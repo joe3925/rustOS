@@ -5,26 +5,57 @@ pub(crate) struct Console{
     pub(crate) currentLine: isize,
     pub(crate) currentCharSize: isize,
     pub(crate) vga_width: isize,
-    pub(crate) vga_height: isize,
     pub(crate) cursor_pose: isize,
 }
 impl Console {
     pub(crate) fn print(&mut self, str: &[u8]) {
         let mut i = 0;
+        unsafe {
+            static mut INIT: bool = false;
+            if (INIT == false) {
+                clear_vga_buffer();
+                INIT = true;
+            }
+        }
         static mut VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
 
-        while i < str.len() {
+        while i < str.len() && self.cursor_pose + 2 <= 0xB8FA0 {
+            // Correct cursor position if it's not even
             if self.cursor_pose % 2 != 0 {
-                // Correct cursor position if it's not even
                 self.cursor_pose += 1;
-                break;
             }
-
+            if(self.cursor_pose % 160 == 0 && self.cursor_pose != 0){
+                self.currentLine += 1;
+            }
+            // Handle newlines
+            if self.cursor_pose >= 0xB8FA0 {
+                self.scroll_up();
+            }
             if str[i] == b'\n' {
-                self.cursor_pose += (self.vga_width * 2) - (self.currentCharSize * 2);
+                self.cursor_pose += (self.vga_width * 2) - (self.cursor_pose % (self.vga_width * 2));
                 self.currentLine += 1;
                 self.currentCharSize = 0;
-            } else {
+
+            }
+            // Handle backspace
+            else if (str[i] == 0x08){
+                unsafe {
+                    if (*VGA_BUFFER.offset(self.cursor_pose) == 0x0){
+                        while (*VGA_BUFFER.offset(self.cursor_pose) == 0x0 && self.cursor_pose > 0){
+                            self.cursor_pose -= 2;
+                        }
+                    }                     // Check the character at the current cursor position
+                    if (*VGA_BUFFER.offset(self.cursor_pose) != 0x0) {
+                            // Clear the non-null character
+                        *VGA_BUFFER.offset(self.cursor_pose) = 0x0; // Clear character
+                        *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // Reset attribute (white on black)
+                        self.currentCharSize = self.currentCharSize.saturating_sub(1); // Adjust character size
+                    }
+                }
+            }
+
+            // Handle regular character printing
+            else {
                 unsafe {
                     // Check if we need to scroll
                     if self.currentLine >= 24 {
@@ -33,9 +64,8 @@ impl Console {
                         self.cursor_pose = self.currentLine * self.vga_width * 2;
                     }
 
-                    // Print the character at the current cursor position
-                    *VGA_BUFFER.offset(self.cursor_pose as isize) = str[i];
-                    *VGA_BUFFER.offset((self.cursor_pose + 1) as isize) = 0x07; // White foreground, black background
+                    *VGA_BUFFER.offset(self.cursor_pose) = str[i];
+                    *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // White foreground, black background
                 }
                 self.cursor_pose += 2;
                 self.currentCharSize += 1;
@@ -54,46 +84,46 @@ impl Console {
                     let from = ((y * self.vga_width) + x) * 2;
                     let to = (((y - 1) * self.vga_width) + x) * 2;
 
-                    *VGA_BUFFER.offset(to as isize) = *VGA_BUFFER.offset(from as isize);
-                    *VGA_BUFFER.offset((to + 1) as isize) = *VGA_BUFFER.offset((from + 1) as isize);
+                    *VGA_BUFFER.offset(to) = *VGA_BUFFER.offset(from);
+                    *VGA_BUFFER.offset((to + 1)) = *VGA_BUFFER.offset((from + 1));
                 }
             }
 
             // Clear the last line
             let last_line_start = (24 * self.vga_width) * 2;
             for x in 0..self.vga_width {
-                *VGA_BUFFER.offset((last_line_start + x * 2) as isize) = b' ';
-                *VGA_BUFFER.offset((last_line_start + x * 2 + 1) as isize) = 0x07;
+                *VGA_BUFFER.offset((last_line_start + x * 2) ) = b' ';
+                *VGA_BUFFER.offset((last_line_start + x * 2 + 1) ) = 0x07;
             }
         }
+        // Adjust the cursor position after scrolling
+        self.cursor_pose = (self.vga_width * 23 * 2) + (self.currentCharSize * 2);
     }
 }
+
 lazy_static! {
      static ref CONSOLE: Mutex<Console> = Mutex::new(Console {
         currentCharSize: 0,
         vga_width: 80,
-        vga_height: 25,
         cursor_pose: 0,
         currentLine: 0,
     });
 }
 pub(crate) fn clear_vga_buffer() {
-    for y in 0..CONSOLE.lock().vga_height {
-        for x in 0..CONSOLE.lock().vga_width {
-            unsafe {
-                let offset = (y * CONSOLE.lock().vga_width + x) * 2;
-                *((0xB8000 as *mut u8).offset(offset as isize)) = b""[0];
-                *((0xB8000 as *mut u8).offset(offset as isize)) = b""[0];
-            }
+    let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
+    let mut i = 0;
+    unsafe {
+        while (vga_buffer.offset(i) < 0xB8FA0 as *mut u8) {
+            *vga_buffer.offset(i) = 0x0;
+
+            i += 2;
         }
     }
-    CONSOLE.lock().currentLine = 0;
-    CONSOLE.lock().cursor_pose = 0;
 }
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
-        $crate::console::_print(format_args!($($arg)*));
+        $crate::console::_print(format_args!($($arg)*))
     };
 }
 
@@ -103,7 +133,7 @@ macro_rules! println {
         $crate::print!("\n");
     };
     ($($arg:tt)*) => {
-        $crate::print!("{}\n", format_args!($($arg)*));
+        $crate::print!("{}\n", format_args!($($arg)*))
     };
 }
 

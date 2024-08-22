@@ -1,9 +1,6 @@
-use x86_64::instructions::port;
-use x86_64::instructions::port::Port;
+
 use pic8259::ChainedPics;
-use spin;
-use crate::drivers::interrupt_index::InterruptIndex::KeyboardIndex;
-use crate::println;
+
 
 pub(crate) const PIC_1_OFFSET: u8 = 32;
 pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -24,9 +21,6 @@ impl InterruptIndex {
         self as u8
     }
 
-    pub(crate) fn as_usize(self) -> usize {
-        usize::from(self.as_u8())
-    }
 }
 pub fn send_eoi(irq: u8) {
     unsafe {

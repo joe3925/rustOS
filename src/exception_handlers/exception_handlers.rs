@@ -1,4 +1,3 @@
-use crate::{println};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {

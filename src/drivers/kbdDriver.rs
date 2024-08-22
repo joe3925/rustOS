@@ -1,9 +1,8 @@
-use core::arch::asm;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptStackFrame;
 use crate::drivers::interrupt_index::InterruptIndex::KeyboardIndex;
 use crate::drivers::interrupt_index::send_eoi;
-use crate::{print, println};
+use crate::{print};
 use x86_64::instructions::port::Port;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
 use spin::Mutex;
@@ -21,7 +20,7 @@ pub(crate) extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: In
         let mut port = Port::new(0x60);
         let scancode: u8 = port.read();
 
-        let mut keyboard = KEYBOARD.lock();  // Lock the keyboard mutex once
+        let mut keyboard = KEYBOARD.lock();
         if let Ok(Some(key_event)) = keyboard.add_byte(scancode) {
 
             if let Some(key) = keyboard.process_keyevent(key_event) {
@@ -33,6 +32,6 @@ pub(crate) extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: In
             }
         }
 
-        send_eoi(KeyboardIndex.as_u8());  // Ensure EOI is always sent
+        send_eoi(KeyboardIndex.as_u8());
     }
 }

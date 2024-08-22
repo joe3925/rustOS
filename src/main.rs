@@ -12,8 +12,6 @@ mod console;
 mod util;
 
 use core::panic::PanicInfo;
-use x86_64::instructions::interrupts;
-use crate::console::clear_vga_buffer;
 use crate::drivers::interrupt_index;
 
 mod drivers {
@@ -35,10 +33,12 @@ fn panic(info: &PanicInfo) -> !{
 #[no_mangle]
 pub extern "C"  fn _start() -> ! {
     gdt::init();
+    println!("loaded GDT");
     load_idt();
+    println!("loaded IDT");
     unsafe { interrupt_index::PICS.lock().initialize() }; // new
     x86_64::instructions::interrupts::enable();
     loop {
-
+        //clear_vga_buffer();
     }
 }
