@@ -31,11 +31,14 @@ lazy_static! {
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
 
+
+
         idt
     };
 }
 pub(crate) fn load_idt() {
         //hardware interrupts
         IDT.load();
+        //TODO: fix page fault here
         x86_64::instructions::interrupts::enable();
 }

@@ -10,13 +10,6 @@ pub(crate) struct Console{
 impl Console {
     pub(crate) fn print(&mut self, str: &[u8]) {
         let mut i = 0;
-        unsafe {
-            static mut INIT: bool = false;
-            if (INIT == false) {
-                clear_vga_buffer();
-                INIT = true;
-            }
-        }
         static mut VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
 
         while i < str.len() && self.cursor_pose + 2 <= 0xB8FA0 {
@@ -24,9 +17,12 @@ impl Console {
             if self.cursor_pose % 2 != 0 {
                 self.cursor_pose += 1;
             }
+            //TODO: get this to work with kernel panics
+            /*
             if(self.cursor_pose % 160 == 0 && self.cursor_pose != 0){
                 self.currentLine += 1;
             }
+            */
             // Handle newlines
             if self.cursor_pose >= 0xB8FA0 {
                 self.scroll_up();

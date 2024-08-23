@@ -52,6 +52,7 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(stack_frame: Inter
     panic!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
 }
 
+//TODO: properly handle page faults
 pub(crate) extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     panic!("EXCEPTION: PAGE FAULT\nError Code: {:#x}\n{:#?}", error_code, stack_frame);
 }
