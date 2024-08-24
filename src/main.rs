@@ -4,6 +4,8 @@
 #![no_main]
 #![allow(unused_parens)]
 #![allow(non_snake_case)]
+#![feature(const_mut_refs)]
+
 extern crate alloc;
 
 mod idt;
@@ -12,6 +14,7 @@ pub mod gdt;
 mod console;
 mod util;
 
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
@@ -29,6 +32,9 @@ mod memory{
 }
 mod exception_handlers {
     pub mod exception_handlers;
+}
+mod structs{
+    pub mod linked_list;
 }
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
@@ -53,8 +59,16 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
-
+    let mut vec = Vec::new();
+    for i in 0..500 {
+        vec.push(i);
+    }
+    let mut i = 0;
     loop{
+        while(i < 500) {
+            vec[i];
+            i+=1;
+        }
     }
 }
 
