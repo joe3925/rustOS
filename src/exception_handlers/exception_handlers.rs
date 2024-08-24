@@ -1,4 +1,6 @@
+use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
+use crate::{println};
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
@@ -54,7 +56,11 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(stack_frame: Inter
 
 //TODO: properly handle page faults
 pub(crate) extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
-    panic!("EXCEPTION: PAGE FAULT\nError Code: {:#x}\n{:#?}", error_code, stack_frame);
+    println!("page fault: {:?}", error_code);
+    println!("attempted to access: {:?}", Cr2::read());
+    println!("{:#?}", stack_frame);
+
+
 }
 
 pub(crate) extern "x86-interrupt" fn x87_floating_point_exception(stack_frame: InterruptStackFrame) {

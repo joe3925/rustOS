@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable};
 use crate::exception_handlers::exception_handlers;
-use crate::{drivers, gdt};
+use crate::{drivers, gdt, println};
 use crate::drivers::kbdDriver::keyboard_interrupt_handler;
 use crate::drivers::timerDriver::timer_interrupt_handler;
 
@@ -41,4 +41,5 @@ pub(crate) fn load_idt() {
         IDT.load();
         //TODO: fix page fault here
         x86_64::instructions::interrupts::enable();
+        println!("loaded IDT");
 }

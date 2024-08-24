@@ -22,6 +22,7 @@ lazy_static! {
 use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
 
 use x86_64::structures::gdt::SegmentSelector;
+use crate::println;
 
 lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
@@ -45,4 +46,6 @@ pub fn init() {
         CS::set_reg(GDT.1.code_selector);
         load_tss(GDT.1.tss_selector);
     }
+    println!("loaded GDT");
+
 }

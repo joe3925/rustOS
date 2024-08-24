@@ -1,8 +1,47 @@
-use x86_64::structures::paging::PageTable;
+use bootloader::bootinfo::MemoryMap;
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::registers::control::Cr3;
 use x86_64::{PhysAddr, VirtAddr};
-use crate::println;
+use x86_64::structures::paging::mapper::MapToError;
+use bootloader::bootinfo::MemoryRegionType;
 
+
+pub struct BootInfoFrameAllocator {
+    memory_map: &'static MemoryMap,
+    next: usize,
+}
+
+impl BootInfoFrameAllocator {
+    pub unsafe fn init(memory_map: &'static MemoryMap) -> Self {
+        BootInfoFrameAllocator {
+            memory_map,
+            next: 0,
+        }
+    }
+}
+unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.usable_frames().nth(self.next);
+        self.next += 1;
+        frame
+    }
+}
+impl BootInfoFrameAllocator {
+    /// Returns an iterator over the usable frames specified in the memory map.
+    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
+        // get usable regions from memory map
+        let regions = self.memory_map.iter();
+        let usable_regions = regions
+            .filter(|r| r.region_type == MemoryRegionType::Usable);
+        // map each region to its address range
+        let addr_ranges = usable_regions
+            .map(|r| r.range.start_addr()..r.range.end_addr());
+        // transform to an iterator of frame start addresses
+        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
+        // create `PhysFrame` types from the start addresses
+        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+}
 fn get_table4_index(virtual_address: VirtAddr) -> usize {
     ((virtual_address.as_u64() >> 39) & 0x1FF) as usize
 }
@@ -20,7 +59,6 @@ fn get_table1_index(virtual_address: VirtAddr) -> usize {
 }
 
 fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
-    println!("getting page 4");
     let (table_frame, _) = Cr3::read();
     let virt_addr = mem_offset + table_frame.start_address().as_u64();
     let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
@@ -28,7 +66,6 @@ fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
 }
 
 fn get_level3_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
-    println!("getting page 3");
     let l4_table = get_level4_page_table(mem_offset);
     let l3_table_addr = l4_table[get_table4_index(to_phys)].addr().as_u64();
     let virt_addr = mem_offset + l3_table_addr;
@@ -37,8 +74,6 @@ fn get_level3_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 }
 
 fn get_level2_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
-    println!("getting page 2");
-
     let l3_table = get_level3_page_table(mem_offset, to_phys);
     let l2_table_addr = l3_table[get_table3_index(to_phys)].addr().as_u64();
     let virt_addr = mem_offset + l2_table_addr;
@@ -47,7 +82,6 @@ fn get_level2_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 }
 
 fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
-    println!("getting page 1");
     let l2_table = get_level2_page_table(mem_offset, to_phys);
     let l1_table_addr = l2_table[get_table2_index(to_phys)].addr().as_u64();
     let virt_addr = mem_offset + l1_table_addr;
@@ -56,8 +90,24 @@ fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 }
 
 pub(crate) fn virtual_to_phys(mem_offset: VirtAddr, to_phys: VirtAddr) -> PhysAddr {
-    println!("getting page addr");
     let l1_table = get_level1_page_table(mem_offset, to_phys);
     let page_entry = &l1_table[get_table1_index(to_phys)];
     page_entry.addr()
+}
+pub(crate) fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    let level_4_table = unsafe { get_level4_page_table(physical_memory_offset) };
+    unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
+}
+pub fn map_page(
+    mapper: &mut impl Mapper<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    flags: PageTableFlags) -> Result<(), MapToError<Size4KiB>> {
+    let frame = frame_allocator
+        .allocate_frame()
+        .ok_or(MapToError::FrameAllocationFailed)?;
+    unsafe {
+        mapper.map_to(page, frame, flags, frame_allocator)?.flush();
+    }
+    Ok(())
 }
