@@ -5,6 +5,8 @@
 #![allow(unused_parens)]
 #![allow(non_snake_case)]
 #![feature(const_mut_refs)]
+#![feature(const_ptr_as_ref)]
+#![feature(const_ptr_write)]
 
 extern crate alloc;
 
