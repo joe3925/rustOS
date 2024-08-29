@@ -3,7 +3,6 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::FrameAllocator;
 use crate::memory::paging::map_page;
 use crate::structs::linked_list::ListNode;
-//use crate::memory::allocator::ALLOCATOR;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 100 * 1024;
@@ -21,5 +20,4 @@ pub(crate) fn init_heap(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mu
     }
     let heapNode = heap_start.as_mut_ptr() as *mut ListNode;
     unsafe{heapNode.write(ListNode::new(HEAP_SIZE));}
-
 }
