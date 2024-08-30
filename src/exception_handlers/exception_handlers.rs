@@ -43,7 +43,7 @@ pub(crate) extern "x86-interrupt" fn invalid_tss_exception(stack_frame: Interrup
 }
 
 pub(crate) extern "x86-interrupt" fn segment_not_present_exception(stack_frame: InterruptStackFrame, _error_code: u64) {
-    panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
+   // panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
 }
 
 pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptStackFrame, _error_code: u64) {
@@ -58,9 +58,7 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(stack_frame: Inter
 pub(crate) extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());
-    println!("{:#?}", stack_frame);
-
-
+   // println!("{:#?}", stack_frame);
 }
 
 pub(crate) extern "x86-interrupt" fn x87_floating_point_exception(stack_frame: InterruptStackFrame) {

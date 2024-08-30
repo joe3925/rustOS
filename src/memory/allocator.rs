@@ -43,7 +43,6 @@ impl Allocator{
         node_ptr.write(node);
         self.freeList.head.next = Some(&mut *node_ptr);
         self.merge_free_list();
-        self.freeList.printList();
     }
 
     fn find_region(&mut self, size: usize, align: usize)
@@ -62,7 +61,6 @@ impl Allocator{
                 current = current.next.as_mut()?;
             }
         }
-        //println!("here1");
         None
     }
     fn alloc_from_region(region: &mut ListNode, size: usize, align: usize)

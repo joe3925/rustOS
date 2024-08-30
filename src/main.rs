@@ -16,17 +16,26 @@ pub mod gdt;
 mod console;
 mod util;
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
+
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
+use crate::drivers::ideDiskDriver::IdeController;
 use crate::drivers::interrupt_index;
+use crate::idt::load_idt;
+use crate::memory::heap::{init_heap};
+use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
 
 mod drivers {
     pub mod kbdDriver;
     pub mod interrupt_index;
     pub mod timerDriver;
+    pub mod ideDiskDriver;
+    pub mod pci{
+        pub mod device_collection;
+        pub mod pci_bus;
+
+    }
 }
 mod memory{
     pub mod paging;
@@ -39,9 +48,6 @@ mod exception_handlers {
 mod structs{
     pub mod linked_list;
 }
-use crate::idt::load_idt;
-use crate::memory::heap::{init_heap};
-use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
@@ -49,34 +55,12 @@ fn panic(info: &PanicInfo) -> !{
     print!("{}", info);
     loop{}
 }
-fn box_test(){
-    let mut i = 0;
-    while(i < 500){
-        let _ = Box::new(i);
-        i+= 1;
-    }
-}
-fn vec_test(){
-    let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
-    if large_vec.capacity() >= 1024 * 50 {
-        println!("Large vector allocation of 50 KB succeeded.");
-    } else {
-        println!("Large vector allocation of 50 KB failed.");
-    }
-}
-fn large_vec_test(){
-    let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
-    if large_vec.capacity() >= 1024 * 50 {
-        println!("Large vector allocation of 100 KB succeeded.");
-    } else {
-        println!("Large vector allocation of 50 KB failed.");
-    }
-}
+
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
+    let mut controller = IdeController::new();
     gdt::init();
     load_idt();
-    x86_64::instructions::interrupts::enable();
     unsafe { interrupt_index::PICS.lock().initialize() };
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
@@ -85,11 +69,10 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
-    box_test();
-    // Test 1
-    vec_test();
-    // Test 2
-    large_vec_test();
+    controller.init();
+    controller.print_all_drives();
+
+
     virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
 
     loop{}
