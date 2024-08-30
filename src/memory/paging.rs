@@ -95,7 +95,7 @@ pub(crate) fn virtual_to_phys(mem_offset: VirtAddr, to_phys: VirtAddr) -> PhysAd
     page_entry.addr()
 }
 pub(crate) fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
-    let level_4_table = unsafe { get_level4_page_table(physical_memory_offset) };
+    let level_4_table = get_level4_page_table(physical_memory_offset);
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
 pub fn map_page(

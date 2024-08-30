@@ -105,6 +105,7 @@ lazy_static! {
         currentLine: 0,
     });
 }
+#[allow(dead_code)]
 pub(crate) fn clear_vga_buffer() {
     let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
     let mut i = 0;

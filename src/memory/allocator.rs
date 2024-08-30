@@ -1,8 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::{mem, ptr};
-use linked_list_allocator::LockedHeap;
+use core::{ ptr};
 use x86_64::{align_up, VirtAddr};
-use crate::{print, println};
 use crate::memory::heap::HEAP_START;
 use crate::structs::linked_list::{LinkedList, ListNode};
 #[global_allocator]
@@ -36,7 +34,7 @@ impl Allocator{
     }
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
         // ensure that the freed region is capable of holding ListNode
-        assert!(size >= mem::size_of::<ListNode>());
+        assert!(size >= size_of::<ListNode>());
 
         // create a new list node and append it at the start of the list
         let mut node = ListNode::new(size);
@@ -45,6 +43,7 @@ impl Allocator{
         node_ptr.write(node);
         self.freeList.head.next = Some(&mut *node_ptr);
         self.merge_free_list();
+        self.freeList.printList();
     }
 
     fn find_region(&mut self, size: usize, align: usize)
@@ -55,12 +54,12 @@ impl Allocator{
         while let Some(ref mut region) = current.next {
             if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
                 let next = region.next.take();
-                let ret = Some((current.next.take().unwrap(), alloc_start));
+                let ret = Some((current.next.take()?, alloc_start));
                 current.next = next;
                 return ret;
 
             } else {
-                current = current.next.as_mut().unwrap();
+                current = current.next.as_mut()?;
             }
         }
         //println!("here1");
@@ -78,7 +77,7 @@ impl Allocator{
         }
 
         let excess_size = region.end_addr() as u64 - alloc_end;
-        if excess_size > 0 && excess_size < mem::size_of::<ListNode>() as u64 {
+        if excess_size > 0 && excess_size < size_of::<ListNode>() as u64 {
             // rest of region too small to hold a ListNode (required because the
             // allocation splits the region in a used and a free part)
             return Err(());
@@ -89,24 +88,27 @@ impl Allocator{
     }
     fn size_align(layout: Layout) -> (usize, usize) {
         let layout = layout
-            .align_to(mem::align_of::<ListNode>())
+            .align_to(align_of::<ListNode>())
             .expect("adjusting alignment failed")
             .pad_to_align();
-        let size = layout.size().max(mem::size_of::<ListNode>());
+        let size = layout.size().max(size_of::<ListNode>());
         (size, layout.align())
     }
 
     pub fn merge_free_list(&mut self) {
-        let mut current = &mut self.freeList.head;
-        while let Some(ref mut next) = current.next {
-            let size = current.size + next.size;
-            let nextnext = next.next.take();
-            if(next.mut_start_addr() == current.mut_start_addr() + current.size){
-                current.size = size;
-                current.next = nextnext;
-            }
-            else{
 
+        let mut current = VirtAddr::new(self.freeList.head.start_addr() as u64).as_mut_ptr() as *mut ListNode;
+
+        unsafe {
+            while let Some(ref mut next) = (*current).next {
+                let nextPtr = VirtAddr::new(next.start_addr() as u64).as_mut_ptr() as *mut ListNode;
+                if((*nextPtr).start_addr() == (*current).start_addr() + (*current).size){
+                    (*current).size += (*nextPtr).size;
+                    //nextPtr is left dangling but it doesn't matter as the allocator marked its space as free
+                    (*current).next = (*nextPtr).next.take();
+                }
+
+                current = nextPtr;
             }
         }
     }

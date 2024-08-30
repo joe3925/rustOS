@@ -16,12 +16,9 @@ pub mod gdt;
 mod console;
 mod util;
 
-use alloc::alloc::{alloc, dealloc};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::alloc::Layout;
 use core::panic::PanicInfo;
-use core::ptr::null_mut;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::drivers::interrupt_index;
@@ -43,7 +40,7 @@ mod structs{
     pub mod linked_list;
 }
 use crate::idt::load_idt;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::heap::{init_heap};
 use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
 
 #[panic_handler]
@@ -51,6 +48,13 @@ fn panic(info: &PanicInfo) -> !{
     //clear_vga_buffer();
     print!("{}", info);
     loop{}
+}
+fn box_test(){
+    let mut i = 0;
+    while(i < 500){
+        let _ = Box::new(i);
+        i+= 1;
+    }
 }
 fn vec_test(){
     let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
@@ -81,11 +85,12 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
-
+    box_test();
     // Test 1
     vec_test();
     // Test 2
     large_vec_test();
+    virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
 
     loop{}
 
