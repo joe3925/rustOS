@@ -20,6 +20,12 @@ impl ListNode {
     pub fn start_addr(&self) -> usize {
         self as *const Self as usize
     }
+    pub fn mut_start_addr(&mut self) -> usize {
+        self as *const Self as usize
+    }
+    pub fn mut_end_addr(&mut self) -> usize {
+        self.mut_start_addr() + self.size
+    }
 
     pub fn end_addr(&self) -> usize {
         self.start_addr() + self.size

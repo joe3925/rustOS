@@ -45,16 +45,28 @@ mod structs{
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
-fn many_boxes() {
-    for i in 0..HEAP_SIZE * 2 {
-        let x = Box::new(i);
-    }
-}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
     //clear_vga_buffer();
     print!("{}", info);
     loop{}
+}
+fn vec_test(){
+    let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
+    if large_vec.capacity() >= 1024 * 50 {
+        println!("Large vector allocation of 50 KB succeeded.");
+    } else {
+        println!("Large vector allocation of 50 KB failed.");
+    }
+}
+fn large_vec_test(){
+    let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
+    if large_vec.capacity() >= 1024 * 50 {
+        println!("Large vector allocation of 100 KB succeeded.");
+    } else {
+        println!("Large vector allocation of 50 KB failed.");
+    }
 }
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
@@ -69,30 +81,11 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
-    many_boxes();
-    let layout_50kb = Layout::from_size_align(50 * 1024, 8).expect("Failed to create layout");
-    let ptr_50kb = unsafe { alloc(layout_50kb) };
-    if ptr_50kb == null_mut() {
-        panic!("Failed to allocate 50KB");
-    }
-    println!("Successfully allocated 50KB");
-    unsafe { dealloc(ptr_50kb, layout_50kb); }
-    //TODO: find out why the global dealloc is not called for Vec
-    // Test 2: Allocate a large array
-    let large_vec: Vec<u8> = Vec::with_capacity(1024 * 50); // 50 KB
-    if large_vec.capacity() >= 1024 * 50 {
-        println!("Large vector allocation of 50 KB succeeded.");
-    } else {
-        println!("Large vector allocation of 50 KB failed.");
-    }
 
-    // Test 3: Allocate an even larger array
-    let large_vec2: Vec<u8> = Vec::with_capacity(1024 * 51); // 100 KB
-    if large_vec2.capacity() >= 1024 * 100 {
-        println!("Large vector allocation of 100 KB succeeded.");
-    } else {
-        println!("Large vector allocation of 100 KB failed.");
-    }
+    // Test 1
+    vec_test();
+    // Test 2
+    large_vec_test();
 
     loop{}
 

@@ -43,7 +43,8 @@ impl Allocator{
         node.next = self.freeList.head.next.take();
         let node_ptr = addr as *mut ListNode;
         node_ptr.write(node);
-        self.freeList.head.next = Some(&mut *node_ptr)
+        self.freeList.head.next = Some(&mut *node_ptr);
+        self.merge_free_list();
     }
 
     fn find_region(&mut self, size: usize, align: usize)
@@ -52,7 +53,7 @@ impl Allocator{
         //self.freeList.printList();
         let mut current = &mut self.freeList.head;
         while let Some(ref mut region) = current.next {
-            if let Ok(alloc_start) = Self::alloc_from_region(&region, size, align) {
+            if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
                 let next = region.next.take();
                 let ret = Some((current.next.take().unwrap(), alloc_start));
                 current.next = next;
@@ -65,7 +66,7 @@ impl Allocator{
         //println!("here1");
         None
     }
-    fn alloc_from_region(region: &ListNode, size: usize, align: usize)
+    fn alloc_from_region(region: &mut ListNode, size: usize, align: usize)
                          -> Result<usize, ()>
     {
         let alloc_start = align_up(region.start_addr() as u64, align as u64);
@@ -93,6 +94,21 @@ impl Allocator{
             .pad_to_align();
         let size = layout.size().max(mem::size_of::<ListNode>());
         (size, layout.align())
+    }
+
+    pub fn merge_free_list(&mut self) {
+        let mut current = &mut self.freeList.head;
+        while let Some(ref mut next) = current.next {
+            let size = current.size + next.size;
+            let nextnext = next.next.take();
+            if(next.mut_start_addr() == current.mut_start_addr() + current.size){
+                current.size = size;
+                current.next = nextnext;
+            }
+            else{
+
+            }
+        }
     }
 }
 
