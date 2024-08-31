@@ -33,11 +33,11 @@ pub fn has_ide_controller(mut bus: PciBus) -> bool {
     false
 }
 #[derive(Debug, Clone)]
-struct DriveInfo {
-    drive_label: String,
-    model: String,
-    serial: String,
-    capacity: u64,
+pub struct DriveInfo {
+    pub drive_label: String,
+    pub model: String,
+    pub serial: String,
+    pub capacity: u64,
 }
 impl DriveInfo {
     pub fn print(&self) {
@@ -59,7 +59,7 @@ pub struct IdeController {
     drive_head_port: Port<u8>,
     command_port: Port<u8>,
     control_port: Port<u8>,
-    drives: Vec<DriveInfo>,
+    pub(crate) drives: Vec<DriveInfo>,
 }
 
 impl IdeController {
@@ -124,7 +124,7 @@ impl IdeController {
             })
         }
     }
-    fn drive_selector_from_label(&self, label: &str) -> u8 {
+    pub fn drive_selector_from_label(&self, label: &str) -> u8 {
         match label.to_uppercase().as_str() {
             "C:" => 0xA0,  // Master drive on primary channel
             "D:" => 0xB0,  // Slave drive on primary channel

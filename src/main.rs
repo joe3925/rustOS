@@ -48,6 +48,9 @@ mod exception_handlers {
 mod structs{
     pub mod linked_list;
 }
+ mod file_system {
+    pub mod FAT;
+}
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
