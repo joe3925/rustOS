@@ -6,6 +6,7 @@ use crate::println;
 
 const CLUSTER_SIZE: u64 = 32; //in KiB
 const CLUSTER_OFFSET: u64 = CLUSTER_SIZE * 1024;
+const SECTORS_PER_CLUSTER: u64 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u64 = 2;
 const SECTORS_FOR_TABLE: u64 = 10;
 const DATA_REGION_START: u64 = (SECTORS_FOR_TABLE + RESERVED_SECTORS) - 1;
@@ -30,9 +31,8 @@ struct InfoSector{
 
 }
 #[derive(Debug)]
-struct FileSystem {
+pub struct FileSystem {
     info: InfoSector,
-    allocation_table: Vec<u32>, // FAT table, where each entry points to the next cluster
 }
 
 impl FileSystem {
@@ -44,7 +44,6 @@ impl FileSystem {
                 free_clusters: 0xFFFFFFFF ,
                 recently_allocated_cluster: 0xFFFFFFFF ,
             },
-            allocation_table: vec![0xFFFFFFFF; 100], // Initialize FAT table with 100 entries, all free
         }
     }
 
@@ -59,35 +58,32 @@ impl FileSystem {
             drive_size = ide_controller.drives[1].capacity;
         }
         let total_clusters = drive_size / CLUSTER_OFFSET;
-        let total_size = reserved_area_size + total_clusters;
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
-        // Zero out reserved sectors
         for i in 0..RESERVED_SECTORS {
             ide_controller.write_sector(drive_label, i as u32, &buffer);
         }
 
-        // Initialize the FAT table in memory
-        self.allocation_table = vec![0xFFFFFFFF; total_clusters as usize]; // Mark all clusters as free
+        for j in 0..512 {
+            buffer[j] = 0xFF;
+        }
+
 
         // Write the FAT table to the drive
-        for i in 0..total_clusters {
-            let offset:usize = (i * 512) as usize;
-            for j in 0..512 {
-                buffer[j] = if offset + j < (self.allocation_table.len() as u32 * 4) as usize {
-                    // Convert FAT table entry to bytes and write it to the buffer
-                    let cluster_entry = self.allocation_table[(offset + j) as usize / 4];
-                    let byte_offset = (j % 4) as u32;
-                    ((cluster_entry >> (byte_offset * 8)) & 0xFF) as u8
-                } else {
-                    0
-                };
+        let itr = total_clusters / 512;
+        println!("{}", total_clusters);
+        println!("{}", itr);
+
+        for i in 0..itr {
+            ide_controller.write_sector(drive_label, (i + RESERVED_SECTORS) as u32, &buffer);
+            if( i % 10 == 0) {
+                println!("Formatting at {}%", ((i as f64 / itr as f64) * 100f64));
             }
-            ide_controller.write_sector(drive_label, (RESERVED_SECTORS + i) as u32, &buffer);
+
         }
 
         // Initialize the InfoSector
-        self.info.free_clusters = self.allocation_table.len() as u32;
+        self.info.free_clusters = total_clusters as u32;
         self.info.recently_allocated_cluster = 0;
 
         println!("Drive {} formatted successfully.", drive_label);

@@ -22,6 +22,7 @@ use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::drivers::interrupt_index;
+use crate::file_system::FAT::FileSystem;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap};
 use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
@@ -74,6 +75,8 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     init_heap(&mut mapper, &mut frame_allocator);
     controller.init();
     controller.print_all_drives();
+    let mut system = FileSystem::new();
+    system.format_drive(&mut controller, "D:").expect("TODO: panic message");
 
 
     virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));

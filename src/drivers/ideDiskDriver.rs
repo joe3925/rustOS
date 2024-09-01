@@ -175,7 +175,6 @@ impl IdeController {
                 chunk[1] = ((data >> 8) & 0xFF) as u8;
             }
         }
-        println!("Sector read successfully from {}.", label);
     }
 
     pub fn write_sector(&mut self, label: &str, lba: u32, buffer: &[u8]) {
@@ -196,7 +195,6 @@ impl IdeController {
                 self.data_port.write(data);
             }
         }
-        println!("Sector written successfully to {}.", label);
     }
 }
 bitflags! {
