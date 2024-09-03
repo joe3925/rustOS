@@ -8,6 +8,7 @@ const CLUSTER_SIZE: u64 = 32; //in KiB
 const CLUSTER_OFFSET: u64 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u64 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u64 = 2;
+const INFO_SECTOR: u64 = RESERVED_SECTORS - 1;
 const SECTORS_FOR_TABLE: u64 = 10;
 const DATA_REGION_START: u64 = (SECTORS_FOR_TABLE + RESERVED_SECTORS) - 1;
 #[derive(Debug)]
@@ -46,10 +47,9 @@ impl FileSystem {
             },
         }
     }
-
+//TODO: figure out why sector 1 is being formatted as a data sector
     pub fn format_drive(&mut self, ide_controller: &mut IdeController, drive_label: &str) -> Result<(), &'static str> {
         let reserved_area_size = RESERVED_SECTORS * 512; // 512 bytes per sector
-
 
         let drive_size;
         if(drive_label == "C:"){
@@ -57,6 +57,13 @@ impl FileSystem {
         }else{
             drive_size = ide_controller.drives[1].capacity;
         }
+        let mut info_sec_buffer = vec![0x0; 512];
+        info_sec_buffer[0x0] = self.info.signature as u8;
+        info_sec_buffer[0x1E8] = self.info.free_clusters as u8;
+        info_sec_buffer[0x1FC] = self.info.recently_allocated_cluster as u8;
+        //create the info sector
+        ide_controller.write_sector(drive_label, INFO_SECTOR as u32, &info_sec_buffer);
+
         let total_clusters = drive_size / CLUSTER_OFFSET;
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
