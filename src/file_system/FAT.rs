@@ -8,9 +8,9 @@ const CLUSTER_SIZE: u32 = 32; //in KiB
 const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u32 = 2;
-const INFO_SECTOR: u32 = RESERVED_SECTORS - 1;
+const INFO_SECTOR: u32 = RESERVED_SECTORS;
 const SECTORS_FOR_TABLE: u32 = 10;
-const DATA_REGION_START: u32 = (SECTORS_FOR_TABLE + RESERVED_SECTORS) - 1;
+const DATA_REGION_START: u32 = (SECTORS_FOR_TABLE + RESERVED_SECTORS);
 #[derive(Debug)]
 struct FileEntry {
     file_name: String,          // File name without extension
@@ -30,6 +30,10 @@ struct InfoSector{
     recently_allocated_cluster: u32, //offset: 0x1EC
     //one more signature at offset 0x1FC
 
+}
+struct Dir {
+    files: Vec<FileEntry>,
+    next_cluster: u8,
 }
 #[derive(Debug)]
 pub struct FileSystem {
@@ -82,8 +86,8 @@ impl FileSystem {
         println!("{}", total_clusters);
         println!("{}", itr);
 
-        for i in 0..itr {
-            ide_controller.write_sector(drive_label, (i + RESERVED_SECTORS), &buffer);
+        for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
+            ide_controller.write_sector(drive_label, (i + 1), &buffer);
             if(i % 10 == 0) {
                 println!("{}", i);
             }
@@ -91,8 +95,8 @@ impl FileSystem {
         let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
     //validate data sectors
-        for i in 0..itr{
-            ide_controller.read_sector(drive_label, (i+RESERVED_SECTORS), &mut readBuffer);
+        for i in RESERVED_SECTORS..itr + RESERVED_SECTORS{
+            ide_controller.read_sector(drive_label, (i + 1), &mut readBuffer);
             for j in 0..512{
                 if (readBuffer[j] != buffer[j]){
                     println!("Sector {} is invalid", i);
@@ -108,6 +112,7 @@ impl FileSystem {
         println!("Drive {} formatted successfully.", drive_label);
         Ok(())
     }
+
 
 
 }
