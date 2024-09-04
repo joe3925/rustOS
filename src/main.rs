@@ -76,7 +76,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     controller.init();
     controller.print_all_drives();
     let mut system = FileSystem::new();
-    system.format_drive(&mut controller, "D:").expect("TODO: panic message");
+    system.format_drive(&mut controller, "D:").expect("");
 
 
     virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));

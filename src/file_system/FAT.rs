@@ -4,13 +4,13 @@ use alloc::vec::Vec;
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::println;
 
-const CLUSTER_SIZE: u64 = 32; //in KiB
-const CLUSTER_OFFSET: u64 = CLUSTER_SIZE * 1024;
-const SECTORS_PER_CLUSTER: u64 = (CLUSTER_SIZE * 1024) / 512;
-const RESERVED_SECTORS: u64 = 2;
-const INFO_SECTOR: u64 = RESERVED_SECTORS - 1;
-const SECTORS_FOR_TABLE: u64 = 10;
-const DATA_REGION_START: u64 = (SECTORS_FOR_TABLE + RESERVED_SECTORS) - 1;
+const CLUSTER_SIZE: u32 = 32; //in KiB
+const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
+const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
+const RESERVED_SECTORS: u32 = 2;
+const INFO_SECTOR: u32 = RESERVED_SECTORS - 1;
+const SECTORS_FOR_TABLE: u32 = 10;
+const DATA_REGION_START: u32 = (SECTORS_FOR_TABLE + RESERVED_SECTORS) - 1;
 #[derive(Debug)]
 struct FileEntry {
     file_name: String,          // File name without extension
@@ -62,14 +62,15 @@ impl FileSystem {
         info_sec_buffer[0x1E8] = self.info.free_clusters as u8;
         info_sec_buffer[0x1FC] = self.info.recently_allocated_cluster as u8;
         //create the info sector
-        ide_controller.write_sector(drive_label, INFO_SECTOR as u32, &info_sec_buffer);
 
-        let total_clusters = drive_size / CLUSTER_OFFSET;
+        let total_clusters = drive_size as u32 / CLUSTER_OFFSET;
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         for i in 0..RESERVED_SECTORS {
-            ide_controller.write_sector(drive_label, i as u32, &buffer);
+            ide_controller.write_sector(drive_label, i, &buffer);
         }
+        ide_controller.write_sector(drive_label, INFO_SECTOR, &info_sec_buffer);
+
 
         for j in 0..512 {
             buffer[j] = 0xFF;
@@ -82,11 +83,22 @@ impl FileSystem {
         println!("{}", itr);
 
         for i in 0..itr {
-            ide_controller.write_sector(drive_label, (i + RESERVED_SECTORS) as u32, &buffer);
-            if( i % 10 == 0) {
-                println!("Formatting at {}%", ((i as f64 / itr as f64) * 100f64));
+            ide_controller.write_sector(drive_label, (i + RESERVED_SECTORS), &buffer);
+            if(i % 10 == 0) {
+                println!("{}", i);
             }
+        }
+        let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
+    //validate data sectors
+        for i in 0..itr{
+            ide_controller.read_sector(drive_label, (i+RESERVED_SECTORS), &mut readBuffer);
+            for j in 0..512{
+                if (readBuffer[j] != buffer[j]){
+                    println!("Sector {} is invalid", i);
+                    break;
+                }
+            }
         }
 
         // Initialize the InfoSector

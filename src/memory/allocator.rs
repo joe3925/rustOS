@@ -1,5 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::{ ptr};
+use core::mem::{align_of, size_of};
 use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
 use crate::structs::linked_list::{LinkedList, ListNode};
