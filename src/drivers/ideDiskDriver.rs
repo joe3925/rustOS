@@ -124,7 +124,7 @@ impl IdeController {
             })
         }
     }
-    pub fn drive_selector_from_label(&self, label: &str) -> u8 {
+    pub fn drive_selector_from_label(&self, label: String) -> u8 {
         match label.to_uppercase().as_str() {
             "C:" => 0xA0,  // Master drive on primary channel
             "D:" => 0xB0,  // Slave drive on primary channel
@@ -156,7 +156,7 @@ impl IdeController {
         }
     }
 
-    pub fn read_sector(&mut self, label: &str, lba: u32, buffer: &mut [u8]) {
+    pub fn read_sector(&mut self, label: String, lba: u32, buffer: &mut [u8]) {
         assert_eq!(buffer.len(), 512); // Ensure the buffer can hold one sector
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
@@ -177,7 +177,7 @@ impl IdeController {
         }
     }
 
-    pub fn write_sector(&mut self, label: &str, lba: u32, buffer: &[u8]) {
+    pub fn write_sector(&mut self, label: String, lba: u32, buffer: &[u8]) {
         assert_eq!(buffer.len(), 512); // Ensure the buffer is one sector long
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);

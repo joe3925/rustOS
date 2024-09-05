@@ -16,7 +16,9 @@ pub mod gdt;
 mod console;
 mod util;
 
-
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
@@ -59,6 +61,50 @@ fn panic(info: &PanicInfo) -> !{
     print!("{}", info);
     loop{}
 }
+pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
+    // Define the file content to write, large enough to span multiple clusters
+    let cluster_size = 32 as usize * 1024;
+    let num_clusters = 1;
+    let total_size = num_clusters * cluster_size;
+
+    // Generate the content: A sequence of bytes for simplicity
+    let file_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+
+    let file_name = "BIGFILE";
+    let file_extension = "DAT";
+
+    println!("Creating a multi-cluster file '{}.{}'...", file_name, file_extension);
+
+    // Write the file to the file system
+    filesystem.create_and_write_file(ide_controller, file_name, file_extension, &file_data);
+
+    println!("File '{}.{}' created successfully.", file_name, file_extension);
+}
+pub fn test_read_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
+    let file_name = "BIGFILE";
+    let file_extension = "DAT";
+
+    println!("Reading the multi-cluster file '{}.{}'...", file_name, file_extension);
+
+    // Read the file from the file system
+    if let Some(file_data) = filesystem.read_file(ide_controller, file_name, file_extension) {
+        println!("File read successfully. Size: {} bytes", file_data.len());
+
+        // Verify the content: Should match the original pattern
+        let cluster_size = 32 as usize * 1024;
+        let num_clusters = file_data.len() / cluster_size;
+
+        let expected_data: Vec<u8> = (0..file_data.len()).map(|i| (i % 256) as u8).collect();
+
+        if file_data == expected_data {
+            println!("File content verified successfully.");
+        } else {
+            println!("File content does not match expected data.");
+        }
+    } else {
+        println!("Failed to read the file '{}.{}'", file_name, file_extension);
+    }
+}
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
@@ -75,10 +121,10 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     init_heap(&mut mapper, &mut frame_allocator);
     controller.init();
     controller.print_all_drives();
-    let mut system = FileSystem::new();
-    system.format_drive(&mut controller, "D:").expect("");
-
-
+    let mut system = FileSystem::new("D:".to_string());
+    system.format_drive(&mut controller).expect("");
+    test_create_multi_cluster_file(&mut system, &mut controller);
+    test_read_multi_cluster_file(&mut system, &mut controller);
     virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
 
     loop{}
