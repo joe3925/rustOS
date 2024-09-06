@@ -64,7 +64,7 @@ fn panic(info: &PanicInfo) -> !{
 pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
     // Define the file content to write, large enough to span multiple clusters
     let cluster_size = 32 as usize * 1024;
-    let num_clusters = 1;
+    let num_clusters = 3;
     let total_size = num_clusters * cluster_size;
 
     // Generate the content: A sequence of bytes for simplicity
