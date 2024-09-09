@@ -64,7 +64,7 @@ fn panic(info: &PanicInfo) -> !{
 pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
     // Define the file content to write, large enough to span multiple clusters
     let cluster_size = 32 as usize * 1024;
-    let num_clusters = 3;
+    let num_clusters = 30;
     let total_size = num_clusters * cluster_size;
 
     // Generate the content: A sequence of bytes for simplicity
@@ -91,15 +91,22 @@ pub fn test_read_multi_cluster_file(filesystem: &mut FileSystem, ide_controller:
         println!("File read successfully. Size: {} bytes", file_data.len());
 
         // Verify the content: Should match the original pattern
-        let cluster_size = 32 as usize * 1024;
-        let num_clusters = file_data.len() / cluster_size;
-
         let expected_data: Vec<u8> = (0..file_data.len()).map(|i| (i % 256) as u8).collect();
 
         if file_data == expected_data {
             println!("File content verified successfully.");
         } else {
             println!("File content does not match expected data.");
+
+            // Print differences between expected and actual data
+            for (i, (expected, actual)) in expected_data.iter().zip(file_data.iter()).enumerate() {
+                if expected != actual {
+                    println!(
+                        "Difference at offset {}: expected 0x{:02X}, got 0x{:02X}",
+                        i, expected, actual
+                    );
+                }
+            }
         }
     } else {
         println!("Failed to read the file '{}.{}'", file_name, file_extension);
@@ -122,7 +129,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     controller.init();
     controller.print_all_drives();
     let mut system = FileSystem::new("D:".to_string());
-    system.format_drive(&mut controller).expect("");
+    system.format_drive(&mut controller).expect("TODO: panic message");
     test_create_multi_cluster_file(&mut system, &mut controller);
     test_read_multi_cluster_file(&mut system, &mut controller);
     virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));

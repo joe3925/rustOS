@@ -88,14 +88,10 @@ impl FileSystem{
 
         // Write the FAT table to the drive
         let itr = total_clusters / 512;
-        println!("{}", total_clusters);
-        println!("{}", itr);
 
         for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
             ide_controller.write_sector(drive_label.clone(), (i + 1), &buffer);
-            if(i % 10 == 0) {
-                println!("{}", i);
-            }
+
         }
         let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
@@ -225,8 +221,6 @@ impl FileSystem{
             self.update_fat(ide_controller, free_cluster,next_cluster);
             free_cluster = next_cluster;
         }
-        let root_dir = self.read_root_dir(ide_controller);
-        println!("{:#?}", self.get_all_clusters(ide_controller, 2));
     }
 
     pub fn read_file(
@@ -235,35 +229,48 @@ impl FileSystem{
         file_name: &str,
         file_extension: &str,
     ) -> Option<Vec<u8>> {
-        // Locate the file entry in the root directory
+        let file_entries = self.read_root_dir(ide_controller);
 
-        // Read the file data by following the cluster chain
-        let file_size = 0;
-        let mut file_data = Vec::with_capacity(file_size as usize);
+        if(file_entries.len() == 0){
+            return None;
+        }
+        let mut entry = &file_entries[0];
+        //find the correct entry
+        for i in 0..file_entries.len(){
+            if(file_entries[i].file_name == file_name && file_entries[i].file_extension == file_extension){
+                entry = &file_entries[i];
+            }
+        }
+        let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
+        let remainder = entry.file_size % CLUSTER_OFFSET as u64;
+        let clusters = self.get_all_clusters(ide_controller, entry.starting_cluster);
+        for i in 0..clusters.len(){
+            let mut cluster = vec!(0u8; CLUSTER_OFFSET as usize);
+            self.read_cluster(ide_controller, clusters[i], &mut cluster);
+            let base_offset = i * CLUSTER_OFFSET as usize;
 
+            if (i + 1) != clusters.len() || remainder == 0{
+                for j in 0..cluster.len() {
+
+                    file_data[j + base_offset] = cluster[j];
+                }
+            }else{
+                for j in 0..remainder as usize {
+
+                    file_data[j + base_offset] = cluster[j];
+                }
+            }
+        }
 
         Some(file_data)
     }
     //set ignore cluster to 0 to ignore no clusters
     fn find_free_cluster(&mut self, mut ide_controller: &mut IdeController, ignore_cluster: u32) -> u32 {
-        let drive_size: u32;
-        let drive_label = self.drive_label.clone();
-
-        if drive_label == "C:" {
-            drive_size = ide_controller.drives[0].capacity as u32;
-        } else {
-            drive_size = ide_controller.drives[1].capacity as u32;
-        }
-
-        // Calculate total number of clusters
-        let total_clusters = drive_size / CLUSTER_OFFSET;
-
-        // Calculate the number of sectors occupied by the FAT table
-        let fat_sectors = (total_clusters * 4 + 511) / 512; // Each FAT entry is 4 bytes
+        let fat_sectors = self.calculate_data_region_start(ide_controller) - RESERVED_SECTORS;
 
         for i in 0..fat_sectors {
             let mut buffer = vec![0u8; 512];
-            ide_controller.read_sector(drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer);
+            ide_controller.read_sector(self.drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer);
             for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
                 let entry = u32::from_le_bytes([
                     buffer[j * 4],
@@ -415,8 +422,9 @@ impl FileSystem{
                 sector[sector_index + 2],
                 sector[sector_index + 3],
             ]);
-            println!("{}", entry);
-            out_vec.push(entry);
+            if(entry != 0xFFFFFFFF) {
+                out_vec.push(entry);
+            }
             starting_cluster = entry;
         }
         out_vec

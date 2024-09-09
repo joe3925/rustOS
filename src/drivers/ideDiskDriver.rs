@@ -126,9 +126,9 @@ impl IdeController {
     }
     pub fn drive_selector_from_label(&self, label: String) -> u8 {
         match label.to_uppercase().as_str() {
-            "C:" => 0xA0,  // Master drive on primary channel
-            "D:" => 0xB0,  // Slave drive on primary channel
-            _ => 0xA0,     // Default to master if unspecified or unknown label
+            "C:" => 0xE0,  // Master drive on primary channel
+            "D:" => 0xF0,  // Slave drive on primary channel
+            _ => 0xE0,     // Default to master if unspecified or unknown label
         }
     }
     fn status(&mut self) -> StatusFlags {
@@ -157,17 +157,23 @@ impl IdeController {
     }
 
     pub fn read_sector(&mut self, label: String, lba: u32, buffer: &mut [u8]) {
-        assert_eq!(buffer.len(), 512); // Ensure the buffer can hold one sector
+        assert_eq!(buffer.len(), 512);
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
-            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8)); // Select drive and head
-            self.sector_count_port.write(1); // Read one sector
+            while(self.command_port.read() & 0x80 == 1) {}
+            while (self.command_port.read() & 0x40 == 0) { println!("drive not ready");}
+            while (self.command_port.read() & 0x20 == 1 ) { println!("drive faulted!");}
+
+            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            self.sector_count_port.write(1);
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            self.command_port.write(0x20); // Send read command
+            self.command_port.write(0x20);
 
-            while self.command_port.read() & 0x80 != 0 {} // Wait for BSY to clear
+            while self.command_port.read() & 0x80 != 0 {}
+            while self.command_port.read() & 0x08 == 0 {}
+
 
             for chunk in buffer.chunks_mut(2) {
                 let data = self.data_port.read();
@@ -178,20 +184,27 @@ impl IdeController {
     }
 
     pub fn write_sector(&mut self, label: String, lba: u32, buffer: &[u8]) {
-        assert_eq!(buffer.len(), 512); // Ensure the buffer is one sector long
+        assert_eq!(buffer.len(), 512);
 
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
-            while(self.command_port.read() & 0x80 != 0){}
+            while(self.command_port.read() & 0x80 == 1) {}
+            while (self.command_port.read() & 0x40 == 0) { println!("drive not ready");}
+            while (self.command_port.read() & 0x20 == 1 ) { println!("drive faulted!");}
 
-            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8)); // Properly select drive and head
-            self.sector_count_port.write(1); // Write one sector
+            if (self.command_port.read() & 0x01 != 0) {
+                println!("Error: IDE command failed!");
+            }
+            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            self.sector_count_port.write(1);
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            self.command_port.write(0x30); // Send write command
+            self.command_port.write(0x30);
 
-            while self.command_port.read() & 0x80 != 0 {} // Wait for BSY to clear
+            while self.command_port.read() & 0x80 != 0 {}
+            while self.command_port.read() & 0x08 == 0 {}
+
 
             for chunk in buffer.chunks(2) {
                 let data = (u16::from(chunk[1]) << 8) | u16::from(chunk[0]);
