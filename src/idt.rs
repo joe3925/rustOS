@@ -4,7 +4,7 @@ use crate::exception_handlers::exception_handlers;
 use crate::{drivers, gdt, println};
 use crate::drivers::kbdDriver::keyboard_interrupt_handler;
 use crate::drivers::timerDriver::timer_interrupt_handler;
-use crate::drivers::ideDiskDriver::drive_irq_handler;
+use crate::drivers::ideDiskDriver::{primary_drive_irq_handler, secondary_drive_irq_handler};
 
 
 lazy_static! {
@@ -32,7 +32,9 @@ lazy_static! {
         //hardware interrupts
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
-        idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(drive_irq_handler);
+        idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(primary_drive_irq_handler);
+        idt[drivers::interrupt_index::InterruptIndex::SecondaryDrive.as_u8()].set_handler_fn(secondary_drive_irq_handler);
+
 
 
 

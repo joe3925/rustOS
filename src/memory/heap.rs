@@ -5,7 +5,7 @@ use crate::memory::paging::map_page;
 use crate::structs::linked_list::ListNode;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
-pub const HEAP_SIZE: usize = 1000 * 1024;
+pub const HEAP_SIZE: usize = 10000 * 1024;
 pub(crate) fn init_heap(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>){
     let heap_start = VirtAddr::new(HEAP_START as u64);
     let heap_end = heap_start + HEAP_SIZE as u64;

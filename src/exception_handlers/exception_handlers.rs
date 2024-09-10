@@ -1,7 +1,8 @@
+use x86_64::instructions::tables::lidt;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use crate::{println};
-
+use x86_64::VirtAddr;
+use crate::{panic, println};
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
 }
@@ -43,7 +44,7 @@ pub(crate) extern "x86-interrupt" fn invalid_tss_exception(stack_frame: Interrup
 }
 
 pub(crate) extern "x86-interrupt" fn segment_not_present_exception(stack_frame: InterruptStackFrame, _error_code: u64) {
-   // panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
+   panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
 }
 
 pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptStackFrame, _error_code: u64) {
@@ -58,7 +59,7 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(stack_frame: Inter
 pub(crate) extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());
-   // println!("{:#?}", stack_frame);
+   println!("{:#?}", stack_frame);
 }
 
 pub(crate) extern "x86-interrupt" fn x87_floating_point_exception(stack_frame: InterruptStackFrame) {

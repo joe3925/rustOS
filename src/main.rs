@@ -71,7 +71,7 @@ pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controlle
     // Generate the content: A sequence of bytes for simplicity
     let file_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
-    let file_name = "BIGFILE";
+    let file_name = "BIGFILE1";
     let file_extension = "DAT";
 
     println!("Creating a multi-cluster file '{}.{}'...", file_name, file_extension);
@@ -82,7 +82,7 @@ pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controlle
     println!("File '{}.{}' created successfully.", file_name, file_extension);
 }
 pub fn test_read_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
-    let file_name = "BIGFILE";
+    let file_name = "BIGFILE1";
     let file_extension = "DAT";
 
     println!("Reading the multi-cluster file '{}.{}'...", file_name, file_extension);
@@ -130,12 +130,13 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     controller.init();
     controller.print_all_drives();
     let mut system = FileSystem::new("D:".to_string());
+    virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
     system.format_drive(&mut controller).expect("TODO: panic message");
     test_create_multi_cluster_file(&mut system, &mut controller);
-    test_read_multi_cluster_file(&mut system, &mut controller);
-    virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
 
-    loop{}
+    loop{
+        //test_read_multi_cluster_file(&mut system, &mut controller);
+        }
 
 }
 

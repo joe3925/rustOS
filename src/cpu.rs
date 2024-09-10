@@ -1,7 +1,7 @@
 use core::arch::x86_64::_rdtsc;
 
 
-fn get_cycles() -> u64 {
+pub fn get_cycles() -> u64 {
     unsafe {
         _rdtsc()
     }
