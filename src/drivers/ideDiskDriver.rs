@@ -57,7 +57,7 @@ pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: Int
         if status & 0x01 != 0 {
             println!("Error: Read sector failed!");
         }
-        println!("{}", status);
+       // println!("{}", status);
 
 
         DRIVE_IRQ_RECEIVED.store(true, Ordering::SeqCst);
@@ -200,9 +200,8 @@ impl IdeController {
         }
     }
 
-    pub fn read_write_sector(&mut self, label: String, lba: u32, buffer: &mut [u8], is_write: bool) {
+    pub fn read_write_sector(&mut self, label: String, lba: u32, buffer: &mut [u8],  is_write: bool) {
         assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
-
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
 
@@ -238,7 +237,7 @@ impl IdeController {
             // Wait for the interrupt (drive ready signal)
             while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {
                 if is_write {
-                    println!("waiting {}: {}",is_write, get_cycles());
+                    println!("waiting. write:{}, cycles:{}, port status:{}",is_write, get_cycles(),self.alternative_command_port.read());
                 }
             }
 
