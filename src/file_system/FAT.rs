@@ -76,9 +76,9 @@ impl FileSystem{
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         for i in 0..RESERVED_SECTORS {
-            ide_controller.read_write_sector(drive_label.clone(), i, &mut buffer, true);
+            ide_controller.write_sector(drive_label.clone(), i, &mut buffer);
         }
-        ide_controller.read_write_sector(drive_label.clone(), INFO_SECTOR, &mut info_sec_buffer, true);
+        ide_controller.write_sector(drive_label.clone(), INFO_SECTOR, &mut info_sec_buffer);
 
 
         for j in 0..512 {
@@ -90,14 +90,14 @@ impl FileSystem{
         let itr = total_clusters / 512;
 
         for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-            ide_controller.read_write_sector(drive_label.clone(), (i + 1), &mut buffer, true);
+            ide_controller.write_sector(drive_label.clone(), (i + 1), &mut buffer);
 
         }
         let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         //validate data sectors
         for i in RESERVED_SECTORS..itr + RESERVED_SECTORS{
-            ide_controller.read_write_sector(drive_label.clone(), (i + 1), &mut readBuffer, false);
+            ide_controller.read_sector(drive_label.clone(), (i + 1), &mut readBuffer);
             for j in 0..512{
                 if (readBuffer[j] != buffer[j]){
                     println!("Sector {} is invalid", i);
@@ -128,7 +128,7 @@ impl FileSystem{
 
         // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
-        ide_controller.read_write_sector(self.drive_label.clone(), sector_number, &mut buffer, false);
+        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer);
 
         // Update the FAT entry in the buffer
         buffer[entry_offset] = (next_cluster & 0xFF) as u8;
@@ -137,7 +137,7 @@ impl FileSystem{
         buffer[entry_offset + 3] = ((next_cluster >> 24) & 0xFF) as u8;
 
         // Write the updated sector back to the disk
-        ide_controller.read_write_sector(self.drive_label.clone(), sector_number, &mut buffer, true);
+        ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer);
     }
     //TODO: update to support multi cluster root dirs
     pub fn read_root_dir(
@@ -217,7 +217,8 @@ impl FileSystem{
             for j in 0..buffer.len() {
                 buffer[j] = file_data[j + data_offset]
             }
-            self.write_cluster(ide_controller, free_cluster, &mut buffer);
+            println!("{}", free_cluster);
+            self.write_cluster(ide_controller, free_cluster, &buffer);
             self.update_fat(ide_controller, free_cluster,next_cluster);
             free_cluster = next_cluster;
         }
@@ -270,7 +271,7 @@ impl FileSystem{
 
         for i in 0..fat_sectors {
             let mut buffer = vec![0u8; 512];
-            ide_controller.read_write_sector(self.drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer, false);
+            ide_controller.read_sector(self.drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer);
             for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
                 let entry = u32::from_le_bytes([
                     buffer[j * 4],
@@ -290,7 +291,7 @@ impl FileSystem{
 
         0xFFFFFFFF // Return a special value indicating no free cluster was found
     }
-//TODO: modify to allocate a new cluster when full
+    //TODO: modify to allocate a new cluster when full
     pub fn write_file_to_root(
         &mut self,
         mut ide_controller: &mut IdeController,
@@ -351,13 +352,13 @@ impl FileSystem{
             println!("No free directory entry found!");
         }
     }
-    fn write_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &mut [u8]) {
+    fn write_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &[u8]) {
         let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
         for i in 0..sector_count {
-            let mut sector = &mut buffer[(i * 512) as usize..((i + 1) * 512) as usize];
+            let sector = &buffer[(i * 512) as usize..((i + 1) * 512) as usize];
             let current_sector = start_sector + i;
-            ide_controller.read_write_sector(self.drive_label.clone(), current_sector, &mut sector, true);
+            ide_controller.write_sector(self.drive_label.clone(), current_sector, sector);
         }
     }
 
@@ -365,9 +366,8 @@ impl FileSystem{
         let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
         for i in 0..sector_count {
-            let mut sector = vec![0u8; 512];
-            let current_sector = start_sector + i;
-            ide_controller.read_write_sector(self.drive_label.clone(), current_sector, &mut sector, false);
+            let mut sector = [0u8; 512];
+            ide_controller.read_sector(self.drive_label.clone(), start_sector + i, &mut sector);
             buffer[(i * 512) as usize..((i + 1) * 512) as usize].copy_from_slice(&sector);
         }
     }
@@ -379,7 +379,7 @@ impl FileSystem{
 
         // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
-        ide_controller.read_write_sector(self.drive_label.clone(), sector_number, &mut buffer, false);
+        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer);
 
         // Retrieve the FAT entry, which points to the next cluster in the chain
         let next_cluster = u32::from_le_bytes([
@@ -411,7 +411,7 @@ impl FileSystem{
             let mut sector = vec!(0u8; 512);
             let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
             let sector_index = FileSystem::cluster_in_sector(starting_cluster);
-            ide_controller.read_write_sector(self.drive_label.clone(), starting_sector, &mut sector, false);
+            ide_controller.read_sector(self.drive_label.clone(), starting_sector, &mut sector);
             entry = u32::from_le_bytes([
                 sector[sector_index],
                 sector[sector_index + 1],
