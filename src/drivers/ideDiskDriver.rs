@@ -4,8 +4,13 @@ use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
 use crate::drivers::pci;
 use crate::drivers::pci::pci_bus::PciBus;
-use crate::println;
+use crate::{drivers, println};
+use crate::cpu;
 use bitflags::bitflags;
+use x86_64::structures::idt::InterruptStackFrame;
+use crate::cpu::wait_cycle;
+use crate::drivers::interrupt_index::InterruptIndex::KeyboardIndex;
+use crate::drivers::interrupt_index::send_eoi;
 
 const PRIMARY_CMD_BASE: u16 = 0x1F0;
 const PRIMARY_CTRL_BASE: u16 = 0x3F6;
@@ -31,6 +36,9 @@ pub fn has_ide_controller(mut bus: PciBus) -> bool {
     }
     println!("No IDE Controller found.");
     false
+}
+pub(crate) extern "x86-interrupt" fn drive_irq_handler(_stack_frame: InterruptStackFrame){
+    send_eoi(drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8());
 }
 #[derive(Debug, Clone)]
 pub struct DriveInfo {
@@ -85,7 +93,7 @@ impl IdeController {
     fn identify_drive(&mut self, drive: u8) -> Option<DriveInfo> {
 
         unsafe {
-            self.drive_head_port.write(0xA0 | (drive << 4)); // Select drive (0 = master, 1 = slave)
+            self.drive_head_port.write(0xE0 | (drive << 4)); // Select drive (0 = master, 1 = slave)
             self.command_port.write(0xEC); // Send IDENTIFY command
 
             if self.status().contains(StatusFlags::ERR) {
@@ -161,7 +169,6 @@ impl IdeController {
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
             while(self.command_port.read() & 0x80 == 1) {}
-            while (self.command_port.read() & 0x40 == 0) { println!("drive not ready");}
             while (self.command_port.read() & 0x20 == 1 ) { println!("drive faulted!");}
 
             self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
@@ -172,7 +179,9 @@ impl IdeController {
             self.command_port.write(0x20);
 
             while self.command_port.read() & 0x80 != 0 {}
-            while self.command_port.read() & 0x08 == 0 {}
+            while self.command_port.read() & 0x01 != 0 {println!("drive error");}
+
+            while (self.command_port.read() & 0x40 == 0) { println!("drive not ready");}
 
 
             for chunk in buffer.chunks_mut(2) {
@@ -203,8 +212,6 @@ impl IdeController {
             self.command_port.write(0x30);
 
             while self.command_port.read() & 0x80 != 0 {}
-            while self.command_port.read() & 0x08 == 0 {}
-
 
             for chunk in buffer.chunks(2) {
                 let data = (u16::from(chunk[1]) << 8) | u16::from(chunk[0]);

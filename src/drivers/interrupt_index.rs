@@ -14,6 +14,9 @@ pub(crate) static PICS: spin::Mutex<ChainedPics> =
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     KeyboardIndex = PIC_1_OFFSET + 1,
+    PrimaryDrive = PIC_1_OFFSET + 14,
+    SecondaryDrive = PIC_1_OFFSET + 15,
+
 }
 
 impl InterruptIndex {
