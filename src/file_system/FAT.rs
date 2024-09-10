@@ -217,7 +217,6 @@ impl FileSystem{
             for j in 0..buffer.len() {
                 buffer[j] = file_data[j + data_offset]
             }
-            println!("{}", free_cluster);
             self.write_cluster(ide_controller, free_cluster, &mut buffer);
             self.update_fat(ide_controller, free_cluster,next_cluster);
             free_cluster = next_cluster;

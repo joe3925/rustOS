@@ -53,12 +53,10 @@ pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: Int
 
         while status & 0x40 == 0 { println!("Drive not ready"); }
         while status & 0x20 != 0 { println!("Drive faulted!"); }
-
+        while status & 0x80 != 0 { println!("Drive busy!"); }
         if status & 0x01 != 0 {
             println!("Error: Read sector failed!");
         }
-       // println!("{}", status);
-
 
         DRIVE_IRQ_RECEIVED.store(true, Ordering::SeqCst);
 
@@ -216,12 +214,11 @@ impl IdeController {
                 println!("Drive faulted!");
             }
 
-            if self.alternative_command_port.read() & 0x01 != 0 {
-                println!("Error: IDE command failed!");
-            }
-
             // Set up the LBA (Logical Block Address) and drive selector
             self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            while self.alternative_command_port.read() & 0x80 != 0 {
+            }  // BSY
+
             self.sector_count_port.write(1);  // Request 1 sector
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
@@ -233,12 +230,19 @@ impl IdeController {
             } else {
                 self.command_port.write(0x20);  // Command to read
             }
+            //while self.alternative_command_port.read() & 0x08 != 0 {
+              //  println!("waiting. write:{}, cycles:{}, port status:{}",is_write, get_cycles(),self.alternative_command_port.read());
+            //}
+            if self.alternative_command_port.read() & 0x01 != 0 {
+                println!("Error: IDE command failed!");
+            }
 
             // Wait for the interrupt (drive ready signal)
-            while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {
-                if is_write {
-                    println!("waiting. write:{}, cycles:{}, port status:{}",is_write, get_cycles(),self.alternative_command_port.read());
+            while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) && false {
+                if self.alternative_command_port.read() & 0x01 != 0 {
+                    println!("Error: IDE command failed!");
                 }
+                println!("waiting. write:{}, cycles:{}, port status:{}",is_write, get_cycles(),self.alternative_command_port.read());
             }
 
             // Reset the IRQ flag
