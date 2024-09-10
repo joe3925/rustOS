@@ -57,6 +57,8 @@ pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: Int
         if status & 0x01 != 0 {
             println!("Error: Read sector failed!");
         }
+        println!("{}", status);
+
 
         DRIVE_IRQ_RECEIVED.store(true, Ordering::SeqCst);
 
@@ -236,7 +238,7 @@ impl IdeController {
             // Wait for the interrupt (drive ready signal)
             while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {
                 if is_write {
-                    println!("waiting write: {}", get_cycles());
+                    println!("waiting {}: {}",is_write, get_cycles());
                 }
             }
 
