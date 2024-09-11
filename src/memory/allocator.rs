@@ -131,7 +131,7 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
         static mut INIT:bool = false;
         let (size, align) = Allocator::size_align(layout);
         let mut allocator = self.lock();
-        println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
+       // println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
 
         if(INIT == false){
             let heap_start = VirtAddr::new(HEAP_START as u64);

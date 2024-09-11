@@ -198,7 +198,8 @@ impl IdeController {
         }
     }
 
-    pub fn read_sector(&mut self, label: String, lba: u32, buffer: &mut [u8], num_sectors: u8) {
+    pub fn read_sector(&mut self, label: String, lba: u32, buffer: &mut [u8]) {
+        assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
 
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
@@ -241,7 +242,8 @@ impl IdeController {
 
         }
     }
-    pub fn write_sector(&mut self, label: String, lba: u32, buffer: &[u8], num_sectors: u8) {
+    pub fn write_sector(&mut self, label: String, lba: u32, buffer: &[u8]) {
+        assert_eq!(buffer.len(), 512);
 
         unsafe {
             let drive_selector = self.drive_selector_from_label(label);
@@ -260,7 +262,7 @@ impl IdeController {
             // Send command to write to the sector
             self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
             while self.command_port.read() & 0x80 != 0 {}  // BSY
-            self.sector_count_port.write(num_sectors);
+            self.sector_count_port.write(1);
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
