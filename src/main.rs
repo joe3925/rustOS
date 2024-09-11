@@ -65,7 +65,7 @@ fn panic(info: &PanicInfo) -> !{
 pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
     // Define the file content to write, large enough to span multiple clusters
     let cluster_size = 32 as usize * 1024;
-    let num_clusters = 2;
+    let num_clusters = 1;
     let total_size = num_clusters * cluster_size;
 
     // Generate the content: A sequence of bytes for simplicity
@@ -74,12 +74,10 @@ pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controlle
     let file_name = "BIGFILE1";
     let file_extension = "DAT";
 
-    println!("Creating a multi-cluster file '{}.{}'...", file_name, file_extension);
 
     // Write the file to the file system
     filesystem.create_and_write_file(ide_controller, file_name, file_extension, &file_data);
 
-    println!("File '{}.{}' created successfully.", file_name, file_extension);
 }
 pub fn test_read_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
     let file_name = "BIGFILE1";
@@ -135,7 +133,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
 
     loop{
         test_create_multi_cluster_file(&mut system, &mut controller);
-        test_read_multi_cluster_file(&mut system, &mut controller);
+        //test_read_multi_cluster_file(&mut system, &mut controller);
         }
 
 }

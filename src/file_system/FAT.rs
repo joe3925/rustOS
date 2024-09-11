@@ -215,14 +215,12 @@ impl FileSystem{
             if (i != clusters_needed - 1){
                 next_cluster = self.find_free_cluster(ide_controller, free_cluster);
             }
-            println!("{}", free_cluster);
             let data_offset = i * cluster_size;
             let mut buffer = vec!(0u8; cluster_size);
 
             for j in 0..buffer.len() {
                 buffer[j] = file_data[j + data_offset]
             }
-            println!("{}", free_cluster);
             self.write_cluster(ide_controller, free_cluster, &buffer);
             self.update_fat(ide_controller, free_cluster,next_cluster);
             free_cluster = next_cluster;
@@ -310,7 +308,6 @@ impl FileSystem{
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         let clusters = self.get_all_clusters(ide_controller, 0);
         self.read_cluster(&mut ide_controller, clusters[clusters.len() - 1], &mut root_dir);
-
         // Find the first empty entry in the root directory (assuming 32-byte entries)
         let entry_size = 32; // FAT directory entry is always 32 bytes
         let mut entry_offset = None;
@@ -324,7 +321,10 @@ impl FileSystem{
             let free_cluster = self.find_free_cluster(ide_controller, 0);
             if(free_cluster != 0xFFFFFFFF) {
                 self.update_fat(ide_controller, clusters[clusters.len() - 1], free_cluster);
+                self.update_fat(ide_controller, free_cluster, 0xFFFFFFFF);
+
             }
+            println!("{}", free_cluster);
             self.write_file_to_root(ide_controller,file_name, file_extension, start_cluster, size);
             return;
         }
@@ -361,11 +361,12 @@ impl FileSystem{
             root_dir[offset + 28..offset + 32].copy_from_slice(&size_bytes);
 
             // Write the updated root directory back to disk
-            self.write_cluster(&mut ide_controller, 0, &mut root_dir);
+            self.write_cluster(&mut ide_controller, clusters[clusters.len() - 1], &mut root_dir);
         } else {
             // Handle the case where no free entry was found
             println!("No free directory entry found!");
         }
+        return;
     }
     fn write_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &[u8]) {
         let sector_count = SECTORS_PER_CLUSTER;

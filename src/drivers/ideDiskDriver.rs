@@ -218,6 +218,7 @@ impl IdeController {
             // Send command to read from the sector
             self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
             while self.command_port.read() & 0x80 != 0 {}  // BSY
+
             self.sector_count_port.write(1);  // Request 1 sector
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
