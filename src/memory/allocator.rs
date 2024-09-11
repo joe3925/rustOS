@@ -3,6 +3,7 @@ use core::{ ptr};
 use core::mem::{align_of, size_of};
 use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
+use crate::println;
 use crate::structs::linked_list::{LinkedList, ListNode};
 #[global_allocator]
 static mut ALLOCATOR: Locked<Allocator> =
@@ -93,6 +94,17 @@ impl Allocator{
         let size = layout.size().max(size_of::<ListNode>());
         (size, layout.align())
     }
+    pub fn free_memory(&self) -> usize {
+        let mut current = &self.freeList.head;
+        let mut total_free = 0;
+
+        while let Some(ref region) = current.next {
+            total_free += region.size;
+            current = region;
+        }
+
+        total_free
+    }
 
     pub fn merge_free_list(&mut self) {
 
@@ -117,9 +129,10 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // perform layout adjustments
         static mut INIT:bool = false;
-
         let (size, align) = Allocator::size_align(layout);
         let mut allocator = self.lock();
+        println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
+
         if(INIT == false){
             let heap_start = VirtAddr::new(HEAP_START as u64);
             let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;

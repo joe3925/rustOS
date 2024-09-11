@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::{print, println};
-
+//TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
 const CLUSTER_SIZE: u32 = 32; //in KiB
 const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
@@ -76,9 +76,9 @@ impl FileSystem{
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         for i in 0..RESERVED_SECTORS {
-            ide_controller.write_sector(drive_label.clone(), i, &mut buffer);
+            ide_controller.write_sector(drive_label.clone(), i, &mut buffer, 1);
         }
-        ide_controller.write_sector(drive_label.clone(), INFO_SECTOR, &mut info_sec_buffer);
+        ide_controller.write_sector(drive_label.clone(), INFO_SECTOR, &mut info_sec_buffer, 1);
 
 
         for j in 0..512 {
@@ -90,14 +90,14 @@ impl FileSystem{
         let itr = total_clusters / 512;
 
         for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-            ide_controller.write_sector(drive_label.clone(), (i + 1), &mut buffer);
+            ide_controller.write_sector(drive_label.clone(), (i + 1), &mut buffer, 1);
 
         }
         let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         //validate data sectors
         for i in RESERVED_SECTORS..itr + RESERVED_SECTORS{
-            ide_controller.read_sector(drive_label.clone(), (i + 1), &mut readBuffer);
+            ide_controller.read_sector(drive_label.clone(), (i + 1), &mut readBuffer, 1);
             for j in 0..512{
                 if (readBuffer[j] != buffer[j]){
                     println!("Sector {} is invalid", i);
@@ -128,7 +128,7 @@ impl FileSystem{
 
         // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
-        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer);
+        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer, 1);
 
         // Update the FAT entry in the buffer
         buffer[entry_offset] = (next_cluster & 0xFF) as u8;
@@ -137,7 +137,7 @@ impl FileSystem{
         buffer[entry_offset + 3] = ((next_cluster >> 24) & 0xFF) as u8;
 
         // Write the updated sector back to the disk
-        ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer);
+        ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer, 1);
     }
     //TODO: update to support multi cluster root dirs
     pub fn read_root_dir(
@@ -271,7 +271,7 @@ impl FileSystem{
 
         for i in 0..fat_sectors {
             let mut buffer = vec![0u8; 512];
-            ide_controller.read_sector(self.drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer);
+            ide_controller.read_sector(self.drive_label.to_string(), i + RESERVED_SECTORS + 1, &mut buffer, 1);
             for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
                 let entry = u32::from_le_bytes([
                     buffer[j * 4],
@@ -353,23 +353,13 @@ impl FileSystem{
         }
     }
     fn write_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &[u8]) {
-        let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
-        for i in 0..sector_count {
-            let sector = &buffer[(i * 512) as usize..((i + 1) * 512) as usize];
-            let current_sector = start_sector + i;
-            ide_controller.write_sector(self.drive_label.clone(), current_sector, sector);
-        }
+        ide_controller.write_sector(self.drive_label.clone(), start_sector, buffer, SECTORS_PER_CLUSTER as u8);
     }
 
     fn read_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &mut [u8]) {
-        let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
-        for i in 0..sector_count {
-            let mut sector = [0u8; 512];
-            ide_controller.read_sector(self.drive_label.clone(), start_sector + i, &mut sector);
-            buffer[(i * 512) as usize..((i + 1) * 512) as usize].copy_from_slice(&sector);
-        }
+        ide_controller.read_sector(self.drive_label.clone(), start_sector, buffer, SECTORS_PER_CLUSTER as u8);
     }
     fn get_next_cluster(&self, ide_controller: &mut IdeController, current_cluster: u32) -> u32 {
         // Calculate which sector the FAT entry is in
@@ -379,7 +369,7 @@ impl FileSystem{
 
         // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
-        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer);
+        ide_controller.read_sector(self.drive_label.clone(), sector_number, &mut buffer, 1);
 
         // Retrieve the FAT entry, which points to the next cluster in the chain
         let next_cluster = u32::from_le_bytes([
@@ -411,7 +401,7 @@ impl FileSystem{
             let mut sector = vec!(0u8; 512);
             let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
             let sector_index = FileSystem::cluster_in_sector(starting_cluster);
-            ide_controller.read_sector(self.drive_label.clone(), starting_sector, &mut sector);
+            ide_controller.read_sector(self.drive_label.clone(), starting_sector, &mut sector, 1);
             entry = u32::from_le_bytes([
                 sector[sector_index],
                 sector[sector_index + 1],
@@ -428,14 +418,15 @@ impl FileSystem{
     fn calculate_data_region_start(&self, ide_controller: &mut IdeController) -> u32 {
         // Determine the drive size
         let drive_size = if self.drive_label == "C:" {
-            ide_controller.drives[0].capacity as u32
+            ide_controller.drives[0].capacity
         } else {
-            ide_controller.drives[1].capacity as u32
+            ide_controller.drives[1].capacity
         };
 
         // Calculate the total number of clusters
-        let total_clusters = drive_size / CLUSTER_OFFSET;
-        (total_clusters / 512) + RESERVED_SECTORS
+        let total_clusters = drive_size / CLUSTER_OFFSET as u64;
+        ((total_clusters / 512) + RESERVED_SECTORS as u64) as u32
+
 
     }
     fn cluster_to_sector(&self, cluster: u32, ide_controller: &mut IdeController) -> u32{
