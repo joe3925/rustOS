@@ -6,7 +6,7 @@ use core::fmt::Debug;
 use core::ops::{Deref, DerefMut};
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::{print, println};
-use crate::file_system::file;
+use crate::file_system::{file, FAT};
 use crate::file_system::file::FileAttribute;
 
 //TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
@@ -15,11 +15,11 @@ const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u32 = 2;
 const INFO_SECTOR: u32 = RESERVED_SECTORS;
-#[derive(Debug)]
-struct FileEntry {
-    file_name: String,          // 0x00 - 0x17 : 24 bytes
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    pub file_name: String,          // 0x00 - 0x17 : 24 bytes
     file_extension: String,     // 0x18 - 0x2F : 24 bytes
-    attributes: u8,             // 0x30        : 1 byte
+    pub attributes: u8,             // 0x30        : 1 byte
     // 3 bytes padding for alignment          : 0x31 - 0x33
     creation_date: String,      // 0x34 - 0x4B : 24 bytes
     creation_time: String,      // 0x4C - 0x63 : 24 bytes
@@ -143,15 +143,27 @@ impl FileSystem{
         // Write the updated sector back to the disk
         ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer);
     }
-    //TODO: update to support multi cluster root dirs
-    pub fn read_root_dir(
+    pub fn create_dir(&mut self, ide_controller: &mut IdeController, path: &str){
+        let files = FileSystem::file_parser(path);
+        let current_cluster = 0;
+        for i in 0..files.len() {
+            let file = self.file_present(ide_controller, files[i], file::FileAttribute::Directory, current_cluster);
+            if(file.is_none()){
+                let free_cluster = self.find_free_cluster(ide_controller, 0);
+                self.write_file_to_dir(ide_controller, files[i], r"", file::FileAttribute::Directory, current_cluster, 0);
+            }
+        }
+
+    }
+    pub fn read_dir(
         &mut self,
         ide_controller: &mut IdeController,
+        starting_cluster: u32,
     ) -> Vec<FileEntry> {
-        let dirs = self.get_all_clusters(ide_controller, 0);
+        let dirs = self.get_all_clusters(ide_controller, starting_cluster);
         // 1. Allocate space for the root directory (assume one cluster for simplicity)
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
-        self.read_cluster(ide_controller, 0, &mut root_dir);
+        self.read_cluster(ide_controller, starting_cluster, &mut root_dir);
 
         // 2. Parse directory entries (each entry is 32 bytes)
         let entry_size = 32;
@@ -201,7 +213,45 @@ impl FileSystem{
     fn file_parser(path: &str) -> Vec<&str> {
         path.trim_start_matches('\\').split('\\').collect()
     }
-    //fc000
+    fn file_present(
+        &mut self,
+        ide_controller: &mut IdeController,
+        file_name: &str,
+        file_attribute: FileAttribute,
+        starting_cluster: u32)
+        -> Option<FileEntry>{
+        let clusters = self.get_all_clusters(ide_controller, starting_cluster);
+        for i in 0..clusters.len(){
+            let mut dir = self.read_dir(ide_controller, clusters[i]);
+            for j in 0..dir.len(){
+                if(file_name == dir[j].file_name && file_attribute as u8 == dir[j].attributes){
+                    return Some(dir[j].clone());
+                }
+            }
+        }
+        None
+    }
+    fn find_file(&mut self,ide_controller: &mut IdeController, path: &str) -> Option<FileEntry>{
+        let files = Self::file_parser(path);
+        let mut current_cluster = 0;
+        for i in 0..files.len(){
+            let mut attribute = file::FileAttribute::Directory;
+            if(i == files.len() - 1){
+                attribute = file::FileAttribute::Archive;
+            }
+            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
+            if(attribute as u8 == file::FileAttribute::Archive as u8){
+                return current_file;
+            }else if (!current_file.is_none()){
+                current_cluster = current_file?.starting_cluster;
+            }
+            else{
+                return None
+            }
+
+        }
+        None
+    }
     pub fn create_and_write_file(
         &mut self,
         mut ide_controller: &mut IdeController,
@@ -240,7 +290,7 @@ impl FileSystem{
         file_name: &str,
         file_extension: &str,
     ) -> Option<Vec<u8>> {
-        let file_entries = self.read_root_dir(ide_controller);
+        let file_entries = self.read_dir(ide_controller, 0);
 
         if(file_entries.len() == 0){
             return None;
@@ -303,18 +353,19 @@ impl FileSystem{
         0xFFFFFFFF // Return a special value indicating no free cluster was found
     }
     //TODO: modify to allocate a new cluster when full
-    pub fn write_file_to_root(
+    pub fn write_file_to_dir(
         &mut self,
         mut ide_controller: &mut IdeController,
         file_name: &str,
         file_extension: &str,
         file_attribute: FileAttribute,
         start_cluster: u32,
+        start_cluster_of_dir: u32,
         size: u64
     ) {
         // Read the current root directory (one cluster)
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
-        let clusters = self.get_all_clusters(ide_controller, 0);
+        let clusters = self.get_all_clusters(ide_controller, start_cluster_of_dir);
         self.read_cluster(&mut ide_controller, clusters[clusters.len() - 1], &mut root_dir);
         // Find the first empty entry in the root directory (assuming 32-byte entries)
         let entry_size = 32; // FAT directory entry is always 32 bytes
@@ -353,7 +404,7 @@ impl FileSystem{
             root_dir[offset + 8..offset + 11].copy_from_slice(&ext_bytes);
 
             // File attributes (1 byte)
-            root_dir[offset + 11] = file_attribute.into(); // Regular file (no special attributes)
+            root_dir[offset + 11] = file_attribute as u8; // Regular file (no special attributes)
 
             // Reserved (10 bytes)
             for i in 12..22 {
