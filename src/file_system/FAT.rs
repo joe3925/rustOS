@@ -2,9 +2,13 @@ use alloc::string::{String, ToString};
 use alloc::{format, vec};
 use alloc::borrow::ToOwned;
 use alloc::vec::Vec;
+use core::fmt::Debug;
 use core::ops::{Deref, DerefMut};
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::{print, println};
+use crate::file_system::file;
+use crate::file_system::file::FileAttribute;
+
 //TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
 const CLUSTER_SIZE: u32 = 32; //in KiB
 const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
@@ -194,6 +198,9 @@ impl FileSystem{
 
         file_entries
     }
+    fn file_parser(path: &str) -> Vec<&str> {
+        path.trim_start_matches('\\').split('\\').collect()
+    }
     //fc000
     pub fn create_and_write_file(
         &mut self,
@@ -208,7 +215,7 @@ impl FileSystem{
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
 
-        self.write_file_to_root(ide_controller, file_name, file_extension, free_cluster, file_data.len() as u64);
+        self.write_file_to_root(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster, file_data.len() as u64);
 
         for i in 0..clusters_needed{
             let mut next_cluster = 0xFFFFFFFF;
@@ -301,6 +308,7 @@ impl FileSystem{
         mut ide_controller: &mut IdeController,
         file_name: &str,
         file_extension: &str,
+        file_attribute: FileAttribute,
         start_cluster: u32,
         size: u64
     ) {
@@ -325,7 +333,7 @@ impl FileSystem{
 
             }
             println!("{}", free_cluster);
-            self.write_file_to_root(ide_controller,file_name, file_extension, start_cluster, size);
+            self.write_file_to_root(ide_controller,file_name, file_extension,file_attribute, start_cluster, size);
             return;
         }
 
@@ -345,7 +353,7 @@ impl FileSystem{
             root_dir[offset + 8..offset + 11].copy_from_slice(&ext_bytes);
 
             // File attributes (1 byte)
-            root_dir[offset + 11] = 0x20; // Regular file (no special attributes)
+            root_dir[offset + 11] = file_attribute.into(); // Regular file (no special attributes)
 
             // Reserved (10 bytes)
             for i in 12..22 {

@@ -54,6 +54,7 @@ mod structs{
 }
  mod file_system {
     pub mod FAT;
+     pub mod file;
 }
 
 #[panic_handler]
@@ -128,13 +129,11 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     controller.init();
     controller.print_all_drives();
     let mut system = FileSystem::new("D:".to_string());
-    virtual_to_phys(mem_offset, VirtAddr::new(0xb8000));
     system.format_drive(&mut controller).expect("TODO: panic message");
 
     loop{
         test_create_multi_cluster_file(&mut system, &mut controller);
         //test_read_multi_cluster_file(&mut system, &mut controller);
         }
-
 }
 
