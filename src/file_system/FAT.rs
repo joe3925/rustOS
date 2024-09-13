@@ -143,6 +143,40 @@ impl FileSystem{
         // Write the updated sector back to the disk
         ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer);
     }
+    pub fn wipe_dir(&mut self, ide_controller: &mut IdeController, path: &str) -> bool{
+        if let Some(dir) = self.find_dir(ide_controller, path) {
+            let files = self.read_dir(ide_controller, dir.starting_cluster);
+            for file in files{
+                self.remove_from_fat(ide_controller, file.starting_cluster);
+            }
+        }
+        else{
+            return false
+        }
+        true
+    }
+    pub fn remove_from_fat(&mut self, ide_controller: &mut IdeController, starting_cluster: u32){
+        let mut clusters = self.get_all_clusters(ide_controller, starting_cluster);
+        clusters.reverse();
+        for i in 0..clusters.len(){
+            self.update_fat(ide_controller, clusters[i], 0x00000000);
+        }
+    }
+    pub fn delete_file(&mut self, ide_controller: &mut IdeController, path: &str) -> bool{
+        if let Some(file) = self.find_file(ide_controller, path) {
+            if file.attributes == file::FileAttribute::Directory as u8 {
+                return false;
+            }
+            let mut clusters = self.get_all_clusters(ide_controller, file.starting_cluster);
+            clusters.reverse();
+            for i in 0..clusters.len(){
+                self.update_fat(ide_controller, clusters[i], 0x00000000);
+            }
+            true
+        } else {
+            false
+        }
+    }
     pub fn create_dir(&mut self, ide_controller: &mut IdeController, path: &str){
         let files = FileSystem::file_parser(path);
         let mut current_cluster = 0;
@@ -252,7 +286,21 @@ impl FileSystem{
             else{
                 return None
             }
-
+        }
+        None
+    }
+    fn find_dir(&mut self,ide_controller: &mut IdeController, path: &str) -> Option<FileEntry>{
+        let files = Self::file_parser(path);
+        let mut current_cluster = 0;
+        let attribute = file::FileAttribute::Directory;
+        for i in 0..files.len(){
+            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
+            if (current_file.is_some()){
+                current_cluster = current_file?.starting_cluster;
+            }
+            else{
+                return None
+            }
         }
         None
     }
