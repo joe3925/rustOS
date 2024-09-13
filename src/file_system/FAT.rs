@@ -196,6 +196,10 @@ impl FileSystem{
     }
     pub fn delete_file(&mut self, ide_controller: &mut IdeController, path: &str) -> bool{
         if let Some(file) = self.find_file(ide_controller, path) {
+            let mut dirs = FileSystem::file_parser(path);
+            dirs.remove(dirs.len() - 1);
+
+            self.delete_dir_entry_at_index(ide_controller, );
             self.remove_from_fat(ide_controller, file.starting_cluster);
             true
         } else {
@@ -273,6 +277,53 @@ impl FileSystem{
 
         file_entries
     }
+    pub fn delete_dir_entry_at_index(
+        &mut self,
+        ide_controller: &mut IdeController,
+        starting_cluster: u32,
+        index: usize,
+    ) {
+        // Constants
+        const ENTRY_SIZE: usize = 32; // Each directory entry is 32 bytes
+        const SECTOR_SIZE: usize = 512; // Size of a sector in bytes
+        const CLUSTER_SIZE: usize = SECTORS_PER_CLUSTER as usize * SECTOR_SIZE;
+
+        // Get all clusters that make up the directory
+        let clusters = self.get_all_clusters(ide_controller, starting_cluster);
+
+        // Calculate how many entries fit in one cluster
+        let entries_per_cluster = CLUSTER_SIZE / ENTRY_SIZE;
+
+        // Determine which cluster contains the target entry
+        let cluster_index = index / entries_per_cluster;
+
+        // Check if the cluster index is within bounds
+        if cluster_index >= clusters.len() {
+            // Index out of bounds; handle error as needed
+            // For this example, we'll simply return
+            return;
+        }
+
+        // Get the specific cluster number
+        let cluster_number = clusters[cluster_index];
+
+        // Read the cluster data into a buffer
+        // Note: For OS environments without dynamic memory allocation,
+        // ensure that CLUSTER_SIZE is manageable for stack allocation.
+        let mut cluster_data = [0u8; CLUSTER_SIZE];
+
+        self.read_cluster(ide_controller, cluster_number, &mut cluster_data);
+
+        // Calculate the offset of the entry within the cluster
+        let entry_offset = (index % entries_per_cluster) * ENTRY_SIZE;
+
+        // Mark the entry as deleted by setting the first byte to 0xE5
+        cluster_data[entry_offset] = 0xE5;
+
+        // Write the modified cluster back to the disk
+        self.write_cluster(ide_controller, cluster_number, &cluster_data);
+    }
+
     fn file_parser(path: &str) -> Vec<&str> {
         path.trim_start_matches('\\').split('\\').collect()
     }
@@ -283,15 +334,12 @@ impl FileSystem{
         file_attribute: FileAttribute,
         starting_cluster: u32)
         -> Option<FileEntry>{
-        let clusters = self.get_all_clusters(ide_controller, starting_cluster);
-        for i in 0..clusters.len(){
-            let mut dir = self.read_dir(ide_controller, clusters[i]);
+            let mut dir = self.read_dir(ide_controller, starting_cluster);
             for j in 0..dir.len(){
                 if(file_name == dir[j].file_name && file_attribute as u8 == dir[j].attributes){
                     return Some(dir[j].clone());
                 }
             }
-        }
         None
     }
     fn find_file(&mut self, ide_controller: &mut IdeController, path: &str) -> Option<FileEntry> {
