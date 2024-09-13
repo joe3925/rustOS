@@ -143,11 +143,43 @@ impl FileSystem{
         // Write the updated sector back to the disk
         ide_controller.write_sector(self.drive_label.clone(), sector_number, &mut buffer);
     }
+    pub fn recursively_remove_dir(&mut self, ide_controller: &mut IdeController, path: &str){
+        if let Some(dir) = self.find_dir(ide_controller, path) {
+            let entries = self.read_dir(ide_controller, dir.starting_cluster);
+            for entry in entries{
+                let separator = if path.ends_with('\\') { "" } else { "\\" };
+                let dot = if entry.file_extension.is_empty() { "" } else { "." };
+                let file_path_owned = format!(
+                    "{}{}{}{}{}",
+                    path, separator, entry.file_name, dot, entry.file_extension
+                );
+                let file_path = file_path_owned.as_str();
+
+                if (entry.attributes == file::FileAttribute::Directory as u8){
+                    self.recursively_remove_dir(ide_controller, file_path)
+                }
+                self.delete_file(ide_controller, file_path);
+            }
+            self.delete_file(ide_controller,path);
+        }
+    }
     pub fn wipe_dir(&mut self, ide_controller: &mut IdeController, path: &str) -> bool{
         if let Some(dir) = self.find_dir(ide_controller, path) {
             let files = self.read_dir(ide_controller, dir.starting_cluster);
             for file in files{
-                self.remove_from_fat(ide_controller, file.starting_cluster);
+                let separator = if path.ends_with('\\') { "" } else { "\\" };
+                let dot = if file.file_extension.is_empty() { "" } else { "." };
+                let file_path_owned = format!(
+                    "{}{}{}{}{}",
+                    path, separator, file.file_name, dot, file.file_extension
+                );
+
+                let file_path = file_path_owned.as_str();
+
+                if (file.attributes == file::FileAttribute::Directory as u8){
+                    self.recursively_remove_dir(ide_controller, file_path)
+                }
+                self.delete_file(ide_controller, file_path);
             }
         }
         else{
@@ -164,14 +196,7 @@ impl FileSystem{
     }
     pub fn delete_file(&mut self, ide_controller: &mut IdeController, path: &str) -> bool{
         if let Some(file) = self.find_file(ide_controller, path) {
-            if file.attributes == file::FileAttribute::Directory as u8 {
-                return false;
-            }
-            let mut clusters = self.get_all_clusters(ide_controller, file.starting_cluster);
-            clusters.reverse();
-            for i in 0..clusters.len(){
-                self.update_fat(ide_controller, clusters[i], 0x00000000);
-            }
+            self.remove_from_fat(ide_controller, file.starting_cluster);
             true
         } else {
             false
@@ -210,7 +235,7 @@ impl FileSystem{
             for i in (0..root_dir.len()).step_by(entry_size) {
                 // Check if the entry is valid (not empty or deleted)
                 if root_dir[i] == 0x00 {
-                    if dirs.len() == 0 {
+                    if dirs.len() <= 1 {
                         break;
                     }
                     self.read_cluster(ide_controller, dirs[j], &mut root_dir);
@@ -269,40 +294,50 @@ impl FileSystem{
         }
         None
     }
-    fn find_file(&mut self,ide_controller: &mut IdeController, path: &str) -> Option<FileEntry>{
+    fn find_file(&mut self, ide_controller: &mut IdeController, path: &str) -> Option<FileEntry> {
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
-        for i in 0..files.len(){
-            let mut attribute = file::FileAttribute::Directory;
-            if(i == files.len() - 1){
-                attribute = file::FileAttribute::Archive;
-            }
-            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
-            if(attribute as u8 == file::FileAttribute::Archive as u8){
-                return current_file;
-            }else if (!current_file.is_none()){
-                current_cluster = current_file?.starting_cluster;
-            }
-            else{
-                return None
+        let mut current_file: Option<FileEntry> = None;
+
+        for i in 0..files.len() {
+            let attribute = if i == files.len() - 1 {
+                file::FileAttribute::Archive
+            } else {
+                file::FileAttribute::Directory
+            };
+
+            current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
+            if let Some(ref file) = current_file {
+                if attribute as u8 == file::FileAttribute::Archive as u8 {
+                    // Found the file, return it
+                    return current_file;
+                } else {
+                    current_cluster = file.starting_cluster;
+                }
+            } else {
+                // File not found, return None
+                return None;
             }
         }
-        None
+
+        // If the loop completes without returning, return the last current_file
+        current_file
     }
-    fn find_dir(&mut self,ide_controller: &mut IdeController, path: &str) -> Option<FileEntry>{
+    fn find_dir(&mut self, ide_controller: &mut IdeController, path: &str) -> Option<FileEntry> {
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
-        let attribute = file::FileAttribute::Directory;
-        for i in 0..files.len(){
-            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
-            if (current_file.is_some()){
-                current_cluster = current_file?.starting_cluster;
-            }
-            else{
-                return None
+        let mut current_file: Option<FileEntry> = None;
+
+        for i in 0..files.len() {
+            current_file = self.file_present(ide_controller, files[i], file::FileAttribute::Directory, current_cluster);
+            if let Some(ref file) = current_file {
+                current_cluster = file.starting_cluster;
+            } else {
+                return None;
             }
         }
-        None
+
+        current_file
     }
     pub fn create_and_write_file(
         &mut self,
@@ -317,7 +352,7 @@ impl FileSystem{
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
 
-        self.write_file_to_root(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster, file_data.len() as u64);
+        self.write_file_to_dir(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster,0, file_data.len() as u64);
 
         for i in 0..clusters_needed{
             let mut next_cluster = 0xFFFFFFFF;
