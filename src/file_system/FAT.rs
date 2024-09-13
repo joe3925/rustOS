@@ -145,12 +145,16 @@ impl FileSystem{
     }
     pub fn create_dir(&mut self, ide_controller: &mut IdeController, path: &str){
         let files = FileSystem::file_parser(path);
-        let current_cluster = 0;
+        let mut current_cluster = 0;
         for i in 0..files.len() {
             let file = self.file_present(ide_controller, files[i], file::FileAttribute::Directory, current_cluster);
             if(file.is_none()){
                 let free_cluster = self.find_free_cluster(ide_controller, 0);
-                self.write_file_to_dir(ide_controller, files[i], r"", file::FileAttribute::Directory, current_cluster, 0);
+                self.write_file_to_dir(ide_controller, files[i], r"", file::FileAttribute::Directory, free_cluster, current_cluster, 0);
+                self.update_fat(ide_controller, free_cluster, 0xFFFFFFFF);
+                current_cluster = free_cluster;
+            }else{
+                current_cluster = file.unwrap().starting_cluster;
             }
         }
 
@@ -384,7 +388,7 @@ impl FileSystem{
 
             }
             println!("{}", free_cluster);
-            self.write_file_to_root(ide_controller,file_name, file_extension,file_attribute, start_cluster, size);
+            self.write_file_to_dir(ide_controller,file_name, file_extension,file_attribute, start_cluster,start_cluster_of_dir, size);
             return;
         }
 
