@@ -18,7 +18,7 @@ mod util;
 mod cpu;
 
 use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::{format, vec};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
@@ -63,53 +63,50 @@ fn panic(info: &PanicInfo) -> !{
     print!("{}", info);
     loop{}
 }
-pub fn test_create_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
-    // Define the file content to write, large enough to span multiple clusters
-    let cluster_size = 32 as usize * 1024;
-    let num_clusters = 1;
-    let total_size = num_clusters * cluster_size;
-
-    // Generate the content: A sequence of bytes for simplicity
-    let file_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
-
-    let file_name = "BIGFILE1";
-    let file_extension = "DAT";
+pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController) {
 
 
-    // Write the file to the file system
-    filesystem.create_and_write_file(ide_controller, file_name, file_extension, &file_data);
 
-}
-pub fn test_read_multi_cluster_file(filesystem: &mut FileSystem, ide_controller: &mut IdeController) {
-    let file_name = "BIGFILE1";
-    let file_extension = "DAT";
+    // Create a directory where the file will be stored
+    let dir_path = "\\test_dir";
+    println!("here1");
+    fs.create_dir(&mut ide_controller, dir_path);
+    println!("here1");
 
-    println!("Reading the multi-cluster file '{}.{}'...", file_name, file_extension);
+    // Prepare test data that spans multiple clusters
+    let cluster_size = 32 * 1024;
+    let num_clusters = 3; // Number of clusters the file will occupy
+    let total_size = cluster_size * num_clusters;
+    let test_data: Vec<u8> = (0..total_size as u8).collect(); // Fill with sequential bytes
 
-    // Read the file from the file system
-    if let Some(file_data) = filesystem.read_file(ide_controller, file_name, file_extension) {
-        println!("File read successfully. Size: {} bytes", file_data.len());
+    // File name and extension
+    let file_name = "multi_cluster_file";
+    let file_extension = "bin";
 
-        // Verify the content: Should match the original pattern
-        let expected_data: Vec<u8> = (0..file_data.len()).map(|i| (i % 256) as u8).collect();
+    // Create and write the file
+    if let Some(file_entry) = fs.create_and_write_file(
+        &mut ide_controller,
+        file_name,
+        file_extension,
+        &test_data,
+        dir_path,
+    ) {
+        println!("File created successfully: {:?}", file_entry);
 
-        if file_data == expected_data {
-            println!("File content verified successfully.");
-        } else {
-            println!("File content does not match expected data.");
-
-            // Print differences between expected and actual data
-            for (i, (expected, actual)) in expected_data.iter().zip(file_data.iter()).enumerate() {
-                if expected != actual {
-                    println!(
-                        "Difference at offset {}: expected 0x{:02X}, got 0x{:02X}",
-                        i, expected, actual
-                    );
-                }
+        // Read back the file
+        let file_path = format!("{}\\{}.{}", dir_path, file_name, file_extension);
+        if let Some(read_data) = fs.read_file(&mut ide_controller, &file_path) {
+            // Verify that the read data matches the written data
+            if read_data == test_data {
+                println!("Data verification successful. Read data matches written data.");
+            } else {
+                println!("Data verification failed. Read data does not match written data.");
             }
+        } else {
+            println!("Failed to read the file at path: {}", file_path);
         }
     } else {
-        println!("Failed to read the file '{}.{}'", file_name, file_extension);
+        println!("Failed to create and write the file.");
     }
 }
 
@@ -132,8 +129,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     system.format_drive(&mut controller).expect("TODO: panic message");
 
     loop{
-        test_create_multi_cluster_file(&mut system, &mut controller);
-        //test_read_multi_cluster_file(&mut system, &mut controller);
+        test_create_and_read_multicluster_file(&mut system, &mut controller);
         }
 }
 

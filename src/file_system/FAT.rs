@@ -145,6 +145,7 @@ impl FileSystem{
     }
     pub fn create_dir(&mut self, ide_controller: &mut IdeController, path: &str){
         let files = FileSystem::file_parser(path);
+        println!("{:#?}", files);
         let mut current_cluster = 0;
         for i in 0..files.len() {
             let file = self.file_present(ide_controller, files[i], file::FileAttribute::Directory, current_cluster);
@@ -159,6 +160,7 @@ impl FileSystem{
         }
 
     }
+    //TODO: read dir is not skipping empty entries
     pub fn read_dir(
         &mut self,
         ide_controller: &mut IdeController,
@@ -167,19 +169,18 @@ impl FileSystem{
         let dirs = self.get_all_clusters(ide_controller, starting_cluster);
         // 1. Allocate space for the root directory (assume one cluster for simplicity)
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
-        self.read_cluster(ide_controller, starting_cluster, &mut root_dir);
-
         // 2. Parse directory entries (each entry is 32 bytes)
         let entry_size = 32;
         let mut file_entries = Vec::new();
         for j in 0..dirs.len() {
+            self.read_cluster(ide_controller, dirs[j], &mut root_dir);
             for i in (0..root_dir.len()).step_by(entry_size) {
                 // Check if the entry is valid (not empty or deleted)
                 if root_dir[i] == 0x00 {
                     if dirs.len() == 0 {
-                        break;
+                        println!("skipping");
+                        continue;
                     }
-                    self.read_cluster(ide_controller, dirs[j], &mut root_dir);
                 } else if root_dir[i] == 0xE5 {
                     // Deleted entry, skip it
                     continue;
@@ -224,13 +225,17 @@ impl FileSystem{
         file_attribute: FileAttribute,
         starting_cluster: u32)
         -> Option<FileEntry>{
-        let clusters = self.get_all_clusters(ide_controller, starting_cluster);
+        let clusters = self.get_all_clusters(ide_controller, 0);
+        println!("{:#?}", clusters);
         for i in 0..clusters.len(){
             let mut dir = self.read_dir(ide_controller, clusters[i]);
+            println!("{:#?}", dir.len());
             for j in 0..dir.len(){
-                if(file_name == dir[j].file_name && file_attribute as u8 == dir[j].attributes){
+                let name = dir[j].file_name.clone() + &*dir[j].file_extension;
+                if(file_name.to_string() == name && file_attribute as u8 == dir[j].attributes){
                     return Some(dir[j].clone());
                 }
+                println!("{}", j)
             }
         }
         None
@@ -256,78 +261,91 @@ impl FileSystem{
         }
         None
     }
+    pub fn find_dir(
+        &mut self,
+        ide_controller: &mut IdeController,
+        path: &str,
+    ) -> Option<FileEntry> {
+        let files = Self::file_parser(path);
+        let mut current_cluster = 0;
+        for i in 0..files.len() {
+            let attribute = file::FileAttribute::Directory;
+
+            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
+
+            if i == files.len() - 1 {
+                return current_file;
+            } else if let Some(file_entry) = current_file {
+                current_cluster = file_entry.starting_cluster;
+            } else {
+                return None;
+            }
+        }
+        None
+    }
     pub fn create_and_write_file(
         &mut self,
-        mut ide_controller: &mut IdeController,
+        ide_controller: &mut IdeController,
         file_name: &str,
         file_extension: &str,
         file_data: &[u8],
-    )
+        path: &str,
+    ) -> Option<FileEntry>
     {
-
         let cluster_size = CLUSTER_OFFSET as usize;
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
+        if let Some(dir) = self.find_dir(ide_controller, path) {
+            self.write_file_to_dir(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster,dir.starting_cluster, file_data.len() as u64);
+            for i in 0..clusters_needed {
+                let mut next_cluster = 0xFFFFFFFF;
+                if (i != clusters_needed - 1) {
+                    next_cluster = self.find_free_cluster(ide_controller, free_cluster);
+                }
+                let data_offset = i * cluster_size;
+                let mut buffer = vec!(0u8; cluster_size);
 
-        self.write_file_to_root(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster, file_data.len() as u64);
-
-        for i in 0..clusters_needed{
-            let mut next_cluster = 0xFFFFFFFF;
-            if (i != clusters_needed - 1){
-                next_cluster = self.find_free_cluster(ide_controller, free_cluster);
+                for j in 0..buffer.len() {
+                    buffer[j] = file_data[j + data_offset]
+                }
+                self.write_cluster(ide_controller, free_cluster, &buffer);
+                self.update_fat(ide_controller, free_cluster, next_cluster);
+                free_cluster = next_cluster;
             }
-            let data_offset = i * cluster_size;
-            let mut buffer = vec!(0u8; cluster_size);
-
-            for j in 0..buffer.len() {
-                buffer[j] = file_data[j + data_offset]
-            }
-            self.write_cluster(ide_controller, free_cluster, &buffer);
-            self.update_fat(ide_controller, free_cluster,next_cluster);
-            free_cluster = next_cluster;
+            let file_path = path.to_string() + "\\" + file_name + "." + file_extension;
+            self.find_file(ide_controller, file_path.as_str())
+        }else{
+            None
         }
     }
 
     pub fn read_file(
         &mut self,
         ide_controller: &mut IdeController,
-        file_name: &str,
-        file_extension: &str,
+        path: &str
     ) -> Option<Vec<u8>> {
-        let file_entries = self.read_dir(ide_controller, 0);
+        if let Some(mut entry) = self.find_file(ide_controller, path) {
+            let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
+            let remainder = entry.file_size % CLUSTER_OFFSET as u64;
+            let clusters = self.get_all_clusters(ide_controller, entry.starting_cluster);
+            for i in 0..clusters.len() {
+                let mut cluster = vec!(0u8; CLUSTER_OFFSET as usize);
+                self.read_cluster(ide_controller, clusters[i], &mut cluster);
+                let base_offset = i * CLUSTER_OFFSET as usize;
 
-        if(file_entries.len() == 0){
-            return None;
-        }
-        let mut entry = &file_entries[0];
-        //find the correct entry
-        for i in 0..file_entries.len(){
-            if(file_entries[i].file_name == file_name && file_entries[i].file_extension == file_extension){
-                entry = &file_entries[i];
-            }
-        }
-        let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
-        let remainder = entry.file_size % CLUSTER_OFFSET as u64;
-        let clusters = self.get_all_clusters(ide_controller, entry.starting_cluster);
-        for i in 0..clusters.len(){
-            let mut cluster = vec!(0u8; CLUSTER_OFFSET as usize);
-            self.read_cluster(ide_controller, clusters[i], &mut cluster);
-            let base_offset = i * CLUSTER_OFFSET as usize;
-
-            if (i + 1) != clusters.len() || remainder == 0{
-                for j in 0..cluster.len() {
-
-                    file_data[j + base_offset] = cluster[j];
-                }
-            }else{
-                for j in 0..remainder as usize {
-
-                    file_data[j + base_offset] = cluster[j];
+                if (i + 1) != clusters.len() || remainder == 0 {
+                    for j in 0..cluster.len() {
+                        file_data[j + base_offset] = cluster[j];
+                    }
+                } else {
+                    for j in 0..remainder as usize {
+                        file_data[j + base_offset] = cluster[j];
+                    }
                 }
             }
+            return Some(file_data)
         }
-
-        Some(file_data)
+        None
     }
     //set ignore cluster to 0 to ignore no clusters
     fn find_free_cluster(&mut self, mut ide_controller: &mut IdeController, ignore_cluster: u32) -> u32 {
@@ -386,9 +404,10 @@ impl FileSystem{
                 self.update_fat(ide_controller, clusters[clusters.len() - 1], free_cluster);
                 self.update_fat(ide_controller, free_cluster, 0xFFFFFFFF);
 
+
+                println!("{}", free_cluster);
+                self.write_file_to_dir(ide_controller, file_name, file_extension, file_attribute, start_cluster, start_cluster_of_dir, size);
             }
-            println!("{}", free_cluster);
-            self.write_file_to_dir(ide_controller,file_name, file_extension,file_attribute, start_cluster,start_cluster_of_dir, size);
             return;
         }
 
