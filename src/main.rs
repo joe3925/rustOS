@@ -69,16 +69,13 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
     // Create a directory where the file will be stored
     let dir_path = "\\test_dir";
-    println!("here1");
     fs.create_dir(&mut ide_controller, dir_path);
-    println!("here1");
 
     // Prepare test data that spans multiple clusters
     let cluster_size = 32 * 1024;
     let num_clusters = 3; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
-    let test_data: Vec<u8> = (0..total_size as u8).collect(); // Fill with sequential bytes
-
+    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
     // File name and extension
     let file_name = "multi_cluster_file";
     let file_extension = "bin";
@@ -106,7 +103,7 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
             println!("Failed to read the file at path: {}", file_path);
         }
     } else {
-        println!("Failed to create and write the file.");
+        //println!("Failed to create and write the file.");
     }
 }
 

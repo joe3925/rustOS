@@ -145,7 +145,6 @@ impl FileSystem{
     }
     pub fn create_dir(&mut self, ide_controller: &mut IdeController, path: &str){
         let files = FileSystem::file_parser(path);
-        println!("{:#?}", files);
         let mut current_cluster = 0;
         for i in 0..files.len() {
             let file = self.file_present(ide_controller, files[i], file::FileAttribute::Directory, current_cluster);
@@ -176,11 +175,9 @@ impl FileSystem{
             self.read_cluster(ide_controller, dirs[j], &mut root_dir);
             for i in (0..root_dir.len()).step_by(entry_size) {
                 // Check if the entry is valid (not empty or deleted)
+
                 if root_dir[i] == 0x00 {
-                    if dirs.len() == 0 {
-                        println!("skipping");
-                        continue;
-                    }
+                    continue;
                 } else if root_dir[i] == 0xE5 {
                     // Deleted entry, skip it
                     continue;
@@ -226,16 +223,13 @@ impl FileSystem{
         starting_cluster: u32)
         -> Option<FileEntry>{
         let clusters = self.get_all_clusters(ide_controller, 0);
-        println!("{:#?}", clusters);
         for i in 0..clusters.len(){
             let mut dir = self.read_dir(ide_controller, clusters[i]);
-            println!("{:#?}", dir.len());
             for j in 0..dir.len(){
                 let name = dir[j].file_name.clone() + &*dir[j].file_extension;
                 if(file_name.to_string() == name && file_attribute as u8 == dir[j].attributes){
                     return Some(dir[j].clone());
                 }
-                println!("{}", j)
             }
         }
         None
@@ -255,10 +249,12 @@ impl FileSystem{
                 current_cluster = current_file?.starting_cluster;
             }
             else{
+                println!("here1");
                 return None
             }
 
         }
+        println!("here2");
         None
     }
     pub fn find_dir(
@@ -278,9 +274,11 @@ impl FileSystem{
             } else if let Some(file_entry) = current_file {
                 current_cluster = file_entry.starting_cluster;
             } else {
+                println!("here1");
                 return None;
             }
         }
+        println!("here");
         None
     }
     pub fn create_and_write_file(
@@ -295,13 +293,11 @@ impl FileSystem{
         let cluster_size = CLUSTER_OFFSET as usize;
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
+        let mut next_cluster = 0xFFFFFFFF;
         if let Some(dir) = self.find_dir(ide_controller, path) {
             self.write_file_to_dir(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster,dir.starting_cluster, file_data.len() as u64);
             for i in 0..clusters_needed {
-                let mut next_cluster = 0xFFFFFFFF;
-                if (i != clusters_needed - 1) {
-                    next_cluster = self.find_free_cluster(ide_controller, free_cluster);
-                }
+
                 let data_offset = i * cluster_size;
                 let mut buffer = vec!(0u8; cluster_size);
 
@@ -309,6 +305,12 @@ impl FileSystem{
                     buffer[j] = file_data[j + data_offset]
                 }
                 self.write_cluster(ide_controller, free_cluster, &buffer);
+                println!("{}", free_cluster);
+                if (i != clusters_needed - 1) {
+                    next_cluster = 0xFFFFFFFF;
+                }else{
+                    next_cluster = self.find_free_cluster(ide_controller, 0);
+                }
                 self.update_fat(ide_controller, free_cluster, next_cluster);
                 free_cluster = next_cluster;
             }
@@ -405,7 +407,6 @@ impl FileSystem{
                 self.update_fat(ide_controller, free_cluster, 0xFFFFFFFF);
 
 
-                println!("{}", free_cluster);
                 self.write_file_to_dir(ide_controller, file_name, file_extension, file_attribute, start_cluster, start_cluster_of_dir, size);
             }
             return;
@@ -539,7 +540,7 @@ impl FileSystem{
     }
     fn cluster_to_sector(&self, cluster: u32, ide_controller: &mut IdeController) -> u32{
         let cluster_offset = SECTORS_PER_CLUSTER;
-        let cluster_start = cluster_offset * cluster + self.calculate_data_region_start(ide_controller);
-        cluster_start
+        let cluster_start = cluster_offset as u64 * cluster as u64 + self.calculate_data_region_start(ide_controller) as u64;
+        cluster_start as u32
     }
 }
