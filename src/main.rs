@@ -7,6 +7,7 @@
 #![feature(const_mut_refs)]
 #![feature(const_ptr_as_ref)]
 #![feature(const_ptr_write)]
+#[allow(dead_code)]
 
 extern crate alloc;
 
@@ -17,8 +18,8 @@ mod console;
 mod util;
 mod cpu;
 
-use alloc::string::{String, ToString};
-use alloc::{format, vec};
+use alloc::string::{ToString};
+use alloc::{format};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
@@ -27,8 +28,9 @@ use crate::drivers::ideDiskDriver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::file_system::FAT::FileSystem;
 use crate::idt::load_idt;
+use crate::memory::allocator::ALLOCATOR;
 use crate::memory::heap::{init_heap};
-use crate::memory::paging::{init_mapper, virtual_to_phys, BootInfoFrameAllocator};
+use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 
 mod drivers {
     pub mod kbdDriver;
@@ -60,24 +62,22 @@ mod structs{
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
     //clear_vga_buffer();
-    print!("{}", info);
+    println!("{}", info);
     loop{}
 }
 pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController) {
-
-
-
     // Create a directory where the file will be stored
-    let dir_path = "\\test_dir";
+    let dir_path = "\\test_dir\\testing\\tester\\deep\\test";
     fs.create_dir(&mut ide_controller, dir_path);
 
     // Prepare test data that spans multiple clusters
     let cluster_size = 32 * 1024;
-    let num_clusters = 3; // Number of clusters the file will occupy
+    let num_clusters = 30; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+
     // File name and extension
-    let file_name = "multi_cluster_file";
+    let file_name = "multi_cl";
     let file_extension = "bin";
 
     // Create and write the file
@@ -98,12 +98,33 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
                 println!("Data verification successful. Read data matches written data.");
             } else {
                 println!("Data verification failed. Read data does not match written data.");
+
+                for i in 0..read_data.len() {
+                    if read_data[i] != test_data[i] {
+                        println!(
+                           "Difference at byte {} of {}: expected 0x{:02x}, got 0x{:02x}",
+                            i,read_data.len(), test_data[i], read_data[i]
+                        );
+                    }
+                }
+
+                if read_data.len() > test_data.len() {
+                    println!(
+                        "Read data is longer than test data by {} bytes.",
+                        read_data.len() - test_data.len()
+                    );
+                } else if read_data.len() < test_data.len() {
+                    println!(
+                        "Read data is shorter than test data by {} bytes.",
+                        test_data.len() - read_data.len()
+                    );
+                }
             }
         } else {
             println!("Failed to read the file at path: {}", file_path);
         }
     } else {
-        //println!("Failed to create and write the file.");
+        println!("Failed to create and write the file.");
     }
 }
 
@@ -125,7 +146,13 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     let mut system = FileSystem::new("D:".to_string());
     system.format_drive(&mut controller).expect("TODO: panic message");
 
+
     loop{
+        //TODO: fix memory fragmentation
+        unsafe { println!("free memory: {}", ALLOCATOR.lock().free_memory());
+                ALLOCATOR.lock().freeList.printList();
+
+        }
         test_create_and_read_multicluster_file(&mut system, &mut controller);
         }
 }

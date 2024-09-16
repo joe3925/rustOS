@@ -1,12 +1,10 @@
 use alloc::string::{String, ToString};
-use alloc::{format, vec};
-use alloc::borrow::ToOwned;
+use alloc::{vec};
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use core::ops::{Deref, DerefMut};
 use crate::drivers::ideDiskDriver::IdeController;
-use crate::{print, println};
-use crate::file_system::{file, FAT};
+use crate::{ println};
+use crate::file_system::{file};
 use crate::file_system::file::FileAttribute;
 
 //TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
@@ -121,7 +119,7 @@ impl FileSystem{
 
     fn update_fat(
         &mut self,
-        mut ide_controller: &mut IdeController,
+        ide_controller: &mut IdeController,
         cluster_number: u32,
         next_cluster: u32,
     ) {
@@ -215,6 +213,30 @@ impl FileSystem{
     fn file_parser(path: &str) -> Vec<&str> {
         path.trim_start_matches('\\').split('\\').collect()
     }
+    fn find_last_dot(s: &str) -> Option<usize> {
+        let bytes = s.as_bytes();
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] == b'.' {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn get_text_before_last_dot(s: &str) -> &str {
+        if let Some(pos) = FileSystem::find_last_dot(s) {
+            &s[..pos]
+        } else {
+            s
+        }
+    }
+    fn get_text_after_last_dot(s: &str) -> &str {
+        if let Some(pos) = FileSystem::find_last_dot(s) {
+            &s[pos + 1..]
+        } else {
+            ""
+        }
+    }
     fn file_present(
         &mut self,
         ide_controller: &mut IdeController,
@@ -222,12 +244,13 @@ impl FileSystem{
         file_attribute: FileAttribute,
         starting_cluster: u32)
         -> Option<FileEntry>{
-        let clusters = self.get_all_clusters(ide_controller, 0);
+        let clusters = self.get_all_clusters(ide_controller, starting_cluster);
         for i in 0..clusters.len(){
-            let mut dir = self.read_dir(ide_controller, clusters[i]);
+            let dir = self.read_dir(ide_controller, clusters[i]);
             for j in 0..dir.len(){
-                let name = dir[j].file_name.clone() + &*dir[j].file_extension;
-                if(file_name.to_string() == name && file_attribute as u8 == dir[j].attributes){
+                let name = FileSystem::get_text_before_last_dot(file_name) .to_string();
+                let extension = FileSystem::get_text_after_last_dot(file_name) .to_string();
+                if(dir[j].file_name == name && dir[j].file_extension == extension && file_attribute as u8 == dir[j].attributes){
                     return Some(dir[j].clone());
                 }
             }
@@ -242,19 +265,18 @@ impl FileSystem{
             if(i == files.len() - 1){
                 attribute = file::FileAttribute::Archive;
             }
-            let current_file = self.file_present(ide_controller, files[i], attribute, current_cluster);
-            if(attribute as u8 == file::FileAttribute::Archive as u8){
-                return current_file;
-            }else if (!current_file.is_none()){
-                current_cluster = current_file?.starting_cluster;
+            if let Some(current_file) = self.file_present(ide_controller, files[i], attribute, current_cluster) {
+                if (attribute as u8 == file::FileAttribute::Archive as u8) {
+                    return Some(current_file);
+                } else{
+                    current_cluster = current_file.starting_cluster;
+                }
             }
             else{
-                println!("here1");
                 return None
             }
 
         }
-        println!("here2");
         None
     }
     pub fn find_dir(
@@ -293,7 +315,7 @@ impl FileSystem{
         let cluster_size = CLUSTER_OFFSET as usize;
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
-        let mut next_cluster = 0xFFFFFFFF;
+        let mut next_cluster;
         if let Some(dir) = self.find_dir(ide_controller, path) {
             self.write_file_to_dir(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster,dir.starting_cluster, file_data.len() as u64);
             for i in 0..clusters_needed {
@@ -305,11 +327,10 @@ impl FileSystem{
                     buffer[j] = file_data[j + data_offset]
                 }
                 self.write_cluster(ide_controller, free_cluster, &buffer);
-                println!("{}", free_cluster);
-                if (i != clusters_needed - 1) {
+                if (i == clusters_needed - 1) {
                     next_cluster = 0xFFFFFFFF;
                 }else{
-                    next_cluster = self.find_free_cluster(ide_controller, 0);
+                    next_cluster = self.find_free_cluster(ide_controller, free_cluster);
                 }
                 self.update_fat(ide_controller, free_cluster, next_cluster);
                 free_cluster = next_cluster;
@@ -326,7 +347,7 @@ impl FileSystem{
         ide_controller: &mut IdeController,
         path: &str
     ) -> Option<Vec<u8>> {
-        if let Some(mut entry) = self.find_file(ide_controller, path) {
+        if let Some(entry) = self.find_file(ide_controller, path) {
             let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
             let remainder = entry.file_size % CLUSTER_OFFSET as u64;
             let clusters = self.get_all_clusters(ide_controller, entry.starting_cluster);
@@ -350,7 +371,7 @@ impl FileSystem{
         None
     }
     //set ignore cluster to 0 to ignore no clusters
-    fn find_free_cluster(&mut self, mut ide_controller: &mut IdeController, ignore_cluster: u32) -> u32 {
+    fn find_free_cluster(&mut self,  ide_controller: &mut IdeController, ignore_cluster: u32) -> u32 {
         let fat_sectors = self.calculate_data_region_start(ide_controller) - RESERVED_SECTORS;
 
         for i in 0..fat_sectors {
@@ -377,7 +398,7 @@ impl FileSystem{
         0xFFFFFFFF // Return a special value indicating no free cluster was found
     }
     //TODO: modify to allocate a new cluster when full
-    pub fn write_file_to_dir(
+    fn write_file_to_dir(
         &mut self,
         mut ide_controller: &mut IdeController,
         file_name: &str,
@@ -451,7 +472,7 @@ impl FileSystem{
         }
         return;
     }
-    fn write_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &[u8]) {
+    fn write_cluster(&self,  ide_controller: &mut IdeController, cluster: u32, buffer: &[u8]) {
         let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
         for i in 0..sector_count {
@@ -461,7 +482,7 @@ impl FileSystem{
         }
     }
 
-    fn read_cluster(&self, mut ide_controller: &mut IdeController, cluster: u32, buffer: &mut [u8]) {
+    fn read_cluster(&self,  ide_controller: &mut IdeController, cluster: u32, buffer: &mut [u8]) {
         let sector_count = SECTORS_PER_CLUSTER;
         let start_sector = self.cluster_to_sector(cluster, ide_controller);
         for i in 0..sector_count {

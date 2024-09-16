@@ -3,10 +3,9 @@ use core::{ ptr};
 use core::mem::{align_of, size_of};
 use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
-use crate::println;
 use crate::structs::linked_list::{LinkedList, ListNode};
 #[global_allocator]
-static mut ALLOCATOR: Locked<Allocator> =
+pub static mut ALLOCATOR: Locked<Allocator> =
     Locked::new(Allocator::new());
 pub struct Locked<A> {
     inner: spin::Mutex<A>,
@@ -23,8 +22,8 @@ impl<A> Locked<A> {
         self.inner.lock()
     }
 }
-struct Allocator {
-    freeList: LinkedList,
+pub struct Allocator {
+    pub(crate) freeList: LinkedList,
 }
 impl Allocator{
     pub const fn new() -> Self {
@@ -94,7 +93,7 @@ impl Allocator{
         let size = layout.size().max(size_of::<ListNode>());
         (size, layout.align())
     }
-    pub fn free_memory(&self) -> usize {
+    pub(crate) fn free_memory(&self) -> usize {
         let mut current = &self.freeList.head;
         let mut total_free = 0;
 

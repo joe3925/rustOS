@@ -1,7 +1,5 @@
 use alloc::vec::Vec;
-use core::iter::TrustedRandomAccessNoCoerce;
-use x86_64::instructions::port::Port;
-use crate::println;
+
 
 
 pub(crate) struct Device{

@@ -2,14 +2,11 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
-use crate::drivers::pci;
 use crate::drivers::pci::pci_bus::PciBus;
-use crate::{drivers, print, println};
-use crate::cpu;
+use crate::{drivers,  println};
 use bitflags::bitflags;
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::cpu::{get_cycles, wait_cycle};
-use crate::drivers::interrupt_index::InterruptIndex::KeyboardIndex;
+use crate::cpu::{get_cycles};
 use crate::drivers::interrupt_index::send_eoi;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -233,6 +230,10 @@ impl IdeController {
             if self.command_port.read() & 0x01 != 0 {
                 println!("Error: Read sector failed!");
             }
+            if self.error_port.read() & 0x10 != 0{
+                println!("Tried to read from non existent sector");
+                return;
+            }
 
             // Transfer data in chunks of 2 bytes (16-bit data)
             for chunk in buffer.chunks_mut(2) {
@@ -281,6 +282,10 @@ impl IdeController {
             }
             DRIVE_IRQ_RECEIVED.store(false, Ordering::SeqCst);
 
+            if self.error_port.read() & 0x10 != 0{
+                println!("Tried to write to non existent sector");
+                return;
+            }
             // Transfer data in chunks of 2 bytes (16-bit data)
             for chunk in buffer.chunks(2) {
                 let data = (u16::from(chunk[1]) << 8) | u16::from(chunk[0]);
