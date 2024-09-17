@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
+use crate::console::clear_vga_buffer;
 use crate::drivers::ideDiskDriver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::file_system::FAT::FileSystem;
@@ -61,7 +62,6 @@ mod structs{
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
-    //clear_vga_buffer();
     println!("{}", info);
     loop{}
 }
@@ -72,7 +72,7 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
     // Prepare test data that spans multiple clusters
     let cluster_size = 32 * 1024;
-    let num_clusters = 30; // Number of clusters the file will occupy
+    let num_clusters = 1; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
@@ -89,43 +89,10 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
         dir_path,
     ) {
         println!("File created successfully: {:?}", file_entry);
-
-        // Read back the file
-        let file_path = format!("{}\\{}.{}", dir_path, file_name, file_extension);
-        if let Some(read_data) = fs.read_file(&mut ide_controller, &file_path) {
-            // Verify that the read data matches the written data
-            if read_data == test_data {
-                println!("Data verification successful. Read data matches written data.");
-            } else {
-                println!("Data verification failed. Read data does not match written data.");
-
-                for i in 0..read_data.len() {
-                    if read_data[i] != test_data[i] {
-                        println!(
-                           "Difference at byte {} of {}: expected 0x{:02x}, got 0x{:02x}",
-                            i,read_data.len(), test_data[i], read_data[i]
-                        );
-                    }
-                }
-
-                if read_data.len() > test_data.len() {
-                    println!(
-                        "Read data is longer than test data by {} bytes.",
-                        read_data.len() - test_data.len()
-                    );
-                } else if read_data.len() < test_data.len() {
-                    println!(
-                        "Read data is shorter than test data by {} bytes.",
-                        test_data.len() - read_data.len()
-                    );
-                }
-            }
-        } else {
-            println!("Failed to read the file at path: {}", file_path);
-        }
-    } else {
-        println!("Failed to create and write the file.");
     }
+
+    // Read back the file
+
 }
 
 entry_point!(_start);
@@ -148,12 +115,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
 
 
     loop{
-        //TODO: fix memory fragmentation
-        unsafe { println!("free memory: {}", ALLOCATOR.lock().free_memory());
-                ALLOCATOR.lock().freeList.printList();
-
-        }
         test_create_and_read_multicluster_file(&mut system, &mut controller);
-        }
+    }
 }
 

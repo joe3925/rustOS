@@ -303,6 +303,7 @@ impl FileSystem{
         println!("here");
         None
     }
+    //TODO: there is a memory leak here somewhere somehow
     pub fn create_and_write_file(
         &mut self,
         ide_controller: &mut IdeController,

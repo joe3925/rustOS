@@ -1,8 +1,9 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::{ ptr};
+use core::{mem, ptr};
 use core::mem::{align_of, size_of};
 use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
+use crate::println;
 use crate::structs::linked_list::{LinkedList, ListNode};
 #[global_allocator]
 pub static mut ALLOCATOR: Locked<Allocator> =
@@ -113,7 +114,7 @@ impl Allocator{
             while let Some(ref mut next) = (*current).next {
                 let nextPtr = VirtAddr::new(next.start_addr() as u64).as_mut_ptr() as *mut ListNode;
                 if((*nextPtr).start_addr() == (*current).start_addr() + (*current).size){
-                    (*current).size += (*nextPtr).size;
+                    (*current).size += ((*nextPtr).size);
                     //nextPtr is left dangling but it doesn't matter as the allocator marked its space as free
                     (*current).next = (*nextPtr).next.take();
                 }
