@@ -12,3 +12,20 @@ impl From<FileAttribute> for u8 {
         attribute as u8
     }
 }
+pub(crate) enum FileStatus {
+    Success = 0x0,
+    FileAlreadyExist = 0x1,
+    PathNotFound = 0x2,
+    UnknownFail = 0x3,
+}
+
+impl FileStatus {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            FileStatus::Success => "Success",
+            FileStatus::FileAlreadyExist => "File already exists",
+            FileStatus::PathNotFound => "Path not found",
+            FileStatus::UnknownFail => "The operation failed for an unknown reason"
+        }
+    }
+}

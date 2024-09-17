@@ -311,8 +311,12 @@ impl FileSystem{
         file_extension: &str,
         file_data: &[u8],
         path: &str,
-    ) -> Option<FileEntry>
+    ) -> file::FileStatus
     {
+        let file_path = path.to_string() + "\\" + file_name + "." + file_extension;
+        if let Some(file) = self.find_file(ide_controller, file_path.as_str()){
+            return file::FileStatus::FileAlreadyExist;
+        }
         let cluster_size = CLUSTER_OFFSET as usize;
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
@@ -336,10 +340,13 @@ impl FileSystem{
                 self.update_fat(ide_controller, free_cluster, next_cluster);
                 free_cluster = next_cluster;
             }
-            let file_path = path.to_string() + "\\" + file_name + "." + file_extension;
-            self.find_file(ide_controller, file_path.as_str())
+            if let Some( file) = self.find_file(ide_controller, file_path.as_str()){
+                file::FileStatus::Success
+            } else{
+                file::FileStatus::UnknownFail
+            }
         }else{
-            None
+            file::FileStatus::PathNotFound
         }
     }
 
