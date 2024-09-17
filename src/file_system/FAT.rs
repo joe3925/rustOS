@@ -6,6 +6,7 @@ use crate::drivers::ideDiskDriver::IdeController;
 use crate::{ println};
 use crate::file_system::{file};
 use crate::file_system::file::FileAttribute;
+use crate::memory::allocator::ALLOCATOR;
 
 //TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
 const CLUSTER_SIZE: u32 = 32; //in KiB
@@ -326,6 +327,7 @@ impl FileSystem{
             for i in 0..clusters_needed {
 
                 let data_offset = i * cluster_size;
+                //TODO: this buffer isn't freed
                 let mut buffer = vec!(0u8; cluster_size);
 
                 for j in 0..buffer.len() {

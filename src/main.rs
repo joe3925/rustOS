@@ -18,7 +18,7 @@ mod console;
 mod util;
 mod cpu;
 
-use alloc::string::{ToString};
+use alloc::string::{String, ToString};
 use alloc::{format};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
@@ -65,33 +65,27 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
-pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController) {
+pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController, file_name: String, dir_path: &str) {
     // Create a directory where the file will be stored
-    let dir_path = "\\test_dir\\testing\\tester\\deep\\test";
-    fs.create_dir(&mut ide_controller, dir_path);
+
 
     // Prepare test data that spans multiple clusters
     let cluster_size = 32 * 1024;
-    let num_clusters = 1; // Number of clusters the file will occupy
+    let num_clusters = 12; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
     // File name and extension
-    let file_name = "multi_cl";
     let file_extension = "bin";
 
     // Create and write the file
-    if let Some(file_entry) = fs.create_and_write_file(
+    println!("{}",fs.create_and_write_file(
         &mut ide_controller,
-        file_name,
+        file_name.as_str(),
         file_extension,
         &test_data,
         dir_path,
-    ) {
-        println!("File created successfully: {:?}", file_entry);
-    }
-
-    // Read back the file
+    ).to_str());
 
 }
 
@@ -113,9 +107,13 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     let mut system = FileSystem::new("D:".to_string());
     system.format_drive(&mut controller).expect("TODO: panic message");
 
+    let dir_path = "\\test_dir\\testing\\tester\\deep\\test";
+    system.create_dir(&mut controller, dir_path);
 
+    let mut i = 0;
     loop{
-        test_create_and_read_multicluster_file(&mut system, &mut controller);
+        test_create_and_read_multicluster_file(&mut system, &mut controller, format!("{}", i),dir_path);
+        i += 1;
     }
 }
 
