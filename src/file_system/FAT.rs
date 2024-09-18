@@ -322,13 +322,13 @@ impl FileSystem{
         let clusters_needed = file_data.len() / cluster_size;
         let mut free_cluster = self.find_free_cluster(ide_controller, 0);
         let mut next_cluster;
+        let mut buffer = vec!(0u8; cluster_size);
         if let Some(dir) = self.find_dir(ide_controller, path) {
             self.write_file_to_dir(ide_controller, file_name, file_extension, file::FileAttribute::Archive, free_cluster,dir.starting_cluster, file_data.len() as u64);
             for i in 0..clusters_needed {
 
                 let data_offset = i * cluster_size;
-                //TODO: this buffer isn't freed
-                let mut buffer = vec!(0u8; cluster_size);
+                unsafe { println!("Allocations: {}", ALLOCATOR.lock().allocationsMade) }
 
                 for j in 0..buffer.len() {
                     buffer[j] = file_data[j + data_offset]
@@ -339,6 +339,7 @@ impl FileSystem{
                 }else{
                     next_cluster = self.find_free_cluster(ide_controller, free_cluster);
                 }
+
                 self.update_fat(ide_controller, free_cluster, next_cluster);
                 free_cluster = next_cluster;
             }

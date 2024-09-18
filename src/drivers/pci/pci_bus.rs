@@ -22,7 +22,7 @@ impl PciBus{
             for device in 0..32 {
                 for function in 0..8 {
                     let id = PciBus::pci_config_read(bus, device, function, 0, &mut address_port, &mut data_port);
-                    if id != 0xFFFF_FFFF { // 0xFFFFFFFF means no device present
+                    if id != 0xFFFFFFFF { // 0xFFFFFFFF means no device present
                         let header = PciBus::pci_config_read(bus, device, function, 0x08, &mut address_port, &mut data_port);
                         let class_code = (header >> 24) as u8;
                         let subclass = ((header >> 16) & 0xFF) as u8;

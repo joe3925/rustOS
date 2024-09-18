@@ -25,11 +25,13 @@ impl<A> Locked<A> {
 }
 pub struct Allocator {
     pub(crate) freeList: LinkedList,
+    pub(crate) allocationsMade: u128,
 }
 impl Allocator{
     pub const fn new() -> Self {
         Allocator {
             freeList: LinkedList::new(),
+            allocationsMade: 0,
         }
 
 
@@ -44,25 +46,47 @@ impl Allocator{
         let node_ptr = addr as *mut ListNode;
         node_ptr.write(node);
         self.freeList.head.next = Some(&mut *node_ptr);
-        self.merge_free_list();
     }
 
-    fn find_region(&mut self, size: usize, align: usize)
-                   -> Option<(&'static mut ListNode, usize)>
-    {
-        //self.freeList.printList();
-        let mut current = &mut self.freeList.head;
-        while let Some(ref mut region) = current.next {
-            if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
-                let next = region.next.take();
-                let ret = Some((current.next.take()?, alloc_start));
-                current.next = next;
-                return ret;
+    fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
+        let mut best_fit_size = usize::MAX;
+        let mut best_fit_prev: *mut ListNode = ptr::null_mut();
+        let mut best_fit_alloc_start = 0usize;
 
-            } else {
-                current = current.next.as_mut()?;
+        // Start from the head of the free list
+        let mut current = &mut self.freeList.head as *mut ListNode;
+
+        unsafe {
+            // Traverse the free list
+            while let Some(ref mut region) = (*current).next {
+                // Try to allocate from the current region
+                if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
+                    let region_size = region.size;
+                    // Check if this region is a better fit
+                    if region_size < best_fit_size {
+                        best_fit_size = region_size;
+                        best_fit_prev = current;
+                        best_fit_alloc_start = alloc_start;
+                    }
+                }
+                // Move to the next region
+                current = &mut **region as *mut ListNode;
+            }
+
+            // If a best-fit region was found
+            if !best_fit_prev.is_null() {
+                // Remove the best-fit region from the free list
+                let best_fit_prev_ref = &mut *best_fit_prev;
+                let mut best_fit_region = best_fit_prev_ref.next.take().unwrap();
+                let next = best_fit_region.next.take();
+                best_fit_prev_ref.next = next;
+
+                // Return the best-fit region and allocation start address
+                return Some((best_fit_region, best_fit_alloc_start));
             }
         }
+
+        // No suitable region found
         None
     }
     fn alloc_from_region(region: &mut ListNode, size: usize, align: usize)
@@ -146,6 +170,7 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
             if excess_size > 0 {
                 allocator.add_free_region(alloc_end, excess_size);
             }
+            allocator.allocationsMade += 1;
             alloc_start as *mut u8
         } else {
             ptr::null_mut()
@@ -154,9 +179,11 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // perform layout adjustments
+        let mut allocator = self.lock();
         let (size, _) = Allocator::size_align(layout);
-
-        self.lock().add_free_region(ptr as usize, size)
+        allocator.allocationsMade -= 1;
+        allocator.add_free_region(ptr as usize, size);
+        allocator.merge_free_list();
     }
 }
 
