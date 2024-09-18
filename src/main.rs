@@ -113,6 +113,9 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     let mut i = 0;
     loop{
         test_create_and_read_multicluster_file(&mut system, &mut controller, format!("{}", i),dir_path);
+        unsafe { println!("Allocations: {}", ALLOCATOR.lock().freeList.count_nodes()); }
+        unsafe { println!("Allocations: {:#?}", ALLOCATOR.lock().freeList.printList()); }
+
         i += 1;
     }
 }

@@ -328,7 +328,6 @@ impl FileSystem{
             for i in 0..clusters_needed {
 
                 let data_offset = i * cluster_size;
-                unsafe { println!("Allocations: {}", ALLOCATOR.lock().allocationsMade) }
 
                 for j in 0..buffer.len() {
                     buffer[j] = file_data[j + data_offset]

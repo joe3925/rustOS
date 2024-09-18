@@ -131,19 +131,52 @@ impl Allocator{
     }
 
     pub fn merge_free_list(&mut self) {
-
-        let mut current = VirtAddr::new(self.freeList.head.start_addr() as u64).as_mut_ptr() as *mut ListNode;
-
         unsafe {
-            while let Some(ref mut next) = (*current).next {
-                let nextPtr = VirtAddr::new(next.start_addr() as u64).as_mut_ptr() as *mut ListNode;
-                if((*nextPtr).start_addr() == (*current).start_addr() + (*current).size){
-                    (*current).size += ((*nextPtr).size);
-                    //nextPtr is left dangling but it doesn't matter as the allocator marked its space as free
-                    (*current).next = (*nextPtr).next.take();
-                }
+            // We need to loop until no merges are made in an iteration
+            let mut merges_made = true;
+            while merges_made {
+                merges_made = false;
+                let mut current = &mut self.freeList.head as *mut ListNode;
 
-                current = nextPtr;
+                while let Some(ref mut current_node) = (*current).next {
+                    let mut other = &mut self.freeList.head as *mut ListNode;
+
+                    while let Some(ref mut other_node) = (*other).next {
+                        if other_node.start_addr() == current_node.start_addr() {
+                            other = &mut **other_node as *mut ListNode;
+                            continue;
+                        }
+
+                        // Check if current_node and other_node are adjacent in memory
+                        if current_node.end_addr() == other_node.start_addr() {
+                            // Merge other_node into current_node
+                            current_node.size += other_node.size;
+                            // Remove other_node from the free list
+                            (*other).next = other_node.next.take();
+                            merges_made = true;
+                            break;
+                        } else if other_node.end_addr() == current_node.start_addr() {
+                            // Merge current_node into other_node
+                            other_node.size += current_node.size;
+                            // Remove current_node from the free list
+                            (*current).next = current_node.next.take();
+                            merges_made = true;
+                            // Restart outer loop since current_node has changed
+                            break;
+                        } else {
+                            // Move to the next node in the inner loop
+                            other = &mut **other_node as *mut ListNode;
+                        }
+                    }
+
+                    // If a merge was made, restart the outer loop
+                    if merges_made {
+                        break;
+                    } else {
+                        // Move to the next node in the outer loop
+                        current = &mut **current_node as *mut ListNode;
+                    }
+                }
             }
         }
     }

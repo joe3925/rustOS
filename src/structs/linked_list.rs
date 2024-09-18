@@ -30,6 +30,18 @@ impl LinkedList {
         }
     }
 
+    pub fn count_nodes(&self) -> usize {
+        let mut count = 0;
+        let mut current = &self.head;
+
+        // Traverse the free list starting from the head
+        while let Some(ref next_node) = current.next {
+            count += 1;
+            current = next_node;
+        }
+
+        count
+    }
 
     pub fn printList(&mut self) {
         let mut current = &mut self.head;
