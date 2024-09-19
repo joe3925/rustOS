@@ -36,7 +36,7 @@ impl PciBus{
         }
         unsafe { self.last_update = TIMER.get_current_tick(); }
     }
-    fn print_devices(&self){
+    pub(crate) fn print_devices(&self){
         for i in 0..self.device_collection.devices.len(){
             println!("Device found: Bus {}, Device {}, Function {}, ID {}, Class Code {}, Subclass {:#X}",
                      self.device_collection.devices[i].bus,

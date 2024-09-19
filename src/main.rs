@@ -26,7 +26,7 @@ use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
 use crate::drivers::drive::ide_disk_driver::IdeController;
-use crate::drivers::drive::sata_disk_drivers::SataController;
+use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::file_system::FAT::FileSystem;
@@ -42,6 +42,7 @@ mod drivers {
     pub mod drive {
         pub mod ide_disk_driver;
         pub mod sata_disk_drivers;
+        pub mod generic_drive;
     }
     pub mod pci{
         pub mod device_collection;
@@ -109,8 +110,9 @@ fn _start(boot_info: &'static BootInfo) -> ! {
 
     unsafe {
         PCIBUS.lock().enumerate_pci();
+        PCIBUS.lock().print_devices();
     }
-    let controller = SataController::new();
+    let controller = AHCIController::new();
     println!("{}",controller.mmio_base);
     loop{
 
