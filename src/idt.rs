@@ -4,7 +4,7 @@ use crate::exception_handlers::exception_handlers;
 use crate::{drivers, gdt, println};
 use crate::drivers::kbdDriver::keyboard_interrupt_handler;
 use crate::drivers::timerDriver::timer_interrupt_handler;
-use crate::drivers::ideDiskDriver::{primary_drive_irq_handler, secondary_drive_irq_handler};
+use crate::drivers::drive::ide_disk_driver::{primary_drive_irq_handler, secondary_drive_irq_handler};
 
 
 lazy_static! {

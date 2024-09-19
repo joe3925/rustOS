@@ -25,8 +25,9 @@ use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
-use crate::drivers::ideDiskDriver::IdeController;
+use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
+use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::file_system::FAT::FileSystem;
 use crate::idt::load_idt;
 use crate::memory::allocator::ALLOCATOR;
@@ -37,7 +38,10 @@ mod drivers {
     pub mod kbdDriver;
     pub mod interrupt_index;
     pub mod timerDriver;
-    pub mod ideDiskDriver;
+    pub mod drive {
+        pub mod ide_disk_driver;
+        pub mod sata_disk_drivers;
+    }
     pub mod pci{
         pub mod device_collection;
         pub mod pci_bus;
@@ -71,7 +75,7 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
     // Prepare test data that spans multiple clusters
     let cluster_size = 32 * 1024;
-    let num_clusters = 12; // Number of clusters the file will occupy
+    let num_clusters = 125; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
@@ -102,7 +106,12 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
+
+    unsafe {
+        PCIBUS.lock().enumerate_pci();
+    }
     controller.init();
+
     controller.print_all_drives();
     let mut system = FileSystem::new("D:".to_string());
     system.format_drive(&mut controller).expect("TODO: panic message");
@@ -110,11 +119,9 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     let dir_path = "\\test_dir\\testing\\tester\\deep\\test";
     system.create_dir(&mut controller, dir_path);
 
-    let mut i = 0;
+    let mut i = 322;
     loop{
         test_create_and_read_multicluster_file(&mut system, &mut controller, format!("{}", i),dir_path);
-        unsafe { println!("Allocations: {}", ALLOCATOR.lock().freeList.count_nodes()); }
-        unsafe { println!("Allocations: {:#?}", ALLOCATOR.lock().freeList.printList()); }
 
         i += 1;
     }

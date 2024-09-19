@@ -11,7 +11,7 @@ pub(crate) struct Device{
     pub(crate) subclass: u8,
 }
 impl Device{
-    pub fn new(bus: u8, device: u8, function: u8, id: u32, class_code: u8, subclass: u8) -> Self {
+    pub const fn new(bus: u8, device: u8, function: u8, id: u32, class_code: u8, subclass: u8) -> Self {
         Device {
             bus,
             device,
@@ -26,7 +26,7 @@ pub(crate) struct DeviceCollection {
     pub(crate) devices: Vec<Device>,
 }
 impl DeviceCollection {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         DeviceCollection {
             devices: Vec::new(),
         }

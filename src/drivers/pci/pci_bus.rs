@@ -2,8 +2,10 @@ use x86_64::instructions::port::Port;
 use crate::drivers::pci::device_collection::DeviceCollection;
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::timerDriver::TIMER;
+use crate::memory::allocator::{Allocator, Locked};
 use crate::println;
-
+pub(crate) static mut PCIBUS: Locked<PciBus> =
+    Locked::new(PciBus::new());
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 pub(crate) struct PciBus {
@@ -11,7 +13,8 @@ pub(crate) struct PciBus {
     pub (crate)last_update: i128,
 }
 impl PciBus{
-    pub(crate) fn new() -> Self{
+
+    pub(crate) const fn new() -> Self{
         PciBus{ device_collection: DeviceCollection::new(),last_update: 0  }
     }
     pub(crate) fn enumerate_pci(&mut self) {
@@ -33,7 +36,7 @@ impl PciBus{
         }
         unsafe { self.last_update = TIMER.get_current_tick(); }
     }
-    pub(crate) fn print_devices(&self){
+    fn print_devices(&self){
         for i in 0..self.device_collection.devices.len(){
             println!("Device found: Bus {}, Device {}, Function {}, ID {}, Class Code {}, Subclass {:#X}",
                      self.device_collection.devices[i].bus,
@@ -46,7 +49,7 @@ impl PciBus{
             );
         }
     }
-    fn pci_config_read(bus: u8, device: u8, function: u8, offset: u8, address_port: &mut Port<u32>, data_port: &mut Port<u32>) -> u32 {
+    pub(crate) fn pci_config_read(bus: u8, device: u8, function: u8, offset: u8, address_port: &mut Port<u32>, data_port: &mut Port<u32>) -> u32 {
         let bus = u32::from(bus);
         let device = u32::from(device);
         let function = u32::from(function);

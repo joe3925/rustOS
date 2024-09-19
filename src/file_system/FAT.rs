@@ -2,7 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::{vec};
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use crate::drivers::ideDiskDriver::IdeController;
+use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::{ println};
 use crate::file_system::{file};
 use crate::file_system::file::FileAttribute;
