@@ -26,6 +26,7 @@ use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
 use crate::drivers::drive::ide_disk_driver::IdeController;
+use crate::drivers::drive::sata_disk_drivers::SataController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::file_system::FAT::FileSystem;
@@ -95,7 +96,6 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
-    let mut controller = IdeController::new();
     gdt::init();
     load_idt();
     unsafe { interrupt_index::PICS.lock().initialize() };
@@ -110,20 +110,10 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     unsafe {
         PCIBUS.lock().enumerate_pci();
     }
-    controller.init();
-
-    controller.print_all_drives();
-    let mut system = FileSystem::new("D:".to_string());
-    system.format_drive(&mut controller).expect("TODO: panic message");
-
-    let dir_path = "\\test_dir\\testing\\tester\\deep\\test";
-    system.create_dir(&mut controller, dir_path);
-
-    let mut i = 322;
+    let controller = SataController::new();
+    println!("{}",controller.mmio_base);
     loop{
-        test_create_and_read_multicluster_file(&mut system, &mut controller, format!("{}", i),dir_path);
 
-        i += 1;
     }
 }
 

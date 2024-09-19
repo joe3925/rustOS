@@ -3,8 +3,8 @@ use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
-struct SataController {
-    mmio_base: u64,
+pub(crate) struct SataController {
+    pub(crate) mmio_base: u64,
 }
 impl SataController {
     pub fn new() -> Self {
