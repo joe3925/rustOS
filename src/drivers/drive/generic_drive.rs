@@ -1,4 +1,3 @@
-//This file will enumerate all drives and assign each a generic read write function
 
 use alloc::string::String;
 use crate::drivers::drive::ide_disk_driver::IdeController;
@@ -19,5 +18,13 @@ pub struct Drive<'a> {
     pub label: String,
     pub Name: String,
     pub controller: &'a mut dyn DriveController, // A reference to any controller that implements the DriveController trait
+} impl Drive{
+    pub fn new<'a>(label: String, Name: String, controller: &'a mut dyn DriveController) -> Self{
+        Drive{
+            label,
+            Name,
+            controller
+        }
+    }
 }
 
