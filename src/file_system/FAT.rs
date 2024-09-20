@@ -40,14 +40,14 @@ struct Dir {
     files: Vec<FileEntry>,
     next_cluster: u8,
 }
-pub struct FileSystem<'a>{
+pub struct FileSystem{
     info: InfoSector,
-    drive: Drive<'a>,
+    drive: Drive,
 }
 
-impl<'a> FileSystem<'a>{
+impl FileSystem{
     // Initialize the file system with a formatted drive
-    pub fn new(label: String, drive: Drive<'a>) -> Self {
+    pub fn new(label: String, drive: Drive) -> Self {
 
         FileSystem {
             info: InfoSector {
@@ -61,7 +61,7 @@ impl<'a> FileSystem<'a>{
     //TODO: figure out why sector 1 is being formatted as a data sector
     pub fn format_drive(&mut self) -> Result<(), &'static str> {
 
-        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone()) {
+        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone().as_str()) {
             let drive_label = self.drive.label.clone();
             let mut info_sec_buffer = vec![0x0; 512];
             info_sec_buffer[0x0] = self.info.signature as u8;
@@ -73,9 +73,9 @@ impl<'a> FileSystem<'a>{
             let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
             for i in 0..RESERVED_SECTORS {
-                self.drive.controller.write(drive_label.clone(), i, &mut buffer);
+                self.drive.controller.write(drive_label.clone().as_str(), i, &mut buffer);
             }
-            self.drive.controller.write(drive_label.clone(), INFO_SECTOR, &mut info_sec_buffer);
+            self.drive.controller.write(drive_label.clone().as_str(), INFO_SECTOR, &mut info_sec_buffer);
 
 
             for j in 0..512 {
@@ -87,13 +87,13 @@ impl<'a> FileSystem<'a>{
             let itr = total_clusters / 512;
 
             for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-                self.drive.controller.write(drive_label.clone(), (i + 1), &mut buffer);
+                self.drive.controller.write(drive_label.clone().as_str(), (i + 1), &mut buffer);
             }
             let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
             //validate data sectors
             for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-                self.drive.controller.read(drive_label.clone(), (i + 1), &mut readBuffer);
+                self.drive.controller.read(drive_label.clone().as_str(), (i + 1), &mut readBuffer);
                 for j in 0..512 {
                     if (readBuffer[j] != buffer[j]) {
                         println!("Sector {} is invalid", i);
@@ -126,7 +126,7 @@ impl<'a> FileSystem<'a>{
 
         // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
-        self.drive.controller.read(self.drive.label.clone(), sector_number, &mut buffer);
+        self.drive.controller.read(self.drive.label.clone().as_str(), sector_number, &mut buffer);
 
         // Update the FAT entry in the buffer
         buffer[entry_offset] = (next_cluster & 0xFF) as u8;
@@ -135,7 +135,7 @@ impl<'a> FileSystem<'a>{
         buffer[entry_offset + 3] = ((next_cluster >> 24) & 0xFF) as u8;
 
         // Write the updated sector back to the disk
-        self.drive.controller.write(self.drive.label.clone(), sector_number, &mut buffer);
+        self.drive.controller.write(self.drive.label.clone().as_str(), sector_number, &mut buffer);
     }
     pub fn create_dir(&mut self,  path: &str){
         let files = FileSystem::file_parser(path);
@@ -378,7 +378,7 @@ impl<'a> FileSystem<'a>{
 
         for i in 0..fat_sectors {
             let mut buffer = vec![0u8; 512];
-            self.drive.controller.read(self.drive.label.clone(), i + RESERVED_SECTORS + 1, &mut buffer);
+            self.drive.controller.read(self.drive.label.clone().as_str(), i + RESERVED_SECTORS + 1, &mut buffer);
             for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
                 let entry = u32::from_le_bytes([
                     buffer[j * 4],
@@ -480,7 +480,7 @@ impl<'a> FileSystem<'a>{
         for i in 0..sector_count {
             let sector = &buffer[(i * 512) as usize..((i + 1) * 512) as usize];
             let current_sector = start_sector + i;
-            self.drive.controller.write(self.drive.label.clone(), current_sector, sector);
+            self.drive.controller.write(self.drive.label.clone().as_str(), current_sector, sector);
         }
     }
 
@@ -489,7 +489,7 @@ impl<'a> FileSystem<'a>{
         let start_sector = self.cluster_to_sector(cluster);
         for i in 0..sector_count {
             let mut sector = [0u8; 512];
-            self.drive.controller.read(self.drive.label.clone(), start_sector + i, &mut sector);
+            self.drive.controller.read(self.drive.label.clone().as_str(), start_sector + i, &mut sector);
             buffer[(i * 512) as usize..((i + 1) * 512) as usize].copy_from_slice(&sector);
         }
     }
@@ -534,7 +534,7 @@ impl<'a> FileSystem<'a>{
             let mut sector = vec!(0u8; 512);
             let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
             let sector_index = FileSystem::cluster_in_sector(starting_cluster);
-            self.drive.controller.read(self.drive.label.clone(), starting_sector, &mut sector);
+            self.drive.controller.read(self.drive.label.clone().as_str(), starting_sector, &mut sector);
             entry = u32::from_le_bytes([
                 sector[sector_index],
                 sector[sector_index + 1],
@@ -550,7 +550,7 @@ impl<'a> FileSystem<'a>{
     }
     fn calculate_data_region_start(&self) -> u32 {
         // Determine the drive size
-        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone()) {
+        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone().as_str()) {
 
 
             // Calculate the total number of clusters

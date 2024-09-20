@@ -196,11 +196,11 @@ impl IdeController {
 }
 
 impl DriveController for IdeController{
-        fn read(&mut self, label: String, lba: u32, buffer: &mut [u8]) {
+        fn read(&mut self, label: &str, lba: u32, buffer: &mut [u8]) {
             assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
 
             unsafe {
-                let drive_selector = self.drive_selector_from_label(label);
+                let drive_selector = self.drive_selector_from_label(label.to_string());
 
                 // Wait until the drive is not busy
                 while self.command_port.read() & 0x80 != 0 {}  // BSY
@@ -245,11 +245,11 @@ impl DriveController for IdeController{
 
             }
         }
-        fn write(&mut self, label: String, lba: u32, buffer: &[u8]) {
+        fn write(&mut self, label: &str, lba: u32, buffer: &[u8]) {
             assert_eq!(buffer.len(), 512);
 
             unsafe {
-                let drive_selector = self.drive_selector_from_label(label);
+                let drive_selector = self.drive_selector_from_label(label.to_string());
 
                 // Wait until the drive is not busy
                 while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
@@ -294,7 +294,7 @@ impl DriveController for IdeController{
                 }
             }
         }
-        fn size(&self, label: String) -> Option<usize> {
+        fn size(&self, label: &str) -> Option<usize> {
             for drive in &self.drives {
                 if drive.drive_label == label {
                     return Some(drive.capacity as usize);
