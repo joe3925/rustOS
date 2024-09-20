@@ -302,6 +302,12 @@ impl DriveController for IdeController{
             }
             None
         }
+        fn isController(class: u8, sub_class: u8) -> bool {
+            if (class == 0x1 && sub_class == 0x1){
+                return true
+            }
+            false
+        }
     }
 
 bitflags! {

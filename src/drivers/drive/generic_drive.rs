@@ -10,6 +10,9 @@ use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::pci::pci_bus::PciBus;
 use crate::memory::allocator::Locked;
 
+pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
+    Mutex::new(DriveCollection::new())
+});
 
 pub enum Controller {
     AHCI(AHCIController),
@@ -27,12 +30,13 @@ pub trait DriveController {
     fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, label: &str, sector: u32, data: &[u8]);
     fn size(&self, label: &str) -> Option<usize>;
+    fn isController(class: u8, sub_class: u8) -> bool;
 }
 
 pub struct Drive {
     pub label: String,
     pub name: String,
-    pub controller: Box<dyn DriveController + Send>, // Added `Send` for thread safety
+    pub controller: Box<dyn DriveController + Send>,
 }
 
 impl Drive {
@@ -61,7 +65,3 @@ impl DriveCollection {
         self.drives.push(drive);
     }
 }
-
-pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
-    Mutex::new(DriveCollection::new())
-});
