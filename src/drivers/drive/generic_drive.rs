@@ -9,14 +9,15 @@ pub enum Controller {
     IDE(IdeController),
 }
 //All drives must implement this trait
-pub trait DriveOperations {
-    fn read(&self, sector: u64, buffer: &mut [u8]);
-    fn write(&self, sector: u64, data: &[u8]);
+pub trait DriveController {
+    fn read(&mut self, label: String, sector: u32, buffer: &mut [u8]);
+    fn write(&mut self, label: String, sector: u32, data: &[u8]);
+    fn size(&self, label: String) -> Option<usize>;
 }
 
-struct Drive {
-    label: String,
-    Name: String,
-    controller: Controller
+pub struct Drive<'a> {
+    pub label: String,
+    pub Name: String,
+    pub controller: &'a mut dyn DriveController, // A reference to any controller that implements the DriveController trait
 }
 

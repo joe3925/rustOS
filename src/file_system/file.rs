@@ -13,10 +13,10 @@ impl From<FileAttribute> for u8 {
     }
 }
 pub(crate) enum FileStatus {
-    Success = 0x0,
-    FileAlreadyExist = 0x1,
-    PathNotFound = 0x2,
-    UnknownFail = 0x3,
+    Success = 0x00,
+    FileAlreadyExist = 0x01,
+    PathNotFound = 0x02,
+    UnknownFail = 0x03,
 }
 
 impl FileStatus {

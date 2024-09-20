@@ -86,7 +86,6 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
     // Create and write the file
     println!("{}",fs.create_and_write_file(
-        &mut ide_controller,
         file_name.as_str(),
         file_extension,
         &test_data,
