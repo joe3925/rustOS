@@ -1,8 +1,13 @@
 
 use alloc::string::String;
+use alloc::vec;
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
+use crate::drivers::pci::pci_bus::PciBus;
+use crate::memory::allocator::Locked;
 
+pub(crate) static mut DRIVECOLLECTION: Locked<DriveCollection> =
+    Locked::new(DriveCollection::new());
 pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
@@ -33,4 +38,15 @@ impl Drive{
         }
     }
 }
-
+pub struct DriveCollection<'a> {
+    pub drives: vec<Drive<'a>>,
+}
+impl DriveCollection{
+    fn new() -> Self{
+        DriveCollection{
+            drives: (),
+        }
+    }
+    fn new_drive<'a>(&mut self, label: String, name: String, controller: &'a mut dyn DriveController,){
+    }
+}
