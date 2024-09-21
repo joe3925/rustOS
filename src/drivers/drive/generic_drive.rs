@@ -1,19 +1,20 @@
+use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use lazy_static::lazy_static;
 use spin::Lazy;
 use spin::mutex::Mutex;
-use crate::drivers::drive::ide_disk_driver::IdeController;
+use crate::drivers::drive::ide_disk_driver::{DriveInfo, IdeController};
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
-use crate::drivers::pci::pci_bus::PciBus;
-use crate::memory::allocator::Locked;
+use strum::IntoEnumIterator; // Trait for iterating over enum variants
+use strum_macros::EnumIter;
+use crate::drivers::pci::device_collection::Device;
 
+// Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
     Mutex::new(DriveCollection::new())
 });
-
 pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
@@ -29,21 +30,21 @@ pub enum DriveType {
 pub trait DriveController {
     fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, label: &str, sector: u32, data: &[u8]);
-    fn size(&self, label: &str) -> Option<usize>;
-    fn isController(class: u8, sub_class: u8) -> bool;
+    fn enumerate_drives() where Self: Sized;
+    fn isController(device: &Device) -> bool where Self: Sized;
 }
 
 pub struct Drive {
     pub label: String,
-    pub name: String,
+    pub info: DriveInfo,
     pub controller: Box<dyn DriveController + Send>,
 }
 
 impl Drive {
-    pub fn new(label: String, name: String, controller: Box<dyn DriveController + Send>) -> Self {
+    pub fn new(label: String, info: DriveInfo, controller: Box<dyn DriveController + Send>) -> Self {
         Drive {
             label,
-            name,
+            info,
             controller,
         }
     }
@@ -60,8 +61,33 @@ impl DriveCollection {
         }
     }
 
-    fn new_drive(&mut self, label: String, name: String, controller: Box<dyn DriveController + Send>) {
-        let drive = Drive::new(label, name, controller);
+    pub(crate) fn new_drive(&mut self, label: String, info: DriveInfo, controller: Box<dyn DriveController + Send>) {
+        let drive = Drive::new(label, info, controller);
         self.drives.push(drive);
+    }
+    pub fn find_free_label(&self) -> Option<String> {
+        let mut used_labels = [false; 26]; // A flag array for each letter A-Z
+
+        for drive in &self.drives {
+            if let Some(first_char) = drive.label.chars().next() {
+                if first_char.is_ascii_alphabetic() {
+                    let index = (first_char.to_ascii_uppercase() as u8 - b'A') as usize;
+                    if index < 26 {
+                        used_labels[index] = true;
+                    }
+                }
+            }
+        }
+
+        // Find the first unused label from A: to Z:
+        for i in 0..26 {
+            if !used_labels[i] {
+                let letter = (b'A' + i as u8).to_string();
+
+                return Some(":".to_owned() + &*letter);
+            }
+        }
+
+        None // No free label found
     }
 }

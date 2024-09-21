@@ -60,8 +60,7 @@ impl FileSystem{
     }
     //TODO: figure out why sector 1 is being formatted as a data sector
     pub fn format_drive(&mut self) -> Result<(), &'static str> {
-
-        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone().as_str()) {
+            let drive_size = self.drive.info.capacity;
             let drive_label = self.drive.label.clone();
             let mut info_sec_buffer = vec![0x0; 512];
             info_sec_buffer[0x0] = self.info.signature as u8;
@@ -109,9 +108,6 @@ impl FileSystem{
 
             println!("Drive {} formatted successfully.",drive_label);
             Ok(())
-        } else{
-            Ok(())
-        }
     }
 
     fn update_fat(
@@ -550,16 +546,11 @@ impl FileSystem{
     }
     fn calculate_data_region_start(&self) -> u32 {
         // Determine the drive size
-        if let Some(drive_size) = self.drive.controller.size(self.drive.label.clone().as_str()) {
-
-
-            // Calculate the total number of clusters
-            let total_clusters = drive_size / CLUSTER_OFFSET as usize;
-            ((total_clusters / 512) + RESERVED_SECTORS as usize) as u32
-        } else{
-            0
-        }
+        let drive_size = self.drive.info.capacity as usize;
+        let total_clusters = drive_size / CLUSTER_OFFSET as usize;
+        ((total_clusters / 512) + RESERVED_SECTORS as usize) as u32
     }
+
     fn cluster_to_sector(&self, cluster: u32) -> u32{
         let cluster_offset = SECTORS_PER_CLUSTER;
         let cluster_start = cluster_offset as u64 * cluster as u64 + self.calculate_data_region_start() as u64;
