@@ -19,6 +19,12 @@ pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
 }
+impl Controller{
+    fn enumerate_drives(){
+        IdeController::enumerate_drives();
+        AHCIController::enumerate_drives();
+    }
+}
 
 pub enum DriveType {
     Master = 0xE0,
@@ -64,6 +70,9 @@ impl DriveCollection {
     pub(crate) fn new_drive(&mut self, label: String, info: DriveInfo, controller: Box<dyn DriveController + Send>) {
         let drive = Drive::new(label, info, controller);
         self.drives.push(drive);
+    }
+    pub(crate) fn enumerate_drives(){
+        Controller::enumerate_drives();
     }
     pub fn find_free_label(&self) -> Option<String> {
         let mut used_labels = [false; 26]; // A flag array for each letter A-Z

@@ -301,13 +301,13 @@ impl DriveController for IdeController{
             }
         }
     }
-        fn isController(device: &Device) -> bool {
-            if (device.class_code == 0x1 && device.subclass == 0x1){
-                return true
-            }
-            false
+    fn isController(device: &Device) -> bool {
+        if (device.class_code == 0x1 && device.subclass == 0x1){
+            return true
         }
+        false
     }
+}
 
 bitflags! {
     struct StatusFlags: u8 {
