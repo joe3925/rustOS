@@ -1,7 +1,11 @@
 use x86_64::instructions::port::Port;
+use x86_64::{PhysAddr, VirtAddr};
+use x86_64::structures::idt::ExceptionVector::Page;
+use x86_64::structures::paging::OffsetPageTable;
 use crate::drivers::drive::generic_drive::DriveController;
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
+use crate::memory::paging::{map_mmio_region, BootInfoFrameAllocator};
 use crate::println;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -12,13 +16,21 @@ pub(crate) struct AHCIController {
 impl AHCIController {
     pub fn new() -> Self {
         if let Some(base_addr) = AHCIController::find_sata_controller(){
-            return AHCIController {
+            let controller = AHCIController {
                 mmio_base: base_addr,
-            }
+            };
+
+            return controller
         }
         AHCIController {
             mmio_base: 0x0,
         }
+    }
+    pub fn init(&mut self, mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator)
+    {
+        let mmio_virtual_addr = VirtAddr::new(0xFFFF_FF00_0000_0000);
+        map_mmio_region(mapper, frame_allocator, PhysAddr::new(self.mmio_base), 0, mmio_virtual_addr).expect("TODO: panic message");
+        self.mmio_base = mmio_virtual_addr.as_u64();
     }
     pub fn find_sata_controller() -> Option<u64> {
         let mut address_port = Port::<u32>::new(CONFIG_ADDRESS);
@@ -43,6 +55,14 @@ impl AHCIController {
         }
 
         None // Return None if no SATA controller is found
+    }
+    pub fn get_total_drives(&self) -> u32{
+        unsafe {
+            let hba_cap = *(self.mmio_base as *const u32);
+            let num_ports = (hba_cap & 0b11111) + 1; // Bits [4:0] hold the number of supported ports - 1
+            println!("Number of supported ports: {}", num_ports);
+            num_ports
+        }
     }
 
 }

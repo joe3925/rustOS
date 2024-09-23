@@ -111,3 +111,22 @@ pub fn map_page(
     }
     Ok(())
 }
+pub fn map_mmio_region(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
+    mmio_size: u64,               // The size of the MMIO region
+    virtual_addr: VirtAddr         // The virtual address to map it to
+) -> Result<(), MapToError<Size4KiB>> {
+    let virtAddr = VirtAddr(mmio_base.as_u64());
+    // Calculate the number of pages to map based on the MMIO size
+    let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
+
+    for i in 0..num_pages {
+        let page = Page::containing_address(virtual_addr + i * 4096);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let result = map_page(mapper, page, frame_allocator, flags);
+    }
+
+    Ok(())
+}

@@ -111,7 +111,9 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         PCIBUS.lock().enumerate_pci();
         PCIBUS.lock().print_devices();
     }
-    let controller = AHCIController::new();
+    let mut controller = AHCIController::new();
+    controller.init(&mut mapper, &mut frame_allocator);
+    controller.get_total_drives();
     println!("{}",controller.mmio_base);
     loop{
 
