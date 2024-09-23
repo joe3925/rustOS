@@ -118,14 +118,18 @@ pub fn map_mmio_region(
     mmio_size: u64,               // The size of the MMIO region
     virtual_addr: VirtAddr         // The virtual address to map it to
 ) -> Result<(), MapToError<Size4KiB>> {
-    let virtAddr = VirtAddr(mmio_base.as_u64());
+    // Convert the physical address to a frame
+    let phys_frame = PhysFrame::containing_address(mmio_base);
+
     // Calculate the number of pages to map based on the MMIO size
     let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
 
     for i in 0..num_pages {
         let page = Page::containing_address(virtual_addr + i * 4096);
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        let result = map_page(mapper, page, frame_allocator, flags);
+        unsafe {
+            mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
+        }
     }
 
     Ok(())

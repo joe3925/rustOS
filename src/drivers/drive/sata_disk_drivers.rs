@@ -29,7 +29,7 @@ impl AHCIController {
     pub fn init(&mut self, mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator)
     {
         let mmio_virtual_addr = VirtAddr::new(0xFFFF_FF00_0000_0000);
-        map_mmio_region(mapper, frame_allocator, PhysAddr::new(self.mmio_base), 0, mmio_virtual_addr).expect("TODO: panic message");
+        map_mmio_region(mapper, frame_allocator, PhysAddr::new(self.mmio_base), 8192, mmio_virtual_addr).expect("TODO: panic message");
         self.mmio_base = mmio_virtual_addr.as_u64();
     }
     pub fn find_sata_controller() -> Option<u64> {
