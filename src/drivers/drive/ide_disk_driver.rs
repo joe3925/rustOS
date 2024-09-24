@@ -12,7 +12,7 @@ use crate::drivers::interrupt_index::send_eoi;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Lazy;
 use spin::mutex::Mutex;
-use crate::drivers::drive::generic_drive::{Controller, Drive, DriveCollection, DriveController, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{Controller, Drive, DriveCollection, DriveController, DriveInfo, DRIVECOLLECTION};
 use crate::drivers::pci::device_collection::Device;
 
 const PRIMARY_CMD_BASE: u16 = 0x1F0;
@@ -72,22 +72,7 @@ pub(crate) extern "x86-interrupt" fn secondary_drive_irq_handler(_stack_frame: I
     // Acknowledge the IRQ (send End of Interrupt to PIC)
     send_eoi(drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8());
 }
-#[derive(Debug, Clone)]
-pub struct DriveInfo {
-    pub drive_label: String,
-    pub model: String,
-    pub serial: String,
-    pub capacity: u64,
-}
-impl DriveInfo {
-    pub fn print(&self) {
-        println!("Drive Label: {}", self.drive_label);
-        println!("Model: {}", self.model);
-        println!("Serial Number: {}", self.serial);
-        println!("Capacity: {} bytes", self.capacity);
-        println!("--------------------------------");
-    }
-}
+
 
 pub struct IdeController {
     data_port: Port<u16>,
@@ -100,10 +85,11 @@ pub struct IdeController {
     command_port: Port<u8>,
     alternative_command_port: Port<u8>,
     control_port: Port<u8>,
+    managed_port: u8,
 }
 
 impl IdeController {
-    pub const fn new() -> Self {
+    pub const fn new(managed_port: u32) -> Self {
         IdeController {
             data_port: Port::new(DATA_REG),
             error_port: Port::new(ERROR_REG),
@@ -115,6 +101,7 @@ impl IdeController {
             command_port: Port::new(PRIMARY_STATUS_REG),
             alternative_command_port: Port::new(STATUS_REG),
             control_port: Port::new(CONTROL_REG),
+            managed_port: managed_port as u8
         }
     }
     fn identify_drive(&mut self, drive: u8) -> Option<DriveInfo> {
@@ -151,7 +138,7 @@ impl IdeController {
             let capacity = ((data[60] as u64) | ((data[61] as u64) << 16)) * 512; // Assuming 512 bytes per sector
 
             Some(DriveInfo {
-                drive_label: if drive == 0 { "C:".to_string() } else { "D:".to_string() },
+                port: if drive == 0 { 0xE0 } else { 0xF0 },
                 model,
                 serial,
                 capacity,
@@ -187,7 +174,7 @@ impl DriveController for IdeController{
             assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
 
             unsafe {
-                let drive_selector = self.drive_selector_from_label(label.to_string());
+                let drive_selector = self.managed_port;
 
                 // Wait until the drive is not busy
                 while self.command_port.read() & 0x80 != 0 {}  // BSY
@@ -236,7 +223,7 @@ impl DriveController for IdeController{
             assert_eq!(buffer.len(), 512);
 
             unsafe {
-                let drive_selector = self.drive_selector_from_label(label.to_string());
+                let drive_selector = self.managed_port;
 
                 // Wait until the drive is not busy
                 while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
@@ -283,13 +270,13 @@ impl DriveController for IdeController{
         }
     fn enumerate_drives() {
         let mut drive_collection = DRIVECOLLECTION.lock();
-        let mut ide_controller = Self::new();
+        let mut ide_controller = Self::new(0x0);
 
         // Check for the master drive
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(0) {  // Master drive
                 // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info, Box::new(IdeController::new()));
+                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
             }
         }
 
@@ -297,12 +284,12 @@ impl DriveController for IdeController{
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(1) {  // Slave drive
                 // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info,  Box::new(IdeController::new()));
+                drive_collection.new_drive(label, info,  Box::new(IdeController::new(0xF0)));
             }
         }
     }
     fn isController(device: &Device) -> bool {
-        if (device.class_code == 0x1 && device.subclass == 0x1){
+        if (device.class_code == 0x01 && device.subclass == 0x01){
             return true
         }
         false

@@ -25,6 +25,7 @@ use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
+use crate::drivers::drive::generic_drive::DriveController;
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::interrupt_index;
@@ -106,15 +107,11 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
-
     unsafe {
         PCIBUS.lock().enumerate_pci();
-        PCIBUS.lock().print_devices();
     }
-    let mut controller = AHCIController::new();
-    controller.init(&mut mapper, &mut frame_allocator);
-    controller.get_total_drives();
-    println!("{}",controller.mmio_base);
+    AHCIController::map(&mut mapper, &mut frame_allocator);
+    AHCIController::enumerate_drives();
     loop{
 
     }

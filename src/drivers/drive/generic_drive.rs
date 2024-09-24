@@ -5,11 +5,12 @@ use alloc::vec;
 use alloc::vec::Vec;
 use spin::Lazy;
 use spin::mutex::Mutex;
-use crate::drivers::drive::ide_disk_driver::{DriveInfo, IdeController};
+use crate::drivers::drive::ide_disk_driver::{ IdeController};
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use strum::IntoEnumIterator; // Trait for iterating over enum variants
 use strum_macros::EnumIter;
 use crate::drivers::pci::device_collection::Device;
+use crate::println;
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -31,6 +32,22 @@ pub enum DriveType {
     Master = 0xE0,
     Slave = 0xF0,
     AHCI = 0x00,
+}
+#[derive(Debug, Clone)]
+pub struct DriveInfo {
+    pub model: String,
+    pub serial: String,
+    pub port: u32,
+    pub capacity: u64,
+}
+impl DriveInfo {
+    pub fn print(&self) {
+        println!("Drive port: {}", self.port);
+        println!("Model: {}", self.model);
+        println!("Serial Number: {}", self.serial);
+        println!("Capacity: {} bytes", self.capacity);
+        println!("--------------------------------");
+    }
 }
 
 // All drives must implement this trait
@@ -76,6 +93,7 @@ impl DriveCollection {
         <IdeController as DriveController>::enumerate_drives();
         <AHCIController as DriveController>::enumerate_drives();
     }
+
     pub fn find_free_label(&self) -> Option<String> {
         let mut used_labels = [false; 26]; // A flag array for each letter A-Z
 
