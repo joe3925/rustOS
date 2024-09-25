@@ -61,6 +61,7 @@ mod exception_handlers {
 }
 mod structs{
     pub mod linked_list;
+    pub mod aligned_buffer;
 }
  mod file_system {
     pub mod FAT;

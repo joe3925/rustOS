@@ -126,7 +126,7 @@ pub fn map_mmio_region(
 
     for i in 0..num_pages {
         let page = Page::containing_address(virtual_addr + i * 4096);
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
         unsafe {
             mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
         }
