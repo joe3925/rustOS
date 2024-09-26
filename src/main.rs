@@ -69,14 +69,11 @@ mod structs{
     pub mod FAT;
      pub mod file;
 }
-
+static mut BOOT_INFO: Option<&'static BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
-}
-lazy_static! {
-    static ref BOOT_INFO: Mutex<Option<&'static BootInfo>> = Mutex::new(None);
 }
 pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController, file_name: String, dir_path: &str) {
     // Create a directory where the file will be stored
@@ -103,6 +100,7 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
+    unsafe { BOOT_INFO = Some(boot_info); }
     gdt::init();
     load_idt();
     unsafe { interrupt_index::PICS.lock().initialize() };

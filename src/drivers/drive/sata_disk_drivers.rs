@@ -11,10 +11,11 @@ use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
 use core::ptr::{read_volatile, write_volatile};
+use bootloader::BootInfo;
 use crate::structs::aligned_buffer;
 
 use crate::{println, BOOT_INFO};
-use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer256};
+use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -30,15 +31,48 @@ pub(crate) struct AHCIController {
 }
 unsafe impl Send for AHCIController {}
 
-pub(crate) struct AHCIPortRegisters {
-    pub(crate) cmd: *mut u32,    // PxCMD: Command and Status
-    pub(crate) is: *mut u32,     // PxIS: Interrupt Status
-    pub(crate) ci: *mut u32,     // PxCI: Command Issue
-    pub(crate) CLB: *mut u32,
-    pub(crate) CLBU: *mut u32,
-    pub(crate) FB: *mut u32,
-    pub(crate) FBU: *mut u32,
+#[repr(C)]
+struct CommandHeader {
+    flags: u16,
+    prdtl: u16,
+    prdbc: u32,
+    ctba: u32,
+    ctbau: u32,
+    reserved: [u32; 4],
 }
+
+#[repr(C)]
+struct CommandTable {
+    command_fis: [u8; 64],  // Command FIS
+    atapi_command: [u8; 16], // ATAPI Command (if applicable)
+    reserved: [u8; 48],
+    prdt_entry: [PRDTEntry; 8], // Physical Region Descriptor Table (PRDT) entries
+}
+
+#[repr(C)]
+struct PRDTEntry {
+    data_base_address: u32,
+    data_base_address_upper: u32,
+    reserved: u32,
+    byte_count: u32,
+}
+
+#[repr(C)]
+struct AHCICommandList {
+    command_headers: [CommandHeader; 32], // AHCI supports up to 32 command slots
+}
+
+#[repr(C)]
+struct AHCIPortRegisters {
+    cmd: *mut u32, // Command Register
+    is: *mut u32,  // Interrupt Status Register
+    ci: *mut u32,  // Command Issue Register
+    CLB: *mut u32, // Command List Base
+    CLBU: *mut u32, // Command List Base Upper
+    FB: *mut u32, // FIS Base Address
+    FBU: *mut u32, // FIS Base Upper Address
+}
+
 impl AHCIController {
     pub fn new() -> Self {
         let mut controller =
@@ -51,15 +85,39 @@ impl AHCIController {
                 FIS_Buffer: Vec::new(),
 
             };
-        unsafe { controller.init(); }
+        controller.init();
         controller
     }
-    pub unsafe fn init(&mut self) {
+    pub fn init(&mut self) {
         self.total_ports = self.get_total_ports();
         self.occupied_ports = self.get_total_drives();
+        unsafe {
+            // Initialize port registers
+            self.initialize_port_registers();
+            println!("init ports");
+            // Disable ports before setup
+            self.disable_ports();
+            println!("disable ports");
+            // Allocate Command List and FIS buffers
+            self.allocate_buffers();
+            println!("allocate buffers");
 
-        //create the port registers
-        let mut ports_registers = Vec::new();
+            // Set up command tables and list for each occupied port
+            self.setup_command_tables();
+            println!("command table");
+
+            // Re-enable ports after setup
+            self.enable_ports();
+            println!("enable ports");
+
+        }
+
+        // The device is now initialized
+    }
+
+    /// Initialize port registers based on the total number of ports.
+    unsafe fn initialize_port_registers(&mut self) {
+        let mut ports_registers = Vec::with_capacity(self.total_ports as usize);
 
         for i in 0..self.total_ports {
             let port_base = self.mmio_base + 0x100 + (i as u64 * 0x80);
@@ -68,53 +126,109 @@ impl AHCIController {
                 cmd: (port_base + 0x18) as *mut u32, // PxCMD register at offset 0x18
                 is: (port_base + 0x10) as *mut u32,  // PxIS register at offset 0x10
                 ci: (port_base + 0x38) as *mut u32,  // PxCI register at offset 0x38
-                CLB: (port_base + 0x00) as *mut u32,
-                CLBU: (port_base + 0x04) as *mut u32,
-                FB: (port_base + 0x08) as *mut u32,
-                FBU: (port_base + 0x0C) as *mut u32,
+                CLB: (port_base + 0x00) as *mut u32, // Command List Base
+                CLBU: (port_base + 0x04) as *mut u32, // Command List Base Upper
+                FB: (port_base + 0x08) as *mut u32, // FIS Base
+                FBU: (port_base + 0x0C) as *mut u32, // FIS Base Upper
             });
         }
 
-
         self.ports_registers = ports_registers;
-        //This will not work change to index with the values of occupied ports
-        for mut port  in 0..self.occupied_ports.len() {
-            let mut cmd_value = unsafe { read_volatile(self.ports_registers[self.occupied_ports[port] as usize].cmd) };
-            // Step 2: Clear bit 0 and bit 8 of the command register
-            cmd_value &= !(1 << 0);  // Clear bit 0
-            cmd_value &= !(1 << 8);  // Clear bit 8
+    }
 
-            unsafe {
-                write_volatile(self.ports_registers[self.occupied_ports[port] as usize].cmd, cmd_value);
-            }
+    /// Disable ports by clearing ST (bit 0) and FRE (bit 8).
+    unsafe fn disable_ports(&mut self) {
+        for port_index in 0..self.occupied_ports.len() {
+            // Ensure no commands are active by waiting for CI to be 0
+            while read_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].ci) != 0 {}
 
+            let mut cmd_value = read_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].cmd);
+            cmd_value &= !(1 << 0);  // Clear bit 0 (ST)
+            cmd_value &= !(1 << 8);  // Clear bit 8 (FRE)
+            write_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].cmd, cmd_value);
+
+
+            // Wait until CR (bit 15) and FRE (bit 14) are cleared
             loop {
-                let cmd_value = unsafe { read_volatile(self.ports_registers[self.occupied_ports[port] as usize].cmd) };
+                let cmd_value = read_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].cmd);
+                println!("{}", cmd_value & (1 << 14));
+                println!("{}", cmd_value & (1 << 15));
 
-                if (cmd_value & (1 << 14)) == 0 && (cmd_value & (1 << 15)) == 0 {
+                if (cmd_value & (1 << 15)) == 0 && (cmd_value & (1 << 15)) == 0 {
                     break;
                 }
             }
         }
-        for _port in 0..self.total_ports{
-            let buffer_1024 = AlignedBuffer1024::new();
+    }
+
+    /// Allocate memory for Command List and FIS buffers.
+    unsafe fn allocate_buffers(&mut self) {
+        for _ in 0..self.total_ports {
+            let buffer_1024 = AlignedBuffer1024::new(); // For Command List
             self.command_list_buffers.push(buffer_1024);
 
-            let buffer_256 = AlignedBuffer256::new();
+            let buffer_256 = AlignedBuffer256::new(); // For FIS
             self.FIS_Buffer.push(buffer_256);
         }
-        for port in self.occupied_ports.clone(){
-            let mem_offset = VirtAddr::new(BOOT_INFO.lock().unwrap().physical_memory_offset);
+    }
+
+    /// Setup command tables and initialize Command Headers for each port.
+    unsafe fn setup_command_tables(&mut self) {
+        for port in self.occupied_ports.clone() {
+            let mem_offset = VirtAddr::new(BOOT_INFO.unwrap().physical_memory_offset);
+
+            // Set Command List Base (CLB) and CLBU
             let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize] as *const _ as u64));
-            self.ports_registers[port as usize].CLB.write_volatile(command_list_address.as_u64() as u32);
-            self.ports_registers[port as usize].CLBU.write_volatile((command_list_address.as_u64() >> 32) as u32);
+            write_volatile(self.ports_registers[port as usize].CLB, command_list_address.as_u64() as u32);
+            write_volatile(self.ports_registers[port as usize].CLBU, (command_list_address.as_u64() >> 32) as u32);
 
-            let FIS_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize] as *const _ as u64));
-            self.ports_registers[port as usize].FB.write_volatile(FIS_address.as_u64() as u32);
-            self.ports_registers[port as usize].FBU.write_volatile((FIS_address.as_u64() >> 32) as u32);
+            // Set FIS Base (FB) and FBU
+            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize] as *const _ as u64));
+            write_volatile(self.ports_registers[port as usize].FB, fis_address.as_u64() as u32);
+            write_volatile(self.ports_registers[port as usize].FBU, (fis_address.as_u64() >> 32) as u32);
+
+            // Allocate an 8KiB buffer for the Command Table (CT)
+            let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
+
+            // Calculate the physical address of the Command Table
+            let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer as *const _ as u64));
+
+            // Initialize Command Headers
+            self.initialize_command_headers(port, command_table_address);
         }
-        for i in 0..32{
+    }
 
+    /// Initialize command headers for each occupied port.
+    unsafe fn initialize_command_headers(&mut self, port: u32, command_table_address: PhysAddr) {
+        const COMMAND_HEADER_SIZE: usize = 32;
+        const NUM_COMMAND_HEADERS: usize = 32;
+
+        for cmdheader_index in 0..NUM_COMMAND_HEADERS {
+            // Get a pointer to the start of the command list buffer for the current port
+            let command_list_base_ptr = self.command_list_buffers[port as usize].buffer.as_mut_ptr();
+
+            // Calculate the offset for the current Command Header
+            let cmdheader_ptr = command_list_base_ptr.add(cmdheader_index * COMMAND_HEADER_SIZE) as *mut CommandHeader;
+
+            // Dereference the pointer to get the actual Command Header
+            let cmdheader = &mut *cmdheader_ptr;
+
+            // Set CTBA to the lower 32 bits and CTBAU to the upper 32 bits
+            cmdheader.ctba = command_table_address.as_u64() as u32;
+            cmdheader.ctbau = (command_table_address.as_u64() >> 32) as u32;
+
+            // Set the Physical Region Descriptor Table Length (prdtl) to 8 (default for now)
+            cmdheader.prdtl = 8;
+        }
+    }
+
+    /// Re-enable ports by setting ST (bit 0) and FRE (bit 8).
+    unsafe fn enable_ports(&mut self) {
+        for port_index in 0..self.occupied_ports.len() {
+            let mut cmd_value = read_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].cmd);
+            cmd_value |= (1 << 0);  // Set bit 0 (ST)
+            cmd_value |= (1 << 8);  // Set bit 8 (FRE)
+            write_volatile(self.ports_registers[self.occupied_ports[port_index] as usize].cmd, cmd_value);
         }
     }
 

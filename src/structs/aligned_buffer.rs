@@ -22,12 +22,12 @@ impl AlignedBuffer256 {
 }
 #[repr(align(128))]
 pub(crate) struct AlignedBuffer128 {
-    pub(crate) buffer: [u8; 256],
+    pub(crate) buffer: [u8; 8192],
 }
 impl AlignedBuffer128 {
     pub(crate) fn new() -> Self {
         Self {
-            buffer: [0; 256], // Initialize the buffer with zeros
+            buffer: [0; 8192], // Initialize the buffer with zeros
         }
     }
 }
