@@ -9,11 +9,11 @@ use x86_64::structures::paging::OffsetPageTable;
 use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
-use crate::memory::paging::{map_mmio_region, BootInfoFrameAllocator};
+use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
 use core::ptr::{read_volatile, write_volatile};
 use crate::structs::aligned_buffer;
 
-use crate::println;
+use crate::{println, BOOT_INFO};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer256};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -34,6 +34,10 @@ pub(crate) struct AHCIPortRegisters {
     pub(crate) cmd: *mut u32,    // PxCMD: Command and Status
     pub(crate) is: *mut u32,     // PxIS: Interrupt Status
     pub(crate) ci: *mut u32,     // PxCI: Command Issue
+    pub(crate) CLB: *mut u32,
+    pub(crate) CLBU: *mut u32,
+    pub(crate) FB: *mut u32,
+    pub(crate) FBU: *mut u32,
 }
 impl AHCIController {
     pub fn new() -> Self {
@@ -47,10 +51,10 @@ impl AHCIController {
                 FIS_Buffer: Vec::new(),
 
             };
-        controller.init();
+        unsafe { controller.init(); }
         controller
     }
-    pub fn init(&mut self) {
+    pub unsafe fn init(&mut self) {
         self.total_ports = self.get_total_ports();
         self.occupied_ports = self.get_total_drives();
 
@@ -64,6 +68,10 @@ impl AHCIController {
                 cmd: (port_base + 0x18) as *mut u32, // PxCMD register at offset 0x18
                 is: (port_base + 0x10) as *mut u32,  // PxIS register at offset 0x10
                 ci: (port_base + 0x38) as *mut u32,  // PxCI register at offset 0x38
+                CLB: (port_base + 0x00) as *mut u32,
+                CLBU: (port_base + 0x04) as *mut u32,
+                FB: (port_base + 0x08) as *mut u32,
+                FBU: (port_base + 0x0C) as *mut u32,
             });
         }
 
@@ -94,6 +102,19 @@ impl AHCIController {
 
             let buffer_256 = AlignedBuffer256::new();
             self.FIS_Buffer.push(buffer_256);
+        }
+        for port in self.occupied_ports.clone(){
+            let mem_offset = VirtAddr::new(BOOT_INFO.lock().unwrap().physical_memory_offset);
+            let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize] as *const _ as u64));
+            self.ports_registers[port as usize].CLB.write_volatile(command_list_address.as_u64() as u32);
+            self.ports_registers[port as usize].CLBU.write_volatile((command_list_address.as_u64() >> 32) as u32);
+
+            let FIS_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize] as *const _ as u64));
+            self.ports_registers[port as usize].FB.write_volatile(FIS_address.as_u64() as u32);
+            self.ports_registers[port as usize].FBU.write_volatile((FIS_address.as_u64() >> 32) as u32);
+        }
+        for i in 0..32{
+
         }
     }
 

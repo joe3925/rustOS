@@ -23,6 +23,8 @@ use alloc::{format};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
+use lazy_static::lazy_static;
+use spin::mutex::Mutex;
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
 use crate::drivers::drive::generic_drive::DriveController;
@@ -73,6 +75,9 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
+lazy_static! {
+    static ref BOOT_INFO: Mutex<Option<&'static BootInfo>> = Mutex::new(None);
+}
 pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController, file_name: String, dir_path: &str) {
     // Create a directory where the file will be stored
 
@@ -112,7 +117,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         PCIBUS.lock().enumerate_pci();
     }
     AHCIController::map(&mut mapper, &mut frame_allocator);
-    AHCIController::enumerate_drives();
+    AHCIController::new();
     loop{
 
     }
