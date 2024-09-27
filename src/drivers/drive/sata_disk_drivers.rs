@@ -2,7 +2,6 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ascii::Char::Null;
 use x86_64::instructions::port::Port;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::idt::ExceptionVector::Page;
@@ -17,8 +16,8 @@ use crate::structs::aligned_buffer;
 use crate::drivers::drive::AHCI_structs;
 
 use crate::{println, BOOT_INFO};
-use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, FisRegH2D, FisType};
-use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256};
+use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D, FisType};
+use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -140,12 +139,12 @@ impl AHCIController {
             let mem_offset = VirtAddr::new(BOOT_INFO.unwrap().physical_memory_offset);
 
             // Set Command List Base (CLB) and CLBU
-            let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize] as *const _ as u64));
+            let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize].buffer as *const _ as u64));
             write_volatile(self.ports_registers[port as usize].CLB, command_list_address.as_u64() as u32);
             write_volatile(self.ports_registers[port as usize].CLBU, (command_list_address.as_u64() >> 32) as u32);
 
             // Set FIS Base (FB) and FBU
-            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize] as *const _ as u64));
+            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize].buffer as *const _ as u64));
             write_volatile(self.ports_registers[port as usize].FB, fis_address.as_u64() as u32);
             write_volatile(self.ports_registers[port as usize].FBU, (fis_address.as_u64() >> 32) as u32);
 
@@ -153,7 +152,7 @@ impl AHCIController {
             let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
 
             // Calculate the physical address of the Command Table
-            let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer as *const _ as u64));
+            let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
 
             // Initialize Command Headers
             self.initialize_command_headers(port, command_table_address);
@@ -258,31 +257,78 @@ impl AHCIController {
         println!("total drives: {}", drives[0]);
         drives
     }
-    pub fn identify_drive(&self, port: u32) -> Option<DriveInfo> {
-        let mut fis = FisRegH2D{
-            fis_type: 0,
-            pm_port: 0,
-            command: 0,
-            feature_low: 0,
-            lba0: 0,
-            lba1: 0,
-            lba2: 0,
-            device: 0,
-            lba3: 0,
-            lba4: 0,
-            lba5: 0,
-            feature_high: 0,
-            count_low: 0,
-            count_high: 0,
-            icc: 0,
-            control: 0,
-            reserved: [0; 4],
-        };
-        fis.fis_type = FisType::FIS_TYPE_REG_H2D as u8;
-        fis.command = 0xEC; // ID command
-        fis.device = 0;
-        fis.control = 1;
-        None
+    pub fn identify_drive(&mut self, port: u32) -> Option<DriveInfo> {
+        // Step 1: Set up the FIS for the IDENTIFY DEVICE command (0xEC)
+        let mut fis = FisRegH2D::new(0xEC, 0, 1); // Identify device has no specific LBA, sector_count = 1
+
+        // Step 2: Get the Command Header and Command Table for this port
+        let command_list_base_ptr = self.command_list_buffers[port as usize].buffer.as_mut_ptr();
+        let command_header_ptr = command_list_base_ptr as *mut CommandHeader;
+        let command_header = unsafe { &mut *command_header_ptr };
+
+        // Set the flags in the Command Header: Command FIS length (5 DWORDs) and write (0 for IDENTIFY)
+        command_header.flags = (size_of::<FisRegH2D>() / 4) as u16; // 5 DWORDs for the FIS
+        command_header.prdtl = 1; // One PRD entry
+
+        // Step 3: Set up the Command Table and add the FIS to it
+        let command_table_base_ptr = command_header.ctba as *mut CommandTable;
+        let command_table = unsafe { &mut *command_table_base_ptr };
+
+        // Clear the command table
+        unsafe { core::ptr::write_bytes(command_table as *mut CommandTable, 0, 1) };
+
+        // Copy the FIS into the Command Table
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &fis as *const FisRegH2D as *const u8,
+                command_table.command_fis.as_mut_ptr(),
+                size_of::<FisRegH2D>(),
+            );
+        }
+
+        // Set up a Physical Region Descriptor (PRD) to point to the buffer for the response data
+        let identify_buffer = AlignedBuffer512::new(); // Assume 512-byte aligned buffer for the IDENTIFY response
+        command_table.prdt_entry[0].data_base_address = identify_buffer.buffer.as_ptr() as u32;
+        command_table.prdt_entry[0].data_base_address_upper = (identify_buffer.buffer.as_ptr() as u64 >> 32) as u32;
+        command_table.prdt_entry[0].byte_count = 512 - 1; // 512 bytes to transfer (byte_count field is size-1)
+
+        // Step 4: Issue the command by setting the Command Issue (CI) bit for this slot
+        unsafe {
+            let cmd_issue = self.ports_registers[port as usize].ci;
+            *cmd_issue |= 1; // Set the first slot in the Command Issue register
+        }
+
+        // Step 5: Poll for the command completion by checking the Interrupt Status (IS) and Command Issue (CI)
+        loop {
+            let is_register = unsafe { read_volatile(self.ports_registers[port as usize].is) };
+            let ci_register = unsafe { read_volatile(self.ports_registers[port as usize].ci) };
+
+            // Check if the command has completed (CI bit cleared)
+            if (ci_register & 1) == 0 {
+                break;
+            }
+
+            // Check for any errors in the Interrupt Status (IS) register
+            if is_register & 0x40000000 != 0 {
+                println!("Error during IDENTIFY DEVICE");
+                return None;
+            }
+        }
+
+        // Step 6: Retrieve the data from the buffer
+        let identify_data = unsafe { core::slice::from_raw_parts(identify_buffer.buffer.as_ptr(), 512) };
+
+        // Parse the IDENTIFY DEVICE response data (model name, serial number, etc.)
+        let model_name = String::from_utf8_lossy(&identify_data[54..94]).to_string(); // Example: extract the model name
+        let serial_number = String::from_utf8_lossy(&identify_data[20..40]).to_string(); // Example: extract the serial number
+
+        // Step 7: Return the parsed DriveInfo
+        Some(DriveInfo {
+            model: model_name,
+            serial: serial_number,
+            port: 1,
+            capacity: 0,
+        })
     }
 
 
@@ -297,7 +343,7 @@ impl DriveController for AHCIController{
     }
 
      fn enumerate_drives(){
-        let controller = AHCIController::new();
+        let mut controller = AHCIController::new();
         println!("Occupied ports: {:#?}, Total Ports: {:#?}",controller.occupied_ports,
                  controller.total_ports);
         let mut drive_collection = DRIVECOLLECTION.lock();

@@ -9,6 +9,17 @@ impl AlignedBuffer1024 {
         }
     }
 }
+#[repr(align(512))]
+pub(crate) struct AlignedBuffer512 {
+    pub(crate) buffer: [u8; 512],
+}
+impl AlignedBuffer512 {
+    pub(crate) fn new() -> Self {
+        Self {
+            buffer: [0; 512], // Initialize the buffer with zeros
+        }
+    }
+}
 #[repr(align(256))]
 pub(crate) struct AlignedBuffer256 {
     pub(crate) buffer: [u8; 256],

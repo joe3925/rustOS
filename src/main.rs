@@ -116,7 +116,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         PCIBUS.lock().enumerate_pci();
     }
     AHCIController::map(&mut mapper, &mut frame_allocator);
-    AHCIController::new();
+    AHCIController::enumerate_drives();
     loop{
 
     }
