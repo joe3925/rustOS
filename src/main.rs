@@ -46,6 +46,7 @@ mod drivers {
         pub mod ide_disk_driver;
         pub mod sata_disk_drivers;
         pub mod generic_drive;
+        pub mod AHCI_structs;
     }
     pub mod pci{
         pub mod device_collection;

@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::ascii::Char::Null;
 use x86_64::instructions::port::Port;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::idt::ExceptionVector::Page;
@@ -13,8 +14,10 @@ use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAlloc
 use core::ptr::{read_volatile, write_volatile};
 use bootloader::BootInfo;
 use crate::structs::aligned_buffer;
+use crate::drivers::drive::AHCI_structs;
 
 use crate::{println, BOOT_INFO};
+use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, FisRegH2D, FisType};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -31,47 +34,6 @@ pub(crate) struct AHCIController {
 }
 unsafe impl Send for AHCIController {}
 
-#[repr(C)]
-struct CommandHeader {
-    flags: u16,
-    prdtl: u16,
-    prdbc: u32,
-    ctba: u32,
-    ctbau: u32,
-    reserved: [u32; 4],
-}
-
-#[repr(C)]
-struct CommandTable {
-    command_fis: [u8; 64],  // Command FIS
-    atapi_command: [u8; 16], // ATAPI Command (if applicable)
-    reserved: [u8; 48],
-    prdt_entry: [PRDTEntry; 8], // Physical Region Descriptor Table (PRDT) entries
-}
-
-#[repr(C)]
-struct PRDTEntry {
-    data_base_address: u32,
-    data_base_address_upper: u32,
-    reserved: u32,
-    byte_count: u32,
-}
-
-#[repr(C)]
-struct AHCICommandList {
-    command_headers: [CommandHeader; 32], // AHCI supports up to 32 command slots
-}
-
-#[repr(C)]
-struct AHCIPortRegisters {
-    cmd: *mut u32, // Command Register
-    is: *mut u32,  // Interrupt Status Register
-    ci: *mut u32,  // Command Issue Register
-    CLB: *mut u32, // Command List Base
-    CLBU: *mut u32, // Command List Base Upper
-    FB: *mut u32, // FIS Base Address
-    FBU: *mut u32, // FIS Base Upper Address
-}
 
 impl AHCIController {
     pub fn new() -> Self {
@@ -297,7 +259,30 @@ impl AHCIController {
         drives
     }
     pub fn identify_drive(&self, port: u32) -> Option<DriveInfo> {
-        todo!()
+        let mut fis = FisRegH2D{
+            fis_type: 0,
+            pm_port: 0,
+            command: 0,
+            feature_low: 0,
+            lba0: 0,
+            lba1: 0,
+            lba2: 0,
+            device: 0,
+            lba3: 0,
+            lba4: 0,
+            lba5: 0,
+            feature_high: 0,
+            count_low: 0,
+            count_high: 0,
+            icc: 0,
+            control: 0,
+            reserved: [0; 4],
+        };
+        fis.fis_type = FisType::FIS_TYPE_REG_H2D as u8;
+        fis.command = 0xEC; // ID command
+        fis.device = 0;
+        fis.control = 1;
+        None
     }
 
 
