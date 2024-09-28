@@ -1,6 +1,6 @@
 #[repr(C)]
 pub struct CommandHeader {
-    flags: u16,
+    pub(crate) flags: u16,
     pub(crate) prdtl: u16,
     prdbc: u32,
     pub(crate) ctba: u32,
@@ -10,18 +10,18 @@ pub struct CommandHeader {
 
 #[repr(C)]
 pub struct CommandTable {
-    command_fis: [u8; 64],  // Command FIS
+    pub(crate) command_fis: [u8; 64],  // Command FIS
     atapi_command: [u8; 16], // ATAPI Command (if applicable)
     reserved: [u8; 48],
-    prdt_entry: [PRDTEntry; 8], // Physical Region Descriptor Table (PRDT) entries
+    pub(crate) prdt_entry: [PRDTEntry; 8], // Physical Region Descriptor Table (PRDT) entries
 }
 
 #[repr(C)]
 pub struct PRDTEntry {
-    data_base_address: u32,
-    data_base_address_upper: u32,
+    pub(crate) data_base_address: u32,
+    pub(crate) data_base_address_upper: u32,
     reserved: u32,
-    byte_count: u32,
+    pub(crate) byte_count: u32,
 }
 
 #[repr(C)]
@@ -41,7 +41,7 @@ pub struct AHCIPortRegisters {
 #[repr(C, packed)]
 pub struct FisRegH2D {
     pub fis_type: u8,      // FIS type – 0x27 for Register H2D FIS
-    pub pm_port: u8,       // Port multiplier, Command Control (bit 7 should be set for commands)
+    pub pm_port_cmd_control: u8,       // Port multiplier, Command Control (bit 7 should be set for commands)
     pub command: u8,       // Command register (e.g., 0xEC for IDENTIFY DEVICE)
     pub feature_low: u8,   // Feature register, 7:0
 
@@ -67,7 +67,7 @@ impl FisRegH2D {
     pub fn new(command: u8, lba: u64, sector_count: u16) -> Self {
         FisRegH2D {
             fis_type: 0x27,  // H2D FIS type
-            pm_port: 1 << 7, // Set the Command bit (bit 7)
+            pm_port_cmd_control: 1 << 7, // Set the Command bit (bit 7)
             command,         // ATA command (e.g., 0xEC for IDENTIFY DEVICE)
             feature_low: 0,
             feature_high: 0,
