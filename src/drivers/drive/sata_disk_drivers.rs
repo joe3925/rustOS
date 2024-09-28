@@ -267,7 +267,7 @@ impl AHCIController {
         let command_header = unsafe { &mut *command_header_ptr };
 
         // Set the flags in the Command Header: Command FIS length (5 DWORDs) and write (0 for IDENTIFY)
-        command_header.flags = (size_of::<FisRegH2D>() / 4) as u16; // 5 DWORDs for the FIS
+        command_header.flags = ( core::mem::size_of::<FisRegH2D>() / 4) as u16; // 5 DWORDs for the FIS
         command_header.prdtl = 1; // One PRD entry
 
         // Step 3: Set up the Command Table and add the FIS to it
@@ -282,7 +282,7 @@ impl AHCIController {
             core::ptr::copy_nonoverlapping(
                 &fis as *const FisRegH2D as *const u8,
                 command_table.command_fis.as_mut_ptr(),
-                size_of::<FisRegH2D>(),
+                core::mem::size_of::<FisRegH2D>(),
             );
         }
 
