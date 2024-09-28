@@ -101,7 +101,8 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_contr
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
-    unsafe { BOOT_INFO = Some(boot_info); }
+
+    unsafe { BOOT_INFO = Some(boot_info); } //RustRover will mark this as an error not sure why
     gdt::init();
     load_idt();
     unsafe { interrupt_index::PICS.lock().initialize() };

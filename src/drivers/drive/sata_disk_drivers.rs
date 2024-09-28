@@ -15,7 +15,7 @@ use bootloader::BootInfo;
 use crate::structs::aligned_buffer;
 use crate::drivers::drive::AHCI_structs;
 
-use crate::{println, BOOT_INFO};
+use crate::{panic, println, BOOT_INFO};
 use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D, FisType};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 
@@ -29,6 +29,7 @@ pub(crate) struct AHCIController {
     pub(crate) ports_registers: Vec<AHCIPortRegisters>,
     pub(crate) command_list_buffers: Vec<AlignedBuffer1024>,
     pub(crate) FIS_Buffer: Vec<AlignedBuffer256>,
+    pub(crate) command_table_virt_addr: Vec<VirtAddr>,
 
 }
 unsafe impl Send for AHCIController {}
@@ -44,6 +45,7 @@ impl AHCIController {
                 ports_registers: Vec::new(),
                 command_list_buffers: Vec::new(),
                 FIS_Buffer: Vec::new(),
+                command_table_virt_addr: Vec::new(),
 
             };
         controller.init();
@@ -135,7 +137,7 @@ impl AHCIController {
 
     /// Setup command tables and initialize Command Headers for each port.
     unsafe fn setup_command_tables(&mut self) {
-        for port in self.occupied_ports.clone() {
+        for port in 0..self.total_ports.clone() {
             let mem_offset = VirtAddr::new(BOOT_INFO.unwrap().physical_memory_offset);
 
             // Set Command List Base (CLB) and CLBU
@@ -152,6 +154,7 @@ impl AHCIController {
             let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
 
             // Calculate the physical address of the Command Table
+            self.command_table_virt_addr.push(VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
             let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
 
             // Initialize Command Headers
@@ -263,6 +266,7 @@ impl AHCIController {
 
         // Step 2: Get the Command Header and Command Table for this port
         let command_list_base_ptr = self.command_list_buffers[port as usize].buffer.as_mut_ptr();
+        let command_table_virtAddr = self.command_table_virt_addr[(port) as usize];
         let command_header_ptr = command_list_base_ptr as *mut CommandHeader;
         let command_header = unsafe { &mut *command_header_ptr };
 
@@ -271,7 +275,7 @@ impl AHCIController {
         command_header.prdtl = 1; // One PRD entry
 
         // Step 3: Set up the Command Table and add the FIS to it
-        let command_table_base_ptr = command_header.ctba as *mut CommandTable;
+        let command_table_base_ptr = command_table_virtAddr.as_u64() as *mut CommandTable;
         let command_table = unsafe { &mut *command_table_base_ptr };
 
         // Clear the command table
@@ -304,7 +308,7 @@ impl AHCIController {
             let ci_register = unsafe { read_volatile(self.ports_registers[port as usize].ci) };
 
             // Check if the command has completed (CI bit cleared)
-            if (ci_register & 1) == 0 {
+            if (ci_register & 1) == 0{
                 break;
             }
 
@@ -321,7 +325,6 @@ impl AHCIController {
         // Parse the IDENTIFY DEVICE response data (model name, serial number, etc.)
         let model_name = String::from_utf8_lossy(&identify_data[54..94]).to_string(); // Example: extract the model name
         let serial_number = String::from_utf8_lossy(&identify_data[20..40]).to_string(); // Example: extract the serial number
-
         // Step 7: Return the parsed DriveInfo
         Some(DriveInfo {
             model: model_name,
