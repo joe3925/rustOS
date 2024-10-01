@@ -16,6 +16,7 @@ use crate::structs::aligned_buffer;
 use crate::drivers::drive::AHCI_structs;
 
 use crate::{panic, println, BOOT_INFO};
+use crate::cpu::wait_cycle;
 use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D, FisType};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 
@@ -308,7 +309,8 @@ impl AHCIController {
             let ci_register = unsafe { read_volatile(self.ports_registers[port as usize].ci) };
 
             // Check if the command has completed (CI bit cleared)
-            if (ci_register & 1) == 0{
+            if (ci_register & 1) == 0 || true{
+                wait_cycle(10000000000);
                 break;
             }
 
