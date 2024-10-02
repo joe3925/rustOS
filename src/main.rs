@@ -86,10 +86,12 @@ pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, file_name: St
     let num_clusters = 125; // Number of clusters the file will occupy
     let total_size = cluster_size * num_clusters;
     let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+    println!("here");
 
     // File name and extension
     let file_extension = "bin";
-
+    fs.create_dir(dir_path);
+    println!("here");
     // Create and write the file
     println!("{}",fs.create_and_write_file(
         file_name.as_str(),

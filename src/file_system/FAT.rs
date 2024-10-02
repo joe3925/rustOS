@@ -9,7 +9,6 @@ use crate::file_system::{file};
 use crate::file_system::file::FileAttribute;
 use crate::memory::allocator::ALLOCATOR;
 
-//TODO: find out why theres a memory leak maybe because the create file loop never ends could also be leaving data in buffer
 const CLUSTER_SIZE: u32 = 32; //in KiB
 const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
@@ -144,7 +143,7 @@ impl FileSystem{
     }
     pub fn create_dir(&mut self,  path: &str){
         let files = FileSystem::file_parser(path);
-        let mut current_cluster = 0;
+        let mut current_cluster = 1;
         for i in 0..files.len() {
             let file = self.file_present(files[i], file::FileAttribute::Directory, current_cluster);
             if(file.is_none()){
@@ -158,7 +157,6 @@ impl FileSystem{
         }
 
     }
-    //TODO: read dir is not skipping empty entries
     pub fn read_dir(
         &mut self,
         starting_cluster: u32,
@@ -247,7 +245,9 @@ impl FileSystem{
         let clusters = self.get_all_clusters(starting_cluster);
         for i in 0..clusters.len(){
             let dir = self.read_dir(clusters[i]);
+            println!("file name:{:#?}", file_name);
             for j in 0..dir.len(){
+                println!("file name:{:#?}", file_name);
                 let name = FileSystem::get_text_before_last_dot(file_name) .to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name) .to_string();
                 if(dir[j].file_name == name && dir[j].file_extension == extension && file_attribute as u8 == dir[j].attributes){
@@ -295,14 +295,11 @@ impl FileSystem{
             } else if let Some(file_entry) = current_file {
                 current_cluster = file_entry.starting_cluster;
             } else {
-                println!("here1");
                 return None;
             }
         }
-        println!("here");
         None
     }
-    //TODO: there is a memory leak here somewhere somehow
     pub fn create_and_write_file(
         &mut self,
 
@@ -336,7 +333,6 @@ impl FileSystem{
                 }else{
                     next_cluster = self.find_free_cluster(free_cluster);
                 }
-                println!("here");
                 self.update_fat(free_cluster, next_cluster);
                 free_cluster = next_cluster;
             }
@@ -482,10 +478,10 @@ impl FileSystem{
         return;
     }
     fn write_cluster(&mut self, cluster: u32, buffer: &[u8]) {
+        let start_sector = self.cluster_to_sector(cluster);
         let mut drive_collection = DRIVECOLLECTION.lock();
         if let Some(mut drive) = drive_collection.find_drive(self.label.clone()) {
             let sector_count = SECTORS_PER_CLUSTER;
-            let start_sector = self.cluster_to_sector(cluster);
             for i in 0..sector_count {
                 let sector = &buffer[(i * 512) as usize..((i + 1) * 512) as usize];
                 let current_sector = start_sector + i;
@@ -495,10 +491,10 @@ impl FileSystem{
     }
 
     fn read_cluster(&mut self, cluster: u32, buffer: &mut [u8]) {
+        let start_sector = self.cluster_to_sector(cluster);
         let mut drive_collection = DRIVECOLLECTION.lock();
         if let Some(mut drive) = drive_collection.find_drive(self.label.clone()) {
             let sector_count = SECTORS_PER_CLUSTER;
-            let start_sector = self.cluster_to_sector(cluster);
             for i in 0..sector_count {
                 let mut sector = [0u8; 512];
                 drive.controller.read(self.label.clone().as_str(), start_sector + i, &mut sector);
