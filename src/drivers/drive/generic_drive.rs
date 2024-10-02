@@ -1,7 +1,7 @@
 use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::{format, vec};
 use alloc::vec::Vec;
 use spin::Lazy;
 use spin::mutex::Mutex;
@@ -74,6 +74,7 @@ impl Drive {
     }
 }
 
+
 pub struct DriveCollection {
     pub drives: Vec<Drive>,
 }
@@ -93,10 +94,29 @@ impl DriveCollection {
         <IdeController as DriveController>::enumerate_drives();
         <AHCIController as DriveController>::enumerate_drives();
     }
-
+    pub fn find_drive(&mut self, label: String) -> Option<&mut Drive> {
+        for drive in self.drives.iter_mut() { // Iterate over mutable references
+            if drive.label == label {
+                return Some(drive); // Return the mutable reference
+            }
+        }
+        None
+    }
+    pub fn print_drives(&self) {
+        if self.drives.is_empty() {
+            println!("No drives in the collection.");
+        } else {
+            for (i, drive) in self.drives.iter().enumerate() {
+                println!("Drive {}:", i + 1);
+                println!("Label: {}", drive.label);
+                drive.info.print(); // Call the print method of DriveInfo
+            }
+        }
+    }
     pub fn find_free_label(&self) -> Option<String> {
         let mut used_labels = [false; 26]; // A flag array for each letter A-Z
 
+        // Mark used labels
         for drive in &self.drives {
             if let Some(first_char) = drive.label.chars().next() {
                 if first_char.is_ascii_alphabetic() {
@@ -111,9 +131,8 @@ impl DriveCollection {
         // Find the first unused label from A: to Z:
         for i in 0..26 {
             if !used_labels[i] {
-                let letter = (b'A' + i as u8).to_string();
-
-                return Some(":".to_owned() + &*letter);
+                let letter = (b'A' + i as u8) as char;
+                return Some(format!("{}:", letter)); // Correctly format the label (e.g., "A:")
             }
         }
 

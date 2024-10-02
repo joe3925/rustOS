@@ -27,11 +27,12 @@ use lazy_static::lazy_static;
 use spin::mutex::Mutex;
 use x86_64::VirtAddr;
 use crate::console::clear_vga_buffer;
-use crate::drivers::drive::generic_drive::DriveController;
+use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
+use crate::file_system::FAT;
 use crate::file_system::FAT::FileSystem;
 use crate::idt::load_idt;
 use crate::memory::allocator::ALLOCATOR;
@@ -76,7 +77,7 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
-pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, mut ide_controller: &mut IdeController, file_name: String, dir_path: &str) {
+pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, file_name: String, dir_path: &str) {
     // Create a directory where the file will be stored
 
 
@@ -116,8 +117,14 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     unsafe {
         PCIBUS.lock().enumerate_pci();
     }
-    AHCIController::map(&mut mapper, &mut frame_allocator);
-    AHCIController::enumerate_drives();
+    IdeController::enumerate_drives();
+
+    DRIVECOLLECTION.lock().print_drives();
+    unsafe { DRIVECOLLECTION.force_unlock(); }
+    let mut fs = FileSystem::new("B:".to_string());
+    fs.format_drive().expect("");
+    test_create_and_read_multicluster_file(&mut fs, "test".to_string(), "\\test-dir\\dir");
+
     loop{
 
     }

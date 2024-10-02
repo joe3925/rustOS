@@ -145,14 +145,6 @@ impl IdeController {
             })
         }
     }
-    pub fn drive_selector_from_label(&self, label: String) -> u8 {
-        todo!();
-        match label.to_uppercase().as_str() {
-            "C:" => 0xE0,  // Master drive on primary channel
-            "D:" => 0xF0,  // Slave drive on primary channel
-            _ => 0xE0,     // Default to master if unspecified or unknown label
-        }
-    }
     fn status(&mut self) -> StatusFlags {
         unsafe { StatusFlags::from_bits_truncate(self.command_port.read()) }
     }
@@ -229,7 +221,7 @@ impl DriveController for IdeController{
                 while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
 
                 // Ensure drive is ready and no fault occurred
-                while self.alternative_command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+                while self.alternative_command_port.read() & 0x40 == 0 {  }
                 while self.alternative_command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
                 if self.alternative_command_port.read() & 0x01 != 0 {
@@ -246,7 +238,7 @@ impl DriveController for IdeController{
                 self.command_port.write(0x30);  // Command to write
 
                 while self.command_port.read() & 0x80 != 0 {println!("Drive busy");}  // BSY
-                while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+                while self.command_port.read() & 0x40 == 0 {  }
                 while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
                 while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {
@@ -276,7 +268,7 @@ impl DriveController for IdeController{
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(0) {  // Master drive
                 // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
+                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xE0)));
             }
         }
 
