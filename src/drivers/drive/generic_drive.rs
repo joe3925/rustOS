@@ -62,6 +62,8 @@ pub struct Drive {
     pub label: String,
     pub info: DriveInfo,
     pub controller: Box<dyn DriveController + Send>,
+    pub is_fat: bool, // New flag to indicate if the drive uses the FAT filesystem
+
 }
 
 impl Drive {
@@ -70,6 +72,7 @@ impl Drive {
             label,
             info,
             controller,
+            is_fat: false,
         }
     }
 }

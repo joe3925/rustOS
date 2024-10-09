@@ -17,15 +17,16 @@ const INFO_SECTOR: u32 = RESERVED_SECTORS;
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub file_name: String,          // 0x00 - 0x17 : 24 bytes
-    file_extension: String,     // 0x18 - 0x2F : 24 bytes
+    pub(crate) file_extension: String,     // 0x18 - 0x2F : 24 bytes
     pub attributes: u8,             // 0x30        : 1 byte
     // 3 bytes padding for alignment          : 0x31 - 0x33
     creation_date: String,      // 0x34 - 0x4B : 24 bytes
     creation_time: String,      // 0x4C - 0x63 : 24 bytes
     last_modified_date: String, // 0x64 - 0x7B : 24 bytes
     last_modified_time: String, // 0x7C - 0x93 : 24 bytes
-    starting_cluster: u32,      // 0x94 - 0x97 : 4 bytes
-    file_size: u64,             // 0x98 - 0x9F : 8 bytes
+    pub(crate) starting_cluster: u32,      // 0x94 - 0x97 : 4 bytes
+    pub(crate) file_size: u64,             // 0x98 - 0x9F : 8 bytes
+    pub(crate) drive_label: String,
 }
 #[derive(Debug)]
 struct InfoSector{
@@ -143,7 +144,7 @@ impl FileSystem{
     }
     pub fn create_dir(&mut self,  path: &str){
         let files = FileSystem::file_parser(path);
-        let mut current_cluster = 1;
+        let mut current_cluster = 0;
         for i in 0..files.len() {
             let file = self.file_present(files[i], file::FileAttribute::Directory, current_cluster);
             if(file.is_none()){
@@ -200,6 +201,7 @@ impl FileSystem{
                     last_modified_time: "".to_string(),
                     starting_cluster,
                     file_size,
+                    drive_label: self.label.clone(),
                 };
 
                 file_entries.push(file_entry);
@@ -257,7 +259,7 @@ impl FileSystem{
         }
         None
     }
-    fn find_file(&mut self, path: &str) -> Option<FileEntry>{
+    pub(crate) fn find_file(&mut self, path: &str) -> Option<FileEntry>{
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
         for i in 0..files.len(){

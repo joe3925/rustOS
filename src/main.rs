@@ -122,13 +122,14 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     IdeController::enumerate_drives();
 
     DRIVECOLLECTION.lock().print_drives();
+    //change this to something better
     unsafe { DRIVECOLLECTION.force_unlock(); }
     let mut fs = FileSystem::new("B:".to_string());
     fs.format_drive().expect("");
-    test_create_and_read_multicluster_file(&mut fs, "test".to_string(), "\\test-dir\\dir");
-
+    let mut i = 0;
     loop{
-
+        test_create_and_read_multicluster_file(&mut fs, i.to_string(), "\\test-dir\\dir");
+        i+= 1;
     }
 }
 
