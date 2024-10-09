@@ -18,24 +18,16 @@ mod console;
 mod util;
 mod cpu;
 
-use alloc::string::{String, ToString};
-use alloc::{format};
-use alloc::vec::Vec;
+use alloc::string::{ToString};
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
-use lazy_static::lazy_static;
-use spin::mutex::Mutex;
 use x86_64::VirtAddr;
-use crate::console::clear_vga_buffer;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
-use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
-use crate::file_system::FAT;
 use crate::file_system::FAT::FileSystem;
 use crate::idt::load_idt;
-use crate::memory::allocator::ALLOCATOR;
 use crate::memory::heap::{init_heap};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 
@@ -77,30 +69,6 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
-pub fn test_create_and_read_multicluster_file(fs: &mut FileSystem, file_name: String, dir_path: &str) {
-    // Create a directory where the file will be stored
-
-
-    // Prepare test data that spans multiple clusters
-    let cluster_size = 32 * 1024;
-    let num_clusters = 125; // Number of clusters the file will occupy
-    let total_size = cluster_size * num_clusters;
-    let test_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
-    println!("here");
-
-    // File name and extension
-    let file_extension = "bin";
-    fs.create_dir(dir_path);
-    println!("here");
-    // Create and write the file
-    println!("{}",fs.create_and_write_file(
-        file_name.as_str(),
-        file_extension,
-        &test_data,
-        dir_path,
-    ).to_str());
-
-}
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
@@ -128,7 +96,6 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     fs.format_drive().expect("");
     let mut i = 0;
     loop{
-        test_create_and_read_multicluster_file(&mut fs, i.to_string(), "\\test-dir\\dir");
         i+= 1;
     }
 }

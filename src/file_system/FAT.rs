@@ -1,5 +1,5 @@
 use alloc::string::{String, ToString};
-use alloc::{vec};
+use alloc::{format, vec};
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use crate::drivers::drive::ide_disk_driver::IdeController;
@@ -42,7 +42,7 @@ struct Dir {
 }
 pub struct FileSystem{
     info: InfoSector,
-    label: String,
+    pub(crate) label: String,
 }
 
 impl FileSystem{
@@ -302,51 +302,105 @@ impl FileSystem{
         }
         None
     }
-    pub fn create_and_write_file(
+    pub fn create_file(
         &mut self,
+        file_name: &str,
+        file_extension: &str,
+        path: &str,
+    ) -> file::FileStatus {
+        let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
 
+        // Check if the file already exists
+        if self.find_file(file_path.as_str()).is_some() {
+            return file::FileStatus::FileAlreadyExist;
+        }
+
+        // Get the directory where the file will be created
+        if let Some(dir) = self.find_dir(path) {
+            let free_cluster = self.find_free_cluster(0);
+            if free_cluster == 0xFFFFFFFF {
+                return file::FileStatus::UnknownFail; // No free cluster available
+            }
+
+            // Create the file with an initial size of 0
+            self.write_file_to_dir(
+                file_name,
+                file_extension,
+                file::FileAttribute::Archive,
+                free_cluster,
+                dir.starting_cluster,
+                0,
+            );
+
+            file::FileStatus::Success
+        } else {
+            file::FileStatus::PathNotFound
+        }
+    }
+
+    pub fn write_file(
+        &mut self,
         file_name: &str,
         file_extension: &str,
         file_data: &[u8],
         path: &str,
-    ) -> file::FileStatus
-    {
-        let file_path = path.to_string() + "\\" + file_name + "." + file_extension;
-        if let Some(file) = self.find_file(file_path.as_str()){
-            return file::FileStatus::FileAlreadyExist;
-        }
-        let cluster_size = CLUSTER_OFFSET as usize;
-        let clusters_needed = file_data.len() / cluster_size;
-        let mut free_cluster = self.find_free_cluster(0);
-        let mut next_cluster;
-        let mut buffer = vec!(0u8; cluster_size);
-        if let Some(dir) = self.find_dir(path) {
-            self.write_file_to_dir(file_name, file_extension, file::FileAttribute::Archive, free_cluster,dir.starting_cluster, file_data.len() as u64);
-            for i in 0..clusters_needed {
+    ) -> file::FileStatus {
+        let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
 
+        // Find the file to overwrite
+        if let Some(mut file_entry) = self.find_file(file_path.as_str()) {
+            let cluster_size = CLUSTER_OFFSET as usize;
+            let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
+            let old_clusters = self.get_all_clusters(file_entry.starting_cluster);
+            let old_clusters_needed = old_clusters.len();
+
+            let mut buffer = vec![0u8; cluster_size];
+            let mut current_cluster = file_entry.starting_cluster;
+
+            // Write data to the existing clusters
+            for i in 0..new_clusters_needed {
                 let data_offset = i * cluster_size;
+                let bytes_to_copy = core::cmp::min(cluster_size, file_data.len() - data_offset);
 
-                for j in 0..buffer.len() {
-                    buffer[j] = file_data[j + data_offset]
+                // Copy data to the buffer
+                buffer[..bytes_to_copy].copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
+
+                // Write the buffer to the current cluster
+                self.write_cluster(current_cluster, &buffer);
+
+                // Check if we need more clusters
+                if i < new_clusters_needed - 1 {
+                    if i < old_clusters_needed - 1 {
+                        current_cluster = old_clusters[i + 1];
+                    } else {
+                        let next_cluster = self.find_free_cluster(current_cluster);
+                        if next_cluster == 0xFFFFFFFF {
+                            return file::FileStatus::UnknownFail; // No free cluster available
+                        }
+                        self.update_fat(current_cluster, next_cluster);
+                        current_cluster = next_cluster;
+                    }
+                } else {
+                    self.update_fat(current_cluster, 0xFFFFFFFF); // End of chain
                 }
-                self.write_cluster(free_cluster, &buffer);
-                if (i == clusters_needed - 1) {
-                    next_cluster = 0xFFFFFFFF;
-                }else{
-                    next_cluster = self.find_free_cluster(free_cluster);
+            }
+
+            // If there are leftover clusters, free them
+            if old_clusters_needed > new_clusters_needed {
+                for cluster in &old_clusters[new_clusters_needed..] {
+                    self.update_fat(*cluster, 0x00000000); // Mark as free
                 }
-                self.update_fat(free_cluster, next_cluster);
-                free_cluster = next_cluster;
             }
-            if let Some( file) = self.find_file(file_path.as_str()){
-                file::FileStatus::Success
-            } else{
-                file::FileStatus::UnknownFail
-            }
-        }else{
+
+            // Update the file size
+            file_entry.file_size = file_data.len() as u64;
+
+            file::FileStatus::Success
+        } else {
             file::FileStatus::PathNotFound
         }
     }
+
 
     pub fn read_file(
         &mut self,
