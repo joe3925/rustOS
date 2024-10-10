@@ -2,6 +2,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::file_system::FAT::FileSystem;
+use crate::println;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -34,12 +35,14 @@ impl FileStatus {
         }
     }
 }
+#[derive(Debug)]
 pub struct File {
     pub name: String,
     pub extension: String,
     pub size: u64,
     pub starting_cluster: u32,
     pub drive_label: String,
+    pub path: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenFlags {
@@ -57,10 +60,11 @@ impl File {
         flags: &[OpenFlags], // Accept flags as a slice
     ) -> Result<Self, FileStatus> {
         let drive_letter = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::PathNotFound)?;
-
+        let path = Self::remove_drive_from_path(path);
         let mut file_system = {
             let mut drive_collection = DRIVECOLLECTION.lock();
-            if let Some(drive) = drive_collection.find_drive(drive_letter) {
+            if let Some(drive) = drive_collection.find_drive(drive_letter.clone()) {
+                drive.is_fat = true;
                 if !drive.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
@@ -69,7 +73,6 @@ impl File {
                 return Err(FileStatus::UnknownFail);
             }
         };
-
         // Check if the file exists
         if let Some(file_entry) = file_system.find_file(path) {
             Ok(File {
@@ -78,11 +81,18 @@ impl File {
                 size: file_entry.file_size,
                 starting_cluster: file_entry.starting_cluster,
                 drive_label: file_entry.drive_label.clone(),
+                path: path.to_string()
             })
         } else {
             // If file doesn't exist, check flags for creation
             if flags.contains(&OpenFlags::Create) {
-                let (file_name, file_extension) = Self::split_file_name_and_extension(path);
+                let name = FileSystem::file_parser(path);
+                let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
+                let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
+
+                println!("{}", file_name);
+                println!("{}", file_extension);
+                file_system.create_dir(File::remove_file_from_path(path));
                 match file_system.create_file(&file_name, &file_extension, path) {
                     FileStatus::Success => {
                         if let Some(file_entry) = file_system.find_file(path) {
@@ -92,6 +102,7 @@ impl File {
                                 size: file_entry.file_size,
                                 starting_cluster: file_entry.starting_cluster,
                                 drive_label: file_system.label.clone(),
+                                path: path.to_string(),
                             })
                         } else {
                             Err(FileStatus::UnknownFail)
@@ -106,48 +117,67 @@ impl File {
     }
 
     /// Helper function to split file name and extension from the full path
-    fn split_file_name_and_extension(path: &str) -> (String, String) {
-        let parts: Vec<&str> = path.split('\\').collect();
-        if let Some(file) = parts.last() {
-            if let Some(dot_pos) = file.rfind('.') {
-                let file_name = file[..dot_pos].to_string();
-                let file_extension = file[dot_pos + 1..].to_string();
-                return (file_name, file_extension);
-            }
+    pub fn remove_drive_from_path(path: &str) -> &str {
+        // Check if the path has a valid drive letter (e.g., "C:\" or "D:\")
+        if path.len() >= 3 && path[1..2] == ":".to_string() && path[2..3] == "\\".to_string() {
+            // Return the path after the drive letter and backslash
+            &path[3..]
+        } else {
+            // If the path doesn't have a drive letter, return it unchanged
+            path
         }
-        (String::new(), String::new())
     }
+    pub fn remove_file_from_path(path: &str) -> &str {
+        if let Some(pos) = path.rfind('\\') {
+            // Return everything up to (but not including) the last backslash
+            &path[..pos]
+        } else {
+            // If no backslash is found, return the path unchanged (might not be a valid directory)
+            path
+        }
+    }
+
 
     /// Read data from the file.
     pub fn read(&mut self) -> Result<Vec<u8>, FileStatus> {
-        let mut drive_collection = DRIVECOLLECTION.lock();
-        if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-            if !drive.is_fat {
+        let mut file_system = {
+            let mut drive_collection = DRIVECOLLECTION.lock();
+            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
+                drive.is_fat = true;
+                if !drive.is_fat {
+                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                }
+                FileSystem::new(drive.label.clone())
+            } else {
                 return Err(FileStatus::UnknownFail);
             }
-
-            let mut file_system = FileSystem::new(self.drive_label.clone());
-            file_system.read_file(self.name.as_str()).ok_or(FileStatus::UnknownFail)
-        } else {
-            Err(FileStatus::PathNotFound)
+        };
+        println!("{}",self.path);
+        if let Some(data) = file_system.read_file(self.path.as_str()){
+            Ok(data)
+        }else{
+            Err(FileStatus::UnknownFail)
         }
-    }
 
+    }
     /// Write data to the file (overwrites).
     pub fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
-        let mut drive_collection = DRIVECOLLECTION.lock();
-        if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-            if !drive.is_fat {
+        let mut file_system = {
+            let mut drive_collection = DRIVECOLLECTION.lock();
+            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
+                drive.is_fat = true;
+                if !drive.is_fat {
+                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                }
+                FileSystem::new(drive.label.clone())
+            } else {
                 return Err(FileStatus::UnknownFail);
             }
-
-            let mut file_system = FileSystem::new(self.drive_label.clone());
-            match file_system.write_file(self.name.as_str(), self.extension.as_str(), data, "/") {
-                FileStatus::Success => Ok(()),
-                status => Err(status),
-            }
-        } else {
-            Err(FileStatus::PathNotFound)
+        };
+        println!("{}",self.path);
+        match file_system.write_file(data, self.path.as_str()) {
+            FileStatus::Success => Ok(()),
+            status => Err(status),
         }
     }
     pub fn get_drive_letter(path: &[u8]) -> Option<String> {

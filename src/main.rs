@@ -18,7 +18,7 @@ mod console;
 mod util;
 mod cpu;
 
-use alloc::string::{ToString};
+use alloc::string::{String, ToString};
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 use x86_64::VirtAddr;
@@ -27,6 +27,7 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::file_system::FAT::FileSystem;
+use crate::file_system::file::{File, OpenFlags};
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
@@ -69,6 +70,49 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
+pub fn test_file_operations() {
+    // Define a mock path
+    let path = "B:\\test\\myfile.txt";
+
+    // Test creating a new file
+    let create_flags = &[OpenFlags::Create];
+    let result = File::open(path, create_flags);
+    match result {
+        Ok(file) => println!("File created successfully: {:?}", file),
+        Err(status) => println!("Failed to create file: {}", status.to_str()),
+    }
+
+    // Try opening the file without the Create flag (should succeed since it was just created)
+    let open_flags = &[OpenFlags::ReadOnly];
+    let result = File::open(path, open_flags);
+    match result {
+        Ok(file) => println!("File opened successfully: {:?}", file),
+        Err(status) => println!("Failed to open file: {}", status.to_str()),
+    }
+
+    // Test writing data to the file
+    if let Ok(mut file) = File::open(path, &[OpenFlags::WriteOnly]) {
+        let data = b"Hello, World!";
+        match file.write(data) {
+            Ok(_) => println!("Data written successfully"),
+            Err(status) => println!("Failed to write data: {}", status.to_str()),
+        }
+    } else {
+        println!("Failed to open file for writing.");
+    }
+
+    // Test reading data from the file
+    if let Ok(mut file) = File::open(path, &[OpenFlags::ReadOnly]) {
+        match file.read() {
+            Ok(contents) => println!("Read data: {:?}", String::from_utf8_lossy(&contents)),
+            Err(status) => println!("Failed to read data: {}", status.to_str()),
+        }
+    } else {
+        println!("Failed to open file for reading.");
+    }
+}
+
+
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
@@ -94,6 +138,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     unsafe { DRIVECOLLECTION.force_unlock(); }
     let mut fs = FileSystem::new("B:".to_string());
     fs.format_drive().expect("");
+    test_file_operations();
     let mut i = 0;
     loop{
         i+= 1;

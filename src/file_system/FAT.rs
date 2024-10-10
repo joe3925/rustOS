@@ -6,7 +6,7 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::{ println};
 use crate::drivers::drive::generic_drive::{Drive, DriveCollection, DRIVECOLLECTION};
 use crate::file_system::{file};
-use crate::file_system::file::FileAttribute;
+use crate::file_system::file::{File, FileAttribute};
 use crate::memory::allocator::ALLOCATOR;
 
 const CLUSTER_SIZE: u32 = 32; //in KiB
@@ -210,7 +210,7 @@ impl FileSystem{
 
         file_entries
     }
-    fn file_parser(path: &str) -> Vec<&str> {
+    pub(crate) fn file_parser(path: &str) -> Vec<&str> {
         path.trim_start_matches('\\').split('\\').collect()
     }
     fn find_last_dot(s: &str) -> Option<usize> {
@@ -223,14 +223,14 @@ impl FileSystem{
         None
     }
 
-    fn get_text_before_last_dot(s: &str) -> &str {
+    pub fn get_text_before_last_dot(s: &str) -> &str {
         if let Some(pos) = FileSystem::find_last_dot(s) {
             &s[..pos]
         } else {
             s
         }
     }
-    fn get_text_after_last_dot(s: &str) -> &str {
+    pub fn get_text_after_last_dot(s: &str) -> &str {
         if let Some(pos) = FileSystem::find_last_dot(s) {
             &s[pos + 1..]
         } else {
@@ -247,9 +247,7 @@ impl FileSystem{
         let clusters = self.get_all_clusters(starting_cluster);
         for i in 0..clusters.len(){
             let dir = self.read_dir(clusters[i]);
-            println!("file name:{:#?}", file_name);
             for j in 0..dir.len(){
-                println!("file name:{:#?}", file_name);
                 let name = FileSystem::get_text_before_last_dot(file_name) .to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name) .to_string();
                 if(dir[j].file_name == name && dir[j].file_extension == extension && file_attribute as u8 == dir[j].attributes){
@@ -287,6 +285,7 @@ impl FileSystem{
     ) -> Option<FileEntry> {
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
+        println!("{}", path);
         for i in 0..files.len() {
             let attribute = file::FileAttribute::Directory;
 
@@ -316,7 +315,8 @@ impl FileSystem{
         }
 
         // Get the directory where the file will be created
-        if let Some(dir) = self.find_dir(path) {
+        println!("{}", File::remove_file_from_path(path));
+        if let Some(dir) = self.find_dir(File::remove_file_from_path(path)) {
             let free_cluster = self.find_free_cluster(0);
             if free_cluster == 0xFFFFFFFF {
                 return file::FileStatus::UnknownFail; // No free cluster available
@@ -334,21 +334,18 @@ impl FileSystem{
 
             file::FileStatus::Success
         } else {
+            println!("here");
             file::FileStatus::PathNotFound
         }
     }
 
     pub fn write_file(
         &mut self,
-        file_name: &str,
-        file_extension: &str,
         file_data: &[u8],
         path: &str,
     ) -> file::FileStatus {
-        let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
-
         // Find the file to overwrite
-        if let Some(mut file_entry) = self.find_file(file_path.as_str()) {
+        if let Some(mut file_entry) = self.find_file(path) {
             let cluster_size = CLUSTER_OFFSET as usize;
             let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
             let old_clusters = self.get_all_clusters(file_entry.starting_cluster);
@@ -406,7 +403,7 @@ impl FileSystem{
         &mut self,
         path: &str
     ) -> Option<Vec<u8>> {
-        if let Some(entry) = self.find_file( path) {
+        if let Some(entry) = self.find_file(path) {
             let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
             let remainder = entry.file_size % CLUSTER_OFFSET as u64;
             let clusters = self.get_all_clusters(entry.starting_cluster);
