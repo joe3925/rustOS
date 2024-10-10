@@ -1,5 +1,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cmp::PartialEq;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::file_system::FAT::FileSystem;
 use crate::println;
@@ -43,6 +44,7 @@ pub struct File {
     pub starting_cluster: u32,
     pub drive_label: String,
     pub path: String,
+    pub deleted: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenFlags {
@@ -52,6 +54,7 @@ pub enum OpenFlags {
     Create,      // Creates the file if it doesn't exist
     CreateNew,   // Creates the file only if it doesn't already exist (fails if it exists)
 }
+
 
 impl File {
     /// Open a file from the given path and drive.
@@ -81,18 +84,16 @@ impl File {
                 size: file_entry.file_size,
                 starting_cluster: file_entry.starting_cluster,
                 drive_label: file_entry.drive_label.clone(),
-                path: path.to_string()
+                path: path.to_string(),
+                deleted: false,
             })
         } else {
             // If file doesn't exist, check flags for creation
             if flags.contains(&OpenFlags::Create) {
-                println!("creating file");
                 let name = FileSystem::file_parser(path);
                 let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
                 let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
 
-                println!("{}", file_name);
-                println!("{}", file_extension);
                 file_system.create_dir(File::remove_file_from_path(path));
                 match file_system.create_file(&file_name, &file_extension, path) {
                     FileStatus::Success => {
@@ -104,6 +105,7 @@ impl File {
                                 starting_cluster: file_entry.starting_cluster,
                                 drive_label: file_system.label.clone(),
                                 path: path.to_string(),
+                                deleted: false,
                             })
                         } else {
                             Err(FileStatus::UnknownFail)
@@ -153,7 +155,6 @@ impl File {
                 return Err(FileStatus::UnknownFail);
             }
         };
-        println!("{}",self.path);
         if let Some(data) = file_system.read_file(self.path.as_str()){
             Ok(data)
         }else{
@@ -166,7 +167,6 @@ impl File {
         let mut file_system = {
             let mut drive_collection = DRIVECOLLECTION.lock();
             if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-                drive.is_fat = true;
                 if !drive.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
@@ -175,8 +175,28 @@ impl File {
                 return Err(FileStatus::UnknownFail);
             }
         };
-        println!("{}",self.path);
         match file_system.write_file(data, self.path.as_str()) {
+            FileStatus::Success => Ok(()),
+            status => Err(status),
+        }
+    }
+    pub fn delete(&mut self)-> Result<(), FileStatus>  {
+        let mut file_system = {
+            let mut drive_collection = DRIVECOLLECTION.lock();
+            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
+                if !drive.is_fat {
+                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                }
+                FileSystem::new(drive.label.clone())
+            } else {
+                return Err(FileStatus::UnknownFail);
+            }
+        };
+        let status = file_system.delete_file(self.path.as_str());
+        if(status.to_str() == FileStatus::Success.to_str()){
+            self.deleted = true;
+        }
+        match status {
             FileStatus::Success => Ok(()),
             status => Err(status),
         }

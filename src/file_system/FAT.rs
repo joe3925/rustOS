@@ -2,12 +2,9 @@ use alloc::string::{String, ToString};
 use alloc::{format, vec};
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use crate::drivers::drive::ide_disk_driver::IdeController;
-use crate::{print, println};
-use crate::drivers::drive::generic_drive::{Drive, DriveCollection, DRIVECOLLECTION};
-use crate::file_system::{file};
-use crate::file_system::file::{File, FileAttribute};
-use crate::memory::allocator::ALLOCATOR;
+use crate::{println};
+use crate::drivers::drive::generic_drive::{DRIVECOLLECTION};
+use crate::file_system::file::{File, FileAttribute, FileStatus};
 
 const CLUSTER_SIZE: u32 = 32; //in KiB
 const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
@@ -122,7 +119,6 @@ impl FileSystem{
         cluster_number: u32,
         next_cluster: u32,
     ) {
-        println!("cluster writing: {}", cluster_number);
         let mut drive_collection = DRIVECOLLECTION.lock();
         if let Some(mut drive) = drive_collection.find_drive(self.label.clone()) {
             let fat_offset = cluster_number * 4;
@@ -147,10 +143,10 @@ impl FileSystem{
         let files = FileSystem::file_parser(path);
         let mut current_cluster = 0;
         for i in 0..files.len() {
-            let file = self.file_present(files[i], file::FileAttribute::Directory, current_cluster);
+            let file = self.file_present(files[i], FileAttribute::Directory, current_cluster);
             if(file.is_none()){
                 let free_cluster = self.find_free_cluster( 0);
-                self.write_file_to_dir(files[i], r"", file::FileAttribute::Directory, free_cluster, current_cluster, 0);
+                self.write_file_to_dir(files[i], r"", FileAttribute::Directory, free_cluster, current_cluster, 0);
                 self.update_fat( free_cluster, 0xFFFFFFFF);
                 current_cluster = free_cluster;
             }else{
@@ -262,12 +258,12 @@ impl FileSystem{
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
         for i in 0..files.len(){
-            let mut attribute = file::FileAttribute::Directory;
+            let mut attribute = FileAttribute::Directory;
             if(i == files.len() - 1){
-                attribute = file::FileAttribute::Archive;
+                attribute = FileAttribute::Archive;
             }
             if let Some(current_file) = self.file_present(files[i], attribute, current_cluster) {
-                if (attribute as u8 == file::FileAttribute::Archive as u8) {
+                if (attribute as u8 == FileAttribute::Archive as u8) {
                     return Some(current_file);
                 } else{
                     current_cluster = current_file.starting_cluster;
@@ -287,7 +283,7 @@ impl FileSystem{
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
         for i in 0..files.len() {
-            let attribute = file::FileAttribute::Directory;
+            let attribute = FileAttribute::Directory;
 
             let current_file = self.file_present(files[i], attribute, current_cluster);
 
@@ -306,19 +302,19 @@ impl FileSystem{
         file_name: &str,
         file_extension: &str,
         path: &str,
-    ) -> file::FileStatus {
+    ) -> FileStatus {
         let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
 
         // Check if the file already exists
         if self.find_file(file_path.as_str()).is_some() {
-            return file::FileStatus::FileAlreadyExist;
+            return FileStatus::FileAlreadyExist;
         }
 
         // Get the directory where the file will be created
         if let Some(dir) = self.find_dir(File::remove_file_from_path(path)) {
             let free_cluster = self.find_free_cluster(0);
             if free_cluster == 0xFFFFFFFF {
-                return file::FileStatus::UnknownFail; // No free cluster available
+                return FileStatus::UnknownFail; // No free cluster available
             }
 
             // Create the file with an initial size of 0
@@ -326,15 +322,15 @@ impl FileSystem{
             self.write_file_to_dir(
                 file_name,
                 file_extension,
-                file::FileAttribute::Archive,
+                FileAttribute::Archive,
                 free_cluster,
                 dir.starting_cluster,
                 0,
             );
 
-            file::FileStatus::Success
+            FileStatus::Success
         } else {
-            file::FileStatus::PathNotFound
+            FileStatus::PathNotFound
         }
     }
 
@@ -342,7 +338,7 @@ impl FileSystem{
         &mut self,
         file_data: &[u8],
         path: &str,
-    ) -> file::FileStatus {
+    ) -> FileStatus {
         // Find the file to overwrite
         if let Some(mut file_entry) = self.find_file(path) {
             let cluster_size = CLUSTER_OFFSET as usize;
@@ -371,7 +367,7 @@ impl FileSystem{
                     } else {
                         let next_cluster = self.find_free_cluster(current_cluster);
                         if next_cluster == 0xFFFFFFFF {
-                            return file::FileStatus::UnknownFail; // No free cluster available
+                            return FileStatus::UnknownFail; // No free cluster available
                         }
                         self.update_fat(current_cluster, next_cluster);
                         current_cluster = next_cluster;
@@ -389,12 +385,13 @@ impl FileSystem{
 
             // Update the file size
             file_entry.file_size = file_data.len() as u64;
-            if(self.update_dir_entry(path, file_entry).is_err()){
-                return file::FileStatus::UnknownFail
+            let starting_cluster = file_entry.starting_cluster;
+            if(self.update_dir_entry(path, file_entry, starting_cluster).is_err()){
+                return FileStatus::UnknownFail
             }
-            file::FileStatus::Success
+            FileStatus::Success
         } else {
-            file::FileStatus::PathNotFound
+            FileStatus::PathNotFound
         }
     }
 
@@ -426,6 +423,33 @@ impl FileSystem{
         }
         None
     }
+    pub fn delete_file(&mut self, path: &str) -> FileStatus{
+        if let Some(entry) = self.find_file(path){
+            let clusters = self.get_all_clusters(entry.starting_cluster);
+            for cluster in clusters{
+                self.update_fat(cluster, 0x00000000);
+            }
+            let empty_entry = FileEntry{
+                file_name: "".to_string(),
+                file_extension: "".to_string(),
+                attributes: 0,
+                creation_date: "".to_string(),
+                creation_time: "".to_string(),
+                last_modified_date: "".to_string(),
+                last_modified_time: "".to_string(),
+                starting_cluster: 0,
+                file_size: 0,
+                drive_label: "".to_string(),
+            };
+            if (self.update_dir_entry(path, empty_entry, entry.starting_cluster).is_err()){
+                FileStatus::UnknownFail
+            } else{
+                FileStatus::Success
+            }
+        }else{
+            FileStatus::PathNotFound
+        }
+    }
     //set ignore cluster to 0 to ignore no clusters
     fn find_free_cluster(&mut self,  ignore_cluster: u32) -> u32 {
         let fat_sectors = self.calculate_data_region_start() - RESERVED_SECTORS;
@@ -455,7 +479,8 @@ impl FileSystem{
 
         0xFFFFFFFF // Return a special value indicating no free cluster was found
     }
-    pub fn update_dir_entry(&mut self, path: &str, new_entry: FileEntry) -> Result<(), &'static str> {
+    ///starting cluster is the cluster that will be searched for NOT the one it will be updated to
+    pub fn update_dir_entry(&mut self, path: &str, new_entry: FileEntry, starting_cluster: u32) -> Result<(), &'static str> {
         // 1. Find the directory containing the file
         if let Some(dir_entry) = self.find_dir(File::remove_file_from_path(path)) {
             let dir_clusters = self.get_all_clusters(dir_entry.starting_cluster);
@@ -473,10 +498,9 @@ impl FileSystem{
                         0,
                     ]);
 
-                    if entry_starting_cluster == new_entry.starting_cluster {
+                    if entry_starting_cluster == starting_cluster {
                         // 2. Overwrite the existing file entry with new_entry
                         self.write_file_entry_to_buffer(&mut dir_buffer, i, &new_entry);
-                        println!("{:#?}", new_entry);
                         // 3. Write the updated directory cluster back to the disk
                         self.write_cluster(cluster, &dir_buffer);
 
@@ -484,10 +508,8 @@ impl FileSystem{
                     }
                 }
             }
-            println!("File entry not found in the specified directory");
             Err("File entry not found in the specified directory")
         } else {
-            println!("Directory not found");
             Err("Directory not found")
         }
     }

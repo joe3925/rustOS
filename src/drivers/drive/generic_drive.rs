@@ -10,6 +10,7 @@ use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use strum::IntoEnumIterator; // Trait for iterating over enum variants
 use strum_macros::EnumIter;
 use crate::drivers::pci::device_collection::Device;
+use crate::file_system::FAT::FileSystem;
 use crate::println;
 
 // Macro to derive iteration
@@ -74,6 +75,10 @@ impl Drive {
             controller,
             is_fat: false,
         }
+    }
+    pub fn format(&mut self) -> Result<(), &'static str>{
+        self.is_fat = true;
+        FileSystem::new(self.label.clone()).format_drive()
     }
 }
 
