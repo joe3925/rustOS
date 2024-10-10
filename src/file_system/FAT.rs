@@ -389,7 +389,9 @@ impl FileSystem{
 
             // Update the file size
             file_entry.file_size = file_data.len() as u64;
-
+            if(self.update_dir_entry(path, file_entry).is_err()){
+                return file::FileStatus::UnknownFail
+            }
             file::FileStatus::Success
         } else {
             file::FileStatus::PathNotFound
@@ -412,12 +414,10 @@ impl FileSystem{
 
                 if (i + 1) != clusters.len() || remainder == 0 {
                     for j in 0..cluster.len() {
-                        println!("file data length: {}", file_data.len());
                         file_data[j + base_offset] = cluster[j];
                     }
                 } else {
                     for j in 0..remainder as usize {
-                        println!("file data else length: {}", file_data.len());
                         file_data[j + base_offset] = cluster[j];
                     }
                 }
@@ -455,6 +455,73 @@ impl FileSystem{
 
         0xFFFFFFFF // Return a special value indicating no free cluster was found
     }
+    pub fn update_dir_entry(&mut self, path: &str, new_entry: FileEntry) -> Result<(), &'static str> {
+        // 1. Find the directory containing the file
+        if let Some(dir_entry) = self.find_dir(File::remove_file_from_path(path)) {
+            let dir_clusters = self.get_all_clusters(dir_entry.starting_cluster);
+            let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
+
+            for cluster in dir_clusters {
+                self.read_cluster(cluster, &mut dir_buffer);
+
+                let entry_size = 32; // FAT entry size is always 32 bytes
+                for i in (0..dir_buffer.len()).step_by(entry_size) {
+                    let entry_starting_cluster = u32::from_le_bytes([
+                        dir_buffer[i + 26],   // Low byte
+                        dir_buffer[i + 27],   // High byte
+                        0,
+                        0,
+                    ]);
+
+                    if entry_starting_cluster == new_entry.starting_cluster {
+                        // 2. Overwrite the existing file entry with new_entry
+                        self.write_file_entry_to_buffer(&mut dir_buffer, i, &new_entry);
+                        println!("{:#?}", new_entry);
+                        // 3. Write the updated directory cluster back to the disk
+                        self.write_cluster(cluster, &dir_buffer);
+
+                        return Ok(());
+                    }
+                }
+            }
+            println!("File entry not found in the specified directory");
+            Err("File entry not found in the specified directory")
+        } else {
+            println!("Directory not found");
+            Err("Directory not found")
+        }
+    }
+
+    fn write_file_entry_to_buffer(&self, buffer: &mut [u8], offset: usize, entry: &FileEntry) {
+        // File name (8 bytes, space padded)
+        let mut name_bytes = [0x20; 8]; // 0x20 is space
+        let name_slice = &entry.file_name.as_bytes()[0..entry.file_name.len().min(8)];
+        name_bytes[..name_slice.len()].copy_from_slice(name_slice);
+        buffer[offset..offset + 8].copy_from_slice(&name_bytes);
+
+        // File extension (3 bytes, space padded)
+        let mut ext_bytes = [0x20; 3]; // 0x20 is space
+        let ext_slice = &entry.file_extension.as_bytes()[0..entry.file_extension.len().min(3)];
+        ext_bytes[..ext_slice.len()].copy_from_slice(ext_slice);
+        buffer[offset + 8..offset + 11].copy_from_slice(&ext_bytes);
+
+        // File attributes (1 byte)
+        buffer[offset + 11] = entry.attributes;
+
+        // Reserved (10 bytes)
+        for i in 12..22 {
+            buffer[offset + i] = 0x00;
+        }
+
+        // Starting cluster (2 bytes, low 16 bits)
+        let cluster_bytes = (entry.starting_cluster as u16).to_le_bytes();
+        buffer[offset + 26..offset + 28].copy_from_slice(&cluster_bytes);
+
+        // File size (4 bytes)
+        let size_bytes = (entry.file_size as u32).to_le_bytes(); // FAT stores size as 32-bit value
+        buffer[offset + 28..offset + 32].copy_from_slice(&size_bytes);
+    }
+
     //TODO: modify to allocate a new cluster when full
     fn write_file_to_dir(
         &mut self,
@@ -608,10 +675,6 @@ impl FileSystem{
                 if (entry != 0xFFFFFFFF) {
                     out_vec.push(entry);
                 }
-                for i in 0..24 {
-                    print!("{:02X} ", sector[i]);
-                }
-                println!();
                 starting_cluster = entry;
             }
             return out_vec
