@@ -322,6 +322,7 @@ impl FileSystem{
             }
 
             // Create the file with an initial size of 0
+            self.update_fat(free_cluster, 0xFFFFFFFF);
             self.write_file_to_dir(
                 file_name,
                 file_extension,
@@ -411,10 +412,12 @@ impl FileSystem{
 
                 if (i + 1) != clusters.len() || remainder == 0 {
                     for j in 0..cluster.len() {
+                        println!("file data length: {}", file_data.len());
                         file_data[j + base_offset] = cluster[j];
                     }
                 } else {
                     for j in 0..remainder as usize {
+                        println!("file data else length: {}", file_data.len());
                         file_data[j + base_offset] = cluster[j];
                     }
                 }

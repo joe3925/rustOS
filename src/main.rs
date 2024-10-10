@@ -70,9 +70,10 @@ fn panic(info: &PanicInfo) -> !{
     println!("{}", info);
     loop{}
 }
+static path: &str = "B:\\test\\myfile.txt";
+
 pub fn test_file_operations() {
     // Define a mock path
-    let path = "B:\\test\\myfile.txt";
 
     // Test creating a new file
     let create_flags = &[OpenFlags::Create];
@@ -102,14 +103,14 @@ pub fn test_file_operations() {
     }
 
     // Test reading data from the file
-    /*if let Ok(mut file) = File::open(path, &[OpenFlags::ReadOnly]) {
+    if let Ok(mut file) = File::open(path, &[OpenFlags::ReadOnly]) {
         match file.read() {
             Ok(contents) => println!("Read data: {:?}", String::from_utf8_lossy(&contents)),
             Err(status) => println!("Failed to read data: {}", status.to_str()),
         }
     } else {
         println!("Failed to open file for reading.");
-    }*/
+    }
 
 }
 
