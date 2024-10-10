@@ -89,8 +89,8 @@ pub fn test_file_operations() {
         Ok(file) => println!("File opened successfully: {:?}", file),
         Err(status) => println!("Failed to open file: {}", status.to_str()),
     }
-
     // Test writing data to the file
+    println!("writing file");
     if let Ok(mut file) = File::open(path, &[OpenFlags::WriteOnly]) {
         let data = b"Hello, World!";
         match file.write(data) {
@@ -102,14 +102,15 @@ pub fn test_file_operations() {
     }
 
     // Test reading data from the file
-    if let Ok(mut file) = File::open(path, &[OpenFlags::ReadOnly]) {
+    /*if let Ok(mut file) = File::open(path, &[OpenFlags::ReadOnly]) {
         match file.read() {
             Ok(contents) => println!("Read data: {:?}", String::from_utf8_lossy(&contents)),
             Err(status) => println!("Failed to read data: {}", status.to_str()),
         }
     } else {
         println!("Failed to open file for reading.");
-    }
+    }*/
+
 }
 
 

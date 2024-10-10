@@ -86,6 +86,7 @@ impl File {
         } else {
             // If file doesn't exist, check flags for creation
             if flags.contains(&OpenFlags::Create) {
+                println!("creating file");
                 let name = FileSystem::file_parser(path);
                 let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
                 let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);

@@ -3,7 +3,7 @@ use alloc::{format, vec};
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use crate::drivers::drive::ide_disk_driver::IdeController;
-use crate::{ println};
+use crate::{print, println};
 use crate::drivers::drive::generic_drive::{Drive, DriveCollection, DRIVECOLLECTION};
 use crate::file_system::{file};
 use crate::file_system::file::{File, FileAttribute};
@@ -122,6 +122,7 @@ impl FileSystem{
         cluster_number: u32,
         next_cluster: u32,
     ) {
+        println!("cluster writing: {}", cluster_number);
         let mut drive_collection = DRIVECOLLECTION.lock();
         if let Some(mut drive) = drive_collection.find_drive(self.label.clone()) {
             let fat_offset = cluster_number * 4;
@@ -285,7 +286,6 @@ impl FileSystem{
     ) -> Option<FileEntry> {
         let files = Self::file_parser(path);
         let mut current_cluster = 0;
-        println!("{}", path);
         for i in 0..files.len() {
             let attribute = file::FileAttribute::Directory;
 
@@ -315,7 +315,6 @@ impl FileSystem{
         }
 
         // Get the directory where the file will be created
-        println!("{}", File::remove_file_from_path(path));
         if let Some(dir) = self.find_dir(File::remove_file_from_path(path)) {
             let free_cluster = self.find_free_cluster(0);
             if free_cluster == 0xFFFFFFFF {
@@ -334,7 +333,6 @@ impl FileSystem{
 
             file::FileStatus::Success
         } else {
-            println!("here");
             file::FileStatus::PathNotFound
         }
     }
@@ -381,7 +379,6 @@ impl FileSystem{
                     self.update_fat(current_cluster, 0xFFFFFFFF); // End of chain
                 }
             }
-
             // If there are leftover clusters, free them
             if old_clusters_needed > new_clusters_needed {
                 for cluster in &old_clusters[new_clusters_needed..] {
@@ -608,6 +605,10 @@ impl FileSystem{
                 if (entry != 0xFFFFFFFF) {
                     out_vec.push(entry);
                 }
+                for i in 0..24 {
+                    print!("{:02X} ", sector[i]);
+                }
+                println!();
                 starting_cluster = entry;
             }
             return out_vec
