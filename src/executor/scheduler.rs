@@ -32,7 +32,6 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         if(self.tasks.len() > 0) {
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
-            self.context_switch();
             self.current_task.store(next_task, Ordering::SeqCst);
         }
     }
@@ -46,16 +45,16 @@ impl Scheduler {
     // Context switch would go here (switching task state, etc.)
     pub fn context_switch(&mut self) {
         // Save the current task's state
-        let current_task = &mut self.tasks[self.current_task.load(Ordering::SeqCst)];
+        let mut current_task = &mut self.tasks[self.current_task.load(Ordering::SeqCst)];
         current_task.context.update();
 
         // Select the next task to run
         self.schedule_next();
 
         // Restore the next task's state
-        let next_task = &self.tasks[self.current_task.load(Ordering::SeqCst)];
+        current_task = &mut self.tasks[self.current_task.load(Ordering::SeqCst)];
         unsafe {
-            next_task.context.restore();
+            current_task.context.restore();
         }
     }
 }
