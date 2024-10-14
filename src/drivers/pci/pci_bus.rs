@@ -10,7 +10,7 @@ const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 pub(crate) struct PciBus {
     pub (crate)device_collection: DeviceCollection,
-    pub (crate)last_update: i128,
+    pub (crate)last_update: u128,
 }
 impl PciBus{
 
