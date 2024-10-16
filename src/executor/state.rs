@@ -9,7 +9,7 @@ pub struct State {
     rsi: u64,
     rdi: u64,
     rbp: u64,
-    rsp: u64,  // Stack pointer
+    pub(crate) rsp: u64,   // Stack pointer
     r8: u64,
     r9: u64,
     r10: u64,
@@ -18,8 +18,10 @@ pub struct State {
     r13: u64,
     r14: u64,
     r15: u64,
-    rip: u64,  // Instruction pointer
-    rflags: u64,
+    pub(crate) rip: u64,   // Instruction pointer
+    pub(crate) rflags: u64,
+    pub(crate) cs: u64,    // Code segment register
+    pub(crate) ss: u64,    // Stack segment register
 }
 
 impl State {
@@ -43,13 +45,15 @@ impl State {
             r15: 0,
             rip: 0,
             rflags: 0,
+            cs: 0,    // Initialize with zero
+            ss: 0,    // Initialize with zero
         };
         state.update();
         state
     }
-    /// Save the current CPU context into this State struct
+
+    /// Save the current CPU context into this `State` struct
     pub fn update(&mut self) {
-        //must be split into separate blocks will not compile otherwise
         unsafe {
             asm!(
             "mov {0}, rax",
@@ -96,6 +100,14 @@ impl State {
             "lea {0}, [rip]",    // Save the current RIP (instruction pointer)
             out(reg) self.rip,
             );
+
+            // Save the segment registers (cs and ss)
+            asm!(
+            "mov {0}, cs",       // Save the current code segment
+            "mov {1}, ss",       // Save the current stack segment
+            out(reg) self.cs,
+            out(reg) self.ss,
+            );
         }
     }
 
@@ -139,13 +151,20 @@ impl State {
         in(reg) self.r15,
         );
 
+        // Restore the segment registers (cs and ss)
         asm!(
-        "push {0}",     // Restore rflags
-        "popfq",
-        "jmp {1}",      // Restore rip (instruction pointer)
+        "push {0}",     // Push SS
+        "push {1}",     // Push RSP (stack pointer)
+        "push {2}",     // Push RFLAGS
+        "push {3}",     // Push CS
+        "push {4}",     // Push RIP (instruction pointer)
+        "iretq",        // Return to user mode
+        in(reg) self.ss,
+        in(reg) self.rsp,
         in(reg) self.rflags,
+        in(reg) self.cs,
         in(reg) self.rip,
         );
     }
-
 }
+

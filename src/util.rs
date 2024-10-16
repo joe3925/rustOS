@@ -5,10 +5,11 @@ use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
-use crate::{gdt};
+use crate::{gdt, panic, println};
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
+pub(crate) static mut KERNEL_INITIALIZED: bool = false;
 
 pub unsafe fn init(boot_info: &'static BootInfo){
     gdt::init();
@@ -25,8 +26,11 @@ pub unsafe fn init(boot_info: &'static BootInfo){
         PCIBUS.lock().enumerate_pci();
     }
     IdeController::enumerate_drives();
+    if let Some(drive) = DRIVECOLLECTION.lock().find_drive("B:".to_string()){
+        DRIVECOLLECTION.force_unlock();
+        drive.format();
+    }
 
-    DRIVECOLLECTION.lock().find_drive("B:".to_string()).unwrap()
-        .format()
-        .expect("format failed");
+    println!("Init Done");
+    KERNEL_INITIALIZED = true;
 }

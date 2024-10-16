@@ -3,6 +3,8 @@ use x86_64::structures::idt::InterruptStackFrame;
 use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::executor::scheduler::SCHEDULER;
+use crate::println;
+use crate::util::KERNEL_INITIALIZED;
 
 pub static mut TIMER:SystemTimer = SystemTimer::new();
 pub struct SystemTimer {
@@ -19,8 +21,23 @@ impl SystemTimer{
         self.tick
     }
 }
-pub(crate) extern "x86-interrupt"  fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     unsafe { TIMER.increment(); }
-    SCHEDULER.lock().schedule_next();
-    send_eoi(Timer.as_u8());
+
+    // Check if the kernel has finished initializing
+    //unsafe{println!("timer tick: {}, Kernel init: {}", TIMER.get_current_tick(), KERNEL_INITIALIZED)};
+    if unsafe { KERNEL_INITIALIZED } {
+        // Proceed with task scheduling if initialized
+        SCHEDULER.lock().schedule_next();
+
+        // Perform end-of-interrupt
+        send_eoi(Timer.as_u8());
+
+        // Switch back to user mode
+        unsafe { asm!("iret"); }
+        println!("User Mode Jump!")
+    } else {
+        // Kernel is not initialized yet, just send EOI and return to kernel
+        send_eoi(Timer.as_u8());
+    }
 }

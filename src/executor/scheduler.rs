@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use crate::executor::state::State;
-use crate::executor::task::Task;
+use crate::executor::task::{idle_task, Task};
 use crate::println;
 
 // Global scheduler that contains a list of tasks
@@ -30,6 +30,11 @@ impl Scheduler {
 
     // Select the next task to run in a round-robin fashion
     pub fn schedule_next(&mut self) {
+        if self.tasks.is_empty() {
+            // If there are no tasks, add the idle task to prevent returning
+            let idle_task = Task::new(idle_task as usize); // Create the idle task
+            self.add_task(idle_task);
+        }
         if(self.tasks.len() > 0) {
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);

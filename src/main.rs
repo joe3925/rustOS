@@ -73,9 +73,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BOOT_INFO = Some(boot_info); //RustRover will sometimes mark this as an error not sure why
     }
 
-    let mut i:u128 = 0;
     loop{
-        i+= 1;
     }
 }
 
