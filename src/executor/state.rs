@@ -1,6 +1,8 @@
 use core::arch::asm;
+use crate::println;
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct State {
     rax: u64,
     rbx: u64,
@@ -121,7 +123,6 @@ impl State {
         "mov rsi, {4}",
         "mov rdi, {5}",
         "mov rbp, {6}",
-        "mov rsp, {7}",
         in(reg) self.rax,
         in(reg) self.rbx,
         in(reg) self.rcx,
@@ -129,7 +130,6 @@ impl State {
         in(reg) self.rsi,
         in(reg) self.rdi,
         in(reg) self.rbp,
-        in(reg) self.rsp,
         );
 
         asm!(
@@ -152,12 +152,17 @@ impl State {
         );
 
         // Restore the segment registers (cs and ss)
+        println!("RIP to be restored: {}", self.rip );
+        println!("RSP to be restored: {}", self.rsp );
+
         asm!(
         "push {0}",     // Push SS
-        "push {1}",     // Push RFLAGS
-        "push {2}",     // Push CS
-        "push {3}",     // Push RIP (instruction pointer)
+        "push {1}",
+        "push {2}",     // Push RFLAGS
+        "push {3}",     // Push CS
+        "push {4}",     // Push RIP (instruction pointer)
         in(reg) self.ss,
+        in(reg) self.rsp,
         in(reg) self.rflags,
         in(reg) self.cs,
         in(reg) self.rip,

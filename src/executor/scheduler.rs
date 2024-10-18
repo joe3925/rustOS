@@ -34,20 +34,26 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         if self.tasks.is_empty() {
             // If there are no tasks, add the idle task to prevent returning
-            let idle_task = Task::new(idle_task as usize, 0x8000, false); // Example idle task with kernel mode
+            let idle_task = Task::new(idle_task as usize, 1024 * 10, true); // Example idle task with kernel mode
             self.add_task(idle_task);
-            println!("adding idle task");
         }
         if self.tasks.len() > 0 {
+            self.get_current_task().context.update();
+
+
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
+            println!("State: {:#?}", self.get_current_task().context);
+            println!("rsp: {:#?}", self.get_current_task().context.rsp);
+            unsafe { self.get_current_task().context.restore(); }
         }
+
     }
 
     // Get the currently selected task
-    pub fn get_current_task(&self) -> &Task {
+    pub fn get_current_task(&mut self) -> &mut Task {
         let index = self.current_task.load(Ordering::SeqCst);
-        &self.tasks[index]
+        &mut self.tasks[index]
     }
 
     // Context switch between tasks

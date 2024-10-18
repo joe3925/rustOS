@@ -1,6 +1,7 @@
 use core::arch::asm;
 use crate::executor::state::State;
 use crate::gdt::GDT;
+use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
 use crate::println;
 
 pub struct Task {
@@ -9,22 +10,33 @@ pub struct Task {
 }
 
 impl Task {
-    // Create a new task for user mode or kernel mode
-    pub fn new(entry_point: usize, stack_top: usize, is_user_mode: bool) -> Self {
+    pub fn new(entry_point: usize, stack_size: u64, is_user_mode: bool) -> Self {
+        // Allocate the stack depending on the task mode
+        let stack_top = if is_user_mode {
+            // Allocate a user-mode stack
+            unsafe { allocate_user_stack(stack_size) }
+        } else {
+            // Allocate a kernel-mode stack
+            unsafe { allocate_kernel_stack(stack_size) }
+        };
+
+        // Initialize the state with the entry point and the allocated stack top
         let mut state = State::new();
         state.rip = entry_point as u64;    // Set the instruction pointer to the task entry point
-        state.rsp = stack_top as u64;      // Set the stack pointer
+        state.rsp = stack_top.expect("Paging failed").as_u64();    // Set the stack pointer to the top of the allocated stack
 
+        // Set up segment selectors based on the task mode
         if is_user_mode {
-            // Set up user mode segment selectors
+            // Set user mode segment selectors
             state.cs = GDT.1.user_code_selector.0 as u64;
             state.ss = GDT.1.user_data_selector.0 as u64;
         } else {
-            // Set up kernel mode segment selectors
+            // Set kernel mode segment selectors
             state.cs = GDT.1.kernel_code_selector.0 as u64;
             state.ss = GDT.1.kernel_data_selector.0 as u64;
         }
 
+        // Create and return the new task
         Self {
             context: state,
             isUserMode: is_user_mode,
@@ -32,9 +44,10 @@ impl Task {
     }
 }
 
-pub(crate) const extern "C" fn idle_task() {
+
+pub(crate) extern "C" fn idle_task() {
     loop {
         // The idle task does nothing but loop indefinitely
-        panic!();
+        println!("hello world")
     }
 }

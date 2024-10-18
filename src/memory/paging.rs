@@ -113,48 +113,71 @@ pub fn map_page(
     Ok(())
 }
 /// Allocates a stack for a user-mode task.
-pub fn allocate_user_stack(
-    mapper: &mut OffsetPageTable,
+pub(crate) unsafe fn allocate_user_stack(
     stack_size: u64,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {
     let stack_start = VirtAddr::new(0x8000_0000); // Example user-space stack base (adjust as needed)
     let stack_end = stack_start + stack_size;
+
     if let Some(boot_info) = unsafe { BOOT_INFO } {
-        let frame_allocator = unsafe {
-            BootInfoFrameAllocator::init(&BOOT_INFO.lock().memory_map)
+        let mut frame_allocator = unsafe {
+            BootInfoFrameAllocator::init(&boot_info.memory_map)
         };
+        let mut mapper = unsafe {
+            init_mapper(VirtAddr::new(boot_info.physical_memory_offset))
+        };
+
         for page in Page::range_inclusive(
             Page::containing_address(stack_start),
             Page::containing_address(stack_end - 1u64),
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-            unsafe { map_page(&boot_info.memory_map, page, frame_allocator, flags)?; }
-        }
-
-        Ok(stack_end)
-    }
-
-    /// Allocates a stack for a kernel-mode task.
-    pub fn allocate_kernel_stack(
-        stack_size: u64,
-    ) -> Result<VirtAddr, MapToError<Size4KiB>> {
-        let stack_start = VirtAddr::new(0xFFFF_8000_0000_0000); // Example kernel-space stack base (adjust as needed)
-        let stack_end = stack_start + stack_size;
-        if let Some(boot_info) = unsafe { BOOT_INFO } {
-            let frame_allocator = unsafe {
-                BootInfoFrameAllocator::init(&BOOT_INFO.lock().memory_map)
-            };
-            for page in Page::range_inclusive(
-                Page::containing_address(stack_start),
-                Page::containing_address(stack_end - 1u64),
-            ) {
-                let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-                map_page(&boot_info.memory_map, page, frame_allocator, flags)?;
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            unsafe {
+                mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
             }
         }
 
         Ok(stack_end)
+    } else {
+        Err(MapToError::FrameAllocationFailed)
     }
+}
+
+pub(crate) unsafe fn allocate_kernel_stack(
+    stack_size: u64,
+) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let stack_start = VirtAddr::new(0xFFFF_8000_0000_0000); // Example kernel-space stack base (adjust as needed)
+    let stack_end = stack_start + stack_size;
+
+    if let Some(boot_info) = unsafe { BOOT_INFO } {
+        let mut frame_allocator = unsafe {
+            BootInfoFrameAllocator::init(&boot_info.memory_map)
+        };
+        let mut mapper = unsafe {
+            init_mapper(VirtAddr::new(boot_info.physical_memory_offset))
+        };
+
+        for page in Page::range_inclusive(
+            Page::containing_address(stack_start),
+            Page::containing_address(stack_end - 1u64),
+        ) {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            let frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
+            unsafe {
+                mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+            }
+        }
+
+        Ok(stack_end)
+    } else {
+        Err(MapToError::FrameAllocationFailed)
+    }
+}
     pub fn map_mmio_region(
         mapper: &mut OffsetPageTable,
         frame_allocator: &mut BootInfoFrameAllocator,
@@ -178,4 +201,3 @@ pub fn allocate_user_stack(
 
         Ok(())
     }
-}

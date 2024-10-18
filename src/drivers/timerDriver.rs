@@ -28,16 +28,14 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     //unsafe { println!("kernel init: {}", KERNEL_INITIALIZED) }
     //unsafe{println!("timer tick: {}, Kernel init: {}", TIMER.get_current_tick(), KERNEL_INITIALIZED)};
     if unsafe { KERNEL_INITIALIZED } {
-        println!("scheduling ");
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
         scheduler.schedule_next();
 
-        // Perform end-of-interrupt
+        unsafe { if(scheduler.get_current_task().isUserMode == true){asm!("iret");} }
+
         send_eoi(Timer.as_u8());
 
-        // Switch back to user mode
-        unsafe { if(scheduler.get_current_task().isUserMode == true){asm!("iret");} }
     } else {
         // Kernel is not initialized yet, just send EOI and return to kernel
         send_eoi(Timer.as_u8());
