@@ -4,8 +4,9 @@ use x86_64::registers::control::Cr3;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::mapper::MapToError;
 use bootloader::bootinfo::MemoryRegionType;
+use crate::BOOT_INFO;
 
-
+#[derive(Clone, Copy)]
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
     next: usize,
@@ -111,26 +112,70 @@ pub fn map_page(
     }
     Ok(())
 }
-pub fn map_mmio_region(
+/// Allocates a stack for a user-mode task.
+pub fn allocate_user_stack(
     mapper: &mut OffsetPageTable,
-    frame_allocator: &mut BootInfoFrameAllocator,
-    mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
-    mmio_size: u64,               // The size of the MMIO region
-    virtual_addr: VirtAddr         // The virtual address to map it to
-) -> Result<(), MapToError<Size4KiB>> {
-    // Convert the physical address to a frame
-    let phys_frame = PhysFrame::containing_address(mmio_base);
-
-    // Calculate the number of pages to map based on the MMIO size
-    let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
-
-    for i in 0..num_pages {
-        let page = Page::containing_address(virtual_addr + i * 4096);
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-        unsafe {
-            mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
+    stack_size: u64,
+) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let stack_start = VirtAddr::new(0x8000_0000); // Example user-space stack base (adjust as needed)
+    let stack_end = stack_start + stack_size;
+    if let Some(boot_info) = unsafe { BOOT_INFO } {
+        let frame_allocator = unsafe {
+            BootInfoFrameAllocator::init(&BOOT_INFO.lock().memory_map)
+        };
+        for page in Page::range_inclusive(
+            Page::containing_address(stack_start),
+            Page::containing_address(stack_end - 1u64),
+        ) {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            unsafe { map_page(&boot_info.memory_map, page, frame_allocator, flags)?; }
         }
+
+        Ok(stack_end)
     }
 
-    Ok(())
+    /// Allocates a stack for a kernel-mode task.
+    pub fn allocate_kernel_stack(
+        stack_size: u64,
+    ) -> Result<VirtAddr, MapToError<Size4KiB>> {
+        let stack_start = VirtAddr::new(0xFFFF_8000_0000_0000); // Example kernel-space stack base (adjust as needed)
+        let stack_end = stack_start + stack_size;
+        if let Some(boot_info) = unsafe { BOOT_INFO } {
+            let frame_allocator = unsafe {
+                BootInfoFrameAllocator::init(&BOOT_INFO.lock().memory_map)
+            };
+            for page in Page::range_inclusive(
+                Page::containing_address(stack_start),
+                Page::containing_address(stack_end - 1u64),
+            ) {
+                let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+                map_page(&boot_info.memory_map, page, frame_allocator, flags)?;
+            }
+        }
+
+        Ok(stack_end)
+    }
+    pub fn map_mmio_region(
+        mapper: &mut OffsetPageTable,
+        frame_allocator: &mut BootInfoFrameAllocator,
+        mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
+        mmio_size: u64,               // The size of the MMIO region
+        virtual_addr: VirtAddr         // The virtual address to map it to
+    ) -> Result<(), MapToError<Size4KiB>> {
+        // Convert the physical address to a frame
+        let phys_frame = PhysFrame::containing_address(mmio_base);
+
+        // Calculate the number of pages to map based on the MMIO size
+        let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
+
+        for i in 0..num_pages {
+            let page = Page::containing_address(virtual_addr + i * 4096);
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+            unsafe {
+                mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
+            }
+        }
+
+        Ok(())
+    }
 }

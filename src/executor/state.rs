@@ -154,13 +154,10 @@ impl State {
         // Restore the segment registers (cs and ss)
         asm!(
         "push {0}",     // Push SS
-        "push {1}",     // Push RSP (stack pointer)
-        "push {2}",     // Push RFLAGS
-        "push {3}",     // Push CS
-        "push {4}",     // Push RIP (instruction pointer)
-        "iretq",        // Return to user mode
+        "push {1}",     // Push RFLAGS
+        "push {2}",     // Push CS
+        "push {3}",     // Push RIP (instruction pointer)
         in(reg) self.ss,
-        in(reg) self.rsp,
         in(reg) self.rflags,
         in(reg) self.cs,
         in(reg) self.rip,
