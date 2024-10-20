@@ -40,7 +40,6 @@ impl Scheduler {
         if self.tasks.len() > 0 {
             self.get_current_task().context.update();
 
-
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
             println!("State: {:#?}", self.get_current_task().context);

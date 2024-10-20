@@ -31,9 +31,8 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
         scheduler.schedule_next();
-
+        println!("here");
         unsafe { if(scheduler.get_current_task().isUserMode == true){asm!("iret");} }
-
         send_eoi(Timer.as_u8());
 
     } else {
