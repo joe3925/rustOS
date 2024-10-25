@@ -5,13 +5,13 @@ use lazy_static::lazy_static;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 lazy_static! {
-    pub static ref TSS: TaskStateSegment = {
+    static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;
-            static STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
-            let stack_start = VirtAddr::from_ptr(&STACK);
+            let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
             let stack_end = stack_start + STACK_SIZE as u64;
             stack_end
         };
@@ -26,18 +26,18 @@ use crate::println;
 lazy_static! {
     pub static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
-        
+
         // Kernel mode segments
         let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
         let kernel_data_selector = gdt.append(Descriptor::kernel_data_segment());
-        
+
         // User mode segments (ring 3)
         let user_code_selector = gdt.append(Descriptor::user_code_segment());
         let user_data_selector = gdt.append(Descriptor::user_data_segment());
-        
+
         // Task state segment (TSS)
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-        
+
         (
             gdt,
             Selectors {
@@ -66,6 +66,7 @@ pub fn init() {
 
     // Load the GDT
     GDT.0.load();
+
 
     // Load the kernel code segment and TSS
     unsafe {

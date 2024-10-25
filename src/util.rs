@@ -1,4 +1,5 @@
 use alloc::string::ToString;
+use core::arch::asm;
 use bootloader::BootInfo;
 use x86_64::VirtAddr;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
@@ -13,8 +14,8 @@ pub(crate) static mut KERNEL_INITIALIZED: bool = false;
 
 pub unsafe fn init(boot_info: &'static BootInfo){
     gdt::init();
-    load_idt();
     unsafe { interrupt_index::PICS.lock().initialize() };
+    load_idt();
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
@@ -33,4 +34,14 @@ pub unsafe fn init(boot_info: &'static BootInfo){
 
     println!("Init Done");
     KERNEL_INITIALIZED = true;
+}
+#[no_mangle]
+pub extern "C" fn trigger_stack_overflow() {
+    // Infinite recursion to exhaust the stack
+    trigger_stack_overflow();
+}
+pub fn trigger_breakpoint() {
+    unsafe {
+        asm!("int 3");
+    }
 }

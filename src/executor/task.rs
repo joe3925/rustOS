@@ -2,7 +2,7 @@ use core::arch::asm;
 use crate::executor::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
-use crate::println;
+use crate::{panic, println};
 
 pub struct Task {
     pub(crate) context: State,  // The CPU state for this task
@@ -28,8 +28,12 @@ impl Task {
         // Set up segment selectors based on the task mode
         if is_user_mode {
             // Set user mode segment selectors
-            state.cs = GDT.1.user_code_selector.0 as u64;
-            state.ss = GDT.1.user_data_selector.0 as u64;
+
+            state.cs = GDT.1.user_code_selector.0 as u64 | 3;
+            state.ss = GDT.1.user_data_selector.0 as u64 | 3;
+            println!("current cs: {}", state.cs);
+            println!("current ss: {}", state.ss);
+
         } else {
             // Set kernel mode segment selectors
             state.cs = GDT.1.kernel_code_selector.0 as u64;

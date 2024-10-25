@@ -140,12 +140,13 @@ pub(crate) unsafe fn allocate_user_stack(
             }
         }
 
-        Ok(stack_end)
+        // Ensure the stack pointer is properly aligned to a 16-byte boundary.
+        let aligned_stack_end = VirtAddr::new((stack_end.as_u64() & !0xF));
+        Ok(aligned_stack_end)
     } else {
         Err(MapToError::FrameAllocationFailed)
     }
 }
-
 pub(crate) unsafe fn allocate_kernel_stack(
     stack_size: u64,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {

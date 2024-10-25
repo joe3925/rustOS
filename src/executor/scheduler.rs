@@ -39,14 +39,13 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         if self.tasks.is_empty() {
             // If there are no tasks, add the idle task to prevent returning
-            let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
+            let idle_task = Task::new(idle_task as usize, 1024 * 10, true); // Example idle task with kernel mode
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {
 
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
-            println!("State: {:#?}", self.get_current_task().context);
         }
 
     }

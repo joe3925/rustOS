@@ -1,4 +1,5 @@
 use core::arch::asm;
+use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
 use crate::println;
@@ -108,7 +109,8 @@ impl State {
 
     /// Function to restore the CPU context from this State struct
     #[inline]
-    pub unsafe fn restore(&self) {
+    #[no_mangle]
+    pub unsafe fn restore(&mut self) {
         asm!(
         "mov rax, {0}",
         "mov rbx, {1}",
@@ -144,9 +146,8 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-        // Restore the segment registers (cs and ss)
-        println!("RIP to be restored: {}", self.rip );
-        println!("RSP to be restored: {}", self.rsp );
+
+        function();
 
         asm!(
         "push {0}",     // Push SS
@@ -163,5 +164,8 @@ impl State {
         unsafe { asm!("iretq") }
 
     }
+}
+fn function(){
+
 }
 
