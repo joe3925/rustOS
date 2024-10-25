@@ -1,4 +1,6 @@
 use core::arch::asm;
+use crate::drivers::interrupt_index::InterruptIndex::Timer;
+use crate::drivers::interrupt_index::send_eoi;
 use crate::println;
 
 #[repr(C)]
@@ -53,6 +55,13 @@ impl State {
         state.update();
         state
     }
+    pub fn update_from_interrupt(&mut self, rip: u64, rsp: u64, rflags: u64, cs: u64, ss: u64) {
+        self.rip = rip;
+        self.rsp = rsp;
+        self.rflags = rflags;
+        self.cs = cs;
+        self.ss = ss;
+    }
 
     /// Save the current CPU context into this `State` struct
     pub fn update(&mut self) {
@@ -65,9 +74,7 @@ impl State {
             "mov {4}, rsi",
             "mov {5}, rdi",
             "mov {6}, rbp",
-            "mov {7}, rsp",
-            "pushfq",
-            "pop {8}",         // Save rflags
+
             out(reg) self.rax,
             out(reg) self.rbx,
             out(reg) self.rcx,
@@ -75,8 +82,6 @@ impl State {
             out(reg) self.rsi,
             out(reg) self.rdi,
             out(reg) self.rbp,
-            out(reg) self.rsp,
-            out(reg) self.rflags,
             );
 
             asm!(
@@ -98,22 +103,11 @@ impl State {
             out(reg) self.r15,
             );
 
-            asm!(
-            "lea {0}, [rip]",    // Save the current RIP (instruction pointer)
-            out(reg) self.rip,
-            );
-
-            // Save the segment registers (cs and ss)
-            asm!(
-            "mov {0}, cs",       // Save the current code segment
-            "mov {1}, ss",       // Save the current stack segment
-            out(reg) self.cs,
-            out(reg) self.ss,
-            );
         }
     }
 
     /// Function to restore the CPU context from this State struct
+    #[inline]
     pub unsafe fn restore(&self) {
         asm!(
         "mov rax, {0}",
@@ -150,7 +144,6 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-
         // Restore the segment registers (cs and ss)
         println!("RIP to be restored: {}", self.rip );
         println!("RSP to be restored: {}", self.rsp );
@@ -167,6 +160,8 @@ impl State {
         in(reg) self.cs,
         in(reg) self.rip,
         );
+        unsafe { asm!("iretq") }
+
     }
 }
 
