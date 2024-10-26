@@ -37,7 +37,6 @@ pub unsafe fn init(boot_info: &'static BootInfo){
 }
 #[no_mangle]
 pub extern "C" fn trigger_stack_overflow() {
-    // Infinite recursion to exhaust the stack
     trigger_stack_overflow();
 }
 pub fn trigger_breakpoint() {

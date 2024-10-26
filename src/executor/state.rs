@@ -150,9 +150,9 @@ impl State {
         in(reg) self.r15,
         );
         function();
-        println!("SS value:{}", self.ss);
-        println!("CS value:{}", self.cs);
-        println!("RIP value:{}", self.rip);
+        send_eoi(Timer.as_u8());
+
+        self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
 
         asm!(
         "push {0}",     // Push SS

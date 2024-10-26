@@ -38,16 +38,15 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     //unsafe{println!("timer tick: {}, Kernel init: {}", TIMER.get_current_tick(), KERNEL_INITIALIZED)};
 
     if unsafe { KERNEL_INITIALIZED } {
+        println!("rflags: {:#?}", rflags);
 
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
         if(!scheduler.isEmpty()){
             scheduler.get_current_task().context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
         }
-        wait_cycle(1000000000);
         unsafe { scheduler.schedule_next(); }
 
-        send_eoi(Timer.as_u8());
         unsafe { println!("restore addr: {:X}", init as usize); }
 
         unsafe { scheduler.get_current_task().context.restore(); }

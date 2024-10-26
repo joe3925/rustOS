@@ -38,7 +38,7 @@ impl Scheduler {
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        if self.tasks.is_empty() {
+        if self.tasks.len() < 3 {
             // If there are no tasks, add the idle task to prevent returning
             let idle_task = Task::new(paging::allocate_infinite_loop_page().unwrap().as_u64() as usize, 1024 * 10, true); // Example idle task with kernel mode
             self.add_task(idle_task);

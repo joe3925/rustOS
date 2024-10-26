@@ -78,7 +78,6 @@ impl Drive {
     }
     pub fn format(&mut self) -> Result<(), &'static str>{
         self.is_fat = true;
-        println!("here, {}", 1);
         FileSystem::new(self.label.clone()).format_drive()
     }
 }
