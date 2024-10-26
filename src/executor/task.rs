@@ -37,7 +37,7 @@ impl Task {
             // Set user mode segment selectors
             state.cs = GDT.1.user_code_selector.0 as u64 | 3;
             state.ss = GDT.1.user_data_selector.0 as u64 | 3;
-            println!("User-mode task created with CS: {}, SS: {}", state.cs, state.ss);
+            println!("User-mode task created with RIP {:X}, STACK {:X}", state.rip, state.rsp);
 
         } else {
             // Set kernel mode segment selectors

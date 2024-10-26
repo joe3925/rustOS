@@ -5,6 +5,7 @@ use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
 use crate::{print, println};
+use crate::executor::scheduler::SCHEDULER;
 use crate::util::trigger_stack_overflow;
 
 #[repr(C)]
@@ -110,7 +111,6 @@ impl State {
         }
     }
 
-    /// Function to restore the CPU context from this State struct
     #[inline]
     #[no_mangle]
     pub unsafe extern "C" fn restore(&mut self) {
@@ -150,6 +150,7 @@ impl State {
         in(reg) self.r15,
         );
         function();
+        SCHEDULER.force_unlock();
         send_eoi(Timer.as_u8());
 
         self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
