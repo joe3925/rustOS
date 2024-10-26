@@ -6,7 +6,7 @@ use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::executor::scheduler::SCHEDULER;
 use crate::println;
-use crate::util::KERNEL_INITIALIZED;
+use crate::util::{init, KERNEL_INITIALIZED};
 
 pub static mut TIMER:SystemTimer = SystemTimer::new();
 pub struct SystemTimer {
@@ -45,9 +45,10 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
             scheduler.get_current_task().context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
         }
         wait_cycle(1000000000);
-        scheduler.schedule_next();
+        unsafe { scheduler.schedule_next(); }
 
         send_eoi(Timer.as_u8());
+        unsafe { println!("restore addr: {:X}", init as usize); }
 
         unsafe { scheduler.get_current_task().context.restore(); }
 

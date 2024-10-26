@@ -1,6 +1,8 @@
+use core::arch::asm;
+use bitflags::Flags;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use crate::{println};
+use crate::{panic, println};
 use crate::util::trigger_breakpoint;
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
@@ -51,12 +53,18 @@ pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptS
     panic!("EXCEPTION: STACK SEGMENT FAULT\n{:#?}", stack_frame);
 }
 
-pub(crate) extern "x86-interrupt" fn general_protection_fault(stack_frame: InterruptStackFrame, _error_code: u64) {
-    panic!("EXCEPTION: GENERAL PROTECTION FAULT\n{:#?}", stack_frame);
+pub(crate) extern "x86-interrupt" fn general_protection_fault(
+    stack_frame: InterruptStackFrame, error_code: u64
+) {
+    decode_gpf_error_code(error_code);
+   panic!("EXCEPTION: GENERAL PROTECTION FAULT ERROR CODE(0x{:X}) \n{:#?}", error_code ,stack_frame, );
 }
 
 //TODO: properly handle page faults
-pub(crate) extern "x86-interrupt" fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
+pub(crate) extern "x86-interrupt" fn page_fault(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());
     println!("{:#?}", stack_frame);
@@ -80,4 +88,25 @@ pub(crate) extern "x86-interrupt" fn simd_floating_point_exception(stack_frame: 
 
 pub(crate) extern "x86-interrupt" fn virtualization_exception(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: VIRTUALIZATION\n{:#?}", stack_frame);
+}
+fn decode_gpf_error_code(error_code: u64) {
+    let source = error_code & 0b111;
+    let table_indicator = (error_code >> 3) & 1;
+    let index = (error_code >> 4) & 0x1FFF; // Bits 4-15
+
+    println!("Decoded GPF Error Code:");
+    match source {
+        0 => println!("Source: GDT"),
+        1 => println!("Source: IDT"),
+        2 => println!("Source: LDT"),
+        _ => println!("Source: Reserved"),
+    }
+
+    if table_indicator == 0 {
+        println!("Table: GDT");
+    } else {
+        println!("Table: LDT");
+    }
+
+    println!("Segment Selector Index: {}", index);
 }

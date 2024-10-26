@@ -1,26 +1,41 @@
 use x86_64::VirtAddr;
 use x86_64::structures::tss::TaskStateSegment;
 use lazy_static::lazy_static;
+use x86_64::instructions::segmentation::SS;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 
-            let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
-            let stack_end = stack_start + STACK_SIZE as u64;
+        // Set up the stack for the double fault handler using the IST.
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+            const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5; // 20 KB stack
+            static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
+
+            let stack_start = VirtAddr::from_ptr(unsafe { &DOUBLE_FAULT_STACK });
+            let stack_end = stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
             stack_end
         };
+
+        // Set up the privilege stack for ring 0 (used when transitioning from ring 3 to ring 0).
+        const PRIVILEGE_STACK_SIZE: usize = 4096 * 5; // 20 KB stack
+        static mut PRIVILEGE_STACK: [u8; PRIVILEGE_STACK_SIZE] = [0; PRIVILEGE_STACK_SIZE];
+
+        tss.privilege_stack_table[0] = {
+            let stack_start = VirtAddr::from_ptr(unsafe { &PRIVILEGE_STACK });
+            let stack_end = stack_start + PRIVILEGE_STACK_SIZE as u64;
+            stack_end
+        };
+
         tss
     };
 }
 
 use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
 use x86_64::structures::gdt::SegmentSelector;
+use crate::memory::paging::allocate_kernel_stack;
 use crate::println;
 
 lazy_static! {
@@ -32,8 +47,11 @@ lazy_static! {
         let kernel_data_selector = gdt.append(Descriptor::kernel_data_segment());
 
         // User mode segments (ring 3)
-        let user_code_selector = gdt.append(Descriptor::user_code_segment());
-        let user_data_selector = gdt.append(Descriptor::user_data_segment());
+        // Define 64-bit code segment for user mode
+        let user_code_selector = gdt.append(Descriptor::UserSegment(0x00AFFA000000FFFF));
+
+        // Manually define a 64-bit compatible data segment for user mode
+        let user_data_selector = gdt.append(Descriptor::UserSegment(0x00CFF3000000FFFF));
 
         // Task state segment (TSS)
         let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
@@ -60,19 +78,22 @@ pub struct Selectors {
     tss_selector: SegmentSelector,
 }
 
+
 pub fn init() {
-    use x86_64::instructions::tables::load_tss;
     use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::tables::load_tss;
 
     // Load the GDT
     GDT.0.load();
 
-
-    // Load the kernel code segment and TSS
+    // Reload segment registers
     unsafe {
         CS::set_reg(GDT.1.kernel_code_selector);
+        SS::set_reg(GDT.1.kernel_data_selector);
+
+        // Load the TSS
         load_tss(GDT.1.tss_selector);
     }
 
-    println!("Loaded GDT with user-mode support");
+    println!("Loaded GDT and TSS with user-mode support");
 }

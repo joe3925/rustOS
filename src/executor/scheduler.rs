@@ -5,6 +5,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 use crate::executor::state::State;
 use crate::executor::task::{idle_task, Task};
+use crate::memory::paging;
 use crate::println;
 
 
@@ -36,10 +37,10 @@ impl Scheduler {
 
     // Select the next task to run in a round-robin fashion
     #[inline]
-    pub fn schedule_next(&mut self) {
+    pub unsafe fn schedule_next(&mut self) {
         if self.tasks.is_empty() {
             // If there are no tasks, add the idle task to prevent returning
-            let idle_task = Task::new(idle_task as usize, 1024 * 10, true); // Example idle task with kernel mode
+            let idle_task = Task::new(paging::allocate_infinite_loop_page().unwrap().as_u64() as usize, 1024 * 10, true); // Example idle task with kernel mode
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {

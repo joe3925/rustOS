@@ -1,3 +1,5 @@
+use core::arch::asm;
+use core::ptr;
 use bootloader::bootinfo::MemoryMap;
 use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::registers::control::Cr3;
@@ -111,6 +113,40 @@ pub fn map_page(
         mapper.map_to(page, frame, flags, frame_allocator)?.flush();
     }
     Ok(())
+}
+/// Allocates a page, writes the `HLT` instruction to it, and returns the virtual address of the instruction.
+/// Allocates a page, writes an infinite loop instruction to it, and returns the virtual address of the loop.
+pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
+    // Define the flags to allow writing and executing the page
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    // Initialize the frame allocator and mapper using BOOT_INFO
+    if let Some(boot_info) = BOOT_INFO {
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+        let mut mapper = init_mapper(VirtAddr::new(boot_info.physical_memory_offset));
+
+        // Allocate a frame and get a virtual address for the page
+        let frame = frame_allocator.allocate_frame()
+            .ok_or("Failed to allocate frame")?;
+
+        // Define the virtual address for the page
+        let page = Page::containing_address(VirtAddr::new(0x4000_0000)); // Example address
+
+        // Map the page to the frame
+        unsafe {
+            mapper.map_to(page, frame, flags, &mut frame_allocator).expect("failed to alloc idle page").flush();
+        }
+
+        // Write the infinite loop instruction (`0xEB 0xFE`) to the start of the page
+        let page_ptr: *mut u8 = page.start_address().as_mut_ptr();
+        ptr::write(page_ptr, 0xEB);       // JMP opcode
+        ptr::write(page_ptr.add(1), 0xFE); // -2 offset, to jump back to itself
+
+        // Return the virtual address of the infinite loop
+        Ok(page.start_address())
+    } else {
+        Err("Boot info not available")
+    }
 }
 /// Allocates a stack for a user-mode task.
 pub(crate) unsafe fn allocate_user_stack(

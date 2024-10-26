@@ -1,11 +1,14 @@
 use core::arch::asm;
+use x86_64::registers::segmentation::{Segment, SS};
+use x86_64::structures::gdt::SegmentSelector;
 use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
-use crate::println;
+use crate::{print, println};
+use crate::util::trigger_stack_overflow;
 
 #[repr(C)]
-#[derive(Debug)]
+#[no_mangle]
 pub struct State {
     rax: u64,
     rbx: u64,
@@ -28,7 +31,7 @@ pub struct State {
     pub(crate) cs: u64,    // Code segment register
     pub(crate) ss: u64,    // Stack segment register
 }
-
+#[no_mangle]
 impl State {
     pub fn new() -> Self {
         let mut state = State {
@@ -110,7 +113,7 @@ impl State {
     /// Function to restore the CPU context from this State struct
     #[inline]
     #[no_mangle]
-    pub unsafe fn restore(&mut self) {
+    pub unsafe extern "C" fn restore(&mut self) {
         asm!(
         "mov rax, {0}",
         "mov rbx, {1}",
@@ -146,8 +149,10 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-
         function();
+        println!("SS value:{}", self.ss);
+        println!("CS value:{}", self.cs);
+        println!("RIP value:{}", self.rip);
 
         asm!(
         "push {0}",     // Push SS
