@@ -1,4 +1,3 @@
-use core::arch::asm;
 use core::ptr;
 use bootloader::bootinfo::MemoryMap;
 use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
@@ -179,7 +178,7 @@ pub(crate) unsafe fn allocate_user_stack(
 
         // Loop to find a free range that fits the total stack size (including guard page)
         loop {
-            let mut stack_start = VirtAddr::new(base_addr);
+            let stack_start = VirtAddr::new(base_addr);
             stack_end = stack_start + total_stack_size;
 
             // Check each page in the range to see if it's already mapped

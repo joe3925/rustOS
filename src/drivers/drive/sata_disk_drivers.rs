@@ -1,23 +1,18 @@
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::vec;
 use alloc::vec::Vec;
 use x86_64::instructions::port::Port;
 use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::idt::ExceptionVector::Page;
 use x86_64::structures::paging::OffsetPageTable;
 use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
 use core::ptr::{read_volatile, write_volatile};
-use bootloader::BootInfo;
-use crate::structs::aligned_buffer;
-use crate::drivers::drive::AHCI_structs;
 
-use crate::{panic, println, BOOT_INFO};
+use crate::{println, BOOT_INFO};
 use crate::cpu::wait_cycle;
-use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D, FisType};
+use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
@@ -263,7 +258,7 @@ impl AHCIController {
     }
     pub fn identify_drive(&mut self, port: u32) -> Option<DriveInfo> {
         // Step 1: Set up the FIS for the IDENTIFY DEVICE command (0xEC)
-        let mut fis = FisRegH2D::new(0xEC, 0, 1); // Identify device has no specific LBA, sector_count = 1
+        let fis = FisRegH2D::new(0xEC, 0, 1); // Identify device has no specific LBA, sector_count = 1
 
         // Step 2: Get the Command Header and Command Table for this port
         let command_list_base_ptr = self.command_list_buffers[port as usize].buffer.as_mut_ptr();

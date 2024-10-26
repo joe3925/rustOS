@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="run" type="CompoundRunConfigurationType">
+    <toRun name="1build" type="ShConfigurationType" />
+    <toRun name="qemu" type="ShConfigurationType" />
+    <method v="2" />
+  </configuration>
+</component>

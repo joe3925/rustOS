@@ -1,9 +1,6 @@
-use core::arch::asm;
-use bitflags::Flags;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use crate::{panic, println};
-use crate::util::trigger_breakpoint;
+use crate::println;
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);

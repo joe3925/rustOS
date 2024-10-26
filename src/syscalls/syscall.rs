@@ -1,9 +1,6 @@
-use alloc::string::String;
-use core::arch::asm;
-use pc_keyboard::KeyCode::T;
 use x86_64::registers::model_specific::Msr;
 use crate::gdt::GDT;
-use crate::{console, println};
+use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::scheduling::task::Task;

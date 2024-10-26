@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use core::cmp::PartialEq;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::file_system::FAT::FileSystem;
-use crate::println;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {

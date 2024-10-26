@@ -35,7 +35,6 @@ lazy_static! {
 
 use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
 use x86_64::structures::gdt::SegmentSelector;
-use crate::memory::paging::allocate_kernel_stack;
 use crate::println;
 
 lazy_static! {

@@ -1,9 +1,7 @@
-use core::arch::asm;
 use crate::scheduling::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
-use crate::{panic, println};
-use crate::memory::paging;
+use crate::println;
 
 pub struct Task {
     pub(crate) context: State,  // The CPU state for this task

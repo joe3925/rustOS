@@ -10,9 +10,7 @@ use x86_64::structures::idt::InterruptStackFrame;
 use crate::cpu::{get_cycles};
 use crate::drivers::interrupt_index::send_eoi;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Lazy;
-use spin::mutex::Mutex;
-use crate::drivers::drive::generic_drive::{Controller, Drive, DriveCollection, DriveController, DriveInfo, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
 use crate::drivers::pci::device_collection::Device;
 
 const PRIMARY_CMD_BASE: u16 = 0x1F0;

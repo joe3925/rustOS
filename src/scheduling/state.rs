@@ -1,12 +1,7 @@
 use core::arch::asm;
-use x86_64::registers::segmentation::{Segment, SS};
-use x86_64::structures::gdt::SegmentSelector;
-use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
-use crate::{print, println};
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::util::trigger_stack_overflow;
 
 #[repr(C)]
 #[no_mangle]

@@ -1,9 +1,8 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::{mem, ptr};
+use core::ptr;
 use core::mem::{align_of, size_of};
 use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
-use crate::println;
 use crate::structs::linked_list::{LinkedList, ListNode};
 #[global_allocator]
 pub static mut ALLOCATOR: Locked<Allocator> =
@@ -77,7 +76,7 @@ impl Allocator{
             if !best_fit_prev.is_null() {
                 // Remove the best-fit region from the free list
                 let best_fit_prev_ref = &mut *best_fit_prev;
-                let mut best_fit_region = best_fit_prev_ref.next.take().unwrap();
+                let best_fit_region = best_fit_prev_ref.next.take().unwrap();
                 let next = best_fit_region.next.take();
                 best_fit_prev_ref.next = next;
 

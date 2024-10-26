@@ -1,14 +1,12 @@
-use alloc::borrow::ToOwned;
 use alloc::boxed::Box;
-use alloc::string::{String, ToString};
-use alloc::{format, vec};
+use alloc::string::String;
+use alloc::format;
 use alloc::vec::Vec;
 use spin::Lazy;
 use spin::mutex::Mutex;
 use crate::drivers::drive::ide_disk_driver::{ IdeController};
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use strum::IntoEnumIterator; // Trait for iterating over enum variants
-use strum_macros::EnumIter;
 use crate::drivers::pci::device_collection::Device;
 use crate::file_system::FAT::FileSystem;
 use crate::println;

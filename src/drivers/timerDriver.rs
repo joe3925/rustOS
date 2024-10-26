@@ -1,12 +1,8 @@
-use core::arch::asm;
-use core::arch::x86_64::__cpuid;
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::cpu::wait_cycle;
-use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
+use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::println;
-use crate::util::{init, KERNEL_INITIALIZED};
+use crate::util::KERNEL_INITIALIZED;
 
 pub static mut TIMER:SystemTimer = SystemTimer::new();
 pub struct SystemTimer {

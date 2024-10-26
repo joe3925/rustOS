@@ -1,12 +1,8 @@
 use alloc::vec::Vec;
-use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::scheduling::state::State;
-use crate::scheduling::task::{idle_task};
 use crate::memory::paging;
-use crate::println;
 use crate::scheduling::task::Task;
 
 // Global scheduler that contains a list of tasks

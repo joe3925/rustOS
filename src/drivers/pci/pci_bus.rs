@@ -2,7 +2,7 @@ use x86_64::instructions::port::Port;
 use crate::drivers::pci::device_collection::DeviceCollection;
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::timerDriver::TIMER;
-use crate::memory::allocator::{Allocator, Locked};
+use crate::memory::allocator::Locked;
 use crate::println;
 pub(crate) static mut PCIBUS: Locked<PciBus> =
     Locked::new(PciBus::new());
