@@ -37,7 +37,7 @@ mod drivers {
 
     }
 }
-mod executor{
+mod scheduling{
     pub mod task;
     pub mod scheduler;
     pub mod state;
@@ -57,6 +57,9 @@ mod structs{
  mod file_system {
     pub mod FAT;
      pub mod file;
+}
+mod syscalls{
+    pub mod syscall;
 }
 static mut BOOT_INFO: Option<&'static BootInfo> = None;
 #[panic_handler]

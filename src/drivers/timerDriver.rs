@@ -4,7 +4,7 @@ use x86_64::structures::idt::InterruptStackFrame;
 use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
-use crate::executor::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::println;
 use crate::util::{init, KERNEL_INITIALIZED};
 

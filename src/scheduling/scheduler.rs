@@ -3,11 +3,11 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::executor::state::State;
-use crate::executor::task::{idle_task, Task};
+use crate::scheduling::state::State;
+use crate::scheduling::task::{idle_task};
 use crate::memory::paging;
 use crate::println;
-
+use crate::scheduling::task::Task;
 
 // Global scheduler that contains a list of tasks
 lazy_static! {
@@ -38,7 +38,7 @@ impl Scheduler {
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        if self.tasks.len() < 3 {
+        if self.tasks.len() < 9 {
             // If there are no tasks, add the idle task to prevent returning
             let idle_task = Task::new(paging::allocate_infinite_loop_page().unwrap().as_u64() as usize, 1024 * 10, true); // Example idle task with kernel mode
             self.add_task(idle_task);

@@ -1,5 +1,5 @@
 use core::arch::asm;
-use crate::executor::state::State;
+use crate::scheduling::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
 use crate::{panic, println};

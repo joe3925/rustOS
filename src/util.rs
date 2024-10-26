@@ -10,12 +10,16 @@ use crate::{gdt, panic, println};
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
+use crate::syscalls::syscall;
+use crate::syscalls::syscall::set_syscall_handler;
+
 pub(crate) static mut KERNEL_INITIALIZED: bool = false;
 
 pub unsafe fn init(boot_info: &'static BootInfo){
     gdt::init();
     unsafe { interrupt_index::PICS.lock().initialize() };
     load_idt();
+
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
@@ -29,8 +33,9 @@ pub unsafe fn init(boot_info: &'static BootInfo){
     IdeController::enumerate_drives();
     if let Some(drive) = DRIVECOLLECTION.lock().find_drive("B:".to_string()){
         DRIVECOLLECTION.force_unlock();
-        drive.format();
+        drive.format().expect("format failed");
     }
+    set_syscall_handler();
 
     println!("Init Done");
     KERNEL_INITIALIZED = true;

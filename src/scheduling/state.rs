@@ -5,18 +5,18 @@ use crate::cpu::wait_cycle;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
 use crate::{print, println};
-use crate::executor::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::util::trigger_stack_overflow;
 
 #[repr(C)]
 #[no_mangle]
 pub struct State {
-    rax: u64,
+    pub(crate) rax: u64,
     rbx: u64,
     rcx: u64,
     rdx: u64,
     rsi: u64,
-    rdi: u64,
+    pub(crate) rdi: u64,
     rbp: u64,
     pub(crate) rsp: u64,   // Stack pointer
     r8: u64,
@@ -169,6 +169,45 @@ impl State {
         );
         unsafe { asm!("iretq") }
 
+    }
+    #[inline]
+    #[no_mangle]
+    pub unsafe extern "C" fn sysret_restore(&self) {
+        // Restore general-purpose registers that sysret does not handle
+        asm!(
+        "mov rax, {0}",
+        "mov rbx, {1}",
+        "mov rdx, {2}",
+        "mov rsi, {3}",
+        "mov rdi, {4}",
+        "mov rbp, {5}",
+        "mov r8, {6}",
+        "mov r9, {7}",
+        "mov r10, {8}",
+        "mov r12, {9}",
+        "mov r13, {10}",
+        "mov r14, {11}",
+        "mov r15, {12}",
+        in(reg) self.rax,
+        in(reg) self.rbx,
+        in(reg) self.rdx,
+        in(reg) self.rsi,
+        in(reg) self.rdi,
+        in(reg) self.rbp,
+        in(reg) self.r8,
+        in(reg) self.r9,
+        in(reg) self.r10,
+        in(reg) self.r12,
+        in(reg) self.r13,
+        in(reg) self.r14,
+        in(reg) self.r15,
+        );
+
+        // Ensure the stack pointer is correctly set for `sysret`
+        asm!("mov rsp, {}", in(reg) self.rsp);
+
+        // Use `sysret` to return to user mode
+        asm!("sysretq", options(noreturn));
     }
 }
 fn function(){
