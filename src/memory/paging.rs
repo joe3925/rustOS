@@ -160,7 +160,6 @@ pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static 
         Err("Boot info not available")
     }
 }
-/// Allocates a stack for a user-mode task.
 /// Allocates a stack for a user-mode task with guard pages.
 pub(crate) unsafe fn allocate_user_stack(
     stack_size: u64,
@@ -222,35 +221,60 @@ pub(crate) unsafe fn allocate_user_stack(
 pub(crate) unsafe fn allocate_kernel_stack(
     stack_size: u64,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {
-    let stack_start = VirtAddr::new(0xFFFF_8000_0000_0000); // Example kernel-space stack base (adjust as needed)
-    let stack_end = stack_start + stack_size;
+    // Initial base address to start searching from
+    let mut base_addr = 0xFFFF_8000_0000_0000;
 
-    if let Some(boot_info) = unsafe { BOOT_INFO } {
-        let mut frame_allocator = unsafe {
-            BootInfoFrameAllocator::init(&boot_info.memory_map)
-        };
-        let mut mapper = unsafe {
-            init_mapper(VirtAddr::new(boot_info.physical_memory_offset))
-        };
+    // Calculate the total size needed, including the guard page (4 KiB)
+    let total_stack_size = stack_size + 0x1000;
+    let mut stack_end;
 
-        for page in Page::range_inclusive(
-            Page::containing_address(stack_start),
-            Page::containing_address(stack_end - 1u64),
-        ) {
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or(MapToError::FrameAllocationFailed)?;
-            unsafe {
-                mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+    if let Some(boot_info) = BOOT_INFO {
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+        let mut mapper = init_mapper(VirtAddr::new(boot_info.physical_memory_offset));
+
+        // Loop to find a free range that fits the total stack size (including guard page)
+        loop {
+            let stack_start = VirtAddr::new(base_addr);
+            stack_end = stack_start + total_stack_size;
+
+            // Check each page in the range to see if it's already mapped
+            let mut is_range_free = true;
+            for page in Page::<Size4KiB>::range_inclusive(
+                Page::containing_address(stack_start),
+                Page::containing_address(stack_end - 0x1000), // Exclude guard page
+            ) {
+                if mapper.translate_page(page).is_ok() {
+                    is_range_free = false;
+                    break;
+                }
             }
+
+            // If the entire range is free, proceed to allocate
+            if is_range_free {
+                break;
+            }
+            // Increment the base address by the total size needed (including guard page)
+            base_addr += total_stack_size;
         }
 
-        Ok(stack_end)
+        // Map each page in the stack range, leaving the guard page unmapped
+        for page in Page::range_inclusive(
+            Page::containing_address(VirtAddr::new(base_addr)),
+            Page::containing_address(stack_end - 0x1000), // Last page as guard
+        ) {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            let frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+            mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+        }
+
+        // Ensure the stack pointer is properly aligned to a 16-byte boundary.
+        let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
+        Ok(aligned_stack_end)
     } else {
         Err(MapToError::FrameAllocationFailed)
     }
 }
+
     pub fn map_mmio_region(
         mapper: &mut OffsetPageTable,
         frame_allocator: &mut BootInfoFrameAllocator,
