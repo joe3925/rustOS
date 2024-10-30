@@ -5,7 +5,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 use crate::memory::paging;
 use crate::println;
-use crate::scheduling::task::Task;
+use crate::scheduling::task::{idle_task, test_syscall, Task};
 
 // Global scheduler that contains a list of tasks
 lazy_static! {
@@ -36,9 +36,9 @@ impl Scheduler {
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        if self.tasks.len() < 25 {
-            let idle_task = Task::new(paging::allocate_infinite_loop_page().expect("failed to alloc idle task").as_u64() as usize, 1024 * 1, true); // Example idle task with kernel mode
-            //TODO: this add task cause a page fault in the heap after about 8 task have been added
+        if self.tasks.len() == 0 {
+            let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
+            println!("Created new task");
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {

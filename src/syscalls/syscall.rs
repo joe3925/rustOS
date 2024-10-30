@@ -54,7 +54,6 @@ extern "C" fn syscall_handler() {
 
             }
         }
-        // Add cases for other syscall numbers as needed
         _ => {
             println!("Unknown syscall number: {}", state.rax);
         }

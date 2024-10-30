@@ -1,3 +1,4 @@
+use core::arch::asm;
 use crate::scheduling::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
@@ -58,4 +59,19 @@ pub(crate) extern "C" fn idle_task() {
         // The idle task does nothing but loop indefinitely
         println!("hello world")
     }
+}
+pub unsafe fn test_syscall() -> u64 {
+    let syscall_number: u64 = 1; // replace with your syscall number
+    let arg1: u64 = 0x0;         // replace with any argument if needed
+    let result: u64;
+    asm!(
+    "mov rax, {0}",          // Move syscall number into rax
+    "mov rdi, {1}",          // First argument
+    "syscall",               // Execute syscall
+    "mov {2}, rax",          // Store result in `result`
+    in(reg) syscall_number,
+    in(reg) arg1,
+    out(reg) result,
+    );
+    result
 }

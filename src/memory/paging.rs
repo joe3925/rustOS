@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use core::ptr;
 use bootloader::bootinfo::MemoryMap;
 use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
@@ -132,65 +133,48 @@ pub(crate) fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'
     let level_4_table = get_level4_page_table(physical_memory_offset);
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
-pub fn map_page(
-    mapper: &mut impl Mapper<Size4KiB>,
-    page: Page<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-    flags: PageTableFlags) -> Result<(), MapToError<Size4KiB>> {
-    let frame = frame_allocator
-        .allocate_frame()
-        .ok_or(MapToError::FrameAllocationFailed)?;
-    unsafe {
-        mapper.map_to(page, frame, flags, frame_allocator)?.flush();
-    }
-    Ok(())
+unsafe fn write_infinite_loop(page_ptr: *mut u8) {
+    // Infinite loop instruction: `0xEB 0xFE` (JMP -2)
+    ptr::write(page_ptr, 0xEB);       // JMP opcode
+    ptr::write(page_ptr.add(1), 0xFE); // -2 offset to jump back to itself
 }
 
-/// Allocates a page with an infinite loop instruction at a free virtual address.
-//TODO: split this into a generic write inf loop function and an alloc user page function
-pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
-    // Define the flags to allow writing and executing the page
+// Function to allocate a user-accessible page with write and execute permissions
+pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
-    // Initialize the frame allocator and mapper using BOOT_INFO
     if let Some(boot_info) = BOOT_INFO {
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(VirtAddr::new(boot_info.physical_memory_offset));
 
-        // Start searching for a free virtual address at 0x4000_0000
         let mut base_addr = 0x4000_0000u64;
-        let mut page:Page<Size4KiB>;
+        let mut page: Page<Size4KiB>;
 
-        // Loop to find an unmapped page
         loop {
             page = Page::containing_address(VirtAddr::new(base_addr));
             if mapper.translate_page(page).is_err() {
-                // Page is not currently mapped, so we can use it
-                break;
+                break; // Found an unmapped page
             }
-            // Move to the next potential page address
-            base_addr += 0x1000; // Increment by one page (4 KiB)
+            base_addr += 0x1000; // Move to the next page (4 KiB)
         }
 
-        // Allocate a new frame for this page
-        let frame = frame_allocator.allocate_frame()
-            .ok_or("Failed to allocate frame")?;
+        let frame = frame_allocator.allocate_frame().ok_or("Failed to allocate frame")?;
 
-        // Map the page to the frame
         mapper.map_to(page, frame, flags, &mut frame_allocator)
-            .expect("failed to map idle page")
+            .expect("failed to map user page")
             .flush();
 
-        // Write the infinite loop instruction (`0xEB 0xFE`) to the start of the page
-        let page_ptr: *mut u8 = page.start_address().as_mut_ptr();
-        ptr::write(page_ptr, 0xEB);       // JMP opcode
-        ptr::write(page_ptr.add(1), 0xFE); // -2 offset, to jump back to itself
-
-        // Return the virtual address of the infinite loop
         Ok(page.start_address())
     } else {
         Err("Boot info not available")
     }
+}
+
+/// Allocates a page with an infinite loop instruction at a free virtual address.
+pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
+    let page_addr = alloc_user_page()?; // Allocate the user page
+    write_infinite_loop(page_addr.as_mut_ptr()); // Write the infinite loop
+    Ok(page_addr)
 }
 /// Allocates a stack for a user-mode task with guard pages.
 pub(crate) unsafe fn allocate_user_stack(
@@ -234,8 +218,8 @@ pub(crate) unsafe fn allocate_user_stack(
 
         // Map each page in the stack range, leaving the guard page unmapped
         for page in Page::range_inclusive(
-            Page::containing_address(VirtAddr::new(base_addr)),
-            Page::containing_address(stack_end - 0x1000), // Last page as guard
+            Page::<Size4KiB>::containing_address(VirtAddr::new(base_addr)),
+            Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Last page as guard
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
             let frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
@@ -252,7 +236,7 @@ pub(crate) unsafe fn allocate_user_stack(
 
 pub(crate) unsafe fn allocate_kernel_stack(
     stack_size: u64,
-) -> Result<VirtAddr, MapToError<Size4KiB>> {
+) -> Result<VirtAddr, String> {
     // Initial base address to start searching from
     let mut base_addr = 0xFFFF_8000_0000_0000;
 
@@ -291,19 +275,19 @@ pub(crate) unsafe fn allocate_kernel_stack(
 
         // Map each page in the stack range, leaving the guard page unmapped
         for page in Page::range_inclusive(
-            Page::containing_address(VirtAddr::new(base_addr)),
-            Page::containing_address(stack_end - 0x1000), // Last page as guard
+            Page::<Size4KiB>::containing_address(VirtAddr::new(base_addr)),
+            Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Last page as guard
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            let frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
-            mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+            let frame = frame_allocator.allocate_frame().expect("Failed to alloc kernel stack frame");
+            mapper.map_to(page, frame, flags, &mut frame_allocator).expect("failed to map kernel stack").flush();
         }
 
         // Ensure the stack pointer is properly aligned to a 16-byte boundary.
         let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
         Ok(aligned_stack_end)
     } else {
-        Err(MapToError::FrameAllocationFailed)
+        Err("Failed to get kernel boot info".to_string())
     }
 }
 

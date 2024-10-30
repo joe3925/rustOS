@@ -2,7 +2,7 @@ use x86_64::structures::paging::{Mapper, Page, PageSize, PageTableFlags, PhysFra
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::FrameAllocator;
 use x86_64::structures::paging::mapper::MapToError;
-use crate::memory::paging::{map_page, BootInfoFrameAllocator};
+use crate::memory::paging::{BootInfoFrameAllocator};
 use crate::println;
 use crate::structs::linked_list::ListNode;
 
@@ -51,7 +51,7 @@ pub(crate) fn init_heap(
     let heap_node = heap_start.as_mut_ptr() as *mut ListNode;
     unsafe { heap_node.write(ListNode::new(HEAP_SIZE)); }
 
-    println!("heap created using 4 KiB pages, but 2 MiB frame allocations");
+    println!("heap created");
 }
 struct DummyAllocator;
 
