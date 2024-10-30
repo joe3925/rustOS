@@ -6,7 +6,7 @@ use x86_64::registers::control::Cr3;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::mapper::MapToError;
 use bootloader::bootinfo::MemoryRegionType;
-use crate::BOOT_INFO;
+use crate::{println, BOOT_INFO};
 
 #[derive(Clone, Copy)]
 pub struct BootInfoFrameAllocator {
@@ -238,7 +238,7 @@ pub(crate) unsafe fn allocate_kernel_stack(
     stack_size: u64,
 ) -> Result<VirtAddr, String> {
     // Initial base address to start searching from
-    let mut base_addr = 0xFFFF_8000_0000_0000;
+    let mut base_addr = 0xFFFF_8000_0000_0000u64;
 
     // Calculate the total size needed, including the guard page (4 KiB)
     let total_stack_size = stack_size + 0x1000;

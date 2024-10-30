@@ -7,9 +7,11 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::{gdt, println};
+use crate::console::CONSOLE;
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::syscalls::syscall::set_syscall_handler;
 
 pub(crate) static mut KERNEL_INITIALIZED: bool = false;
@@ -36,9 +38,8 @@ pub unsafe fn init(boot_info: &'static BootInfo){
         drive.format().expect("format failed");
     }
     set_syscall_handler();
-    KERNEL_INITIALIZED = true;
-
     println!("Init Done");
+    KERNEL_INITIALIZED = true;
 }
 #[no_mangle]
 pub extern "C" fn trigger_stack_overflow() {
@@ -47,5 +48,14 @@ pub extern "C" fn trigger_stack_overflow() {
 pub fn trigger_breakpoint() {
     unsafe {
         asm!("int 3");
+    }
+}
+//will unlock kernel mode statics during a context switch from a kernel mode task
+pub fn unlock_statics(){
+    unsafe {
+        DRIVECOLLECTION.force_unlock();
+        CONSOLE.force_unlock();
+        SCHEDULER.force_unlock();
+
     }
 }

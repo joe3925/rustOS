@@ -38,7 +38,6 @@ impl Scheduler {
     pub unsafe fn schedule_next(&mut self) {
         if self.tasks.len() == 0 {
             let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
-            println!("Created new task");
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {

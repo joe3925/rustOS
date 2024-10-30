@@ -98,7 +98,7 @@ impl Console {
 }
 
 lazy_static! {
-     static ref CONSOLE: Mutex<Console> = Mutex::new(Console {
+     pub(crate) static ref CONSOLE: Mutex<Console> = Mutex::new(Console {
         currentCharSize: 0,
         vga_width: 80,
         cursor_pose: 0,

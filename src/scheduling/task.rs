@@ -1,4 +1,5 @@
 use core::arch::asm;
+use crate::drivers::timerDriver::TIMER;
 use crate::scheduling::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
@@ -43,6 +44,7 @@ impl Task {
             // Set kernel mode segment selectors
             state.cs = GDT.1.kernel_code_selector.0 as u64;
             state.ss = GDT.1.kernel_data_selector.0 as u64;
+            println!("Kernel-mode task created with RIP {:X}, STACK {:X}", state.rip, state.rsp);
         }
 
         // Create and return the new task
@@ -51,13 +53,17 @@ impl Task {
             isUserMode: is_user_mode,
         }
     }
+    pub fn update_from_context(&mut self, context: State){
+        self.context = context;
+    }
 }
 
 
 pub(crate) extern "C" fn idle_task() {
     loop {
         // The idle task does nothing but loop indefinitely
-        println!("hello world")
+        unsafe { println!("Timer Tick:{}", TIMER.get_current_tick()); }
+        x86_64::instructions::hlt();
     }
 }
 pub unsafe fn test_syscall() -> u64 {

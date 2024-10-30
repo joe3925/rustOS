@@ -2,6 +2,8 @@ use x86_64::structures::idt::InterruptStackFrame;
 use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::state::State;
+use crate::util;
 use crate::util::KERNEL_INITIALIZED;
 
 pub static mut TIMER:SystemTimer = SystemTimer::new();
@@ -21,6 +23,7 @@ impl SystemTimer{
 }
 pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     //these variables are on the stack and must be captured before any other function is called
+    let mut context = State::new();
     let rip = _stack_frame.instruction_pointer.as_u64();
     let cs = _stack_frame.code_segment;
     let rflags = _stack_frame.cpu_flags;
@@ -36,8 +39,10 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     if unsafe { KERNEL_INITIALIZED } {
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
+        util::unlock_statics();
         if(!scheduler.isEmpty()){
-            scheduler.get_current_task().context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
+            context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
+            scheduler.get_current_task().update_from_context(context);
         }
         unsafe { scheduler.schedule_next(); }
 
