@@ -280,7 +280,7 @@ pub(crate) unsafe fn allocate_kernel_stack(
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
             let frame = frame_allocator.allocate_frame().expect("Failed to alloc kernel stack frame");
-            mapper.map_to(page, frame, flags, &mut frame_allocator).expect("failed to map kernel stack").flush();
+            mapper.map_to(page, frame, flags, &mut frame_allocator).expect("Failed to map kernel stack").flush();
         }
 
         // Ensure the stack pointer is properly aligned to a 16-byte boundary.
