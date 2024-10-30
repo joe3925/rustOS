@@ -1,6 +1,6 @@
 use core::ptr;
 use bootloader::bootinfo::MemoryMap;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::registers::control::Cr3;
 use x86_64::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::mapper::MapToError;
@@ -28,6 +28,14 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         frame
     }
 }
+// Implement `FrameAllocator<Size2MiB>` for `BootInfoFrameAllocator`
+unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
+        let frame = self.usable_2mb_frames().nth(self.next);
+        self.next += 1;
+        frame
+    }
+}
 impl BootInfoFrameAllocator {
     /// Returns an iterator over the usable frames specified in the memory map.
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
@@ -42,6 +50,30 @@ impl BootInfoFrameAllocator {
         let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
         // create `PhysFrame` types from the start addresses
         frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+    /// Returns an iterator over usable 2 MiB-aligned frames in the memory map.
+    fn usable_2mb_frames(&self) -> impl Iterator<Item = PhysFrame<Size2MiB>> {
+        // Filter out non-usable regions from the memory map
+        self.memory_map
+            .iter()
+            .filter(|region| region.region_type == MemoryRegionType::Usable)
+            .flat_map(|region| {
+                // Get the starting address of the region, rounded up to 2 MiB alignment
+                let start_addr = PhysAddr::new(region.range.start_addr());
+                let start_frame_addr = start_addr.align_up(Size2MiB::SIZE);
+
+                // Get the ending address of the region, rounded down to 2 MiB alignment
+                let end_frame_addr = PhysAddr::new(region.range.end_addr()).align_down(Size2MiB::SIZE);
+
+                // Calculate the range of frames in this region
+                let num_frames = (end_frame_addr.as_u64() - start_frame_addr.as_u64()) / Size2MiB::SIZE;
+
+                // Create an iterator over all aligned frames within the usable range
+                (0..num_frames).map(move |i| {
+                    let frame_start = start_frame_addr + i * Size2MiB::SIZE;
+                    PhysFrame::containing_address(frame_start)
+                })
+            })
     }
 }
 fn get_table4_index(virtual_address: VirtAddr) -> usize {
@@ -127,7 +159,7 @@ pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static 
 
         // Start searching for a free virtual address at 0x4000_0000
         let mut base_addr = 0x4000_0000u64;
-        let mut page;
+        let mut page:Page<Size4KiB>;
 
         // Loop to find an unmapped page
         loop {

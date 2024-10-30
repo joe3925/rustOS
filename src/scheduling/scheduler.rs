@@ -1,8 +1,10 @@
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use crate::memory::paging;
+use crate::println;
 use crate::scheduling::task::Task;
 
 // Global scheduler that contains a list of tasks
@@ -18,7 +20,7 @@ pub struct Scheduler {
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            tasks: Vec::new(),
+            tasks: Vec::with_capacity(25),
             current_task: AtomicUsize::new(0),
         }
     }
@@ -34,13 +36,12 @@ impl Scheduler {
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        //TODO: find out why i cant have more then 8 at once
-        if self.tasks.len() < 9 {
+        if self.tasks.len() < 25 {
             let idle_task = Task::new(paging::allocate_infinite_loop_page().expect("failed to alloc idle task").as_u64() as usize, 1024 * 1, true); // Example idle task with kernel mode
+            //TODO: this add task cause a page fault in the heap after about 8 task have been added
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {
-
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
         }

@@ -25,7 +25,8 @@ pub unsafe fn init(boot_info: &'static BootInfo){
     let mut frame_allocator = unsafe {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
-    init_heap(&mut mapper, &mut frame_allocator);
+    //The heap needs to be rewritten it is not pretty
+    init_heap(&mut mapper, &mut frame_allocator.clone(), &mut frame_allocator);
     unsafe {
         PCIBUS.lock().enumerate_pci();
     }
@@ -35,9 +36,9 @@ pub unsafe fn init(boot_info: &'static BootInfo){
         drive.format().expect("format failed");
     }
     set_syscall_handler();
+    KERNEL_INITIALIZED = true;
 
     println!("Init Done");
-    KERNEL_INITIALIZED = true;
 }
 #[no_mangle]
 pub extern "C" fn trigger_stack_overflow() {

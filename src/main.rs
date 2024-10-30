@@ -18,6 +18,8 @@ mod console;
 mod util;
 mod cpu;
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 use bootloader::{entry_point, BootInfo};
 

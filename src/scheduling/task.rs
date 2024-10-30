@@ -3,6 +3,7 @@ use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
 use crate::println;
 
+#[derive(Debug)]
 pub struct Task {
     pub(crate) context: State,  // The CPU state for this task
     pub(crate) isUserMode: bool,

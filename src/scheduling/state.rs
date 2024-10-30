@@ -5,6 +5,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 
 #[repr(C)]
 #[no_mangle]
+#[derive(Debug)]
 pub struct State {
     pub(crate) rax: u64,
     rbx: u64,
