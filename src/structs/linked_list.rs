@@ -42,7 +42,7 @@ impl LinkedList {
         count
     }
 
-    pub fn printList(&mut self) {
+    pub fn print_list(&mut self) {
         let mut current = &mut self.head;
         loop {
             // Print the size and the memory range (start to end) of each node

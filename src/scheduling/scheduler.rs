@@ -26,7 +26,7 @@ impl Scheduler {
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
     }
-    pub fn isEmpty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
 

@@ -27,7 +27,6 @@ const STATUS_REG: u16 = PRIMARY_CTRL_BASE; // Same as CMD_REG for writing
 const PRIMARY_STATUS_REG: u16 = PRIMARY_CMD_BASE + 7;
 const CONTROL_REG: u16 = PRIMARY_CTRL_BASE + 2;
 
-const PRIMARY_STATUS_PORT: Port<u8> = Port::new(PRIMARY_CMD_BASE + 7);  // Status register for primary IDE
 pub fn has_ide_controller(mut bus: PciBus) -> bool {
     bus.enumerate_pci();
     for device in &bus.device_collection.devices {
@@ -46,7 +45,8 @@ static DRIVE_IRQ_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
-        let status: u8 = PRIMARY_STATUS_PORT.read();  // Read the status register
+        let mut status_port = Port::new(PRIMARY_CMD_BASE + 7);
+        let status: u8 = status_port.read();  // Read the status register
 
         while status & 0x40 == 0 { println!("Drive not ready"); }
         while status & 0x20 != 0 { println!("Drive faulted!"); }
@@ -275,7 +275,7 @@ impl DriveController for IdeController {
             }
         }
     }
-    fn isController(device: &Device) -> bool {
+    fn is_controller(device: &Device) -> bool {
         if (device.class_code == 0x01 && device.subclass == 0x01) {
             return true;
         }

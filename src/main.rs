@@ -3,11 +3,11 @@
 #![no_std]
 #![no_main]
 #![allow(unused_parens)]
-#![allow(non_snake_case)]
 #![feature(const_mut_refs)]
 #![feature(const_ptr_as_ref)]
 #![feature(const_ptr_write)]
-#[allow(dead_code)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
 
 extern crate alloc;
 

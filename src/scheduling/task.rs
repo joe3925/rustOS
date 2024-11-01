@@ -1,4 +1,4 @@
-use crate::drivers::timerDriver::TIMER;
+use crate::drivers::timer_driver::TIMER;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
 use crate::println;
@@ -8,7 +8,7 @@ use core::arch::asm;
 #[derive(Debug)]
 pub struct Task {
     pub(crate) context: State,  // The CPU state for this task
-    pub(crate) isUserMode: bool,
+    pub(crate) is_user_mode: bool,
 }
 
 impl Task {
@@ -49,7 +49,7 @@ impl Task {
         // Create and return the new task
         Self {
             context: state,
-            isUserMode: is_user_mode,
+            is_user_mode: is_user_mode,
         }
     }
     pub fn update_from_context(&mut self, context: State) {

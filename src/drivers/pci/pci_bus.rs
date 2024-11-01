@@ -1,6 +1,6 @@
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::device_collection::DeviceCollection;
-use crate::drivers::timerDriver::TIMER;
+use crate::drivers::timer_driver::TIMER;
 use crate::memory::allocator::Locked;
 use crate::println;
 use x86_64::instructions::port::Port;

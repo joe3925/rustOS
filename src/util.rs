@@ -42,6 +42,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     KERNEL_INITIALIZED = true;
 }
 #[no_mangle]
+#[allow(unconditional_recursion)]
 pub extern "C" fn trigger_stack_overflow() {
     trigger_stack_overflow();
 }

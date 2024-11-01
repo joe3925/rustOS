@@ -33,10 +33,10 @@ pub struct AHCIPortRegisters {
     pub(crate) cmd: *mut u32, // Command Register
     pub(crate) is: *mut u32,  // Interrupt Status Register
     pub(crate) ci: *mut u32,  // Command Issue Register
-    pub(crate) CLB: *mut u32, // Command List Base
-    pub(crate) CLBU: *mut u32, // Command List Base Upper
-    pub(crate) FB: *mut u32, // FIS Base Address
-    pub(crate) FBU: *mut u32, // FIS Base Upper Address
+    pub(crate) clb: *mut u32, // Command List Base
+    pub(crate) clbu: *mut u32, // Command List Base Upper
+    pub(crate) fb: *mut u32, // FIS Base Address
+    pub(crate) fbu: *mut u32, // FIS Base Upper Address
 }
 #[repr(C, packed)]
 pub struct FisRegH2D {
@@ -110,12 +110,12 @@ pub struct FisRegD2H {
 }
 pub enum FisType
 {
-    FIS_TYPE_REG_H2D = 0x27,    // Register FIS - host to device
-    FIS_TYPE_REG_D2H = 0x34,    // Register FIS - device to host
-    FIS_TYPE_DMA_ACT = 0x39,    // DMA activate FIS - device to host
-    FIS_TYPE_DMA_SETUP = 0x41,    // DMA setup FIS - bidirectional
-    FIS_TYPE_DATA = 0x46,    // Data FIS - bidirectional
-    FIS_TYPE_BIST = 0x58,    // BIST activate FIS - bidirectional
-    FIS_TYPE_PIO_SETUP = 0x5F,    // PIO setup FIS - device to host
-    FIS_TYPE_DEV_BITS = 0xA1,    // Set device bits FIS - device to host
+    FisTypeRegH2d = 0x27,    // Register FIS - host to device
+    FisTypeRegD2h = 0x34,    // Register FIS - device to host
+    FisTypeDmaAct = 0x39,    // DMA activate FIS - device to host
+    FisTypeDmaSetup = 0x41,    // DMA setup FIS - bidirectional
+    FisTypeData = 0x46,    // Data FIS - bidirectional
+    FisTypeBist = 0x58,    // BIST activate FIS - bidirectional
+    FisTypePioSetup = 0x5F,    // PIO setup FIS - device to host
+    FisTypeDevBits = 0xA1,    // Set device bits FIS - device to host
 }

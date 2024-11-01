@@ -2,7 +2,7 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 // Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
-use crate::file_system::FAT::FileSystem;
+use crate::file_system::fat::FileSystem;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::format;
@@ -10,7 +10,6 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use spin::mutex::Mutex;
 use spin::Lazy;
-use strum::IntoEnumIterator;
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -56,7 +55,7 @@ pub trait DriveController {
     fn enumerate_drives()
     where
         Self: Sized;
-    fn isController(device: &Device) -> bool
+    fn is_controller(device: &Device) -> bool
     where
         Self: Sized;
 }

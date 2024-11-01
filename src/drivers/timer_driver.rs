@@ -5,7 +5,6 @@ use crate::scheduling::state::State;
 use crate::util;
 use crate::util::KERNEL_INITIALIZED;
 use x86_64::structures::idt::InterruptStackFrame;
-
 pub static mut TIMER: SystemTimer = SystemTimer::new();
 pub struct SystemTimer {
     tick: u128,
@@ -40,7 +39,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
         util::unlock_statics();
-        if (!scheduler.isEmpty()) {
+        if (!scheduler.is_empty()) {
             context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
             scheduler.get_current_task().update_from_context(context);
         }

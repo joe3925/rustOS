@@ -1,5 +1,5 @@
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
-use crate::file_system::FAT::FileSystem;
+use crate::file_system::fat::FileSystem;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;

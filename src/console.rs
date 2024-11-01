@@ -2,8 +2,8 @@ use core::fmt::Write;
 use lazy_static::lazy_static;
 use spin::Mutex;
 pub(crate) struct Console {
-    pub(crate) currentLine: isize,
-    pub(crate) currentCharSize: isize,
+    pub(crate) current_line: isize,
+    pub(crate) current_char_size: isize,
     pub(crate) vga_width: isize,
     pub(crate) cursor_pose: isize,
 }
@@ -20,7 +20,7 @@ impl Console {
             //TODO: get this to work with kernel panics
 
             //if(self.cursor_pose % 160 == 0 && self.cursor_pose != 0){
-            //  self.currentLine += 1;
+            //  self.current_line += 1;
             //}
 
             // Handle newlines
@@ -29,8 +29,8 @@ impl Console {
             }
             if str[i] == b'\n' {
                 self.cursor_pose += (self.vga_width * 2) - (self.cursor_pose % (self.vga_width * 2));
-                self.currentLine += 1;
-                self.currentCharSize = 0;
+                self.current_line += 1;
+                self.current_char_size = 0;
             }
             // Handle backspace
             else if (str[i] == 0x08) {
@@ -44,7 +44,7 @@ impl Console {
                         // Clear the non-null character
                         *VGA_BUFFER.offset(self.cursor_pose) = 0x0; // Clear character
                         *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // Reset attribute (white on black)
-                        self.currentCharSize = self.currentCharSize.saturating_sub(1); // Adjust character size
+                        self.current_char_size = self.current_char_size.saturating_sub(1); // Adjust character size
                     }
                 }
             }
@@ -53,17 +53,17 @@ impl Console {
             else {
                 unsafe {
                     // Check if we need to scroll
-                    if self.currentLine >= 24 {
+                    if self.current_line >= 24 {
                         self.scroll_up();
-                        self.currentLine = 23;
-                        self.cursor_pose = self.currentLine * self.vga_width * 2;
+                        self.current_line = 23;
+                        self.cursor_pose = self.current_line * self.vga_width * 2;
                     }
 
                     *VGA_BUFFER.offset(self.cursor_pose) = str[i];
                     *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // White foreground, black background
                 }
                 self.cursor_pose += 2;
-                self.currentCharSize += 1;
+                self.current_char_size += 1;
             }
 
             i += 1;
@@ -72,36 +72,36 @@ impl Console {
 
     fn scroll_up(&mut self) {
         unsafe {
-            let VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
+            let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
 
             for y in 1..25 {
                 for x in 0..self.vga_width {
                     let from = ((y * self.vga_width) + x) * 2;
                     let to = (((y - 1) * self.vga_width) + x) * 2;
 
-                    *VGA_BUFFER.offset(to) = *VGA_BUFFER.offset(from);
-                    *VGA_BUFFER.offset((to + 1)) = *VGA_BUFFER.offset((from + 1));
+                    *vga_buffer.offset(to) = *vga_buffer.offset(from);
+                    *vga_buffer.offset((to + 1)) = *vga_buffer.offset((from + 1));
                 }
             }
 
             // Clear the last line
             let last_line_start = (24 * self.vga_width) * 2;
             for x in 0..self.vga_width {
-                *VGA_BUFFER.offset((last_line_start + x * 2)) = b' ';
-                *VGA_BUFFER.offset((last_line_start + x * 2 + 1)) = 0x07;
+                *vga_buffer.offset((last_line_start + x * 2)) = b' ';
+                *vga_buffer.offset((last_line_start + x * 2 + 1)) = 0x07;
             }
         }
         // Adjust the cursor position after scrolling
-        self.cursor_pose = (self.vga_width * 23 * 2) + (self.currentCharSize * 2);
+        self.cursor_pose = (self.vga_width * 23 * 2) + (self.current_char_size * 2);
     }
 }
 
 lazy_static! {
      pub(crate) static ref CONSOLE: Mutex<Console> = Mutex::new(Console {
-        currentCharSize: 0,
+        current_char_size: 0,
         vga_width: 80,
         cursor_pose: 0,
-        currentLine: 0,
+        current_line: 0,
     });
 }
 #[allow(dead_code)]

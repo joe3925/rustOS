@@ -86,13 +86,13 @@ impl FileSystem {
             for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
                 drive.controller.write(drive_label.clone().as_str(), (i + 1), &mut buffer);
             }
-            let mut readBuffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
+            let mut read_buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
             //validate data sectors
             for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-                drive.controller.read(drive_label.clone().as_str(), (i + 1), &mut readBuffer);
+                drive.controller.read(drive_label.clone().as_str(), (i + 1), &mut read_buffer);
                 for j in 0..512 {
-                    if (readBuffer[j] != buffer[j]) {
+                    if (read_buffer[j] != buffer[j]) {
                         println!("Sector {} is invalid", i);
                         break;
                     }

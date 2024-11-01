@@ -1,3 +1,4 @@
+use core::ptr::addr_of;
 use lazy_static::lazy_static;
 use x86_64::instructions::segmentation::SS;
 use x86_64::structures::tss::TaskStateSegment;
@@ -11,20 +12,20 @@ lazy_static! {
 
         // Set up the stack for the double fault handler using the IST.
         const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5; // 20 KB stack
-        static mut DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
-        unsafe { println!("DOUBLE_FAULT_STACK AT: {:#?}", &DOUBLE_FAULT_STACK.as_mut_ptr() ); }
+        static DOUBLE_FAULT_STACK: [u8; DOUBLE_FAULT_STACK_SIZE] = [0; DOUBLE_FAULT_STACK_SIZE];
+        println!("DOUBLE_FAULT_STACK AT: {:#?}", addr_of!(DOUBLE_FAULT_STACK));
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &DOUBLE_FAULT_STACK });
+            let stack_start = VirtAddr::from_ptr(addr_of!(DOUBLE_FAULT_STACK));
             let stack_end = stack_start + DOUBLE_FAULT_STACK_SIZE as u64;
             stack_end
         };
 
         // Set up the privilege stack for ring 0 (used when transitioning from ring 3 to ring 0).
         const PRIVILEGE_STACK_SIZE: usize = 4096 * 10; // 20 KB stack
-        static mut PRIVILEGE_STACK: [u8; PRIVILEGE_STACK_SIZE] = [0; PRIVILEGE_STACK_SIZE];
-        unsafe { println!("PRIVILEGE_STACK AT: {:#?}", &PRIVILEGE_STACK.as_mut_ptr() ); }
+        static PRIVILEGE_STACK: [u8; PRIVILEGE_STACK_SIZE] = [0; PRIVILEGE_STACK_SIZE];
+        println!("PRIVILEGE_STACK AT: {:#?}", addr_of!(PRIVILEGE_STACK) );
         tss.privilege_stack_table[0] = {
-            let stack_start = VirtAddr::from_ptr(unsafe { &PRIVILEGE_STACK });
+            let stack_start = VirtAddr::from_ptr(addr_of!(PRIVILEGE_STACK) );
             let stack_end = stack_start + PRIVILEGE_STACK_SIZE as u64;
             stack_end
         };

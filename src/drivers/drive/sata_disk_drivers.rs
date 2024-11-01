@@ -11,10 +11,9 @@ use x86_64::structures::paging::OffsetPageTable;
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::cpu::wait_cycle;
-use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
+use crate::drivers::drive::ahci_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 use crate::{println, BOOT_INFO};
-
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 const MMIO_VIRTUAL_ADDR: VirtAddr = VirtAddr::new(0xFFFF_FF00_0000_0000);
@@ -24,7 +23,7 @@ pub(crate) struct AHCIController {
     pub(crate) occupied_ports: Vec<u32>,
     pub(crate) ports_registers: Vec<AHCIPortRegisters>,
     pub(crate) command_list_buffers: Vec<AlignedBuffer1024>,
-    pub(crate) FIS_Buffer: Vec<AlignedBuffer256>,
+    pub(crate) fis_buffer: Vec<AlignedBuffer256>,
     pub(crate) command_table_virt_addr: Vec<VirtAddr>,
 
 }
@@ -40,7 +39,7 @@ impl AHCIController {
                 occupied_ports: Vec::new(),
                 ports_registers: Vec::new(),
                 command_list_buffers: Vec::new(),
-                FIS_Buffer: Vec::new(),
+                fis_buffer: Vec::new(),
                 command_table_virt_addr: Vec::new(),
 
             };
@@ -84,10 +83,10 @@ impl AHCIController {
                 cmd: (port_base + 0x18) as *mut u32, // PxCMD register at offset 0x18
                 is: (port_base + 0x10) as *mut u32,  // PxIS register at offset 0x10
                 ci: (port_base + 0x38) as *mut u32,  // PxCI register at offset 0x38
-                CLB: (port_base + 0x00) as *mut u32, // Command List Base
-                CLBU: (port_base + 0x04) as *mut u32, // Command List Base Upper
-                FB: (port_base + 0x08) as *mut u32, // FIS Base
-                FBU: (port_base + 0x0C) as *mut u32, // FIS Base Upper
+                clb: (port_base + 0x00) as *mut u32, // Command List Base
+                clbu: (port_base + 0x04) as *mut u32, // Command List Base Upper
+                fb: (port_base + 0x08) as *mut u32, // FIS Base
+                fbu: (port_base + 0x0C) as *mut u32, // FIS Base Upper
             });
         }
 
@@ -126,7 +125,7 @@ impl AHCIController {
             self.command_list_buffers.push(buffer_1024);
 
             let buffer_256 = AlignedBuffer256::new(); // For FIS
-            self.FIS_Buffer.push(buffer_256);
+            self.fis_buffer.push(buffer_256);
         }
     }
 
@@ -135,15 +134,15 @@ impl AHCIController {
         for port in 0..self.total_ports.clone() {
             let mem_offset = VirtAddr::new(BOOT_INFO.unwrap().physical_memory_offset);
 
-            // Set Command List Base (CLB) and CLBU
+            // Set Command List Base (clb) and clbu
             let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize].buffer as *const _ as u64));
-            write_volatile(self.ports_registers[port as usize].CLB, command_list_address.as_u64() as u32);
-            write_volatile(self.ports_registers[port as usize].CLBU, (command_list_address.as_u64() >> 32) as u32);
+            write_volatile(self.ports_registers[port as usize].clb, command_list_address.as_u64() as u32);
+            write_volatile(self.ports_registers[port as usize].clbu, (command_list_address.as_u64() >> 32) as u32);
 
-            // Set FIS Base (FB) and FBU
-            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.FIS_Buffer[port as usize].buffer as *const _ as u64));
-            write_volatile(self.ports_registers[port as usize].FB, fis_address.as_u64() as u32);
-            write_volatile(self.ports_registers[port as usize].FBU, (fis_address.as_u64() >> 32) as u32);
+            // Set FIS Base (fb) and fbu
+            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.fis_buffer[port as usize].buffer as *const _ as u64));
+            write_volatile(self.ports_registers[port as usize].fb, fis_address.as_u64() as u32);
+            write_volatile(self.ports_registers[port as usize].fbu, (fis_address.as_u64() >> 32) as u32);
 
             // Allocate an 8KiB buffer for the Command Table (CT)
             let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
@@ -261,7 +260,7 @@ impl AHCIController {
 
         // Step 2: Get the Command Header and Command Table for this port
         let command_list_base_ptr = self.command_list_buffers[port as usize].buffer.as_mut_ptr();
-        let command_table_virtAddr = self.command_table_virt_addr[(port) as usize];
+        let command_table_virt_addr = self.command_table_virt_addr[(port) as usize];
         let command_header_ptr = command_list_base_ptr as *mut CommandHeader;
         let command_header = unsafe { &mut *command_header_ptr };
 
@@ -270,7 +269,7 @@ impl AHCIController {
         command_header.prdtl = 1; // One PRD entry
 
         // Step 3: Set up the Command Table and add the FIS to it
-        let command_table_base_ptr = command_table_virtAddr.as_u64() as *mut CommandTable;
+        let command_table_base_ptr = command_table_virt_addr.as_u64() as *mut CommandTable;
         let command_table = unsafe { &mut *command_table_base_ptr };
 
         // Clear the command table
@@ -354,7 +353,7 @@ impl DriveController for AHCIController {
         }
     }
 
-    fn isController(device: &Device) -> bool {
+    fn is_controller(device: &Device) -> bool {
         if (device.class_code == 0x01 && device.subclass == 0x06) {
             return true;
         }

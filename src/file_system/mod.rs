@@ -1,2 +1,3 @@
+#[allow(dead_code)]
 mod file;
-pub(crate) mod FAT;
+pub(crate) mod fat;

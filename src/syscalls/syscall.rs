@@ -47,11 +47,9 @@ extern "C" fn syscall_handler() {
     // Use `rax` to match on syscall numbers
     match state.rax {
         1 => {
-            unsafe {
-                let mut task = Task::new(println_wrapper as usize, 1024 * 10, false);
-                task.context.rdi = state.rdi;
-                SCHEDULER.lock().add_task(task);
-            }
+            let mut task = Task::new(println_wrapper as usize, 1024 * 10, false);
+            task.context.rdi = state.rdi;
+            SCHEDULER.lock().add_task(task);
         }
         _ => {
             println!("Unknown syscall number: {}", state.rax);

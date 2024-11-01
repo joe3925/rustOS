@@ -4,7 +4,6 @@ use crate::scheduling::scheduler::SCHEDULER;
 use core::arch::asm;
 
 #[repr(C)]
-#[no_mangle]
 #[derive(Debug)]
 pub struct State {
     pub(crate) rax: u64,
@@ -28,7 +27,6 @@ pub struct State {
     pub(crate) cs: u64,    // Code segment register
     pub(crate) ss: u64,    // Stack segment register
 }
-#[no_mangle]
 impl State {
     pub fn new() -> Self {
         let mut state = State {

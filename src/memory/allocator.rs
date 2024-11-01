@@ -23,14 +23,14 @@ impl<A> Locked<A> {
     }
 }
 pub struct Allocator {
-    pub(crate) freeList: LinkedList,
-    pub(crate) allocationsMade: u128,
+    pub(crate) free_list: LinkedList,
+    pub(crate) allocations_made: u128,
 }
 impl Allocator {
     pub const fn new() -> Self {
         Allocator {
-            freeList: LinkedList::new(),
-            allocationsMade: 0,
+            free_list: LinkedList::new(),
+            allocations_made: 0,
         }
     }
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
@@ -39,10 +39,10 @@ impl Allocator {
 
         // create a new list node and append it at the start of the list
         let mut node = ListNode::new(size);
-        node.next = self.freeList.head.next.take();
+        node.next = self.free_list.head.next.take();
         let node_ptr = addr as *mut ListNode;
         node_ptr.write(node);
-        self.freeList.head.next = Some(&mut *node_ptr);
+        self.free_list.head.next = Some(&mut *node_ptr);
     }
 
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
@@ -51,7 +51,7 @@ impl Allocator {
         let mut best_fit_alloc_start = 0usize;
 
         // Start from the head of the free list
-        let mut current = &mut self.freeList.head as *mut ListNode;
+        let mut current = &mut self.free_list.head as *mut ListNode;
 
         unsafe {
             // Traverse the free list
@@ -116,7 +116,7 @@ impl Allocator {
         (size, layout.align())
     }
     pub(crate) fn free_memory(&self) -> usize {
-        let mut current = &self.freeList.head;
+        let mut current = &self.free_list.head;
         let mut total_free = 0;
 
         while let Some(ref region) = current.next {
@@ -133,10 +133,10 @@ impl Allocator {
             let mut merges_made = true;
             while merges_made {
                 merges_made = false;
-                let mut current = &mut self.freeList.head as *mut ListNode;
+                let mut current = &mut self.free_list.head as *mut ListNode;
 
                 while let Some(ref mut current_node) = (*current).next {
-                    let mut other = &mut self.freeList.head as *mut ListNode;
+                    let mut other = &mut self.free_list.head as *mut ListNode;
 
                     while let Some(ref mut other_node) = (*other).next {
                         if other_node.start_addr() == current_node.start_addr() {
@@ -191,7 +191,7 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
             let heap_start = VirtAddr::new(HEAP_START as u64);
             let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
 
-            allocator.freeList.head.next = heap_node_ptr.as_mut();
+            allocator.free_list.head.next = heap_node_ptr.as_mut();
             INIT = true;
         }
         if let Some((region, alloc_start)) = allocator.find_region(size, align) {
@@ -200,7 +200,7 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
             if excess_size > 0 {
                 allocator.add_free_region(alloc_end, excess_size);
             }
-            allocator.allocationsMade += 1;
+            allocator.allocations_made += 1;
             alloc_start as *mut u8
         } else {
             ptr::null_mut()
@@ -211,7 +211,7 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
         // perform layout adjustments
         let mut allocator = self.lock();
         let (size, _) = Allocator::size_align(layout);
-        allocator.allocationsMade -= 1;
+        allocator.allocations_made -= 1;
         allocator.add_free_region(ptr as usize, size);
         allocator.merge_free_list();
     }
