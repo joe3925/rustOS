@@ -1,4 +1,3 @@
-
 use pic8259::ChainedPics;
 
 
@@ -9,7 +8,6 @@ pub(crate) static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-
 
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
@@ -23,7 +21,6 @@ impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
     }
-
 }
 pub fn send_eoi(irq: u8) {
     unsafe {

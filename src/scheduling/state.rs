@@ -1,7 +1,7 @@
-use core::arch::asm;
-use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::drivers::interrupt_index::send_eoi;
+use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
+use core::arch::asm;
 
 #[repr(C)]
 #[no_mangle]
@@ -75,7 +75,6 @@ impl State {
             "mov {4}, rsi",
             "mov {5}, rdi",
             "mov {6}, rbp",
-
             out(reg) self.rax,
             out(reg) self.rbx,
             out(reg) self.rcx,
@@ -103,7 +102,6 @@ impl State {
             out(reg) self.r14,
             out(reg) self.r15,
             );
-
         }
     }
 
@@ -164,7 +162,6 @@ impl State {
         in(reg) self.rip,
         );
         unsafe { asm!("iretq") }
-
     }
     #[inline]
     #[no_mangle]
@@ -206,7 +203,5 @@ impl State {
         asm!("sysretq", options(noreturn));
     }
 }
-fn function(){
-
-}
+fn function() {}
 

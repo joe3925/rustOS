@@ -1,9 +1,9 @@
-use core::alloc::{GlobalAlloc, Layout};
-use core::ptr;
-use core::mem::{align_of, size_of};
-use x86_64::{align_up, VirtAddr};
 use crate::memory::heap::HEAP_START;
 use crate::structs::linked_list::{LinkedList, ListNode};
+use core::alloc::{GlobalAlloc, Layout};
+use core::mem::{align_of, size_of};
+use core::ptr;
+use x86_64::{align_up, VirtAddr};
 #[global_allocator]
 pub static mut ALLOCATOR: Locked<Allocator> =
     Locked::new(Allocator::new());
@@ -26,14 +26,12 @@ pub struct Allocator {
     pub(crate) freeList: LinkedList,
     pub(crate) allocationsMade: u128,
 }
-impl Allocator{
+impl Allocator {
     pub const fn new() -> Self {
         Allocator {
             freeList: LinkedList::new(),
             allocationsMade: 0,
         }
-
-
     }
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
         // ensure that the freed region is capable of holding ListNode
@@ -184,12 +182,12 @@ impl Allocator{
 unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // perform layout adjustments
-        static mut INIT:bool = false;
+        static mut INIT: bool = false;
         let (size, align) = Allocator::size_align(layout);
         let mut allocator = self.lock();
-       // println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
+        // println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
 
-        if(INIT == false){
+        if (INIT == false) {
             let heap_start = VirtAddr::new(HEAP_START as u64);
             let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
 

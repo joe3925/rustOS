@@ -1,7 +1,7 @@
-use x86_64::VirtAddr;
-use x86_64::structures::tss::TaskStateSegment;
 use lazy_static::lazy_static;
 use x86_64::instructions::segmentation::SS;
+use x86_64::structures::tss::TaskStateSegment;
+use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
@@ -33,9 +33,9 @@ lazy_static! {
     };
 }
 
-use x86_64::structures::gdt::{GlobalDescriptorTable, Descriptor};
-use x86_64::structures::gdt::SegmentSelector;
 use crate::println;
+use x86_64::structures::gdt::SegmentSelector;
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 
 lazy_static! {
     pub static ref GDT: (GlobalDescriptorTable, Selectors) = {
@@ -79,7 +79,7 @@ pub struct Selectors {
 
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::segmentation::{Segment, CS};
     use x86_64::instructions::tables::load_tss;
 
     // Load the GDT

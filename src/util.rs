@@ -1,22 +1,22 @@
-use alloc::string::ToString;
-use core::arch::asm;
-use bootloader::BootInfo;
-use x86_64::VirtAddr;
+use crate::console::CONSOLE;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
-use crate::{gdt, println};
-use crate::console::CONSOLE;
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::syscalls::syscall::set_syscall_handler;
+use crate::{gdt, println};
+use alloc::string::ToString;
+use bootloader::BootInfo;
+use core::arch::asm;
+use x86_64::VirtAddr;
 
 pub(crate) static mut KERNEL_INITIALIZED: bool = false;
 
-pub unsafe fn init(boot_info: &'static BootInfo){
+pub unsafe fn init(boot_info: &'static BootInfo) {
     gdt::init();
     unsafe { interrupt_index::PICS.lock().initialize() };
     load_idt();
@@ -33,7 +33,7 @@ pub unsafe fn init(boot_info: &'static BootInfo){
         PCIBUS.lock().enumerate_pci();
     }
     IdeController::enumerate_drives();
-    if let Some(drive) = DRIVECOLLECTION.lock().find_drive("B:".to_string()){
+    if let Some(drive) = DRIVECOLLECTION.lock().find_drive("B:".to_string()) {
         DRIVECOLLECTION.force_unlock();
         drive.format().expect("format failed");
     }
@@ -51,11 +51,10 @@ pub fn trigger_breakpoint() {
     }
 }
 //will unlock kernel mode statics during a context switch from a kernel mode task
-pub fn unlock_statics(){
+pub fn unlock_statics() {
     unsafe {
         DRIVECOLLECTION.force_unlock();
         CONSOLE.force_unlock();
         SCHEDULER.force_unlock();
-
     }
 }

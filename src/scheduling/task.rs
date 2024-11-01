@@ -1,9 +1,9 @@
-use core::arch::asm;
 use crate::drivers::timerDriver::TIMER;
-use crate::scheduling::state::State;
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack};
 use crate::println;
+use crate::scheduling::state::State;
+use core::arch::asm;
 
 #[derive(Debug)]
 pub struct Task {
@@ -39,7 +39,6 @@ impl Task {
             state.cs = GDT.1.user_code_selector.0 as u64 | 3;
             state.ss = GDT.1.user_data_selector.0 as u64 | 3;
             println!("User-mode task created with RIP {:X}, STACK {:X}", state.rip, state.rsp);
-
         } else {
             // Set kernel mode segment selectors
             state.cs = GDT.1.kernel_code_selector.0 as u64;
@@ -53,7 +52,7 @@ impl Task {
             isUserMode: is_user_mode,
         }
     }
-    pub fn update_from_context(&mut self, context: State){
+    pub fn update_from_context(&mut self, context: State) {
         self.context = context;
     }
 }

@@ -1,15 +1,16 @@
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::format;
-use alloc::vec::Vec;
-use spin::Lazy;
-use spin::mutex::Mutex;
-use crate::drivers::drive::ide_disk_driver::{ IdeController};
+use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
-use strum::IntoEnumIterator; // Trait for iterating over enum variants
+// Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
 use crate::file_system::FAT::FileSystem;
 use crate::println;
+use alloc::boxed::Box;
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use spin::mutex::Mutex;
+use spin::Lazy;
+use strum::IntoEnumIterator;
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -19,12 +20,11 @@ pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
 }
-impl Controller{
-    fn enumerate_drives(){
+impl Controller {
+    fn enumerate_drives() {
         AHCIController::enumerate_drives();
         IdeController::enumerate_drives();
     }
-
 }
 
 pub enum DriveType {
@@ -53,8 +53,12 @@ impl DriveInfo {
 pub trait DriveController {
     fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, label: &str, sector: u32, data: &[u8]);
-    fn enumerate_drives() where Self: Sized;
-    fn isController(device: &Device) -> bool where Self: Sized;
+    fn enumerate_drives()
+    where
+        Self: Sized;
+    fn isController(device: &Device) -> bool
+    where
+        Self: Sized;
 }
 
 pub struct Drive {
@@ -74,7 +78,7 @@ impl Drive {
             is_fat: false,
         }
     }
-    pub fn format(&mut self) -> Result<(), &'static str>{
+    pub fn format(&mut self) -> Result<(), &'static str> {
         self.is_fat = true;
         FileSystem::new(self.label.clone()).format_drive()
     }
@@ -96,7 +100,7 @@ impl DriveCollection {
         let drive = Drive::new(label, info, controller);
         self.drives.push(drive);
     }
-    pub(crate) fn enumerate_drives(){
+    pub(crate) fn enumerate_drives() {
         <IdeController as DriveController>::enumerate_drives();
         <AHCIController as DriveController>::enumerate_drives();
     }

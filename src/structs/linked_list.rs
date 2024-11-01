@@ -1,4 +1,3 @@
-
 use crate::println;
 
 pub struct ListNode {
@@ -63,6 +62,4 @@ impl LinkedList {
             current = current.next.as_mut().unwrap();
         }
     }
-
-
 }

@@ -1,19 +1,19 @@
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use x86_64::instructions::port::Port;
-use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::OffsetPageTable;
 use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
+use alloc::boxed::Box;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
+use x86_64::instructions::port::Port;
+use x86_64::structures::paging::OffsetPageTable;
+use x86_64::{PhysAddr, VirtAddr};
 
-use crate::{println, BOOT_INFO};
 use crate::cpu::wait_cycle;
 use crate::drivers::drive::AHCI_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
+use crate::{println, BOOT_INFO};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -34,7 +34,7 @@ unsafe impl Send for AHCIController {}
 impl AHCIController {
     pub fn new() -> Self {
         let mut controller =
-            AHCIController{
+            AHCIController {
                 mmio_base: MMIO_VIRTUAL_ADDR.as_u64(),
                 total_ports: 0,
                 occupied_ports: Vec::new(),
@@ -68,7 +68,6 @@ impl AHCIController {
             // Re-enable ports after setup
             self.enable_ports();
             println!("enable ports");
-
         }
 
         // The device is now initialized
@@ -192,9 +191,9 @@ impl AHCIController {
         }
     }
 
-    pub fn map(mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator){
+    pub fn map(mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator) {
         if let Some(base_addr) = AHCIController::find_sata_controller() {
-            println!("found controller at {}",base_addr);
+            println!("found controller at {}", base_addr);
             map_mmio_region(mapper, frame_allocator, PhysAddr::new(base_addr), 8192, MMIO_VIRTUAL_ADDR).expect("TODO: panic message");
         }
     }
@@ -223,7 +222,7 @@ impl AHCIController {
 
         None // Return None if no SATA controller is found
     }
-    pub fn get_total_ports(&self) -> u32{
+    pub fn get_total_ports(&self) -> u32 {
         unsafe {
             let hba_cap = *(self.mmio_base as *const u32);
             let num_ports = (hba_cap & 0b11111) + 1; // Bits [4:0] hold the number of supported ports - 1
@@ -267,7 +266,7 @@ impl AHCIController {
         let command_header = unsafe { &mut *command_header_ptr };
 
         // Set the flags in the Command Header: Command FIS length (5 DWORDs) and write (0 for IDENTIFY)
-        command_header.flags = ( core::mem::size_of::<FisRegH2D>() / 4) as u16; // 5 DWORDs for the FIS
+        command_header.flags = (core::mem::size_of::<FisRegH2D>() / 4) as u16; // 5 DWORDs for the FIS
         command_header.prdtl = 1; // One PRD entry
 
         // Step 3: Set up the Command Table and add the FIS to it
@@ -304,7 +303,7 @@ impl AHCIController {
             let ci_register = unsafe { read_volatile(self.ports_registers[port as usize].ci) };
 
             // Check if the command has completed (CI bit cleared)
-            if (ci_register & 1) == 0 || true{
+            if (ci_register & 1) == 0 || true {
                 wait_cycle(10000000000);
                 break;
             }
@@ -330,10 +329,8 @@ impl AHCIController {
             capacity: 0,
         })
     }
-
-
 }
-impl DriveController for AHCIController{
+impl DriveController for AHCIController {
     fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]) {
         todo!()
     }
@@ -342,27 +339,25 @@ impl DriveController for AHCIController{
         todo!()
     }
 
-     fn enumerate_drives(){
+    fn enumerate_drives() {
         let mut controller = AHCIController::new();
-        println!("Occupied ports: {:#?}, Total Ports: {:#?}",controller.occupied_ports,
+        println!("Occupied ports: {:#?}, Total Ports: {:#?}", controller.occupied_ports,
                  controller.total_ports);
         let mut drive_collection = DRIVECOLLECTION.lock();
-        for i in 0..controller.occupied_ports.len(){
-            if let Some(drive_info) = controller.identify_drive(controller.occupied_ports[i]){
+        for i in 0..controller.occupied_ports.len() {
+            if let Some(drive_info) = controller.identify_drive(controller.occupied_ports[i]) {
                 drive_info.print();
                 if let Some(label) = drive_collection.find_free_label() {
                     drive_collection.new_drive(label, drive_info, Box::new(AHCIController::new()));
                 }
             }
-
         }
     }
 
-    fn isController(device: &Device) -> bool{
-        if (device.class_code == 0x01 && device.subclass == 0x06){
-            return true
+    fn isController(device: &Device) -> bool {
+        if (device.class_code == 0x01 && device.subclass == 0x06) {
+            return true;
         }
         false
     }
-
 }

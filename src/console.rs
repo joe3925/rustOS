@@ -1,7 +1,7 @@
-use core::fmt::{Write};
+use core::fmt::Write;
 use lazy_static::lazy_static;
 use spin::Mutex;
-pub(crate) struct Console{
+pub(crate) struct Console {
     pub(crate) currentLine: isize,
     pub(crate) currentCharSize: isize,
     pub(crate) vga_width: isize,
@@ -20,7 +20,7 @@ impl Console {
             //TODO: get this to work with kernel panics
 
             //if(self.cursor_pose % 160 == 0 && self.cursor_pose != 0){
-              //  self.currentLine += 1;
+            //  self.currentLine += 1;
             //}
 
             // Handle newlines
@@ -31,18 +31,17 @@ impl Console {
                 self.cursor_pose += (self.vga_width * 2) - (self.cursor_pose % (self.vga_width * 2));
                 self.currentLine += 1;
                 self.currentCharSize = 0;
-
             }
             // Handle backspace
-            else if (str[i] == 0x08){
+            else if (str[i] == 0x08) {
                 unsafe {
-                    if (*VGA_BUFFER.offset(self.cursor_pose) == 0x0){
-                        while (*VGA_BUFFER.offset(self.cursor_pose) == 0x0 && self.cursor_pose > 0){
+                    if (*VGA_BUFFER.offset(self.cursor_pose) == 0x0) {
+                        while (*VGA_BUFFER.offset(self.cursor_pose) == 0x0 && self.cursor_pose > 0) {
                             self.cursor_pose -= 2;
                         }
                     }                     // Check the character at the current cursor position
                     if (*VGA_BUFFER.offset(self.cursor_pose) != 0x0) {
-                            // Clear the non-null character
+                        // Clear the non-null character
                         *VGA_BUFFER.offset(self.cursor_pose) = 0x0; // Clear character
                         *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // Reset attribute (white on black)
                         self.currentCharSize = self.currentCharSize.saturating_sub(1); // Adjust character size
@@ -88,8 +87,8 @@ impl Console {
             // Clear the last line
             let last_line_start = (24 * self.vga_width) * 2;
             for x in 0..self.vga_width {
-                *VGA_BUFFER.offset((last_line_start + x * 2) ) = b' ';
-                *VGA_BUFFER.offset((last_line_start + x * 2 + 1) ) = 0x07;
+                *VGA_BUFFER.offset((last_line_start + x * 2)) = b' ';
+                *VGA_BUFFER.offset((last_line_start + x * 2 + 1)) = 0x07;
             }
         }
         // Adjust the cursor position after scrolling

@@ -1,11 +1,8 @@
-use alloc::vec;
+use crate::scheduling::task::{idle_task, Task};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::memory::paging;
-use crate::println;
-use crate::scheduling::task::{idle_task, test_syscall, Task};
 
 // Global scheduler that contains a list of tasks
 lazy_static! {
@@ -29,7 +26,7 @@ impl Scheduler {
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
     }
-    pub fn isEmpty(&self) -> bool{
+    pub fn isEmpty(&self) -> bool {
         self.tasks.is_empty()
     }
 
@@ -44,7 +41,6 @@ impl Scheduler {
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
         }
-
     }
 
     // Get the currently selected task

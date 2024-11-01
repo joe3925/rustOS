@@ -1,9 +1,9 @@
-use x86_64::registers::model_specific::Msr;
 use crate::gdt::GDT;
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::scheduling::task::Task;
+use x86_64::registers::model_specific::Msr;
 
 // Define the MSR addresses
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -48,10 +48,9 @@ extern "C" fn syscall_handler() {
     match state.rax {
         1 => {
             unsafe {
-                let mut task = Task::new(println_wrapper as usize, 1024*10, false);
+                let mut task = Task::new(println_wrapper as usize, 1024 * 10, false);
                 task.context.rdi = state.rdi;
                 SCHEDULER.lock().add_task(task);
-
             }
         }
         _ => {

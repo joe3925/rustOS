@@ -1,6 +1,6 @@
+use crate::println;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use crate::println;
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
@@ -34,7 +34,7 @@ pub(crate) extern "x86-interrupt" fn device_not_available_exception(stack_frame:
     panic!("EXCEPTION: DEVICE NOT AVAILABLE\n{:#?}", stack_frame);
 }
 
-pub(crate) extern "x86-interrupt" fn double_fault(stack_frame: InterruptStackFrame, _error_code: u64) -> !{
+pub(crate) extern "x86-interrupt" fn double_fault(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
@@ -43,7 +43,7 @@ pub(crate) extern "x86-interrupt" fn invalid_tss_exception(stack_frame: Interrup
 }
 
 pub(crate) extern "x86-interrupt" fn segment_not_present_exception(stack_frame: InterruptStackFrame, _error_code: u64) {
-   panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
+    panic!("EXCEPTION: SEGMENT NOT PRESENT\n{:#?}", stack_frame);
 }
 
 pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptStackFrame, _error_code: u64) {
@@ -51,10 +51,10 @@ pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptS
 }
 
 pub(crate) extern "x86-interrupt" fn general_protection_fault(
-    stack_frame: InterruptStackFrame, error_code: u64
+    stack_frame: InterruptStackFrame, error_code: u64,
 ) {
     decode_gpf_error_code(error_code);
-   panic!("EXCEPTION: GENERAL PROTECTION FAULT ERROR CODE(0x{:X}) \n{:#?}", error_code ,stack_frame, );
+    panic!("EXCEPTION: GENERAL PROTECTION FAULT ERROR CODE(0x{:X}) \n{:#?}", error_code, stack_frame, );
 }
 
 //TODO: properly handle page faults

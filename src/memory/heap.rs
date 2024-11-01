@@ -1,10 +1,8 @@
-use x86_64::structures::paging::{Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
-use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::FrameAllocator;
-use x86_64::structures::paging::mapper::MapToError;
-use crate::memory::paging::{BootInfoFrameAllocator};
 use crate::println;
 use crate::structs::linked_list::ListNode;
+use x86_64::structures::paging::FrameAllocator;
+use x86_64::structures::paging::{Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 20 * 1024 * 1024; // 20 MiB, aligned for 2 MiB pages

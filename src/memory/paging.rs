@@ -1,12 +1,11 @@
-use alloc::string::{String, ToString};
-use core::ptr;
+use crate::BOOT_INFO;
 use bootloader::bootinfo::MemoryMap;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
-use x86_64::registers::control::Cr3;
-use x86_64::{PhysAddr, VirtAddr};
-use x86_64::structures::paging::mapper::MapToError;
 use bootloader::bootinfo::MemoryRegionType;
-use crate::{println, BOOT_INFO};
+use core::ptr;
+use x86_64::registers::control::Cr3;
+use x86_64::structures::paging::mapper::MapToError;
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::{PhysAddr, VirtAddr};
 
 #[derive(Clone, Copy)]
 pub struct BootInfoFrameAllocator {
@@ -39,7 +38,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
 }
 impl BootInfoFrameAllocator {
     /// Returns an iterator over the usable frames specified in the memory map.
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
+    fn usable_frames(&self) -> impl Iterator<Item=PhysFrame> {
         // get usable regions from memory map
         let regions = self.memory_map.iter();
         let usable_regions = regions
@@ -53,7 +52,7 @@ impl BootInfoFrameAllocator {
         frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
     /// Returns an iterator over usable 2 MiB-aligned frames in the memory map.
-    fn usable_2mb_frames(&self) -> impl Iterator<Item = PhysFrame<Size2MiB>> {
+    fn usable_2mb_frames(&self) -> impl Iterator<Item=PhysFrame<Size2MiB>> {
         // Filter out non-usable regions from the memory map
         self.memory_map
             .iter()
@@ -237,57 +236,80 @@ pub(crate) unsafe fn allocate_user_stack(
 pub(crate) unsafe fn allocate_kernel_stack(
     stack_size: u64,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {
-    //TODO: figure out what went wrong here with the new attempt
-    let stack_start = VirtAddr::new(0xFFFF_8000_0000_0000); // Example kernel-space stack base (adjust as needed)
-    let stack_end = stack_start + stack_size;
+    // Initial base address to start searching from
+    let stack_start = 0xFFFF_8000_0000_0000; // Example kernel-space stack base (adjust as needed)
 
-    if let Some(boot_info) = unsafe { BOOT_INFO } {
-        let mut frame_allocator = unsafe {
-            BootInfoFrameAllocator::init(&boot_info.memory_map)
-        };
-        let mut mapper = unsafe {
-            init_mapper(VirtAddr::new(boot_info.physical_memory_offset))
-        };
+    // Calculate the total size needed, including the guard page (4 KiB)
+    let total_stack_size = stack_size + 0x1000;
+    let mut stack_end;
 
-        for page in Page::range_inclusive(
-            Page::containing_address(stack_start),
-            Page::containing_address(stack_end - 1u64),
-        ) {
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            let frame = frame_allocator
-                .allocate_frame()
-                .ok_or(MapToError::FrameAllocationFailed)?;
-            unsafe {
-                mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+    if let Some(boot_info) = BOOT_INFO {
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+        let mut mapper = init_mapper(VirtAddr::new(boot_info.physical_memory_offset));
+
+        // Loop to find a free range that fits the total stack size (including guard page)
+        loop {
+            let mut stack_start = VirtAddr::new(stack_start);
+            stack_end = stack_start + total_stack_size;
+
+            // Check each page in the range to see if it's already mapped
+            let mut is_range_free = true;
+            for page in Page::<Size4KiB>::range_inclusive(
+                Page::containing_address(stack_start),
+                Page::containing_address(stack_end - 0x1000), // Exclude guard page
+            ) {
+                if mapper.translate_page(page).is_ok() {
+                    is_range_free = false;
+                    break;
+                }
             }
+
+            // If the entire range is free, proceed to allocate
+            if is_range_free {
+                break;
+            }
+            // Increment the base address by the total size needed (including guard page)
+            stack_start += total_stack_size;
         }
 
-        Ok(stack_end)
+        // Map each page in the stack range, leaving the guard page unmapped
+        for page in Page::range_inclusive(
+            Page::<Size4KiB>::containing_address(VirtAddr::new(stack_start)),
+            Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Last page as guard
+        ) {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            let frame = frame_allocator.allocate_frame().ok_or(MapToError::FrameAllocationFailed)?;
+            mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush();
+        }
+
+        // Ensure the stack pointer is properly aligned to a 16-byte boundary.
+        let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
+        Ok(aligned_stack_end)
     } else {
         Err(MapToError::FrameAllocationFailed)
     }
 }
 
-    pub fn map_mmio_region(
-        mapper: &mut OffsetPageTable,
-        frame_allocator: &mut BootInfoFrameAllocator,
-        mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
-        mmio_size: u64,               // The size of the MMIO region
-        virtual_addr: VirtAddr         // The virtual address to map it to
-    ) -> Result<(), MapToError<Size4KiB>> {
-        // Convert the physical address to a frame
-        let phys_frame = PhysFrame::containing_address(mmio_base);
+pub fn map_mmio_region(
+    mapper: &mut OffsetPageTable,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
+    mmio_size: u64,               // The size of the MMIO region
+    virtual_addr: VirtAddr,         // The virtual address to map it to
+) -> Result<(), MapToError<Size4KiB>> {
+    // Convert the physical address to a frame
+    let phys_frame = PhysFrame::containing_address(mmio_base);
 
-        // Calculate the number of pages to map based on the MMIO size
-        let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
+    // Calculate the number of pages to map based on the MMIO size
+    let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
 
-        for i in 0..num_pages {
-            let page = Page::containing_address(virtual_addr + i * 4096);
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-            unsafe {
-                mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
-            }
+    for i in 0..num_pages {
+        let page = Page::containing_address(virtual_addr + i * 4096);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        unsafe {
+            mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
         }
-
-        Ok(())
     }
+
+    Ok(())
+}

@@ -1,23 +1,23 @@
-use x86_64::structures::idt::InterruptStackFrame;
 use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::util;
 use crate::util::KERNEL_INITIALIZED;
+use x86_64::structures::idt::InterruptStackFrame;
 
-pub static mut TIMER:SystemTimer = SystemTimer::new();
+pub static mut TIMER: SystemTimer = SystemTimer::new();
 pub struct SystemTimer {
     tick: u128,
 }
-impl SystemTimer{
-    pub const fn new() -> Self{
-        SystemTimer{tick: 0}
+impl SystemTimer {
+    pub const fn new() -> Self {
+        SystemTimer { tick: 0 }
     }
-    pub fn increment(&mut self){
+    pub fn increment(&mut self) {
         self.tick += 1;
     }
-    pub fn get_current_tick(&self) -> u128{
+    pub fn get_current_tick(&self) -> u128 {
         self.tick
     }
 }
@@ -40,14 +40,13 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
         // Proceed with task scheduling if initialized
         let mut scheduler = SCHEDULER.lock();
         util::unlock_statics();
-        if(!scheduler.isEmpty()){
+        if (!scheduler.isEmpty()) {
             context.update_from_interrupt(rip, rsp, rflags.bits(), cs.0 as u64, ss.0 as u64);
             scheduler.get_current_task().update_from_context(context);
         }
         unsafe { scheduler.schedule_next(); }
 
         unsafe { scheduler.get_current_task().context.restore(); }
-
     } else {
         // Kernel is not initialized yet, just send EOI and return to kernel
         send_eoi(Timer.as_u8());

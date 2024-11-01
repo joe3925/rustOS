@@ -1,8 +1,8 @@
+use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
+use crate::file_system::FAT::FileSystem;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
-use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
-use crate::file_system::FAT::FileSystem;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -154,12 +154,11 @@ impl File {
                 return Err(FileStatus::UnknownFail);
             }
         };
-        if let Some(data) = file_system.read_file(self.path.as_str()){
+        if let Some(data) = file_system.read_file(self.path.as_str()) {
             Ok(data)
-        }else{
+        } else {
             Err(FileStatus::UnknownFail)
         }
-
     }
     /// Write data to the file (overwrites).
     pub fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
@@ -179,7 +178,7 @@ impl File {
             status => Err(status),
         }
     }
-    pub fn delete(&mut self)-> Result<(), FileStatus>  {
+    pub fn delete(&mut self) -> Result<(), FileStatus> {
         let mut file_system = {
             let mut drive_collection = DRIVECOLLECTION.lock();
             if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
@@ -192,7 +191,7 @@ impl File {
             }
         };
         let status = file_system.delete_file(self.path.as_str());
-        if(status.to_str() == FileStatus::Success.to_str()){
+        if (status.to_str() == FileStatus::Success.to_str()) {
             self.deleted = true;
         }
         match status {

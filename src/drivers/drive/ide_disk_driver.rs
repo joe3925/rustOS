@@ -1,17 +1,17 @@
+use crate::cpu::get_cycles;
+use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
+use crate::drivers::interrupt_index::send_eoi;
+use crate::drivers::pci::device_collection::Device;
+use crate::drivers::pci::pci_bus::PciBus;
+use crate::{drivers, println};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
-use x86_64::instructions::port::Port;
-use crate::drivers::pci::pci_bus::PciBus;
-use crate::{drivers,  println};
 use bitflags::bitflags;
-use x86_64::structures::idt::InterruptStackFrame;
-use crate::cpu::{get_cycles};
-use crate::drivers::interrupt_index::send_eoi;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
-use crate::drivers::pci::device_collection::Device;
+use x86_64::instructions::port::Port;
+use x86_64::structures::idt::InterruptStackFrame;
 
 const PRIMARY_CMD_BASE: u16 = 0x1F0;
 const PRIMARY_CTRL_BASE: u16 = 0x3F6;
@@ -46,7 +46,6 @@ static DRIVE_IRQ_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
-
         let status: u8 = PRIMARY_STATUS_PORT.read();  // Read the status register
 
         while status & 0x40 == 0 { println!("Drive not ready"); }
@@ -99,7 +98,7 @@ impl IdeController {
             command_port: Port::new(PRIMARY_STATUS_REG),
             alternative_command_port: Port::new(STATUS_REG),
             control_port: Port::new(CONTROL_REG),
-            managed_port: managed_port as u8
+            managed_port: managed_port as u8,
         }
     }
     fn identify_drive(&mut self, drive: u8) -> Option<DriveInfo> {
@@ -149,7 +148,7 @@ impl IdeController {
 
     pub fn init(&mut self) -> bool {
         if (!has_ide_controller(PciBus::new())) {
-            return false
+            return false;
         }
         unsafe {
             self.control_port.write(0x02); // Reset the controller
@@ -159,105 +158,103 @@ impl IdeController {
     }
 }
 
-impl DriveController for IdeController{
-        fn read(&mut self, label: &str, lba: u32, buffer: &mut [u8]) {
-            assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
+impl DriveController for IdeController {
+    fn read(&mut self, label: &str, lba: u32, buffer: &mut [u8]) {
+        assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
 
-            unsafe {
-                let drive_selector = self.managed_port;
+        unsafe {
+            let drive_selector = self.managed_port;
 
-                // Wait until the drive is not busy
-                while self.command_port.read() & 0x80 != 0 {}  // BSY
+            // Wait until the drive is not busy
+            while self.command_port.read() & 0x80 != 0 {}  // BSY
 
-                // Ensure drive is ready and no fault occurred
-                while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
-                while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            // Ensure drive is ready and no fault occurred
+            while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
-                if self.command_port.read() & 0x01 != 0 {
-                    println!("Error: IDE command failed!");
-                }
+            if self.command_port.read() & 0x01 != 0 {
+                println!("Error: IDE command failed!");
+            }
 
-                // Send command to read from the sector
-                self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
-                while self.command_port.read() & 0x80 != 0 {}  // BSY
+            // Send command to read from the sector
+            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            while self.command_port.read() & 0x80 != 0 {}  // BSY
 
-                self.sector_count_port.write(1);  // Request 1 sector
-                self.lba_lo_port.write((lba & 0xFF) as u8);
-                self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
-                self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-                self.command_port.write(0x20);  // Command to read
+            self.sector_count_port.write(1);  // Request 1 sector
+            self.lba_lo_port.write((lba & 0xFF) as u8);
+            self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
+            self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
+            self.command_port.write(0x20);  // Command to read
 
-                while self.command_port.read() & 0x80 != 0 {}  // BSY
-                while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
-                while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.command_port.read() & 0x80 != 0 {}  // BSY
+            while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
-                // Check if there was an error
-                if self.command_port.read() & 0x01 != 0 {
-                    println!("Error: Read sector failed!");
-                }
-                if self.error_port.read() & 0x10 != 0{
-                    println!("Tried to read from non existent sector");
-                    return;
-                }
+            // Check if there was an error
+            if self.command_port.read() & 0x01 != 0 {
+                println!("Error: Read sector failed!");
+            }
+            if self.error_port.read() & 0x10 != 0 {
+                println!("Tried to read from non existent sector");
+                return;
+            }
 
-                // Transfer data in chunks of 2 bytes (16-bit data)
-                for chunk in buffer.chunks_mut(2) {
-                    let data = self.data_port.read();  // Read 16-bit data
-                    chunk[0] = (data & 0xFF) as u8;    // Lower byte
-                    chunk[1] = ((data >> 8) & 0xFF) as u8;  // Upper byte
-                }
-
+            // Transfer data in chunks of 2 bytes (16-bit data)
+            for chunk in buffer.chunks_mut(2) {
+                let data = self.data_port.read();  // Read 16-bit data
+                chunk[0] = (data & 0xFF) as u8;    // Lower byte
+                chunk[1] = ((data >> 8) & 0xFF) as u8;  // Upper byte
             }
         }
-        fn write(&mut self, label: &str, lba: u32, buffer: &[u8]) {
-            assert_eq!(buffer.len(), 512);
+    }
+    fn write(&mut self, label: &str, lba: u32, buffer: &[u8]) {
+        assert_eq!(buffer.len(), 512);
 
-            unsafe {
-                let drive_selector = self.managed_port;
+        unsafe {
+            let drive_selector = self.managed_port;
 
-                // Wait until the drive is not busy
-                while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
+            // Wait until the drive is not busy
+            while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
 
-                // Ensure drive is ready and no fault occurred
-                while self.alternative_command_port.read() & 0x40 == 0 {  }
-                while self.alternative_command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            // Ensure drive is ready and no fault occurred
+            while self.alternative_command_port.read() & 0x40 == 0 {}
+            while self.alternative_command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
-                if self.alternative_command_port.read() & 0x01 != 0 {
-                    println!("Error: IDE command failed!");
-                }
+            if self.alternative_command_port.read() & 0x01 != 0 {
+                println!("Error: IDE command failed!");
+            }
 
-                // Send command to write to the sector
-                self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
-                while self.command_port.read() & 0x80 != 0 {}  // BSY
-                self.sector_count_port.write(1);
-                self.lba_lo_port.write((lba & 0xFF) as u8);
-                self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
-                self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-                self.command_port.write(0x30);  // Command to write
+            // Send command to write to the sector
+            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            while self.command_port.read() & 0x80 != 0 {}  // BSY
+            self.sector_count_port.write(1);
+            self.lba_lo_port.write((lba & 0xFF) as u8);
+            self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
+            self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
+            self.command_port.write(0x30);  // Command to write
 
-                while self.command_port.read() & 0x80 != 0 {println!("Drive busy");}  // BSY
-                while self.command_port.read() & 0x40 == 0 {  }
-                while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.command_port.read() & 0x80 != 0 { println!("Drive busy"); }  // BSY
+            while self.command_port.read() & 0x40 == 0 {}
+            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
-                while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {
-                }
-                // Check if there was an error
-                if self.alternative_command_port.read() & 0x01 != 0 {
-                    println!("Error: Read sector failed!");
-                }
-                DRIVE_IRQ_RECEIVED.store(false, Ordering::SeqCst);
+            while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {}
+            // Check if there was an error
+            if self.alternative_command_port.read() & 0x01 != 0 {
+                println!("Error: Read sector failed!");
+            }
+            DRIVE_IRQ_RECEIVED.store(false, Ordering::SeqCst);
 
-                if self.error_port.read() & 0x10 != 0{
-                    println!("Tried to write to non existent sector");
-                    return;
-                }
-                // Transfer data in chunks of 2 bytes (16-bit data)
-                for chunk in buffer.chunks(2) {
-                    let data = (u16::from(chunk[1]) << 8) | u16::from(chunk[0]);
-                    self.data_port.write(data);
-                }
+            if self.error_port.read() & 0x10 != 0 {
+                println!("Tried to write to non existent sector");
+                return;
+            }
+            // Transfer data in chunks of 2 bytes (16-bit data)
+            for chunk in buffer.chunks(2) {
+                let data = (u16::from(chunk[1]) << 8) | u16::from(chunk[0]);
+                self.data_port.write(data);
             }
         }
+    }
     fn enumerate_drives() {
         let mut drive_collection = DRIVECOLLECTION.lock();
         let mut ide_controller = Self::new(0x0);
@@ -274,13 +271,13 @@ impl DriveController for IdeController{
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(1) {  // Slave drive
                 // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info,  Box::new(IdeController::new(0xF0)));
+                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
             }
         }
     }
     fn isController(device: &Device) -> bool {
-        if (device.class_code == 0x01 && device.subclass == 0x01){
-            return true
+        if (device.class_code == 0x01 && device.subclass == 0x01) {
+            return true;
         }
         false
     }
