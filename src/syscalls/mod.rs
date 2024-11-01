@@ -1,1 +1,1 @@
-mod syscall;
+pub(crate) mod syscall;
