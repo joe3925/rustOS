@@ -1,5 +1,6 @@
 use crate::scheduling::task::{idle_task, Task};
 use alloc::vec::Vec;
+use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -47,5 +48,10 @@ impl Scheduler {
     pub fn get_current_task(&mut self) -> &mut Task {
         let index = self.current_task.load(Ordering::SeqCst);
         &mut self.tasks[index]
+    }
+}
+pub fn thr_yield() {
+    unsafe {
+        asm!("int 0x20");
     }
 }

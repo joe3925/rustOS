@@ -1,6 +1,8 @@
 use core::fmt::Write;
 use lazy_static::lazy_static;
 use spin::Mutex;
+use crate::scheduling::scheduler::thr_yield;
+
 pub(crate) struct Console {
     pub(crate) current_line: isize,
     pub(crate) current_char_size: isize,
@@ -151,6 +153,12 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
     // Write the formatted arguments into the buffer
     write!(writer, "{}", args).unwrap();
     // Print the formatted buffer using Console's print method
+    unsafe {
+        while (CONSOLE.try_lock().is_none()) {
+            x86_64::instructions::interrupts::int3();
+            thr_yield();
+        }
+    }
     unsafe { CONSOLE.lock().print(writer.as_bytes()); }
 }
 
