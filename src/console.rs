@@ -7,6 +7,18 @@ pub(crate) struct Console {
     pub(crate) vga_width: isize,
     pub(crate) cursor_pose: isize,
 }
+
+impl Console {
+    const fn new() -> Self {
+        Console {
+            current_char_size: 0,
+            vga_width: 80,
+            cursor_pose: 0,
+            current_line: 0,
+        }
+    }
+}
+
 impl Console {
     pub(crate) fn print(&mut self, str: &[u8]) {
         let mut i = 0;
@@ -69,6 +81,10 @@ impl Console {
             i += 1;
         }
     }
+    pub unsafe fn reset_state(){
+        CONSOLE.force_unlock();
+        CONSOLE = Mutex::new(Console::new());
+    }
 
     fn scroll_up(&mut self) {
         unsafe {
@@ -96,14 +112,7 @@ impl Console {
     }
 }
 
-lazy_static! {
-     pub(crate) static ref CONSOLE: Mutex<Console> = Mutex::new(Console {
-        current_char_size: 0,
-        vga_width: 80,
-        cursor_pose: 0,
-        current_line: 0,
-    });
-}
+pub(crate) static mut CONSOLE: Mutex<Console> = Mutex::new(Console::new());
 #[allow(dead_code)]
 pub(crate) fn clear_vga_buffer() {
     let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
@@ -141,9 +150,8 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
 
     // Write the formatted arguments into the buffer
     write!(writer, "{}", args).unwrap();
-
     // Print the formatted buffer using Console's print method
-    CONSOLE.lock().print(writer.as_bytes());
+    unsafe { CONSOLE.lock().print(writer.as_bytes()); }
 }
 
 // Helper structure to wrap the buffer and implement core::fmt::Write for it

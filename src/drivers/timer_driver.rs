@@ -22,12 +22,12 @@ impl SystemTimer {
 }
 pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     //these variables are on the stack and must be captured before any other function is called
-    let mut context = State::new();
     let rip = _stack_frame.instruction_pointer.as_u64();
     let cs = _stack_frame.code_segment;
     let rflags = _stack_frame.cpu_flags;
     let rsp = _stack_frame.stack_pointer.as_u64();
     let ss = _stack_frame.stack_segment;
+    let mut context = State::new();
 
     unsafe { TIMER.increment(); }
 
