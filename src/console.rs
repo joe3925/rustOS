@@ -85,6 +85,7 @@ impl Console {
             for x in 0..self.vga_width {
                 let from = (y * self.vga_width + x) * 2;
                 let to = ((y - 1) * self.vga_width + x) * 2;
+
                 vga_buffer[to] = vga_buffer[from];
                 vga_buffer[to + 1] = vga_buffer[from + 1];
             }
@@ -106,11 +107,11 @@ pub(crate) static mut CONSOLE: Mutex<Console> = Mutex::new(Console::new());
 
 #[allow(dead_code)]
 pub(crate) fn clear_vga_buffer() {
-    let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
+    let vga_buffer = Console::vga_buffer();
     let mut i = 0;
     unsafe {
-        while (vga_buffer.offset(i) < 0xB8FA0 as *mut u8) {
-            *vga_buffer.offset(i) = 0x0;
+        while (i < 0xFA0) {
+            vga_buffer[i] = 0x0;
 
             i += 2;
         }
