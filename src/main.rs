@@ -32,8 +32,8 @@ use crate::console::{Console, CONSOLE};
 static mut BOOT_INFO: Option<&'static BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
     unsafe { Console::reset_state(); }
+    println!("{}", info);
     loop {}
 }
 

@@ -1,17 +1,16 @@
+
 use core::fmt::Write;
-use lazy_static::lazy_static;
 use spin::Mutex;
 use crate::scheduling::scheduler::thr_yield;
-
 pub(crate) struct Console {
-    pub(crate) current_line: isize,
-    pub(crate) current_char_size: isize,
-    pub(crate) vga_width: isize,
-    pub(crate) cursor_pose: isize,
+    pub(crate) current_line: usize,
+    pub(crate) current_char_size: usize,
+    pub(crate) vga_width: usize,
+    pub(crate) cursor_pose: usize,
 }
 
 impl Console {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Console {
             current_char_size: 0,
             vga_width: 80,
@@ -19,63 +18,54 @@ impl Console {
             current_line: 0,
         }
     }
-}
 
-impl Console {
+    const fn vga_buffer() -> &'static mut [u8] {
+        // Unsafe slice directly referencing the VGA memory at 0xB8000
+        unsafe { core::slice::from_raw_parts_mut(0xB8000 as *mut u8, 80 * 25 * 2) }
+    }
+
     pub(crate) fn print(&mut self, str: &[u8]) {
         let mut i = 0;
-        static mut VGA_BUFFER: *mut u8 = 0xB8000 as *mut u8;
-
-        while i < str.len() && self.cursor_pose + 2 <= 0xB8FA0 {
+        let vga_buffer = Console::vga_buffer();
+        while i < str.len() && self.cursor_pose + 2 <= 80 * 25 * 2 {
             // Correct cursor position if it's not even
             if self.cursor_pose % 2 != 0 {
                 self.cursor_pose += 1;
             }
-            //TODO: get this to work with kernel panics
-
-            //if(self.cursor_pose % 160 == 0 && self.cursor_pose != 0){
-            //  self.current_line += 1;
-            //}
 
             // Handle newlines
-            if self.cursor_pose >= 0xB8FA0 {
+            if self.cursor_pose > 80 * 25 * 2 {
                 self.scroll_up();
             }
+
             if str[i] == b'\n' {
                 self.cursor_pose += (self.vga_width * 2) - (self.cursor_pose % (self.vga_width * 2));
                 self.current_line += 1;
                 self.current_char_size = 0;
             }
             // Handle backspace
-            else if (str[i] == 0x08) {
-                unsafe {
-                    if (*VGA_BUFFER.offset(self.cursor_pose) == 0x0) {
-                        while (*VGA_BUFFER.offset(self.cursor_pose) == 0x0 && self.cursor_pose > 0) {
-                            self.cursor_pose -= 2;
-                        }
-                    }                     // Check the character at the current cursor position
-                    if (*VGA_BUFFER.offset(self.cursor_pose) != 0x0) {
-                        // Clear the non-null character
-                        *VGA_BUFFER.offset(self.cursor_pose) = 0x0; // Clear character
-                        *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // Reset attribute (white on black)
-                        self.current_char_size = self.current_char_size.saturating_sub(1); // Adjust character size
+            else if str[i] == 0x08 {
+                if vga_buffer[self.cursor_pose] == 0x0 {
+                    while self.cursor_pose > 0 && vga_buffer[self.cursor_pose] == 0x0 {
+                        self.cursor_pose -= 2;
                     }
+                }
+                if vga_buffer[self.cursor_pose] != 0x0 {
+                    vga_buffer[self.cursor_pose] = 0x0; // Clear character
+                    vga_buffer[self.cursor_pose + 1] = 0x07; // Reset attribute (white on black)
+                    self.current_char_size = self.current_char_size.saturating_sub(1);
                 }
             }
-
             // Handle regular character printing
             else {
-                unsafe {
-                    // Check if we need to scroll
-                    if self.current_line >= 24 {
-                        self.scroll_up();
-                        self.current_line = 23;
-                        self.cursor_pose = self.current_line * self.vga_width * 2;
-                    }
-
-                    *VGA_BUFFER.offset(self.cursor_pose) = str[i];
-                    *VGA_BUFFER.offset((self.cursor_pose + 1)) = 0x07; // White foreground, black background
+                if self.current_line >= 24 {
+                    self.scroll_up();
+                    self.current_line = 23;
+                    self.cursor_pose = self.current_line * self.vga_width * 2;
                 }
+
+                vga_buffer[self.cursor_pose] = str[i];
+                vga_buffer[self.cursor_pose + 1] = 0x07; // White foreground, black background
                 self.cursor_pose += 2;
                 self.current_char_size += 1;
             }
@@ -83,38 +73,37 @@ impl Console {
             i += 1;
         }
     }
+
     pub unsafe fn reset_state(){
         CONSOLE.force_unlock();
         CONSOLE = Mutex::new(Console::new());
     }
 
     fn scroll_up(&mut self) {
-        unsafe {
-            let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
-
-            for y in 1..25 {
-                for x in 0..self.vga_width {
-                    let from = ((y * self.vga_width) + x) * 2;
-                    let to = (((y - 1) * self.vga_width) + x) * 2;
-
-                    *vga_buffer.offset(to) = *vga_buffer.offset(from);
-                    *vga_buffer.offset((to + 1)) = *vga_buffer.offset((from + 1));
-                }
-            }
-
-            // Clear the last line
-            let last_line_start = (24 * self.vga_width) * 2;
+        let mut vga_buffer = Console::vga_buffer();
+        for y in 1..25 {
             for x in 0..self.vga_width {
-                *vga_buffer.offset((last_line_start + x * 2)) = b' ';
-                *vga_buffer.offset((last_line_start + x * 2 + 1)) = 0x07;
+                let from = (y * self.vga_width + x) * 2;
+                let to = ((y - 1) * self.vga_width + x) * 2;
+                vga_buffer[to] = vga_buffer[from];
+                vga_buffer[to + 1] = vga_buffer[from + 1];
             }
         }
+
+        // Clear the last line
+        let last_line_start = (24 * self.vga_width)  * 2;
+        for x in 0..self.vga_width  {
+            vga_buffer[last_line_start + x * 2] = b' ';
+            vga_buffer[last_line_start + x * 2 + 1] = 0x07;
+        }
+
         // Adjust the cursor position after scrolling
         self.cursor_pose = (self.vga_width * 23 * 2) + (self.current_char_size * 2);
     }
 }
 
 pub(crate) static mut CONSOLE: Mutex<Console> = Mutex::new(Console::new());
+
 #[allow(dead_code)]
 pub(crate) fn clear_vga_buffer() {
     let vga_buffer: *mut u8 = 0xB8000 as *mut u8;
@@ -154,12 +143,12 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
     write!(writer, "{}", args).unwrap();
     // Print the formatted buffer using Console's print method
     unsafe {
-        while (CONSOLE.try_lock().is_none()) {
-            x86_64::instructions::interrupts::int3();
+        if let Some(mut console) = CONSOLE.try_lock() {
+            console.print(writer.as_bytes());
+        }else{
             thr_yield();
         }
     }
-    unsafe { CONSOLE.lock().print(writer.as_bytes()); }
 }
 
 // Helper structure to wrap the buffer and implement core::fmt::Write for it

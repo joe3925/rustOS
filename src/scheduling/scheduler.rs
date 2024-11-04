@@ -34,7 +34,7 @@ impl Scheduler {
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        if self.tasks.len() < 2 {
+        if self.tasks.len() < 1{
             let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
             self.add_task(idle_task);
         }
