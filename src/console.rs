@@ -144,11 +144,7 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
     write!(writer, "{}", args).unwrap();
     // Print the formatted buffer using Console's print method
     unsafe {
-        if let Some(mut console) = CONSOLE.try_lock() {
-            console.print(writer.as_bytes());
-        }else{
-            thr_yield();
-        }
+        CONSOLE.lock().print(writer.as_bytes());
     }
 }
 

@@ -62,8 +62,7 @@ impl Task {
 pub(crate) extern "C" fn idle_task() {
     loop {
         // The idle task does nothing but loop indefinitely
-        unsafe { println!("Timer Tick:{}", TIMER.get_current_tick()); }
-        x86_64::instructions::hlt();
+        unsafe { println!("Hello world" )}
     }
 }
 pub unsafe fn test_syscall() -> u64 {

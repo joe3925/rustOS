@@ -4,6 +4,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
+use crate::memory::paging::allocate_syscall_page;
 
 // Global scheduler that contains a list of tasks
 lazy_static! {
@@ -36,7 +37,9 @@ impl Scheduler {
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
         if self.tasks.len() < 1{
-            let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
+            let idle_task = Task::new(idle_task as usize, 1024 * 10, true); // Example idle task with kernel mode
+            //let idle_task = Task::new(allocate_syscall_page().expect("failed to alloc syscall page").as_u64() as usize, 1024 * 10, true); // Example idle task with kernel mode
+
             self.add_task(idle_task);
         }
         if self.tasks.len() > 0 {

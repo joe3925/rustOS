@@ -1,3 +1,5 @@
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::slice;
 use crate::gdt::GDT;
 use crate::println;
@@ -10,12 +12,12 @@ use x86_64::registers::model_specific::Msr;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_SYSCALL_MASK: u32 = 0xC000_0084;
-fn println_wrapper(message_ptr: *const str) {
+fn println_wrapper(message_ptr: String) {
     // Safety: We assume the caller guarantees that message_ptr is valid.
     let message = unsafe { &*message_ptr };
     println!("{}", message);
 }
-fn u64_to_str_ptr(value: u64) -> Option<&'static str> {
+fn u64_to_str_ptr(value: u64) -> Option<String> {
     // Convert u64 to a raw pointer
     let ptr = value as *const u8;
 
@@ -33,7 +35,7 @@ fn u64_to_str_ptr(value: u64) -> Option<&'static str> {
 
         // Attempt to create a slice and then convert it to a str
         let slice = slice::from_raw_parts(ptr, len);
-        str::from_utf8(slice).ok()
+        String::from_utf8(Vec::from(slice)).ok()
     }
 }
 pub unsafe fn set_syscall_handler() {
@@ -65,14 +67,15 @@ extern "C" fn syscall_handler() {
     // Fifth argument r8
     // Sixth argument r9
 
-    // Use `rax` to match on syscall numbers
+    // Use rax to match on syscall numbers
 
     match state.rax {
         1 => {
-            let param = state.rdi;
+            println!("Syscall");
+            /*let param = state.rdi;
             if let Some(string) = u64_to_str_ptr(param) {
                 println_wrapper(string)
-            }
+            }*/
         }
         _ => {
             println!("Unknown syscall number: {}", state.rax);

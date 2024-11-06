@@ -37,7 +37,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
         DRIVECOLLECTION.force_unlock();
         drive.format().expect("format failed");
     }
-    set_syscall_handler();
+    //set_syscall_handler();
     println!("Init Done");
     KERNEL_INITIALIZED = true;
 }

@@ -137,6 +137,19 @@ unsafe fn write_infinite_loop(page_ptr: *mut u8) {
     ptr::write(page_ptr, 0xEB);       // JMP opcode
     ptr::write(page_ptr.add(1), 0xFE); // -2 offset to jump back to itself
 }
+pub(crate) unsafe fn write_syscall(page_ptr: *mut u8) {
+    // Syscall instruction: `0x0F 0x05`
+    ptr::write(page_ptr, 0xF4);
+    ptr::write(page_ptr.add(1), 0x0F);       // First byte of syscall opcode
+    ptr::write(page_ptr.add(2), 0x05); // Second byte of syscall opcode
+}
+
+/// Allocates a page with a syscall instruction at a free virtual address.
+pub(crate) unsafe fn allocate_syscall_page() -> Result<VirtAddr, &'static str> {
+    let page_addr = alloc_user_page()?; // Allocate the user page
+    write_syscall(page_addr.as_mut_ptr()); // Write the syscall instruction
+    Ok(page_addr)
+}
 
 // Function to allocate a user-accessible page with write and execute permissions
 pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {

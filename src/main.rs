@@ -28,11 +28,13 @@ mod drivers;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 use crate::console::{Console, CONSOLE};
+use crate::scheduling::task::test_syscall;
+use crate::util::KERNEL_INITIALIZED;
 
 static mut BOOT_INFO: Option<&'static BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe { Console::reset_state(); }
+    //unsafe { Console::reset_state(); }
     println!("{}", info);
     loop {}
 }
@@ -44,6 +46,7 @@ fn _start(boot_info: &'static BootInfo) -> ! {
         BOOT_INFO = Some(boot_info); //RustRover will sometimes mark this as an error not sure why
     }
 
-    loop {}
+    loop {
+    }
 }
 
