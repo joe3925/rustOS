@@ -12,6 +12,7 @@ pub struct Task {
 }
 
 impl Task {
+    #[inline]
     pub fn new(
         entry_point: usize,
         stack_size: u64,

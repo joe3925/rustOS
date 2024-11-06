@@ -1,3 +1,4 @@
+use core::slice;
 use crate::gdt::GDT;
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -13,6 +14,27 @@ fn println_wrapper(message_ptr: *const str) {
     // Safety: We assume the caller guarantees that message_ptr is valid.
     let message = unsafe { &*message_ptr };
     println!("{}", message);
+}
+fn u64_to_str_ptr(value: u64) -> Option<&'static str> {
+    // Convert u64 to a raw pointer
+    let ptr = value as *const u8;
+
+    // Check if the pointer is null or not (to avoid dereferencing a null pointer)
+    if ptr.is_null() {
+        return None;
+    }
+
+    // Calculate the length of the string by scanning for a null terminator
+    let mut len = 0;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+
+        // Attempt to create a slice and then convert it to a str
+        let slice = slice::from_raw_parts(ptr, len);
+        str::from_utf8(slice).ok()
+    }
 }
 pub unsafe fn set_syscall_handler() {
     // Create Msr objects for each MSR
@@ -34,7 +56,6 @@ pub unsafe fn set_syscall_handler() {
 }
 extern "C" fn syscall_handler() {
     let mut state = State::new();
-    state.update();
 
     // Syscall number rax
     // First argument rdi
@@ -45,11 +66,13 @@ extern "C" fn syscall_handler() {
     // Sixth argument r9
 
     // Use `rax` to match on syscall numbers
+
     match state.rax {
         1 => {
-            let mut task = Task::new(println_wrapper as usize, 1024 * 10, false);
-            task.context.rdi = state.rdi;
-            SCHEDULER.lock().add_task(task);
+            let param = state.rdi;
+            if let Some(string) = u64_to_str_ptr(param) {
+                println_wrapper(string)
+            }
         }
         _ => {
             println!("Unknown syscall number: {}", state.rax);

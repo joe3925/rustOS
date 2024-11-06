@@ -24,6 +24,7 @@ impl Scheduler {
     }
 
     // Add a new task to the scheduler
+    #[inline]
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
     }
