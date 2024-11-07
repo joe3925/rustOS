@@ -1,0 +1,7 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="debug" type="CompoundRunConfigurationType">
+    <toRun name="1build" type="ShConfigurationType" />
+    <toRun name="bochs dbg" type="ShConfigurationType" />
+    <method v="2" />
+  </configuration>
+</component>
