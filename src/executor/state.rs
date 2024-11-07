@@ -34,6 +34,7 @@ pub struct State {
 }
 #[no_mangle]
 impl State {
+    #[inline(always)]
     pub fn new() -> Self {
         let mut state = State {
             rax: 0,
@@ -60,12 +61,36 @@ impl State {
         state.update();
         state
     }
-    pub fn update_from_interrupt(&mut self, rip: u64, rsp: u64, rflags: u64, cs: u64, ss: u64) {
+    #[inline(always)]
+    #[no_mangle]
+    pub unsafe extern "C" fn update_from_stack(&mut self, ) {
+
+    }
+    #[inline(always)]
+    #[no_mangle]
+    pub fn update_from_interrupt(
+        &mut self,
+        rip: u64,
+        rsp: u64,
+        rflags: u64,
+        cs: u64,
+        ss: u64,
+        r12: u64,
+        r13: u64,
+        r14: u64,
+        r15: u64,
+        rbp: u64,
+    ) {
         self.rip = rip;
         self.rsp = rsp;
         self.rflags = rflags;
         self.cs = cs;
         self.ss = ss;
+        self.r12 = r12;
+        self.r13 = r13;
+        self.r14 = r14;
+        self.r15 = r15;
+        self.rbp = rbp;
     }
 
     /// Save the current CPU context into this `State` struct
@@ -167,7 +192,9 @@ impl State {
         in(reg) self.cs,
         in(reg) self.rip,
         );
-        unsafe { asm!("iretq") }
+        x86_64::instructions::bochs_breakpoint();
+        unsafe { asm!("iretq");
+        }
 
     }
 }

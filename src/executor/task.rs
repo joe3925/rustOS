@@ -43,6 +43,8 @@ impl Task {
             // Set kernel mode segment selectors
             state.cs = GDT.1.kernel_code_selector.0 as u64;
             state.ss = GDT.1.kernel_data_selector.0 as u64;
+            println!("Kernel-mode task created with RIP {:X}, STACK {:X}", state.rip, state.rsp);
+
         }
 
         // Create and return the new task

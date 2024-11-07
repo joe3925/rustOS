@@ -34,15 +34,17 @@ impl Scheduler {
     pub fn isEmpty(&self) -> bool{
         self.tasks.is_empty()
     }
+    pub unsafe fn create_idle(&mut self) {
+        if self.tasks.len() < 1 {
+            // If there are no tasks, add the idle task to prevent returning
+            let idle_task = Task::new(idle_task as usize, 1024 * 10, false); // Example idle task with kernel mode
+            self.add_task(idle_task);
+        }
+    }
 
     // Select the next task to run in a round-robin fashion
     #[inline]
     pub unsafe fn schedule_next(&mut self) {
-        if self.tasks.len() < 3 {
-            // If there are no tasks, add the idle task to prevent returning
-            let idle_task = Task::new(paging::allocate_infinite_loop_page().unwrap().as_u64() as usize, 1024 * 10, true); // Example idle task with kernel mode
-            self.add_task(idle_task);
-        }
         if self.tasks.len() > 0 {
 
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();

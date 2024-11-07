@@ -44,8 +44,6 @@ lazy_static! {
 pub(crate) fn load_idt() {
         //hardware interrupts
         IDT.load();
-        //TODO: fix page fault here
         x86_64::instructions::interrupts::enable();
-
         println!("loaded IDT");
 }

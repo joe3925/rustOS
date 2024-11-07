@@ -7,6 +7,7 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::{gdt, panic, println};
+use crate::executor::scheduler::SCHEDULER;
 use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
@@ -23,6 +24,7 @@ pub unsafe fn init(boot_info: &'static BootInfo){
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
     init_heap(&mut mapper, &mut frame_allocator);
+
     unsafe {
         PCIBUS.lock().enumerate_pci();
     }
