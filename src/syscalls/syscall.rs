@@ -3,9 +3,7 @@ use alloc::vec::Vec;
 use core::slice;
 use crate::gdt::GDT;
 use crate::println;
-use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
-use crate::scheduling::task::Task;
 use x86_64::registers::model_specific::Msr;
 
 // Define the MSR addresses
@@ -56,7 +54,7 @@ pub unsafe fn set_syscall_handler() {
     // Set the syscall flag mask, clearing certain flags
     syscall_mask.write(0x3F4);  // Example: clear DF, TF, IF, AC, and RF
 }
-extern "C" fn syscall_handler() {
+extern "x86-interrupt" fn syscall_handler() {
     let mut state = State::new();
 
     // Syscall number rax

@@ -41,6 +41,18 @@ impl LinkedList {
 
         count
     }
+    pub fn get_last(&mut self) -> &mut ListNode {
+        let mut current = &mut self.head;
+        loop {
+
+            // If the next node is None, break the loop
+            if current.next.is_none() {
+                return current;
+            }
+
+            current = current.next.as_mut().unwrap();
+        }
+    }
 
     pub fn print_list(&mut self) {
         let mut current = &mut self.head;

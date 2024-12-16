@@ -256,6 +256,7 @@ impl DriveController for IdeController {
         }
     }
     fn enumerate_drives() {
+        unsafe{DRIVECOLLECTION.force_unlock();}
         let mut drive_collection = DRIVECOLLECTION.lock();
         let mut ide_controller = Self::new(0x0);
 

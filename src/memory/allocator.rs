@@ -4,6 +4,8 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr;
 use x86_64::{align_up, VirtAddr};
+use crate::println;
+
 #[global_allocator]
 pub static mut ALLOCATOR: Locked<Allocator> =
     Locked::new(Allocator::new());
@@ -185,7 +187,6 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
         static mut INIT: bool = false;
         let (size, align) = Allocator::size_align(layout);
         let mut allocator = self.lock();
-        // println!("free mem:{}, alloc size: {}", allocator.free_memory(), layout.size());
 
         if (INIT == false) {
             let heap_start = VirtAddr::new(HEAP_START as u64);

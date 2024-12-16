@@ -22,8 +22,10 @@ impl InterruptIndex {
         self as u8
     }
 }
+#[inline(never)]
 pub fn send_eoi(irq: u8) {
     unsafe {
+        PICS.force_unlock();
         PICS.lock().notify_end_of_interrupt(irq);
     }
 }

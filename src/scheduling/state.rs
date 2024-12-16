@@ -2,32 +2,40 @@ use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
 use core::arch::asm;
+use x86_64::registers::rflags::RFlags;
+use x86_64::registers::segmentation::CS;
+use x86_64::structures::gdt::SegmentSelector;
+use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::VirtAddr;
+use crate::println;
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct State {
+pub(crate) struct State {
     pub(crate) rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rsi: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rsi: u64,
     pub(crate) rdi: u64,
-    rbp: u64,
+    pub(crate) rbp: u64,
     pub(crate) rsp: u64,   // Stack pointer
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
+    pub(crate) r8: u64,
+    pub(crate) r9: u64,
+    pub(crate) r10: u64,
+    pub(crate) r11: u64,
+    pub(crate) r12: u64,
+    pub(crate) r13: u64,
+    pub(crate) r14: u64,
+    pub(crate) r15: u64,
     pub(crate) rip: u64,   // Instruction pointer
     pub(crate) rflags: u64,
     pub(crate) cs: u64,    // Code segment register
     pub(crate) ss: u64,    // Stack segment register
 }
 impl State {
+    #[inline(always)]
+    #[no_mangle]
     pub fn new() -> Self {
         let mut state = State {
             rax: 0,
@@ -63,6 +71,8 @@ impl State {
     }
 
     /// Save the current CPU context into this `State` struct
+    #[inline(always)]
+    #[no_mangle]
     pub fn update(&mut self) {
         unsafe {
             asm!(
@@ -102,10 +112,23 @@ impl State {
             );
         }
     }
-
-    #[inline]
+    pub fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
+        unsafe {
+            self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
+           // self.rflags = 0x00000202;
+            // Cast the read-only stack frame into a mutable raw pointer
+            let mut new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
+                                                               SegmentSelector(self.cs as u16),
+                                                               RFlags::from_bits_retain(self.rflags),
+                                                               VirtAddr::new(self.rsp),
+                                                               SegmentSelector(self.ss as u16));
+            // Update the stack frame fields
+            _stack_frame.as_mut().write(*new_stack_frame);
+        }
+    }
+    #[inline(always)]
     #[no_mangle]
-    pub unsafe extern "C" fn restore(&mut self) {
+    pub unsafe extern "C" fn restore(&mut self){
         asm!(
         "mov rax, {0}",
         "mov rbx, {1}",
@@ -141,15 +164,13 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-        function();
         SCHEDULER.force_unlock();
-        send_eoi(Timer.as_u8());
-
+        /*
         self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
 
         asm!(
         "push {0}",     // Push SS
-        "push {1}",
+        "push {1}",     // push rsp
         "push {2}",     // Push RFLAGS
         "push {3}",     // Push CS
         "push {4}",     // Push RIP (instruction pointer)
@@ -159,7 +180,10 @@ impl State {
         in(reg) self.cs,
         in(reg) self.rip,
         );
-        unsafe { asm!("iretq") }
+        send_eoi(Timer.as_u8());
+        x86_64::instructions::bochs_breakpoint();
+        asm!("iretq", options(noreturn));
+ */
     }
     #[inline]
     #[no_mangle]

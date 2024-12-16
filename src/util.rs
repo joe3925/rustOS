@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use crate::console::CONSOLE;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
@@ -10,34 +11,49 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::syscalls::syscall::set_syscall_handler;
 use crate::{gdt, println};
 use alloc::string::ToString;
+use alloc::vec::Vec;
 use bootloader::BootInfo;
 use core::arch::asm;
+use x86_64::structures::paging::Mapper;
 use x86_64::VirtAddr;
 
 pub(crate) static mut KERNEL_INITIALIZED: bool = false;
 
 pub unsafe fn init(boot_info: &'static BootInfo) {
-    gdt::init();
-    unsafe { interrupt_index::PICS.lock().initialize() };
-    load_idt();
 
-
+    let mut collection = DRIVECOLLECTION.lock();
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = unsafe {
         BootInfoFrameAllocator::init(&boot_info.memory_map)
     };
-    //The heap needs to be rewritten it is not pretty
-    init_heap(&mut mapper, &mut frame_allocator.clone(), &mut frame_allocator);
+    mapper = init_mapper(mem_offset);
+    frame_allocator = unsafe {
+        BootInfoFrameAllocator::init(&boot_info.memory_map)
+    };
+    gdt::init();
+    println!("GDT loaded");
+    unsafe { interrupt_index::PICS.lock().initialize() };
+    load_idt();
+    init_heap(&mut mapper, &mut frame_allocator.clone());
+    println!("IDT loaded");
+    test_full_heap();
+    //TODO: The heap needs to be rewritten it is not pretty
     unsafe {
         PCIBUS.lock().enumerate_pci();
     }
+    println!("PCI BUS enumerated");
+
     IdeController::enumerate_drives();
-    if let Some(drive) = DRIVECOLLECTION.lock().find_drive("B:".to_string()) {
+    println!("Drives enumerated");
+    //collection.print_drives();
+
+
+    if let Some(drive) = collection.find_drive("B:".to_string()) {
         DRIVECOLLECTION.force_unlock();
-        drive.format().expect("format failed");
+        //drive.format().expect("format failed");
     }
-    //set_syscall_handler();
+    set_syscall_handler();
     println!("Init Done");
     KERNEL_INITIALIZED = true;
 }
@@ -54,8 +70,33 @@ pub fn trigger_breakpoint() {
 //will unlock kernel mode statics during a context switch from a kernel mode task
 pub fn unlock_statics() {
     unsafe {
-        DRIVECOLLECTION.force_unlock();
-        CONSOLE.force_unlock();
         SCHEDULER.force_unlock();
     }
+}
+// Assumes these constants are defined and used in your heap initialization:
+const HEAP_SIZE: usize = 2 * 1024 * 1024; // 10 MiB
+
+pub fn test_full_heap() {
+    // Calculate the number of elements to fill the heap
+    // Each element is a `u64`, which is 8 bytes.
+    let element_count = (HEAP_SIZE) / size_of::<u64>();
+
+    // Allocate a `Vec` that should take up the entire heap
+    let mut vec: Vec<u64> = Vec::with_capacity(1);
+
+    // Fill the vector with data
+    for i in 0..element_count {
+        vec.push(i as u64);
+    }
+    // Verify the data
+    for i in 0..element_count {
+        if(i != vec[i] as usize) {
+            println!("Heap data verification failed at index {}", i);
+        }
+    }
+
+    println!(
+        "Heap test passed: allocated and verified {} elements in the heap",
+        element_count
+    );
 }

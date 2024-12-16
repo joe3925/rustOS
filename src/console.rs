@@ -1,7 +1,14 @@
-
+use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt::Write;
 use spin::Mutex;
 use crate::scheduling::scheduler::thr_yield;
+use crate::structs::linked_list::LinkedList;
+use crate::util::KERNEL_INITIALIZED;
+
+static mut QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
+
 pub(crate) struct Console {
     pub(crate) current_line: usize,
     pub(crate) current_char_size: usize,
@@ -76,6 +83,7 @@ impl Console {
 
     pub unsafe fn reset_state(){
         CONSOLE.force_unlock();
+        clear_vga_buffer();
         CONSOLE = Mutex::new(Console::new());
     }
 
@@ -133,8 +141,13 @@ macro_rules! println {
         $crate::print!("{}\n", format_args!($($arg)*))
     };
 }
-
-#[doc(hidden)]
+pub(crate) unsafe fn print_queue(){
+    CONSOLE.force_unlock();
+    let mut console = CONSOLE.lock();
+    while(!QUEUE.is_empty()) {
+        console.print(QUEUE.remove(0).unwrap().as_slice())
+    }
+}
 pub(crate) fn _print(args: core::fmt::Arguments) {
     // Create a buffer to hold the formatted string
     let mut buffer = [0u8; 1024]; // Allocate a 1024-byte buffer
@@ -142,13 +155,21 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
 
     // Write the formatted arguments into the buffer
     write!(writer, "{}", args).unwrap();
-    // Print the formatted buffer using Console's print method
+
+    // Safely extract the buffer content as a slice
+    let data = writer.as_bytes();
+    // Handle the printed data based on the state
     unsafe {
-        CONSOLE.lock().print(writer.as_bytes());
+        if false {
+            QUEUE.push_back(data.to_vec()); // Clone data to decouple from buffer
+        } else {
+            CONSOLE.lock().print(data);
+        }
     }
 }
 
 // Helper structure to wrap the buffer and implement core::fmt::Write for it
+
 struct BufferWriter<'a> {
     buffer: &'a mut [u8],
     position: usize,
