@@ -1,22 +1,22 @@
-use crate::drivers::timer_driver::TIMER;
 use crate::gdt::GDT;
-use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack, KERNEL_STACK_ALLOCATOR, KERNEL_STACK_SIZE, USER_STACK_ALLOCATOR};
-use crate::{println, util};
+use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack, KERNEL_STACK_ALLOCATOR, USER_STACK_ALLOCATOR};
+use crate::println;
 use crate::scheduling::state::State;
 use core::arch::asm;
 use x86_64::VirtAddr;
-use crate::util::trigger_stack_overflow;
+use crate::scheduling::scheduler::kernel_task_end;
+use crate::util::KERNEL_INITIALIZED;
 
 #[derive(Debug)]
 pub struct Task {
     pub(crate) context: State,  // The CPU state for this task
     pub(crate) stack_start: u64,
     pub(crate) id: u64,
+    pub(crate) terminated: bool,
     pub(crate) is_user_mode: bool,
 }
 
 impl Task {
-    #[inline]
     pub fn new(
         entry_point: usize,
         is_user_mode: bool,
@@ -34,13 +34,18 @@ impl Task {
         };
 
         // Initialize the state with the entry point and the allocated stack top
-        let mut state = State::new();
+        let mut state = State::new(0);
         state.rip = entry_point as u64;    // Set the instruction pointer to the task entry point
-        state.rsp = stack_top.as_u64();    // Set the stack pointer to the top of the allocated stack
+        state.rsp = (stack_top.as_u64() - 8) as u64; // Reserve 8 bytes for the return address
         state.rflags = 0x00000202;
 
+        // Push the return address onto the stack
+        unsafe {
+            let stack_ptr = state.rsp as *mut u64;
+            *stack_ptr = kernel_task_end as u64; // Store the return address at the current top of the stack
+        }
 
-            // Set up segment selectors based on the task mode
+        // Set up segment selectors based on the task mode
         if is_user_mode {
             // Set user mode segment selectors
             state.cs = GDT.1.user_code_selector.0 as u64 | 3;
@@ -54,17 +59,18 @@ impl Task {
         }
 
         // Create and return the new task
-
-                unsafe {
-                    ID +=1;
+        unsafe {
+            ID += 1;
             Self {
                 context: state,
                 stack_start: stack_top.as_u64(),
                 id: ID,
-                is_user_mode: is_user_mode,
+                terminated: false,
+                is_user_mode,
             }
         }
     }
+
     pub fn update_from_context(&mut self, context: State) {
         self.context = context;
     }
@@ -73,6 +79,15 @@ impl Task {
             unsafe { USER_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start)); }
         }else{
             unsafe { KERNEL_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start)); }
+        }
+    }
+    /// Prints the task's RIP, RSP, and ID in one line.
+    pub fn print(&self) {
+        unsafe {
+            println!(
+                "Task ID: {}, RIP: {:X}, RSP: {:X}",
+                self.id, self.context.rip, self.context.rsp
+            );
         }
     }
 
@@ -88,18 +103,15 @@ pub(crate) fn idle_task() -> ! {
 
     }
 }
-pub unsafe fn test_syscall() -> u64 {
+pub unsafe fn test_syscall() {
     let syscall_number: u64 = 1; // replace with your syscall number
-    let arg1: u64 = 0x0;         // replace with any argument if needed
+    let arg1: *const u8 = "syscall!".as_ptr();         // replace with any argument if needed
     let result: u64;
     asm!(
     "mov rax, {0}",          // Move syscall number into rax
-    "mov rdi, {1}",          // First argument
-    "syscall",               // Execute syscall
-    "mov {2}, rax",          // Store result in `result`
+    "mov r8, {1}",          // First argument
+    "int 0x80",               // Execute syscall
     in(reg) syscall_number,
     in(reg) arg1,
-    out(reg) result,
     );
-    result
 }

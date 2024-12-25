@@ -1,7 +1,6 @@
-use crate::{println, util};
+use crate::println;
 use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
-use crate::console::Console;
 use crate::util::KERNEL_INITIALIZED;
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
@@ -78,7 +77,6 @@ pub(crate) extern "x86-interrupt" fn page_fault(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    x86_64::instructions::bochs_breakpoint();
     unsafe { KERNEL_INITIALIZED = false; }
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());

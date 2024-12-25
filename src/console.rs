@@ -1,10 +1,7 @@
 use alloc::collections::VecDeque;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use spin::Mutex;
-use crate::scheduling::scheduler::thr_yield;
-use crate::structs::linked_list::LinkedList;
 use crate::util::KERNEL_INITIALIZED;
 
 static mut QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
@@ -88,7 +85,7 @@ impl Console {
     }
 
     fn scroll_up(&mut self) {
-        let mut vga_buffer = Console::vga_buffer();
+        let vga_buffer = Console::vga_buffer();
         for y in 1..25 {
             for x in 0..self.vga_width {
                 let from = (y * self.vga_width + x) * 2;
@@ -160,7 +157,7 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
     let data = writer.as_bytes();
     // Handle the printed data based on the state
     unsafe {
-        if false {
+        if KERNEL_INITIALIZED {
             QUEUE.push_back(data.to_vec()); // Clone data to decouple from buffer
         } else {
             CONSOLE.lock().print(data);

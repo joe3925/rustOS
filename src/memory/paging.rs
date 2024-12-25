@@ -1,11 +1,11 @@
-use alloc::collections::{BTreeSet, LinkedList};
-use crate::{print, println, BOOT_INFO};
+use alloc::collections::LinkedList;
+use crate::BOOT_INFO;
 use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 use bootloader::bootinfo::MemoryRegionType;
 use core::ptr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 #[derive(Clone)]
@@ -257,7 +257,7 @@ impl StackAllocator {
 /// Allocates a stack for a user-mode task with guard pages.
 pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = USER_STACK_ALLOCATOR.lock();
-    let mut stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
+    let stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
     let total_stack_size = USER_STACK_SIZE + 0x1000; // Includes guard page
     let stack_end = stack_start + total_stack_size;
 
@@ -272,7 +272,7 @@ pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4K
             Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Guard page is last
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-            map_page(&mut mapper, page, &mut frame_allocator, flags).expect("Failed to alloc kernel stack");
+            map_page(&mut mapper, page, &mut frame_allocator, flags);
         }
 
         // Ensure the stack pointer is properly aligned to a 16-byte boundary.
@@ -287,7 +287,7 @@ pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4K
 
 pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
-    let mut stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
+    let stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
     let total_stack_size = KERNEL_STACK_SIZE + 0x1000; // Includes guard page
     let stack_end = stack_start + total_stack_size;
 
@@ -302,8 +302,16 @@ pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size
             Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Guard page is last
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            map_page(&mut mapper, page, &mut frame_allocator, flags).expect("Failed to alloc kernel stack");
-        }
+            match map_page(&mut mapper, page, &mut frame_allocator, flags) {
+                Ok(_) => {} // Mapping succeeded, do nothing
+                Err(MapToError::PageAlreadyMapped(..)) => {
+                    // Ignore the specific error
+                }
+                Err(e) => {
+                    // Handle other errors (e.g., log them or panic)
+                    panic!("Unexpected error: {:?}", e);
+                }
+            }        }
 
         // Ensure the stack pointer is properly aligned to a 16-byte boundary.
         let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);

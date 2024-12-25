@@ -17,7 +17,7 @@ pub(crate) extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: In
     }
 
     unsafe {
-        let mut port = Port::new(0x60);
+        let port = Port::new(0x60);
         let scancode: u8 = port.read();
 
         let mut keyboard = KEYBOARD.lock();

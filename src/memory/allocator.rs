@@ -4,7 +4,6 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr;
 use x86_64::{align_up, VirtAddr};
-use crate::println;
 
 #[global_allocator]
 pub static mut ALLOCATOR: Locked<Allocator> =
@@ -180,11 +179,10 @@ impl Allocator {
         }
     }
 }
-
+static mut INIT: bool = false;
 unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // perform layout adjustments
-        static mut INIT: bool = false;
         let (size, align) = Allocator::size_align(layout);
         let mut allocator = self.lock();
 

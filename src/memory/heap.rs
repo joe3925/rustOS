@@ -1,9 +1,8 @@
-use core::ptr::write_volatile;
 use crate::println;
 use crate::structs::linked_list::ListNode;
 use x86_64::structures::paging::FrameAllocator;
-use x86_64::structures::paging::{Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
-use x86_64::{PhysAddr, VirtAddr};
+use x86_64::structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::VirtAddr;
 use crate::memory::paging::map_page;
 
 pub const HEAP_START: usize = 0x_4444_4444_0000;

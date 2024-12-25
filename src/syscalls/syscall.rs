@@ -1,10 +1,13 @@
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
+use core::arch::asm;
 use core::slice;
-use crate::gdt::GDT;
 use crate::println;
-use crate::scheduling::state::State;
-use x86_64::registers::model_specific::Msr;
+use x86_64::structures::idt::InterruptStackFrame;
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::task::Task;
+use crate::file_system::file::{File, OpenFlags};
 
 // Define the MSR addresses
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -36,47 +39,125 @@ fn u64_to_str_ptr(value: u64) -> Option<String> {
         String::from_utf8(Vec::from(slice)).ok()
     }
 }
-pub unsafe fn set_syscall_handler() {
-    // Create Msr objects for each MSR
-    let mut lstar = Msr::new(MSR_LSTAR);
-    let mut star = Msr::new(MSR_STAR);
-    let mut syscall_mask = Msr::new(MSR_SYSCALL_MASK);
 
-    // Set the `LSTAR` MSR to the address of your custom handler
-    lstar.write(syscall_handler as u64);
+pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame){
+    let mut rax:u64;
+    let mut param1:u64;
+    let mut param2:u64;
+    let mut param3:u64;
+    let mut extra_params: u64;
 
-    // Set up `STAR` for code segment configuration (example values)
-    let kernel_cs = GDT.1.kernel_code_selector.0 as u64;   // Kernel code segment
-    let user_cs = GDT.1.user_code_selector.0 as u64;     // User code segment with RPL=3
-    let star_value = (user_cs << 48) | (kernel_cs << 32);
-    star.write(star_value as u64);
-
-    // Set the syscall flag mask, clearing certain flags
-    syscall_mask.write(0x3F4);  // Example: clear DF, TF, IF, AC, and RF
-}
-extern "x86-interrupt" fn syscall_handler() {
-    let mut state = State::new();
-
-    // Syscall number rax
-    // First argument rdi
-    // Second argument rsi
-    // Third argument rdx
-    // Fourth argument r10
-    // Fifth argument r8
-    // Sixth argument r9
-
-    // Use rax to match on syscall numbers
-
-    match state.rax {
+    unsafe { asm!("mov {0}, rax", lateout(reg) rax); }
+    unsafe { asm!("mov {0}, r8", lateout(reg) param1); }
+    unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
+    unsafe { asm!("mov {0}, r10", lateout(reg) param3); }
+    unsafe { asm!("mov {0}, r11", lateout(reg) extra_params); }
+    let mut params = extra_params as *mut SyscallParams;
+    match rax {
+        //print syscall
         1 => {
-            println!("Syscall");
-            /*let param = state.rdi;
-            if let Some(string) = u64_to_str_ptr(param) {
+            if let Some(string) = u64_to_str_ptr(param1) {
                 println_wrapper(string)
-            }*/
+            }
+        }
+        //destroy task syscall
+        2 => {
+            let mut scheduler = SCHEDULER.lock();
+            scheduler.delete_task(param1).ok();
+        }
+        //create task
+        3 =>{
+            let mut scheduler = SCHEDULER.lock();
+            scheduler.add_task(Task::new(param1 as usize, true));
+        }
+        //file open syscall 1st file path, 2nd ptr to flags array, 3rd sizeof flags, return buffer
+        4 => {
+            if let Some(path) = u64_to_str_ptr(param1) {
+                let flags_ptr = param2 as *const OpenFlags;
+                let flags: &[OpenFlags] = unsafe {
+                    slice::from_raw_parts(flags_ptr, param3 as usize)
+                };
+
+                let result = File::open(path.as_str(), flags);
+                if let Ok(file) = result {
+                    unsafe {
+                        *((*params).param1 as *mut File) = file;
+                    }
+                }
+            }
+        }
+
+        // File Read
+        5 => {
+            unsafe {
+                let file_ptr = param1 as *mut File;
+                let buffer_ptr = param2 as *mut u8;
+                let buffer_len = param3 as usize;
+
+                if file_ptr.is_null() || buffer_ptr.is_null() {
+                    return;
+                }
+
+                let file = &mut *file_ptr;
+                if let Ok(data) = file.read() {
+                    let len = core::cmp::min(data.len(), buffer_len);
+                    core::ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
+                }
+            }
+        }
+
+        // File Write
+        6 => {
+            unsafe {
+                let file_ptr = param1 as *mut File;
+                let buffer_ptr = param2 as *const u8;
+                let buffer_len = param3 as usize;
+
+                if file_ptr.is_null() || buffer_ptr.is_null() {
+                    return;
+                }
+
+                let file = &mut *file_ptr;
+                let data = slice::from_raw_parts(buffer_ptr, buffer_len);
+                let _ = file.write(data);
+            }
+        }
+
+        // File Delete
+        7 => {
+            unsafe {
+                let file_ptr = param1 as *mut File;
+
+                if file_ptr.is_null() {
+                    return;
+                }
+
+                let file = &mut *file_ptr;
+                let _ = file.delete();
+            }
         }
         _ => {
-            println!("Unknown syscall number: {}", state.rax);
+            println!("Unknown syscall number: {}", rax);
+        }
+    }
+}
+///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
+struct SyscallParams{
+    param1: u64,
+    param2: u64,
+    param3: u64,
+    param4: u64,
+    extra_params: Vec<u64>,
+
+}
+impl SyscallParams{
+    fn new() -> Self{
+        SyscallParams{
+            param1: 0,
+            param2: 0,
+            param3: 0,
+            param4: 0,
+            extra_params: vec![],
         }
     }
 }

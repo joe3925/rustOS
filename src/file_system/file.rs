@@ -36,7 +36,7 @@ impl FileStatus {
     }
 }
 #[derive(Debug)]
-pub struct File {
+pub(crate) struct File {
     pub name: String,
     pub extension: String,
     pub size: u64,

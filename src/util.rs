@@ -1,5 +1,3 @@
-use alloc::boxed::Box;
-use crate::console::CONSOLE;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
@@ -8,13 +6,11 @@ use crate::idt::load_idt;
 use crate::memory::heap::init_heap;
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::syscalls::syscall::set_syscall_handler;
 use crate::{gdt, println};
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use bootloader::BootInfo;
 use core::arch::asm;
-use x86_64::structures::paging::Mapper;
 use x86_64::VirtAddr;
 
 pub(crate) static mut KERNEL_INITIALIZED: bool = false;
@@ -53,7 +49,6 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
         DRIVECOLLECTION.force_unlock();
         //drive.format().expect("format failed");
     }
-    set_syscall_handler();
     println!("Init Done");
     KERNEL_INITIALIZED = true;
 }

@@ -3,6 +3,7 @@ use pic8259::ChainedPics;
 
 pub(crate) const PIC_1_OFFSET: u8 = 32;
 pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
+pub(crate) const INT_0x80: u8 = 0x80;
 
 pub(crate) static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });

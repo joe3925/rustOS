@@ -1,13 +1,9 @@
-use crate::drivers::interrupt_index::send_eoi;
-use crate::drivers::interrupt_index::InterruptIndex::Timer;
 use crate::scheduling::scheduler::SCHEDULER;
 use core::arch::asm;
 use x86_64::registers::rflags::RFlags;
-use x86_64::registers::segmentation::CS;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::VirtAddr;
-use crate::println;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -36,7 +32,8 @@ pub(crate) struct State {
 impl State {
     #[inline(always)]
     #[no_mangle]
-    pub fn new() -> Self {
+    //rustc is protesting inlining this function so rax must be saved before call
+    pub fn new(rax: u64) -> Self {
         let mut state = State {
             rax: 0,
             rbx: 0,
@@ -59,7 +56,7 @@ impl State {
             cs: 0,    // Initialize with zero
             ss: 0,    // Initialize with zero
         };
-        state.update();
+        state.update(rax);
         state
     }
     pub fn update_from_interrupt(&mut self, rip: u64, rsp: u64, rflags: u64, cs: u64, ss: u64) {
@@ -73,23 +70,22 @@ impl State {
     /// Save the current CPU context into this `State` struct
     #[inline(always)]
     #[no_mangle]
-    pub fn update(&mut self) {
+    pub extern "C" fn update(&mut self, rax: u64) {
         unsafe {
             asm!(
-            "mov {0}, rax",
-            "mov {1}, rbx",
-            "mov {2}, rcx",
-            "mov {3}, rdx",
-            "mov {4}, rsi",
-            "mov {5}, rdi",
-            "mov {6}, rbp",
-            out(reg) self.rax,
-            out(reg) self.rbx,
-            out(reg) self.rcx,
-            out(reg) self.rdx,
-            out(reg) self.rsi,
-            out(reg) self.rdi,
-            out(reg) self.rbp,
+            "mov {0}, rbx",
+            "mov {1}, rcx",
+            "mov {2}, rdx",
+            "mov {3}, rsi",
+            "mov {4}, rdi",
+            "mov {5}, rbp",
+            lateout(reg) self.rbx,
+            lateout(reg) self.rcx,
+            lateout(reg) self.rdx,
+            lateout(reg) self.rsi,
+            lateout(reg) self.rdi,
+            lateout(reg) self.rbp,
+            options(nostack, preserves_flags, pure, readonly),
             );
 
             asm!(
@@ -101,23 +97,25 @@ impl State {
             "mov {5}, r13",
             "mov {6}, r14",
             "mov {7}, r15",
-            out(reg) self.r8,
-            out(reg) self.r9,
-            out(reg) self.r10,
-            out(reg) self.r11,
-            out(reg) self.r12,
-            out(reg) self.r13,
-            out(reg) self.r14,
-            out(reg) self.r15,
+            lateout(reg) self.r8,
+            lateout(reg) self.r9,
+            lateout(reg) self.r10,
+            lateout(reg) self.r11,
+            lateout(reg) self.r12,
+            lateout(reg) self.r13,
+            lateout(reg) self.r14,
+            lateout(reg) self.r15,
+            options(nostack, preserves_flags, pure, readonly),
             );
         }
+        self.rax = rax;
     }
     pub fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
         unsafe {
             self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
            // self.rflags = 0x00000202;
             // Cast the read-only stack frame into a mutable raw pointer
-            let mut new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
+            let new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
                                                                SegmentSelector(self.cs as u16),
                                                                RFlags::from_bits_retain(self.rflags),
                                                                VirtAddr::new(self.rsp),
@@ -164,7 +162,6 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-        SCHEDULER.force_unlock();
         /*
         self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
 
@@ -184,45 +181,6 @@ impl State {
         x86_64::instructions::bochs_breakpoint();
         asm!("iretq", options(noreturn));
  */
-    }
-    #[inline]
-    #[no_mangle]
-    pub unsafe extern "C" fn sysret_restore(&self) {
-        // Restore general-purpose registers that sysret does not handle
-        asm!(
-        "mov rax, {0}",
-        "mov rbx, {1}",
-        "mov rdx, {2}",
-        "mov rsi, {3}",
-        "mov rdi, {4}",
-        "mov rbp, {5}",
-        "mov r8, {6}",
-        "mov r9, {7}",
-        "mov r10, {8}",
-        "mov r12, {9}",
-        "mov r13, {10}",
-        "mov r14, {11}",
-        "mov r15, {12}",
-        in(reg) self.rax,
-        in(reg) self.rbx,
-        in(reg) self.rdx,
-        in(reg) self.rsi,
-        in(reg) self.rdi,
-        in(reg) self.rbp,
-        in(reg) self.r8,
-        in(reg) self.r9,
-        in(reg) self.r10,
-        in(reg) self.r12,
-        in(reg) self.r13,
-        in(reg) self.r14,
-        in(reg) self.r15,
-        );
-
-        // Ensure the stack pointer is correctly set for `sysret`
-        asm!("mov rsp, {}", in(reg) self.rsp);
-
-        // Use `sysret` to return to user mode
-        asm!("sysretq", options(noreturn));
     }
 }
 fn function() {}

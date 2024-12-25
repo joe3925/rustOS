@@ -45,7 +45,7 @@ static DRIVE_IRQ_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
-        let mut status_port = Port::new(PRIMARY_CMD_BASE + 7);
+        let status_port = Port::new(PRIMARY_CMD_BASE + 7);
         let status: u8 = status_port.read();  // Read the status register
 
         while status & 0x40 == 0 { println!("Drive not ready"); }

@@ -6,8 +6,7 @@ use crate::scheduling::state::State;
 use crate::{println, util};
 use crate::util::KERNEL_INITIALIZED;
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::console::{print_queue, CONSOLE};
-use crate::scheduling::state;
+use crate::console::print_queue;
 
 pub static mut TIMER: SystemTimer = SystemTimer::new();
 pub struct SystemTimer {
@@ -25,7 +24,9 @@ impl SystemTimer {
     }
 }
 pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    let mut state = State::new();
+    let mut rax:u64;
+    unsafe { asm!("mov {0}, rax",  lateout(reg) rax ); }
+    let mut state = State::new(rax);
     state.rip = _stack_frame.instruction_pointer.as_u64();
     state.cs = _stack_frame.code_segment.0 as u64;
     state.rflags = _stack_frame.cpu_flags.bits().clone();
@@ -38,7 +39,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     //unsafe { println!("kernel init: {}", KERNEL_INITIALIZED) }
 unsafe{
         if  (KERNEL_INITIALIZED)  {
-            util::unlock_statics();
+            //util::unlock_statics();
             //unsafe { println!("timer tick: {}, Kernel init: {}", TIMER.get_current_tick(), KERNEL_INITIALIZED) };
 
             //unsafe { print_queue(); }
