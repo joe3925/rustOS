@@ -1,7 +1,7 @@
-use alloc::collections::LinkedList;
 use crate::BOOT_INFO;
-use bootloader::bootinfo::{MemoryMap, MemoryRegion};
+use alloc::collections::LinkedList;
 use bootloader::bootinfo::MemoryRegionType;
+use bootloader::bootinfo::{MemoryMap, MemoryRegion};
 use core::ptr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
@@ -12,20 +12,20 @@ use x86_64::{PhysAddr, VirtAddr};
 pub(crate) struct BootInfoFrameAllocator {
     memory_map: &'static [MemoryRegion], // Provided at boot
 }
-pub const KERNEL_STACK_SIZE: u64 = 0x10000;
+pub const KERNEL_STACK_SIZE: u64 = 0x2800;
 pub const USER_STACK_SIZE: u64 = 0x2800;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here
-    KERNEL_STACK_SIZE,               // Kernel stack size (10 KB)
+    KERNEL_STACK_SIZE,               // Kernel stack size (64 KB)
 ));
 
 pub static USER_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0x8000_0000u64), // User stacks start here
-    USER_STACK_SIZE,              // User stack size (64 KB)
+    USER_STACK_SIZE,              // User stack size
 ));
 static NEXT: Mutex<usize> = Mutex::new(0);
 impl BootInfoFrameAllocator {
-    pub unsafe fn init(memory_map: &'static MemoryMap) -> Self {
+    pub fn init(memory_map: &'static MemoryMap) -> Self {
         BootInfoFrameAllocator {
             memory_map,
         }
@@ -49,7 +49,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
         if *next % 512 != 0 {
             *next += 512 - (*next % 512);
         }
-        let base_frame = self.usable_2mb_frames().nth((*next/512));
+        let base_frame = self.usable_2mb_frames().nth((*next / 512));
 
         // Mark all 512 frames as allocated by advancing the NEXT pointer
         *next += 512;
@@ -59,7 +59,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
 }
 impl BootInfoFrameAllocator {
     /// Returns an iterator over the usable frames specified in the memory map.
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
+    fn usable_frames(&self) -> impl Iterator<Item=PhysFrame> {
         // get usable regions from memory map
         let regions = self.memory_map.iter();
         let usable_regions = regions
@@ -183,7 +183,6 @@ pub(crate) unsafe fn allocate_syscall_page() -> Result<VirtAddr, &'static str> {
 
 // Function to allocate a user-accessible page with write and execute permissions
 pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
-
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
     if let Some(boot_info) = BOOT_INFO {
@@ -257,8 +256,8 @@ impl StackAllocator {
 /// Allocates a stack for a user-mode task with guard pages.
 pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = USER_STACK_ALLOCATOR.lock();
-    let stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
-    let total_stack_size = USER_STACK_SIZE + 0x1000; // Includes guard page
+    let stack_start = allocator.allocate().expect("kernel stack alloc failed");
+    let total_stack_size = USER_STACK_SIZE + 0x1000; //guard page
     let stack_end = stack_start + total_stack_size;
 
     if let Some(boot_info) = BOOT_INFO {
@@ -266,29 +265,33 @@ pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4K
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(phys_mem_offset);
 
-        // Map each page in the stack range, leaving the guard page unmapped
+        //guard page is not mapped
         for page in Page::range_inclusive(
             Page::<Size4KiB>::containing_address(stack_start),
-            Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Guard page is last
+            Page::<Size4KiB>::containing_address(stack_end - 0x1000),
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-            map_page(&mut mapper, page, &mut frame_allocator, flags);
+            match map_page(&mut mapper, page, &mut frame_allocator, flags) {
+                Ok(_) => {}
+                Err(MapToError::PageAlreadyMapped(..)) => {}
+                Err(e) => {
+                    panic!("Unexpected error: {:?}", e);
+                }
+            }
         }
 
-        // Ensure the stack pointer is properly aligned to a 16-byte boundary.
         let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
         Ok(aligned_stack_end)
     } else {
         Err(MapToError::FrameAllocationFailed)
     }
 }
-
 
 
 pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
-    let stack_start = allocator.allocate().expect("kernel stack alloc failed"); // Get a stack from the allocator
-    let total_stack_size = KERNEL_STACK_SIZE + 0x1000; // Includes guard page
+    let stack_start = allocator.allocate().expect("kernel stack alloc failed");
+    let total_stack_size = KERNEL_STACK_SIZE + 0x1000;
     let stack_end = stack_start + total_stack_size;
 
     if let Some(boot_info) = BOOT_INFO {
@@ -296,32 +299,26 @@ pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(phys_mem_offset);
 
-        // Map each page in the stack range, leaving the guard page unmapped
         for page in Page::range_inclusive(
             Page::<Size4KiB>::containing_address(stack_start),
-            Page::<Size4KiB>::containing_address(stack_end - 0x1000), // Guard page is last
+            Page::<Size4KiB>::containing_address(stack_end - 0x1000),
         ) {
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
             match map_page(&mut mapper, page, &mut frame_allocator, flags) {
-                Ok(_) => {} // Mapping succeeded, do nothing
-                Err(MapToError::PageAlreadyMapped(..)) => {
-                    // Ignore the specific error
-                }
+                Ok(_) => {}
+                Err(MapToError::PageAlreadyMapped(..)) => {}
                 Err(e) => {
-                    // Handle other errors (e.g., log them or panic)
                     panic!("Unexpected error: {:?}", e);
                 }
-            }        }
+            }
+        }
 
-        // Ensure the stack pointer is properly aligned to a 16-byte boundary.
         let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
         Ok(aligned_stack_end)
     } else {
         Err(MapToError::FrameAllocationFailed)
     }
 }
-
-
 
 
 pub fn map_mmio_region(
@@ -331,10 +328,8 @@ pub fn map_mmio_region(
     mmio_size: u64,               // The size of the MMIO region
     virtual_addr: VirtAddr,         // The virtual address to map it to
 ) -> Result<(), MapToError<Size4KiB>> {
-    // Convert the physical address to a frame
     let phys_frame = PhysFrame::containing_address(mmio_base);
 
-    // Calculate the number of pages to map based on the MMIO size
     let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
 
     for i in 0..num_pages {

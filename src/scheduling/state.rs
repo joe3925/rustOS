@@ -1,4 +1,3 @@
-use crate::scheduling::scheduler::SCHEDULER;
 use core::arch::asm;
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::gdt::SegmentSelector;
@@ -110,23 +109,19 @@ impl State {
         }
         self.rax = rax;
     }
-    pub fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
-        unsafe {
-            self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
-           // self.rflags = 0x00000202;
-            // Cast the read-only stack frame into a mutable raw pointer
-            let new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
-                                                               SegmentSelector(self.cs as u16),
-                                                               RFlags::from_bits_retain(self.rflags),
-                                                               VirtAddr::new(self.rsp),
-                                                               SegmentSelector(self.ss as u16));
-            // Update the stack frame fields
-            _stack_frame.as_mut().write(*new_stack_frame);
-        }
+    pub unsafe fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
+        self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
+        // self.rflags = 0x00000202;
+        let new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
+                                                       SegmentSelector(self.cs as u16),
+                                                       RFlags::from_bits_retain(self.rflags),
+                                                       VirtAddr::new(self.rsp),
+                                                       SegmentSelector(self.ss as u16));
+        _stack_frame.as_mut().write(*new_stack_frame);
     }
     #[inline(always)]
     #[no_mangle]
-    pub unsafe extern "C" fn restore(&mut self){
+    pub unsafe extern "C" fn restore(&mut self) {
         asm!(
         "mov rax, {0}",
         "mov rbx, {1}",

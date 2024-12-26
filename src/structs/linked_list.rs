@@ -33,7 +33,6 @@ impl LinkedList {
         let mut count = 0;
         let mut current = &self.head;
 
-        // Traverse the free list starting from the head
         while let Some(ref next_node) = current.next {
             count += 1;
             current = next_node;
@@ -44,8 +43,6 @@ impl LinkedList {
     pub fn get_last(&mut self) -> &mut ListNode {
         let mut current = &mut self.head;
         loop {
-
-            // If the next node is None, break the loop
             if current.next.is_none() {
                 return current;
             }
@@ -57,7 +54,6 @@ impl LinkedList {
     pub fn print_list(&mut self) {
         let mut current = &mut self.head;
         loop {
-            // Print the size and the memory range (start to end) of each node
             println!(
                 "Node size: {}, Start address: 0x{:x}, End address: 0x{:x}",
                 current.size,
@@ -65,12 +61,10 @@ impl LinkedList {
                 current.end_addr()
             );
 
-            // If the next node is None, break the loop
             if current.next.is_none() {
                 break;
             }
 
-            // Move to the next node
             current = current.next.as_mut().unwrap();
         }
     }

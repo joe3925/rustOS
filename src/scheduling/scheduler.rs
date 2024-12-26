@@ -4,19 +4,17 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::{print, println};
 
 pub enum TaskError {
     NotFound(u64),
 }
-// Global scheduler that contains a list of tasks
 lazy_static! {
     pub static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 }
 
 pub struct Scheduler {
     tasks: Vec<Task>,
-    current_task: AtomicUsize,  // Index of the currently running task
+    current_task: AtomicUsize,
 }
 
 impl Scheduler {
@@ -38,9 +36,9 @@ impl Scheduler {
 
     // Select the next task to run in a round-robin fashion
     #[inline]
-    pub unsafe fn schedule_next(&mut self) {
+    pub fn schedule_next(&mut self) {
         self.end_task();
-        while self.tasks.len() < 1{
+        while self.tasks.len() < 1 {
             //let user_idle_task = Task::new(allocate_syscall_page().expect("failed to alloc syscall page").as_u64() as usize, true); // Example idle task with kernel mode
             //let kernel_idle_task = Task::new(idle_task as usize, false); // Example idle task with kernel mode
             let kernel_idle_task = Task::new(test_syscall as usize, false);
@@ -59,9 +57,8 @@ impl Scheduler {
         &mut self.tasks[index]
     }
     ///marks task for deletion will be deleted next scheduler cycle
-    pub(crate) fn delete_task(&mut self, id: u64)  -> Result<(), TaskError>{
+    pub(crate) fn delete_task(&mut self, id: u64) -> Result<(), TaskError> {
         for i in 0..self.tasks.len() {
-            println!("removing task with id: {}", id);
             if self.tasks[i].id == id {
                 self.tasks[i].terminated = true;
                 return Ok(());
@@ -69,17 +66,16 @@ impl Scheduler {
         }
         Err(TaskError::NotFound(id))
     }
-    fn end_task(&mut self,) {
+    fn end_task(&mut self) {
         for i in 0..self.tasks.len() {
             if self.tasks[i].terminated {
                 self.tasks[i].destroy();
                 self.tasks.remove(i);
-                println!("tasks left: {}, task index: {}",self.tasks.len(), i );
             }
         }
     }
-    fn print_task(&self){
-        for task in &self.tasks{
+    fn print_task(&self) {
+        for task in &self.tasks {
             task.print();
         }
     }
@@ -89,13 +85,12 @@ pub fn kernel_task_yield() {
         asm!("int 0x20");
     }
 }
-pub fn kernel_task_end() -> !{
+pub fn kernel_task_end() -> ! {
     let syscall_number: u64 = 2;
     let arg1: u64;
     {
         let mut scheduler = SCHEDULER.lock();
         arg1 = scheduler.get_current_task().id;
-        print!("task id: {} has ended", scheduler.get_current_task().id);
     }
     unsafe {
         asm!(
@@ -106,5 +101,5 @@ pub fn kernel_task_end() -> !{
         in(reg) arg1,
         );
     }
-    loop{}
+    loop {}
 }

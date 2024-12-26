@@ -120,21 +120,16 @@ impl File {
 
     /// Helper function to split file name and extension from the full path
     pub fn remove_drive_from_path(path: &str) -> &str {
-        // Check if the path has a valid drive letter (e.g., "C:\" or "D:\")
         if path.len() >= 3 && path[1..2] == ":".to_string() && path[2..3] == "\\".to_string() {
-            // Return the path after the drive letter and backslash
             &path[3..]
         } else {
-            // If the path doesn't have a drive letter, return it unchanged
             path
         }
     }
     pub fn remove_file_from_path(path: &str) -> &str {
         if let Some(pos) = path.rfind('\\') {
-            // Return everything up to (but not including) the last backslash
             &path[..pos]
         } else {
-            // If no backslash is found, return the path unchanged (might not be a valid directory)
             path
         }
     }
@@ -202,7 +197,6 @@ impl File {
     pub fn get_drive_letter(path: &[u8]) -> Option<String> {
         // Ensure the path has at least 3 bytes: the letter, the colon, and the backslash.
         if path.len() >= 3 {
-            // Check if the first byte is a valid ASCII alphabetic character, second is colon, and third is backslash
             if (path[0] as char).is_ascii_alphabetic() && path[1] == b':' && path[2] == b'\\' {
                 return Some(String::from_utf8_lossy(&path[0..2]).to_string());
             }

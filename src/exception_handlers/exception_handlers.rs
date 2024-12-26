@@ -65,7 +65,7 @@ pub(crate) extern "x86-interrupt" fn stack_segment_fault(stack_frame: InterruptS
 pub(crate) extern "x86-interrupt" fn general_protection_fault(
     stack_frame: InterruptStackFrame, error_code: u64,
 ) {
-    unsafe { KERNEL_INITIALIZED = false; }
+    *KERNEL_INITIALIZED.lock() = false;
 
     decode_gpf_error_code(error_code);
     panic!("EXCEPTION: GENERAL PROTECTION FAULT ERROR CODE(0x{:X}) \n{:#?}", error_code, stack_frame, );
@@ -77,7 +77,7 @@ pub(crate) extern "x86-interrupt" fn page_fault(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
-    unsafe { KERNEL_INITIALIZED = false; }
+    *KERNEL_INITIALIZED.lock() = false;
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());
     panic!("{:#?}", stack_frame);

@@ -1,20 +1,15 @@
+use crate::file_system::file::{File, OpenFlags};
+use crate::println;
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::task::Task;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::slice;
-use crate::println;
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::task::Task;
-use crate::file_system::file::{File, OpenFlags};
 
-// Define the MSR addresses
-const MSR_LSTAR: u32 = 0xC000_0082;
-const MSR_STAR: u32 = 0xC000_0081;
-const MSR_SYSCALL_MASK: u32 = 0xC000_0084;
 fn println_wrapper(message_ptr: String) {
-    // Safety: We assume the caller guarantees that message_ptr is valid.
     let message = unsafe { &*message_ptr };
     println!("{}", message);
 }
@@ -22,29 +17,26 @@ fn u64_to_str_ptr(value: u64) -> Option<String> {
     // Convert u64 to a raw pointer
     let ptr = value as *const u8;
 
-    // Check if the pointer is null or not (to avoid dereferencing a null pointer)
     if ptr.is_null() {
         return None;
     }
 
-    // Calculate the length of the string by scanning for a null terminator
     let mut len = 0;
     unsafe {
         while *ptr.add(len) != 0 {
             len += 1;
         }
 
-        // Attempt to create a slice and then convert it to a str
         let slice = slice::from_raw_parts(ptr, len);
         String::from_utf8(Vec::from(slice)).ok()
     }
 }
 
-pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame){
-    let mut rax:u64;
-    let mut param1:u64;
-    let mut param2:u64;
-    let mut param3:u64;
+pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
+    let mut rax: u64;
+    let mut param1: u64;
+    let mut param2: u64;
+    let mut param3: u64;
     let mut extra_params: u64;
 
     unsafe { asm!("mov {0}, rax", lateout(reg) rax); }
@@ -61,12 +53,14 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
             }
         }
         //destroy task syscall
-        2 => {
+        2 => unsafe {
+            SCHEDULER.force_unlock();
             let mut scheduler = SCHEDULER.lock();
             scheduler.delete_task(param1).ok();
         }
         //create task
-        3 =>{
+        3 => unsafe {
+            SCHEDULER.force_unlock();
             let mut scheduler = SCHEDULER.lock();
             scheduler.add_task(Task::new(param1 as usize, true));
         }
@@ -142,7 +136,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     }
 }
 ///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
-struct SyscallParams{
+struct SyscallParams {
     param1: u64,
     param2: u64,
     param3: u64,
@@ -150,9 +144,9 @@ struct SyscallParams{
     extra_params: Vec<u64>,
 
 }
-impl SyscallParams{
-    fn new() -> Self{
-        SyscallParams{
+impl SyscallParams {
+    fn new() -> Self {
+        SyscallParams {
             param1: 0,
             param2: 0,
             param3: 0,

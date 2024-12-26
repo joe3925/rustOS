@@ -1,11 +1,11 @@
+use spin::{mutex, Mutex};
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::device_collection::DeviceCollection;
 use crate::drivers::timer_driver::TIMER;
 use crate::memory::allocator::Locked;
 use crate::println;
 use x86_64::instructions::port::Port;
-pub(crate) static mut PCIBUS: Locked<PciBus> =
-    Locked::new(PciBus::new());
+pub(crate) static PCIBUS: Mutex<PciBus> = Mutex::new(PciBus::new());
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 pub(crate) struct PciBus {
@@ -33,7 +33,7 @@ impl PciBus {
                 }
             }
         }
-        unsafe { self.last_update = TIMER.get_current_tick(); }
+        unsafe { self.last_update = TIMER.lock().get_current_tick(); }
     }
     pub(crate) fn print_devices(&self) {
         for i in 0..self.device_collection.devices.len() {

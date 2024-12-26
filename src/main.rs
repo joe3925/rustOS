@@ -34,7 +34,7 @@ static mut BOOT_INFO: Option<&'static BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     //unsafe { Console::reset_state(); }
-    unsafe { KERNEL_INITIALIZED = false; }
+    unsafe { *KERNEL_INITIALIZED.lock() = false}
     println!("{}", info);
     loop {  }
 }

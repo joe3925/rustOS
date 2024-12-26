@@ -43,7 +43,6 @@ pub struct FileSystem {
 }
 
 impl FileSystem {
-    // Initialize the file system with a formatted drive
     pub fn new(label: String) -> Self {
         FileSystem {
             info: InfoSector {
@@ -158,7 +157,6 @@ impl FileSystem {
         starting_cluster: u32,
     ) -> Vec<FileEntry> {
         let dirs = self.get_all_clusters(starting_cluster);
-        // 1. Allocate space for the root directory (assume one cluster for simplicity)
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         // 2. Parse directory entries (each entry is 32 bytes)
         let entry_size = 32;
@@ -166,16 +164,12 @@ impl FileSystem {
         for j in 0..dirs.len() {
             self.read_cluster(dirs[j], &mut root_dir);
             for i in (0..root_dir.len()).step_by(entry_size) {
-                // Check if the entry is valid (not empty or deleted)
-
                 if root_dir[i] == 0x00 {
                     continue;
                 } else if root_dir[i] == 0xE5 {
-                    // Deleted entry, skip it
                     continue;
                 }
 
-                // 3. Extract file information (assuming the fields are stored sequentially)
                 let file_name = String::from_utf8_lossy(&root_dir[i..i + 8]).trim().to_string();
                 let file_extension = String::from_utf8_lossy(&root_dir[i + 8..i + 11]).trim().to_string();
                 let attributes = root_dir[i + 11];
@@ -185,7 +179,6 @@ impl FileSystem {
                     0, 0, 0, 0,
                 ]);
 
-                // Create a FileEntry and push it to the vector
                 let file_entry = FileEntry {
                     file_name,
                     file_extension,
@@ -301,7 +294,6 @@ impl FileSystem {
     ) -> FileStatus {
         let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
 
-        // Check if the file already exists
         if self.find_file(file_path.as_str()).is_some() {
             return FileStatus::FileAlreadyExist;
         }
@@ -350,7 +342,6 @@ impl FileSystem {
                 let data_offset = i * cluster_size;
                 let bytes_to_copy = core::cmp::min(cluster_size, file_data.len() - data_offset);
 
-                // Copy data to the buffer
                 buffer[..bytes_to_copy].copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
 
                 // Write the buffer to the current cluster
@@ -379,7 +370,6 @@ impl FileSystem {
                 }
             }
 
-            // Update the file size
             file_entry.file_size = file_data.len() as u64;
             let starting_cluster = file_entry.starting_cluster;
             if (self.update_dir_entry(path, file_entry, starting_cluster).is_err()) {
@@ -397,7 +387,7 @@ impl FileSystem {
         path: &str,
     ) -> Option<Vec<u8>> {
         if let Some(entry) = self.find_file(path) {
-            let mut file_data = vec![0u8; entry.file_size as usize]; // Initialize the vector with zeros
+            let mut file_data = vec![0u8; entry.file_size as usize];
             let remainder = entry.file_size % CLUSTER_OFFSET as u64;
             let clusters = self.get_all_clusters(entry.starting_cluster);
             for i in 0..clusters.len() {
@@ -555,8 +545,8 @@ impl FileSystem {
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         let clusters = self.get_all_clusters(start_cluster_of_dir);
         self.read_cluster(clusters[clusters.len() - 1], &mut root_dir);
-        // Find the first empty entry in the root directory (assuming 32-byte entries)
-        let entry_size = 32; // FAT directory entry is always 32 bytes
+        // Find the first empty entry in the root directory
+        let entry_size = 32;
         let mut entry_offset = None;
         for i in (0..root_dir.len()).step_by(entry_size) {
             if root_dir[i] == 0x00 || root_dir[i] == 0xE5 {
@@ -607,10 +597,8 @@ impl FileSystem {
             let size_bytes = (size as u32).to_le_bytes(); // FAT stores size as 32-bit value
             root_dir[offset + 28..offset + 32].copy_from_slice(&size_bytes);
 
-            // Write the updated root directory back to disk
             self.write_cluster(clusters[clusters.len() - 1], &mut root_dir);
         } else {
-            // Handle the case where no free entry was found
             println!("No free directory entry found!");
         }
         return;
@@ -646,7 +634,6 @@ impl FileSystem {
         let sector_number = (fat_offset / 512) + RESERVED_SECTORS;
         let entry_offset = (fat_offset % 512) as usize;
 
-        // Read the sector containing the FAT entry
         let mut buffer = vec![0u8; 512];
 
         (self.label.clone(), sector_number, &mut buffer);

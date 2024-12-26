@@ -1,12 +1,12 @@
+use crate::drivers;
 use crate::drivers::drive::ide_disk_driver::{primary_drive_irq_handler, secondary_drive_irq_handler};
 use crate::drivers::kbd_driver::keyboard_interrupt_handler;
 use crate::drivers::timer_driver::timer_interrupt_handler;
 use crate::exception_handlers::exception_handlers;
-use crate::drivers;
-use lazy_static::lazy_static;
-use x86_64::structures::idt::InterruptDescriptorTable;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
 use crate::syscalls::syscall::syscall_handler;
+use lazy_static::lazy_static;
+use x86_64::structures::idt::InterruptDescriptorTable;
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = unsafe{
@@ -44,8 +44,6 @@ lazy_static! {
     };
 }
 pub(crate) fn load_idt() {
-    //hardware interrupts
     IDT.load();
     x86_64::instructions::interrupts::enable();
-
 }

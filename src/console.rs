@@ -1,8 +1,8 @@
+use crate::util::KERNEL_INITIALIZED;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt::Write;
 use spin::Mutex;
-use crate::util::KERNEL_INITIALIZED;
 
 static mut QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
 
@@ -24,7 +24,6 @@ impl Console {
     }
 
     const fn vga_buffer() -> &'static mut [u8] {
-        // Unsafe slice directly referencing the VGA memory at 0xB8000
         unsafe { core::slice::from_raw_parts_mut(0xB8000 as *mut u8, 80 * 25 * 2) }
     }
 
@@ -78,12 +77,6 @@ impl Console {
         }
     }
 
-    pub unsafe fn reset_state(){
-        CONSOLE.force_unlock();
-        clear_vga_buffer();
-        CONSOLE = Mutex::new(Console::new());
-    }
-
     fn scroll_up(&mut self) {
         let vga_buffer = Console::vga_buffer();
         for y in 1..25 {
@@ -97,8 +90,8 @@ impl Console {
         }
 
         // Clear the last line
-        let last_line_start = (24 * self.vga_width)  * 2;
-        for x in 0..self.vga_width  {
+        let last_line_start = (24 * self.vga_width) * 2;
+        for x in 0..self.vga_width {
             vga_buffer[last_line_start + x * 2] = b' ';
             vga_buffer[last_line_start + x * 2 + 1] = 0x07;
         }
@@ -108,7 +101,7 @@ impl Console {
     }
 }
 
-pub(crate) static mut CONSOLE: Mutex<Console> = Mutex::new(Console::new());
+pub(crate) static CONSOLE: Mutex<Console> = Mutex::new(Console::new());
 
 #[allow(dead_code)]
 pub(crate) fn clear_vga_buffer() {
@@ -138,34 +131,30 @@ macro_rules! println {
         $crate::print!("{}\n", format_args!($($arg)*))
     };
 }
-pub(crate) unsafe fn print_queue(){
+pub(crate) unsafe fn print_queue() {
     CONSOLE.force_unlock();
     let mut console = CONSOLE.lock();
-    while(!QUEUE.is_empty()) {
+    while (!QUEUE.is_empty()) {
         console.print(QUEUE.remove(0).unwrap().as_slice())
     }
 }
 pub(crate) fn _print(args: core::fmt::Arguments) {
-    // Create a buffer to hold the formatted string
-    let mut buffer = [0u8; 1024]; // Allocate a 1024-byte buffer
+    let mut buffer = [0u8; 1024];
     let mut writer = BufferWriter::new(&mut buffer);
 
-    // Write the formatted arguments into the buffer
     write!(writer, "{}", args).unwrap();
 
-    // Safely extract the buffer content as a slice
     let data = writer.as_bytes();
-    // Handle the printed data based on the state
+
     unsafe {
-        if KERNEL_INITIALIZED {
-            QUEUE.push_back(data.to_vec()); // Clone data to decouple from buffer
+        KERNEL_INITIALIZED.force_unlock();
+        if *KERNEL_INITIALIZED.lock() {
+            QUEUE.push_back(data.to_vec());
         } else {
             CONSOLE.lock().print(data);
         }
     }
 }
-
-// Helper structure to wrap the buffer and implement core::fmt::Write for it
 
 struct BufferWriter<'a> {
     buffer: &'a mut [u8],

@@ -35,7 +35,6 @@ impl Allocator {
         }
     }
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-        // ensure that the freed region is capable of holding ListNode
         assert!(size >= size_of::<ListNode>());
 
         // create a new list node and append it at the start of the list
@@ -51,16 +50,13 @@ impl Allocator {
         let mut best_fit_prev: *mut ListNode = ptr::null_mut();
         let mut best_fit_alloc_start = 0usize;
 
-        // Start from the head of the free list
         let mut current = &mut self.free_list.head as *mut ListNode;
 
         unsafe {
             // Traverse the free list
             while let Some(ref mut region) = (*current).next {
-                // Try to allocate from the current region
                 if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
                     let region_size = region.size;
-                    // Check if this region is a better fit
                     if region_size < best_fit_size {
                         best_fit_size = region_size;
                         best_fit_prev = current;
@@ -71,20 +67,16 @@ impl Allocator {
                 current = &mut **region as *mut ListNode;
             }
 
-            // If a best-fit region was found
             if !best_fit_prev.is_null() {
-                // Remove the best-fit region from the free list
                 let best_fit_prev_ref = &mut *best_fit_prev;
                 let best_fit_region = best_fit_prev_ref.next.take().unwrap();
                 let next = best_fit_region.next.take();
                 best_fit_prev_ref.next = next;
 
-                // Return the best-fit region and allocation start address
                 return Some((best_fit_region, best_fit_alloc_start));
             }
         }
 
-        // No suitable region found
         None
     }
     fn alloc_from_region(region: &mut ListNode, size: usize, align: usize)
@@ -94,7 +86,6 @@ impl Allocator {
         let alloc_end = alloc_start.checked_add(size as u64).ok_or(())?;
 
         if alloc_end > region.end_addr() as u64 {
-            // region too small
             return Err(());
         }
 
@@ -105,7 +96,6 @@ impl Allocator {
             return Err(());
         }
 
-        // region suitable for allocation
         Ok(alloc_start as usize)
     }
     fn size_align(layout: Layout) -> (usize, usize) {
@@ -130,7 +120,6 @@ impl Allocator {
 
     pub fn merge_free_list(&mut self) {
         unsafe {
-            // We need to loop until no merges are made in an iteration
             let mut merges_made = true;
             while merges_made {
                 merges_made = false;
@@ -147,31 +136,24 @@ impl Allocator {
 
                         // Check if current_node and other_node are adjacent in memory
                         if current_node.end_addr() == other_node.start_addr() {
-                            // Merge other_node into current_node
                             current_node.size += other_node.size;
-                            // Remove other_node from the free list
                             (*other).next = other_node.next.take();
                             merges_made = true;
                             break;
                         } else if other_node.end_addr() == current_node.start_addr() {
                             // Merge current_node into other_node
                             other_node.size += current_node.size;
-                            // Remove current_node from the free list
                             (*current).next = current_node.next.take();
                             merges_made = true;
-                            // Restart outer loop since current_node has changed
                             break;
                         } else {
-                            // Move to the next node in the inner loop
                             other = &mut **other_node as *mut ListNode;
                         }
                     }
 
-                    // If a merge was made, restart the outer loop
                     if merges_made {
                         break;
                     } else {
-                        // Move to the next node in the outer loop
                         current = &mut **current_node as *mut ListNode;
                     }
                 }
