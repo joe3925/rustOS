@@ -94,11 +94,7 @@ impl Task {
 
 pub(crate) fn idle_task() -> ! {
     //x86_64::instructions::bochs_breakpoint();
-    let mut i = 0;
-    loop {
-        println!("hello world, {}", i);
-        i += 1;
-    }
+    loop {}
 }
 pub unsafe fn test_syscall() {
     let syscall_number: u64 = 1;

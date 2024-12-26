@@ -166,12 +166,13 @@ unsafe fn write_infinite_loop(page_ptr: *mut u8) {
     ptr::write(page_ptr.add(1), 0xFE); // -2 offset to jump back to itself
 }
 pub(crate) unsafe fn write_syscall(page_ptr: *mut u8) {
-    // Syscall instruction: `0x0F 0x05`
-    ptr::write(page_ptr.add(0), 0x0F); // First byte of syscall opcode
-    ptr::write(page_ptr.add(1), 0x05); // Second byte of syscall opcode
+    // Interrupt instruction: `int 0x80` → opcode: `0xCD 0x80`
+    ptr::write(page_ptr.add(0), 0xCD); // First byte of int 0x80
+    ptr::write(page_ptr.add(1), 0x80); // Second byte of int 0x80
 
-    ptr::write(page_ptr.add(2), 0xEB); // `jmp` opcode
-    ptr::write(page_ptr.add(3), 0xFE); // Offset: -2 (signed byte)
+    // Infinite loop after syscall
+    ptr::write(page_ptr.add(2), 0xEB); // `jmp` short opcode
+    ptr::write(page_ptr.add(3), 0xFE); // Offset: -2 (infinite loop)
 }
 
 /// Allocates a page with a syscall instruction at a free virtual address.
@@ -232,17 +233,22 @@ impl StackAllocator {
     }
 
     pub unsafe fn allocate(&mut self) -> Option<VirtAddr> {
-        // Reuse a freed stack if available
         if let Some(free_stack) = self.free_list.pop_front() {
             return Some(free_stack);
         }
 
-        // Otherwise, allocate a new stack
-        let total_stack_size = self.stack_size + 0x1000; // Includes guard page
+        // Ensure alignment
         let alignment = 0x10000; // 64 KB alignment
-        self.base_address = VirtAddr::new((self.base_address.as_u64() + alignment - 1) & !(alignment - 1)); // Align base address
+        let total_stack_size = self.stack_size + 0x1000; // Includes guard page
+
+
+        // Align base address
+        self.base_address = VirtAddr::new((self.base_address.as_u64() + alignment - 1) & !(alignment - 1));
+
         let stack_start = self.base_address;
-        self.base_address = VirtAddr::new(self.base_address.as_u64() + total_stack_size); // Move base for the next stack
+        self.base_address = VirtAddr::new(self.base_address.as_u64() + total_stack_size);
+
+        // Set up the guard page
         Some(stack_start)
     }
 

@@ -1,4 +1,5 @@
-use crate::scheduling::task::{test_syscall, Task};
+use crate::memory::paging::allocate_syscall_page;
+use crate::scheduling::task::Task;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -38,12 +39,13 @@ impl Scheduler {
     #[inline]
     pub fn schedule_next(&mut self) {
         self.end_task();
-        while self.tasks.len() < 1 {
-            //let user_idle_task = Task::new(allocate_syscall_page().expect("failed to alloc syscall page").as_u64() as usize, true); // Example idle task with kernel mode
-            //let kernel_idle_task = Task::new(idle_task as usize, false); // Example idle task with kernel mode
-            let kernel_idle_task = Task::new(test_syscall as usize, false);
-            self.add_task(kernel_idle_task);
-            self.print_task();
+        unsafe {
+            while self.tasks.len() < 1 {
+                let user_idle_task = Task::new(allocate_syscall_page().expect("failed to alloc syscall page").as_u64() as usize, true); // Example idle task with kernel mode
+                //let kernel_idle_task = Task::new(idle_task as usize, false); // Example idle task with kernel mode
+                //let kernel_idle_task = Task::new(test_syscall as usize, false);
+                self.add_task(user_idle_task);
+            }
         }
         if self.tasks.len() > 0 {
             let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
@@ -67,7 +69,7 @@ impl Scheduler {
         Err(TaskError::NotFound(id))
     }
     fn end_task(&mut self) {
-        for i in 0..self.tasks.len() {
+        for i in (0..self.tasks.len()).rev() {
             if self.tasks[i].terminated {
                 self.tasks[i].destroy();
                 self.tasks.remove(i);

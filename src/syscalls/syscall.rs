@@ -1,3 +1,5 @@
+use crate::drivers::interrupt_index::send_eoi;
+use crate::drivers::interrupt_index::InterruptIndex::SysCall;
 use crate::file_system::file::{File, OpenFlags};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -134,6 +136,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
             println!("Unknown syscall number: {}", rax);
         }
     }
+    send_eoi(SysCall.as_u8());
 }
 ///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
 struct SyscallParams {

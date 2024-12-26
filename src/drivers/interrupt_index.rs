@@ -1,9 +1,8 @@
 use pic8259::ChainedPics;
 
 
-pub(crate) const PIC_1_OFFSET: u8 = 32;
-pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
-pub(crate) const INT_0x80: u8 = 0x80;
+pub(crate) const PIC_1_OFFSET: u8 = 0x20;
+pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
 
 pub(crate) static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
@@ -12,10 +11,10 @@ pub(crate) static PICS: spin::Mutex<ChainedPics> =
 
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
-    KeyboardIndex = PIC_1_OFFSET + 1,
-    PrimaryDrive = PIC_1_OFFSET + 14,
-    SecondaryDrive = PIC_1_OFFSET + 15,
-
+    KeyboardIndex = PIC_1_OFFSET + 0x1,
+    PrimaryDrive = PIC_1_OFFSET + 0xE,
+    SecondaryDrive = PIC_1_OFFSET + 0xF,
+    SysCall = PIC_1_OFFSET + 0x60,
 }
 
 impl InterruptIndex {

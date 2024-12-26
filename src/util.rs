@@ -38,12 +38,12 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
 
     IdeController::enumerate_drives();
     println!("Drives enumerated");
-    //collection.print_drives();
+    collection.print_drives();
 
 
     if let Some(drive) = collection.find_drive("B:".to_string()) {
         DRIVECOLLECTION.force_unlock();
-        drive.format().expect("format failed");
+        //drive.format().expect("format failed");
     }
     println!("Init Done");
 
@@ -61,7 +61,7 @@ pub fn trigger_breakpoint() {
 }
 
 pub fn test_full_heap() {
-    let element_count = (HEAP_SIZE) / size_of::<u64>();
+    let element_count = (HEAP_SIZE / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
 

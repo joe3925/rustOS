@@ -111,7 +111,7 @@ impl State {
     }
     pub unsafe fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
         self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
-        // self.rflags = 0x00000202;
+        //self.rflags = 0x00000202;
         let new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
                                                        SegmentSelector(self.cs as u16),
                                                        RFlags::from_bits_retain(self.rflags),

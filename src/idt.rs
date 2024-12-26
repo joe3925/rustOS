@@ -7,6 +7,7 @@ use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
 use crate::syscalls::syscall::syscall_handler;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptDescriptorTable;
+use x86_64::PrivilegeLevel;
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = unsafe{
@@ -36,7 +37,7 @@ lazy_static! {
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(primary_drive_irq_handler);
         idt[drivers::interrupt_index::InterruptIndex::SecondaryDrive.as_u8()].set_handler_fn(secondary_drive_irq_handler);
-        idt[drivers::interrupt_index::INT_0x80].set_handler_fn(syscall_handler);
+        idt[drivers::interrupt_index::InterruptIndex::SysCall.as_u8()].set_handler_fn(syscall_handler).set_privilege_level(PrivilegeLevel::Ring3);
 
 
 
