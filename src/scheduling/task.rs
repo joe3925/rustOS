@@ -3,6 +3,7 @@ use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack, KERNEL_S
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
+use alloc::boxed::Box;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
@@ -97,14 +98,32 @@ pub(crate) fn idle_task() -> ! {
     loop {}
 }
 pub unsafe fn test_syscall() {
-    let syscall_number: u64 = 1;
-    let arg1: *const u8 = "syscall!".as_ptr();
-    let result: u64;
+    let mut syscall_number: u64 = 8;
+    let mut boxed_id = Box::new(0);
+    let id_addr: *mut u64 = Box::into_raw(boxed_id);
+
+    unsafe {
+        asm!(
+        "mov r8, {1}",
+        "mov rax, {0}",
+        "int 0x80",
+        in(reg) syscall_number,
+        in(reg) id_addr,
+        );
+    }
+
+    let boxed_id = Box::from_raw(id_addr);
+
+    println!("Updated ID: {}", *boxed_id);
+    //let arg1: *const u8 = "syscall!".as_ptr();
+
+    /*let id_string = id.to_string(); // Store the String in a variable
+    let arg1: *const u8 = id_string.as_ptr();
     asm!(
     "mov rax, {0}",
     "mov r8, {1}",
     "int 0x80",
     in(reg) syscall_number,
     in(reg) arg1,
-    );
+    );*/
 }

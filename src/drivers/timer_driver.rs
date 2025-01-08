@@ -32,17 +32,13 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     state.rflags = _stack_frame.cpu_flags.bits().clone();
     state.rsp = _stack_frame.stack_pointer.as_u64();
     state.ss = _stack_frame.stack_segment.0 as u64;
-
     let mut timer = TIMER.lock();
     timer.increment();
-    // Check if the kernel has finished initializing
-    //unsafe { println!("kernel init: {}", KERNEL_INITIALIZED) }
 
     //force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
     unsafe {
         KERNEL_INITIALIZED.force_unlock();
         if *(KERNEL_INITIALIZED.lock()) {
-            //util::unlock_statics();
             //unsafe { println!("timer tick: {}, Kernel init: {}", timer.get_current_tick(), *KERNEL_INITIALIZED.lock()) };
 
             unsafe {

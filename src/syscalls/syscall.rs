@@ -46,7 +46,9 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
     unsafe { asm!("mov {0}, r10", lateout(reg) param3); }
     unsafe { asm!("mov {0}, r11", lateout(reg) extra_params); }
-    let mut params = extra_params as *mut SyscallParams;
+    let mut return_value: usize = 0;
+    let params = unsafe { (extra_params as *mut SyscallParams).as_mut() };
+    //all returns are buffers because im lazy
     match rax {
         //print syscall
         1 => {
@@ -77,7 +79,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
                 let result = File::open(path.as_str(), flags);
                 if let Ok(file) = result {
                     unsafe {
-                        *((*params).param1 as *mut File) = file;
+                        *(param3 as *mut File) = file;
                     }
                 }
             }
@@ -132,6 +134,12 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
                 let _ = file.delete();
             }
         }
+        //get current task id
+        8 => {
+            {
+                unsafe { *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize; }
+            }
+        }
         _ => {
             println!("Unknown syscall number: {}", rax);
         }
@@ -139,13 +147,13 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     send_eoi(SysCall.as_u8());
 }
 ///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
+#[derive(Clone)]
 struct SyscallParams {
     param1: u64,
     param2: u64,
     param3: u64,
     param4: u64,
     extra_params: Vec<u64>,
-
 }
 impl SyscallParams {
     fn new() -> Self {
