@@ -4,12 +4,14 @@ use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
 use alloc::boxed::Box;
+use alloc::string::String;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
 
 #[derive(Debug)]
 pub struct Task {
+    pub(crate) name: String,
     pub(crate) context: State,  // The CPU state for this task
     pub(crate) stack_start: u64,
     pub(crate) id: u64,
@@ -21,20 +23,21 @@ static ID: Mutex<u64> = Mutex::new(0);
 impl Task {
     pub fn new(
         entry_point: usize,
+        name: String,
         is_user_mode: bool,
     ) -> Self {
         let stack_top = if is_user_mode {
-            unsafe { allocate_user_stack() }
+            allocate_user_stack()
                 .expect("Failed to allocate user-mode stack")
         } else {
-            unsafe { allocate_kernel_stack() }
+            allocate_kernel_stack()
                 .expect("Failed to allocate kernel-mode stack")
         };
 
         // Initialize the state with the entry point and the allocated stack top
         let mut state = State::new(0);
         state.rip = entry_point as u64;
-        state.rsp = (stack_top.as_u64() - 8) as u64;
+        state.rsp = (stack_top.as_u64() - 8);
         state.rflags = 0x00000202;
 
         // Push the return address onto the stack
@@ -47,27 +50,26 @@ impl Task {
         if is_user_mode {
             state.cs = GDT.1.user_code_selector.0 as u64 | 3;
             state.ss = GDT.1.user_data_selector.0 as u64 | 3;
-            unsafe { println!("User-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock()); }
+            println!("User-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock());
         } else {
             state.cs = GDT.1.kernel_code_selector.0 as u64;
             state.ss = GDT.1.kernel_data_selector.0 as u64;
-            unsafe { println!("Kernel-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock()); }
+            println!("Kernel-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock());
         }
 
         // Create and return the new task
-        unsafe {
-            let id = {
-                let mut id_guard = ID.lock();
-                *id_guard += 1;
-                *id_guard
-            };
-            Self {
-                context: state,
-                stack_start: stack_top.as_u64(),
-                id: id.clone(),
-                terminated: false,
-                is_user_mode,
-            }
+        let id = {
+            let mut id_guard = ID.lock();
+            *id_guard += 1;
+            *id_guard
+        };
+        Self {
+            name,
+            context: state,
+            stack_start: stack_top.as_u64(),
+            id: id.clone(),
+            terminated: false,
+            is_user_mode,
         }
     }
 
@@ -76,30 +78,29 @@ impl Task {
     }
     pub fn destroy(&mut self) {
         if (self.is_user_mode) {
-            unsafe { USER_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start)); }
+            USER_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start));
         } else {
-            unsafe { KERNEL_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start)); }
+            KERNEL_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start));
         }
     }
     /// Prints the task's RIP, RSP, and ID in one line.
     pub fn print(&self) {
-        unsafe {
-            println!(
-                "Task ID: {}, RIP: {:X}, RSP: {:X}",
-                self.id, self.context.rip, self.context.rsp
-            );
-        }
+        println!(
+            "Task ID: {}, RIP: {:X}, RSP: {:X}",
+            self.id, self.context.rip, self.context.rsp
+        );
     }
 }
 
 
+//Idle task to prevent return
 pub(crate) fn idle_task() -> ! {
     //x86_64::instructions::bochs_breakpoint();
-    loop {}
+    loop { x86_64::instructions::hlt(); }
 }
 pub unsafe fn test_syscall() {
-    let mut syscall_number: u64 = 8;
-    let mut boxed_id = Box::new(0);
+    let syscall_number: u64 = 8;
+    let boxed_id = Box::new(0);
     let id_addr: *mut u64 = Box::into_raw(boxed_id);
 
     unsafe {

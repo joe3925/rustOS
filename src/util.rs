@@ -21,12 +21,10 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
 
-    mapper = init_mapper(mem_offset);
-    frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
     gdt::init();
     println!("GDT loaded");
 
-    unsafe { interrupt_index::PICS.lock().initialize() };
+    interrupt_index::PICS.lock().initialize();
     load_idt();
     init_heap(&mut mapper, &mut frame_allocator.clone());
     println!("IDT loaded");

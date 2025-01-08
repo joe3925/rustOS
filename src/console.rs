@@ -107,12 +107,10 @@ pub(crate) static CONSOLE: Mutex<Console> = Mutex::new(Console::new());
 pub(crate) fn clear_vga_buffer() {
     let vga_buffer = Console::vga_buffer();
     let mut i = 0;
-    unsafe {
-        while (i < 0xFA0) {
-            vga_buffer[i] = 0x0;
+    while (i < 0xFA0) {
+        vga_buffer[i] = 0x0;
 
-            i += 2;
-        }
+        i += 2;
     }
 }
 #[macro_export]

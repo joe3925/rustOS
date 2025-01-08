@@ -12,7 +12,7 @@ use core::slice;
 use x86_64::structures::idt::InterruptStackFrame;
 
 fn println_wrapper(message_ptr: String) {
-    let message = unsafe { &*message_ptr };
+    let message = &*message_ptr;
     println!("{}", message);
 }
 fn u64_to_str_ptr(value: u64) -> Option<String> {
@@ -46,7 +46,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
     unsafe { asm!("mov {0}, r10", lateout(reg) param3); }
     unsafe { asm!("mov {0}, r11", lateout(reg) extra_params); }
-    let mut return_value: usize = 0;
+    let return_value: usize = 0;
     let params = unsafe { (extra_params as *mut SyscallParams).as_mut() };
     //all returns are buffers because im lazy
     match rax {
@@ -57,16 +57,13 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
             }
         }
         //destroy task syscall
-        2 => unsafe {
-            SCHEDULER.force_unlock();
+        2 => {
             let mut scheduler = SCHEDULER.lock();
             scheduler.delete_task(param1).ok();
         }
         //create task
         3 => unsafe {
-            SCHEDULER.force_unlock();
-            let mut scheduler = SCHEDULER.lock();
-            scheduler.add_task(Task::new(param1 as usize, true));
+            SCHEDULER.lock().add_task(Task::new(param1 as usize, (*(param2 as *const String)).clone(), true));
         }
         //file open syscall 1st file path, 2nd ptr to flags array, 3rd sizeof flags, return buffer
         4 => {
@@ -134,12 +131,14 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
                 let _ = file.delete();
             }
         }
-        //get current task id
+        //get current task id, param 1 buffer to place id in
         8 => {
             {
                 unsafe { *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize; }
             }
         }
+        //get task id by name
+        9 => {}
         _ => {
             println!("Unknown syscall number: {}", rax);
         }

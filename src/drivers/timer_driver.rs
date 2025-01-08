@@ -41,10 +41,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
         if *(KERNEL_INITIALIZED.lock()) {
             //unsafe { println!("timer tick: {}, Kernel init: {}", timer.get_current_tick(), *KERNEL_INITIALIZED.lock()) };
 
-            unsafe {
-                print_queue();
-            }
-
+            print_queue();
             // Proceed with task scheduling if initialized
             {
                 SCHEDULER.force_unlock();
@@ -54,10 +51,8 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                 }
                 scheduler.schedule_next();
 
-                unsafe {
-                    scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
-                    scheduler.get_current_task().context.restore();
-                }
+                scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
+                scheduler.get_current_task().context.restore();
                 send_eoi(Timer.as_u8());
             }
         } else {

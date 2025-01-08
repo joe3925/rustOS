@@ -132,7 +132,7 @@ impl AHCIController {
     /// Setup command tables and initialize Command Headers for each port.
     unsafe fn setup_command_tables(&mut self) {
         for port in 0..self.total_ports.clone() {
-            let mem_offset = VirtAddr::new(BOOT_INFO.unwrap().physical_memory_offset);
+            let mem_offset = VirtAddr::new(BOOT_INFO.lock().unwrap().physical_memory_offset);
 
             // Set Command List Base (clb) and clbu
             let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize].buffer as *const _ as u64));
@@ -200,24 +200,23 @@ impl AHCIController {
         let mut address_port = Port::<u32>::new(CONFIG_ADDRESS);
         let mut data_port = Port::<u32>::new(CONFIG_DATA);
 
-        unsafe {
-            let pci_bus = PCIBUS.lock();
-            pci_bus.print_devices();
+        let pci_bus = PCIBUS.lock();
+        pci_bus.print_devices();
 
-            for device in pci_bus.device_collection.devices.iter() {
-                //SATA controller has class 0x01 and subclass 0x06
-                if device.class_code == 0x01 && device.subclass == 0x06 {
-                    // The base address is at BAR5
-                    let bar5 = PciBus::pci_config_read(device.bus, device.device, device.function, 0x24, &mut address_port, &mut data_port);
-                    println!("Found SATA device at {}", bar5);
-                    // Determine if BAR0 is a memory-mapped address (bit 0 should be 0 for MMIO)
-                    if bar5 & 0x1 == 0 {
-                        let mmio_base = bar5 & 0xFFFFFFF0;
-                        return Some(mmio_base as u64);
-                    }
+        for device in pci_bus.device_collection.devices.iter() {
+            //SATA controller has class 0x01 and subclass 0x06
+            if device.class_code == 0x01 && device.subclass == 0x06 {
+                // The base address is at BAR5
+                let bar5 = PciBus::pci_config_read(device.bus, device.device, device.function, 0x24, &mut address_port, &mut data_port);
+                println!("Found SATA device at {}", bar5);
+                // Determine if BAR0 is a memory-mapped address (bit 0 should be 0 for MMIO)
+                if bar5 & 0x1 == 0 {
+                    let mmio_base = bar5 & 0xFFFFFFF0;
+                    return Some(mmio_base as u64);
                 }
             }
         }
+
 
         None // Return None if no SATA controller is found
     }

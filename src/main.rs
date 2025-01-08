@@ -3,9 +3,6 @@
 #![no_std]
 #![no_main]
 #![allow(unused_parens)]
-#![feature(const_mut_refs)]
-#![feature(const_ptr_as_ref)]
-#![feature(const_ptr_write)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
@@ -25,28 +22,32 @@ mod file_system;
 mod exception_handlers;
 mod drivers;
 
+use crate::util::KERNEL_INITIALIZED;
+use bootloader;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use bootloader;
-use crate::util::KERNEL_INITIALIZED;
+use lazy_static::lazy_static;
+use spin::Mutex;
 
-static mut BOOT_INFO: Option<&'static BootInfo> = None;
+lazy_static! {
+
+    pub static ref BOOT_INFO: Mutex<Option<&'static BootInfo>> =  Mutex::new(None);
+}
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     //unsafe { Console::reset_state(); }
-    unsafe { *KERNEL_INITIALIZED.lock() = false}
+    *KERNEL_INITIALIZED.lock() = false;
     println!("{}", info);
-    loop {  }
+    loop {}
 }
 
 entry_point!(_start);
 fn _start(boot_info: &'static BootInfo) -> ! {
+    *BOOT_INFO.lock() = Some(boot_info); //RustRover will sometimes mark this as an error not sure why
     unsafe {
-        BOOT_INFO = Some(boot_info); //RustRover will sometimes mark this as an error not sure why
         util::init(boot_info);
     }
 
-    loop {
-    }
+    loop {}
 }
 

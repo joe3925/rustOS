@@ -183,10 +183,10 @@ pub(crate) unsafe fn allocate_syscall_page() -> Result<VirtAddr, &'static str> {
 }
 
 // Function to allocate a user-accessible page with write and execute permissions
-pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
+pub(crate) fn alloc_user_page() -> Result<VirtAddr, &'static str> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
-    if let Some(boot_info) = BOOT_INFO {
+    if let Some(boot_info) = *BOOT_INFO.lock() {
         let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(phys_mem_offset);
@@ -211,9 +211,9 @@ pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
 }
 
 /// Allocates a page with an infinite loop instruction at a free virtual address.
-pub(crate) unsafe fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
+pub(crate) fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
     let page_addr = alloc_user_page()?; // Allocate the user page
-    write_infinite_loop(page_addr.as_mut_ptr()); // Write the infinite loop
+    unsafe { write_infinite_loop(page_addr.as_mut_ptr()); } // Write the infinite loop
     Ok(page_addr)
 }
 use spin::Mutex;
@@ -232,7 +232,7 @@ impl StackAllocator {
         }
     }
 
-    pub unsafe fn allocate(&mut self) -> Option<VirtAddr> {
+    pub fn allocate(&mut self) -> Option<VirtAddr> {
         if let Some(free_stack) = self.free_list.pop_front() {
             return Some(free_stack);
         }
@@ -252,7 +252,7 @@ impl StackAllocator {
         Some(stack_start)
     }
 
-    pub unsafe fn deallocate(&mut self, stack_start: VirtAddr) {
+    pub fn deallocate(&mut self, stack_start: VirtAddr) {
         // Add the stack back to the free list for reuse
         self.free_list.push_back(stack_start);
     }
@@ -260,13 +260,13 @@ impl StackAllocator {
 
 
 /// Allocates a stack for a user-mode task with guard pages.
-pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
+pub(crate) fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = USER_STACK_ALLOCATOR.lock();
     let stack_start = allocator.allocate().expect("kernel stack alloc failed");
     let total_stack_size = USER_STACK_SIZE + 0x1000; //guard page
     let stack_end = stack_start + total_stack_size;
 
-    if let Some(boot_info) = BOOT_INFO {
+    if let Some(boot_info) = *BOOT_INFO.lock() {
         let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(phys_mem_offset);
@@ -294,13 +294,13 @@ pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4K
 }
 
 
-pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
+pub(crate) fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
     let stack_start = allocator.allocate().expect("kernel stack alloc failed");
     let total_stack_size = KERNEL_STACK_SIZE + 0x1000;
     let stack_end = stack_start + total_stack_size;
 
-    if let Some(boot_info) = BOOT_INFO {
+    if let Some(boot_info) = *BOOT_INFO.lock() {
         let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
         let mut mapper = init_mapper(phys_mem_offset);
