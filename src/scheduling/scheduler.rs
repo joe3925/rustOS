@@ -1,4 +1,4 @@
-use crate::scheduling::task::{test_syscall, Task};
+use crate::scheduling::task::{idle_task, Task};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
@@ -8,6 +8,7 @@ use spin::Mutex;
 
 pub enum TaskError {
     NotFound(u64),
+
 }
 lazy_static! {
     pub static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -41,8 +42,8 @@ impl Scheduler {
         self.end_task();
         while self.tasks.len() < 1 {
             //let mut user_idle_task = Task::new(allocate_syscall_page().expect("failed to alloc syscall page").as_u64() as usize, true); // Example idle task with kernel mode
-            //let kernel_idle_task = Task::new(idle_task as usize, false); // Example idle task with kernel mode
-            let kernel_idle_task = Task::new(test_syscall as usize, "syscall test".to_string(), false);
+            let kernel_idle_task = Task::new(idle_task as usize, "idle task".to_string(), false); // Example idle task with kernel mode
+            //let kernel_idle_task = Task::new(test_syscall as usize, "syscall test".to_string(), false);
             self.add_task(kernel_idle_task);
         }
 
@@ -50,7 +51,7 @@ impl Scheduler {
             let mut next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             if (self.tasks.len() > 1) {
                 let next_task_name = self.tasks[next_task].name.clone();
-                if (next_task_name == "") {
+                if (next_task_name == "idle task") {
                     next_task = (self.current_task.load(Ordering::SeqCst) + 2) % self.tasks.len();
                 }
             }

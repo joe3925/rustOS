@@ -94,9 +94,13 @@ impl Task {
 
 
 //Idle task to prevent return
-pub(crate) fn idle_task() -> ! {
+pub(crate) fn idle_task() {
     //x86_64::instructions::bochs_breakpoint();
-    loop { x86_64::instructions::hlt(); }
+    loop {
+        unsafe {
+            asm!("hlt", options(nomem, nostack, preserves_flags));
+        }
+    }
 }
 pub unsafe fn test_syscall() {
     let syscall_number: u64 = 8;

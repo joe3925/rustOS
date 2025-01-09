@@ -50,8 +50,8 @@ impl DriveInfo {
 
 // All drives must implement this trait
 pub trait DriveController {
-    fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]);
-    fn write(&mut self, label: &str, sector: u32, data: &[u8]);
+    fn read(&mut self, sector: u32, buffer: &mut [u8]);
+    fn write(&mut self, sector: u32, data: &[u8]);
     fn enumerate_drives()
     where
         Self: Sized;
@@ -78,7 +78,14 @@ impl Drive {
         }
     }
     pub fn format(&mut self) -> Result<(), &'static str> {
-        self.is_fat = true;
+        let mut fs = FileSystem::new(self.label.clone());
+        self.is_fat = fs.is_fat_present();
+        if (self.is_fat == false) {
+            return fs.format_drive();
+        }
+        Err("Drive is already formatted")
+    }
+    pub fn force_format(&mut self) -> Result<(), &'static str> {
         FileSystem::new(self.label.clone()).format_drive()
     }
 }

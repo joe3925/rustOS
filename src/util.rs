@@ -41,7 +41,10 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
 
     if let Some(drive) = collection.find_drive("B:".to_string()) {
         DRIVECOLLECTION.force_unlock();
-        //drive.format().expect("format failed");
+        match drive.format() {
+            Ok(_) => { println!("Drive {} formatted successfully", drive.label.clone()) }
+            Err(err) => println!("Error formatting drive {} {}", drive.label.clone(), err),
+        }
     }
     println!("Init Done");
 

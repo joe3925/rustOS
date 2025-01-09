@@ -329,11 +329,11 @@ impl AHCIController {
     }
 }
 impl DriveController for AHCIController {
-    fn read(&mut self, label: &str, sector: u32, buffer: &mut [u8]) {
+    fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         todo!()
     }
 
-    fn write(&mut self, label: &str, sector: u32, data: &[u8]) {
+    fn write(&mut self, sector: u32, data: &[u8]) {
         todo!()
     }
 

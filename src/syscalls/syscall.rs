@@ -51,7 +51,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     //all returns are buffers because im lazy
     match rax {
         //print syscall
-        1 => {
+        1 => unsafe {
             if let Some(string) = u64_to_str_ptr(param1) {
                 println_wrapper(string)
             }

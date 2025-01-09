@@ -159,7 +159,7 @@ impl IdeController {
 }
 
 impl DriveController for IdeController {
-    fn read(&mut self, label: &str, lba: u32, buffer: &mut [u8]) {
+    fn read(&mut self, lba: u32, buffer: &mut [u8]) {
         assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
 
         unsafe {
@@ -207,7 +207,7 @@ impl DriveController for IdeController {
             }
         }
     }
-    fn write(&mut self, label: &str, lba: u32, buffer: &[u8]) {
+    fn write(&mut self, lba: u32, buffer: &[u8]) {
         assert_eq!(buffer.len(), 512);
 
         unsafe {
@@ -256,23 +256,25 @@ impl DriveController for IdeController {
         }
     }
     fn enumerate_drives() {
-        unsafe{DRIVECOLLECTION.force_unlock();}
+        unsafe { DRIVECOLLECTION.force_unlock(); }
         let mut drive_collection = DRIVECOLLECTION.lock();
         let mut ide_controller = Self::new(0x0);
 
         // Check for the master drive
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(0) {  // Master drive
-                // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xE0)));
+                if (info.capacity != 0) {
+                    drive_collection.new_drive(label, info, Box::new(IdeController::new(0xE0)));
+                }
             }
         }
 
         // Check for the slave drive
         if let Some(label) = drive_collection.find_free_label() {
             if let Some(info) = ide_controller.identify_drive(1) {  // Slave drive
-                // Pass the mutable reference to the controller
-                drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
+                if (info.capacity != 0) {
+                    drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
+                }
             }
         }
     }
