@@ -48,7 +48,6 @@ fn _start(boot_info: &'static BootInfo) -> ! {
     unsafe {
         util::init(boot_info);
     }
-
     loop {}
 }
 

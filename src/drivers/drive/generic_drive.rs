@@ -52,7 +52,7 @@ impl DriveInfo {
 pub trait DriveController {
     fn read(&mut self, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, sector: u32, data: &[u8]);
-    fn enumerate_drives()
+    fn enumerate_drives() -> Vec<Drive>
     where
         Self: Sized;
     fn is_controller(device: &Device) -> bool
@@ -64,8 +64,7 @@ pub struct Drive {
     pub label: String,
     pub info: DriveInfo,
     pub controller: Box<dyn DriveController + Send>,
-    pub is_fat: bool, // New flag to indicate if the drive uses the FAT filesystem
-
+    pub is_fat: bool,
 }
 
 impl Drive {
@@ -93,6 +92,7 @@ impl Drive {
 
 pub struct DriveCollection {
     pub drives: Vec<Drive>,
+
 }
 
 impl DriveCollection {
@@ -106,9 +106,19 @@ impl DriveCollection {
         let drive = Drive::new(label, info, controller);
         self.drives.push(drive);
     }
-    pub(crate) fn enumerate_drives() {
-        <IdeController as DriveController>::enumerate_drives();
-        <AHCIController as DriveController>::enumerate_drives();
+    pub(crate) fn enumerate_drives(&mut self) {
+        let mut drives = Vec::new();
+        drives.extend(<IdeController as DriveController>::enumerate_drives());
+        //drives.extend(<AHCIController as DriveController>::enumerate_drives());
+
+        for mut drive in drives {
+            if (drive.label == "") {
+                if let Some(label) = self.find_free_label() {
+                    drive.label = label;
+                    self.drives.push(drive);
+                }
+            }
+        }
     }
     pub fn find_drive(&mut self, label: String) -> Option<&mut Drive> {
         for drive in self.drives.iter_mut() { // Iterate over mutable references

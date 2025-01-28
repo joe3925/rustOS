@@ -1,5 +1,4 @@
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
-use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
@@ -34,7 +33,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     PCIBUS.lock().enumerate_pci();
     println!("PCI BUS enumerated");
 
-    IdeController::enumerate_drives();
+    collection.enumerate_drives();
     println!("Drives enumerated");
     collection.print_drives();
 
@@ -45,6 +44,8 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
             Ok(_) => { println!("Drive {} formatted successfully", drive.label.clone()) }
             Err(err) => println!("Error formatting drive {} {}", drive.label.clone(), err),
         }
+    } else {
+        println!("failed to find drive B:");
     }
     println!("Init Done");
 

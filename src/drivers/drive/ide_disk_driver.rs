@@ -1,5 +1,5 @@
 use crate::cpu::get_cycles;
-use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo, DriveType, DRIVECOLLECTION};
 use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::PciBus;
@@ -45,7 +45,7 @@ static DRIVE_IRQ_RECEIVED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
-        let status_port = Port::new(PRIMARY_CMD_BASE + 7);
+        let mut status_port = Port::new(PRIMARY_CMD_BASE + 7);
         let status: u8 = status_port.read();  // Read the status register
 
         while status & 0x40 == 0 { println!("Drive not ready"); }
@@ -101,19 +101,21 @@ impl IdeController {
             managed_port: managed_port as u8,
         }
     }
-    fn identify_drive(&mut self, drive: u8) -> Option<DriveInfo> {
+    fn identify_drive(drive: u8) -> Option<DriveInfo> {
         unsafe {
-            self.drive_head_port.write(0xE0 | (drive << 4)); // Select drive (0 = master, 1 = slave)
-            self.command_port.write(0xEC); // Send IDENTIFY command
-
-            if self.status().contains(StatusFlags::ERR) {
+            let mut head_port = Port::new(DRIVE_HEAD_REG);
+            let mut command_port = Port::new(PRIMARY_STATUS_REG);
+            let mut data_port = Port::new(DATA_REG);
+            head_port.write(0xE0 | (drive << 4)); // Select drive (0 = master, 1 = slave)
+            command_port.write(0xEC); // Send IDENTIFY command
+            if unsafe { StatusFlags::from_bits_truncate(command_port.read()) }.contains(StatusFlags::ERR) {
                 return None; // If error, drive does not exist
             }
 
             // Read IDENTIFY data
             let mut data = [0u16; 256];
             for word in data.iter_mut() {
-                *word = self.data_port.read();
+                *word = data_port.read();
             }
             //For some reason these serial and model are stored as an array of 2 byte chunks https://mail.gnu.org/archive/html/qemu-devel/2015-04/msg02158.html
             let serial = String::from_utf8_lossy(
@@ -255,28 +257,26 @@ impl DriveController for IdeController {
             }
         }
     }
-    fn enumerate_drives() {
+    fn enumerate_drives() -> Vec<Drive> {
         unsafe { DRIVECOLLECTION.force_unlock(); }
-        let mut drive_collection = DRIVECOLLECTION.lock();
+        let mut drive_list: Vec<Drive> = Vec::new();
         let mut ide_controller = Self::new(0x0);
 
         // Check for the master drive
-        if let Some(label) = drive_collection.find_free_label() {
-            if let Some(info) = ide_controller.identify_drive(0) {  // Master drive
-                if (info.capacity != 0) {
-                    drive_collection.new_drive(label, info, Box::new(IdeController::new(0xE0)));
-                }
+        if let Some(info) = IdeController::identify_drive(0) {
+            if (info.capacity != 0) {
+                drive_list.push(Drive::new("".to_string(), info, Box::new(IdeController::new(DriveType::Master as u32))));
             }
         }
 
+
         // Check for the slave drive
-        if let Some(label) = drive_collection.find_free_label() {
-            if let Some(info) = ide_controller.identify_drive(1) {  // Slave drive
-                if (info.capacity != 0) {
-                    drive_collection.new_drive(label, info, Box::new(IdeController::new(0xF0)));
-                }
+        if let Some(info) = IdeController::identify_drive(1) {
+            if (info.capacity != 0) {
+                drive_list.push(Drive::new("".to_string(), info, Box::new(IdeController::new(DriveType::Slave as u32))));
             }
         }
+        drive_list
     }
     fn is_controller(device: &Device) -> bool {
         if (device.class_code == 0x01 && device.subclass == 0x01) {

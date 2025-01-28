@@ -1,4 +1,4 @@
-use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo};
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
@@ -337,19 +337,18 @@ impl DriveController for AHCIController {
         todo!()
     }
 
-    fn enumerate_drives() {
+    fn enumerate_drives() -> Vec<Drive> {
         let mut controller = AHCIController::new();
         println!("Occupied ports: {:#?}, Total Ports: {:#?}", controller.occupied_ports,
                  controller.total_ports);
-        let mut drive_collection = DRIVECOLLECTION.lock();
+        let mut drive_list = Vec::new();
         for i in 0..controller.occupied_ports.len() {
             if let Some(drive_info) = controller.identify_drive(controller.occupied_ports[i]) {
                 drive_info.print();
-                if let Some(label) = drive_collection.find_free_label() {
-                    drive_collection.new_drive(label, drive_info, Box::new(AHCIController::new()));
-                }
+                drive_list.push(Drive::new("".to_string(), drive_info, Box::new(AHCIController::new())));
             }
         }
+        drive_list
     }
 
     fn is_controller(device: &Device) -> bool {
