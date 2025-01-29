@@ -3,6 +3,7 @@ use crate::file_system::fat::FileSystem;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
+use crate::drivers::drive::gpt::PARTITIONS;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -64,13 +65,12 @@ impl File {
         let drive_letter = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::PathNotFound)?;
         let path = Self::remove_drive_from_path(path);
         let mut file_system = {
-            let mut drive_collection = DRIVECOLLECTION.lock();
-            if let Some(drive) = drive_collection.find_drive(drive_letter.clone()) {
-                drive.is_fat = true;
-                if !drive.is_fat {
+            let mut partitions = PARTITIONS.lock();
+            if let Some(part) = partitions.find_volume(drive_letter.clone()) {
+                if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(drive.label.clone())
+                FileSystem::new(part.label.clone())
             } else {
                 return Err(FileStatus::UnknownFail);
             }
@@ -138,13 +138,12 @@ impl File {
     /// Read data from the file.
     pub fn read(&mut self) -> Result<Vec<u8>, FileStatus> {
         let mut file_system = {
-            let mut drive_collection = DRIVECOLLECTION.lock();
-            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-                drive.is_fat = true;
-                if !drive.is_fat {
+            let mut partition = PARTITIONS.lock();
+            if let Some(part) = partition.find_volume(self.drive_label.clone()) {
+                if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(drive.label.clone())
+                FileSystem::new(part.label.clone())
             } else {
                 return Err(FileStatus::UnknownFail);
             }
@@ -158,12 +157,12 @@ impl File {
     /// Write data to the file (overwrites).
     pub fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
         let mut file_system = {
-            let mut drive_collection = DRIVECOLLECTION.lock();
-            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-                if !drive.is_fat {
+            let mut partition = PARTITIONS.lock();
+            if let Some(part) = partition.find_volume(self.drive_label.clone()) {
+                if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(drive.label.clone())
+                FileSystem::new(part.label.clone())
             } else {
                 return Err(FileStatus::UnknownFail);
             }
@@ -175,12 +174,12 @@ impl File {
     }
     pub fn delete(&mut self) -> Result<(), FileStatus> {
         let mut file_system = {
-            let mut drive_collection = DRIVECOLLECTION.lock();
-            if let Some(drive) = drive_collection.find_drive(self.drive_label.clone()) {
-                if !drive.is_fat {
+            let mut partition = PARTITIONS.lock();
+            if let Some(part) = partition.find_volume(self.drive_label.clone()) {
+                if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(drive.label.clone())
+                FileSystem::new(part.label.clone())
             } else {
                 return Err(FileStatus::UnknownFail);
             }

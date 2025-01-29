@@ -278,6 +278,10 @@ impl DriveController for IdeController {
         }
         drive_list
     }
+
+    fn factory(&self) -> Box<dyn DriveController + Send + Sync> {
+        Box::new(IdeController::new(self.managed_port as u32)) // Cloning with new instance
+    }
     fn is_controller(device: &Device) -> bool {
         if (device.class_code == 0x01 && device.subclass == 0x01) {
             return true;

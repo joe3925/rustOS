@@ -5,8 +5,11 @@ use alloc::boxed::Box;
 use alloc::{format, vec};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::any::Any;
+use core::mem;
 use spin::mutex::Mutex;
 use spin::Lazy;
+use crate::file_system::fat::FileSystem;
 
 pub static PARTITIONS: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
     Mutex::new(PartitionCollection::new())
@@ -51,7 +54,7 @@ impl GptHeader {
     pub fn is_valid_signature(&self) -> bool {
         &self.signature == b"EFI PART"
     }
-    pub const fn new(buffer: &[u8]) -> Option<Self> {
+    pub fn new(buffer: &[u8]) -> Option<Self> {
         // Ensure the buffer is at least 92 bytes (header size)
         if buffer.len() < 92 {
             return None;
@@ -87,7 +90,29 @@ pub struct GptPartitionEntry {
     pub partition_name: [u16; 36],
 }
 
-impl GptPartitionEntry {}
+impl GptPartitionEntry {
+    /// Creates a new GptPartitionEntry from a 128-byte chunk.
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 128 {
+            return None; // Ensure the slice is exactly 128 bytes
+        }
+
+        Some(Self {
+            partition_type_guid: bytes[0x00..0x10].try_into().unwrap(),
+            unique_partition_guid: bytes[0x10..0x20].try_into().unwrap(),
+            first_lba: u64::from_le_bytes(bytes[0x20..0x28].try_into().unwrap()),
+            last_lba: u64::from_le_bytes(bytes[0x28..0x30].try_into().unwrap()),
+            attribute_flags: u64::from_le_bytes(bytes[0x30..0x38].try_into().unwrap()),
+            partition_name: {
+                let mut name = [0u16; 36];
+                for (i, chunk) in bytes[0x38..0x80].chunks_exact(2).enumerate() {
+                    name[i] = u16::from_le_bytes(chunk.try_into().unwrap());
+                }
+                name
+            },
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GptDrive {
@@ -117,9 +142,9 @@ impl PartitionCollection {
         }
     }
 
-    pub(crate) fn new_partition(&mut self, entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send>) -> Result<(), &'static str>  {
+    pub(crate) fn new_partition(&mut self, mut entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Result<(), &'static str>  {
         if let Some(label) = self.find_free_label() {
-            let drive = Partition::new(label,"TODO".to_string(), drive_index, controller, entry.first_lba, entry.last_lba);
+            let drive = Partition::new(label, String::from_utf16(&mut entry.partition_name).unwrap().to_string(), drive_index, controller, entry.first_lba, entry.last_lba);
             self.parts.push(drive);
             Ok(())
         }else{
@@ -127,15 +152,24 @@ impl PartitionCollection {
         }
     }
     pub(crate) fn enumerate_drives(&mut self) {
-        for mut drive in DRIVECOLLECTION.lock().drives {
-            let buffer = vec![0u8; 512];
-            drive.controller.read(1, &mut buffer.as_slice());
-            if let Some(header) = GptHeader::new(buffer.as_slice()){
-                //TODO: add function to return a vec of partitions from the drive
+        let mut i = 0;
+        for mut drive in DRIVECOLLECTION.lock().drives.iter_mut() {
+            let mut buffer = vec![0u8; 512];
+            drive.controller.read(1, &mut buffer);
+
+            if let Some(header) = GptHeader::new(&mut buffer) {
+                let mut buffer = vec![0u8; 512];
+                drive.controller.read(2, &mut buffer);
+
+                if let Some(entry) = GptPartitionEntry::new(&mut buffer) {
+                    self.new_partition(entry, i, drive.controller.factory());
+                }
             }
+            i += 1;
         }
     }
-    pub fn find_drive(&mut self, label: String) -> Option<&mut Drive> {
+
+    pub fn find_volume(&mut self, label: String) -> Option<&mut Partition> {
         for drive in self.parts.iter_mut() { // Iterate over mutable references
             if drive.label == label {
                 return Some(drive); // Return the mutable reference
@@ -148,9 +182,9 @@ impl PartitionCollection {
             println!("No drives in the collection.");
         } else {
             for (i, drive) in self.parts.iter().enumerate() {
-                println!("Drive {}:", i + 1);
+                println!("Part {}:", i + 1);
+                println!("parent drive: {}", drive.parent_drive_index);
                 println!("Label: {}", drive.label);
-                drive.info.print(); // Call the print method of DriveInfo
             }
         }
     }
@@ -183,17 +217,32 @@ impl PartitionCollection {
 pub struct Partition {
     parent_drive_index: u64,
     name: String,
-    label: String,
+    pub(crate) label: String,
+    pub(crate) size: u64,
     controller: PartitionController,
+    pub(crate) is_fat: bool,
 }
 impl Partition {
-    pub fn new(label: String, name: String, parent_drive_index: u64, controller: Box<dyn DriveController + Send>, start_lba: u64, end_lba: u64) -> Self {
+    pub fn new(label: String, name: String, parent_drive_index: u64, controller: Box<dyn DriveController + Send + Sync>, start_lba: u64, end_lba: u64) -> Self {
+        FileSystem::new(label.clone()).is_fat_present();
         Partition {
             parent_drive_index,
-            name
-            label,
+            name,
+            label: label.clone(),
+            size: ((end_lba - start_lba) * 512),
             controller: PartitionController::new(controller, start_lba, end_lba),
+            is_fat: FileSystem::new(label).is_fat_present(),
         }
+    }
+    pub fn format(&mut self) -> Result<(), &'static str> {
+        if (self.is_fat == false) {
+            let mut fs = FileSystem::new(self.label.clone());
+            return fs.format_drive();
+        }
+        Err("Drive is already formatted")
+    }
+    pub fn force_format(&mut self) -> Result<(), &'static str> {
+        FileSystem::new(self.label.clone()).format_drive()
     }
     pub fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         self.controller.read(sector, buffer);
@@ -204,7 +253,7 @@ impl Partition {
 }
 pub struct PartitionController {
     /// Underlying drive controller
-    drive_controller: Box<dyn DriveController + Send>,
+    drive_controller: Box<dyn DriveController>,
     /// Starting LBA of the partition
     start_lba: u64,
     /// Ending LBA of the partition (inclusive)
@@ -214,7 +263,7 @@ pub struct PartitionController {
 impl PartitionController {
     /// Create a new PartitionController
     pub fn new(
-        drive_controller: Box<dyn DriveController + Send>,
+        drive_controller: Box<dyn DriveController + Send + Sync>,
         start_lba: u64,
         end_lba: u64,
     ) -> Self {

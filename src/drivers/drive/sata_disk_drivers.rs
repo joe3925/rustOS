@@ -328,7 +328,7 @@ impl AHCIController {
         })
     }
 }
-impl DriveController for AHCIController {
+/*impl DriveController for AHCIController  {
     fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         todo!()
     }
@@ -351,10 +351,13 @@ impl DriveController for AHCIController {
         drive_list
     }
 
+    fn factory(&self) -> Box<(dyn DriveController + Send + Sync)> {
+        todo!()
+    }
     fn is_controller(device: &Device) -> bool {
         if (device.class_code == 0x01 && device.subclass == 0x06) {
             return true;
         }
         false
     }
-}
+}*/

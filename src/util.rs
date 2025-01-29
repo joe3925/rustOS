@@ -11,11 +11,12 @@ use bootloader::BootInfo;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
+use crate::drivers::drive::gpt::PARTITIONS;
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
 pub unsafe fn init(boot_info: &'static BootInfo) {
-    let mut collection = DRIVECOLLECTION.lock();
+    let mut partitions = PARTITIONS.lock();
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
@@ -33,16 +34,16 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     PCIBUS.lock().enumerate_pci();
     println!("PCI BUS enumerated");
 
-    collection.enumerate_drives();
+    partitions.enumerate_drives();
     println!("Drives enumerated");
-    collection.print_drives();
+    partitions.print_drives();
 
 
-    if let Some(drive) = collection.find_drive("B:".to_string()) {
-        DRIVECOLLECTION.force_unlock();
-        match drive.format() {
-            Ok(_) => { println!("Drive {} formatted successfully", drive.label.clone()) }
-            Err(err) => println!("Error formatting drive {} {}", drive.label.clone(), err),
+    if let Some(part) = partitions.find_volume("B:".to_string()) {
+        PARTITIONS.force_unlock();
+        match part.format() {
+            Ok(_) => { println!("Drive {} formatted successfully", part.label.clone()) }
+            Err(err) => println!("Error formatting drive {} {}", part.label.clone(), err),
         }
     } else {
         println!("failed to find drive B:");

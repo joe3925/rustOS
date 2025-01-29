@@ -21,7 +21,7 @@ pub enum Controller {
 }
 impl Controller {
     fn enumerate_drives() {
-        AHCIController::enumerate_drives();
+        //AHCIController::enumerate_drives();
         IdeController::enumerate_drives();
     }
 }
@@ -49,12 +49,13 @@ impl DriveInfo {
 }
 
 // All drives must implement this trait
-pub trait DriveController {
+pub trait DriveController: Send + Sync{
     fn read(&mut self, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, sector: u32, data: &[u8]);
     fn enumerate_drives() -> Vec<Drive>
     where
         Self: Sized;
+    fn factory(&self) -> Box<dyn DriveController + Send + Sync>;
     fn is_controller(device: &Device) -> bool
     where
         Self: Sized;
@@ -75,17 +76,6 @@ impl Drive {
             controller,
             is_fat: false,
         }
-    }
-    pub fn format(&mut self) -> Result<(), &'static str> {
-        let mut fs = FileSystem::new(self.label.clone());
-        self.is_fat = fs.is_fat_present();
-        if (self.is_fat == false) {
-            return fs.format_drive();
-        }
-        Err("Drive is already formatted")
-    }
-    pub fn force_format(&mut self) -> Result<(), &'static str> {
-        FileSystem::new(self.label.clone()).format_drive()
     }
 }
 
