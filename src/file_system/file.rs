@@ -1,9 +1,9 @@
-use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
+use crate::drivers::drive::gpt::PARTITIONS;
 use crate::file_system::fat::FileSystem;
+use crate::println;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
-use crate::drivers::drive::gpt::PARTITIONS;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -19,12 +19,18 @@ impl From<FileAttribute> for u8 {
         attribute as u8
     }
 }
+#[derive(Debug)]
 pub(crate) enum FileStatus {
     Success = 0x00,
     FileAlreadyExist = 0x01,
     PathNotFound = 0x02,
     UnknownFail = 0x03,
+    NotFat = 0x04,
+    DriveNotFound,
+    IncompatibleFlags,
+    CorruptFat,
 }
+
 
 impl FileStatus {
     pub fn to_str(&self) -> &'static str {
@@ -32,7 +38,11 @@ impl FileStatus {
             FileStatus::Success => "Success",
             FileStatus::FileAlreadyExist => "File already exists",
             FileStatus::PathNotFound => "Path not found",
-            FileStatus::UnknownFail => "The operation failed for an unknown reason"
+            FileStatus::UnknownFail => "The operation failed for an unknown reason",
+            FileStatus::NotFat => "The partition is unformatted or not supported",
+            FileStatus::DriveNotFound => "The drive specified doesnt exist",
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
+            FileStatus::CorruptFat => "The File Allocation Table is corrupt this drive should be reformated and backed up if still possible"
         }
     }
 }
@@ -51,10 +61,20 @@ pub enum OpenFlags {
     ReadOnly,
     WriteOnly,
     ReadWrite,
-    Create,      // Creates the file if it doesn't exist
-    CreateNew,   // Creates the file only if it doesn't already exist (fails if it exists)
+    /// Creates the file if it doesn't exist
+    Create,
+    /// Creates the file only if it doesn't already exist (fails if it exists)
+    CreateNew,
 }
 
+impl PartialEq for FileStatus {
+    fn eq(&self, other: &FileStatus) -> bool {
+        if (self.to_str() == other.to_str()) {
+            return true;
+        }
+        false
+    }
+}
 
 impl File {
     /// Open a file from the given path and drive.
@@ -64,56 +84,76 @@ impl File {
     ) -> Result<Self, FileStatus> {
         let drive_letter = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::PathNotFound)?;
         let path = Self::remove_drive_from_path(path);
+        if (flags.contains(&OpenFlags::Create) && flags.contains(&OpenFlags::CreateNew)) {
+            return Err(FileStatus::IncompatibleFlags);
+        }
         let mut file_system = {
             let mut partitions = PARTITIONS.lock();
             if let Some(part) = partitions.find_volume(drive_letter.clone()) {
                 if !part.is_fat {
-                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                    return Err(FileStatus::NotFat); // Drive is not FAT
                 }
-                FileSystem::new(part.label.clone())
+                FileSystem::new(part.label.clone(), part.size)
             } else {
-                return Err(FileStatus::UnknownFail);
+                return Err(FileStatus::DriveNotFound);
             }
         };
         // Check if the file exists
-        if let Some(file_entry) = file_system.find_file(path) {
-            Ok(File {
-                name: file_entry.file_name.clone(),
-                extension: file_entry.file_extension.clone(),
-                size: file_entry.file_size,
-                starting_cluster: file_entry.starting_cluster,
-                drive_label: file_entry.drive_label.clone(),
-                path: path.to_string(),
-                deleted: false,
-            })
-        } else {
-            // If file doesn't exist, check flags for creation
-            if flags.contains(&OpenFlags::Create) {
-                let name = FileSystem::file_parser(path);
-                let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
-                let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
-
-                file_system.create_dir(File::remove_file_from_path(path));
-                match file_system.create_file(&file_name, &file_extension, path) {
-                    FileStatus::Success => {
-                        if let Some(file_entry) = file_system.find_file(path) {
-                            Ok(File {
-                                name: file_entry.file_name.clone(),
-                                extension: file_entry.file_extension.clone(),
-                                size: file_entry.file_size,
-                                starting_cluster: file_entry.starting_cluster,
-                                drive_label: file_system.label.clone(),
-                                path: path.to_string(),
-                                deleted: false,
-                            })
-                        } else {
-                            Err(FileStatus::UnknownFail)
-                        }
-                    }
-                    status => Err(status),
+        println!("here1");
+        let file_entry = file_system.find_file(path);
+        match file_entry {
+            Ok(file_entry) => {
+                if (!flags.contains(&OpenFlags::CreateNew)) {
+                    Ok(File {
+                        name: file_entry.file_name.clone(),
+                        extension: file_entry.file_extension.clone(),
+                        size: file_entry.file_size,
+                        starting_cluster: file_entry.starting_cluster,
+                        drive_label: file_entry.drive_label.clone(),
+                        path: path.to_string(),
+                        deleted: false,
+                    })
+                } else {
+                    Err(FileStatus::FileAlreadyExist)
                 }
-            } else {
-                Err(FileStatus::PathNotFound)
+            }
+            Err(FileStatus::PathNotFound) => {
+                // If file doesn't exist, check flags for creation
+                if flags.contains(&OpenFlags::Create) || flags.contains(&OpenFlags::CreateNew) {
+                    let name = FileSystem::file_parser(path);
+                    let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
+                    let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
+
+                    file_system.create_dir(File::remove_file_from_path(path))?;
+
+                    match file_system.create_file(&file_name, &file_extension, path) {
+                        Ok(_) => {
+                            let file_entry = file_system.find_file(path);
+                            match file_entry {
+                                Ok(file_entry) => {
+                                    Ok(File {
+                                        name: file_entry.file_name.clone(),
+                                        extension: file_entry.file_extension.clone(),
+                                        size: file_entry.file_size,
+                                        starting_cluster: file_entry.starting_cluster,
+                                        drive_label: file_system.label.clone(),
+                                        path: path.to_string(),
+                                        deleted: false,
+                                    })
+                                }
+                                Err(e) => {
+                                    Err(e)
+                                }
+                            }
+                        }
+                        Err(status) => Err(status),
+                    }
+                } else {
+                    Err(FileStatus::PathNotFound)
+                }
+            }
+            Err(e) => {
+                Err(e)
             }
         }
     }
@@ -143,16 +183,12 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(part.label.clone())
+                FileSystem::new(part.label.clone(), part.size)
             } else {
                 return Err(FileStatus::UnknownFail);
             }
         };
-        if let Some(data) = file_system.read_file(self.path.as_str()) {
-            Ok(data)
-        } else {
-            Err(FileStatus::UnknownFail)
-        }
+        file_system.read_file(self.path.as_str())
     }
     /// Write data to the file (overwrites).
     pub fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
@@ -162,15 +198,12 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(part.label.clone())
+                FileSystem::new(part.label.clone(), part.size)
             } else {
                 return Err(FileStatus::UnknownFail);
             }
         };
-        match file_system.write_file(data, self.path.as_str()) {
-            FileStatus::Success => Ok(()),
-            status => Err(status),
-        }
+        file_system.write_file(data, self.path.as_str())
     }
     pub fn delete(&mut self) -> Result<(), FileStatus> {
         let mut file_system = {
@@ -179,18 +212,18 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::UnknownFail); // Drive is not FAT
                 }
-                FileSystem::new(part.label.clone())
+                FileSystem::new(part.label.clone(), part.size)
             } else {
                 return Err(FileStatus::UnknownFail);
             }
         };
         let status = file_system.delete_file(self.path.as_str());
-        if (status.to_str() == FileStatus::Success.to_str()) {
-            self.deleted = true;
-        }
         match status {
-            FileStatus::Success => Ok(()),
-            status => Err(status),
+            Ok(_) => {
+                self.deleted = true;
+                Ok(())
+            }
+            Err(_) => status,
         }
     }
     pub fn get_drive_letter(path: &[u8]) -> Option<String> {

@@ -1,15 +1,12 @@
-use crate::drivers::drive::generic_drive::{Drive, DriveCollection, DriveController, DriveInfo, DRIVECOLLECTION};
-use crate::drivers::drive::ide_disk_driver::IdeController;
+use crate::drivers::drive::generic_drive::{DriveController, DriveInfo, FormatStatus, DRIVECOLLECTION};
+use crate::file_system::fat::{FileSystem, INFO_SECTOR};
 use crate::println;
 use alloc::boxed::Box;
-use alloc::{format, vec};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::any::Any;
-use core::mem;
+use alloc::{format, vec};
 use spin::mutex::Mutex;
 use spin::Lazy;
-use crate::file_system::fat::FileSystem;
 
 pub static PARTITIONS: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
     Mutex::new(PartitionCollection::new())
@@ -59,16 +56,23 @@ impl GptHeader {
         if buffer.len() < 92 {
             return None;
         }
+        // Extract the first 8 bytes
+        let first_8_bytes = &buffer[0..8];
 
+        // Convert to a UTF-8 string (safe conversion)
+        match core::str::from_utf8(first_8_bytes) {
+            Ok(string) => println!("First 8 bytes as string: {}", string),
+            Err(_) => println!("First 8 bytes contain invalid UTF-8 characters."),
+        }
         // Extract the first 92 bytes
         let header_bytes = &buffer[0..92];
 
         // Perform an unsafe cast to GptHeader
         let header: GptHeader = unsafe { core::ptr::read(header_bytes.as_ptr() as *const _) };
 
-        if(header.is_valid_signature()) {
+        if (header.is_valid_signature()) {
             Some(header)
-        }else{
+        } else {
             None
         }
     }
@@ -142,27 +146,39 @@ impl PartitionCollection {
         }
     }
 
-    pub(crate) fn new_partition(&mut self, mut entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Result<(), &'static str>  {
+    pub(crate) fn new_partition(&mut self, mut entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Result<(), &'static str> {
         if let Some(label) = self.find_free_label() {
             let drive = Partition::new(label, String::from_utf16(&mut entry.partition_name).unwrap().to_string(), drive_index, controller, entry.first_lba, entry.last_lba);
+
             self.parts.push(drive);
             Ok(())
-        }else{
+        } else {
             Err("No available label")
         }
     }
-    pub(crate) fn enumerate_drives(&mut self) {
+    pub(crate) fn enumerate_parts(&mut self) {
         let mut i = 0;
         for mut drive in DRIVECOLLECTION.lock().drives.iter_mut() {
             let mut buffer = vec![0u8; 512];
             drive.controller.read(1, &mut buffer);
-
             if let Some(header) = GptHeader::new(&mut buffer) {
-                let mut buffer = vec![0u8; 512];
-                drive.controller.read(2, &mut buffer);
+                buffer.fill(0);
 
-                if let Some(entry) = GptPartitionEntry::new(&mut buffer) {
-                    self.new_partition(entry, i, drive.controller.factory());
+                for sector in 2..=33 {
+                    drive.controller.read(sector, &mut buffer);
+
+                    for chunk_start in (0..buffer.len()).step_by(128) {
+                        let mut slice_128: &[u8] = &buffer[chunk_start..chunk_start + 128];
+
+                        // Check if the 128-byte chunk is empty
+                        if slice_128.iter().all(|&b| b == 0) {
+                            continue;
+                        }
+
+                        if let Some(entry) = GptPartitionEntry::new(&mut slice_128) {
+                            self.new_partition(entry, sector as u64, drive.controller.factory());
+                        }
+                    }
                 }
             }
             i += 1;
@@ -177,14 +193,16 @@ impl PartitionCollection {
         }
         None
     }
-    pub fn print_drives(&self) {
+    pub fn print_parts(&self) {
         if self.parts.is_empty() {
             println!("No drives in the collection.");
         } else {
             for (i, drive) in self.parts.iter().enumerate() {
-                println!("Part {}:", i + 1);
+                println!("Part: ({})", drive.label);
+                println!("Name: ({})", drive.name);
+                println!("is fat: {}", drive.is_fat);
                 println!("parent drive: {}", drive.parent_drive_index);
-                println!("Label: {}", drive.label);
+                println!("Capacity: {}", drive.size);
             }
         }
     }
@@ -224,31 +242,37 @@ pub struct Partition {
 }
 impl Partition {
     pub fn new(label: String, name: String, parent_drive_index: u64, controller: Box<dyn DriveController + Send + Sync>, start_lba: u64, end_lba: u64) -> Self {
-        FileSystem::new(label.clone()).is_fat_present();
+        let mut part_controller = PartitionController::new(controller, start_lba, end_lba);
+        let mut sector = vec![0u8; 512];
+        part_controller.read(INFO_SECTOR, &mut sector);
+        let fat_present = FileSystem::is_fat_present(sector);
         Partition {
             parent_drive_index,
             name,
             label: label.clone(),
             size: ((end_lba - start_lba) * 512),
-            controller: PartitionController::new(controller, start_lba, end_lba),
-            is_fat: FileSystem::new(label).is_fat_present(),
+            controller: part_controller,
+            is_fat: fat_present,
         }
     }
-    pub fn format(&mut self) -> Result<(), &'static str> {
+    pub fn format(&mut self) -> Result<(), FormatStatus> {
         if (self.is_fat == false) {
-            let mut fs = FileSystem::new(self.label.clone());
+            let mut fs = FileSystem::new(self.label.clone(), self.size);
             return fs.format_drive();
         }
-        Err("Drive is already formatted")
+        Err(FormatStatus::AlreadyFat32)
     }
-    pub fn force_format(&mut self) -> Result<(), &'static str> {
-        FileSystem::new(self.label.clone()).format_drive()
+    pub fn force_format(&mut self) -> Result<(), FormatStatus> {
+        FileSystem::new(self.label.clone(), self.size).format_drive()
     }
     pub fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         self.controller.read(sector, buffer);
     }
     pub fn write(&mut self, sector: u32, data: &[u8]) {
         self.controller.write(sector, data);
+    }
+    pub fn get_start_lba(&self) -> u32 {
+        self.controller.start_lba as u32
     }
 }
 pub struct PartitionController {
@@ -302,4 +326,10 @@ impl PartitionController {
         self.drive_controller.write(physical_sector as u32, data);
         Ok(())
     }
+}
+pub fn scan_for_efi_signature(buffer: &[u8]) -> Option<usize> {
+    let efi_sig: [u8; 8] = *b"EFI PART";
+
+    // Iterate over the buffer using an 8-byte sliding window to find the signature
+    buffer.windows(8).position(|window| window == efi_sig)
 }

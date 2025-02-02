@@ -265,7 +265,7 @@ impl DriveController for IdeController {
         // Check for the master drive
         if let Some(info) = IdeController::identify_drive(0) {
             if (info.capacity != 0) {
-                drive_list.push(Drive::new("".to_string(), info, Box::new(IdeController::new(DriveType::Master as u32))));
+                drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Master as u32))));
             }
         }
 
@@ -273,7 +273,7 @@ impl DriveController for IdeController {
         // Check for the slave drive
         if let Some(info) = IdeController::identify_drive(1) {
             if (info.capacity != 0) {
-                drive_list.push(Drive::new("".to_string(), info, Box::new(IdeController::new(DriveType::Slave as u32))));
+                drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Slave as u32))));
             }
         }
         drive_list

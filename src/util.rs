@@ -1,6 +1,8 @@
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
+use crate::drivers::drive::gpt::PARTITIONS;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
+use crate::file_system::file::{File, OpenFlags};
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
@@ -11,12 +13,13 @@ use bootloader::BootInfo;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
-use crate::drivers::drive::gpt::PARTITIONS;
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
 pub unsafe fn init(boot_info: &'static BootInfo) {
     let mut partitions = PARTITIONS.lock();
+    let mut drives = DRIVECOLLECTION.lock();
+
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
@@ -33,22 +36,29 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
 
     PCIBUS.lock().enumerate_pci();
     println!("PCI BUS enumerated");
-
-    partitions.enumerate_drives();
+    drives.enumerate_drives();
+    partitions.enumerate_parts();
     println!("Drives enumerated");
-    partitions.print_drives();
+    //drives.print_drives();
+    //partitions.print_parts();
 
 
     if let Some(part) = partitions.find_volume("B:".to_string()) {
         PARTITIONS.force_unlock();
-        match part.format() {
-            Ok(_) => { println!("Drive {} formatted successfully", part.label.clone()) }
-            Err(err) => println!("Error formatting drive {} {}", part.label.clone(), err),
+        match part.force_format() {
+            Ok(_) => {
+                println!("Drive {} formatted successfully", part.label.clone());
+                part.is_fat = true;
+            }
+            Err(err) => println!("Error formatting drive {} {}", part.label.clone(), err.to_str()),
         }
     } else {
         println!("failed to find drive B:");
     }
     println!("Init Done");
+    let path = "B:\\folder\\home\\test.txt";
+    let flags = [OpenFlags::ReadWrite, OpenFlags::CreateNew];
+    println!("{:#?}", File::open(path, &flags));
 
     *KERNEL_INITIALIZED.lock() = true;
 }

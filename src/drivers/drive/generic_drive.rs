@@ -2,14 +2,13 @@ use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 // Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
-use crate::file_system::fat::FileSystem;
 use crate::println;
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::mutex::Mutex;
 use spin::Lazy;
+use strum_macros::Display;
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -25,7 +24,21 @@ impl Controller {
         IdeController::enumerate_drives();
     }
 }
-
+#[derive(Debug, Display)]
+pub enum FormatStatus {
+    TooCorrupted,
+    AlreadyFat32,
+    DriveDoesntExist,
+}
+impl FormatStatus {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            FormatStatus::TooCorrupted => "The former Fat32 filesystem is too corrupted to be formatted by this OS please try a different formatter",
+            FormatStatus::AlreadyFat32 => "File already exists",
+            FormatStatus::DriveDoesntExist => "The drive specified could not be found"
+        }
+    }
+}
 pub enum DriveType {
     Master = 0xE0,
     Slave = 0xF0,
@@ -49,7 +62,7 @@ impl DriveInfo {
 }
 
 // All drives must implement this trait
-pub trait DriveController: Send + Sync{
+pub trait DriveController: Send + Sync {
     fn read(&mut self, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, sector: u32, data: &[u8]);
     fn enumerate_drives() -> Vec<Drive>
@@ -62,16 +75,16 @@ pub trait DriveController: Send + Sync{
 }
 
 pub struct Drive {
-    pub label: String,
     pub info: DriveInfo,
     pub controller: Box<dyn DriveController + Send>,
     pub is_fat: bool,
+    pub index: i64,
 }
 
 impl Drive {
-    pub fn new(label: String, info: DriveInfo, controller: Box<dyn DriveController + Send>) -> Self {
+    pub fn new(index: i64, info: DriveInfo, controller: Box<dyn DriveController + Send>) -> Self {
         Drive {
-            label,
+            index,
             info,
             controller,
             is_fat: false,
@@ -92,8 +105,8 @@ impl DriveCollection {
         }
     }
 
-    pub(crate) fn new_drive(&mut self, label: String, info: DriveInfo, controller: Box<dyn DriveController + Send>) {
-        let drive = Drive::new(label, info, controller);
+    pub(crate) fn new_drive(&mut self, index: i64, info: DriveInfo, controller: Box<dyn DriveController + Send>) {
+        let drive = Drive::new(index, info, controller);
         self.drives.push(drive);
     }
     pub(crate) fn enumerate_drives(&mut self) {
@@ -102,21 +115,11 @@ impl DriveCollection {
         //drives.extend(<AHCIController as DriveController>::enumerate_drives());
 
         for mut drive in drives {
-            if (drive.label == "") {
-                if let Some(label) = self.find_free_label() {
-                    drive.label = label;
-                    self.drives.push(drive);
-                }
+            if (drive.index == -1) {
+                drive.index = self.drives.len() as i64;
+                self.drives.push(drive);
             }
         }
-    }
-    pub fn find_drive(&mut self, label: String) -> Option<&mut Drive> {
-        for drive in self.drives.iter_mut() { // Iterate over mutable references
-            if drive.label == label {
-                return Some(drive); // Return the mutable reference
-            }
-        }
-        None
     }
     pub fn print_drives(&self) {
         if self.drives.is_empty() {
@@ -124,34 +127,9 @@ impl DriveCollection {
         } else {
             for (i, drive) in self.drives.iter().enumerate() {
                 println!("Drive {}:", i + 1);
-                println!("Label: {}", drive.label);
+                println!("Index: {}", drive.index);
                 drive.info.print(); // Call the print method of DriveInfo
             }
         }
-    }
-    pub fn find_free_label(&self) -> Option<String> {
-        let mut used_labels = [false; 26]; // A flag array for each letter A-Z
-
-        // Mark used labels
-        for drive in &self.drives {
-            if let Some(first_char) = drive.label.chars().next() {
-                if first_char.is_ascii_alphabetic() {
-                    let index = (first_char.to_ascii_uppercase() as u8 - b'A') as usize;
-                    if index < 26 {
-                        used_labels[index] = true;
-                    }
-                }
-            }
-        }
-
-        // Find the first unused label from A: to Z:
-        for i in 0..26 {
-            if !used_labels[i] {
-                let letter = (b'A' + i as u8) as char;
-                return Some(format!("{}:", letter)); // Correctly format the label (e.g., "A:")
-            }
-        }
-
-        None // No free label found
     }
 }
