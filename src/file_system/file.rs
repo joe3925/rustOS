@@ -1,6 +1,5 @@
 use crate::drivers::drive::gpt::PARTITIONS;
 use crate::file_system::fat::FileSystem;
-use crate::println;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
@@ -29,6 +28,7 @@ pub(crate) enum FileStatus {
     DriveNotFound,
     IncompatibleFlags,
     CorruptFat,
+    InternalError,
 }
 
 
@@ -42,7 +42,8 @@ impl FileStatus {
             FileStatus::NotFat => "The partition is unformatted or not supported",
             FileStatus::DriveNotFound => "The drive specified doesnt exist",
             FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFat => "The File Allocation Table is corrupt this drive should be reformated and backed up if still possible"
+            FileStatus::CorruptFat => "The File Allocation Table is corrupt this drive should be reformated and backed up if still possible",
+            FileStatus::InternalError => "An unknown Error has happened likely due to a code logic error"
         }
     }
 }
@@ -82,79 +83,82 @@ impl File {
         path: &str,
         flags: &[OpenFlags], // Accept flags as a slice
     ) -> Result<Self, FileStatus> {
-        let drive_letter = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::PathNotFound)?;
-        let path = Self::remove_drive_from_path(path);
-        if (flags.contains(&OpenFlags::Create) && flags.contains(&OpenFlags::CreateNew)) {
-            return Err(FileStatus::IncompatibleFlags);
-        }
-        let mut file_system = {
-            let mut partitions = PARTITIONS.lock();
-            if let Some(part) = partitions.find_volume(drive_letter.clone()) {
-                if !part.is_fat {
-                    return Err(FileStatus::NotFat); // Drive is not FAT
-                }
-                FileSystem::new(part.label.clone(), part.size)
-            } else {
-                return Err(FileStatus::DriveNotFound);
+        if let Some(drive_letter) = File::get_drive_letter(path.as_bytes())
+        {
+            let path = Self::remove_drive_from_path(path);
+            if (flags.contains(&OpenFlags::Create) && flags.contains(&OpenFlags::CreateNew)) {
+                return Err(FileStatus::IncompatibleFlags);
             }
-        };
-        // Check if the file exists
-        println!("here1");
-        let file_entry = file_system.find_file(path);
-        match file_entry {
-            Ok(file_entry) => {
-                if (!flags.contains(&OpenFlags::CreateNew)) {
-                    Ok(File {
-                        name: file_entry.file_name.clone(),
-                        extension: file_entry.file_extension.clone(),
-                        size: file_entry.file_size,
-                        starting_cluster: file_entry.starting_cluster,
-                        drive_label: file_entry.drive_label.clone(),
-                        path: path.to_string(),
-                        deleted: false,
-                    })
+            let mut file_system = {
+                let mut partitions = PARTITIONS.lock();
+                if let Some(part) = partitions.find_volume(drive_letter.clone()) {
+                    if !part.is_fat {
+                        return Err(FileStatus::NotFat); // Drive is not FAT
+                    }
+                    FileSystem::new(part.label.clone(), part.size)
                 } else {
-                    Err(FileStatus::FileAlreadyExist)
+                    return Err(FileStatus::DriveNotFound);
                 }
-            }
-            Err(FileStatus::PathNotFound) => {
-                // If file doesn't exist, check flags for creation
-                if flags.contains(&OpenFlags::Create) || flags.contains(&OpenFlags::CreateNew) {
-                    let name = FileSystem::file_parser(path);
-                    let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
-                    let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
+            };
+            // Check if the file exists
+            let file_entry = file_system.find_file(path);
+            match file_entry {
+                Ok(file_entry) => {
+                    if (!flags.contains(&OpenFlags::CreateNew)) {
+                        Ok(File {
+                            name: file_entry.file_name.clone(),
+                            extension: file_entry.file_extension.clone(),
+                            size: file_entry.file_size,
+                            starting_cluster: file_entry.starting_cluster,
+                            drive_label: file_entry.drive_label.clone(),
+                            path: path.to_string(),
+                            deleted: false,
+                        })
+                    } else {
+                        Err(FileStatus::FileAlreadyExist)
+                    }
+                }
+                Err(FileStatus::PathNotFound) => {
+                    // If file doesn't exist, check flags for creation
+                    if flags.contains(&OpenFlags::Create) || flags.contains(&OpenFlags::CreateNew) {
+                        let name = FileSystem::file_parser(path);
+                        let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
+                        let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
 
-                    file_system.create_dir(File::remove_file_from_path(path))?;
+                        file_system.create_dir(File::remove_file_from_path(path))?;
 
-                    match file_system.create_file(&file_name, &file_extension, path) {
-                        Ok(_) => {
-                            let file_entry = file_system.find_file(path);
-                            match file_entry {
-                                Ok(file_entry) => {
-                                    Ok(File {
-                                        name: file_entry.file_name.clone(),
-                                        extension: file_entry.file_extension.clone(),
-                                        size: file_entry.file_size,
-                                        starting_cluster: file_entry.starting_cluster,
-                                        drive_label: file_system.label.clone(),
-                                        path: path.to_string(),
-                                        deleted: false,
-                                    })
-                                }
-                                Err(e) => {
-                                    Err(e)
+                        match file_system.create_file(&file_name, &file_extension, path) {
+                            Ok(_) => {
+                                let file_entry = file_system.find_file(path);
+                                match file_entry {
+                                    Ok(file_entry) => {
+                                        Ok(File {
+                                            name: file_entry.file_name.clone(),
+                                            extension: file_entry.file_extension.clone(),
+                                            size: file_entry.file_size,
+                                            starting_cluster: file_entry.starting_cluster,
+                                            drive_label: file_system.label.clone(),
+                                            path: path.to_string(),
+                                            deleted: false,
+                                        })
+                                    }
+                                    Err(e) => {
+                                        Err(FileStatus::UnknownFail)
+                                    }
                                 }
                             }
+                            Err(status) => Err(status),
                         }
-                        Err(status) => Err(status),
+                    } else {
+                        Err(FileStatus::PathNotFound)
                     }
-                } else {
-                    Err(FileStatus::PathNotFound)
+                }
+                Err(e) => {
+                    Err(e)
                 }
             }
-            Err(e) => {
-                Err(e)
-            }
+        } else {
+            Err(FileStatus::PathNotFound)
         }
     }
 
@@ -167,10 +171,14 @@ impl File {
         }
     }
     pub fn remove_file_from_path(path: &str) -> &str {
-        if let Some(pos) = path.rfind('\\') {
-            &path[..pos]
+        let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
+
+        if parent.is_empty() {
+            "\\"
+        } else if parent == "\\\\" {
+            "\\"
         } else {
-            path
+            parent
         }
     }
 

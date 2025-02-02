@@ -58,7 +58,8 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     println!("Init Done");
     let path = "B:\\folder\\home\\test.txt";
     let flags = [OpenFlags::ReadWrite, OpenFlags::CreateNew];
-    println!("{:#?}", File::open(path, &flags));
+    let file = File::open(path, &flags).unwrap();
+    println!("{:#?}", file);
 
     *KERNEL_INITIALIZED.lock() = true;
 }

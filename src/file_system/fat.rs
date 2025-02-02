@@ -47,14 +47,14 @@ pub struct BIOSParameterBlock {
 }
 
 impl BIOSParameterBlock {
-    pub fn new(total_sectors: u32, fat_size: u32, root_cluster: u32) -> Self {
+    pub fn new(total_sectors: u32, fat_size: u32) -> Self {
         BIOSParameterBlock {
             jmp_boot: [0xEB, 0x58, 0x90],  // Standard jump code
             oem_name: *b"MSWIN4.1",     // Standard OEM name
             bytes_per_sector: 512,        // Standard sector size
             sectors_per_cluster: 64,      // Must be power of 2, chosen for performance
             reserved_sectors: 32,         // Typically 32 for FAT32
-            num_fats: 2,                  // Always 2 for redundancy
+            num_fats: 1,                  // Always 2 for redundancy
             root_entry_count: 0,          // Always 0 for FAT32
             total_sectors_16: 0,          // Use total_sectors_32 for FAT32
             media_descriptor: 0xF8,       // Fixed disk
@@ -66,7 +66,7 @@ impl BIOSParameterBlock {
             fat_size_32: fat_size,        // FAT size in sectors
             ext_flags: 0x0000,            // FAT mirroring enabled
             fs_version: 0x0000,           // FAT32 version 0.0
-            root_cluster,   // Typically starts at cluster 2
+            root_cluster: 2,              // Typically starts at cluster 2
             fs_info_sector: 1,            // FSINFO sector location
             backup_boot_sector: 6,        // Backup boot sector location
             reserved: [0; 12],            // Must be zero
@@ -77,6 +77,35 @@ impl BIOSParameterBlock {
             volume_label: *b"NO NAME    ", // Default volume label
             file_system_type: *b"FAT32   ", // FAT32 identifier
         }
+    }
+    pub fn write_to_buffer(&self, buffer: &mut [u8]) {
+        buffer[0..3].copy_from_slice(&self.jmp_boot);
+        buffer[3..11].copy_from_slice(&self.oem_name);
+        buffer[11..13].copy_from_slice(&self.bytes_per_sector.to_le_bytes());
+        buffer[13] = self.sectors_per_cluster;
+        buffer[14..16].copy_from_slice(&self.reserved_sectors.to_le_bytes());
+        buffer[16] = self.num_fats;
+        buffer[17..19].copy_from_slice(&self.root_entry_count.to_le_bytes());
+        buffer[19..21].copy_from_slice(&self.total_sectors_16.to_le_bytes());
+        buffer[21] = self.media_descriptor;
+        buffer[22..24].copy_from_slice(&self.fat_size_16.to_le_bytes());
+        buffer[24..26].copy_from_slice(&self.sectors_per_track.to_le_bytes());
+        buffer[26..28].copy_from_slice(&self.num_heads.to_le_bytes());
+        buffer[28..32].copy_from_slice(&self.hidden_sectors.to_le_bytes());
+        buffer[32..36].copy_from_slice(&self.total_sectors_32.to_le_bytes());
+        buffer[36..40].copy_from_slice(&self.fat_size_32.to_le_bytes());
+        buffer[40..42].copy_from_slice(&self.ext_flags.to_le_bytes());
+        buffer[42..44].copy_from_slice(&self.fs_version.to_le_bytes());
+        buffer[44..48].copy_from_slice(&self.root_cluster.to_le_bytes());
+        buffer[48..50].copy_from_slice(&self.fs_info_sector.to_le_bytes());
+        buffer[50..52].copy_from_slice(&self.backup_boot_sector.to_le_bytes());
+        buffer[52..64].copy_from_slice(&self.reserved);
+        buffer[64] = self.drive_number;
+        buffer[65] = self.reserved1;
+        buffer[66] = self.boot_signature;
+        buffer[67..71].copy_from_slice(&self.volume_id.to_le_bytes());
+        buffer[71..82].copy_from_slice(&self.volume_label);
+        buffer[82..90].copy_from_slice(&self.file_system_type);
     }
 }
 
@@ -170,21 +199,23 @@ impl FileSystem {
             part.read(1, &mut info_sec);
             //TODO: stop doing this
             unsafe { PARTITIONS.force_unlock(); }
-            if (Self::is_fat_present(info_sec) && false) {
+            if (Self::is_fat_present(info_sec)) {
                 let clusters = self.get_all_clusters(2);
                 //if the root directory has been corrupted remove what we can
                 if (*clusters.last().unwrap() == 0) {
                     //prevents a fault from the corrupted root dir
                     self.update_fat(2, 0xFFFFFFFF);
                 }
-                if self.remove_dir("\\".to_string()).is_err() {
+                let res = self.remove_dir("\\".to_string());
+                if res.is_err() {
                     return Err(TooCorrupted);
                 }
-                println!("dir gone");
             }
             let mut boot_buffer = vec![0u8; 512];
             let part_size = part.size;
             //self.calculate_data_region_start() - RESERVED_SECTORS;
+            let bpb = BIOSParameterBlock::new((part_size / 512) as u32, self.calculate_max_fat_size());
+            bpb.write_to_buffer(&mut boot_buffer);
             part.write(0, &boot_buffer);
 
             self.info.free_clusters = (part_size / CLUSTER_OFFSET as u64) as u32;
@@ -275,8 +306,13 @@ impl FileSystem {
                 Err(FileStatus::PathNotFound) => {
                     let free_cluster = self.find_free_cluster(0);
                     self.write_file_to_dir(files[i], r"", FileAttribute::Directory, free_cluster, current_cluster, 0)?;
-                    println!("cluster {}", free_cluster);
                     self.update_fat(free_cluster, 0xFFFFFFFF);
+                    let entry = self.file_present(files[i], FileAttribute::Directory, current_cluster);
+                    match entry {
+                        Ok(entry) => { current_cluster = entry.starting_cluster }
+                        Err(FileStatus::PathNotFound) => { return Err(FileStatus::InternalError) }
+                        Err(e) => { return Err(e) }
+                    }
                 }
                 Err(e) => {
                     return Err(e);
@@ -331,22 +367,31 @@ impl FileSystem {
                 file_entries.push(file_entry);
             }
         }
-
         Ok(file_entries)
     }
     pub fn remove_dir(&mut self, path: String) -> Result<(), FileStatus> {
         let dir = self.find_dir(path.clone().as_str())?;
         let files = self.read_dir(dir.starting_cluster)?;
+        let mut entry_path = path.clone();
         for entry in files {
-            println!("{:#?}", entry.file_name);
+            if entry_path == "\\" {
+                entry_path = path.clone() + &entry.file_name;
+            } else {
+                if !entry_path.ends_with("\\") {
+                    entry_path.push('\\'); // Ensure only one backslash
+                }
+                entry_path += &entry.file_name;
+            }
 
-            let entry_path = (path.clone() + "\\" + entry.file_name.as_str().clone());
+            if entry.attributes == u8::from(FileAttribute::Archive) {
+                entry_path.push('.');
+                entry_path += &entry.file_extension;
+            }
 
             if (entry.attributes == u8::from(FileAttribute::Archive)) {
                 self.delete_file(&entry_path)?;
             } else if (entry.attributes == u8::from(FileAttribute::Directory)) {
                 self.remove_dir(entry_path.clone())?;
-                self.delete_file(&entry_path)?;
             }
         }
         self.delete_file(path.as_str())?;
@@ -387,8 +432,10 @@ impl FileSystem {
         starting_cluster: u32)
         -> Result<FileEntry, FileStatus> {
         let clusters = self.get_all_clusters(starting_cluster);
+
         for i in 0..clusters.len() {
             let dir = self.read_dir(clusters[i])?;
+
             for j in 0..dir.len() {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
@@ -405,7 +452,7 @@ impl FileSystem {
         for i in 0..files.len() {
             let mut attribute = FileAttribute::Directory;
             if (i == files.len() - 1) {
-                if (Self::get_text_after_last_dot(files[0]) == "") {
+                if (Self::get_text_after_last_dot(files.last().unwrap()) == "") {
                     return Ok(FileEntry {
                         file_name: "".to_string(),
                         file_extension: "".to_string(),
@@ -497,6 +544,8 @@ impl FileSystem {
 
                 Ok(())
             }
+            Err(FileStatus::PathNotFound) => { Err(FileStatus::InternalError) }
+
             Err(err) => { Err(err) }
         }
     }
@@ -584,11 +633,16 @@ impl FileSystem {
         return Ok(file_data);
     }
     pub fn delete_file(&mut self, path: &str) -> Result<(), FileStatus> {
-        let entry = self.find_file(path)?;
-        let clusters = self.get_all_clusters(entry.starting_cluster);
-        for cluster in clusters {
-            self.update_fat(cluster, 0x00000000);
+        let mut entry;
+        if (path == "\\") {
+            return Ok(());
         }
+        if (Self::get_text_after_last_dot(path) == "") {
+            entry = self.find_dir(path)?;
+        } else {
+            entry = self.find_file(path)?;
+        }
+        let clusters = self.get_all_clusters(entry.starting_cluster);
         let empty_entry = FileEntry {
             file_name: "".to_string(),
             file_extension: "".to_string(),
@@ -601,13 +655,17 @@ impl FileSystem {
             file_size: 0,
             drive_label: "".to_string(),
         };
-        if (self.update_dir_entry(path, empty_entry, entry.starting_cluster).is_err()) {
+        let res = self.update_dir_entry(path, empty_entry, entry.starting_cluster);
+        if (res.is_err()) {
             Err(FileStatus::UnknownFail)
         } else {
+            for cluster in clusters {
+                self.update_fat(cluster, 0x00000000);
+            }
             Ok(())
         }
     }
-    //set ignore cluster to 0 to ignore no clusters
+    ///set ignore cluster to 0 to ignore no clusters
     fn find_free_cluster(&mut self, ignore_cluster: u32) -> u32 {
         let fat_sectors = self.calculate_max_fat_size();
         let mut partitions = PARTITIONS.lock();
@@ -615,7 +673,6 @@ impl FileSystem {
             for i in 0..fat_sectors {
                 let mut buffer = vec![0u8; 512];
                 part.read(i + RESERVED_SECTORS, &mut buffer);
-                println!("Sector starts: {:#x}", (i + part.get_start_lba()) * 512);
                 for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
                     let entry = u32::from_le_bytes([
                         buffer[j * 4],
