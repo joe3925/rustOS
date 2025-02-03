@@ -106,11 +106,11 @@ impl File {
                 Ok(file_entry) => {
                     if (!flags.contains(&OpenFlags::CreateNew)) {
                         Ok(File {
-                            name: file_entry.file_name.clone(),
-                            extension: file_entry.file_extension.clone(),
-                            size: file_entry.file_size,
-                            starting_cluster: file_entry.starting_cluster,
-                            drive_label: file_entry.drive_label.clone(),
+                            name: file_entry.get_name().clone(),
+                            extension: file_entry.get_extension().clone(),
+                            size: file_entry.file_size as u64,
+                            starting_cluster: file_entry.get_cluster(),
+                            drive_label: drive_letter.clone(),
                             path: path.to_string(),
                             deleted: false,
                         })
@@ -133,10 +133,10 @@ impl File {
                                 match file_entry {
                                     Ok(file_entry) => {
                                         Ok(File {
-                                            name: file_entry.file_name.clone(),
-                                            extension: file_entry.file_extension.clone(),
-                                            size: file_entry.file_size,
-                                            starting_cluster: file_entry.starting_cluster,
+                                            name: file_entry.get_name().clone(),
+                                            extension: file_entry.get_extension().clone(),
+                                            size: file_entry.file_size as u64,
+                                            starting_cluster: file_entry.get_cluster(),
                                             drive_label: file_system.label.clone(),
                                             path: path.to_string(),
                                             deleted: false,

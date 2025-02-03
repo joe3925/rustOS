@@ -109,20 +109,90 @@ impl BIOSParameterBlock {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileEntry {
-    pub file_name: String,          // 0x00 - 0x17 : 24 bytes
-    pub(crate) file_extension: String,     // 0x18 - 0x2F : 24 bytes
-    pub attributes: u8,             // 0x30        : 1 byte
-    // 3 bytes padding for alignment          : 0x31 - 0x33
-    creation_date: String,      // 0x34 - 0x4B : 24 bytes
-    creation_time: String,      // 0x4C - 0x63 : 24 bytes
-    last_modified_date: String, // 0x64 - 0x7B : 24 bytes
-    last_modified_time: String, // 0x7C - 0x93 : 24 bytes
-    pub(crate) starting_cluster: u32,      // 0x94 - 0x97 : 4 bytes
-    pub(crate) file_size: u64,             // 0x98 - 0x9F : 8 bytes
-    pub(crate) drive_label: String,
+    name: [u8; 8],         // DIR_Name (first 8 bytes - filename)
+    extension: [u8; 3],    // DIR_Name (last 3 bytes - extension)
+    attributes: u8,        // DIR_Attr
+    nt_reserved: u8,       // DIR_NTRes
+    creation_time_tenth: u8, // DIR_CrtTimeTenth
+    creation_time: u16,    // DIR_CrtTime
+    creation_date: u16,    // DIR_CrtDate
+    last_access_date: u16, // DIR_LstAccDate
+    first_cluster_high: u16, // DIR_FstClusHI
+    write_time: u16,       // DIR_WrtTime
+    write_date: u16,       // DIR_WrtDate
+    first_cluster_low: u16, // DIR_FstClusLO
+    pub(crate) file_size: u32,        // DIR_FileSize
 }
+
+impl FileEntry {
+    /// Parses a 32-byte buffer into a `FileEntry`
+    pub fn from_buffer(buffer: &[u8]) -> Self {
+        assert!(buffer.len() >= 32, "Buffer must be at least 32 bytes");
+
+        FileEntry {
+            name: buffer[0..8].try_into().unwrap(),
+            extension: buffer[8..11].try_into().unwrap(),
+            attributes: buffer[11],
+            nt_reserved: buffer[12],
+            creation_time_tenth: buffer[13],
+            creation_time: u16::from_le_bytes([buffer[14], buffer[15]]),
+            creation_date: u16::from_le_bytes([buffer[16], buffer[17]]),
+            last_access_date: u16::from_le_bytes([buffer[18], buffer[19]]),
+            first_cluster_high: u16::from_le_bytes([buffer[20], buffer[21]]),
+            write_time: u16::from_le_bytes([buffer[22], buffer[23]]),
+            write_date: u16::from_le_bytes([buffer[24], buffer[25]]),
+            first_cluster_low: u16::from_le_bytes([buffer[26], buffer[27]]),
+            file_size: u32::from_le_bytes([buffer[28], buffer[29], buffer[30], buffer[31]]),
+        }
+    }
+
+    /// Creates a blank `FileEntry` with only a name and starting cluster set
+    pub fn new(name: &str, extension: &str, starting_cluster: u32) -> Self {
+        let mut name_arr = [b' '; 8]; // Default spaces for padding
+        let mut ext_arr = [b' '; 3];  // Default spaces for padding
+
+        let name_bytes = name.as_bytes();
+        let ext_bytes = extension.as_bytes();
+
+        name_arr[..name_bytes.len().min(8)].copy_from_slice(&name_bytes[..name_bytes.len().min(8)]);
+        ext_arr[..ext_bytes.len().min(3)].copy_from_slice(&ext_bytes[..ext_bytes.len().min(3)]);
+
+        FileEntry {
+            name: name_arr,
+            extension: ext_arr,
+            attributes: 0x20, // Default to ATTR_ARCHIVE
+            nt_reserved: 0,
+            creation_time_tenth: 0,
+            creation_time: 0,
+            creation_date: 0,
+            last_access_date: 0,
+            first_cluster_high: ((starting_cluster >> 16) & 0xFFFF) as u16,
+            write_time: 0,
+            write_date: 0,
+            first_cluster_low: (starting_cluster & 0xFFFF) as u16,
+            file_size: 0, // Default size 0
+        }
+    }
+
+    /// Extracts the file name as a `String`
+    pub fn get_name(&self) -> String {
+        let name_trimmed = self.name.iter().take_while(|&&c| c != b' ').copied().collect::<Vec<_>>();
+        String::from_utf8_lossy(&name_trimmed).to_string()
+    }
+
+    /// Extracts the file extension as a `String`
+    pub fn get_extension(&self) -> String {
+        let ext_trimmed = self.extension.iter().take_while(|&&c| c != b' ').copied().collect::<Vec<_>>();
+        String::from_utf8_lossy(&ext_trimmed).to_string()
+    }
+    /// Returns the first cluster number as a `u32`
+    pub fn get_cluster(&self) -> u32 {
+        ((self.first_cluster_high as u32) << 16) | (self.first_cluster_low as u32)
+    }
+}
+
 
 #[repr(C, packed)]
 struct InfoSector {
@@ -298,21 +368,26 @@ impl FileSystem {
     pub fn create_dir(&mut self, path: &str) -> Result<(), FileStatus> {
         let files = FileSystem::file_parser(path);
         let mut current_cluster = 2;
+
         for i in 0..files.len() {
             match self.file_present(files[i], FileAttribute::Directory, current_cluster) {
                 Ok(file) => {
-                    current_cluster = file.starting_cluster;
+                    current_cluster = file.get_cluster();
                 }
                 Err(FileStatus::PathNotFound) => {
                     let free_cluster = self.find_free_cluster(0);
-                    self.write_file_to_dir(files[i], r"", FileAttribute::Directory, free_cluster, current_cluster, 0)?;
+                    self.write_file_to_dir(files[i], "", FileAttribute::Directory, free_cluster, current_cluster, 0)?;
                     self.update_fat(free_cluster, 0xFFFFFFFF);
+
                     let entry = self.file_present(files[i], FileAttribute::Directory, current_cluster);
                     match entry {
-                        Ok(entry) => { current_cluster = entry.starting_cluster }
+                        Ok(entry) => { current_cluster = entry.get_cluster() }
                         Err(FileStatus::PathNotFound) => { return Err(FileStatus::InternalError) }
                         Err(e) => { return Err(e) }
                     }
+
+                    // Initialize the new directory structure
+                    self.initialize_directory(free_cluster, current_cluster)?;
                 }
                 Err(e) => {
                     return Err(e);
@@ -321,6 +396,22 @@ impl FileSystem {
         }
         Ok(())
     }
+
+    fn initialize_directory(&mut self, new_cluster: u32, parent_cluster: u32) -> Result<(), FileStatus> {
+        // Ensure the directory cluster is allocated and initialized to zero
+        let empty_buffer = vec!(0u8; CLUSTER_OFFSET as usize);
+        self.write_cluster(new_cluster, &empty_buffer)?;
+
+        // Create the '.' entry (self-reference)
+        self.write_file_to_dir(".", "", FileAttribute::Directory, new_cluster, new_cluster, 0)?;
+
+        // Create the '..' entry (parent reference)
+        let parent_cluster_ref = if new_cluster == 2 { 0 } else { parent_cluster };
+        self.write_file_to_dir("..", "", FileAttribute::Directory, parent_cluster_ref, new_cluster, 0)?;
+
+        Ok(())
+    }
+
     pub fn read_dir(
         &mut self,
         starting_cluster: u32,
@@ -336,34 +427,13 @@ impl FileSystem {
 
             for i in (0..root_dir.len()).step_by(entry_size) {
                 if root_dir[i] == 0x00 {
-                    continue;
+                    continue; // Empty entry, skip
                 } else if root_dir[i] == 0xE5 {
-                    continue;
+                    continue; // Deleted entry, skip
                 }
 
-                let file_name = String::from_utf8_lossy(&root_dir[i..i + 8]).trim().to_string();
-                let file_extension = String::from_utf8_lossy(&root_dir[i + 8..i + 11]).trim().to_string();
-                let attributes = root_dir[i + 11];
-                let starting_cluster = u32::from_le_bytes([root_dir[i + 26], root_dir[i + 27], 0, 0]);
-                let file_size = u64::from_le_bytes([
-                    root_dir[i + 28], root_dir[i + 29], root_dir[i + 30], root_dir[i + 31],
-                    0, 0, 0, 0,
-                ]);
-
-                let file_entry = FileEntry {
-                    file_name,
-                    file_extension,
-                    attributes,
-                    creation_date: "".to_string(),  // Placeholder for creation date/time
-                    creation_time: "".to_string(),  // Placeholder for creation date/time
-                    last_modified_date: "".to_string(),
-                    last_modified_time: "".to_string(),
-                    starting_cluster,
-                    file_size,
-                    drive_label: self.label.clone(),
-                };
-
-
+                let file_entry = FileEntry::from_buffer(&root_dir[i..i + entry_size]);
+                println!("{:#?}", file_entry.get_name());
                 file_entries.push(file_entry);
             }
         }
@@ -371,26 +441,26 @@ impl FileSystem {
     }
     pub fn remove_dir(&mut self, path: String) -> Result<(), FileStatus> {
         let dir = self.find_dir(path.clone().as_str())?;
-        let files = self.read_dir(dir.starting_cluster)?;
+        let files = self.read_dir(dir.get_cluster())?;
         let mut entry_path = path.clone();
         for entry in files {
             if entry_path == "\\" {
-                entry_path = path.clone() + &entry.file_name;
+                entry_path = path.clone() + &entry.get_name();
             } else {
                 if !entry_path.ends_with("\\") {
                     entry_path.push('\\'); // Ensure only one backslash
                 }
-                entry_path += &entry.file_name;
+                entry_path += &entry.get_name();
             }
 
             if entry.attributes == u8::from(FileAttribute::Archive) {
                 entry_path.push('.');
-                entry_path += &entry.file_extension;
+                entry_path += &entry.get_extension();
             }
 
             if (entry.attributes == u8::from(FileAttribute::Archive)) {
                 self.delete_file(&entry_path)?;
-            } else if (entry.attributes == u8::from(FileAttribute::Directory)) {
+            } else if (entry.attributes == u8::from(FileAttribute::Directory) && ((entry.get_name() != "..") || (entry.get_name() != "."))) {
                 self.remove_dir(entry_path.clone())?;
             }
         }
@@ -439,7 +509,7 @@ impl FileSystem {
             for j in 0..dir.len() {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
-                if (dir[j].file_name == name && dir[j].file_extension == extension && file_attribute as u8 == dir[j].attributes) {
+                if (dir[j].get_name() == name && dir[j].get_extension() == extension && file_attribute as u8 == dir[j].attributes) {
                     return Ok(dir[j].clone());
                 }
             }
@@ -453,18 +523,9 @@ impl FileSystem {
             let mut attribute = FileAttribute::Directory;
             if (i == files.len() - 1) {
                 if (Self::get_text_after_last_dot(files.last().unwrap()) == "") {
-                    return Ok(FileEntry {
-                        file_name: "".to_string(),
-                        file_extension: "".to_string(),
-                        attributes: u8::from(FileAttribute::Directory),
-                        creation_date: "".to_string(),
-                        creation_time: "".to_string(),
-                        last_modified_date: "".to_string(),
-                        last_modified_time: "".to_string(),
-                        starting_cluster: 2,
-                        file_size: 0,
-                        drive_label: "".to_string(),
-                    });
+                    let mut root_dir = FileEntry::new("", "", 2);
+                    root_dir.attributes = u8::from(FileAttribute::Directory);
+                    return Ok(root_dir);
                 }
                 attribute = FileAttribute::Archive;
             }
@@ -472,7 +533,7 @@ impl FileSystem {
             if (attribute as u8 == FileAttribute::Archive as u8) {
                 return Ok(current_file);
             } else {
-                current_cluster = current_file.starting_cluster;
+                current_cluster = current_file.get_cluster();
             }
         }
         Err(FileStatus::PathNotFound)
@@ -482,18 +543,9 @@ impl FileSystem {
         path: &str,
     ) -> Result<FileEntry, FileStatus> {
         if (path == "\\") {
-            return Ok(FileEntry {
-                file_name: "".to_string(),
-                file_extension: "".to_string(),
-                attributes: u8::from(FileAttribute::Directory),
-                creation_date: "".to_string(),
-                creation_time: "".to_string(),
-                last_modified_date: "".to_string(),
-                last_modified_time: "".to_string(),
-                starting_cluster: 2,
-                file_size: 0,
-                drive_label: "".to_string(),
-            });
+            let mut root_dir = FileEntry::new("", "", 2);
+            root_dir.attributes = u8::from(FileAttribute::Directory);
+            return Ok(root_dir);
         }
         let files = Self::file_parser(path);
         let mut current_cluster = 2;
@@ -505,7 +557,7 @@ impl FileSystem {
             if i == files.len() - 1 {
                 return Ok(current_file);
             } else {
-                current_cluster = current_file.starting_cluster;
+                current_cluster = current_file.get_cluster();
             }
         }
         Err(UnknownFail)
@@ -538,7 +590,7 @@ impl FileSystem {
                     file_extension,
                     FileAttribute::Archive,
                     free_cluster,
-                    dir.starting_cluster,
+                    dir.get_cluster(),
                     0,
                 )?;
 
@@ -559,11 +611,11 @@ impl FileSystem {
         let mut file_entry = self.find_file(path)?;
         let cluster_size = CLUSTER_OFFSET as usize;
         let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
-        let old_clusters = self.get_all_clusters(file_entry.starting_cluster);
+        let old_clusters = self.get_all_clusters(file_entry.get_cluster());
         let old_clusters_needed = old_clusters.len();
 
         let mut buffer = vec![0u8; cluster_size];
-        let mut current_cluster = file_entry.starting_cluster;
+        let mut current_cluster = file_entry.get_cluster();
 
         // Write data to the existing clusters
         for i in 0..new_clusters_needed {
@@ -598,8 +650,8 @@ impl FileSystem {
             }
         }
 
-        file_entry.file_size = file_data.len() as u64;
-        let starting_cluster = file_entry.starting_cluster;
+        file_entry.file_size = file_data.len() as u32;
+        let starting_cluster = file_entry.get_cluster();
         if (self.update_dir_entry(path, file_entry, starting_cluster).is_err()) {
             return Err(FileStatus::UnknownFail);
         }
@@ -613,8 +665,8 @@ impl FileSystem {
     ) -> Result<Vec<u8>, FileStatus> {
         let entry = self.find_file(path)?;
         let mut file_data = vec![0u8; entry.file_size as usize];
-        let remainder = entry.file_size % CLUSTER_OFFSET as u64;
-        let clusters = self.get_all_clusters(entry.starting_cluster);
+        let remainder = entry.file_size % CLUSTER_OFFSET;
+        let clusters = self.get_all_clusters(entry.get_cluster());
         for i in 0..clusters.len() {
             let mut cluster = vec!(0u8; CLUSTER_OFFSET as usize);
             self.read_cluster(clusters[i], &mut cluster)?;
@@ -642,20 +694,9 @@ impl FileSystem {
         } else {
             entry = self.find_file(path)?;
         }
-        let clusters = self.get_all_clusters(entry.starting_cluster);
-        let empty_entry = FileEntry {
-            file_name: "".to_string(),
-            file_extension: "".to_string(),
-            attributes: 0,
-            creation_date: "".to_string(),
-            creation_time: "".to_string(),
-            last_modified_date: "".to_string(),
-            last_modified_time: "".to_string(),
-            starting_cluster: 0,
-            file_size: 0,
-            drive_label: "".to_string(),
-        };
-        let res = self.update_dir_entry(path, empty_entry, entry.starting_cluster);
+        let clusters = self.get_all_clusters(entry.get_cluster());
+        let empty_entry = FileEntry::new("", "", 0);
+        let res = self.update_dir_entry(path, empty_entry, entry.get_cluster());
         if (res.is_err()) {
             Err(FileStatus::UnknownFail)
         } else {
@@ -695,7 +736,7 @@ impl FileSystem {
         let dir_path = File::remove_file_from_path(path);
 
         let dir_entry = self.find_dir(dir_path)?; // Assuming a function exists to retrieve the directory entry
-        let dir_clusters = self.get_all_clusters(dir_entry.starting_cluster);
+        let dir_clusters = self.get_all_clusters(dir_entry.get_cluster());
         let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
 
         for cluster in dir_clusters {
@@ -728,13 +769,15 @@ impl FileSystem {
     fn write_file_entry_to_buffer(&self, buffer: &mut [u8], offset: usize, entry: &FileEntry) {
         // File name (8 bytes, space padded)
         let mut name_bytes = [0x20; 8]; // 0x20 is space
-        let name_slice = &entry.file_name.as_bytes()[0..entry.file_name.len().min(8)];
+        let binding = entry.get_name().clone();
+        let name_slice = &binding.as_bytes()[0..entry.get_name().len().min(8)];
         name_bytes[..name_slice.len()].copy_from_slice(name_slice);
         buffer[offset..offset + 8].copy_from_slice(&name_bytes);
 
         // File extension (3 bytes, space padded)
         let mut ext_bytes = [0x20; 3]; // 0x20 is space
-        let ext_slice = &entry.file_extension.as_bytes()[0..entry.file_extension.len().min(3)];
+        let binding = entry.get_extension().clone();
+        let ext_slice = &binding.as_bytes()[0..entry.get_extension().len().min(3)];
         ext_bytes[..ext_slice.len()].copy_from_slice(ext_slice);
         buffer[offset + 8..offset + 11].copy_from_slice(&ext_bytes);
 
@@ -747,7 +790,7 @@ impl FileSystem {
         }
 
         // Starting cluster (2 bytes, low 16 bits)
-        let cluster_bytes = (entry.starting_cluster as u16).to_le_bytes();
+        let cluster_bytes = (entry.get_cluster() as u16).to_le_bytes();
         buffer[offset + 26..offset + 28].copy_from_slice(&cluster_bytes);
 
         // File size (4 bytes)
