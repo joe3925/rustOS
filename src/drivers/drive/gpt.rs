@@ -11,6 +11,12 @@ use spin::Lazy;
 pub static PARTITIONS: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
     Mutex::new(PartitionCollection::new())
 });
+pub struct Gpt {
+    /// The GPT header
+    pub header: GptHeader,
+    /// A vector of GPT partition entries
+    pub entries: Vec<GptPartitionEntry>,
+}
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct GptHeader {
@@ -76,6 +82,18 @@ impl GptHeader {
             None
         }
     }
+    pub fn write_to_buffer(&self, buffer: &mut [u8]) -> Result<(), String> {
+        if buffer.len() < core::mem::size_of::<GptHeader>() {
+            return Err("Buffer is too small to write GptHeader.".to_string());
+        }
+
+        // Safety: Copy the struct into the buffer
+        unsafe {
+            core::ptr::write_unaligned(buffer.as_mut_ptr() as *mut GptHeader, *self);
+        }
+
+        Ok(())
+    }
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -116,26 +134,29 @@ impl GptPartitionEntry {
             },
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct GptDrive {
-    pub label: String,
-    pub info: DriveInfo,
-    pub partition_table: Vec<GptPartitionEntry>, // GPT-specific data
-    pub header: GptHeader,
-}
-
-impl GptDrive {
-    pub fn new(label: String, info: DriveInfo, header: GptHeader) -> Self {
-        GptDrive {
-            label,
-            info,
-            partition_table: Vec::new(),
-            header,
+    pub fn write_to_buffer(&self, buffer: &mut [u8]) -> Result<(), String> {
+        if buffer.len() < core::mem::size_of::<GptPartitionEntry>() {
+            return Err("Buffer is too small to write GptPartitionEntry.".to_string());
         }
+
+        // Copy the fields manually to ensure proper layout
+        buffer[0x00..0x10].copy_from_slice(&self.partition_type_guid);
+        buffer[0x10..0x20].copy_from_slice(&self.unique_partition_guid);
+        buffer[0x20..0x28].copy_from_slice(&self.first_lba.to_le_bytes());
+        buffer[0x28..0x30].copy_from_slice(&self.last_lba.to_le_bytes());
+        buffer[0x30..0x38].copy_from_slice(&self.attribute_flags.to_le_bytes());
+
+        // Partition name (convert u16 to little-endian bytes)
+        for (i, &ch) in self.partition_name.iter().enumerate() {
+            let start = 0x38 + i * 2;
+            let end = start + 2;
+            buffer[start..end].copy_from_slice(&ch.to_le_bytes());
+        }
+
+        Ok(())
     }
 }
+
 pub struct PartitionCollection {
     pub parts: Vec<Partition>,
 }
