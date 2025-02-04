@@ -14,6 +14,7 @@ use bootloader::BootInfo;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
+use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
@@ -43,10 +44,11 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     //drives.print_drives();
     //partitions.print_parts();
 
-
+    (drives.drives)[1].format_gpt().expect("TODO: panic message");
+    (drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
     if let Some(part) = partitions.find_volume("B:".to_string()) {
         PARTITIONS.force_unlock();
-        match part.force_format() {
+        match part.format() {
             Ok(_) => {
                 println!("Drive {} formatted successfully", part.label.clone());
                 part.is_fat = true;
@@ -58,8 +60,8 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     }
     println!("Init Done");
     let path = "B:\\FOLDE\\TEST.TXT";
-    let flags = [OpenFlags::ReadWrite, OpenFlags::CreateNew];
-    File::open(path, &flags).expect("");
+    let flags = [OpenFlags::ReadWrite];
+    println!("{:#?}", File::open(path, &flags).unwrap());
     //File::make_dir(path.to_string()).expect("TODO: panic message");
 
     *KERNEL_INITIALIZED.lock() = true;

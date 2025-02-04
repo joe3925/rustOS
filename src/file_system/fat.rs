@@ -257,7 +257,7 @@ impl FileSystem {
     pub fn is_fat_present(sector: Vec<u8>) -> bool {
         if let Some(info) = InfoSector::from_buffer(&sector) {
             let sig3 = info.signature3;
-            println!("sig1: {:#?}, sig2: {:#?}, sig3: {:#x}", info.signature1, info.signature2, sig3);
+            //println!("sig1: {:#?}, sig2: {:#?}, sig3: {:#x}", info.signature1, info.signature2, sig3);
             if (info.signature1 == [0x52, 0x52, 0x61, 0x41] && info.signature2 == [0x72, 0x72, 0x41, 0x61] && info.signature3 == 0xAA55) {
                 return true;
             }
@@ -284,7 +284,7 @@ impl FileSystem {
                 }
                 let res = self.remove_dir("\\".to_string());
                 if res.is_err() {
-                    println!("err: {}", res.unwrap_err().to_str());
+
                     return Err(TooCorrupted);
                 }
             }
@@ -389,7 +389,7 @@ impl FileSystem {
                 Err(FileStatus::PathNotFound) => {
                     let free_cluster = self.find_free_cluster(0);
                     // Create the directory entry in the parent directory
-                    println!("making dir {}", dir_name);
+
                     self.write_file_to_dir(
                         dir_name,
                         "",
@@ -465,7 +465,7 @@ impl FileSystem {
                 }
 
                 let file_entry = FileEntry::from_buffer(&root_dir[i..i + entry_size]);
-                println!("{:#?}", file_entry.get_name());
+
                 file_entries.push(file_entry);
             }
         }
@@ -500,7 +500,7 @@ impl FileSystem {
                     self.delete_file(&child_path)?;
                     continue;
                 }
-                println!("deleting {}", child_path);
+
                 self.remove_dir(child_path)?;
             }
         }
@@ -552,7 +552,7 @@ impl FileSystem {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
                 if(dir[j].get_name() == "TEST"){
-                    println!("Target name: {}, File name {}, Target ext {}, File ext {}",name, dir[j].get_name(), extension, dir[j].get_extension() );
+
                 }
                 if (dir[j].get_name() == name && dir[j].get_extension() == extension && file_attribute as u8 == dir[j].attributes) {
                     return Ok(dir[j].clone());
@@ -574,7 +574,7 @@ impl FileSystem {
             if (i == files.len() - 1) {
                 attribute = FileAttribute::Archive;
             }
-            println!("file: {}", files[i]);
+
             let current_file = self.file_present(files[i], attribute, current_cluster)?;
             if (i == files.len() - 1) {
                 return Ok(current_file);
@@ -1022,7 +1022,7 @@ impl FileSystem {
                     sector[sector_index + 3],
                 ]);
                 if entry != 0xFFFFFFFF && entry >= 0x00000002 {
-                    println!("{:#?}", entry);
+
 
                     out_vec.push(entry);
                 }else if(entry >= 0x00000002){

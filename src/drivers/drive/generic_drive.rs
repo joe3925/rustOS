@@ -5,12 +5,14 @@ use crate::drivers::pci::device_collection::Device;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::vec;
+use alloc::{format, vec};
 use alloc::vec::Vec;
 use spin::mutex::Mutex;
 use spin::Lazy;
 use strum_macros::Display;
 use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry};
+use embedded_crc32c::crc32c;
+use crate::drivers::drive::gpt::GptPartitionType::EfiSystemPartition;
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -94,13 +96,12 @@ impl Drive {
             gpt_data: None
         }
     }
-        /// Checks if the drive is using GPT by validating the header.
+    /// Checks if the drive is using GPT by validating the header.
         pub fn is_gpt(&mut self) -> bool {
             let mut buffer = vec![0u8; 512]; // GPT header is within the first sector (LBA 1)
             self.controller.read(1, &mut buffer);
 
-            if let Ok(gpt) = GptHeader::new(&buffer) {
-                self.gpt_data = Some(gpt);
+            if let Some(gpt) = GptHeader::new(&buffer) {
                 true
             } else {
                 false
@@ -142,15 +143,17 @@ impl Drive {
             for (i, entry) in partition_entries.iter().enumerate() {
                 entry.write_to_buffer(&mut partition_buffer[i * gpt_header.partition_entry_size as usize..])?;
             }
-            gpt_header.partition_crc32 = crc32fast::hash(&partition_buffer);
+            gpt_header.partition_crc32 = crc32c(&partition_buffer);
 
             let mut header_buffer = vec![0u8; sector_size];
             gpt_header.write_to_buffer(&mut header_buffer)?;
-            gpt_header.header_crc32 = crc32fast::hash(&header_buffer[0..gpt_header.header_size as usize]);
+            gpt_header.header_crc32 = crc32c(&header_buffer[0..gpt_header.header_size as usize]);
 
             self.controller.write(1, &header_buffer);
 
-            self.controller.write(2, &partition_buffer);
+            for sector in partition_buffer.chunks_exact(sector_size){
+                self.controller.write(2, &sector);
+            }
 
             self.controller.write((self.info.capacity / 512  - 1) as u32, &header_buffer);
 
@@ -158,11 +161,15 @@ impl Drive {
                 header: gpt_header,
                 entries: partition_entries,
             });
+            self.add_partition((256 * 1024 * 1024), EfiSystemPartition.to_u8_16(), "EFI_PART".to_string()).expect("TODO: panic message");
 
             Ok(())
         }
-        pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16]) -> Result<(), String> {
+        pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16], part_name: String) -> Result<(), String> {
             // Ensure GPT is initialized
+            if(part_name.len() > 72){
+                return Err("name too long".to_string());
+            }
             let gpt = match self.gpt_data.as_mut() {
                 Some(gpt) => gpt,
                 None => return Err("GPT is not initialized on this drive.".to_string()),
@@ -210,7 +217,7 @@ impl Drive {
                 first_lba: start_lba,
                 last_lba: start_lba + required_sectors - 1,
                 attribute_flags: 0,
-                partition_name: [0; 36], // UTF-16 partition name should be set
+                partition_name: name_to_utf16_fixed(part_name.as_str()), // UTF-16 partition name should be set
             };
 
             gpt.entries[entry_index] = new_partition;
@@ -219,21 +226,34 @@ impl Drive {
             for (i, entry) in gpt.entries.iter().enumerate() {
                 entry.write_to_buffer(&mut partition_buffer[i * gpt.header.partition_entry_size as usize..])?;
             }
-            gpt.header.partition_crc32 = crc32fast::hash(&partition_buffer);
+            gpt.header.partition_crc32 = crc32c(&partition_buffer);
 
             // Update GPT header CRC
             let mut header_buffer = vec![0u8; sector_size as usize];
             gpt.header.write_to_buffer(&mut header_buffer)?;
-            gpt.header.header_crc32 = crc32fast::hash(&header_buffer[0..gpt.header.header_size as usize]);
+            gpt.header.header_crc32 = crc32c(&header_buffer[0..gpt.header.header_size as usize]);
 
             // Write updated GPT structures to disk
-            self.controller.write(2, &partition_buffer);
+            for i in (0..partition_buffer.len()).step_by(sector_size as usize) {
+                let sector = &partition_buffer[i..i + sector_size as usize];
+                self.controller.write((i + 2) as u32, sector );
+            }
             self.controller.write(1, &header_buffer);
             self.controller.write((self.info.capacity / 512 - 1) as u32, &header_buffer); // Backup GPT
 
             Ok(())
         }
 
+}
+fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
+    let mut buffer = [0x0000; 36]; // Fill with null terminators
+    let utf16_iter = name.encode_utf16();
+
+    for (i, c) in utf16_iter.take(36).enumerate() {
+        buffer[i] = c;
+    }
+
+    buffer
 }
 
 

@@ -15,7 +15,7 @@ pc-keyboard = "0.7.0"
 bitflags = "2.6.0"
 strum = { version = "0.24", default-features = false, features = ["derive"] }
 strum_macros = { version = "0.24" }
-crc32fast = "1.4.2"
+embedded-crc32c = "0.1"
 
 [dependencies.lazy_static]
 version = "1.0"
