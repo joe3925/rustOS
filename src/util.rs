@@ -8,6 +8,7 @@ use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 use crate::{gdt, println};
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
 use bootloader::BootInfo;
 use core::arch::asm;
@@ -56,10 +57,10 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
         println!("failed to find drive B:");
     }
     println!("Init Done");
-    let path = "B:\\folder\\home\\test.txt";
+    let path = "B:\\FOLDE\\TEST.TXT";
     let flags = [OpenFlags::ReadWrite, OpenFlags::CreateNew];
-    let file = File::open(path, &flags).unwrap();
-    println!("{:#?}", file);
+    File::open(path, &flags).expect("");
+    //File::make_dir(path.to_string()).expect("TODO: panic message");
 
     *KERNEL_INITIALIZED.lock() = true;
 }

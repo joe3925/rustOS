@@ -1,8 +1,10 @@
+use alloc::format;
 use crate::drivers::drive::gpt::PARTITIONS;
-use crate::file_system::fat::FileSystem;
+use crate::file_system::fat::{FileEntry, FileSystem};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
+use crate::file_system::file::FileStatus::{BadPath, DriveNotFound, UnknownFail};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -29,6 +31,7 @@ pub(crate) enum FileStatus {
     IncompatibleFlags,
     CorruptFat,
     InternalError,
+    BadPath,
 }
 
 
@@ -43,7 +46,8 @@ impl FileStatus {
             FileStatus::DriveNotFound => "The drive specified doesnt exist",
             FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
             FileStatus::CorruptFat => "The File Allocation Table is corrupt this drive should be reformated and backed up if still possible",
-            FileStatus::InternalError => "An unknown Error has happened likely due to a code logic error"
+            FileStatus::InternalError => "An unknown Error has happened likely due to a code logic error",
+            FileStatus::BadPath => "File name must be no more then 8 chars file Extension must be no more then 3 chars and every letter must be capital"
         }
     }
 }
@@ -83,6 +87,7 @@ impl File {
         path: &str,
         flags: &[OpenFlags], // Accept flags as a slice
     ) -> Result<Self, FileStatus> {
+        Self::check_path(path)?;
         if let Some(drive_letter) = File::get_drive_letter(path.as_bytes())
         {
             let path = Self::remove_drive_from_path(path);
@@ -158,7 +163,7 @@ impl File {
                 }
             }
         } else {
-            Err(FileStatus::PathNotFound)
+            Err(FileStatus::DriveNotFound)
         }
     }
 
@@ -189,7 +194,7 @@ impl File {
             let mut partition = PARTITIONS.lock();
             if let Some(part) = partition.find_volume(self.drive_label.clone()) {
                 if !part.is_fat {
-                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                    return Err(FileStatus::NotFat); // Drive is not FAT
                 }
                 FileSystem::new(part.label.clone(), part.size)
             } else {
@@ -204,7 +209,7 @@ impl File {
             let mut partition = PARTITIONS.lock();
             if let Some(part) = partition.find_volume(self.drive_label.clone()) {
                 if !part.is_fat {
-                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                    return Err(FileStatus::NotFat); // Drive is not FAT
                 }
                 FileSystem::new(part.label.clone(), part.size)
             } else {
@@ -218,7 +223,7 @@ impl File {
             let mut partition = PARTITIONS.lock();
             if let Some(part) = partition.find_volume(self.drive_label.clone()) {
                 if !part.is_fat {
-                    return Err(FileStatus::UnknownFail); // Drive is not FAT
+                    return Err(FileStatus::NotFat); // Drive is not FAT
                 }
                 FileSystem::new(part.label.clone(), part.size)
             } else {
@@ -234,6 +239,53 @@ impl File {
             Err(_) => status,
         }
     }
+    pub fn remove_dir(path: String) -> Result<(), FileStatus> {
+        Self::check_path(path.as_str())?;
+        if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
+            let mut file_system = {
+                let mut partition = PARTITIONS.lock();
+                if let Some(part) = partition.find_volume(label) {
+                    if !part.is_fat {
+                        return Err(FileStatus::NotFat); // Drive is not FAT
+                    }
+                    FileSystem::new(part.label.clone(), part.size)
+                } else {
+                    return Err(FileStatus::UnknownFail);
+                }
+            };
+            file_system.remove_dir(Self::remove_drive_from_path(path.as_str()).to_string())?;
+        }
+        Err(FileStatus::DriveNotFound)
+    }
+    pub fn make_dir(path: String) -> Result<(), FileStatus>{
+        Self::check_path(path.as_str())?;
+        if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
+            let mut file_system = {
+                let mut partition = PARTITIONS.lock();
+                if let Some(part) = partition.find_volume(label) {
+                    if !part.is_fat {
+                        return Err(FileStatus::NotFat); // Drive is not FAT
+                    }
+                    FileSystem::new(part.label.clone(), part.size)
+                } else {
+                    return Err(FileStatus::UnknownFail);
+                }
+            };
+            file_system.create_dir(path.as_str())?;
+            match file_system.find_dir(path.as_str())  {
+                Ok(_) => {
+                    Ok(())
+                }
+                Err(_) => {
+                    Err(UnknownFail)
+                }
+            }
+
+        }else{
+            Err(DriveNotFound)
+        }
+
+    }
     pub fn get_drive_letter(path: &[u8]) -> Option<String> {
         // Ensure the path has at least 3 bytes: the letter, the colon, and the backslash.
         if path.len() >= 3 {
@@ -243,5 +295,43 @@ impl File {
         }
         None
     }
+    pub fn check_path(path: &str) -> Result<(), FileStatus> {
+        // Remove the drive letter from the path
+        let sanitized_path = File::remove_drive_from_path(path);
+
+        // Parse the path into individual components (directories and file name)
+        let components = FileSystem::file_parser(sanitized_path);
+
+        // Iterate through each component and validate it
+        for component in components {
+            // Extract name and extension (if applicable)
+            let name = FileSystem::get_text_before_last_dot(component);
+            let extension = FileSystem::get_text_after_last_dot(component);
+
+            // Validate the name length (directories should not have extensions)
+            if name.len() > 8 {
+                return Err(FileStatus::BadPath);
+            }
+
+            // Validate the extension length (only applicable to files)
+            if !extension.is_empty() && extension.len() > 3 {
+                return Err(FileStatus::BadPath);
+            }
+
+            // Check for lowercase letters in the name
+            if name.chars().any(|c| c.is_ascii_lowercase()) {
+                return Err(FileStatus::BadPath);
+            }
+
+            // Check for lowercase letters in the extension
+            if !extension.is_empty() && extension.chars().any(|c| c.is_ascii_lowercase()) {
+                return Err(FileStatus::BadPath);
+            }
+        }
+
+        Ok(())
+    }
+
+
 }
 

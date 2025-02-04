@@ -14,7 +14,8 @@ const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u32 = 32;
 pub const INFO_SECTOR: u32 = 1;
-
+const NUM_FATS: u8 = 1;
+const SECTOR_SIZE: u16 = 512;
 #[repr(C, packed)]
 pub struct BIOSParameterBlock {
     pub jmp_boot: [u8; 3],      // Jump instruction to bootstrap code
@@ -52,8 +53,8 @@ impl BIOSParameterBlock {
             jmp_boot: [0xEB, 0x58, 0x90],  // Standard jump code
             oem_name: *b"MSWIN4.1",     // Standard OEM name
             bytes_per_sector: 512,        // Standard sector size
-            sectors_per_cluster: 64,      // Must be power of 2, chosen for performance
-            reserved_sectors: 32,         // Typically 32 for FAT32
+            sectors_per_cluster: SECTORS_PER_CLUSTER as u8,      // Must be power of 2, chosen for performance
+            reserved_sectors: RESERVED_SECTORS as u16,         // Typically 32 for FAT32
             num_fats: 1,                  // Always 2 for redundancy
             root_entry_count: 0,          // Always 0 for FAT32
             total_sectors_16: 0,          // Use total_sectors_32 for FAT32
@@ -152,9 +153,11 @@ impl FileEntry {
     pub fn new(name: &str, extension: &str, starting_cluster: u32) -> Self {
         let mut name_arr = [b' '; 8]; // Default spaces for padding
         let mut ext_arr = [b' '; 3];  // Default spaces for padding
+        let name_upper = name.to_uppercase();
+        let ext_upper = extension.to_uppercase();
 
-        let name_bytes = name.as_bytes();
-        let ext_bytes = extension.as_bytes();
+        let name_bytes = name_upper.as_bytes();
+        let ext_bytes = ext_upper.as_bytes();
 
         name_arr[..name_bytes.len().min(8)].copy_from_slice(&name_bytes[..name_bytes.len().min(8)]);
         ext_arr[..ext_bytes.len().min(3)].copy_from_slice(&ext_bytes[..ext_bytes.len().min(3)]);
@@ -270,14 +273,18 @@ impl FileSystem {
             //TODO: stop doing this
             unsafe { PARTITIONS.force_unlock(); }
             if (Self::is_fat_present(info_sec)) {
+
                 let clusters = self.get_all_clusters(2);
+
                 //if the root directory has been corrupted remove what we can
                 if (*clusters.last().unwrap() == 0) {
                     //prevents a fault from the corrupted root dir
                     self.update_fat(2, 0xFFFFFFFF);
+
                 }
                 let res = self.remove_dir("\\".to_string());
                 if res.is_err() {
+                    println!("err: {}", res.unwrap_err().to_str());
                     return Err(TooCorrupted);
                 }
             }
@@ -319,7 +326,7 @@ impl FileSystem {
                     }
                 }
             }
-            //better then the alternative
+            //better than the alternative
             unsafe { PARTITIONS.force_unlock(); }
             //reserve sectors
             self.update_fat(0, 0xFFFFFFFF);
@@ -365,52 +372,77 @@ impl FileSystem {
             part.write(sector_number, &mut buffer);
         }
     }
+    fn get_fat_start(&self, fat_number: u8) -> u32{
+        (self.calculate_max_fat_size() * (fat_number) as u32) + RESERVED_SECTORS
+    }
     pub fn create_dir(&mut self, path: &str) -> Result<(), FileStatus> {
         let files = FileSystem::file_parser(path);
-        let mut current_cluster = 2;
+        let mut current_cluster = 2; // Assuming cluster 2 is the root
 
-        for i in 0..files.len() {
-            match self.file_present(files[i], FileAttribute::Directory, current_cluster) {
+        for dir_name in files {
+            // Preserve the parent's cluster before creating a new directory
+            let parent_cluster = current_cluster;
+            match self.file_present(dir_name, FileAttribute::Directory, parent_cluster) {
                 Ok(file) => {
                     current_cluster = file.get_cluster();
                 }
                 Err(FileStatus::PathNotFound) => {
                     let free_cluster = self.find_free_cluster(0);
-                    self.write_file_to_dir(files[i], "", FileAttribute::Directory, free_cluster, current_cluster, 0)?;
+                    // Create the directory entry in the parent directory
+                    println!("making dir {}", dir_name);
+                    self.write_file_to_dir(
+                        dir_name,
+                        "",
+                        FileAttribute::Directory,
+                        free_cluster,
+                        parent_cluster,
+                        0,
+                    )?;
                     self.update_fat(free_cluster, 0xFFFFFFFF);
 
-                    let entry = self.file_present(files[i], FileAttribute::Directory, current_cluster);
-                    match entry {
-                        Ok(entry) => { current_cluster = entry.get_cluster() }
-                        Err(FileStatus::PathNotFound) => { return Err(FileStatus::InternalError) }
-                        Err(e) => { return Err(e) }
-                    }
-
-                    // Initialize the new directory structure
-                    self.initialize_directory(free_cluster, current_cluster)?;
+                    // Initialize the new directory structure with the correct parent reference.
+                    // Notice: We pass parent_cluster, not free_cluster, as the parent.
+                    self.initialize_directory(free_cluster, parent_cluster)?;
+                    current_cluster = free_cluster;
                 }
-                Err(e) => {
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
     }
 
     fn initialize_directory(&mut self, new_cluster: u32, parent_cluster: u32) -> Result<(), FileStatus> {
-        // Ensure the directory cluster is allocated and initialized to zero
-        let empty_buffer = vec!(0u8; CLUSTER_OFFSET as usize);
+        // Zero out the new directory cluster.
+        let empty_buffer = vec![0u8; CLUSTER_OFFSET as usize];
         self.write_cluster(new_cluster, &empty_buffer)?;
 
         // Create the '.' entry (self-reference)
-        self.write_file_to_dir(".", "", FileAttribute::Directory, new_cluster, new_cluster, 0)?;
+        self.write_file_to_dir(
+            ".",
+            "",
+            FileAttribute::Directory,
+            new_cluster,
+            new_cluster,
+            0,
+        )?;
+
+        // For the '..' entry, if the parent is the root directory (usually cluster 2),
+        // set the cluster reference to 0 as required.
+        let parent_cluster_ref = if parent_cluster == 2 { 0 } else { parent_cluster };
 
         // Create the '..' entry (parent reference)
-        let parent_cluster_ref = if new_cluster == 2 { 0 } else { parent_cluster };
-        self.write_file_to_dir("..", "", FileAttribute::Directory, parent_cluster_ref, new_cluster, 0)?;
+        self.write_file_to_dir(
+            "..",
+            "",
+            FileAttribute::Directory,
+            parent_cluster_ref,
+            new_cluster,
+            0,
+        )?;
 
         Ok(())
     }
+
 
     pub fn read_dir(
         &mut self,
@@ -440,31 +472,41 @@ impl FileSystem {
         Ok(file_entries)
     }
     pub fn remove_dir(&mut self, path: String) -> Result<(), FileStatus> {
-        let dir = self.find_dir(path.clone().as_str())?;
+        // Get the directory and its contents.
+        let dir = self.find_dir(&path)?;
         let files = self.read_dir(dir.get_cluster())?;
-        let mut entry_path = path.clone();
+
         for entry in files {
-            if entry_path == "\\" {
-                entry_path = path.clone() + &entry.get_name();
-            } else {
-                if !entry_path.ends_with("\\") {
-                    entry_path.push('\\'); // Ensure only one backslash
-                }
-                entry_path += &entry.get_name();
+            // Skip the current and parent directory entries.
+            if entry.get_name() == "." || entry.get_name() == ".." {
+                continue;
             }
+
+            // Build the child path.
+            let child_path = if path == "\\" {
+                // If the parent path is the root "\" then simply prepend it.
+                format!("\\{}", entry.get_name())
+            } else {
+                // Otherwise, combine parent and child with a single backslash.
+                format!("{}\\{}", path, entry.get_name())
+            };
 
             if entry.attributes == u8::from(FileAttribute::Archive) {
-                entry_path.push('.');
-                entry_path += &entry.get_extension();
-            }
-
-            if (entry.attributes == u8::from(FileAttribute::Archive)) {
-                self.delete_file(&entry_path)?;
-            } else if (entry.attributes == u8::from(FileAttribute::Directory) && ((entry.get_name() != "..") || (entry.get_name() != "."))) {
-                self.remove_dir(entry_path.clone())?;
+                // For files, append the extension.
+                let file_path = format!("{}.{}", child_path, entry.get_extension());
+                self.delete_file(&file_path)?;
+            } else if entry.attributes == u8::from(FileAttribute::Directory) {
+                if(entry.get_name() == ".." || entry.get_name() == "."){
+                    self.delete_file(&child_path)?;
+                    continue;
+                }
+                println!("deleting {}", child_path);
+                self.remove_dir(child_path)?;
             }
         }
-        self.delete_file(path.as_str())?;
+
+        // Remove the (now empty) directory.
+        self.delete_file(&path)?;
         Ok(())
     }
     pub(crate) fn file_parser(path: &str) -> Vec<&str> {
@@ -509,6 +551,9 @@ impl FileSystem {
             for j in 0..dir.len() {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
+                if(dir[j].get_name() == "TEST"){
+                    println!("Target name: {}, File name {}, Target ext {}, File ext {}",name, dir[j].get_name(), extension, dir[j].get_extension() );
+                }
                 if (dir[j].get_name() == name && dir[j].get_extension() == extension && file_attribute as u8 == dir[j].attributes) {
                     return Ok(dir[j].clone());
                 }
@@ -519,18 +564,19 @@ impl FileSystem {
     pub(crate) fn find_file(&mut self, path: &str) -> Result<FileEntry, FileStatus> {
         let files = Self::file_parser(path);
         let mut current_cluster = 2;
+        if (path == "\\") {
+            let mut root_dir = FileEntry::new("", "", 2);
+            root_dir.attributes = u8::from(FileAttribute::Directory);
+            return Ok(root_dir);
+        }
         for i in 0..files.len() {
             let mut attribute = FileAttribute::Directory;
             if (i == files.len() - 1) {
-                if (Self::get_text_after_last_dot(files.last().unwrap()) == "") {
-                    let mut root_dir = FileEntry::new("", "", 2);
-                    root_dir.attributes = u8::from(FileAttribute::Directory);
-                    return Ok(root_dir);
-                }
                 attribute = FileAttribute::Archive;
             }
+            println!("file: {}", files[i]);
             let current_file = self.file_present(files[i], attribute, current_cluster)?;
-            if (attribute as u8 == FileAttribute::Archive as u8) {
+            if (i == files.len() - 1) {
                 return Ok(current_file);
             } else {
                 current_cluster = current_file.get_cluster();
@@ -591,7 +637,7 @@ impl FileSystem {
                     FileAttribute::Archive,
                     free_cluster,
                     dir.get_cluster(),
-                    0,
+                    CLUSTER_OFFSET as u64,
                 )?;
 
                 Ok(())
@@ -964,7 +1010,7 @@ impl FileSystem {
             let mut out_vec: Vec<u32> = Vec::new();
             out_vec.push(starting_cluster);
             let mut entry = 0x00000000;
-            while (entry != 0xFFFFFFFF) {
+            while (entry != 0xFFFFFFFF && entry >= 0x00000002) {
                 let mut sector = vec!(0u8; 512);
                 let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
                 let sector_index = FileSystem::cluster_in_sector(starting_cluster);
@@ -975,8 +1021,12 @@ impl FileSystem {
                     sector[sector_index + 2],
                     sector[sector_index + 3],
                 ]);
-                if entry != 0xFFFFFFFF {
+                if entry != 0xFFFFFFFF && entry >= 0x00000002 {
+                    println!("{:#?}", entry);
+
                     out_vec.push(entry);
+                }else if(entry >= 0x00000002){
+                    //TODO: corruption warning
                 }
                 starting_cluster = entry;
             }
