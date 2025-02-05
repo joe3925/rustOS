@@ -6,7 +6,7 @@ use crate::file_system::file::{File, OpenFlags};
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
-use crate::{gdt, println};
+use crate::{cpu, gdt, println};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,7 +14,11 @@ use bootloader::BootInfo;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
+extern crate rand_xoshiro;
+use rand_xoshiro::Xoshiro256PlusPlus;
+use rand_core::{RngCore, SeedableRng};
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
+// For seedinguse
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
@@ -45,7 +49,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     //partitions.print_parts();
 
     (drives.drives)[1].format_gpt().expect("TODO: panic message");
-    (drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
+    //(drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
     if let Some(part) = partitions.find_volume("B:".to_string()) {
         PARTITIONS.force_unlock();
         match part.format() {
@@ -96,4 +100,49 @@ pub fn test_full_heap() {
         "Heap test passed: allocated and verified {} elements in the heap",
         element_count
     );
+}
+pub fn random_number() -> u64 {
+    let mut rng = Random::new(cpu::get_cycles());
+    rng.next_u64()
+
+}
+
+
+pub fn generate_guid() -> [u8; 16] {
+    let start: [u8; 8] = random_number().to_le_bytes();
+    let end: [u8; 8] = random_number().to_le_bytes();
+
+    // Combine into a 16-byte GUID
+    let mut guid = [0u8; 16];
+    guid[..8].copy_from_slice(&start);
+    guid[8..].copy_from_slice(&end);
+
+    // Set UUID version (v4: bits 12-15 should be `0100`)
+    guid[6] = (guid[6] & 0x0F) | 0x40;
+
+    // Set UUID variant (RFC 4122: bits 6-7 should be `10`)
+    guid[8] = (guid[8] & 0x3F) | 0x80;
+
+    guid
+}
+
+
+
+pub struct Random {
+    rng: Xoshiro256PlusPlus,
+}
+
+impl Random {
+    pub fn new(seed: u64) -> Self {
+        let rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+        Self { rng }
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.rng.next_u64()
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        (self.rng.next_u64() & 0xFFFF_FFFF) as u32
+    }
 }

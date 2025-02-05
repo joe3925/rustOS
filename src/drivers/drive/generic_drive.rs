@@ -7,12 +7,14 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::{format, vec};
 use alloc::vec::Vec;
+use crc_any::CRC::CRCu32;
 use spin::mutex::Mutex;
 use spin::Lazy;
 use strum_macros::Display;
-use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry};
-use embedded_crc32c::crc32c;
-use crate::drivers::drive::gpt::GptPartitionType::EfiSystemPartition;
+use crate::drivers::drive::gpt::{reserved_part, Gpt, GptHeader, GptPartitionEntry, HEADER, MBR};
+use crate::drivers::drive::gpt::GptPartitionType::{EfiSystemPartition, MicrosoftReserved};
+use crate::util::generate_guid;
+use crc_any::{CRC};
 
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
@@ -110,8 +112,12 @@ impl Drive {
 
         /// Formats the drive as GPT by writing a new GPT header and partition table.
         pub fn format_gpt(&mut self) -> Result<(), String> {
+            let mut crc = CRC::crc32();
             let sector_size = 512; // Assuming standard 512-byte sectors
-
+            self.controller.write(0, &MBR);
+            let data: [u8; 0x10] = [
+                0x81, 0xF1, 0xEA, 0xB1, 0x4D, 0x4A, 0x15, 0x46, 0xB6, 0x47, 0x08, 0x76, 0xD2, 0x65, 0xDB, 0x71,
+            ];
             let mut gpt_header = GptHeader {
                 signature: *b"EFI PART",
                 revision: 0x00010000,
@@ -122,7 +128,7 @@ impl Drive {
                 backup_lba: (self.info.capacity / 512 - 1) as u64, // Last sector as backup
                 first_usable_lba: 34,
                 last_usable_lba: (self.info.capacity / 512 - 34) as u64,
-                disk_guid: [0; 16], // Generate a proper GUID if needed
+                disk_guid: data,
                 partition_entry_lba: 2,
                 num_partition_entries: 128,
                 partition_entry_size: 128,
@@ -143,16 +149,19 @@ impl Drive {
             for (i, entry) in partition_entries.iter().enumerate() {
                 entry.write_to_buffer(&mut partition_buffer[i * gpt_header.partition_entry_size as usize..])?;
             }
-            gpt_header.partition_crc32 = crc32c(&partition_buffer);
+            crc.digest(&partition_buffer);
+            gpt_header.partition_crc32 = crc.get_crc() as u32;
 
             let mut header_buffer = vec![0u8; sector_size];
             gpt_header.write_to_buffer(&mut header_buffer)?;
-            gpt_header.header_crc32 = crc32c(&header_buffer[0..gpt_header.header_size as usize]);
+            crc.digest(&header_buffer[0..gpt_header.header_size as usize]);
+
+            gpt_header.header_crc32 = crc.get_crc() as u32;
 
             self.controller.write(1, &header_buffer);
 
-            for sector in partition_buffer.chunks_exact(sector_size){
-                self.controller.write(2, &sector);
+            for (i, sector) in partition_buffer.chunks_exact(sector_size).enumerate() {
+                self.controller.write(2 + i as u32, sector);
             }
 
             self.controller.write((self.info.capacity / 512  - 1) as u32, &header_buffer);
@@ -161,11 +170,12 @@ impl Drive {
                 header: gpt_header,
                 entries: partition_entries,
             });
-            self.add_partition((256 * 1024 * 1024), EfiSystemPartition.to_u8_16(), "EFI_PART".to_string()).expect("TODO: panic message");
-
+            self.add_partition((32_734  * 512), MicrosoftReserved.to_u8_16(), "Microsoft Reserved Partition".to_string()).expect("TODO: panic message");
             Ok(())
         }
         pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16], part_name: String) -> Result<(), String> {
+            let mut crc = CRC::crc32();
+
             // Ensure GPT is initialized
             if(part_name.len() > 72){
                 return Err("name too long".to_string());
@@ -210,14 +220,17 @@ impl Drive {
 
             let entry_index = gpt.entries.iter().position(|p| p.first_lba == 0 && p.last_lba == 0)
                 .ok_or("No available GPT entry slots.")?;
-
+            println!("required sectors {}", required_sectors);
+            let data: [u8; 0x10] = [
+                0x10, 0x98, 0xA1, 0xC6, 0x3D, 0x7A, 0xF3, 0x4B, 0x9D, 0xDA, 0xD4, 0x5C, 0x69, 0x58, 0x67, 0x0D,
+            ];
             let new_partition = GptPartitionEntry {
                 partition_type_guid: partition_type,
-                unique_partition_guid: [0; 16], // Generate a GUID properly here
+                unique_partition_guid: data,
                 first_lba: start_lba,
                 last_lba: start_lba + required_sectors - 1,
                 attribute_flags: 0,
-                partition_name: name_to_utf16_fixed(part_name.as_str()), // UTF-16 partition name should be set
+                partition_name: name_to_utf16_fixed(part_name.as_str()),
             };
 
             gpt.entries[entry_index] = new_partition;
@@ -226,17 +239,25 @@ impl Drive {
             for (i, entry) in gpt.entries.iter().enumerate() {
                 entry.write_to_buffer(&mut partition_buffer[i * gpt.header.partition_entry_size as usize..])?;
             }
-            gpt.header.partition_crc32 = crc32c(&partition_buffer);
+            crc.digest(&partition_buffer);
+            gpt.header.partition_crc32 = crc.get_crc() as u32;
 
             // Update GPT header CRC
             let mut header_buffer = vec![0u8; sector_size as usize];
+
+            gpt.header.header_crc32 = 0;
             gpt.header.write_to_buffer(&mut header_buffer)?;
-            gpt.header.header_crc32 = crc32c(&header_buffer[0..gpt.header.header_size as usize]);
+
+            header_buffer[16..20].copy_from_slice(&[0, 0, 0, 0]); // not needed just a sanity check
+
+            crc.digest(&header_buffer[0..gpt.header.header_size as usize]);
+
+            gpt.header.header_crc32 = crc.get_crc() as u32;
+            gpt.header.write_to_buffer(&mut header_buffer)?;
 
             // Write updated GPT structures to disk
-            for i in (0..partition_buffer.len()).step_by(sector_size as usize) {
-                let sector = &partition_buffer[i..i + sector_size as usize];
-                self.controller.write((i + 2) as u32, sector );
+            for (i, sector) in partition_buffer.chunks_exact(sector_size as usize).enumerate() {
+                self.controller.write((2 + i as u32), sector);
             }
             self.controller.write(1, &header_buffer);
             self.controller.write((self.info.capacity / 512 - 1) as u32, &header_buffer); // Backup GPT
