@@ -1,23 +1,21 @@
+extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
+use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::drivers::drive::gpt::PARTITIONS;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
-use crate::file_system::file::{File, OpenFlags};
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
 use crate::{cpu, gdt, println};
 use alloc::string::ToString;
-use alloc::vec;
 use alloc::vec::Vec;
 use bootloader::BootInfo;
 use core::arch::asm;
+use rand_core::{RngCore, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::Mutex;
 use x86_64::VirtAddr;
-extern crate rand_xoshiro;
-use rand_xoshiro::Xoshiro256PlusPlus;
-use rand_core::{RngCore, SeedableRng};
-use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 // For seedinguse
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
@@ -47,27 +45,26 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     println!("Drives enumerated");
     //drives.print_drives();
     //partitions.print_parts();
-
-    (drives.drives)[1].format_gpt().expect("TODO: panic message");
-    //(drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
+    match (drives.drives)[1].format_gpt() {
+        Ok(_) => {
+            println!("Drive init successful");
+            (drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
+        }
+        Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
+    }
     if let Some(part) = partitions.find_volume("B:".to_string()) {
         PARTITIONS.force_unlock();
         match part.format() {
             Ok(_) => {
-                println!("Drive {} formatted successfully", part.label.clone());
+                println!("volume {} formatted successfully", part.label.clone());
                 part.is_fat = true;
             }
-            Err(err) => println!("Error formatting drive {} {}", part.label.clone(), err.to_str()),
+            Err(err) => println!("Error formatting volume {} {}", part.label.clone(), err.to_str()),
         }
     } else {
         println!("failed to find drive B:");
     }
     println!("Init Done");
-    let path = "B:\\FOLDE\\TEST.TXT";
-    let flags = [OpenFlags::ReadWrite];
-    println!("{:#?}", File::open(path, &flags).unwrap());
-    //File::make_dir(path.to_string()).expect("TODO: panic message");
-
     *KERNEL_INITIALIZED.lock() = true;
 }
 #[no_mangle]
@@ -104,7 +101,6 @@ pub fn test_full_heap() {
 pub fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
-
 }
 
 
@@ -125,7 +121,6 @@ pub fn generate_guid() -> [u8; 16] {
 
     guid
 }
-
 
 
 pub struct Random {
