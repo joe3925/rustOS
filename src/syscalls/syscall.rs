@@ -65,18 +65,20 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         3 => unsafe {
             SCHEDULER.lock().add_task(Task::new(param1 as usize, (*(param2 as *const String)).clone(), true));
         }
-        //file open syscall 1st file path, 2nd ptr to flags array, 3rd sizeof flags, return buffer
+        //file open syscall 1st file path, 2nd ptr to flags array, 3rd sizeof flags, returned in r10
         4 => {
             if let Some(path) = u64_to_str_ptr(param1) {
                 let flags_ptr = param2 as *const OpenFlags;
                 let flags: &[OpenFlags] = unsafe {
                     slice::from_raw_parts(flags_ptr, param3 as usize)
                 };
-
-                let result = File::open(path.as_str(), flags);
-                if let Ok(file) = result {
-                    unsafe {
-                        *(param3 as *mut File) = file;
+                if let Some(param) = params {
+                    let file_ptr = param.param1 as (*mut Option<File>);
+                    let result = File::open(path.as_str(), flags);
+                    if let Ok(file) = result {
+                        unsafe {
+                            *file_ptr = Some(file);
+                        }
                     }
                 }
             }
@@ -137,8 +139,6 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
                 unsafe { *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize; }
             }
         }
-        //get task id by name
-        9 => {}
         _ => {
             println!("Unknown syscall number: {}", rax);
         }

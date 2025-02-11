@@ -45,10 +45,10 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     println!("Drives enumerated");
     //drives.print_drives();
     //partitions.print_parts();
-    match (drives.drives)[1].format_gpt() {
+    match drives.drives[1].format_gpt_force() {
         Ok(_) => {
             println!("Drive init successful");
-            (drives.drives)[1].add_partition(1024 * 1024 * 1024 * 5, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
+            drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
         }
         Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
     }

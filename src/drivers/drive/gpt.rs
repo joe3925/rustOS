@@ -120,14 +120,6 @@ impl GptHeader {
         if buffer.len() < 92 {
             return None;
         }
-        // Extract the first 8 bytes
-        let first_8_bytes = &buffer[0..8];
-
-        // Convert to a UTF-8 string (safe conversion)
-        match core::str::from_utf8(first_8_bytes) {
-            Ok(string) => println!("First 8 bytes as string: {}", string),
-            Err(_) => println!("First 8 bytes contain invalid UTF-8 characters."),
-        }
         // Extract the first 92 bytes
         let header_bytes = &buffer[0..92];
 
