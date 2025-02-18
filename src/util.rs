@@ -16,8 +16,6 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::Mutex;
 use x86_64::VirtAddr;
-use crate::file_system::file;
-use crate::file_system::file::{File, OpenFlags};
 // For seedinguse
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
@@ -28,7 +26,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = init_mapper(mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+    let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
 
     gdt::init();
     println!("GDT loaded");

@@ -225,7 +225,7 @@ impl PartitionCollection {
     }
     pub(crate) fn enumerate_parts(&mut self) {
         let mut i = 0;
-        for mut drive in DRIVECOLLECTION.lock().drives.iter_mut() {
+        for drive in DRIVECOLLECTION.lock().drives.iter_mut() {
             let mut buffer = vec![0u8; 512];
             drive.controller.read(1, &mut buffer);
             if let Some(header) = GptHeader::new(&mut buffer) {

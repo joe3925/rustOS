@@ -448,7 +448,7 @@ impl FileSystem {
         &mut self,
         starting_cluster: u32,
     ) -> Result<Vec<FileEntry>, FileStatus> {
-        let mut dirs = self.get_all_clusters(starting_cluster);
+        let dirs = self.get_all_clusters(starting_cluster);
 
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         // 2. Parse directory entries (each entry is 32 bytes)
@@ -731,7 +731,7 @@ impl FileSystem {
         return Ok(file_data);
     }
     pub fn delete_file(&mut self, path: &str) -> Result<(), FileStatus> {
-        let mut entry;
+        let entry;
         if (path == "\\") {
             return Ok(());
         }

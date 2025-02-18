@@ -260,7 +260,7 @@ impl DriveController for IdeController {
     fn enumerate_drives() -> Vec<Drive> {
         unsafe { DRIVECOLLECTION.force_unlock(); }
         let mut drive_list: Vec<Drive> = Vec::new();
-        let mut ide_controller = Self::new(0x0);
+        let ide_controller = Self::new(0x0);
 
         // Check for the master drive
         if let Some(info) = IdeController::identify_drive(0) {

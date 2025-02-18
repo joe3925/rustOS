@@ -1,10 +1,9 @@
-use alloc::format;
 use crate::drivers::drive::gpt::PARTITIONS;
-use crate::file_system::fat::{FileEntry, FileSystem};
+use crate::file_system::fat::FileSystem;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
-use crate::file_system::file::FileStatus::{BadPath, DriveNotFound, UnknownFail};
+use crate::file_system::file::FileStatus::{DriveNotFound, UnknownFail};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {

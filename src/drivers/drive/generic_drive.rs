@@ -157,7 +157,7 @@ impl Drive {
             reserved_block: [0; 420],
         };
 
-        let mut partition_entries = vec![GptPartitionEntry {
+        let partition_entries = vec![GptPartitionEntry {
             partition_type_guid: [0; 16],
             unique_partition_guid: [0; 16],
             first_lba: 0,

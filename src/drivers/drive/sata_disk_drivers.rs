@@ -1,8 +1,6 @@
-use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo};
-use crate::drivers::pci::device_collection::Device;
+use crate::drivers::drive::generic_drive::DriveInfo;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
