@@ -242,7 +242,6 @@ impl Drive {
 
         let entry_index = gpt.entries.iter().position(|p| p.first_lba == 0 && p.last_lba == 0)
             .ok_or(NoSpace)?;
-        println!("required sectors {}", required_sectors);
         let new_partition = GptPartitionEntry {
             partition_type_guid: partition_type,
             unique_partition_guid: generate_guid(),

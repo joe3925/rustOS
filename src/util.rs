@@ -66,8 +66,8 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     } else {
         println!("failed to find drive B:");
     }
-    let open_flags = [OpenFlags::Create, OpenFlags::ReadWrite];
-    println!("{:#?}", File::open("B:\\FLDR\\TEST\\TEST.TXT", &open_flags).unwrap());
+    //let open_flags = [OpenFlags::Create, OpenFlags::ReadWrite];
+    //println!("{:#?}", File::open("B:\\FLDR\\TEST\\TEST.TXT", &open_flags).unwrap());
 
     println!("Init Done");
     *KERNEL_INITIALIZED.lock() = true;
