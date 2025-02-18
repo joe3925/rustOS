@@ -194,7 +194,7 @@ impl Drive {
             header: gpt_header,
             entries: partition_entries,
         });
-        self.add_partition((32_734 * 512), MicrosoftReserved.to_u8_16(), "Microsoft Reserved Partition".to_string()).ok().ok_or(FormatStatus::UnknownFail);
+        self.add_partition((32_734 * 512), MicrosoftReserved.to_u8_16(), "Microsoft Reserved Partition".to_string()).ok().ok_or(FormatStatus::UnknownFail)?;
         Ok(())
     }
     pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16], part_name: String) -> Result<(), PartitionErrors> {

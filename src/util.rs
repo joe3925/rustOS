@@ -1,5 +1,5 @@
 extern crate rand_xoshiro;
-use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{DRIVECOLLECTION};
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::drivers::drive::gpt::PARTITIONS;
 use crate::drivers::interrupt_index;

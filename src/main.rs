@@ -6,7 +6,7 @@
 #![allow(unused_parens)]
 #![allow(dead_code)]
 #![allow(unused_variables)]
-
+#![allow(static_mut_refs)]
 extern crate alloc;
 
 mod idt;
