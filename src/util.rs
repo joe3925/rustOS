@@ -16,6 +16,8 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::Mutex;
 use x86_64::VirtAddr;
+use crate::file_system::file;
+use crate::file_system::file::{File, OpenFlags};
 // For seedinguse
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
@@ -45,7 +47,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     println!("Drives enumerated");
     //drives.print_drives();
     //partitions.print_parts();
-    match drives.drives[1].format_gpt_force() {
+    match drives.drives[1].format_gpt() {
         Ok(_) => {
             println!("Drive init successful");
             drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
@@ -64,6 +66,9 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     } else {
         println!("failed to find drive B:");
     }
+    let open_flags = [OpenFlags::Create, OpenFlags::ReadWrite];
+    println!("{:#?}", File::open("B:\\FLDR\\TEST\\TEST.TXT", &open_flags).unwrap());
+
     println!("Init Done");
     *KERNEL_INITIALIZED.lock() = true;
 }

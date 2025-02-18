@@ -637,7 +637,7 @@ impl FileSystem {
                     FileAttribute::Archive,
                     free_cluster,
                     dir.get_cluster(),
-                    CLUSTER_OFFSET as u64,
+                    0,
                 )?;
 
                 Ok(())
