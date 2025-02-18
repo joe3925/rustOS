@@ -1,6 +1,6 @@
 use crate::drivers::drive::generic_drive::FormatStatus;
 use crate::drivers::drive::generic_drive::FormatStatus::{DriveDoesntExist, TooCorrupted};
-use crate::drivers::drive::gpt::PARTITIONS;
+use crate::drivers::drive::gpt::VOLUMES;
 use crate::file_system::file::FileStatus::{PathNotFound, UnknownFail};
 use crate::file_system::file::{File, FileAttribute, FileStatus};
 use crate::println;
@@ -266,12 +266,12 @@ impl FileSystem {
     }
     //TODO: figure out why sector 1 is being formatted as a data sector
     pub fn format_drive(&mut self) -> Result<(), FormatStatus> {
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             let mut info_sec = vec![0u8; 512];
             part.read(1, &mut info_sec);
             //TODO: stop doing this
-            unsafe { PARTITIONS.force_unlock(); }
+            unsafe { VOLUMES.force_unlock(); }
             if (Self::is_fat_present(info_sec)) {
 
                 let clusters = self.get_all_clusters(2);
@@ -327,7 +327,7 @@ impl FileSystem {
                 }
             }
             //better than the alternative
-            unsafe { PARTITIONS.force_unlock(); }
+            unsafe { VOLUMES.force_unlock(); }
             //reserve sectors
             self.update_fat(0, 0xFFFFFFFF);
             self.update_fat(1, 0xFFFFFFFF);
@@ -352,7 +352,7 @@ impl FileSystem {
         cluster_number: u32,
         next_cluster: u32,
     ) {
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             let fat_offset = cluster_number * 4;
             let sector_number = (fat_offset / 512) + RESERVED_SECTORS;
@@ -755,7 +755,7 @@ impl FileSystem {
     ///set ignore cluster to 0 to ignore no clusters
     fn find_free_cluster(&mut self, ignore_cluster: u32) -> u32 {
         let fat_sectors = self.calculate_max_fat_size();
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             for i in 0..fat_sectors {
                 let mut buffer = vec![0u8; 512];
@@ -923,7 +923,7 @@ impl FileSystem {
         let real_cluster = cluster.checked_sub(2).ok_or(FileStatus::CorruptFat)?;
         let start_sector = self.cluster_to_sector(real_cluster);
 
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             let sector_count = SECTORS_PER_CLUSTER;
 
@@ -953,7 +953,7 @@ impl FileSystem {
         let real_cluster = cluster.checked_sub(2).ok_or(FileStatus::CorruptFat)?;
         let start_sector = self.cluster_to_sector(real_cluster);
 
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             let sector_count = SECTORS_PER_CLUSTER;
 
@@ -1005,7 +1005,7 @@ impl FileSystem {
         ((cluster as usize % (512 / 4)) * 4)
     }
     fn get_all_clusters(&mut self, mut starting_cluster: u32) -> Vec<u32> {
-        let mut partitions = PARTITIONS.lock();
+        let mut partitions = VOLUMES.lock();
         if let Some(part) = partitions.find_volume(self.label.clone()) {
             let mut out_vec: Vec<u32> = Vec::new();
             out_vec.push(starting_cluster);

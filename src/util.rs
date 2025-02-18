@@ -1,7 +1,7 @@
 extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DRIVECOLLECTION};
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
-use crate::drivers::drive::gpt::PARTITIONS;
+use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
@@ -21,7 +21,6 @@ use x86_64::VirtAddr;
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
 pub unsafe fn init(boot_info: &'static BootInfo) {
-    let mut partitions = PARTITIONS.lock();
     let mut drives = DRIVECOLLECTION.lock();
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
@@ -41,19 +40,23 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     PCIBUS.lock().enumerate_pci();
     println!("PCI BUS enumerated");
     drives.enumerate_drives();
+
+    let mut partitions = VOLUMES.lock();
     partitions.enumerate_parts();
     println!("Drives enumerated");
     //drives.print_drives();
-    //partitions.print_parts();
+    VOLUMES.force_unlock();
     match drives.drives[1].format_gpt() {
         Ok(_) => {
             println!("Drive init successful");
+            VOLUMES.force_unlock();
             drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
         }
         Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
     }
+    partitions.print_parts();
     if let Some(part) = partitions.find_volume("B:".to_string()) {
-        PARTITIONS.force_unlock();
+        VOLUMES.force_unlock();
         match part.format() {
             Ok(_) => {
                 println!("volume {} formatted successfully", part.label.clone());
@@ -143,4 +146,14 @@ impl Random {
     pub fn next_u32(&mut self) -> u32 {
         (self.rng.next_u64() & 0xFFFF_FFFF) as u32
     }
+}
+pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
+    let mut buffer = [0x0000; 36]; // Fill with null terminators
+    let utf16_iter = name.encode_utf16();
+
+    for (i, c) in utf16_iter.take(36).enumerate() {
+        buffer[i] = c;
+    }
+
+    buffer
 }

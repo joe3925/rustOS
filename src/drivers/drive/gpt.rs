@@ -1,14 +1,19 @@
-use crate::drivers::drive::generic_drive::{DriveController, FormatStatus, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{Drive, DriveController, FormatStatus, PartitionErrors, DRIVECOLLECTION};
 use crate::file_system::fat::{FileSystem, INFO_SECTOR};
 use crate::println;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{format, vec};
+use core::cmp::PartialEq;
+use crc_any::CRC;
 use spin::mutex::Mutex;
 use spin::Lazy;
+use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
+use crate::drivers::drive::gpt::GptPartitionType::MicrosoftReserved;
+use crate::util::{generate_guid, name_to_utf16_fixed};
 
-pub static PARTITIONS: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
+pub static VOLUMES: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
     Mutex::new(PartitionCollection::new())
 });
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +211,17 @@ impl GptPartitionEntry {
 pub struct PartitionCollection {
     pub parts: Vec<Partition>,
 }
+
+impl PartialEq for GptPartitionEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.partition_type_guid == other.partition_type_guid
+            && self.unique_partition_guid == other.unique_partition_guid
+            && self.first_lba == other.first_lba
+            && self.last_lba == other.last_lba
+            && self.attribute_flags == other.attribute_flags
+            && self.partition_name == other.partition_name
+    }
+}
 impl PartitionCollection {
     fn new() -> Self {
         PartitionCollection {
@@ -213,9 +229,9 @@ impl PartitionCollection {
         }
     }
 
-    pub(crate) fn new_partition(&mut self, mut entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Result<(), &'static str> {
+    pub(crate) fn new_partition(&mut self, entry: GptPartitionEntry, drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Result<(), &'static str> {
         if let Some(label) = self.find_free_label() {
-            let drive = Partition::new(label, String::from_utf16(&mut entry.partition_name).unwrap().to_string(), drive_index, controller, entry.first_lba, entry.last_lba);
+            let drive = Partition::new(label, entry, drive_index, controller);
 
             self.parts.push(drive);
             Ok(())
@@ -243,7 +259,10 @@ impl PartitionCollection {
                         }
 
                         if let Some(entry) = GptPartitionEntry::new(&mut slice_128) {
-                            self.new_partition(entry, sector as u64, drive.controller.factory()).expect("TODO: panic message");
+                            if !self.parts.iter().any(|existing_entry| existing_entry.gpt_entry == entry) {
+                                self.new_partition(entry, sector as u64, drive.controller.factory())
+                                    .expect("TODO: panic message");
+                            }
                         }
                     }
                 }
@@ -300,6 +319,7 @@ impl PartitionCollection {
     }
 }
 pub struct Partition {
+    gpt_entry: GptPartitionEntry,
     parent_drive_index: u64,
     name: String,
     pub(crate) label: String,
@@ -308,12 +328,16 @@ pub struct Partition {
     pub(crate) is_fat: bool,
 }
 impl Partition {
-    pub fn new(label: String, name: String, parent_drive_index: u64, controller: Box<dyn DriveController + Send + Sync>, start_lba: u64, end_lba: u64) -> Self {
+    pub fn new(label: String, gpt_partition_entry: GptPartitionEntry, parent_drive_index: u64, controller: Box<dyn DriveController + Send + Sync>) -> Self {
+        let start_lba = gpt_partition_entry.first_lba;
+        let end_lba = gpt_partition_entry.last_lba;
         let mut part_controller = PartitionController::new(controller, start_lba, end_lba);
         let mut sector = vec![0u8; 512];
+        let name = String::from_utf16(&gpt_partition_entry.partition_name).unwrap();
         part_controller.read(INFO_SECTOR, &mut sector).expect("failed to read info sector");
         let fat_present = FileSystem::is_fat_present(sector);
         Partition {
+            gpt_entry: gpt_partition_entry,
             parent_drive_index,
             name,
             label: label.clone(),
@@ -399,8 +423,176 @@ pub fn scan_for_efi_signature(buffer: &[u8]) -> Option<usize> {
 
     // Iterate over the buffer using an 8-byte sliding window to find the signature
     buffer.windows(8).position(|window| window == efi_sig)
-}
+}impl Drive{
+    pub(crate) fn is_gpt(&mut self) -> bool {
+        let mut buffer = vec![0u8; 512]; // GPT header is within the first sector (LBA 1)
+        self.controller.read(1, &mut buffer);
 
+        if let Some(gpt) = GptHeader::new(&buffer) {
+            true
+        } else {
+            false
+        }
+    }
+    pub fn format_gpt(&mut self) -> Result<(), FormatStatus> {
+        if (!self.is_gpt()) {
+            return self.format_gpt_force();
+        }
+        Err(FormatStatus::AlreadyGPT)
+    }
+
+    /// Formats the drive as GPT by writing a new GPT header and partition table.
+    pub fn format_gpt_force(&mut self) -> Result<(), FormatStatus> {
+        let sector_size = 512; // Assuming standard 512-byte sectors
+        self.controller.write(0, &MBR);
+        let mut gpt_header = GptHeader {
+            signature: *b"EFI PART",
+            revision: 0x00010000,
+            header_size: 92,
+            header_crc32: 0,
+            reserved: 0,
+            current_lba: 1,
+            backup_lba: (self.info.capacity / 512 - 1) as u64, // Last sector as backup
+            first_usable_lba: 34,
+            last_usable_lba: (self.info.capacity / 512 - 34) as u64,
+            disk_guid: generate_guid(),
+            partition_entry_lba: 2,
+            num_partition_entries: 128,
+            partition_entry_size: 128,
+            partition_crc32: 0,
+            reserved_block: [0; 420],
+        };
+
+        let partition_entries = vec![GptPartitionEntry {
+            partition_type_guid: [0; 16],
+            unique_partition_guid: [0; 16],
+            first_lba: 0,
+            last_lba: 0,
+            attribute_flags: 0,
+            partition_name: [0; 36],
+        }; gpt_header.num_partition_entries as usize];
+
+        let mut partition_buffer = vec![0u8; (gpt_header.num_partition_entries as usize) * gpt_header.partition_entry_size as usize];
+        for (i, entry) in partition_entries.iter().enumerate() {
+            entry.write_to_buffer(&mut partition_buffer[i * gpt_header.partition_entry_size as usize..]);
+        }
+        let mut part_crc = CRC::crc32();
+        part_crc.digest(&partition_buffer);
+        gpt_header.partition_crc32 = part_crc.get_crc() as u32;
+
+        let mut header_buffer = vec![0u8; sector_size];
+        gpt_header.write_to_buffer(&mut header_buffer);
+
+        let mut header_crc = CRC::crc32();
+        header_crc.digest(&header_buffer[0..gpt_header.header_size as usize]);
+
+        gpt_header.header_crc32 = header_crc.get_crc() as u32;
+
+        self.controller.write(1, &header_buffer);
+
+        for (i, sector) in partition_buffer.chunks_exact(sector_size).enumerate() {
+            self.controller.write(2 + i as u32, sector);
+        }
+
+        self.controller.write((self.info.capacity / 512 - 1) as u32, &header_buffer);
+
+        self.gpt_data = Some(Gpt {
+            header: gpt_header,
+            entries: partition_entries,
+        });
+        self.add_partition((32_734 * 512), MicrosoftReserved.to_u8_16(), "Microsoft Reserved Partition".to_string()).ok().ok_or(FormatStatus::UnknownFail)?;
+        Ok(())
+    }
+    pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16], part_name: String) -> Result<(), PartitionErrors> {
+        // Ensure GPT is initialized
+        if (part_name.len() > 72) {
+            return Err(BadName);
+        }
+        let gpt = match self.gpt_data.as_mut() {
+            Some(gpt) => gpt,
+            None => return Err(NotGPT),
+        };
+
+        let first_usable = gpt.header.first_usable_lba;
+        let last_usable = gpt.header.last_usable_lba;
+        let sector_size = 512;
+
+        let required_sectors = (partition_size + sector_size - 1) / sector_size;
+
+        let mut partitions = gpt.entries.clone();
+        partitions.sort_by_key(|p| p.first_lba);
+
+        let mut start_lba = first_usable;
+        let mut found_space = false;
+
+        for partition in &partitions {
+            if partition.first_lba == 0 && partition.last_lba == 0 {
+                continue; // Skip unused entries
+            }
+
+            let available_sectors = partition.first_lba - start_lba;
+            if available_sectors >= required_sectors {
+                found_space = true;
+                break; // We found a suitable gap
+            }
+
+            start_lba = partition.last_lba + 1;
+        }
+
+        if !found_space {
+            let available_sectors = last_usable - start_lba;
+            if available_sectors < required_sectors {
+                return Err(NoSpace);
+            }
+        }
+
+        let entry_index = gpt.entries.iter().position(|p| p.first_lba == 0 && p.last_lba == 0)
+            .ok_or(NoSpace)?;
+        let new_partition = GptPartitionEntry {
+            partition_type_guid: partition_type,
+            unique_partition_guid: generate_guid(),
+            first_lba: start_lba,
+            last_lba: start_lba + required_sectors - 1,
+            attribute_flags: 0,
+            partition_name: name_to_utf16_fixed(part_name.as_str()),
+        };
+
+        gpt.entries[entry_index] = new_partition;
+
+        let mut partition_buffer = vec![0u8; (gpt.header.num_partition_entries as usize) * gpt.header.partition_entry_size as usize];
+        for (i, entry) in gpt.entries.iter().enumerate() {
+            entry.write_to_buffer(&mut partition_buffer[i * gpt.header.partition_entry_size as usize..]);
+        }
+        let mut part_crc = CRC::crc32();
+        part_crc.digest(&partition_buffer);
+        gpt.header.partition_crc32 = part_crc.get_crc() as u32;
+
+        // Update GPT header CRC
+        let mut header_buffer = vec![0u8; sector_size as usize];
+
+        gpt.header.header_crc32 = 0;
+        gpt.header.write_to_buffer(&mut header_buffer);
+
+        header_buffer[16..20].copy_from_slice(&[0, 0, 0, 0]); // not needed just a sanity check
+
+        let mut header_crc = CRC::crc32();
+        header_crc.digest(&header_buffer[0..gpt.header.header_size as usize]);
+
+        gpt.header.header_crc32 = header_crc.get_crc() as u32;
+        gpt.header.write_to_buffer(&mut header_buffer);
+
+        // Write updated GPT structures to disk
+        for (i, sector) in partition_buffer.chunks_exact(sector_size as usize).enumerate() {
+            self.controller.write((2 + i as u32), sector);
+        }
+        self.controller.write(1, &header_buffer);
+        self.controller.write((self.info.capacity / 512 - 1) as u32, &header_buffer); // Backup GPT
+        let mut partitions = VOLUMES.lock();
+
+        partitions.enumerate_parts();
+        Ok(())
+    }
+}
 pub const MBR: [u8; 512] = [
     0x33, 0xC0, 0x8E, 0xD0, 0xBC, 0x00, 0x7C, 0x8E, 0xC0, 0x8E, 0xD8, 0xBE, 0x00, 0x7C, 0xBF, 0x00,
     0x06, 0xB9, 0x00, 0x02, 0xFC, 0xF3, 0xA4, 0x50, 0x68, 0x1C, 0x06, 0xCB, 0xFB, 0xB9, 0x04, 0x00,
