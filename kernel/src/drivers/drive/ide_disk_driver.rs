@@ -108,7 +108,7 @@ impl IdeController {
             let mut data_port = Port::new(DATA_REG);
             head_port.write(0xE0 | (drive << 4)); // Select drive (0 = master, 1 = slave)
             command_port.write(0xEC); // Send IDENTIFY command
-            if unsafe { StatusFlags::from_bits_truncate(command_port.read()) }.contains(StatusFlags::ERR) {
+            if StatusFlags::from_bits_truncate(command_port.read()).contains(StatusFlags::ERR) {
                 return None; // If error, drive does not exist
             }
 
@@ -260,7 +260,7 @@ impl DriveController for IdeController {
     fn enumerate_drives() -> Vec<Drive> {
         unsafe { DRIVECOLLECTION.force_unlock(); }
         let mut drive_list: Vec<Drive> = Vec::new();
-        let mut ide_controller = Self::new(0x0);
+        let ide_controller = Self::new(0x0);
 
         // Check for the master drive
         if let Some(info) = IdeController::identify_drive(0) {
