@@ -12,7 +12,6 @@ lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
 
-        // Static memory for stacks not sure why they need to be marked as mut but if they aren't it will page fault
         static mut TIMER_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];
         static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];
         static mut PRIVILEGE_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];

@@ -1,16 +1,14 @@
 extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
-use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::drivers::drive::gpt::PARTITIONS;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
-use crate::{cpu, gdt, println};
-use alloc::string::ToString;
+use crate::{cpu, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
-use bootloader::BootInfo;
+use bootloader_api::BootInfo;
 use core::arch::asm;
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -24,9 +22,9 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     let mut partitions = PARTITIONS.lock();
     let mut drives = DRIVECOLLECTION.lock();
 
-    let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset);
+    let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     gdt::init();
     println!("GDT loaded");
@@ -43,27 +41,7 @@ pub unsafe fn init(boot_info: &'static BootInfo) {
     drives.enumerate_drives();
     partitions.enumerate_parts();
     println!("Drives enumerated");
-    //drives.print_drives();
-    //partitions.print_parts();
-    match drives.drives[1].format_gpt_force() {
-        Ok(_) => {
-            println!("Drive init successful");
-            drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
-        }
-        Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
-    }
-    if let Some(part) = partitions.find_volume("B:".to_string()) {
-        PARTITIONS.force_unlock();
-        match part.format() {
-            Ok(_) => {
-                println!("volume {} formatted successfully", part.label.clone());
-                part.is_fat = true;
-            }
-            Err(err) => println!("Error formatting volume {} {}", part.label.clone(), err.to_str()),
-        }
-    } else {
-        println!("failed to find drive B:");
-    }
+
     println!("Init Done");
     *KERNEL_INITIALIZED.lock() = true;
 }
@@ -103,6 +81,11 @@ pub fn random_number() -> u64 {
     rng.next_u64()
 }
 
+pub fn boot_info() -> &'static BootInfo {
+    unsafe {
+        BOOT_INFO.unwrap()
+    }
+}
 
 pub fn generate_guid() -> [u8; 16] {
     let start: [u8; 8] = random_number().to_le_bytes();

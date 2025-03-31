@@ -1,17 +1,12 @@
 use crate::BOOT_INFO;
 use alloc::collections::LinkedList;
-use bootloader::bootinfo::MemoryRegionType;
-use bootloader::bootinfo::{MemoryMap, MemoryRegion};
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::ptr;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
-#[derive(Clone)]
-pub(crate) struct BootInfoFrameAllocator {
-    memory_map: &'static [MemoryRegion], // Provided at boot
-}
 pub const KERNEL_STACK_SIZE: u64 = 0x2800;
 pub const USER_STACK_SIZE: u64 = 0x2800;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
@@ -23,68 +18,57 @@ pub static USER_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocat
     VirtAddr::new(0x8000_0000u64), // User stacks start here
     USER_STACK_SIZE,              // User stack size
 ));
+// Global NEXT counter (still required)
 static NEXT: Mutex<usize> = Mutex::new(0);
+#[derive(Clone)]
+
+pub struct BootInfoFrameAllocator {
+    memory_regions: &'static [MemoryRegion],
+}
+
 impl BootInfoFrameAllocator {
-    pub fn init(memory_map: &'static MemoryMap) -> Self {
-        BootInfoFrameAllocator {
-            memory_map,
-        }
+    pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
+        BootInfoFrameAllocator { memory_regions }
+    }
+
+    fn usable_frames(&self) -> impl Iterator<Item=PhysFrame> {
+        let regions = self.memory_regions.iter();
+        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
+        let addr_ranges = usable.map(|r| r.start..r.end);
+        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(4096));
+        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+
+    fn usable_2mb_frames(&self) -> impl Iterator<Item=PhysFrame<Size2MiB>> {
+        let regions = self.memory_regions.iter();
+        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
+        let addr_ranges = usable.map(|r| r.start..r.end);
+        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(2 * 1024 * 1024));
+        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let mut next = NEXT.lock(); // Lock the global NEXT counter
-        let frame = self.usable_frames().nth(*next); // Get the nth usable frame
-        *next += 1; // Increment the global NEXT counter
+        let mut next = NEXT.lock();
+        let frame = self.usable_frames().nth(*next);
+        *next += 1;
         frame
     }
 }
 
 unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
-        let mut next = NEXT.lock(); // Lock the global NEXT counter
+        let mut next = NEXT.lock();
 
-        // Ensure the NEXT pointer is aligned to 512 (2MiB boundary)
         if *next % 512 != 0 {
             *next += 512 - (*next % 512);
         }
-        let base_frame = self.usable_2mb_frames().nth((*next / 512));
 
-        // Mark all 512 frames as allocated by advancing the NEXT pointer
+        let base_frame = self.usable_2mb_frames().nth(*next / 512);
         *next += 512;
 
         base_frame
-    }
-}
-impl BootInfoFrameAllocator {
-    /// Returns an iterator over the usable frames specified in the memory map.
-    fn usable_frames(&self) -> impl Iterator<Item=PhysFrame> {
-        // get usable regions from memory map
-        let regions = self.memory_map.iter();
-        let usable_regions = regions
-            .filter(|r| r.region_type == MemoryRegionType::Usable);
-        // map each region to its address range
-        let addr_ranges = usable_regions
-            .map(|r| r.range.start_addr()..r.range.end_addr());
-        // transform to an iterator of frame start addresses
-        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
-        // create `PhysFrame` types from the start addresses
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
-    }
-    /// Returns an iterator over usable 2 MiB-aligned frames in the memory map.
-    fn usable_2mb_frames(&self) -> impl Iterator<Item=PhysFrame<Size2MiB>> {
-        // get usable regions from memory map
-        let regions = self.memory_map.iter();
-        let usable_regions = regions
-            .filter(|r| r.region_type == MemoryRegionType::Usable);
-        // map each region to its address range
-        let addr_ranges = usable_regions
-            .map(|r| r.range.start_addr()..r.range.end_addr());
-        // transform to an iterator of frame start addresses
-        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(2 * 1024 * 1024));
-        // create PhysFrame types from the start addresses
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 }
 pub fn map_page(
@@ -182,13 +166,14 @@ pub(crate) unsafe fn allocate_syscall_page() -> Result<VirtAddr, &'static str> {
     Ok(page_addr)
 }
 
-// Function to allocate a user-accessible page with write and execute permissions
-pub(crate) fn alloc_user_page() -> Result<VirtAddr, &'static str> {
+/// Function to allocate a user-accessible page with write and execute permissions
+///Safety: page must be deallocated after
+pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
-    if let Some(boot_info) = *BOOT_INFO.lock() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
         let mut mapper = init_mapper(phys_mem_offset);
 
         let mut base_addr = 0x4000_0000u64;
@@ -212,11 +197,13 @@ pub(crate) fn alloc_user_page() -> Result<VirtAddr, &'static str> {
 
 /// Allocates a page with an infinite loop instruction at a free virtual address.
 pub(crate) fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
-    let page_addr = alloc_user_page()?; // Allocate the user page
+    let page_addr = unsafe { alloc_user_page() }?; // Allocate the user page
     unsafe { write_infinite_loop(page_addr.as_mut_ptr()); } // Write the infinite loop
     Ok(page_addr)
 }
 use spin::Mutex;
+use crate::util::boot_info;
+
 pub(crate) struct StackAllocator {
     base_address: VirtAddr,
     stack_size: u64,
@@ -260,15 +247,16 @@ impl StackAllocator {
 
 
 /// Allocates a stack for a user-mode task with guard pages.
-pub(crate) fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
+///Safety: stack must be deallocated after use
+pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = USER_STACK_ALLOCATOR.lock();
     let stack_start = allocator.allocate().expect("kernel stack alloc failed");
     let total_stack_size = USER_STACK_SIZE + 0x1000; //guard page
     let stack_end = stack_start + total_stack_size;
 
-    if let Some(boot_info) = *BOOT_INFO.lock() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
         let mut mapper = init_mapper(phys_mem_offset);
 
         //guard page is not mapped
@@ -293,16 +281,16 @@ pub(crate) fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     }
 }
 
-
-pub(crate) fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
+///Safety: stack must be deallocated after use
+pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
     let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
     let stack_start = allocator.allocate().expect("kernel stack alloc failed");
     let total_stack_size = KERNEL_STACK_SIZE + 0x1000;
     let stack_end = stack_start + total_stack_size;
 
-    if let Some(boot_info) = *BOOT_INFO.lock() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_map);
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
         let mut mapper = init_mapper(phys_mem_offset);
 
         for page in Page::range_inclusive(

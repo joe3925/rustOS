@@ -1,8 +1,6 @@
-use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo};
-use crate::drivers::pci::device_collection::Device;
+use crate::drivers::drive::generic_drive::DriveInfo;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
@@ -13,7 +11,9 @@ use x86_64::{PhysAddr, VirtAddr};
 use crate::cpu::wait_cycle;
 use crate::drivers::drive::ahci_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
-use crate::{println, BOOT_INFO};
+use crate::util::boot_info;
+use crate::println;
+
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
 const MMIO_VIRTUAL_ADDR: VirtAddr = VirtAddr::new(0xFFFF_FF00_0000_0000);
@@ -132,27 +132,29 @@ impl AHCIController {
     /// Setup command tables and initialize Command Headers for each port.
     unsafe fn setup_command_tables(&mut self) {
         for port in 0..self.total_ports.clone() {
-            let mem_offset = VirtAddr::new(BOOT_INFO.lock().unwrap().physical_memory_offset);
+            if let boot_info = boot_info() {
+                let mem_offset = VirtAddr::new((boot_info.physical_memory_offset.into_option().unwrap()));
 
-            // Set Command List Base (clb) and clbu
-            let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize].buffer as *const _ as u64));
-            write_volatile(self.ports_registers[port as usize].clb, command_list_address.as_u64() as u32);
-            write_volatile(self.ports_registers[port as usize].clbu, (command_list_address.as_u64() >> 32) as u32);
+                // Set Command List Base (clb) and clbu
+                let command_list_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.command_list_buffers[port as usize].buffer as *const _ as u64));
+                write_volatile(self.ports_registers[port as usize].clb, command_list_address.as_u64() as u32);
+                write_volatile(self.ports_registers[port as usize].clbu, (command_list_address.as_u64() >> 32) as u32);
 
-            // Set FIS Base (fb) and fbu
-            let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.fis_buffer[port as usize].buffer as *const _ as u64));
-            write_volatile(self.ports_registers[port as usize].fb, fis_address.as_u64() as u32);
-            write_volatile(self.ports_registers[port as usize].fbu, (fis_address.as_u64() >> 32) as u32);
+                // Set FIS Base (fb) and fbu
+                let fis_address = virtual_to_phys(mem_offset, VirtAddr::new(&self.fis_buffer[port as usize].buffer as *const _ as u64));
+                write_volatile(self.ports_registers[port as usize].fb, fis_address.as_u64() as u32);
+                write_volatile(self.ports_registers[port as usize].fbu, (fis_address.as_u64() >> 32) as u32);
 
-            // Allocate an 8KiB buffer for the Command Table (CT)
-            let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
+                // Allocate an 8KiB buffer for the Command Table (CT)
+                let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
 
-            // Calculate the physical address of the Command Table
-            self.command_table_virt_addr.push(VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
-            let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
+                // Calculate the physical address of the Command Table
+                self.command_table_virt_addr.push(VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
+                let command_table_address = virtual_to_phys(mem_offset, VirtAddr::new(&command_table_buffer.buffer as *const _ as u64));
 
-            // Initialize Command Headers
-            self.initialize_command_headers(port, command_table_address);
+                // Initialize Command Headers
+                self.initialize_command_headers(port, command_table_address);
+            }
         }
     }
 

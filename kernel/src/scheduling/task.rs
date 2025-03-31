@@ -27,10 +27,10 @@ impl Task {
         is_user_mode: bool,
     ) -> Self {
         let stack_top = if is_user_mode {
-            allocate_user_stack()
+            unsafe { allocate_user_stack() }
                 .expect("Failed to allocate user-mode stack")
         } else {
-            allocate_kernel_stack()
+            unsafe { allocate_kernel_stack() }
                 .expect("Failed to allocate kernel-mode stack")
         };
 

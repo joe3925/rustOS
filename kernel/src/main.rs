@@ -1,0 +1,62 @@
+#![feature(trusted_random_access)]
+#![feature(abi_x86_interrupt)]
+#![feature(ascii_char)]
+#![no_std]
+#![no_main]
+#![allow(unused_parens)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![feature(custom_test_frameworks)]
+#![test_runner(crate::test_runner)]
+
+extern crate alloc;
+
+mod idt;
+pub mod gdt;
+
+mod console;
+mod util;
+mod cpu;
+mod syscalls;
+mod structs;
+mod scheduling;
+mod memory;
+mod file_system;
+mod exception_handlers;
+mod drivers;
+
+use crate::util::KERNEL_INITIALIZED;
+use bootloader_api::config::Mapping;
+use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
+use core::panic::PanicInfo;
+
+static mut BOOT_INFO: Option<&'static BootInfo> = None;
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    //unsafe { Console::reset_state(); }
+    *KERNEL_INITIALIZED.lock() = false;
+    println!("{}", info);
+    loop {}
+}
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config
+};
+entry_point!(_start, config = &BOOTLOADER_CONFIG);
+fn _start(boot_info: &'static mut BootInfo) -> ! {
+    unsafe { BOOT_INFO = Some(boot_info); } //RustRover will sometimes mark this as an error not sure why
+    unsafe {
+        util::init(boot_info);
+    }
+    loop {}
+}
+
+#[cfg(test)]
+pub fn test_runner(tests: &[&dyn Fn()]) {
+    println!("Running {} tests", tests.len());
+    for test in tests {
+        test();
+    }
+}
+
