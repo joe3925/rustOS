@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+
 [build-dependencies]
 kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
 bootloader = "0.11"

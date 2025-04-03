@@ -3,7 +3,6 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/rustos-api/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/OS/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
@@ -56,6 +55,7 @@
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/kernel/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/os/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/rustos-api/target" />
       <excludeFolder url="file://$MODULE_DIR$/kernel/target" />

@@ -29,3 +29,7 @@ pub fn send_eoi(irq: u8) {
         PICS.lock().notify_end_of_interrupt(irq);
     }
 }
+struct apic {
+    total_cores: u32,
+
+}

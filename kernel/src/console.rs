@@ -1,117 +1,248 @@
-use crate::util::KERNEL_INITIALIZED;
+use crate::util::{boot_info, KERNEL_INITIALIZED};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::fmt::Write;
+use bootloader_api::info::PixelFormat;
+use core::fmt::{Pointer, Write};
+use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::pixelcolor::Rgb888;
+use embedded_graphics::prelude::*;
+use embedded_graphics::primitives::Rectangle;
+use embedded_graphics::text::Text;
+use lazy_static::lazy_static;
 use spin::Mutex;
 
 static mut QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
-
-pub(crate) struct Console {
-    pub(crate) current_line: usize,
-    pub(crate) current_char_size: usize,
-    pub(crate) vga_width: usize,
-    pub(crate) cursor_pose: usize,
+pub(crate) struct Cursor {
+    x: usize,
+    y: usize,
+}
+pub struct Screen {
+    pub buffer_start: &'static mut [u8],
+    pub width: usize,
+    pub height: usize,
+    pub total_size: usize,
+    pub bytes_per_pixel: usize,
+    pub pixel_format: PixelFormat,
+    red_offset: u8,
+    green_offset: u8,
+    blue_offset: u8,
+    is_greyscale: bool,
 }
 
+impl Screen {
+    pub fn new() -> Option<Self> {
+        let mut boot_info = boot_info();
+        if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
+            //byte offset
+            let mut red_offset = 0;
+            let mut green_offset = 0;
+            let mut blue_offset = 0;
+            let mut is_greyscale = false;
+            match framebuffer.info().pixel_format {
+                PixelFormat::Rgb => {
+                    green_offset = 1;
+                    blue_offset = 2;
+                }
+                PixelFormat::Bgr => {
+                    red_offset = 2;
+                    green_offset = 1;
+                    blue_offset = 0;
+                }
+                PixelFormat::U8 => { is_greyscale = true; }
+                PixelFormat::Unknown { red_position, green_position, blue_position } => {
+                    red_offset = red_position;
+                    green_offset = green_position;
+                    blue_offset = blue_position;
+                }
+                _ => {}
+            }
+            Some(Screen {
+                width: framebuffer.info().width.clone(),
+                height: framebuffer.info().height.clone(),
+                total_size: framebuffer.info().byte_len.clone(),
+                pixel_format: framebuffer.info().pixel_format.clone(),
+                bytes_per_pixel: framebuffer.info().bytes_per_pixel.clone(),
+                buffer_start: framebuffer.buffer_mut(),
+                red_offset,
+                green_offset,
+                blue_offset,
+                is_greyscale,
+            })
+        } else {
+            None
+        }
+    }
+    ///Draws to a given pixel, leave rgb blank for grayscale only set a
+    pub fn set(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8) {
+        let pixel_index = (y * self.width + x) * self.bytes_per_pixel;
+        if (!self.is_greyscale) {
+            self.buffer_start[pixel_index + self.red_offset as usize] = r;
+            self.buffer_start[pixel_index + self.green_offset as usize] = g;
+            self.buffer_start[pixel_index + self.blue_offset as usize] = b;
+        } else {
+            self.buffer_start[pixel_index] = a;
+        }
+    }
+    pub fn clear(&mut self, start_x: usize, start_y: usize) {
+        for x in start_x..start_x + FONT_WIDTH {
+            for y in start_y..start_y + FONT_HEIGHT {
+                self.set(x, y, 0, 0, 0, 0);
+            }
+        }
+    }
+}
+
+impl Dimensions for Screen {
+    fn bounding_box(&self) -> Rectangle {
+        Rectangle::new(Point::zero(), Size::new(self.width as u32, self.height as u32))
+    }
+}
+
+impl DrawTarget for Screen {
+    type Color = Rgb888;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item=Pixel<Self::Color>>,
+    {
+        for Pixel(coord, color) in pixels {
+            if coord.x >= 0 && coord.y >= 0 {
+                let x = coord.x as usize;
+                let y = coord.y as usize;
+                if x < self.width && y < self.height {
+                    self.set(x, y, color.r(), color.g(), color.b(), 0);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+const FONT_HEIGHT: usize = 18;
+const FONT_WIDTH: usize = 9;
+
+pub struct Console {
+    pub screen: Screen,
+    pub cursor_pose: Cursor,
+}
 impl Console {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
+        let screen = Screen::new().unwrap();
         Console {
-            current_char_size: 0,
-            vga_width: 80,
-            cursor_pose: 0,
-            current_line: 0,
+            screen,
+            cursor_pose: Cursor { x: 0, y: FONT_HEIGHT },
         }
     }
 
-    const fn vga_buffer() -> &'static mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(0xB8000 as *mut u8, 80 * 25 * 2) }
-    }
 
     pub(crate) fn print(&mut self, str: &[u8]) {
-        let mut i = 0;
-        let vga_buffer = Console::vga_buffer();
-        while i < str.len() && self.cursor_pose + 2 <= 80 * 25 * 2 {
-            // Correct cursor position if it's not even
-            if self.cursor_pose % 2 != 0 {
-                self.cursor_pose += 1;
-            }
+        let style = MonoTextStyle::new(&FONT_9X18, Rgb888::new(52, 100, 235));
 
-            // Handle newlines
-            if self.cursor_pose > 80 * 25 * 2 {
-                self.scroll_up();
-            }
+        let text = core::str::from_utf8(str).unwrap_or("Invalid UTF-8");
 
-            if str[i] == b'\n' {
-                self.cursor_pose += (self.vga_width * 2) - (self.cursor_pose % (self.vga_width * 2));
-                self.current_line += 1;
-                self.current_char_size = 0;
-            }
-            // Handle backspace
-            else if str[i] == 0x08 {
-                if vga_buffer[self.cursor_pose] == 0x0 {
-                    while self.cursor_pose > 0 && vga_buffer[self.cursor_pose] == 0x0 {
-                        self.cursor_pose -= 2;
-                    }
-                }
-                if vga_buffer[self.cursor_pose] != 0x0 {
-                    vga_buffer[self.cursor_pose] = 0x0; // Clear character
-                    vga_buffer[self.cursor_pose + 1] = 0x07; // Reset attribute (white on black)
-                    self.current_char_size = self.current_char_size.saturating_sub(1);
-                }
-            }
-            // Handle regular character printing
-            else {
-                if self.current_line >= 24 {
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
                     self.scroll_up();
-                    self.current_line = 23;
-                    self.cursor_pose = self.current_line * self.vga_width * 2;
+                } else {
+                    self.cursor_pose.y += FONT_HEIGHT;
                 }
-
-                vga_buffer[self.cursor_pose] = str[i];
-                vga_buffer[self.cursor_pose + 1] = 0x07; // White foreground, black background
-                self.cursor_pose += 2;
-                self.current_char_size += 1;
+                self.cursor_pose.x = 0;
             }
 
-            i += 1;
+            let mut parts = line.split('\x08').peekable();
+
+            while let Some(part) = parts.next() {
+                if !part.is_empty() {
+                    // Check line wrapping
+                    let part_width = FONT_WIDTH * part.len();
+                    if self.cursor_pose.x + part_width > self.screen.width {
+                        if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
+                            self.scroll_up();
+                        } else {
+                            self.cursor_pose.y += FONT_HEIGHT;
+                        }
+                        self.cursor_pose.x = 0;
+                    }
+
+                    Text::new(
+                        part,
+                        Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
+                        style,
+                    )
+                        .draw(&mut self.screen)
+                        .unwrap();
+
+                    self.cursor_pose.x += part_width;
+                }
+
+                // Handle backspace if present
+                if parts.peek().is_some() {
+                    if self.cursor_pose.x >= FONT_WIDTH {
+                        self.cursor_pose.x -= FONT_WIDTH;
+                    } else if self.cursor_pose.y >= FONT_HEIGHT {
+                        // Go to previous line if we're at line start
+                        self.cursor_pose.y -= FONT_HEIGHT;
+                        self.cursor_pose.x = self.screen.width - FONT_WIDTH;
+                    } else {
+                        // At top-left corner, can't move back
+                        self.cursor_pose.x = 0;
+                        self.cursor_pose.y = 0;
+                    }
+
+                    // Clear character visually (overwrite with a blank space)
+                    self.screen.clear(self.cursor_pose.x - FONT_WIDTH, self.cursor_pose.y - FONT_HEIGHT + 9)
+                }
+            }
         }
+    }
+
+
+    /*pub(crate) fn print(&mut self, str: &[u8]) {
+        let style = MonoTextStyle::new(&FONT_7X14, Rgb888::new(255, 255, 255));
+        let text = core::str::from_utf8(str).unwrap_or("Invalid UTF-8");
+
+        Text::new(
+            text,
+            Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
+            style,
+        )
+            .draw(&mut self.screen)
+            .unwrap();
+        // self.cursor_pose.x += 7;
+    }*/
+    pub fn clear_screen(&mut self) {
+        self.screen.buffer_start.fill(0);
     }
 
     fn scroll_up(&mut self) {
-        let vga_buffer = Console::vga_buffer();
-        for y in 1..25 {
-            for x in 0..self.vga_width {
-                let from = (y * self.vga_width + x) * 2;
-                let to = ((y - 1) * self.vga_width + x) * 2;
+        let height = self.screen.height;
+        let width = self.screen.width;
+        let bytes_per_pixel = 3; // RGB888
+        let line_height = 14;
 
-                vga_buffer[to] = vga_buffer[from];
-                vga_buffer[to + 1] = vga_buffer[from + 1];
-            }
-        }
+        let fb = &mut self.screen.buffer_start; // Get &mut [u8] to framebuffer
+        let stride = width * bytes_per_pixel;
 
-        // Clear the last line
-        let last_line_start = (24 * self.vga_width) * 2;
-        for x in 0..self.vga_width {
-            vga_buffer[last_line_start + x * 2] = b' ';
-            vga_buffer[last_line_start + x * 2 + 1] = 0x07;
-        }
+        let scroll_bytes = line_height * stride;
+        let total_bytes = height * stride;
 
-        // Adjust the cursor position after scrolling
-        self.cursor_pose = (self.vga_width * 23 * 2) + (self.current_char_size * 2);
+        // Move framebuffer contents up
+        fb.copy_within(scroll_bytes.., 0);
+
+        // Clear bottom line
+        let start = total_bytes - scroll_bytes;
+        fb[start..].fill(0);
     }
 }
-
-pub(crate) static CONSOLE: Mutex<Console> = Mutex::new(Console::new());
-
-#[allow(dead_code)]
-pub(crate) fn clear_vga_buffer() {
-    let vga_buffer = Console::vga_buffer();
-    let mut i = 0;
-    while (i < 0xFA0) {
-        vga_buffer[i] = 0x0;
-
-        i += 2;
-    }
+pub fn clear_screen() {
+    let mut console = CONSOLE.lock();
+    //x86_64::instructions::interrupts::enable();
+    (*console).clear_screen();
+}
+lazy_static! {
+    pub static ref CONSOLE: Mutex<Console> = Mutex::new(Console::new());
 }
 #[macro_export]
 macro_rules! print {
@@ -143,7 +274,6 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
     write!(writer, "{}", args).unwrap();
 
     let data = writer.as_bytes();
-
     unsafe {
         KERNEL_INITIALIZED.force_unlock();
         if *KERNEL_INITIALIZED.lock() {

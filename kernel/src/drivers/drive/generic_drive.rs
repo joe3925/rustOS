@@ -38,7 +38,7 @@ pub enum FormatStatus {
 impl FormatStatus {
     pub fn to_str(&self) -> &'static str {
         match self {
-            FormatStatus::TooCorrupted => "The former Fat32 filesystem is too corrupted to be formatted by this OS please try a different formatter",
+            FormatStatus::TooCorrupted => "The former Fat32 filesystem is too corrupted to be formatted by this os please try a different formatter",
             FormatStatus::AlreadyFat32 => "The volume is already formated ",
             FormatStatus::DriveDoesntExist => "The drive specified could not be found",
             FormatStatus::AlreadyGPT => "Cannot format already GPT drive with normal format attempt force format",

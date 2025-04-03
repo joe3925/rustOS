@@ -25,12 +25,13 @@ mod file_system;
 mod exception_handlers;
 mod drivers;
 
+use crate::console::clear_screen;
 use crate::util::KERNEL_INITIALIZED;
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 
-static mut BOOT_INFO: Option<&'static BootInfo> = None;
+static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     //unsafe { Console::reset_state(); }
@@ -41,15 +42,20 @@ fn panic(info: &PanicInfo) -> ! {
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = 10 * 100 * 1024;
     config
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 fn _start(boot_info: &'static mut BootInfo) -> ! {
     unsafe { BOOT_INFO = Some(boot_info); } //RustRover will sometimes mark this as an error not sure why
+    clear_screen();
     unsafe {
-        util::init(boot_info);
+        util::init();
     }
     loop {}
+}
+pub fn function(x: i64) -> i64 {
+    return x;
 }
 
 #[cfg(test)]

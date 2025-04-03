@@ -1,11 +1,11 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="1build" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="cd $PROJECT_DIR$/../RustOS; cargo build --target x86_64-unknown-none    " />
+    <option name="SCRIPT_TEXT" value="cd $PROJECT_DIR$/os; cargo build --release" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />
     <option name="INDEPENDENT_SCRIPT_WORKING_DIRECTORY" value="true" />
-    <option name="SCRIPT_WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="SCRIPT_WORKING_DIRECTORY" value="$PROJECT_DIR$/os" />
     <option name="INDEPENDENT_INTERPRETER_PATH" value="true" />
     <option name="INTERPRETER_PATH" value="powershell.exe" />
     <option name="INTERPRETER_OPTIONS" value="" />

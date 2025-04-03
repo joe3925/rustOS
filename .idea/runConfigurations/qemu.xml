@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="qemu" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="&amp; &quot;C:\Program Files\qemu\qemu-system-x86_64w.exe&quot; -m 1024M -drive file=D:\RustroverProjects\RustOS\target\OS\debug\bootimage-RustOS.bin,format=raw -drive file=D:\RustroverProjects\RustOS\target\OS\debug\rustOS.vhdx,if=ide" />
+    <option name="SCRIPT_TEXT" value="D:\RustroverProjects\rustOS\target\release\OS.exe " />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />

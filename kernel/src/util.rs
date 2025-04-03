@@ -1,6 +1,6 @@
 extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
-use crate::drivers::drive::gpt::PARTITIONS;
+use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index;
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
@@ -18,11 +18,13 @@ use x86_64::VirtAddr;
 
 pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
 
-pub unsafe fn init(boot_info: &'static BootInfo) {
-    let mut partitions = PARTITIONS.lock();
+pub unsafe fn init() {
+    let boot_info = boot_info();
+    let mut partitions = VOLUMES.lock();
     let mut drives = DRIVECOLLECTION.lock();
 
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
@@ -81,9 +83,11 @@ pub fn random_number() -> u64 {
     rng.next_u64()
 }
 
-pub fn boot_info() -> &'static BootInfo {
+pub fn boot_info() -> &'static mut BootInfo {
     unsafe {
-        BOOT_INFO.unwrap()
+        BOOT_INFO
+            .as_mut()
+            .expect("BOOT_INFO not initialized")
     }
 }
 
@@ -123,4 +127,14 @@ impl Random {
     pub fn next_u32(&mut self) -> u32 {
         (self.rng.next_u64() & 0xFFFF_FFFF) as u32
     }
+}
+pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
+    let mut buffer = [0x0000; 36]; // Fill with null terminators
+    let utf16_iter = name.encode_utf16();
+
+    for (i, c) in utf16_iter.take(36).enumerate() {
+        buffer[i] = c;
+    }
+
+    buffer
 }

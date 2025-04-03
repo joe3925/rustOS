@@ -1,5 +1,5 @@
 use core::arch::x86_64::_rdtsc;
-
+use cpuid::CpuInfo;
 
 pub fn get_cycles() -> u64 {
     unsafe {
@@ -14,3 +14,11 @@ pub fn wait_cycle(cycles: u64) {
         }
     }
 }
+pub fn get_cpu_info() -> Option<CpuInfo> {
+    let info = cpuid::identify();
+    match info {
+        Ok(Info) => { Some(Info) }
+        Err(_) => { None }
+    }
+}
+

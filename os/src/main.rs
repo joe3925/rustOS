@@ -17,8 +17,9 @@ fn main() {
         let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)
             .args([
                 "-m", "1024M",
-                "-drive", "file=D:\\RustroverProjects\\RustOS\\target\\OS\\release\\bootimage-RustOS.bin,format=raw",
-                "-drive", "file=D:\\RustroverProjects\\RustOS\\target\\OS\\release\\rustOS.vhdx,if=ide",
+                "-no-reboot",
+                "-drive", "file=D:\\RustroverProjects\\rustOS\\target\\release\\boot.img,format=raw",
+                "-drive", "file=D:\\RustroverProjects\\rustOS\\target\\release\\rustOS.vhdx,if=ide",
             ])
             .status()
             .expect("Failed to run QEMU");
