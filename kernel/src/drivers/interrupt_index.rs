@@ -62,6 +62,7 @@ impl ApicErrors {
 pub struct ApicImpl {
     pub apic_info: Apic<'static, Global>,
     pub lapic_virt_addr: VirtAddr,
+    pub ioapic_virt_addr: VirtAddr,
 }
 
 impl ApicImpl {
@@ -108,7 +109,7 @@ impl ApicImpl {
 
         // Other init: clear LVT entries, set DFR/LDR if needed
     }
-    unsafe fn init_timer(&self) {
+    pub(crate) unsafe fn init_timer(&self) {
         let lapic_pointer = self.lapic_virt_addr.as_mut_ptr::<u32>();
         let svr = lapic_pointer.offset(APICOffset::Svr as isize / 4);
         svr.write_volatile(svr.read_volatile() | 0x100);
@@ -124,7 +125,7 @@ impl ApicImpl {
 
         // Set initial count - smaller value for more frequent interrupts
         let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
-        ticr.write_volatile(1000); // Much smaller value than before
+        ticr.write_volatile(300);
     }
     pub fn end_interrupt(&self) {
         unsafe {

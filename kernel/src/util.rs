@@ -8,7 +8,7 @@ use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
-use crate::{cpu, gdt, println, BOOT_INFO};
+use crate::{cpu, gdt, print, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
@@ -41,7 +41,12 @@ pub unsafe fn init() {
 
     APIC.lock().init_local();
     println!("APIC transition successful");
-    
+
+    print!("Starting timer...   ");
+    APIC.lock().init_timer();
+    println!("Started");
+
+
     test_full_heap();
 
     PCIBUS.lock().enumerate_pci();

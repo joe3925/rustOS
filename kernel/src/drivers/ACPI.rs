@@ -1,12 +1,9 @@
 use crate::memory::paging;
-use crate::println;
 use crate::util::boot_info;
 use acpi;
 use acpi::platform::interrupt::Apic;
-use acpi::rsdp::Rsdp;
 use acpi::{AcpiHandler, AcpiTables, InterruptModel, PhysicalMapping, PlatformInfo};
 use alloc::alloc::Global;
-use alloc::vec::Vec;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use x86_64::{PhysAddr, VirtAddr};
@@ -39,9 +36,6 @@ impl ACPI {
         if boot_info().rsdp_addr.into_option().is_none() {
             panic!("RSDP was not supplied by bootloader");
         }
-        println!("rsdp: {:#X}", boot_info().rsdp_addr.into_option().unwrap());
-        let tab = unsafe { paging::map_mmio_region(PhysAddr::new(boot_info().rsdp_addr.into_option().unwrap()), size_of::<Rsdp>() as u64) }.unwrap().as_ptr::<Rsdp>();
-        unsafe { println!("{:#?}", Vec::from((*tab).oem_id())); }
         let tables = unsafe { AcpiTables::from_rsdp(handler, boot_info().rsdp_addr.into_option().unwrap() as usize).expect("failed to parse ACPI") };
         ACPI {
             tables
