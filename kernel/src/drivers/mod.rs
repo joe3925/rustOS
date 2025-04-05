@@ -5,3 +5,4 @@ pub(crate) mod interrupt_index;
 mod graphics_driver;
 pub mod pci;
 pub mod drive;
+mod ACPI;

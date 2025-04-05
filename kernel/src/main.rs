@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 #![feature(custom_test_frameworks)]
+#![feature(allocator_api)]
 #![test_runner(crate::test_runner)]
 
 extern crate alloc;

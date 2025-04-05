@@ -1,7 +1,9 @@
 extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index;
+use crate::drivers::interrupt_index::APIC;
+use crate::drivers::interrupt_index::PICS;
+
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
@@ -31,11 +33,15 @@ pub unsafe fn init() {
     gdt::init();
     println!("GDT loaded");
 
-    interrupt_index::PICS.lock().initialize();
+    PICS.lock().initialize();
     load_idt();
-    init_heap(&mut mapper, &mut frame_allocator.clone());
-    println!("IDT loaded");
+    println!("PIC loaded");
 
+    init_heap(&mut mapper, &mut frame_allocator.clone());
+
+    APIC.lock().init_local();
+    println!("APIC transition successful");
+    
     test_full_heap();
 
     PCIBUS.lock().enumerate_pci();

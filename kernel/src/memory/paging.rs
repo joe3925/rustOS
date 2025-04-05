@@ -1,7 +1,7 @@
-use crate::BOOT_INFO;
 use alloc::collections::LinkedList;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
@@ -201,8 +201,8 @@ pub(crate) fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
     unsafe { write_infinite_loop(page_addr.as_mut_ptr()); } // Write the infinite loop
     Ok(page_addr)
 }
-use spin::Mutex;
 use crate::util::boot_info;
+use spin::Mutex;
 
 pub(crate) struct StackAllocator {
     base_address: VirtAddr,
@@ -313,26 +313,124 @@ pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size
         Err(MapToError::FrameAllocationFailed)
     }
 }
+//TODO: very simple bump allocator change if needed
+const MMIO_BASE: u64 = 0xFFFF_C000_0000_0000;
+const MMIO_LIMIT: u64 = 0xFFFF_FF00_0000_0000;
+const MAX_PENDING_FREES: usize = 64;
 
+static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
+static PENDING_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-pub fn map_mmio_region(
-    mapper: &mut OffsetPageTable,
-    frame_allocator: &mut BootInfoFrameAllocator,
-    mmio_base: PhysAddr,          // The physical address of the MMIO region (from BAR)
-    mmio_size: u64,               // The size of the MMIO region
-    virtual_addr: VirtAddr,         // The virtual address to map it to
-) -> Result<(), MapToError<Size4KiB>> {
-    let phys_frame = PhysFrame::containing_address(mmio_base);
+static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
+fn allocate_mmio_virtual_range(size: u64) -> Option<VirtAddr> {
+    let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4KiB
+    let current = NEXT_MMIO_VADDR.fetch_add(aligned_size, Ordering::SeqCst);
 
-    let num_pages = (mmio_size + 0xFFF) / 4096; // 4KiB pages
+    if current + aligned_size > MMIO_LIMIT {
+        None
+    } else {
+        Some(VirtAddr::new(current))
+    }
+}
+fn unmap_mmio_region(
+    mapper: &mut impl Mapper<Size4KiB>,
+    virtual_addr: VirtAddr,
+    size: u64,
+) {
+    let num_pages = (size + 0xFFF) / 4096;
 
     for i in 0..num_pages {
         let page = Page::containing_address(virtual_addr + i * 4096);
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
         unsafe {
-            mapper.map_to(page, phys_frame + i, flags, frame_allocator)?.flush();
+            if let Ok((_, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+        }
+    }
+}
+
+pub fn deallocate_mmio_virtual_range(
+    addr: VirtAddr,
+    size: u64,
+) {
+    let aligned_size = (size + 0xFFF) & !0xFFF;
+    let addr_val = addr.as_u64();
+
+
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut mapper = init_mapper(phys_mem_offset);
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+        unmap_mmio_region(&mut mapper, addr, aligned_size);
+
+        // Try to shrink bump pointer
+        let expected = addr_val + aligned_size;
+        if NEXT_MMIO_VADDR
+            .compare_exchange(expected, addr_val, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            process_pending_frees();
+        } else {
+            // Can't free immediately, queue it
+            unsafe {
+                let idx = PENDING_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
+                if idx < MAX_PENDING_FREES {
+                    PENDING_FREES[idx] = Some((addr_val, aligned_size));
+                }
+            }
+        }
+    }
+}
+
+fn process_pending_frees() {
+    unsafe {
+        let mut i = 0;
+        while i < PENDING_FREE_COUNT.load(Ordering::SeqCst) {
+            if let Some((addr, size)) = PENDING_FREES[i] {
+                let expected = addr + size;
+                if NEXT_MMIO_VADDR
+                    .compare_exchange(expected, addr, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // Already unmapped when added to queue — safe to reclaim now
+                    for j in i..(MAX_PENDING_FREES - 1) {
+                        PENDING_FREES[j] = PENDING_FREES[j + 1];
+                    }
+                    PENDING_FREES[MAX_PENDING_FREES - 1] = None;
+                    PENDING_FREE_COUNT.fetch_sub(1, Ordering::SeqCst);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+
+pub fn map_mmio_region(
+    mmio_base: PhysAddr,
+    mmio_size: u64,
+) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let phys_frame = PhysFrame::containing_address(mmio_base);
+    let num_pages = (mmio_size + 0xFFF) / 4096;
+
+    let virtual_addr = allocate_mmio_virtual_range(mmio_size)
+        .ok_or_else(|| MapToError::FrameAllocationFailed)?;
+
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut mapper = init_mapper(phys_mem_offset);
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+        for i in 0..num_pages {
+            let page = Page::containing_address(virtual_addr + i * 4096);
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+            unsafe {
+                mapper.map_to(page, phys_frame + i, flags, &mut frame_allocator)?.flush();
+            }
         }
     }
 
-    Ok(())
+    Ok(virtual_addr)
 }

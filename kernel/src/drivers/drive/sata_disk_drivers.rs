@@ -10,9 +10,9 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::cpu::wait_cycle;
 use crate::drivers::drive::ahci_structs::{AHCIPortRegisters, CommandHeader, CommandTable, FisRegH2D};
+use crate::println;
 use crate::structs::aligned_buffer::{AlignedBuffer1024, AlignedBuffer128, AlignedBuffer256, AlignedBuffer512};
 use crate::util::boot_info;
-use crate::println;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -195,7 +195,8 @@ impl AHCIController {
     pub fn map(mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator) {
         if let Some(base_addr) = AHCIController::find_sata_controller() {
             println!("found controller at {}", base_addr);
-            map_mmio_region(mapper, frame_allocator, PhysAddr::new(base_addr), 8192, MMIO_VIRTUAL_ADDR).expect("TODO: panic message");
+            //TODO: make mmio addr dyn
+            map_mmio_region(PhysAddr::new(base_addr), 8192).expect("TODO: panic message");
         }
     }
     pub fn find_sata_controller() -> Option<u64> {

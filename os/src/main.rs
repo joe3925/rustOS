@@ -18,7 +18,14 @@ fn main() {
             .args([
                 "-m", "1024M",
                 "-no-reboot",
+                "-cpu", "qemu64,+apic,+acpi",
+                "-machine", "type=pc,accel=tcg",
+                "-smp", "2",
+                // UEFI firmware
+                "-drive", "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
+                // Kernel image
                 "-drive", "file=D:\\RustroverProjects\\rustOS\\target\\release\\boot.img,format=raw",
+                // Disk
                 "-drive", "file=D:\\RustroverProjects\\rustOS\\target\\release\\rustOS.vhdx,if=ide",
             ])
             .status()
