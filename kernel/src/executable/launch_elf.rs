@@ -1,7 +1,7 @@
 use crate::file_system::file::{File, OpenFlags};
+use crate::println;
 use alloc::vec::Vec;
-use elf::endian::AnyEndian;
-use elf::ElfBytes;
+use goblin::Object;
 use x86_64::VirtAddr;
 
 struct ElfAllocation {
@@ -17,6 +17,23 @@ pub fn parse_elf(path: &str) {
     //add result handling later
     let file_handle = File::open(path, &open_flags).expect("failed to find elf");
     let file = file_handle.read().expect("elf read failed");
-    let elf = ElfBytes::<AnyEndian>::minimal_parse(file.as_slice()).expect("elf parse failed");
-    elf.segments();
+    match Object::parse(&file) {
+        Object::Elf(elf) => {
+            println!("elf: {:#?}", &elf);
+        }
+        Object::PE(pe) => {
+            println!("pe: {:#?}", &pe);
+        }
+        Object::COFF(coff) => {
+            println!("coff: {:#?}", &coff);
+        }
+        Object::Mach(mach) => {
+            println!("mach: {:#?}", &mach);
+        }
+        Object::Archive(archive) => {
+            println!("archive: {:#?}", &archive);
+        }
+        Object::Unknown(magic) => { println!("unknown magic: {:#x}", magic) }
+        _ => {}
+    }
 }
