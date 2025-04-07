@@ -23,6 +23,7 @@ crc-any = "2.0.0"
 embedded-graphics = "0.8.1"
 raw-cpuid = "11.5.0"
 acpi = "5.2.0"
+elf = { version = "0.7.4", default-features = false }
 
 [dependencies.lazy_static]
 version = "1.0"

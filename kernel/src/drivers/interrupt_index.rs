@@ -62,11 +62,9 @@ impl ApicErrors {
 pub struct ApicImpl {
     pub apic_info: Apic<'static, Global>,
     pub lapic_virt_addr: VirtAddr,
-    pub ioapic_virt_addr: VirtAddr,
 }
 
 impl ApicImpl {
-    //noinspection ALL
     pub fn new() -> Result<Self, ApicErrors> {
         if let info = get_cpu_info() {
             let features = info.get_feature_info().ok_or(NoCPUID)?;
@@ -78,6 +76,7 @@ impl ApicImpl {
             }
             if let Some(table) = ACPI_TABLES.get_interrupt_model() {
                 let lapic_vaddr = paging::map_mmio_region(PhysAddr::new(table.local_apic_address), 0x1000).expect("failed to map local apic to mmio space"); // your MMIO mapper
+
                 Ok(ApicImpl {
                     apic_info: table,
                     lapic_virt_addr: lapic_vaddr,
@@ -107,7 +106,6 @@ impl ApicImpl {
         let svr = lapic_ptr.add(LAPIC_SVR_OFFSET);
         svr.write_volatile(svr.read_volatile() | 0x100); // enable LAPIC (bit 8)
 
-        // Other init: clear LVT entries, set DFR/LDR if needed
     }
     pub(crate) unsafe fn init_timer(&self) {
         let lapic_pointer = self.lapic_virt_addr.as_mut_ptr::<u32>();
@@ -125,7 +123,21 @@ impl ApicImpl {
 
         // Set initial count - smaller value for more frequent interrupts
         let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
-        ticr.write_volatile(300);
+        ticr.write_volatile(700);
+    }
+    pub unsafe fn init_ioapic(&self) {
+        let phys_addr = self.apic_info.io_apics[0].address;
+        let virt_addr = paging::map_mmio_region(PhysAddr::new(phys_addr as u64), 0x2048).expect("failed to map io apic");
+        let ioapic_pointer = virt_addr.as_mut_ptr::<u32>();
+
+        ioapic_pointer.offset(0).write_volatile(0x12);
+        ioapic_pointer
+            .offset(4)
+            .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
+    }
+    pub(crate) unsafe fn init_keyboard(&self) {
+        let keyboard_register = self.lapic_virt_addr.as_mut_ptr::<u32>().offset(APICOffset::LvtLint1 as isize / 4);
+        keyboard_register.write_volatile(InterruptIndex::KeyboardIndex.as_u8() as u32);
     }
     pub fn end_interrupt(&self) {
         unsafe {

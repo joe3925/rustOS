@@ -25,6 +25,7 @@ mod memory;
 mod file_system;
 mod exception_handlers;
 mod drivers;
+mod executable;
 
 use crate::console::clear_screen;
 use crate::util::KERNEL_INITIALIZED;

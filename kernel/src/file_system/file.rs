@@ -1,9 +1,9 @@
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::file_system::fat::FileSystem;
+use crate::file_system::file::FileStatus::{DriveNotFound, UnknownFail};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
-use crate::file_system::file::FileStatus::{DriveNotFound, UnknownFail};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FileAttribute {
@@ -188,7 +188,7 @@ impl File {
 
 
     /// Read data from the file.
-    pub fn read(&mut self) -> Result<Vec<u8>, FileStatus> {
+    pub fn read(&self) -> Result<Vec<u8>, FileStatus> {
         let mut file_system = {
             let mut partition = VOLUMES.lock();
             if let Some(part) = partition.find_volume(self.drive_label.clone()) {
@@ -256,7 +256,7 @@ impl File {
         }
         Err(FileStatus::DriveNotFound)
     }
-    pub fn make_dir(path: String) -> Result<(), FileStatus>{
+    pub fn make_dir(path: String) -> Result<(), FileStatus> {
         Self::check_path(path.as_str())?;
         if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
             let mut file_system = {
@@ -271,7 +271,7 @@ impl File {
                 }
             };
             file_system.create_dir(path.as_str())?;
-            match file_system.find_dir(path.as_str())  {
+            match file_system.find_dir(path.as_str()) {
                 Ok(_) => {
                     Ok(())
                 }
@@ -279,11 +279,9 @@ impl File {
                     Err(UnknownFail)
                 }
             }
-
-        }else{
+        } else {
             Err(DriveNotFound)
         }
-
     }
     pub fn get_drive_letter(path: &[u8]) -> Option<String> {
         // Ensure the path has at least 3 bytes: the letter, the colon, and the backslash.
@@ -330,7 +328,5 @@ impl File {
 
         Ok(())
     }
-
-
 }
 

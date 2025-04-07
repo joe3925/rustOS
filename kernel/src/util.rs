@@ -29,6 +29,8 @@ pub unsafe fn init() {
 
     let mut mapper = init_mapper(mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    init_heap(&mut mapper, &mut frame_allocator.clone());
+
 
     gdt::init();
     println!("GDT loaded");
@@ -37,15 +39,8 @@ pub unsafe fn init() {
     load_idt();
     println!("PIC loaded");
 
-    init_heap(&mut mapper, &mut frame_allocator.clone());
-
-    APIC.lock().init_local();
-    println!("APIC transition successful");
-
-    print!("Starting timer...   ");
-    APIC.lock().init_timer();
-    println!("Started");
-
+    init_apic_full();
+    println!("APIC transition successful!");
 
     test_full_heap();
 
@@ -57,6 +52,21 @@ pub unsafe fn init() {
 
     println!("Init Done");
     *KERNEL_INITIALIZED.lock() = true;
+}
+pub unsafe fn init_apic_full() {
+    x86_64::instructions::interrupts::disable();
+    {
+        let apic = APIC.lock();
+        apic.init_local();
+
+        print!("Starting timer...   ");
+        apic.init_timer();
+        println!("Started");
+
+        apic.init_ioapic();
+        apic.init_keyboard();
+    }
+    x86_64::instructions::interrupts::enable();
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

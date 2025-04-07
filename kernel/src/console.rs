@@ -1,5 +1,6 @@
 use crate::util::{boot_info, KERNEL_INITIALIZED};
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
 use core::fmt::{Pointer, Write};
@@ -8,7 +9,7 @@ use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::Rectangle;
-use embedded_graphics::text::Text;
+use embedded_graphics::text::{Baseline, Text, TextStyleBuilder};
 use lazy_static::lazy_static;
 use spin::Mutex;
 
@@ -138,61 +139,56 @@ impl Console {
 
     pub(crate) fn print(&mut self, str: &[u8]) {
         let style = MonoTextStyle::new(&FONT_9X18, Rgb888::new(52, 100, 235));
+        let mut text = String::new();
 
-        let text = core::str::from_utf8(str).unwrap_or("Invalid UTF-8");
-
-        for (i, line) in text.split('\n').enumerate() {
-            if i > 0 {
-                if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
-                    self.scroll_up();
-                } else {
-                    self.cursor_pose.y += FONT_HEIGHT;
+        for &b in str {
+            match b {
+                b'\x08' => {
+                    text.pop(); // remove last character
                 }
-                self.cursor_pose.x = 0;
-            }
-
-            let mut parts = line.split('\x08').peekable();
-
-            while let Some(part) = parts.next() {
-                if !part.is_empty() {
-                    // Check line wrapping
-                    let part_width = FONT_WIDTH * part.len();
-                    if self.cursor_pose.x + part_width > self.screen.width {
-                        if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
-                            self.scroll_up();
-                        } else {
-                            self.cursor_pose.y += FONT_HEIGHT;
-                        }
-                        self.cursor_pose.x = 0;
-                    }
-
-                    Text::new(
-                        part,
+                b'\n' => {
+                    // Draw current line
+                    Text::with_text_style(
+                        &text,
                         Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
                         style,
+                        TextStyleBuilder::new().baseline(Baseline::Top).build(),
                     )
                         .draw(&mut self.screen)
                         .unwrap();
+                    self.cursor_pose.y += FONT_HEIGHT;
 
-                    self.cursor_pose.x += part_width;
-                }
-
-                // Handle backspace if present
-                if parts.peek().is_some() {
-                    if self.cursor_pose.x >= FONT_WIDTH {
-                        self.cursor_pose.x -= FONT_WIDTH;
-                    } else if self.cursor_pose.y >= FONT_HEIGHT {
-                        // Go to previous line if we're at line start
-                        self.cursor_pose.y -= FONT_HEIGHT;
-                        self.cursor_pose.x = self.screen.width - FONT_WIDTH;
-                    } else {
-                        // At top-left corner, can't move back
-                        self.cursor_pose.x = 0;
-                        self.cursor_pose.y = 0;
+                    if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
+                        self.scroll_up();
                     }
 
-                    // Clear character visually (overwrite with a blank space)
-                    self.screen.clear(self.cursor_pose.x - FONT_WIDTH, self.cursor_pose.y - FONT_HEIGHT + 9)
+                    self.cursor_pose.x = 0;
+                    text.clear();
+                }
+                _ => {
+                    text.push(b as char);
+                }
+            }
+        }
+
+        if !text.is_empty() {
+            Text::with_text_style(
+                &text,
+                Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
+                style,
+                TextStyleBuilder::new().baseline(Baseline::Top).build(),
+            )
+                .draw(&mut self.screen)
+                .unwrap();
+
+            self.cursor_pose.x += text.len() * FONT_WIDTH;
+
+            if self.cursor_pose.x + FONT_WIDTH > self.screen.width {
+                self.cursor_pose.x = 0;
+                self.cursor_pose.y += FONT_HEIGHT;
+
+                if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
+                    self.scroll_up();
                 }
             }
         }
@@ -215,30 +211,32 @@ impl Console {
     pub fn clear_screen(&mut self) {
         self.screen.buffer_start.fill(0);
     }
-
     fn scroll_up(&mut self) {
         let height = self.screen.height;
         let width = self.screen.width;
         let bytes_per_pixel = 3; // RGB888
-        let line_height = 14;
+        let line_height = FONT_HEIGHT;
 
-        let fb = &mut self.screen.buffer_start; // Get &mut [u8] to framebuffer
         let stride = width * bytes_per_pixel;
-
         let scroll_bytes = line_height * stride;
         let total_bytes = height * stride;
 
-        // Move framebuffer contents up
-        fb.copy_within(scroll_bytes.., 0);
+        let fb = &mut self.screen.buffer_start[..];
 
-        // Clear bottom line
+        // Scroll up one text line
+        fb.copy_within(scroll_bytes..total_bytes, 0);
+
+        // Clear the bottom line
         let start = total_bytes - scroll_bytes;
         fb[start..].fill(0);
+
+        // Set cursor to the beginning of the last line
+        self.cursor_pose.y = height - line_height;
+        self.cursor_pose.x = 0; // <== THIS IS CRITICAL
     }
 }
 pub fn clear_screen() {
     let mut console = CONSOLE.lock();
-    //x86_64::instructions::interrupts::enable();
     (*console).clear_screen();
 }
 lazy_static! {

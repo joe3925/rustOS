@@ -55,7 +55,7 @@ impl BIOSParameterBlock {
             bytes_per_sector: 512,        // Standard sector size
             sectors_per_cluster: SECTORS_PER_CLUSTER as u8,      // Must be power of 2, chosen for performance
             reserved_sectors: RESERVED_SECTORS as u16,         // Typically 32 for FAT32
-            num_fats: 1,                  // Always 2 for redundancy
+            num_fats: 1,
             root_entry_count: 0,          // Always 0 for FAT32
             total_sectors_16: 0,          // Use total_sectors_32 for FAT32
             media_descriptor: 0xF8,       // Fixed disk
@@ -273,18 +273,15 @@ impl FileSystem {
             //TODO: stop doing this
             unsafe { VOLUMES.force_unlock(); }
             if (Self::is_fat_present(info_sec)) {
-
                 let clusters = self.get_all_clusters(2);
 
                 //if the root directory has been corrupted remove what we can
                 if (*clusters.last().unwrap() == 0) {
                     //prevents a fault from the corrupted root dir
                     self.update_fat(2, 0xFFFFFFFF);
-
                 }
                 let res = self.remove_dir("\\".to_string());
                 if res.is_err() {
-
                     return Err(TooCorrupted);
                 }
             }
@@ -372,7 +369,7 @@ impl FileSystem {
             part.write(sector_number, &mut buffer);
         }
     }
-    fn get_fat_start(&self, fat_number: u8) -> u32{
+    fn get_fat_start(&self, fat_number: u8) -> u32 {
         (self.calculate_max_fat_size() * (fat_number) as u32) + RESERVED_SECTORS
     }
     pub fn create_dir(&mut self, path: &str) -> Result<(), FileStatus> {
@@ -496,7 +493,7 @@ impl FileSystem {
                 let file_path = format!("{}.{}", child_path, entry.get_extension());
                 self.delete_file(&file_path)?;
             } else if entry.attributes == u8::from(FileAttribute::Directory) {
-                if(entry.get_name() == ".." || entry.get_name() == "."){
+                if (entry.get_name() == ".." || entry.get_name() == ".") {
                     self.delete_file(&child_path)?;
                     continue;
                 }
@@ -551,9 +548,7 @@ impl FileSystem {
             for j in 0..dir.len() {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
-                if(dir[j].get_name() == "TEST"){
-
-                }
+                if (dir[j].get_name() == "TEST") {}
                 if (dir[j].get_name() == name && dir[j].get_extension() == extension && file_attribute as u8 == dir[j].attributes) {
                     return Ok(dir[j].clone());
                 }
@@ -1022,10 +1017,8 @@ impl FileSystem {
                     sector[sector_index + 3],
                 ]);
                 if entry != 0xFFFFFFFF && entry >= 0x00000002 {
-
-
                     out_vec.push(entry);
-                }else if(entry >= 0x00000002){
+                } else if (entry >= 0x00000002) {
                     //TODO: corruption warning
                 }
                 starting_cluster = entry;
