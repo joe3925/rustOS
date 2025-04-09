@@ -1,8 +1,8 @@
 extern crate rand_xoshiro;
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::APIC;
 use crate::drivers::interrupt_index::PICS;
+use crate::drivers::interrupt_index::{ApicErrors, ApicImpl, APIC};
 
 use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::idt::load_idt;
@@ -39,9 +39,10 @@ pub unsafe fn init() {
     load_idt();
     println!("PIC loaded");
 
-    init_apic_full();
-    println!("APIC transition successful!");
-
+    match init_apic_full() {
+        Ok(_) => { println!("APIC transition successful!"); }
+        Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
+    }
     test_full_heap();
 
     PCIBUS.lock().enumerate_pci();
@@ -53,20 +54,27 @@ pub unsafe fn init() {
     println!("Init Done");
     *KERNEL_INITIALIZED.lock() = true;
 }
-pub unsafe fn init_apic_full() {
+pub unsafe fn init_apic_full() -> Result<(), ApicErrors> {
     x86_64::instructions::interrupts::disable();
-    {
-        let apic = APIC.lock();
-        apic.init_local();
+    let apic_result = ApicImpl::new();
+    match apic_result {
+        Ok(apic) => {
+            apic.init_local();
 
-        print!("Starting timer...   ");
-        apic.init_timer();
-        println!("Started");
+            print!("Starting timer...   ");
+            apic.init_timer();
+            println!("Started");
 
-        apic.init_ioapic();
-        apic.init_keyboard();
+            apic.init_ioapic();
+            apic.init_keyboard();
+            APIC.lock().replace(apic);
+        }
+        Err(err) => {
+            return Err(err)
+        }
     }
-    x86_64::instructions::interrupts::enable();
+
+    Ok(x86_64::instructions::interrupts::enable())
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

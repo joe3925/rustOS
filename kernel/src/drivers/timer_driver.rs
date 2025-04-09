@@ -1,5 +1,5 @@
 use crate::console::print_queue;
-use crate::drivers::interrupt_index::APIC;
+use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
@@ -40,7 +40,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
         KERNEL_INITIALIZED.force_unlock();
         if *(KERNEL_INITIALIZED.lock()) {
             if (timer.get_current_tick() % 1000 == 0) {
-                unsafe { println!("timer tick: {}, Kernel init: {}", timer.get_current_tick(), *KERNEL_INITIALIZED.lock()) };
+                unsafe { println!("timer tick: {}", timer.get_current_tick()) };
             }
 
             print_queue();
@@ -55,11 +55,11 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
 
                 scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
-                APIC.lock().end_interrupt();
+                send_eoi(InterruptIndex::Timer.as_u8());
             }
         } else {
             // Kernel is not initialized yet, just send EOI and return to kernel
-            APIC.lock().end_interrupt();
+            send_eoi(InterruptIndex::Timer.as_u8());
         }
     }
 }

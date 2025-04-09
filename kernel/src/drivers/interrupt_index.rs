@@ -4,8 +4,9 @@ use crate::drivers::ACPI::ACPI_TABLES;
 use crate::memory::paging;
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
-use lazy_static::lazy_static;
+use core::sync::atomic::AtomicBool;
 use pic8259::ChainedPics;
+use spin::Mutex;
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -13,10 +14,8 @@ pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
 
 pub static PICS: spin::Mutex<ChainedPics> =
     spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
-lazy_static!(
-    pub static ref APIC: spin::Mutex<ApicImpl> =
-        spin::Mutex::new(unsafe { ApicImpl::new().expect("Failed to create apic") });
-);
+pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
+pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 
@@ -36,8 +35,12 @@ impl InterruptIndex {
 #[inline(never)]
 pub fn send_eoi(irq: u8) {
     unsafe {
-        PICS.force_unlock();
-        PICS.lock().notify_end_of_interrupt(irq);
+        if let Some(apic) = APIC.lock().as_mut() {
+            apic.end_interrupt();
+        } else {
+            PICS.force_unlock();
+            PICS.lock().notify_end_of_interrupt(irq);
+        }
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +126,7 @@ impl ApicImpl {
 
         // Set initial count - smaller value for more frequent interrupts
         let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
-        ticr.write_volatile(700);
+        ticr.write_volatile(600);
     }
     pub unsafe fn init_ioapic(&self) {
         let phys_addr = self.apic_info.io_apics[0].address;

@@ -1,4 +1,4 @@
-use crate::drivers::interrupt_index::APIC;
+use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
 use crate::print;
 use lazy_static::lazy_static;
 use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
@@ -29,6 +29,6 @@ pub(crate) extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: In
             }
         }
 
-        APIC.lock().end_interrupt();
+        send_eoi(InterruptIndex::KeyboardIndex.as_u8())
     }
 }
