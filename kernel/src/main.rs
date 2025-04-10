@@ -8,6 +8,7 @@
 #![allow(unused_variables)]
 #![feature(custom_test_frameworks)]
 #![feature(allocator_api)]
+#![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
 
 extern crate alloc;
@@ -32,12 +33,12 @@ use crate::util::KERNEL_INITIALIZED;
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
+use core::sync::atomic::Ordering;
 
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    //unsafe { Console::reset_state(); }
-    *KERNEL_INITIALIZED.lock() = false;
+    KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
     println!("{}", info);
     loop {}
 }

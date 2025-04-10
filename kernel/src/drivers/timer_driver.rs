@@ -5,6 +5,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::util::KERNEL_INITIALIZED;
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 
@@ -37,8 +38,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
 
     //force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
     unsafe {
-        KERNEL_INITIALIZED.force_unlock();
-        if *(KERNEL_INITIALIZED.lock()) {
+        if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
             if (timer.get_current_tick() % 1000 == 0) {
                 unsafe { println!("timer tick: {}", timer.get_current_tick()) };
             }

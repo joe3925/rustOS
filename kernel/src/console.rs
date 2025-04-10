@@ -4,6 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
 use core::fmt::{Pointer, Write};
+use core::sync::atomic::Ordering;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -261,8 +262,8 @@ macro_rules! println {
 pub(crate) unsafe fn print_queue() {
     CONSOLE.force_unlock();
     let mut console = CONSOLE.lock();
-    while (!QUEUE.is_empty()) {
-        console.print(QUEUE.remove(0).unwrap().as_slice())
+    while !QUEUE.is_empty() {
+        console.print(&(QUEUE.pop_front().unwrap()))
     }
 }
 pub(crate) fn _print(args: core::fmt::Arguments) {
@@ -273,9 +274,8 @@ pub(crate) fn _print(args: core::fmt::Arguments) {
 
     let data = writer.as_bytes();
     unsafe {
-        KERNEL_INITIALIZED.force_unlock();
-        if *KERNEL_INITIALIZED.lock() {
-            QUEUE.push_back(data.to_vec());
+        if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+            QUEUE.push_front(data.to_vec());
         } else {
             CONSOLE.lock().print(data);
         }

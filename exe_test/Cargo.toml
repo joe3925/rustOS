@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "elf_test",
+]
+resolver = "2"

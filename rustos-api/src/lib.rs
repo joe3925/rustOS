@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(dead_code)]
+
 extern crate alloc;
 
 use alloc::boxed::Box;
@@ -6,13 +8,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::panic::PanicInfo;
 
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    loop {}
-}
 #[derive(Debug)]
 pub enum OpenFlags {
     ReadOnly,

@@ -1,24 +1,27 @@
 extern crate rand_xoshiro;
+
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
+use crate::drivers::interrupt_index::ApicImpl;
 use crate::drivers::interrupt_index::PICS;
-use crate::drivers::interrupt_index::{ApicErrors, ApicImpl, APIC};
+use alloc::string::ToString;
 
+use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::drivers::pci::pci_bus::PCIBUS;
+use crate::file_system::file::{File, OpenFlags};
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
-use crate::{cpu, gdt, print, println, BOOT_INFO};
+use crate::{cpu, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use spin::Mutex;
 use x86_64::VirtAddr;
-// For seedinguse
 
-pub(crate) static KERNEL_INITIALIZED: Mutex<bool> = Mutex::new(false);
+pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub unsafe fn init() {
     let boot_info = boot_info();
@@ -39,7 +42,7 @@ pub unsafe fn init() {
     load_idt();
     println!("PIC loaded");
 
-    match init_apic_full() {
+    match ApicImpl::init_apic_full() {
         Ok(_) => { println!("APIC transition successful!"); }
         Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
     }
@@ -51,30 +54,34 @@ pub unsafe fn init() {
     partitions.enumerate_parts();
     println!("Drives enumerated");
 
-    println!("Init Done");
-    *KERNEL_INITIALIZED.lock() = true;
-}
-pub unsafe fn init_apic_full() -> Result<(), ApicErrors> {
-    x86_64::instructions::interrupts::disable();
-    let apic_result = ApicImpl::new();
-    match apic_result {
-        Ok(apic) => {
-            apic.init_local();
-
-            print!("Starting timer...   ");
-            apic.init_timer();
-            println!("Started");
-
-            apic.init_ioapic();
-            apic.init_keyboard();
-            APIC.lock().replace(apic);
+    VOLUMES.force_unlock();
+    match drives.drives[1].format_gpt() {
+        Ok(_) => {
+            println!("Drive init successful");
+            VOLUMES.force_unlock();
+            drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
         }
-        Err(err) => {
-            return Err(err)
-        }
+        Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
     }
+    partitions.print_parts();
+    if let Some(part) = partitions.find_volume("C:".to_string()) {
+        VOLUMES.force_unlock();
+        match part.format() {
+            Ok(_) => {
+                println!("volume {} formatted successfully", part.label.clone());
+                part.is_fat = true;
+            }
+            Err(err) => println!("Error formatting volume {} {}", part.label.clone(), err.to_str()),
+        }
+    } else {
+        println!("failed to find drive C:");
+    }
+    let open_flags = [OpenFlags::Create, OpenFlags::ReadWrite];
+    VOLUMES.force_unlock();
+    println!("{:#?}", File::open("C:\\FLDR\\TEST\\TEST.TXT", &open_flags).unwrap());
 
-    Ok(x86_64::instructions::interrupts::enable())
+    println!("Init Done");
+    KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

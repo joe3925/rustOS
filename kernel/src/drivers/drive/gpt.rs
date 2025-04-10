@@ -1,6 +1,9 @@
+use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
 use crate::drivers::drive::generic_drive::{Drive, DriveController, FormatStatus, PartitionErrors, DRIVECOLLECTION};
+use crate::drivers::drive::gpt::GptPartitionType::MicrosoftReserved;
 use crate::file_system::fat::{FileSystem, INFO_SECTOR};
 use crate::println;
+use crate::util::{generate_guid, name_to_utf16_fixed};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -9,9 +12,6 @@ use core::cmp::PartialEq;
 use crc_any::CRC;
 use spin::mutex::Mutex;
 use spin::Lazy;
-use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
-use crate::drivers::drive::gpt::GptPartitionType::MicrosoftReserved;
-use crate::util::{generate_guid, name_to_utf16_fixed};
 
 pub static VOLUMES: Lazy<Mutex<PartitionCollection>> = Lazy::new(|| {
     Mutex::new(PartitionCollection::new())
@@ -349,12 +349,12 @@ impl Partition {
     pub fn format(&mut self) -> Result<(), FormatStatus> {
         if (self.is_fat == false) {
             let mut fs = FileSystem::new(self.label.clone(), self.size);
-            return fs.format_drive();
+            return FileSystem::format_drive(self);
         }
         Err(FormatStatus::AlreadyFat32)
     }
     pub fn force_format(&mut self) -> Result<(), FormatStatus> {
-        FileSystem::new(self.label.clone(), self.size).format_drive()
+        FileSystem::format_drive(self)
     }
     pub fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         self.controller.read(sector, buffer).expect("File read failed");
@@ -423,7 +423,8 @@ pub fn scan_for_efi_signature(buffer: &[u8]) -> Option<usize> {
 
     // Iterate over the buffer using an 8-byte sliding window to find the signature
     buffer.windows(8).position(|window| window == efi_sig)
-}impl Drive{
+}
+impl Drive {
     pub(crate) fn is_gpt(&mut self) -> bool {
         let mut buffer = vec![0u8; 512]; // GPT header is within the first sector (LBA 1)
         self.controller.read(1, &mut buffer);

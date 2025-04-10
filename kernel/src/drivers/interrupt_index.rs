@@ -1,7 +1,8 @@
 use crate::cpu::get_cpu_info;
-use crate::drivers::interrupt_index::ApicErrors::{BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
+use crate::drivers::interrupt_index::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::memory::paging;
+use crate::{print, println};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
 use core::sync::atomic::AtomicBool;
@@ -12,8 +13,8 @@ use x86_64::{PhysAddr, VirtAddr};
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
 pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
 
-pub static PICS: spin::Mutex<ChainedPics> =
-    spin::Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static PICS: Mutex<ChainedPics> =
+    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
 pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,7 @@ pub enum ApicErrors {
     NoCPUID,
     BadInterruptModel,
     NoACPI,
+    AlreadyInit,
 }
 impl ApicErrors {
     pub fn to_str(&self) -> &'static str {
@@ -58,6 +60,7 @@ impl ApicErrors {
             NoCPUID => "CPU ID is not supported by this CPU",
             BadInterruptModel => "CPU has incorrect Interrupt model",
             NoACPI => "ACPI is not supported by this CPU",
+            AlreadyInit => "The APIC has already been init",
         }
     }
 }
@@ -68,7 +71,7 @@ pub struct ApicImpl {
 }
 
 impl ApicImpl {
-    pub fn new() -> Result<Self, ApicErrors> {
+    fn new() -> Result<Self, ApicErrors> {
         if let info = get_cpu_info() {
             let features = info.get_feature_info().ok_or(NoCPUID)?;
             if (!features.has_apic()) {
@@ -92,7 +95,7 @@ impl ApicImpl {
         }
     }
 
-    pub fn init_local(&self) {
+    fn init_local(&self) {
         if self.apic_info.also_has_legacy_pics {
             unsafe { PICS.lock().disable(); }
         }
@@ -110,7 +113,7 @@ impl ApicImpl {
         svr.write_volatile(svr.read_volatile() | 0x100); // enable LAPIC (bit 8)
 
     }
-    pub(crate) unsafe fn init_timer(&self) {
+    unsafe fn init_timer(&self) {
         let lapic_pointer = self.lapic_virt_addr.as_mut_ptr::<u32>();
         let svr = lapic_pointer.offset(APICOffset::Svr as isize / 4);
         svr.write_volatile(svr.read_volatile() | 0x100);
@@ -128,7 +131,7 @@ impl ApicImpl {
         let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
         ticr.write_volatile(600);
     }
-    pub unsafe fn init_ioapic(&self) {
+    unsafe fn init_ioapic(&self) {
         let phys_addr = self.apic_info.io_apics[0].address;
         let virt_addr = paging::map_mmio_region(PhysAddr::new(phys_addr as u64), 0x2048).expect("failed to map io apic");
         let ioapic_pointer = virt_addr.as_mut_ptr::<u32>();
@@ -138,7 +141,7 @@ impl ApicImpl {
             .offset(4)
             .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
     }
-    pub(crate) unsafe fn init_keyboard(&self) {
+    unsafe fn init_keyboard(&self) {
         let keyboard_register = self.lapic_virt_addr.as_mut_ptr::<u32>().offset(APICOffset::LvtLint1 as isize / 4);
         keyboard_register.write_volatile(InterruptIndex::KeyboardIndex.as_u8() as u32);
     }
@@ -149,6 +152,33 @@ impl ApicImpl {
                 .offset(APICOffset::Eoi as isize / 4)
                 .write_volatile(0);
         }
+    }
+    pub fn init_apic_full() -> Result<(), ApicErrors> {
+        x86_64::instructions::interrupts::disable();
+        {
+            if APIC.lock().is_some() {
+                return Err(AlreadyInit);
+            }
+        }
+        let apic_result = ApicImpl::new();
+        match apic_result {
+            Ok(apic) => unsafe {
+                apic.init_local();
+
+                print!("Starting timer...   ");
+                apic.init_timer();
+                println!("Started");
+
+                apic.init_ioapic();
+                apic.init_keyboard();
+                APIC.lock().replace(apic);
+            }
+            Err(err) => {
+                return Err(err)
+            }
+        }
+
+        Ok(x86_64::instructions::interrupts::enable())
     }
 }
 
