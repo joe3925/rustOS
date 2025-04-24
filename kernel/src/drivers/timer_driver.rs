@@ -1,6 +1,5 @@
 use crate::console::print_queue;
 use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
-use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::util::KERNEL_INITIALIZED;
@@ -36,11 +35,11 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     let mut timer = TIMER.lock();
     timer.increment();
 
-    //force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
+    // Force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
     unsafe {
         if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
             if (timer.get_current_tick() % 1000 == 0) {
-                unsafe { println!("timer tick: {}", timer.get_current_tick()) };
+                //unsafe { println!("timer tick: {}", timer.get_current_tick()) };
             }
 
             print_queue();

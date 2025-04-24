@@ -161,6 +161,7 @@ impl Allocator {
         }
     }
 }
+//TODO: make this atomic or mutex lock
 static mut INIT: bool = false;
 unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {

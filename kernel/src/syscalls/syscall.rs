@@ -40,7 +40,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     let mut param2: u64;
     let mut param3: u64;
     let mut extra_params: u64;
-
+    //TODO: change from switch case
     unsafe { asm!("mov {0}, rax", lateout(reg) rax); }
     unsafe { asm!("mov {0}, r8", lateout(reg) param1); }
     unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
@@ -51,8 +51,8 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     //all returns are buffers because im lazy
     match rax {
         //print syscall
-        1 =>{
-            if let Some(string) = u64_to_str_ptr(param1) { println_wrapper(string)}
+        1 => {
+            if let Some(string) = u64_to_str_ptr(param1) { println_wrapper(string) }
         }
         //destroy task syscall
         2 => {
@@ -63,7 +63,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         3 => unsafe {
             SCHEDULER.lock().add_task(Task::new(param1 as usize, (*(param2 as *const String)).clone(), true));
         }
-        //file open syscall 1st file path, 2nd ptr to flags array, 3rd sizeof flags, returned in r10
+        //file open syscall
         4 => {
             if let Some(path) = u64_to_str_ptr(param1) {
                 let flags_ptr = param2 as *const OpenFlags;
@@ -81,6 +81,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
                 }
             }
         }
+        //TODO: File read and file write have arbitrary read write vulnerability
 
         // File Read
         5 => {

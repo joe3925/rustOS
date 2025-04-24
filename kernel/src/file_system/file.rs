@@ -65,7 +65,7 @@ pub enum OpenFlags {
     ReadOnly,
     WriteOnly,
     ReadWrite,
-    /// Creates the file if it doesn't exist
+    /// Creates the file if it doesn't exist opens it if it does
     Create,
     /// Creates the file only if it doesn't already exist (fails if it exists)
     CreateNew,
@@ -96,6 +96,7 @@ impl File {
             if let Some(part) = VOLUMES.lock().find_volume(drive_letter.clone()) {
                 // Check if the file exists
                 let file_entry = FileSystem::find_file(part, path);
+
                 match file_entry {
                     Ok(file_entry) => {
                         if (!flags.contains(&OpenFlags::CreateNew)) {

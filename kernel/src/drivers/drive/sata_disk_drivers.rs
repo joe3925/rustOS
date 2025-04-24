@@ -203,10 +203,10 @@ impl AHCIController {
         let mut address_port = Port::<u32>::new(CONFIG_ADDRESS);
         let mut data_port = Port::<u32>::new(CONFIG_DATA);
 
-        let pci_bus = PCIBUS.lock();
-        pci_bus.print_devices();
 
-        for device in pci_bus.device_collection.devices.iter() {
+        PCIBUS.print_devices();
+
+        for device in PCIBUS.device_collection.devices.iter() {
             //SATA controller has class 0x01 and subclass 0x06
             if device.class_code == 0x01 && device.subclass == 0x06 {
                 // The base address is at BAR5

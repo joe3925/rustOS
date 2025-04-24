@@ -1,6 +1,6 @@
 use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
 use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry};
-use crate::drivers::drive::ide_disk_driver::IdeController;
+use crate::drivers::drive::ide_disk_driver::{has_ide_controller, IdeController};
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 // Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
@@ -83,7 +83,7 @@ impl DriveInfo {
     }
 }
 
-// All drives must implement this trait
+// All drives controllers must implement this trait
 pub trait DriveController: Send + Sync {
     fn read(&mut self, sector: u32, buffer: &mut [u8]);
     fn write(&mut self, sector: u32, data: &[u8]);
@@ -135,17 +135,18 @@ impl DriveCollection {
     }
     pub(crate) fn enumerate_drives(&mut self) {
         let mut drives = Vec::new();
-        drives.extend(<IdeController as DriveController>::enumerate_drives());
+        if (has_ide_controller()) {
+            drives.extend(<IdeController as DriveController>::enumerate_drives());
+        }
         //drives.extend(<AHCIController as DriveController>::enumerate_drives());
-
         for mut drive in drives {
             if (drive.index == -1) {
                 drive.index = self.drives.len() as i64;
-                if (drive.is_gpt()) {
-                    let mut header = vec!(0u8; 512);
+                let mut header_buffer = vec!(0u8; 512);
+                drive.controller.read(1, &mut header_buffer);
+                if let Some(header) = GptHeader::new(&header_buffer) {
                     let mut partition_buffer = vec!(0u8; 512);
                     let mut partitions = Vec::new();
-                    drive.controller.read(1, &mut header);
                     for i in 2..33 {
                         drive.controller.read(i, &mut partition_buffer);
                         if let Some(part) = GptPartitionEntry::new(&partition_buffer) {
@@ -153,7 +154,7 @@ impl DriveCollection {
                         }
                     }
                     let gpt = Gpt {
-                        header: GptHeader::new(&header).expect("idk"),
+                        header,
                         entries: partitions,
                     };
                 }

@@ -27,7 +27,6 @@ impl Scheduler {
         }
     }
 
-    // Add a new task to the scheduler
     #[inline]
     pub fn add_task(&mut self, task: Task) {
         self.tasks.push(task);
@@ -36,7 +35,7 @@ impl Scheduler {
         self.tasks.is_empty()
     }
 
-    // Select the next task to run in a round-robin fashion
+    // round-robin
     #[inline]
     pub fn schedule_next(&mut self) {
         self.end_task();
@@ -59,7 +58,6 @@ impl Scheduler {
         }
     }
 
-    // Get the currently selected task
     pub fn get_current_task(&mut self) -> &mut Task {
         let index = self.current_task.load(Ordering::SeqCst);
         &mut self.tasks[index]
@@ -110,8 +108,8 @@ pub fn kernel_task_end() -> ! {
     }
     unsafe {
         asm!(
-        "mov rax, {0}",          // Move syscall number into rax
-        "mov r8, {1}",          // First argument
+        "mov rax, {0}",          //move syscall number into rax
+        "mov r8, {1}",          //first argument
         "int 0x80",
         in(reg) syscall_number,
         in(reg) arg1,

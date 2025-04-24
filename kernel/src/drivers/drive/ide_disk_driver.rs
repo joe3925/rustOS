@@ -1,8 +1,8 @@
 use crate::cpu::get_cycles;
-use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo, DriveType, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{Drive, DriveController, DriveInfo, DriveType};
 use crate::drivers::interrupt_index::send_eoi;
 use crate::drivers::pci::device_collection::Device;
-use crate::drivers::pci::pci_bus::PciBus;
+use crate::drivers::pci::pci_bus::PCIBUS;
 use crate::{drivers, println};
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -27,9 +27,8 @@ const STATUS_REG: u16 = PRIMARY_CTRL_BASE; // Same as CMD_REG for writing
 const PRIMARY_STATUS_REG: u16 = PRIMARY_CMD_BASE + 7;
 const CONTROL_REG: u16 = PRIMARY_CTRL_BASE + 2;
 
-pub fn has_ide_controller(mut bus: PciBus) -> bool {
-    bus.enumerate_pci();
-    for device in &bus.device_collection.devices {
+pub fn has_ide_controller() -> bool {
+    for device in &PCIBUS.device_collection.devices {
         // IDE controller class code is 0x01 and subclass code is 0x01
         if device.class_code == 0x01 && device.subclass == 0x01 {
             println!("IDE Controller found at Bus {}, Device {}, Function {}",
@@ -101,7 +100,7 @@ impl IdeController {
             managed_port: managed_port as u8,
         }
     }
-    fn identify_drive(drive: u8) -> Option<DriveInfo> {
+    unsafe fn identify_drive(drive: u8) -> Option<DriveInfo> {
         unsafe {
             let mut head_port = Port::new(DRIVE_HEAD_REG);
             let mut command_port = Port::new(PRIMARY_STATUS_REG);
@@ -146,17 +145,6 @@ impl IdeController {
     }
     fn status(&mut self) -> StatusFlags {
         unsafe { StatusFlags::from_bits_truncate(self.command_port.read()) }
-    }
-
-    pub fn init(&mut self) -> bool {
-        if (!has_ide_controller(PciBus::new())) {
-            return false;
-        }
-        unsafe {
-            self.control_port.write(0x02); // Reset the controller
-            self.control_port.write(0x00); // Clear the reset flag
-            true
-        }
     }
 }
 
@@ -214,7 +202,6 @@ impl DriveController for IdeController {
 
         unsafe {
             let drive_selector = self.managed_port;
-
             // Wait until the drive is not busy
             while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
 
@@ -239,12 +226,12 @@ impl DriveController for IdeController {
             while self.command_port.read() & 0x40 == 0 {}
             while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
-            while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {}
+            //while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {  }
             // Check if there was an error
             if self.alternative_command_port.read() & 0x01 != 0 {
                 println!("Error: Read sector failed!");
             }
-            DRIVE_IRQ_RECEIVED.store(false, Ordering::SeqCst);
+            //DRIVE_IRQ_RECEIVED.store(false, Ordering::SeqCst);
 
             if self.error_port.read() & 0x10 != 0 {
                 println!("Tried to write to non existent sector");
@@ -258,22 +245,25 @@ impl DriveController for IdeController {
         }
     }
     fn enumerate_drives() -> Vec<Drive> {
-        unsafe { DRIVECOLLECTION.force_unlock(); }
         let mut drive_list: Vec<Drive> = Vec::new();
         let ide_controller = Self::new(0x0);
 
         // Check for the master drive
-        if let Some(info) = IdeController::identify_drive(0) {
-            if (info.capacity != 0) {
-                drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Master as u32))));
+        unsafe {
+            if let Some(info) = IdeController::identify_drive(0) {
+                if (info.capacity != 0) {
+                    drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Master as u32))));
+                }
             }
         }
 
 
         // Check for the slave drive
-        if let Some(info) = IdeController::identify_drive(1) {
-            if (info.capacity != 0) {
-                drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Slave as u32))));
+        unsafe {
+            if let Some(info) = IdeController::identify_drive(1) {
+                if (info.capacity != 0) {
+                    drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Slave as u32))));
+                }
             }
         }
         drive_list

@@ -30,6 +30,7 @@ mod executable;
 
 use crate::console::clear_screen;
 use crate::util::KERNEL_INITIALIZED;
+
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
@@ -60,7 +61,6 @@ fn _start(boot_info: &'static mut BootInfo) -> ! {
 pub fn function(x: i64) -> i64 {
     return x;
 }
-
 #[cfg(test)]
 pub fn test_runner(tests: &[&dyn Fn()]) {
     println!("Running {} tests", tests.len());

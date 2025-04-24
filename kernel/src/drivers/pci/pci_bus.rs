@@ -1,21 +1,22 @@
 use crate::drivers::pci::device_collection::Device;
 use crate::drivers::pci::device_collection::DeviceCollection;
-use crate::drivers::timer_driver::TIMER;
 use crate::println;
-use spin::Mutex;
+use lazy_static::lazy_static;
 use x86_64::instructions::port::Port;
-pub(crate) static PCIBUS: Mutex<PciBus> = Mutex::new(PciBus::new());
+
+
+lazy_static!(
+    pub static ref PCIBUS: PciBus = PciBus::new();
+);
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
-pub(crate) struct PciBus {
-    pub(crate) device_collection: DeviceCollection,
-    pub(crate) last_update: u128,
+pub struct PciBus {
+    pub device_collection: DeviceCollection,
+    pub last_update: u128,
 }
 impl PciBus {
-    pub(crate) const fn new() -> Self {
-        PciBus { device_collection: DeviceCollection::new(), last_update: 0 }
-    }
-    pub(crate) fn enumerate_pci(&mut self) {
+    pub fn new() -> Self {
+        let mut pci = PciBus { device_collection: DeviceCollection::new(), last_update: 0 };
         let mut address_port = Port::new(CONFIG_ADDRESS);
         let mut data_port = Port::<u32>::new(CONFIG_DATA);
 
@@ -27,12 +28,12 @@ impl PciBus {
                         let header = PciBus::pci_config_read(bus, device, function, 0x08, &mut address_port, &mut data_port);
                         let class_code = (header >> 24) as u8;
                         let subclass = ((header >> 16) & 0xFF) as u8;
-                        self.device_collection.add_device(Device::new(bus, device, function, id, class_code, subclass));
+                        pci.device_collection.add_device(Device::new(bus, device, function, id, class_code, subclass));
                     }
                 }
             }
         }
-        self.last_update = TIMER.lock().get_current_tick();
+        pci
     }
     pub(crate) fn print_devices(&self) {
         for i in 0..self.device_collection.devices.len() {

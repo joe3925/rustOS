@@ -240,7 +240,6 @@ impl PartitionCollection {
         }
     }
     pub(crate) fn enumerate_parts(&mut self) {
-        let mut i = 0;
         for drive in DRIVECOLLECTION.lock().drives.iter_mut() {
             let mut buffer = vec![0u8; 512];
             drive.controller.read(1, &mut buffer);
@@ -267,7 +266,6 @@ impl PartitionCollection {
                     }
                 }
             }
-            i += 1;
         }
     }
 
@@ -446,6 +444,7 @@ impl Drive {
     pub fn format_gpt_force(&mut self) -> Result<(), FormatStatus> {
         let sector_size = 512; // Assuming standard 512-byte sectors
         self.controller.write(0, &MBR);
+
         let mut gpt_header = GptHeader {
             signature: *b"EFI PART",
             revision: 0x00010000,
@@ -502,6 +501,7 @@ impl Drive {
             entries: partition_entries,
         });
         self.add_partition((32_734 * 512), MicrosoftReserved.to_u8_16(), "Microsoft Reserved Partition".to_string()).ok().ok_or(FormatStatus::UnknownFail)?;
+
         Ok(())
     }
     pub fn add_partition(&mut self, partition_size: u64, partition_type: [u8; 16], part_name: String) -> Result<(), PartitionErrors> {
@@ -594,6 +594,8 @@ impl Drive {
         Ok(())
     }
 }
+
+// This is windows MBR just shows an error that a GPT drive was ran as MBR
 pub const MBR: [u8; 512] = [
     0x33, 0xC0, 0x8E, 0xD0, 0xBC, 0x00, 0x7C, 0x8E, 0xC0, 0x8E, 0xD8, 0xBE, 0x00, 0x7C, 0xBF, 0x00,
     0x06, 0xB9, 0x00, 0x02, 0xFC, 0xF3, 0xA4, 0x50, 0x68, 0x1C, 0x06, 0xCB, 0xFB, 0xB9, 0x04, 0x00,
