@@ -65,10 +65,13 @@ pub enum OpenFlags {
     ReadOnly,
     WriteOnly,
     ReadWrite,
+
     /// Creates the file if it doesn't exist opens it if it does
     Create,
     /// Creates the file only if it doesn't already exist (fails if it exists)
     CreateNew,
+    /// Opens the file only if it exists fails if it doesn't (this is default behavior if you have no create flags)
+    Open,
 }
 
 impl PartialEq for FileStatus {
@@ -81,7 +84,51 @@ impl PartialEq for FileStatus {
 }
 
 impl File {
-    /// Open a file from the given path and drive.
+    /// Opens a file from the given `path` using the specified set of `OpenFlags`.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - A string slice representing the full path to the file, including the drive letter.
+    /// * `flags` - A slice of `OpenFlags` specifying the intended access and behavior.
+    ///
+    /// # Behavior
+    ///
+    /// The behavior of this function depends on the combination of `OpenFlags` provided:
+    ///
+    /// - `OpenFlags::ReadOnly`, `WriteOnly`, `ReadWrite`: These specify the intended access mode.
+    ///   (Note: Access mode is currently unused but reserved for future access control enforcement.)
+    ///
+    /// - `OpenFlags::Create`: If the file does not exist, it will be created. If it exists, it will be opened.
+    ///
+    /// - `OpenFlags::CreateNew`: The file will be created only if it doesn't already exist. If it exists, an error is returned.
+    ///
+    /// - `OpenFlags::Open`: The file must already exist. This is the default behavior if neither `Create` nor `CreateNew` are provided.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(File)` - On success, returns an instance of `File` pointing to the opened or newly created file.
+    /// * `Err(FileStatus)` - If the operation fails, returns a `FileStatus` indicating the error:
+    ///   - `FileStatus::DriveNotFound` if the drive letter is invalid or not mounted.
+    ///   - `FileStatus::PathNotFound` if the file doesn't exist and creation flags aren't set.
+    ///   - `FileStatus::FileAlreadyExist` if `CreateNew` is used and the file exists.
+    ///   - `FileStatus::IncompatibleFlags` if both `Create` and `CreateNew` are used together.
+    ///   - `FileStatus::UnknownFail` if file creation appears successful but lookup fails.
+    ///
+    /// # Panics
+    ///
+    /// This function does not panic, but will return errors via the `Result` type if path or drive validation fails.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// let file = File::open("C:/docs/readme.txt", &[OpenFlags::ReadOnly, OpenFlags::Open])?;
+    /// ```
+    ///
+    /// # Notes
+    ///
+    /// - File creation implicitly creates any missing directories in the path.
+    /// - Conflicting flags (`Create` + `CreateNew`) are rejected early.
+    /// - This function assumes that the caller has already mounted or prepared the drive structure (`VOLUMES`).
     pub fn open(
         path: &str,
         flags: &[OpenFlags], // Accept flags as a slice

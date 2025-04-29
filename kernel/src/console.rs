@@ -215,7 +215,7 @@ impl Console {
     fn scroll_up(&mut self) {
         let height = self.screen.height;
         let width = self.screen.width;
-        let bytes_per_pixel = 3; // RGB888
+        let bytes_per_pixel = self.screen.bytes_per_pixel;
         let line_height = FONT_HEIGHT;
 
         let stride = width * bytes_per_pixel;
@@ -224,16 +224,13 @@ impl Console {
 
         let fb = &mut self.screen.buffer_start[..];
 
-        // Scroll up one text line
         fb.copy_within(scroll_bytes..total_bytes, 0);
 
-        // Clear the bottom line
         let start = total_bytes - scroll_bytes;
         fb[start..].fill(0);
 
-        // Set cursor to the beginning of the last line
         self.cursor_pose.y = height - line_height;
-        self.cursor_pose.x = 0; // <== THIS IS CRITICAL
+        self.cursor_pose.x = 0;
     }
 }
 pub fn clear_screen() {

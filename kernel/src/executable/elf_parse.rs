@@ -1,40 +1,46 @@
 use crate::file_system::file::{File, OpenFlags};
-use crate::println;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use goblin::pe::PE;
 use goblin::Object;
-use x86_64::VirtAddr;
+
+pub struct PELoader {
+    file_data: Vec<u8>,
+    path: String,
+}
 
 
-struct ElfAllocation {
-    size: usize,
-    virt_address: VirtAddr,
-}
-struct ElfRuntimeGuide {
-    needed_pages: Vec<ElfAllocation>,
-    entry_point: u64,
-}
-pub fn parse_elf(path: &str) {
-    let open_flags = [OpenFlags::CreateNew, OpenFlags::ReadOnly];
-    //add result handling later
-    let file_handle = File::open(path, &open_flags).expect("failed to find elf");
-    let file = file_handle.read().expect("elf read failed");
-    match Object::parse(&file) {
-        Ok(Object::Elf(elf)) => {
-            println!("elf: {:#?}", &elf);
+impl PELoader {
+    /// Opens and prepares a PE loader from the given path.
+    pub fn new(path: &str) -> Option<Self> {
+        let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
+        let file_handle = File::open(path, &open_flags).ok()?;
+        let file_data = file_handle.read().ok()?;
+        match Object::parse(&file_data).ok()? {
+            Object::PE(pe) => Some(Self { file_data, path: path.to_string() }),
+            _ => None,
         }
-        Ok(Object::PE(pe)) => {
-            println!("pe: {:#?}", &pe);
-        }
-        Ok(Object::COFF(coff)) => {
-            println!("coff: {:#?}", &coff);
-        }
-        Ok(Object::Mach(mach)) => {
-            println!("mach: {:#?}", &mach);
-        }
-        Ok(Object::Archive(archive)) => {
-            println!("archive: {:#?}", &archive);
-        }
-        Ok(Object::Unknown(magic)) => { println!("unknown magic: {:#x}", magic) }
-        _ => {}
     }
+
+    /// Returns the parsed PE object.
+    pub fn pe(&self) -> PE<'_> {
+        match Object::parse(&self.file_data).expect("invalid object format") {
+            Object::PE(pe) => pe,
+            _ => panic!("file is not a PE"),
+        }
+    }
+    pub fn get_path(&self) -> String {
+        self.path.clone()
+    }
+
+    /// Loads the PE into memory and prepares it for execution.
+    pub fn load(&self) -> Result<(), LoadError> {
+        Err(LoadError::NotImplemented)
+    }
+}
+
+/// Placeholder error type for loading failures.
+#[derive(Debug)]
+pub enum LoadError {
+    NotImplemented,
 }

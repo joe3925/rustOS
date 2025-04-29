@@ -1,0 +1,10 @@
+[build]
+target = "x86_64-pc-windows-msvc"
+
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "target-feature=+crt-static",
+    "-Z", "pre-link-arg=/NODEFAULTLIB",
+    "-Z", "pre-link-arg=/SUBSYSTEM:NATIVE",
+    "-C", "link-arg=/ENTRY:mainCRTStartup"
+]

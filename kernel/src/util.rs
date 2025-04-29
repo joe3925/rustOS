@@ -7,7 +7,7 @@ use crate::drivers::interrupt_index::PICS;
 use alloc::string::ToString;
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
-use crate::file_system::file::{File, OpenFlags};
+use crate::executable::elf_parse;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
@@ -77,9 +77,10 @@ pub unsafe fn init() {
 
     println!("Volumes enumerated");
 
-    let open_flags = [OpenFlags::Create, OpenFlags::ReadWrite];
-    println!("{:#?}", File::open("C:\\FLDR\\TEST\\TE.TXT", &open_flags).unwrap());
-
+    let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
+    if let Some(load) = loader {
+        println!("{:#?}", load.pe())
+    }
     println!("Init Done");
     KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
 }
