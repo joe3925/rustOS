@@ -1,6 +1,6 @@
 use crate::gdt::GDT;
 use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack, KERNEL_STACK_ALLOCATOR, USER_STACK_ALLOCATOR};
-use crate::println;
+use crate::{function, println};
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
 use alloc::boxed::Box;
@@ -8,6 +8,7 @@ use alloc::string::String;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
+use rustos_api::sys_print;
 
 #[derive(Debug)]
 pub struct Task {
@@ -94,11 +95,13 @@ impl Task {
 
 
 //Idle task to prevent return
-pub(crate) fn idle_task() {
+pub(crate) extern "C" fn idle_task() {
     //x86_64::instructions::bochs_breakpoint();
     loop {
+        function(0);
+        //sys_print("hello world");
         unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
+            //asm!("hlt", options(nomem, nostack, preserves_flags));
         }
     }
 }

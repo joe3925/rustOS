@@ -203,6 +203,7 @@ pub(crate) fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
 }
 use crate::util::boot_info;
 use spin::Mutex;
+use crate::println;
 
 pub(crate) struct StackAllocator {
     base_address: VirtAddr,
@@ -283,6 +284,7 @@ pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4K
 
 ///Safety: stack must be deallocated after use
 pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
+    println!("here");
     let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
     let stack_start = allocator.allocate().expect("kernel stack alloc failed");
     let total_stack_size = KERNEL_STACK_SIZE + 0x1000;

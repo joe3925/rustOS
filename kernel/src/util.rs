@@ -77,12 +77,13 @@ pub unsafe fn init() {
 
     println!("Volumes enumerated");
 
-    let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
-    if let Some(load) = loader {
-        println!("{:#?}", load.pe())
-    }
+    //let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
+    //if let Some(load) = loader {
+       // println!("{:#?}", load.pe())
+    //}
     println!("Init Done");
     KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
+    asm!("hlt");
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

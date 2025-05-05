@@ -7,6 +7,7 @@ use core::arch::asm;
 use core::sync::atomic::Ordering;
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
+use crate::println;
 
 pub static TIMER: Mutex<SystemTimer> = Mutex::new(SystemTimer::new());
 pub struct SystemTimer {
@@ -39,7 +40,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     unsafe {
         if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
             if (timer.get_current_tick() % 1000 == 0) {
-                //unsafe { println!("timer tick: {}", timer.get_current_tick()) };
+                unsafe { println!("timer tick: {}", 1) };
             }
 
             print_queue();
@@ -52,9 +53,11 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                 }
                 scheduler.schedule_next();
 
+                send_eoi(InterruptIndex::Timer.as_u8());
+
                 scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
-                send_eoi(InterruptIndex::Timer.as_u8());
+
             }
         } else {
             // Kernel is not initialized yet, just send EOI and return to kernel

@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="qemu" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="D:\RustroverProjects\rustOS\target\release\OS.exe " />
+    <option name="SCRIPT_TEXT" value="C:\Users\Boden\RustroverProjects\rustOS\target\release\OS.exe" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="SCRIPT_PATH" value="" />
     <option name="SCRIPT_OPTIONS" value="" />

@@ -35,6 +35,7 @@ fn u64_to_str_ptr(value: u64) -> Option<String> {
 }
 
 pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
+    x86_64::instructions::interrupts::disable();
     let mut rax: u64;
     let mut param1: u64;
     let mut param2: u64;
@@ -143,6 +144,8 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         }
     }
     send_eoi(SysCall.as_u8());
+    x86_64::instructions::interrupts::enable();
+
 }
 ///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
 #[derive(Clone)]

@@ -39,6 +39,7 @@ use core::sync::atomic::Ordering;
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    x86_64::instructions::interrupts::disable();
     KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
     println!("{}", info);
     loop {}
