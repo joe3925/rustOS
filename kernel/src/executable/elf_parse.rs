@@ -35,6 +35,32 @@ impl PELoader {
 
     /// Loads the PE into memory and prepares it for execution.
     pub fn load(&self) -> Result<(), LoadError> {
+        let pe = self.pe();
+
+        if pe.is_lib {
+            return Err(LoadError::IsNotExecutable);
+        }
+
+        if !pe.is_64 {
+            return Err(LoadError::Not64Bit);
+        }
+
+        let entry = pe.entry;
+        if entry == 0 {
+            return Err(LoadError::NoEntryPoint);
+        }
+
+        let opt_hdr = pe.header.optional_header.as_ref().ok_or(LoadError::MissingSections)?;
+
+        if pe.sections.is_empty() {
+            return Err(LoadError::MissingSections);
+        }
+
+        let image_base = opt_hdr.windows_fields.image_base;
+        if image_base % 0x10000 != 0 {
+            return Err(LoadError::UnsupportedImageBase);
+        }
+
         Err(LoadError::NotImplemented)
     }
 }
@@ -42,5 +68,14 @@ impl PELoader {
 /// Placeholder error type for loading failures.
 #[derive(Debug)]
 pub enum LoadError {
+    IsNotExecutable,
+    Not64Bit,
+    NoEntryPoint,
+    InvalidSubsystem,
+    InvalidDllCharacteristics,
+    UnsupportedRelocationFormat,
+    MissingSections,
+    UnsupportedImageBase,
     NotImplemented,
 }
+

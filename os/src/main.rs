@@ -14,7 +14,7 @@ fn main() {
                 "-S",
                 "-drive", "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
                 "-drive", "file=boot.img,format=raw",
-               // "-drive", "file=rustOS.vhdx,if=ide",
+                "-drive", "file=rustOS.vhdx,if=ide",
             ])
             .spawn()
         {
@@ -26,16 +26,26 @@ fn main() {
         };
 
         std::thread::sleep(std::time::Duration::from_secs(1));
-        let kernel_path = "kernel.efi"; // or from env
-        let load_addr = "0xFFFF800000000037";
+        let cwd = std::env::current_dir().expect("Failed to get current dir");
+        let source_path = cwd.join("../../kernel/src");
+        let source_path_str = source_path.to_string_lossy().replace("\\", "/");
 
-        let mut gdb = match Command::new("gdb")
+        let kernel_path = "kernel.efi"; // or from env
+        let load_addr = "0xFFFF800000000000";
+
+        let mut gdb = match Command::new("gdbgui")
             .args([
-                "-ex", "set confirm off", // disables confirmation prompts
-                "-ex", "set architecture i386:x86-64",
-                "-ex", "target remote localhost:1234",
-                "-ex", &format!("add-symbol-file {} -o {}", kernel_path, load_addr),
-                "-ex", "hb _start",
+                "-g", "gdb",
+                "--gdb-args", &format!(
+                    "-ex=\"set confirm off\" \
+             -ex=\"set architecture i386:x86-64\" \
+             -ex=\"target remote localhost:1234\" \
+             -ex=\"add-symbol-file {} -o {}\" \
+             -ex=\"directory {}\"",
+                    kernel_path,
+                    load_addr,
+                    source_path_str
+                ),
             ])
             .spawn()
         {
@@ -68,6 +78,7 @@ fn main() {
 
         // Reap GDB
         let _ = gdb.wait();
+    } else {
         // Release mode → run QEMU
         let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)
             .args([
