@@ -159,7 +159,7 @@ impl DriveController for IdeController {
             while self.command_port.read() & 0x80 != 0 {}  // BSY
 
             // Ensure drive is ready and no fault occurred
-            while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+            while self.command_port.read() & 0x40 == 0 {  }
             while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
             if self.command_port.read() & 0x01 != 0 {
@@ -177,7 +177,7 @@ impl DriveController for IdeController {
             self.command_port.write(0x20);  // Command to read
 
             while self.command_port.read() & 0x80 != 0 {}  // BSY
-            while self.command_port.read() & 0x40 == 0 { println!("Drive not ready"); }
+            while self.command_port.read() & 0x40 == 0 {  }
             while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
 
             // Check if there was an error
