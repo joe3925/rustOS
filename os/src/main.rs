@@ -5,13 +5,11 @@ use std::time::Duration;
 const GUI: bool = false;
 
 fn spawn_in_new_terminal(title: &str, command: &str, args: &[&str]) -> std::io::Result<Child> {
+    let mut cmd_args = vec!["/C", "start", command, command];
+    cmd_args.extend_from_slice(args);
+
     Command::new("cmd")
-        .args([
-            "/C", "start", // new terminal
-            title,
-            command,
-        ])
-        .args(args)
+        .args(&cmd_args)
         .spawn()
 }
 
@@ -19,8 +17,8 @@ fn main() {
     if cfg!(debug_assertions) {
         // === Launch QEMU ===
         let qemu = spawn_in_new_terminal(
-            "QEMU",
-            r#""C:\Program Files\qemu\qemu-system-x86_64w.exe""#,
+            "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
+            "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
             &[
                 "-m", "1024M",
                 "-no-reboot",
@@ -52,6 +50,8 @@ fn main() {
         let kernel_path = "kernel.efi";
         let load_addr = "0xFFFF800000000000";
 
+        let gdbinit = "../../.gdbinit";
+
         // === Launch GDB or GDBGUI ===
         let gdb = if GUI {
             spawn_in_new_terminal(
@@ -60,30 +60,14 @@ fn main() {
                 &[
                     "-g", "gdb",
                     "--gdb-args",
-                    &format!(
-                        "-ex=\"set confirm off\" \
-                         -ex=\"set architecture i386:x86-64\" \
-                         -ex=\"target remote localhost:1234\" \
-                         -ex=\"add-symbol-file {} -o {}\" \
-                         -ex=\"directory {}\"",
-                        kernel_path,
-                        load_addr,
-                        source_path_str
-                    ),
-                    "-n",
+                    &format!("-x \"{}\"", gdbinit)
                 ],
             )
         } else {
             spawn_in_new_terminal(
                 "GDB",
                 "gdb",
-                &[
-                    "-ex", "set confirm off",
-                    "-ex", "set architecture i386:x86-64",
-                    "-ex", "target remote localhost:1234",
-                    "-ex", &format!("add-symbol-file {} {}", kernel_path, load_addr),
-                    "-ex", &format!("directory {}", source_path_str),
-                ],
+                &["-x", gdbinit],
             )
         };
 
@@ -100,7 +84,7 @@ fn main() {
         let qemu_status = match qemu.wait() {
             Ok(status) => {
                 println!("QEMU exited with: {}", status);
-                let _ = gdb.kill();
+                //let _ = gdb.kill();
                 status
             }
             Err(e) => {
