@@ -2,7 +2,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
-const GUI: bool = false;
+const GUI: bool = true;
 
 fn spawn_in_new_terminal(title: &str, command: &str, args: &[&str]) -> std::io::Result<Child> {
     let mut cmd_args = vec!["/C", "start", command, command];
@@ -51,17 +51,14 @@ fn main() {
         let load_addr = "0xFFFF800000000000";
 
         let gdbinit = "../../.gdbinit";
+        let gdbinit_gui = "../../.gdbinit_gui";
 
         // === Launch GDB or GDBGUI ===
         let gdb = if GUI {
             spawn_in_new_terminal(
-                "GDBGUI",
-                "gdbgui",
-                &[
-                    "-g", "gdb",
-                    "--gdb-args",
-                    &format!("-x \"{}\"", gdbinit)
-                ],
+                "GDB",
+                "gdb",
+                &["-x", gdbinit_gui],
             )
         } else {
             spawn_in_new_terminal(
