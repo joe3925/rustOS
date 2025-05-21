@@ -1,0 +1,44 @@
+{
+    "editor.semanticTokenColorCustomizations": {
+        "[Default Dark+]": {
+            "enabled": true,
+            "rules": {
+                "underline": false,
+                "builtinType": "#57adf3",
+                "comment": "#9a9ca3",
+                "enum": "#57adf3",
+                "enumMember": "#e2e6a4",
+                "formatSpecifier": "#6abfca",
+                "function.attribute": "#ad7da4",
+                "function": "#e2e6a4",
+                "interface": "#4fc5bb",
+                "keyword.controlFlow": "#cc8d6c",
+                "keyword": "#cc8d6c",
+                "macro": "#ffc55f",
+                "namespace": "#D4D4D4",
+                "number": "#2aacb8",
+                "operator": "#D4D4D4",
+                "parameter.mutable": {
+                    "underline": false
+                },
+                "parameter": "#D4D4D4",
+                "punctuation.injected": "#D4D4D4",
+                "selfKeyword.mutable": {
+                    "underline": false
+                },
+                "selfKeyword": "#D4D4D4",
+                "string": "#5caa72",
+                "struct": "#D4D4D4",
+                "typeAlias": "#868a91",
+                "typeParameter": "#868a91",
+                "union": "#868a91",
+                "unresolvedReference": "#accfcf",
+                "variable.mutable": {
+                    "underline": false
+                },
+                "variable.static": "#D4D4D4",
+                "variable": "#D4D4D4"
+            }
+        }
+    }
+}

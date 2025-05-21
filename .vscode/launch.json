@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Build and Debug",
+            "type": "cppdbg",
+            "request": "launch",
+            "preLaunchTask": "dbg build",
+            "program": "${workspaceFolder}/target/debug/os.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/target/debug",
+            "stopAtEntry": false,
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "miDebuggerPath": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}
