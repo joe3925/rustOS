@@ -4,11 +4,23 @@
         {
             "label": "dbg build",
             "type": "shell",
-            "command": "cd ${workspaceFolder}\\os; cargo build; cd ${workspaceFolder}\\target\\debug; ./os.exe",
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
+            "command": "cd ${workspaceFolder}/os; cargo build",
+            "problemMatcher": []
+        },
+        {
+            "label": "dbg launch",
+            "type": "shell",
+            "command": "cd ${workspaceFolder}/target/debug; ./os.exe",
+            "problemMatcher": [],
+            "isBackground": true
+        },
+        {
+            "label": "dbg chain",
+            "dependsOn": [
+                "dbg build",
+                "dbg launch"
+            ],
+            "dependsOrder": "sequence",
             "problemMatcher": []
         }
     ]

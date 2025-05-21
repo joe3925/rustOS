@@ -1,19 +1,21 @@
 use crate::gdt::GDT;
-use crate::memory::paging::{allocate_kernel_stack, allocate_user_stack, KERNEL_STACK_ALLOCATOR, USER_STACK_ALLOCATOR};
-use crate::{function, println};
+use crate::memory::paging::{
+    allocate_kernel_stack, allocate_user_stack, KERNEL_STACK_ALLOCATOR, USER_STACK_ALLOCATOR,
+};
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
+use crate::{function, println};
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::arch::asm;
+use rustos_api::sys_print;
 use spin::Mutex;
 use x86_64::VirtAddr;
-use rustos_api::sys_print;
 
 #[derive(Debug)]
 pub struct Task {
     pub(crate) name: String,
-    pub(crate) context: State,  // The CPU state for this task
+    pub(crate) context: State, // The CPU state for this task
     pub(crate) stack_start: u64,
     pub(crate) id: u64,
     pub(crate) terminated: bool,
@@ -22,17 +24,11 @@ pub struct Task {
 static ID: Mutex<u64> = Mutex::new(0);
 
 impl Task {
-    pub fn new(
-        entry_point: usize,
-        name: String,
-        is_user_mode: bool,
-    ) -> Self {
+    pub fn new(entry_point: usize, name: String, is_user_mode: bool) -> Self {
         let stack_top = if is_user_mode {
-            unsafe { allocate_user_stack() }
-                .expect("Failed to allocate user-mode stack")
+            unsafe { allocate_user_stack() }.expect("Failed to allocate user-mode stack")
         } else {
-            unsafe { allocate_kernel_stack() }
-                .expect("Failed to allocate kernel-mode stack")
+            unsafe { allocate_kernel_stack() }.expect("Failed to allocate kernel-mode stack")
         };
 
         // Initialize the state with the entry point and the allocated stack top
@@ -51,11 +47,21 @@ impl Task {
         if is_user_mode {
             state.cs = GDT.1.user_code_selector.0 as u64 | 3;
             state.ss = GDT.1.user_data_selector.0 as u64 | 3;
-            println!("User-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock());
+            println!(
+                "User-mode task created with RIP {:X}, STACK {:X}, ID {}",
+                state.rip,
+                state.rsp,
+                *ID.lock()
+            );
         } else {
             state.cs = GDT.1.kernel_code_selector.0 as u64;
             state.ss = GDT.1.kernel_data_selector.0 as u64;
-            println!("Kernel-mode task created with RIP {:X}, STACK {:X}, ID {}", state.rip, state.rsp, *ID.lock());
+            println!(
+                "Kernel-mode task created with RIP {:X}, STACK {:X}, ID {}",
+                state.rip,
+                state.rsp,
+                *ID.lock()
+            );
         }
 
         // Create and return the new task
@@ -79,9 +85,13 @@ impl Task {
     }
     pub fn destroy(&mut self) {
         if (self.is_user_mode) {
-            USER_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start));
+            USER_STACK_ALLOCATOR
+                .lock()
+                .deallocate(VirtAddr::new(self.stack_start));
         } else {
-            KERNEL_STACK_ALLOCATOR.lock().deallocate(VirtAddr::new(self.stack_start));
+            KERNEL_STACK_ALLOCATOR
+                .lock()
+                .deallocate(VirtAddr::new(self.stack_start));
         }
     }
     /// Prints the task's RIP, RSP, and ID in one line.
@@ -93,13 +103,9 @@ impl Task {
     }
 }
 
-
 //Idle task to prevent return
 pub(crate) extern "C" fn idle_task() {
-    //x86_64::instructions::bochs_breakpoint();
     loop {
-        function(0);
-        //sys_print("hello world");
         unsafe {
             //asm!("hlt", options(nomem, nostack, preserves_flags));
         }

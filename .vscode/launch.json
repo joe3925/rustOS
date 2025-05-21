@@ -2,24 +2,24 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Build and Debug",
-            "type": "cppdbg",
-            "request": "launch",
-            "preLaunchTask": "dbg build",
-            "program": "${workspaceFolder}/target/debug/os.exe",
-            "args": [],
-            "cwd": "${workspaceFolder}/target/debug",
-            "stopAtEntry": false,
-            "externalConsole": true,
-            "MIMode": "gdb",
-            "miDebuggerPath": "gdb",
-            "setupCommands": [
-                {
-                    "description": "Enable pretty-printing for gdb",
-                    "text": "-enable-pretty-printing",
-                    "ignoreFailures": true
-                }
-            ]
+            "name": "LLDB Rust Kernel EFI",
+            "type": "lldb",
+            "request": "custom",
+            "preLaunchTask": "dbg chain",
+            "targetCreateCommands": [
+                // Load ELF symbol file without launching it (just DWARF debug info)
+                "target create --no-dependents --arch x86_64 ${workspaceRoot}/target/debug/kernel.efi"
+            ],
+            "processCreateCommands": [
+                // Connect to QEMU GDB stub
+                "gdb-remote localhost:1234",
+                // Slide image to its actual loaded base address
+                "target modules load --file kernel.efi .text 0xffff800000000000"
+            ],
+            "cwd": "${workspaceRoot}/kernel/src",
+            "sourceMap": {
+                "/cargo_home": "${workspaceRoot}" // Optional, if path remapping is needed
+            }
         }
     ]
 }

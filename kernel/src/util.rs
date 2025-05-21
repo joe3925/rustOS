@@ -7,7 +7,6 @@ use crate::drivers::interrupt_index::PICS;
 use alloc::string::ToString;
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
-use crate::executable::elf_parse;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
@@ -28,7 +27,7 @@ pub unsafe fn init() {
     let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
 
     let mut mapper = init_mapper(mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
     init_heap(&mut mapper, &mut frame_allocator.clone());
 
 
@@ -77,10 +76,10 @@ pub unsafe fn init() {
 
     println!("Volumes enumerated");
 
-    //let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
-    //if let Some(load) = loader {
-       // println!("{:#?}", load.pe())
-    //}
+    // let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
+    // if let Some(load) = loader {
+    //    println!("{:#?}", load.pe())
+    // }
     println!("Init Done");
     KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
     asm!("hlt");

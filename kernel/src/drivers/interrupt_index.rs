@@ -1,5 +1,7 @@
 use crate::cpu::get_cpu_info;
-use crate::drivers::interrupt_index::ApicErrors::{AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable};
+use crate::drivers::interrupt_index::ApicErrors::{
+    AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
+};
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::memory::paging;
 use crate::{print, println};
@@ -81,7 +83,9 @@ impl ApicImpl {
                 return Err(NoACPI);
             }
             if let Some(table) = ACPI_TABLES.get_interrupt_model() {
-                let lapic_vaddr = paging::map_mmio_region(PhysAddr::new(table.local_apic_address), 0x1000).expect("failed to map local apic to mmio space"); // your MMIO mapper
+                let lapic_vaddr =
+                    paging::map_mmio_region(PhysAddr::new(table.local_apic_address), 0x1000)
+                        .expect("failed to map local apic to mmio space"); // your MMIO mapper
 
                 Ok(ApicImpl {
                     apic_info: table,
@@ -97,7 +101,9 @@ impl ApicImpl {
 
     fn init_local(&self) {
         if self.apic_info.also_has_legacy_pics {
-            unsafe { PICS.lock().disable(); }
+            unsafe {
+                PICS.lock().disable();
+            }
         }
 
         // Map and enable the local APIC for the current CPU
@@ -111,7 +117,6 @@ impl ApicImpl {
         const LAPIC_SVR_OFFSET: usize = 0xF0 / 4;
         let svr = lapic_ptr.add(LAPIC_SVR_OFFSET);
         svr.write_volatile(svr.read_volatile() | 0x100); // enable LAPIC (bit 8)
-
     }
     unsafe fn init_timer(&self) {
         let lapic_pointer = self.lapic_virt_addr.as_mut_ptr::<u32>();
@@ -129,11 +134,12 @@ impl ApicImpl {
 
         // Set initial count - smaller value for more frequent interrupts
         let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
-        ticr.write_volatile(600);
+        ticr.write_volatile(2400);
     }
     unsafe fn init_ioapic(&self) {
         let phys_addr = self.apic_info.io_apics[0].address;
-        let virt_addr = paging::map_mmio_region(PhysAddr::new(phys_addr as u64), 0x2048).expect("failed to map io apic");
+        let virt_addr = paging::map_mmio_region(PhysAddr::new(phys_addr as u64), 0x2048)
+            .expect("failed to map io apic");
         let ioapic_pointer = virt_addr.as_mut_ptr::<u32>();
 
         ioapic_pointer.offset(0).write_volatile(0x12);
@@ -142,7 +148,10 @@ impl ApicImpl {
             .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
     }
     unsafe fn init_keyboard(&self) {
-        let keyboard_register = self.lapic_virt_addr.as_mut_ptr::<u32>().offset(APICOffset::LvtLint1 as isize / 4);
+        let keyboard_register = self
+            .lapic_virt_addr
+            .as_mut_ptr::<u32>()
+            .offset(APICOffset::LvtLint1 as isize / 4);
         keyboard_register.write_volatile(InterruptIndex::KeyboardIndex.as_u8() as u32);
     }
     pub fn end_interrupt(&self) {
@@ -172,10 +181,8 @@ impl ApicImpl {
                 apic.init_ioapic();
                 apic.init_keyboard();
                 APIC.lock().replace(apic);
-            }
-            Err(err) => {
-                return Err(err)
-            }
+            },
+            Err(err) => return Err(err),
         }
 
         Ok(x86_64::instructions::interrupts::enable())
