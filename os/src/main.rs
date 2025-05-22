@@ -3,7 +3,7 @@ use std::thread::sleep;
 use std::time::Duration;
 
 const GUI: bool = true;
-
+//legacy
 fn spawn_in_new_terminal(title: &str, command: &str, args: &[&str]) -> std::io::Result<Child> {
     let mut cmd_args = vec!["/C", "start", command, command];
     cmd_args.extend_from_slice(args);
@@ -39,7 +39,7 @@ fn main() {
             ],
         );
 
-        let mut qemu = match qemu {
+        let qemu = match qemu {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Failed to start QEMU: {}", e);
@@ -47,50 +47,6 @@ fn main() {
             }
         };
 
-        // sleep(Duration::from_secs(1));
-
-        // let cwd = std::env::current_dir().expect("Failed to get current dir");
-        // let source_path = cwd.join("../../kernel/src");
-        // let source_path_str = source_path.to_string_lossy().replace("\\", "/");
-
-        // let kernel_path = "kernel.efi";
-        // let load_addr = "0xFFFF800000000000";
-
-        // let gdbinit = "../../.gdbinit";
-        // let gdbinit_gui = "../../.gdbinit_gui";
-
-        // // === Launch GDB or GDBGUI ===
-        // let gdb = if GUI {
-        //     spawn_in_new_terminal("GDB", "gdb", &["-x", gdbinit_gui])
-        // } else {
-        //     spawn_in_new_terminal("GDB", "gdb", &["-x", gdbinit])
-        // };
-
-        // let mut gdb = match gdb {
-        //     Ok(child) => child,
-        //     Err(e) => {
-        //         eprintln!("Failed to launch GDB: {}", e);
-        //         let _ = qemu.kill();
-        //         return;
-        //     }
-        // };
-
-        // // === Monitor QEMU ===
-        // let qemu_status = match qemu.wait() {
-        //     Ok(status) => {
-        //         println!("QEMU exited with: {}", status);
-        //         //let _ = gdb.kill();
-        //         status
-        //     }
-        //     Err(e) => {
-        //         eprintln!("Failed to wait on QEMU: {}", e);
-        //         let _ = gdb.kill();
-        //         return;
-        //     }
-        // };
-
-        // // Reap GDB
-        // let _ = gdb.wait();
     } else {
         // === Release mode ===
         let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)

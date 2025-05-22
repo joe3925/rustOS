@@ -77,12 +77,11 @@ pub unsafe fn init() {
 
     println!("Volumes enumerated");
 
-    let loader = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE");
-    if let Some(load) = loader {
-       println!("{:#?}", load.pe())
+    if let Some(loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
+       println!("{:#?}", loadable.load())
     }
     println!("Init Done");
-    KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
+    KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     asm!("hlt");
 }
 #[no_mangle]
