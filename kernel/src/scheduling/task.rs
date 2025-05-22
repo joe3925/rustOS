@@ -107,7 +107,7 @@ impl Task {
 pub(crate) extern "C" fn idle_task() {
     loop {
         unsafe {
-            //asm!("hlt", options(nomem, nostack, preserves_flags));
+            asm!("hlt", options(nomem, nostack, preserves_flags));
         }
     }
 }

@@ -7,19 +7,13 @@
             "request": "custom",
             "preLaunchTask": "dbg chain",
             "targetCreateCommands": [
-                // Load ELF symbol file without launching it (just DWARF debug info)
                 "target create --no-dependents --arch x86_64 ${workspaceRoot}/target/debug/kernel.efi"
             ],
             "processCreateCommands": [
-                // Connect to QEMU GDB stub
                 "gdb-remote localhost:1234",
-                // Slide image to its actual loaded base address
                 "target modules load --file kernel.efi .text 0xffff800000000000"
             ],
             "cwd": "${workspaceRoot}/kernel/src",
-            "sourceMap": {
-                "/cargo_home": "${workspaceRoot}" // Optional, if path remapping is needed
-            }
         }
     ]
 }

@@ -270,9 +270,9 @@ impl PartitionCollection {
     }
 
     pub fn find_volume(&mut self, label: String) -> Option<&mut Partition> {
-        for drive in self.parts.iter_mut() { // Iterate over mutable references
-            if drive.label == label {
-                return Some(drive); // Return the mutable reference
+        for partition in self.parts.iter_mut() { // Iterate over mutable references
+            if partition.label == label {
+                return Some(partition); // Return the mutable reference
             }
         }
         None
@@ -281,12 +281,12 @@ impl PartitionCollection {
         if self.parts.is_empty() {
             println!("No drives in the collection.");
         } else {
-            for (i, drive) in self.parts.iter().enumerate() {
-                println!("Part: ({})", drive.label);
-                println!("Name: ({})", drive.name);
-                println!("is fat: {}", drive.is_fat);
-                println!("parent drive: {}", drive.parent_drive_index);
-                println!("Capacity: {}", drive.size);
+            for (i, partition) in self.parts.iter().enumerate() {
+                println!("Part: ({})", partition.label);
+                println!("Name: ({})", partition.name);
+                println!("is fat: {}", partition.is_fat);
+                println!("parent drive: {}", partition.parent_drive_index);
+                println!("Capacity: {}", partition.size);
             }
         }
     }
@@ -590,7 +590,8 @@ impl Drive {
         self.controller.write((self.info.capacity / 512 - 1) as u32, &header_buffer); // Backup GPT
         let mut partitions = VOLUMES.lock();
 
-        partitions.enumerate_parts();
+        partitions.new_partition(new_partition, self.index as u64, self.controller.factory())
+            .expect("TODO: panic message");
         Ok(())
     }
 }

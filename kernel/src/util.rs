@@ -4,13 +4,14 @@ use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index::ApicImpl;
 use crate::drivers::interrupt_index::PICS;
+use crate::executable::pe_loadable;
 use alloc::string::ToString;
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
-use crate::{cpu, gdt, println, BOOT_INFO};
+use crate::{cpu, executable, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
@@ -60,7 +61,7 @@ pub unsafe fn init() {
     {
         let mut partitions = VOLUMES.lock();
         partitions.enumerate_parts();
-        if let Some(part) = partitions.find_volume("C:".to_string()) {
+        if let Some(part) = partitions.find_volume("B:".to_string()) {
             match part.format() {
                 Ok(_) => {
                     println!("volume {} formatted successfully", part.label.clone());
@@ -69,17 +70,17 @@ pub unsafe fn init() {
                 Err(err) => println!("Error formatting volume {} {}", part.label.clone(), err.to_str()),
             }
         } else {
-            println!("failed to find drive C:");
+            println!("failed to find drive B:");
         }
         partitions.print_parts();
     }
 
     println!("Volumes enumerated");
 
-    // let loader = elf_parse::PELoader::new("C:\\BIN\\TEST.EXE");
-    // if let Some(load) = loader {
-    //    println!("{:#?}", load.pe())
-    // }
+    let loader = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE");
+    if let Some(load) = loader {
+       println!("{:#?}", load.pe())
+    }
     println!("Init Done");
     KERNEL_INITIALIZED.fetch_xor(true, Ordering::SeqCst);
     asm!("hlt");

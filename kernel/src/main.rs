@@ -52,8 +52,8 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 fn _start(boot_info: &'static mut BootInfo) -> ! {
-    unsafe { BOOT_INFO = Some(boot_info); } //RustRover will sometimes mark this as an error not sure why
-    //clear_screen();
+    unsafe { BOOT_INFO = Some(boot_info); } 
+    clear_screen();
     unsafe {
         util::init();
     }
