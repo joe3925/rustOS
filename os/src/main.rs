@@ -2,9 +2,8 @@ use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::Duration;
 
-const GUI: bool = true;
 //legacy
-fn spawn_in_new_terminal(title: &str, command: &str, args: &[&str]) -> std::io::Result<Child> {
+fn spawn_in_new_terminal(command: &str, args: &[&str]) -> std::io::Result<Child> {
     let mut cmd_args = vec!["/C", "start", command, command];
     cmd_args.extend_from_slice(args);
 
@@ -15,7 +14,6 @@ fn main() {
     if cfg!(debug_assertions) {
         // === Launch QEMU ===
         let qemu = spawn_in_new_terminal(
-            "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
             "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
             &[
                 "-m",
