@@ -1,25 +1,40 @@
 use alloc::collections::LinkedList;
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use spin::{Lazy, Mutex};
+use core::net::Ipv4Addr;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
+use lazy_static::lazy_static;
 
+use crate::util::boot_info;
+
+
+// Memory constants and structures 
 pub const KERNEL_STACK_SIZE: u64 = 0x2800;
-pub const USER_STACK_SIZE: u64 = 0x2800;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here
-    KERNEL_STACK_SIZE,               // Kernel stack size (64 KB)
 ));
 
 pub static USER_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
-    VirtAddr::new(0x8000_0000u64), // User stacks start here
-    USER_STACK_SIZE,              // User stack size
+    VirtAddr::new(0x00007FFFFFFFFFFFu64), // User stacks start here
 ));
 // Global NEXT counter (still required)
 static NEXT: Mutex<usize> = Mutex::new(0);
+
+const MMIO_BASE: u64 = 0xFFFF_C000_0000_0000;
+const MMIO_LIMIT: u64 = 0xFFFF_FF00_0000_0000;
+const MAX_PENDING_FREES: usize = 64;
+
+static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
+static PENDING_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
+
 #[derive(Clone)]
 
 pub struct BootInfoFrameAllocator {
@@ -158,76 +173,27 @@ pub(crate) unsafe fn write_syscall(page_ptr: *mut u8) {
     ptr::write(page_ptr.add(2), 0xEB); // `jmp` short opcode
     ptr::write(page_ptr.add(3), 0xFE); // Offset: -2 (infinite loop)
 }
-
-/// Allocates a page with a syscall instruction at a free virtual address.
-pub(crate) unsafe fn allocate_syscall_page() -> Result<VirtAddr, &'static str> {
-    let page_addr = alloc_user_page()?; // Allocate the user page
-    write_syscall(page_addr.as_mut_ptr()); // Write the syscall instruction
-    Ok(page_addr)
-}
-
-/// Function to allocate a user-accessible page with write and execute permissions
-///Safety: page must be deallocated after
-pub(crate) unsafe fn alloc_user_page() -> Result<VirtAddr, &'static str> {
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-
-    if let boot_info = boot_info() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let mut mapper = init_mapper(phys_mem_offset);
-
-        let mut base_addr = 0x4000_0000u64;
-        let mut page: Page<Size4KiB>;
-
-        loop {
-            page = Page::containing_address(VirtAddr::new(base_addr));
-            if mapper.translate_page(page).is_err() {
-                break; // Found an unmapped page
-            }
-            base_addr += 0x1000; // Move to the next page (4 KiB)
-        }
-
-        map_page(&mut mapper, page, &mut frame_allocator, flags).expect("Failed to map user idle page");
-
-        Ok(page.start_address())
-    } else {
-        Err("Boot info not available")
-    }
-}
-
-/// Allocates a page with an infinite loop instruction at a free virtual address.
-pub(crate) fn allocate_infinite_loop_page() -> Result<VirtAddr, &'static str> {
-    let page_addr = unsafe { alloc_user_page() }?; // Allocate the user page
-    unsafe { write_infinite_loop(page_addr.as_mut_ptr()); } // Write the infinite loop
-    Ok(page_addr)
-}
-use crate::util::boot_info;
-use spin::Mutex;
-use crate::println;
-
 pub(crate) struct StackAllocator {
     base_address: VirtAddr,
-    stack_size: u64,
     free_list: LinkedList<VirtAddr>, // List of free stack starting addresses
 }
 
 impl StackAllocator {
-    pub const fn new(base_address: VirtAddr, stack_size: u64) -> Self {
+    pub const fn new(base_address: VirtAddr) -> Self {
         StackAllocator {
             base_address,
-            stack_size,
             free_list: LinkedList::new(),
         }
     }
 
-    pub fn allocate(&mut self) -> Option<VirtAddr> {
+    pub fn allocate(&mut self, size: u64) -> Option<VirtAddr> {
         if let Some(free_stack) = self.free_list.pop_front() {
             return Some(free_stack);
         }
 
         // Ensure alignment
         let alignment = 0x10000; // 64 KB alignment
-        let total_stack_size = self.stack_size + 0x1000; // Includes guard page
+        let total_stack_size = size + 0x1000; // Includes guard page
 
 
         // Align base address
@@ -246,103 +212,225 @@ impl StackAllocator {
     }
 }
 
+pub fn allocate_kernel_stack(size: u64) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let total_size = size + 0x1000; // +1 page for guard
+    let stack_start_addr = allocate_auto_kernel_range(total_size)
+        .ok_or(MapToError::FrameAllocationFailed)?;
 
-/// Allocates a stack for a user-mode task with guard pages.
-///Safety: stack must be deallocated after use
-pub(crate) unsafe fn allocate_user_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
-    let mut allocator = USER_STACK_ALLOCATOR.lock();
-    let stack_start = allocator.allocate().expect("kernel stack alloc failed");
-    let total_stack_size = USER_STACK_SIZE + 0x1000; //guard page
-    let stack_end = stack_start + total_stack_size;
+    let stack_end = stack_start_addr + total_size;
 
-    if let boot_info = boot_info() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let mut mapper = init_mapper(phys_mem_offset);
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .ok_or(MapToError::FrameAllocationFailed)?,
+    );
 
-        //guard page is not mapped
-        for page in Page::range_inclusive(
-            Page::<Size4KiB>::containing_address(stack_start),
-            Page::<Size4KiB>::containing_address(stack_end - 0x1000),
-        ) {
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-            match map_page(&mut mapper, page, &mut frame_allocator, flags) {
-                Ok(_) => {}
-                Err(MapToError::PageAlreadyMapped(..)) => {}
-                Err(e) => {
-                    panic!("Unexpected error: {:?}", e);
-                }
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut mapper = init_mapper(phys_mem_offset);
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+    // Map all pages except the guard page (last 4KiB)
+    for page in Page::range_inclusive(
+        Page::containing_address(stack_start_addr),
+        Page::containing_address(stack_end - 0x1000),
+    ) {
+        match map_page(&mut mapper, page, &mut frame_allocator, flags) {
+            Ok(_) => {}
+            Err(MapToError::PageAlreadyMapped(..)) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
+    Ok(aligned_stack_end)
+}
+
+
+pub fn deallocate_kernel_stack(stack_top: VirtAddr, size: u64) {
+    let total_size = size + 0x1000; // includes guard page
+    let stack_start = stack_top - size;
+    let full_range_start = stack_start - 0x1000;
+    unmap_range(full_range_start, total_size);
+
+}
+
+pub enum RangeAllocationError {
+    Overlap,
+    OutOfRange,
+}
+#[derive(Debug)]
+pub struct RangeTracker {
+    allocations: Mutex<Vec<(u64, u64)>>, 
+
+    //the range that this allocartor manages
+    pub start: u64,
+    pub end: u64,   
+}
+
+impl RangeTracker {
+    fn new(start: u64, end: u64) -> Self {
+        Self {
+            allocations: Mutex::new(Vec::new()),
+            start,
+            end,
+        }
+    }
+
+   pub fn alloc(&self, base: u64, size: u64) -> Result<VirtAddr, RangeAllocationError> {
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let mut lock = self.allocations.lock();
+        if (base < self.start || base + aligned_size > self.end) {
+            return Err(RangeAllocationError::OutOfRange);
+        }
+        // Ensure no overlap
+        if lock.iter().any(|&(a, s)| {
+            let end = a + s;
+            let req_end = base + aligned_size;
+            !(base >= end || req_end <= a)
+        }) {
+            return Err(RangeAllocationError::Overlap);
+        }
+
+        lock.push((base, aligned_size));
+        Ok(VirtAddr::new(base))
+    }
+
+   pub fn dealloc(&self, base: u64, size: u64) {
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let mut lock = self.allocations.lock();
+        if let Some(index) = lock.iter().position(|&(a, s)| a == base && s == aligned_size) {
+            lock.remove(index);
+        }
+    }
+
+    // Finds a free region of at least `size` bytes and allocates it
+   pub fn alloc_auto(&self, size: u64) -> Option<VirtAddr> {
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        let mut lock = self.allocations.lock();
+
+        // Sort existing allocations by base address
+        lock.sort_unstable_by_key(|&(base, _)| base);
+
+        let mut current = self.start;
+
+        for &(alloc_base, alloc_size) in lock.iter() {
+            let alloc_end = alloc_base;
+
+            if current + aligned_size <= alloc_end {
+                // Found gap
+                lock.push((current, aligned_size));
+                return Some(VirtAddr::new(current));
+            }
+
+            // Move past this allocation
+            current = alloc_base + alloc_size;
+            if current > self.end {
+                return None;
             }
         }
 
-        let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
-        Ok(aligned_stack_end)
-    } else {
-        Err(MapToError::FrameAllocationFailed)
-    }
-}
-
-///Safety: stack must be deallocated after use
-pub(crate) unsafe fn allocate_kernel_stack() -> Result<VirtAddr, MapToError<Size4KiB>> {
-    println!("here");
-    let mut allocator = KERNEL_STACK_ALLOCATOR.lock();
-    let stack_start = allocator.allocate().expect("kernel stack alloc failed");
-    let total_stack_size = KERNEL_STACK_SIZE + 0x1000;
-    let stack_end = stack_start + total_stack_size;
-
-    if let boot_info = boot_info() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let mut mapper = init_mapper(phys_mem_offset);
-
-        for page in Page::range_inclusive(
-            Page::<Size4KiB>::containing_address(stack_start),
-            Page::<Size4KiB>::containing_address(stack_end - 0x1000),
-        ) {
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            match map_page(&mut mapper, page, &mut frame_allocator, flags) {
-                Ok(_) => {}
-                Err(MapToError::PageAlreadyMapped(..)) => {}
-                Err(e) => {
-                    panic!("Unexpected error: {:?}", e);
-                }
-            }
+        // Check space at the end
+        if current + aligned_size <= self.end {
+            lock.push((current, aligned_size));
+            return Some(VirtAddr::new(current));
         }
 
-        let aligned_stack_end = VirtAddr::new((stack_end.as_u64() - 0x1000) & !0xF);
-        Ok(aligned_stack_end)
-    } else {
-        Err(MapToError::FrameAllocationFailed)
-    }
-}
-//TODO: very simple bump allocator change if needed
-const MMIO_BASE: u64 = 0xFFFF_C000_0000_0000;
-const MMIO_LIMIT: u64 = 0xFFFF_FF00_0000_0000;
-const MAX_PENDING_FREES: usize = 64;
-
-static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
-static PENDING_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
-fn allocate_mmio_virtual_range(size: u64) -> Option<VirtAddr> {
-    let aligned_size = (size + 0xFFF) & !0xFFF; // Align to 4KiB
-    let current = NEXT_MMIO_VADDR.fetch_add(aligned_size, Ordering::SeqCst);
-
-    if current + aligned_size > MMIO_LIMIT {
         None
-    } else {
-        Some(VirtAddr::new(current))
     }
 }
-fn unmap_mmio_region(
-    mapper: &mut impl Mapper<Size4KiB>,
+
+lazy_static! {
+    static ref KERNEL_RANGE_TRACKER: RangeTracker = RangeTracker::new(
+        0xffff_9000_0000_0000,
+        0xffff_ffff_ffff_f000,
+    );
+}
+pub fn allocate_auto_kernel_range(size: u64) -> Option<VirtAddr> {
+    let addr = KERNEL_RANGE_TRACKER.alloc_auto(size)?;
+    Some(addr)
+}
+
+pub fn allocate_kernel_range(
+    base: u64,
+    size: u64,
+) -> Result<VirtAddr, RangeAllocationError> {
+    let addr = KERNEL_RANGE_TRACKER.alloc(base, size)?;
+    Ok(addr)
+}
+
+pub fn allocate_auto_kernel_range_mapped(
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let addr = allocate_auto_kernel_range(size)
+        .ok_or(MapToError::FrameAllocationFailed)?;
+
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let mut mapper = init_mapper(phys_mem_offset);
+
+        let num_pages = (size + 0xFFF) / 0x1000;
+        for i in 0..num_pages {
+            let page = Page::containing_address(addr + i * 0x1000);
+            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
+        }
+
+        Ok(addr)
+    } else {
+        Err(MapToError::FrameAllocationFailed)
+    }
+}
+
+pub fn allocate_kernel_range_mapped(
+    base: u64,
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<VirtAddr, MapToError<Size4KiB>> {
+    let addr = allocate_kernel_range(base, size)
+        .map_err(|_| MapToError::FrameAllocationFailed)?;
+
+    if let boot_info = boot_info() {
+        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let mut mapper = init_mapper(phys_mem_offset);
+
+        let num_pages = (size + 0xFFF) / 0x1000;
+        for i in 0..num_pages {
+            let page = Page::containing_address(addr + i * 0x1000);
+            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
+        }
+
+        Ok(addr)
+    } else {
+        Err(MapToError::FrameAllocationFailed)
+    }
+}
+
+
+/// Deallocates a previously allocated kernel range.
+pub fn deallocate_kernel_range(
+    addr: VirtAddr,
+    size: u64,
+) {
+    KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), size);
+}
+
+/// Unmaps and deallocates a previously allocated kernel range.
+pub fn unmap_range(
     virtual_addr: VirtAddr,
     size: u64,
 ) {
-    let num_pages = (size + 0xFFF) / 4096;
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
 
+    deallocate_kernel_range(virtual_addr, size);
+    let num_pages = (size + 0xFFF) / 4096;
     for i in 0..num_pages {
-        let page = Page::containing_address(virtual_addr + i * 4096);
+        let page = Page::<Size4KiB>::containing_address(virtual_addr + i * 4096);
         unsafe {
             if let Ok((_, flush)) = mapper.unmap(page) {
                 flush.flush();
@@ -350,66 +438,6 @@ fn unmap_mmio_region(
         }
     }
 }
-
-pub fn deallocate_mmio_virtual_range(
-    addr: VirtAddr,
-    size: u64,
-) {
-    let aligned_size = (size + 0xFFF) & !0xFFF;
-    let addr_val = addr.as_u64();
-
-
-    if let boot_info = boot_info() {
-        let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-        unmap_mmio_region(&mut mapper, addr, aligned_size);
-
-        // Try to shrink bump pointer
-        let expected = addr_val + aligned_size;
-        if NEXT_MMIO_VADDR
-            .compare_exchange(expected, addr_val, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            process_pending_frees();
-        } else {
-            // Can't free immediately, queue it
-            unsafe {
-                let idx = PENDING_FREE_COUNT.fetch_add(1, Ordering::SeqCst);
-                if idx < MAX_PENDING_FREES {
-                    PENDING_FREES[idx] = Some((addr_val, aligned_size));
-                }
-            }
-        }
-    }
-}
-
-fn process_pending_frees() {
-    unsafe {
-        let mut i = 0;
-        while i < PENDING_FREE_COUNT.load(Ordering::SeqCst) {
-            if let Some((addr, size)) = PENDING_FREES[i] {
-                let expected = addr + size;
-                if NEXT_MMIO_VADDR
-                    .compare_exchange(expected, addr, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    // Already unmapped when added to queue — safe to reclaim now
-                    for j in i..(MAX_PENDING_FREES - 1) {
-                        PENDING_FREES[j] = PENDING_FREES[j + 1];
-                    }
-                    PENDING_FREES[MAX_PENDING_FREES - 1] = None;
-                    PENDING_FREE_COUNT.fetch_sub(1, Ordering::SeqCst);
-                    continue;
-                }
-            }
-            i += 1;
-        }
-    }
-}
-
-
 pub fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
@@ -417,7 +445,7 @@ pub fn map_mmio_region(
     let phys_frame = PhysFrame::containing_address(mmio_base);
     let num_pages = (mmio_size + 0xFFF) / 4096;
 
-    let virtual_addr = allocate_mmio_virtual_range(mmio_size)
+    let virtual_addr = allocate_auto_kernel_range(mmio_size)
         .ok_or_else(|| MapToError::FrameAllocationFailed)?;
 
     if let boot_info = boot_info() {

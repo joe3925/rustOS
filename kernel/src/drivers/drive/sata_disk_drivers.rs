@@ -28,7 +28,7 @@ pub(crate) struct AHCIController {
 
 }
 unsafe impl Send for AHCIController {}
-
+// All dogshit chat gpt slop code
 
 impl AHCIController {
     pub fn new() -> Self {

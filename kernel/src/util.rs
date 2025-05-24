@@ -33,8 +33,6 @@ pub unsafe fn init() {
 
 
     gdt::init();
-    println!("GDT loaded");
-
     PICS.lock().initialize();
     load_idt();
     println!("PIC loaded");

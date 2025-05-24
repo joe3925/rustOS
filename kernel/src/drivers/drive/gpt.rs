@@ -346,7 +346,7 @@ impl Partition {
     }
     pub fn format(&mut self) -> Result<(), FormatStatus> {
         if (self.is_fat == false) {
-            let mut fs = FileSystem::new(self.label.clone(), self.size);
+            let fs = FileSystem::new(self.label.clone(), self.size);
             return FileSystem::format_drive(self);
         }
         Err(FormatStatus::AlreadyFat32)
@@ -574,7 +574,7 @@ impl Drive {
         gpt.header.header_crc32 = 0;
         gpt.header.write_to_buffer(&mut header_buffer);
 
-        header_buffer[16..20].copy_from_slice(&[0, 0, 0, 0]); // not needed just a sanity check
+        header_buffer[16..20].copy_from_slice(&[0, 0, 0, 0]); // Not needed just a sanity check
 
         let mut header_crc = CRC::crc32();
         header_crc.digest(&header_buffer[0..gpt.header.header_size as usize]);
@@ -596,7 +596,7 @@ impl Drive {
     }
 }
 
-// This is windows MBR just shows an error that a GPT drive was ran as MBR
+// This is the windows MBR just shows an error that a GPT drive was ran as MBR
 pub const MBR: [u8; 512] = [
     0x33, 0xC0, 0x8E, 0xD0, 0xBC, 0x00, 0x7C, 0x8E, 0xC0, 0x8E, 0xD8, 0xBE, 0x00, 0x7C, 0xBF, 0x00,
     0x06, 0xB9, 0x00, 0x02, 0xFC, 0xF3, 0xA4, 0x50, 0x68, 0x1C, 0x06, 0xCB, 0xFB, 0xB9, 0x04, 0x00,

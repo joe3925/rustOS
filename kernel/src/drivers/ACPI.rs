@@ -69,6 +69,6 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        paging::deallocate_mmio_virtual_range(VirtAddr::new(region.virtual_start().as_ptr() as u64), region.region_length() as u64)
+        paging::unmap_range(VirtAddr::new(region.virtual_start().as_ptr() as u64), region.region_length() as u64)
     }
 }

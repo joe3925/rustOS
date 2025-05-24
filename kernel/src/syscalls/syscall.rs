@@ -62,7 +62,8 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         }
         //create task
         3 => unsafe {
-            SCHEDULER.lock().add_task(Task::new(param1 as usize, (*(param2 as *const String)).clone(), true));
+            //TODO: add param for stack size 
+            //SCHEDULER.lock().add_task(Task::new_usermode(param1 as usize, 0x2800, (*(param2 as *const String)).clone(), true));
         }
         //file open syscall
         4 => {

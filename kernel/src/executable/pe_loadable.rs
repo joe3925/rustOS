@@ -29,6 +29,7 @@ impl PELoader {
             _ => panic!("file is not a PE"),
         }
     }
+
     pub fn get_path(&self) -> String {
         self.path.clone()
     }
@@ -60,6 +61,7 @@ impl PELoader {
         if image_base % 0x10000 != 0 {
             return Err(LoadError::UnsupportedImageBase);
         }
+
 
         Err(LoadError::NotImplemented)
     }
