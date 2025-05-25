@@ -16,6 +16,19 @@ use lazy_static::lazy_static;
 use crate::util::boot_info;
 
 
+static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
+
+pub fn init_kernel_cr3() {
+    let (frame, _) = Cr3::read();
+    KERNEL_CR3_U64.store(frame.start_address().as_u64(), Ordering::SeqCst);
+}
+
+pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
+    PhysFrame::containing_address(x86_64::PhysAddr::new(
+        KERNEL_CR3_U64.load(Ordering::SeqCst),
+    ))
+}
+
 // Memory constants and structures 
 pub const KERNEL_STACK_SIZE: u64 = 0x2800;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(

@@ -6,11 +6,12 @@ use crate::util::boot_info;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use bitflags::Flags;
 use goblin::pe::PE;
 use goblin::Object;
-use x86_64::registers::control::Cr3;
+use x86_64::registers::control::{Cr2, Cr3, Cr3Flags};
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTable, PageTableFlags};
+use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
 
 pub struct PELoader {
@@ -56,6 +57,7 @@ impl PELoader {
     /// 
     /// Ok: PID of the loaded program
     pub fn load(&self) -> Result<u64, LoadError> {
+        x86_64::instructions::interrupts::disable();
         let pe = &self.pe;
         if pe.is_lib {
             return Err(LoadError::IsNotExecutable);
@@ -88,27 +90,32 @@ impl PELoader {
         let required_frames_4kib = (image_size) / 0x1000;
         range_tracker.alloc(image_base, image_size);
 
-        unsafe { Cr3::write(flags) };
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(
-        boot_info
-            .physical_memory_offset
-            .into_option()
-            .ok_or(LoadError::NoMemory)?,
-    );
+        let old = Cr3::read().0;
+        let new_frame = PhysFrame::containing_address(table_phys);
+        unsafe { Cr3::write(new_frame,Cr3::read().1) };
+    
+        let boot_info = boot_info();
+        let phys_mem_offset = VirtAddr::new(
+            boot_info
+                .physical_memory_offset
+                .into_option()
+                .ok_or(LoadError::NoMemory)?,
+        );
 
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-    let mut mapper = init_mapper(phys_mem_offset);
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let mut mapper = init_mapper(phys_mem_offset);
 
-        for i in 0..required_frames_4kib {
-            let required_address = image_base + (i * 0x1000);
-            let page = Page::containing_address(VirtAddr::new(required_address));
-            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-            map_page(&mut mapper, page, &mut frame_allocator, flags)
-                .map_err(|_| LoadError::NoMemory)?;
+            for i in 0..required_frames_4kib {
+                let required_address = image_base + (i * 0x1000);
+                let page = Page::containing_address(VirtAddr::new(required_address));
+                let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+                map_page(&mut mapper, page, &mut frame_allocator, flags)
+                    .map_err(|_| LoadError::NoMemory)?;
+            }
+            x86_64::instructions::interrupts::enable();
+            Err(LoadError::NotImplemented)
+
         }
-        Err(LoadError::NotImplemented)
-    }
 }
 
 /// Placeholder error type for loading failures.

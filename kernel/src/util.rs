@@ -10,11 +10,12 @@ use alloc::string::ToString;
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::{init_mapper, BootInfoFrameAllocator};
+use crate::memory::paging::{init_kernel_cr3, init_mapper, BootInfoFrameAllocator};
 use crate::{cpu, executable, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
+use core::ptr::addr_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -31,7 +32,8 @@ pub unsafe fn init() {
     let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
     init_heap(&mut mapper, &mut frame_allocator.clone());
 
-
+    init_kernel_cr3();
+    
     gdt::init();
     PICS.lock().initialize();
     load_idt();

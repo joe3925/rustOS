@@ -5,7 +5,7 @@ use x86_64::structures::paging::FrameAllocator;
 use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
-pub const HEAP_START: usize = 0x_4444_4444_0000;
+pub const HEAP_START: usize = 0xFFFF_8500_0000_0000;
 pub const HEAP_SIZE: usize = 5 * 1024 * 1024;
 pub(crate) fn init_heap(mapper: &mut impl Mapper<Size4KiB>, frame_allocator: &mut impl FrameAllocator<Size4KiB>) {
     let heap_start = VirtAddr::new(HEAP_START as u64);

@@ -1,5 +1,6 @@
+use crate::memory::paging::kernel_cr3;
 use crate::println;
-use x86_64::registers::control::Cr2;
+use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
@@ -62,6 +63,8 @@ pub(crate) extern "x86-interrupt" fn page_fault(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+    
     println!("page fault: {:?}", error_code);
     println!("attempted to access: {:?}", Cr2::read());
     panic!("{:#?}", stack_frame);
