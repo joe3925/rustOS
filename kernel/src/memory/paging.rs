@@ -2,6 +2,7 @@ use alloc::collections::LinkedList;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use spin::{Lazy, Mutex};
+use x86_64::structures::paging::page_table::PageTableEntry;
 use core::net::Ipv4Addr;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -103,21 +104,6 @@ pub fn map_page(
 fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
-fn get_table4_index(virtual_address: VirtAddr) -> usize {
-    ((virtual_address.as_u64() >> 39) & 0x1FF) as usize
-}
-
-fn get_table3_index(virtual_address: VirtAddr) -> usize {
-    ((virtual_address.as_u64() >> 30) & 0x1FF) as usize
-}
-
-fn get_table2_index(virtual_address: VirtAddr) -> usize {
-    ((virtual_address.as_u64() >> 21) & 0x1FF) as usize
-}
-
-fn get_table1_index(virtual_address: VirtAddr) -> usize {
-    ((virtual_address.as_u64() >> 12) & 0x1FF) as usize
-}
 
 fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
     let (table_frame, _) = Cr3::read();
@@ -128,7 +114,7 @@ fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
 
 fn get_level3_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
     let l4_table = get_level4_page_table(mem_offset);
-    let l3_table_addr = l4_table[get_table4_index(to_phys)].addr().as_u64();
+    let l3_table_addr = l4_table[to_phys.p4_index()].addr().as_u64();
     let virt_addr = mem_offset + l3_table_addr;
     let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
     unsafe { &mut *page_table_ptr }
@@ -136,7 +122,7 @@ fn get_level3_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 
 fn get_level2_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
     let l3_table = get_level3_page_table(mem_offset, to_phys);
-    let l2_table_addr = l3_table[get_table3_index(to_phys)].addr().as_u64();
+    let l2_table_addr = l3_table[to_phys.p3_index()].addr().as_u64();
     let virt_addr = mem_offset + l2_table_addr;
     let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
     unsafe { &mut *page_table_ptr }
@@ -144,7 +130,7 @@ fn get_level2_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 
 fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mut PageTable {
     let l2_table = get_level2_page_table(mem_offset, to_phys);
-    let l1_table_addr = l2_table[get_table2_index(to_phys)].addr().as_u64();
+    let l1_table_addr = l2_table[to_phys.p2_index()].addr().as_u64();
     let virt_addr = mem_offset + l1_table_addr;
     let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
     unsafe { &mut *page_table_ptr }
@@ -152,7 +138,7 @@ fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
 
 pub(crate) fn virtual_to_phys(mem_offset: VirtAddr, to_phys: VirtAddr) -> PhysAddr {
     let l1_table = get_level1_page_table(mem_offset, to_phys);
-    let page_entry = &l1_table[get_table1_index(to_phys)];
+    let page_entry = &l1_table[to_phys.p1_index()];
     page_entry.addr()
 }
 pub(crate) fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
@@ -463,4 +449,25 @@ pub fn map_mmio_region(
     }
 
     Ok(virtual_addr)
+}
+
+pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), MapToError<Size4KiB>> {
+    let mem_offset = boot_info()
+        .physical_memory_offset
+        .into_option()
+        .ok_or(MapToError::FrameAllocationFailed)?;
+
+    let table_virt = allocate_auto_kernel_range_mapped(size_of::<PageTable>() as u64, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE)?;
+
+    let table_phys_addr = virtual_to_phys(VirtAddr::new(mem_offset), table_virt);
+    let kernel_pml4 = get_level4_page_table(VirtAddr::new(mem_offset));
+
+    let new_table: &mut PageTable = unsafe { &mut *(table_virt.as_mut_ptr()) };
+    new_table.zero();
+
+    for i in 256..512 {
+        new_table[i] = kernel_pml4[i].clone();
+    }
+
+    Ok((table_phys_addr, table_virt))
 }

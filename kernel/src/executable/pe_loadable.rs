@@ -1,11 +1,16 @@
+use core::mem::transmute;
+
 use crate::file_system::file::{File, OpenFlags};
+use crate::memory::paging::new_user_mode_page_table;
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use goblin::pe::PE;
 use goblin::Object;
 
 pub struct PELoader {
-    file_data: Vec<u8>,
+    buffer: Box<[u8]>,
+    pe: PE<'static>,
     path: String,
 }
 
@@ -15,29 +20,38 @@ impl PELoader {
     pub fn new(path: &str) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
         let file_handle = File::open(path, &open_flags).ok()?;
-        let file_data = file_handle.read().ok()?;
-        match Object::parse(&file_data).ok()? {
-            Object::PE(pe) => Some(Self { file_data, path: path.to_string() }),
-            _ => None,
-        }
+        let file_data: Vec<u8> = file_handle.read().ok()?;
+
+        let boxed: Box<[u8]> = file_data.into_boxed_slice();
+
+        let slice: &[u8] = &boxed;
+
+        let pe = match Object::parse(slice).ok()? {
+            Object::PE(pe) => pe,
+            _ => return None,
+        };
+
+        let pe_static: PE<'static> = unsafe { transmute::<PE<'_>, PE<'static>>(pe) };
+
+        Some(Self {
+            buffer: boxed,
+            pe: pe_static,
+            path: path.to_string(),
+        })
     }
 
-    /// Returns the parsed PE object.
-    pub fn pe(&self) -> PE<'_> {
-        match Object::parse(&self.file_data).expect("invalid object format") {
-            Object::PE(pe) => pe,
-            _ => panic!("file is not a PE"),
-        }
-    }
 
     pub fn get_path(&self) -> String {
         self.path.clone()
     }
 
     /// Loads the PE into memory and prepares it for execution.
-    pub fn load(&self) -> Result<(), LoadError> {
-        let pe = self.pe();
-
+    /// 
+    /// Error: LoadError
+    /// 
+    /// Ok: PID of the loaded program
+    pub fn load(&self) -> Result<u64, LoadError> {
+        let pe = &self.pe;
         if pe.is_lib {
             return Err(LoadError::IsNotExecutable);
         }
@@ -62,6 +76,7 @@ impl PELoader {
             return Err(LoadError::UnsupportedImageBase);
         }
 
+        let (table_phys, table_virt) = new_user_mode_page_table().unwrap();
 
         Err(LoadError::NotImplemented)
     }
@@ -79,5 +94,6 @@ pub enum LoadError {
     MissingSections,
     UnsupportedImageBase,
     NotImplemented,
+    NoMemory,
 }
 
