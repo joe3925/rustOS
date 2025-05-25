@@ -1,3 +1,4 @@
+use alloc::borrow::ToOwned;
 use alloc::collections::LinkedList;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
@@ -8,7 +9,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame, Size2MiB, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PageTableIndex, PhysFrame, Size2MiB, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 use lazy_static::lazy_static;
 
@@ -141,7 +142,7 @@ pub(crate) fn virtual_to_phys(mem_offset: VirtAddr, to_phys: VirtAddr) -> PhysAd
     let page_entry = &l1_table[to_phys.p1_index()];
     page_entry.addr()
 }
-pub(crate) fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+pub fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = get_level4_page_table(physical_memory_offset);
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
@@ -256,7 +257,7 @@ pub struct RangeTracker {
 }
 
 impl RangeTracker {
-    fn new(start: u64, end: u64) -> Self {
+    pub fn new(start: u64, end: u64) -> Self {
         Self {
             allocations: Mutex::new(Vec::new()),
             start,
@@ -470,4 +471,53 @@ pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), MapToError<Siz
     }
 
     Ok((table_phys_addr, table_virt))
+}
+
+// I hate having to do this 
+pub fn map_page_in_page_table(
+    l4_table: &mut PageTable,
+    mem_offset: VirtAddr,
+    virtual_addr: VirtAddr,
+    flags: PageTableFlags,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) {
+    let p4_index = virtual_addr.p4_index();
+    let p3_index = virtual_addr.p3_index();
+    let p2_index = virtual_addr.p2_index();
+    let p1_index = virtual_addr.p1_index();
+    let l3_table = get_or_create_table(l4_table, p4_index, mem_offset, frame_allocator);
+
+    let l2_table = get_or_create_table(l3_table, p3_index, mem_offset, frame_allocator);
+
+    let l1_table = get_or_create_table(l2_table, p2_index, mem_offset, frame_allocator);
+
+    let entry = &mut l1_table[p1_index];
+    entry.set_frame(frame_allocator.allocate_frame().unwrap(), flags | PageTableFlags::PRESENT);
+}
+
+fn get_or_create_table(
+    parent: &mut PageTable,
+    index: PageTableIndex,
+    mem_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> &'static mut PageTable {
+    let entry = &mut parent[index];
+
+    if entry.flags().contains(PageTableFlags::PRESENT) {
+        let phys = entry.frame().unwrap().start_address();
+        let virt = mem_offset + phys.as_u64();
+        unsafe { &mut *(virt.as_mut_ptr()) }
+    } else {
+        let frame = frame_allocator
+            .allocate_frame()
+            .expect("Frame allocation failed");
+        let virt = mem_offset + frame.start_address().as_u64();
+        let table = unsafe {
+            let ptr: *mut PageTable = virt.as_mut_ptr();
+            ptr.write(PageTable::new());
+            &mut *ptr
+        };
+        entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+        table
+    }
 }
