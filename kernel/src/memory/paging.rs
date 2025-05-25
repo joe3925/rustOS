@@ -35,15 +35,15 @@ pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAlloc
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here
 ));
 
-pub static USER_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
-    VirtAddr::new(0x00007FFFFFFFFFFFu64), // User stacks start here
-));
 // Global NEXT counter (still required)
 static NEXT: Mutex<usize> = Mutex::new(0);
 
-const MMIO_BASE: u64 = 0xFFFF_C000_0000_0000;
-const MMIO_LIMIT: u64 = 0xFFFF_FF00_0000_0000;
+const MMIO_BASE: u64 = 0xFFFF_8700_0000_0000;
 const MAX_PENDING_FREES: usize = 64;
+
+const MANAGED_KERNEL_RANGE_START: u64 = MMIO_BASE;
+const MANAGED_KERNEL_RANGE_END: u64 = 0xFFFF_FFFF_8000_0000;
+
 
 static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
 static PENDING_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -214,8 +214,7 @@ impl StackAllocator {
 
 pub fn allocate_kernel_stack(size: u64) -> Result<VirtAddr, MapToError<Size4KiB>> {
     let total_size = size + 0x1000; // +1 page for guard
-    let stack_start_addr = allocate_auto_kernel_range(total_size)
-        .ok_or(MapToError::FrameAllocationFailed)?;
+    let stack_start_addr = KERNEL_STACK_ALLOCATOR.lock().allocate(size).unwrap();
 
     let stack_end = stack_start_addr + total_size;
 
@@ -343,8 +342,8 @@ impl RangeTracker {
 
 lazy_static! {
     static ref KERNEL_RANGE_TRACKER: RangeTracker = RangeTracker::new(
-        0xffff_9000_0000_0000,
-        0xffff_ffff_ffff_f000,
+        MANAGED_KERNEL_RANGE_START,
+        MANAGED_KERNEL_RANGE_END,
     );
 }
 pub fn allocate_auto_kernel_range(size: u64) -> Option<VirtAddr> {

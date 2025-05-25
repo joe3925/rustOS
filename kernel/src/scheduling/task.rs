@@ -1,6 +1,6 @@
 use crate::gdt::GDT;
 use crate::memory::paging::{
-     allocate_kernel_stack, KERNEL_STACK_ALLOCATOR, USER_STACK_ALLOCATOR
+     allocate_kernel_stack, KERNEL_STACK_ALLOCATOR
 };
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
@@ -112,9 +112,7 @@ pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String) -> Self
     }
     pub fn destroy(&mut self) {
         if (self.is_user_mode) {
-            USER_STACK_ALLOCATOR
-                .lock()
-                .deallocate(VirtAddr::new(self.stack_start));
+            todo!();
         } else {
             KERNEL_STACK_ALLOCATOR
                 .lock()

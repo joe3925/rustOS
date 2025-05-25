@@ -52,11 +52,16 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
     config.kernel_stack_size = 10 * 100 * 1024;
-    config.mappings.kernel_stack = Mapping::FixedAddress(0xFFFF_FFFF_0000_0000);
+    config.mappings.kernel_stack = Mapping::Dynamic;
+    config.mappings.dynamic_range_start = Some(0xFFFF_8000_0000_0000);
+    config.mappings.dynamic_range_end = Some(0xFFFF_84FF_FFFF_FFFF);
+
+    config.mappings.framebuffer = Mapping::Dynamic;
     config
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 fn _start(boot_info: &'static mut BootInfo) -> ! {
+
     unsafe { BOOT_INFO = Some(boot_info); } 
     clear_screen();
     unsafe {

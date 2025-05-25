@@ -38,12 +38,14 @@ pub unsafe fn init() {
     PICS.lock().initialize();
     load_idt();
     println!("PIC loaded");
-
     match ApicImpl::init_apic_full() {
         Ok(_) => { println!("APIC transition successful!"); }
         Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
     }
     test_full_heap();
+
+    let boot_info_ptr = boot_info as *const BootInfo as usize;
+    println!("BootInfo is at virtual address: {:#x}", boot_info_ptr);
 
     {
         let mut drives = DRIVECOLLECTION.lock();

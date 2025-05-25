@@ -11,7 +11,7 @@
             ],
             "processCreateCommands": [
                 "gdb-remote localhost:1234",
-                "target modules load --file kernel.efi .text 0xffff800000000000"
+                "target modules load --file kernel.efi .text 0xFFFF850000000000"
             ],
             "cwd": "${workspaceRoot}/kernel/src",
         }
