@@ -54,7 +54,8 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                 scheduler.schedule_next();
 
                 send_eoi(InterruptIndex::Timer.as_u8());
-
+                
+                scheduler.restore_page_table();
                 scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
 

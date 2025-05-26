@@ -43,10 +43,6 @@ pub unsafe fn init() {
         Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
     }
     test_full_heap();
-
-    let boot_info_ptr = boot_info as *const BootInfo as usize;
-    println!("BootInfo is at virtual address: {:#x}", boot_info_ptr);
-
     {
         let mut drives = DRIVECOLLECTION.lock();
         drives.enumerate_drives();
@@ -79,12 +75,19 @@ pub unsafe fn init() {
 
     println!("Volumes enumerated");
 
-    if let Some(loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
-       println!("{:#?}", loadable.load())
-    }
     println!("Init Done");
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
-    asm!("hlt");
+    loop{asm!("hlt");}
+}
+
+// Things to be tested after kernel init go here 
+pub extern "C" fn testing(){
+    x86_64::instructions::interrupts::disable();
+    if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
+       println!("{:#?}", loadable.load())
+    }
+    x86_64::instructions::interrupts::enable();
+    loop{}
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

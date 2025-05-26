@@ -5,7 +5,7 @@ use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::VirtAddr;
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct State {
     pub(crate) rax: u64,
     pub(crate) rbx: u64,

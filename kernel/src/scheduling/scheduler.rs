@@ -1,6 +1,10 @@
+use crate::executable::program::PROGRAM_MANAGER;
+use crate::memory::paging::{KERNEL_CR3_U64, KERNEL_STACK_SIZE};
 use crate::scheduling::task::{idle_task, Task};
+use crate::util::testing;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use x86_64::registers::control::Cr3;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
@@ -18,6 +22,7 @@ lazy_static! {
 pub struct Scheduler {
     tasks: Vec<Task>,
     current_task: AtomicUsize,
+    id: u64
 }
 
 impl Scheduler {
@@ -25,15 +30,33 @@ impl Scheduler {
         Self {
             tasks: Vec::new(),
             current_task: AtomicUsize::new(0),
+            id: 0
         }
     }
 
     #[inline]
-    pub fn add_task(&mut self, task: Task) {
+    pub fn add_task(&mut self, mut task: Task) {
+        task.id = self.id;
+        self.id += 1;
         self.tasks.push(task);
+
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+    pub fn restore_page_table(&mut self){
+        if let Some(prorgam) =   PROGRAM_MANAGER.read().get(self.get_current_task().parent_pid){
+            unsafe { Cr3::write(prorgam.cr3, Cr3::read().1) };
+        }else{
+            // Attempt to recover 
+            // Worse case we spin through all the tasks and end up with only the idle task 
+            if(self.tasks.len() > 1 && self.get_current_task().parent_pid != 0){
+                let task_id = self.get_current_task().id;
+                self.delete_task(task_id);
+                self.schedule_next();
+                self.restore_page_table();
+            }
+        }
     }
 
     // round-robin
@@ -41,8 +64,11 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         self.end_task();
         if self.tasks.len() < 1 {
-            let kernel_idle_task = Task::new_kernelmode(idle_task as usize, 0x2800, "idle task".to_string());
-            self.add_task(kernel_idle_task);
+            //let kernel_idle_task = Task::new_kernelmode(idle_task as usize, 0x2800, "idle task".to_string(), 0);
+            let kernel_test_task = Task::new_kernelmode(testing as usize, KERNEL_STACK_SIZE, "test task".to_string(), 0);
+
+            //self.add_task(kernel_idle_task);
+            self.add_task(kernel_test_task);
         }
 
         if self.tasks.len() > 0 {

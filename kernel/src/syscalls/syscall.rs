@@ -35,7 +35,6 @@ fn u64_to_str_ptr(value: u64) -> Option<String> {
 }
 
 pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
-    x86_64::instructions::interrupts::disable();
     let mut rax: u64;
     let mut param1: u64;
     let mut param2: u64;
@@ -47,6 +46,8 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
     unsafe { asm!("mov {0}, r10", lateout(reg) param3); }
     unsafe { asm!("mov {0}, r11", lateout(reg) extra_params); }
+    x86_64::instructions::interrupts::disable();
+
     let return_value: usize = 0;
     let params = unsafe { (extra_params as *mut SyscallParams).as_mut() };
     //all returns are buffers because im lazy

@@ -12,21 +12,19 @@ use spin::Mutex;
 use x86_64::VirtAddr;
 use crate::memory::paging::RangeTracker;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Task {
-    pub(crate) name: String,
-    pub(crate) context: State, // The CPU state for this task
-    pub(crate) stack_start: u64,
-    pub(crate) id: u64,
-    pub(crate) terminated: bool,
-    pub(crate) is_user_mode: bool,
-    pub range_allocator: Option<RangeTracker>,
+    pub name: String,
+    pub context: State, // The CPU state for this task
+    pub stack_start: u64,
+    pub id: u64,
+    pub terminated: bool,
+    pub is_user_mode: bool,
+    pub parent_pid: u64
 }
-static ID: Mutex<u64> = Mutex::new(0);
-
 impl Task {
-pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_pointer: u64, allocator: RangeTracker) -> Self {
-    let stack_top = stack_pointer;
+pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_pointer: VirtAddr, parent_pid: u64) -> Self {
+    let stack_top = stack_pointer.as_u64();
 
     let mut state = State::new(0);
     state.rip = entry_point as u64;
@@ -42,29 +40,22 @@ pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_poi
     state.ss = GDT.1.user_data_selector.0 as u64 | 3;
 
     println!(
-        "User-mode task created with RIP {:X}, STACK {:X}, ID {}",
+        "User-mode task created with RIP {:X}, STACK {:X}",
         state.rip,
         state.rsp,
-        *ID.lock()
     );
-
-    let id = {
-        let mut id_guard = ID.lock();
-        *id_guard += 1;
-        *id_guard
-    };
 
     Self {
         name,
         context: state,
         stack_start: stack_top,
-        id,
+        id: 0,
         terminated: false,
         is_user_mode: true,
-        range_allocator: Some(allocator),
+        parent_pid
     }
 }
-pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String) -> Self {
+pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String, parent_pid: u64) -> Self {
     let stack_top = unsafe { allocate_kernel_stack(stack_size) }
         .expect("Failed to allocate kernel-mode stack");
 
@@ -82,26 +73,21 @@ pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String) -> Self
     state.ss = GDT.1.kernel_data_selector.0 as u64;
 
     println!(
-        "Kernel-mode task created with RIP {:X}, STACK {:X}, ID {}",
+        "Kernel-mode task created with RIP {:X}, STACK {:X}",
         state.rip,
         state.rsp,
-        *ID.lock()
     );
 
-    let id = {
-        let mut id_guard = ID.lock();
-        *id_guard += 1;
-        *id_guard
-    };
+
 
     Self {
         name,
         context: state,
         stack_start: stack_top.as_u64(),
-        id,
+        id: 0,
         terminated: false,
         is_user_mode: false,
-        range_allocator: None,
+        parent_pid
     }
 }
 

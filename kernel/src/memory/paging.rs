@@ -16,7 +16,7 @@ use lazy_static::lazy_static;
 use crate::util::boot_info;
 
 
-static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
+pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_kernel_cr3() {
     let (frame, _) = Cr3::read();
@@ -30,7 +30,7 @@ pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
 }
 
 // Memory constants and structures 
-pub const KERNEL_STACK_SIZE: u64 = 0x2800;
+pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024 * 20 ;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here
 ));
@@ -38,7 +38,7 @@ pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAlloc
 // Global NEXT counter (still required)
 static NEXT: Mutex<usize> = Mutex::new(0);
 
-const MMIO_BASE: u64 = 0xFFFF_8700_0000_0000;
+const MMIO_BASE: u64 = 0xFFFF_9000_0000_0000;
 const MAX_PENDING_FREES: usize = 64;
 
 const MANAGED_KERNEL_RANGE_START: u64 = MMIO_BASE;

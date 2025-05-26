@@ -6,5 +6,7 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     "-Z", "pre-link-arg=/NODEFAULTLIB",
     "-Z", "pre-link-arg=/SUBSYSTEM:NATIVE",
+    "-Z", "pre-link-arg=/DYNAMICBASE",        # ← Enable ASLR (PIE)
+    "-Z", "pre-link-arg=/FIXED:NO",           # ← Allow relocation (required with DYNAMICBASE)
     "-C", "link-arg=/ENTRY:mainCRTStartup"
 ]

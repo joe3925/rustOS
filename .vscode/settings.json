@@ -40,5 +40,9 @@
                 "variable": "#D4D4D4"
             }
         }
-    }
+    },
+    "lldb.displayFormat": "auto",
+    "lldb.showDisassembly": "auto",
+    "lldb.dereferencePointers": true,
+    "lldb.consoleMode": "commands"
 }

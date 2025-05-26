@@ -18,7 +18,7 @@ pub enum OpenFlags {
     CreateNew,
 }
 #[derive(Debug)]
-pub(crate) struct File {
+pub struct File {
     pub name: String,
     pub extension: String,
     pub size: u64,
@@ -28,7 +28,7 @@ pub(crate) struct File {
     pub deleted: bool,
 }
 #[derive(Clone)]
-struct SyscallParams {
+pub struct SyscallParams {
     param1: u64,
     param2: u64,
     param3: u64,
@@ -36,7 +36,7 @@ struct SyscallParams {
     extra_params: Vec<u64>,
 }
 impl SyscallParams {
-    fn new() -> Self {
+    pub fn new() -> Self {
         SyscallParams {
             param1: 0,
             param2: 0,
