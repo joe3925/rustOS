@@ -674,6 +674,24 @@ impl FileSystem {
         }
         Ok(())
     }
+    pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus>{
+        let dir_entry = Self::find_dir(part, path)?;
+        let files = Self::read_dir(part, dir_entry.get_cluster())?;
+        let file_names: Vec<String> = files
+            .iter()
+            .map(|entry| {
+                let raw = entry.name;
+                let trimmed = raw
+                    .iter()
+                    .take_while(|&&c| c != 0 && c != b' ') // trim nulls and spaces
+                    .cloned()
+                    .collect::<Vec<u8>>();
+                String::from_utf8_lossy(&trimmed).to_string()
+            })
+            .collect();
+
+        Ok(file_names)
+    }
 
 
     pub fn read_file(

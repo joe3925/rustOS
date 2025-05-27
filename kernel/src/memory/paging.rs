@@ -1,5 +1,6 @@
 use alloc::borrow::ToOwned;
 use alloc::collections::LinkedList;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use spin::{Lazy, Mutex};
@@ -30,10 +31,17 @@ pub fn kernel_cr3() -> PhysFrame<Size4KiB> {
 }
 
 // Memory constants and structures 
-pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024 * 20 ;
+pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024 * 5 ;
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here
 ));
+
+lazy_static! {
+    pub static ref KERNEL_RANGE_TRACKER: Arc<RangeTracker> = Arc::new(RangeTracker::new(
+        MANAGED_KERNEL_RANGE_START,
+        MANAGED_KERNEL_RANGE_END,
+    ));
+}
 
 // Global NEXT counter (still required)
 static NEXT: Mutex<usize> = Mutex::new(0);
@@ -340,12 +348,6 @@ impl RangeTracker {
     }
 }
 
-lazy_static! {
-    static ref KERNEL_RANGE_TRACKER: RangeTracker = RangeTracker::new(
-        MANAGED_KERNEL_RANGE_START,
-        MANAGED_KERNEL_RANGE_END,
-    );
-}
 pub fn allocate_auto_kernel_range(size: u64) -> Option<VirtAddr> {
     let addr = KERNEL_RANGE_TRACKER.alloc_auto(size)?;
     Some(addr)

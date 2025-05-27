@@ -9,6 +9,7 @@ use crate::scheduling::task::Task;
 use crate::util::boot_info;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bitflags::Flags;
 use embedded_graphics::pixelcolor::raw::LittleEndian;
@@ -174,7 +175,7 @@ impl PELoader {
         if self.pe.sections.is_empty() {
             return Err(LoadError::MissingSections);
         }
-        let range_tracker = RangeTracker::new(0x1000u64, 0x00007FFFFFFFFFFFu64);
+    let range_tracker = Arc::new(RangeTracker::new(0x1000u64, 0x00007FFFFFFFFFFFu64));
         self.current_base = if (self.needs_relocation()){
             self.calculate_relocation_base(&range_tracker)?
         }else{

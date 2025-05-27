@@ -1,5 +1,5 @@
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB}, PhysAddr, VirtAddr};
@@ -22,7 +22,7 @@ pub struct Program {
     pub managed_threads: Mutex<Vec<u64>>,
     pub modules: Mutex<Vec<Module>>,
     pub cr3: PhysFrame,
-    pub tracker: RangeTracker,
+    pub tracker: Arc<RangeTracker>,
 
 }
 impl Program {

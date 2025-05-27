@@ -5,12 +5,17 @@ use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index::ApicImpl;
 use crate::drivers::interrupt_index::PICS;
 use crate::executable::pe_loadable;
-use alloc::string::ToString;
+use crate::executable::program::{Program, PROGRAM_MANAGER};
+use crate::file_system::file::File;
+use crate::scheduling::scheduler::SCHEDULER;
+use alloc::fmt::format;
+use alloc::string::{String, ToString};
+use spin::Mutex;
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::{init_kernel_cr3, init_mapper, BootInfoFrameAllocator};
+use crate::memory::paging::{init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, RangeTracker, KERNEL_RANGE_TRACKER};
 use crate::{cpu, executable, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
@@ -43,6 +48,7 @@ pub unsafe fn init() {
         Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
     }
     test_full_heap();
+
     {
         let mut drives = DRIVECOLLECTION.lock();
         drives.enumerate_drives();
@@ -55,25 +61,11 @@ pub unsafe fn init() {
             Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
         }
     }
-    println!("Drives enumerated");
     {
         let mut partitions = VOLUMES.lock();
         partitions.enumerate_parts();
-        if let Some(part) = partitions.find_volume("B:".to_string()) {
-            match part.format() {
-                Ok(_) => {
-                    println!("volume {} formatted successfully", part.label.clone());
-                    part.is_fat = true;
-                }
-                Err(err) => println!("Error formatting volume {} {}", part.label.clone(), err.to_str()),
-            }
-        } else {
-            println!("failed to find drive B:");
-        }
         partitions.print_parts();
     }
-
-    println!("Volumes enumerated");
 
     println!("Init Done");
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
@@ -81,13 +73,64 @@ pub unsafe fn init() {
 }
 
 // Things to be tested after kernel init go here 
-pub extern "C" fn testing(){
-    x86_64::instructions::interrupts::disable();
-    if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
-       println!("{:#?}", loadable.load())
+pub fn kernel_main() {
+    let program = Program {
+        title: "".to_string(),
+        image_path: "".to_string(),
+        pid: 0,
+        image_base: VirtAddr::new(0xFFFF850000000000),
+        main_thread: Some(SCHEDULER.lock().get_current_task().clone()),
+        managed_threads: Mutex::new(Vec::new()),
+        modules: Mutex::new(Vec::new()),
+        cr3: kernel_cr3(),
+        tracker: KERNEL_RANGE_TRACKER.clone(),
+    };
+    let pid = PROGRAM_MANAGER.write().add_program(program);
+
+    // Extract label and drop the VOLUMES lock early
+    let label = {
+        let mut volumes = VOLUMES.lock();
+        if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
+            system_volume.label.clone()
+        } else {
+            return; // no main volume found
+        }
+    };
+
+    let base_path = "\\SYSTEM\\MOD";
+    let mut path_buffer = String::new();
+
+    let full_path = {
+        let mut s = String::with_capacity(label.len() + base_path.len());
+        s.push_str(&label);
+        s.push_str(base_path);
+        s
+    };
+
+    let entries = File::list_dir(&full_path)
+        .expect("Failed to load system mod directory");
+
+    for name in entries {
+        if !name.to_ascii_lowercase().ends_with(".dll") {
+            continue;
+        }
+        path_buffer.clear();
+        path_buffer.push_str(&label);       
+        path_buffer.push_str(base_path); 
+        path_buffer.push_str("\\");   
+        path_buffer.push_str(&name);        
+
+        match PROGRAM_MANAGER.write().get_mut(pid).unwrap().load_module(path_buffer.clone()) {
+            Ok(_) => {
+                println!("Loaded module: {}", name);
+            }
+            Err(e) => {
+                println!("Failed to load module '{}': {:?}", name, e);
+            }
+        }
     }
-    x86_64::instructions::interrupts::enable();
-    loop{}
+
+    loop {}
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

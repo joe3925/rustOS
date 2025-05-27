@@ -55,7 +55,10 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
 
                 send_eoi(InterruptIndex::Timer.as_u8());
                 
-                scheduler.restore_page_table();
+                if(!scheduler.get_current_task().parent_pid == 0){
+                    // The kernel may be holding locks that this needs, any other task won't be holding said locks 
+                    scheduler.restore_page_table();
+                }
                 scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
 

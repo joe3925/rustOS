@@ -277,6 +277,12 @@ impl PartitionCollection {
         }
         None
     }
+    pub fn find_partition_by_name(&mut self, target_name: &str) -> Option<&mut Partition> {
+        self.parts.iter_mut().find(|partition| {
+            let normalized = partition.name.trim_end_matches(char::from(0)).trim_end();
+            normalized == target_name
+        })
+    }
     pub fn print_parts(&self) {
         if self.parts.is_empty() {
             println!("No drives in the collection.");

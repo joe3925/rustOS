@@ -226,6 +226,18 @@ impl File {
             parent
         }
     }
+    pub fn list_dir(path: &str) -> Result<Vec<String>, FileStatus>{
+        let label = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::DriveNotFound)?;
+        if let Some(part) = VOLUMES.lock().find_volume(label) {
+            if !part.is_fat {
+                return Err(FileStatus::NotFat); // Drive is not FAT
+            }
+            let path = Self::remove_drive_from_path(path);
+            return FileSystem::list_dir(part, path);
+        }else{
+            Err(FileStatus::DriveNotFound)
+        }
+    }
 
 
     /// Read data from the file.

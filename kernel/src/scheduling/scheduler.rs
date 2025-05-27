@@ -1,7 +1,7 @@
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::{KERNEL_CR3_U64, KERNEL_STACK_SIZE};
 use crate::scheduling::task::{idle_task, Task};
-use crate::util::testing;
+use crate::util::kernel_main;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use x86_64::registers::control::Cr3;
@@ -50,7 +50,7 @@ impl Scheduler {
         }else{
             // Attempt to recover 
             // Worse case we spin through all the tasks and end up with only the idle task 
-            if(self.tasks.len() > 1 && self.get_current_task().parent_pid != 0){
+            if(self.tasks.len() > 1){
                 let task_id = self.get_current_task().id;
                 self.delete_task(task_id);
                 self.schedule_next();
@@ -64,11 +64,8 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         self.end_task();
         if self.tasks.len() < 1 {
-            //let kernel_idle_task = Task::new_kernelmode(idle_task as usize, 0x2800, "idle task".to_string(), 0);
-            let kernel_test_task = Task::new_kernelmode(testing as usize, KERNEL_STACK_SIZE, "test task".to_string(), 0);
-
-            //self.add_task(kernel_idle_task);
-            self.add_task(kernel_test_task);
+            let kernel_task = Task::new_kernelmode(kernel_main as usize, KERNEL_STACK_SIZE, "kernel".to_string(), 0);
+            self.add_task(kernel_task);
         }
 
         if self.tasks.len() > 0 {
