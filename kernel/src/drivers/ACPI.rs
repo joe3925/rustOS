@@ -8,9 +8,9 @@ use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use x86_64::{PhysAddr, VirtAddr};
 
-lazy_static!(
+lazy_static! {
     pub static ref ACPI_TABLES: ACPI = ACPI::new();
-);
+}
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct Xsdp {
@@ -36,10 +36,15 @@ impl ACPI {
         if boot_info().rsdp_addr.into_option().is_none() {
             panic!("RSDP was not supplied by bootloader");
         }
-        let tables = unsafe { AcpiTables::from_rsdp(handler, boot_info().rsdp_addr.into_option().unwrap() as usize).expect("failed to parse ACPI") };
-        ACPI {
-            tables
-        }
+        let tables = unsafe {
+            AcpiTables::from_rsdp(
+                handler,
+                boot_info().rsdp_addr.into_option().unwrap() as usize,
+            )
+            .expect("failed to parse ACPI")
+        };
+
+        ACPI { tables }
     }
     pub fn get_interrupt_model(&self) -> Option<Apic<Global>> {
         let platform_info = self.tables.platform_info().ok()?;
@@ -63,12 +68,27 @@ impl ACPIImpl {
 }
 
 impl AcpiHandler for ACPIImpl {
-    unsafe fn map_physical_region<T>(&self, physical_address: usize, size: usize) -> PhysicalMapping<Self, T> {
-        let virt_addr = paging::map_mmio_region(PhysAddr::new(physical_address as u64), size as u64).expect("failed to map io space for ACPI");
-        PhysicalMapping::new(physical_address, NonNull::new(virt_addr.as_mut_ptr()).unwrap(), size, size, self.clone())
+    unsafe fn map_physical_region<T>(
+        &self,
+        physical_address: usize,
+        size: usize,
+    ) -> PhysicalMapping<Self, T> {
+        let virt_addr =
+            paging::map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
+                .expect("failed to map io space for ACPI");
+        PhysicalMapping::new(
+            physical_address,
+            NonNull::new(virt_addr.as_mut_ptr()).unwrap(),
+            size,
+            size,
+            self.clone(),
+        )
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        paging::unmap_range(VirtAddr::new(region.virtual_start().as_ptr() as u64), region.region_length() as u64)
+        paging::unmap_range(
+            VirtAddr::new(region.virtual_start().as_ptr() as u64),
+            region.region_length() as u64,
+        )
     }
 }

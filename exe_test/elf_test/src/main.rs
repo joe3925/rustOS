@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use core::panic::PanicInfo;
 use core::arch::asm;
+use core::panic::PanicInfo;
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
@@ -11,9 +11,11 @@ fn panic(_info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mainCRTStartup() -> ! {
-    loop {    
-        sys_print("Hello world");
+    sys_print("Calling syscall");
+    unsafe {
+        asm!("sysenter");
     }
+    loop {}
 }
 pub fn sys_print(string: &str) {
     unsafe {

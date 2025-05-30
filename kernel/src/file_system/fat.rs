@@ -18,65 +18,65 @@ const NUM_FATS: u8 = 1;
 const SECTOR_SIZE: u16 = 512;
 #[repr(C, packed)]
 pub struct BIOSParameterBlock {
-    pub jmp_boot: [u8; 3],      // Jump instruction to bootstrap code
-    pub oem_name: [u8; 8],      // OEM Identifier (e.g., "MSWIN4.1")
-    pub bytes_per_sector: u16,  // Bytes per sector (512, 1024, 2048, or 4096)
-    pub sectors_per_cluster: u8, // Sectors per allocation unit (1,2,4,8,16,32,64,128)
-    pub reserved_sectors: u16,  // Number of reserved sectors
-    pub num_fats: u8,           // Number of FATs (usually 2)
-    pub root_entry_count: u16,  // Always 0 for FAT32
-    pub total_sectors_16: u16,  // 16-bit total sector count (0 if FAT32)
-    pub media_descriptor: u8,   // Media descriptor type
-    pub fat_size_16: u16,       // FAT size in sectors (0 for FAT32)
-    pub sectors_per_track: u16, // Sectors per track (for CHS addressing)
-    pub num_heads: u16,         // Number of heads (for CHS addressing)
-    pub hidden_sectors: u32,    // Hidden sectors before FAT32 partition
-    pub total_sectors_32: u32,  // 32-bit total sector count
-    pub fat_size_32: u32,       // FAT size in sectors (FAT32 only)
-    pub ext_flags: u16,         // Flags (e.g., active FAT, mirroring)
-    pub fs_version: u16,        // FAT32 version (usually 0x0000)
-    pub root_cluster: u32,      // Root directory starting cluster (typically 2)
-    pub fs_info_sector: u16,    // Sector number of FSINFO structure
-    pub backup_boot_sector: u16, // Sector number of backup boot sector
-    pub reserved: [u8; 12],     // Reserved space (must be zero)
-    pub drive_number: u8,       // Logical drive number (0x80 for HDD, 0x00 for FDD)
-    pub reserved1: u8,          // Reserved (must be zero)
-    pub boot_signature: u8,     // Boot signature (0x29 indicates BPB is present)
-    pub volume_id: u32,         // Volume serial number
-    pub volume_label: [u8; 11], // Volume label (e.g., "NO NAME    ")
+    pub jmp_boot: [u8; 3],         // Jump instruction to bootstrap code
+    pub oem_name: [u8; 8],         // OEM Identifier (e.g., "MSWIN4.1")
+    pub bytes_per_sector: u16,     // Bytes per sector (512, 1024, 2048, or 4096)
+    pub sectors_per_cluster: u8,   // Sectors per allocation unit (1,2,4,8,16,32,64,128)
+    pub reserved_sectors: u16,     // Number of reserved sectors
+    pub num_fats: u8,              // Number of FATs (usually 2)
+    pub root_entry_count: u16,     // Always 0 for FAT32
+    pub total_sectors_16: u16,     // 16-bit total sector count (0 if FAT32)
+    pub media_descriptor: u8,      // Media descriptor type
+    pub fat_size_16: u16,          // FAT size in sectors (0 for FAT32)
+    pub sectors_per_track: u16,    // Sectors per track (for CHS addressing)
+    pub num_heads: u16,            // Number of heads (for CHS addressing)
+    pub hidden_sectors: u32,       // Hidden sectors before FAT32 partition
+    pub total_sectors_32: u32,     // 32-bit total sector count
+    pub fat_size_32: u32,          // FAT size in sectors (FAT32 only)
+    pub ext_flags: u16,            // Flags (e.g., active FAT, mirroring)
+    pub fs_version: u16,           // FAT32 version (usually 0x0000)
+    pub root_cluster: u32,         // Root directory starting cluster (typically 2)
+    pub fs_info_sector: u16,       // Sector number of FSINFO structure
+    pub backup_boot_sector: u16,   // Sector number of backup boot sector
+    pub reserved: [u8; 12],        // Reserved space (must be zero)
+    pub drive_number: u8,          // Logical drive number (0x80 for HDD, 0x00 for FDD)
+    pub reserved1: u8,             // Reserved (must be zero)
+    pub boot_signature: u8,        // Boot signature (0x29 indicates BPB is present)
+    pub volume_id: u32,            // Volume serial number
+    pub volume_label: [u8; 11],    // Volume label (e.g., "NO NAME    ")
     pub file_system_type: [u8; 8], // Always "FAT32   "
 }
 
 impl BIOSParameterBlock {
     pub fn new(total_sectors: u32, fat_size: u32) -> Self {
         BIOSParameterBlock {
-            jmp_boot: [0xEB, 0x58, 0x90],  // Standard jump code
-            oem_name: *b"MSWIN4.1",     // Standard OEM name
-            bytes_per_sector: 512,        // Standard sector size
-            sectors_per_cluster: SECTORS_PER_CLUSTER as u8,      // Must be power of 2, chosen for performance
-            reserved_sectors: RESERVED_SECTORS as u16,         // Typically 32 for FAT32
+            jmp_boot: [0xEB, 0x58, 0x90],                   // Standard jump code
+            oem_name: *b"MSWIN4.1",                         // Standard OEM name
+            bytes_per_sector: 512,                          // Standard sector size
+            sectors_per_cluster: SECTORS_PER_CLUSTER as u8, // Must be power of 2, chosen for performance
+            reserved_sectors: RESERVED_SECTORS as u16,      // Typically 32 for FAT32
             num_fats: 1,
-            root_entry_count: 0,          // Always 0 for FAT32
-            total_sectors_16: 0,          // Use total_sectors_32 for FAT32
-            media_descriptor: 0xF8,       // Fixed disk
-            fat_size_16: 0,               // FAT size is 32-bit, set to 0
-            sectors_per_track: 63,        // CHS setting (not commonly used)
-            num_heads: 255,               // CHS setting
-            hidden_sectors: 0,            // No hidden sectors
+            root_entry_count: 0,             // Always 0 for FAT32
+            total_sectors_16: 0,             // Use total_sectors_32 for FAT32
+            media_descriptor: 0xF8,          // Fixed disk
+            fat_size_16: 0,                  // FAT size is 32-bit, set to 0
+            sectors_per_track: 63,           // CHS setting (not commonly used)
+            num_heads: 255,                  // CHS setting
+            hidden_sectors: 0,               // No hidden sectors
             total_sectors_32: total_sectors, // Total sector count
-            fat_size_32: fat_size,        // FAT size in sectors
-            ext_flags: 0x0000,            // FAT mirroring enabled
-            fs_version: 0x0000,           // FAT32 version 0.0
-            root_cluster: 2,              // Typically starts at cluster 2
-            fs_info_sector: 1,            // FSINFO sector location
-            backup_boot_sector: 6,        // Backup boot sector location
-            reserved: [0; 12],            // Must be zero
-            drive_number: 0x80,           // Standard hard drive identifier
-            reserved1: 0,                 // Reserved
-            boot_signature: 0x29,         // Indicates valid BPB
-            volume_id: 0x12345678,        // Random serial number (can be changed)
-            volume_label: *b"NO NAME    ", // Default volume label
-            file_system_type: *b"FAT32   ", // FAT32 identifier
+            fat_size_32: fat_size,           // FAT size in sectors
+            ext_flags: 0x0000,               // FAT mirroring enabled
+            fs_version: 0x0000,              // FAT32 version 0.0
+            root_cluster: 2,                 // Typically starts at cluster 2
+            fs_info_sector: 1,               // FSINFO sector location
+            backup_boot_sector: 6,           // Backup boot sector location
+            reserved: [0; 12],               // Must be zero
+            drive_number: 0x80,              // Standard hard drive identifier
+            reserved1: 0,                    // Reserved
+            boot_signature: 0x29,            // Indicates valid BPB
+            volume_id: 0x12345678,           // Random serial number (can be changed)
+            volume_label: *b"NO NAME    ",   // Default volume label
+            file_system_type: *b"FAT32   ",  // FAT32 identifier
         }
     }
     pub fn write_to_buffer(&self, buffer: &mut [u8]) {
@@ -112,19 +112,19 @@ impl BIOSParameterBlock {
 
 #[derive(Debug, Clone, Copy)]
 pub struct FileEntry {
-    name: [u8; 8],         // DIR_Name (first 8 bytes - filename)
-    extension: [u8; 3],    // DIR_Name (last 3 bytes - extension)
-    attributes: u8,        // DIR_Attr
-    nt_reserved: u8,       // DIR_NTRes
-    creation_time_tenth: u8, // DIR_CrtTimeTenth
-    creation_time: u16,    // DIR_CrtTime
-    creation_date: u16,    // DIR_CrtDate
-    last_access_date: u16, // DIR_LstAccDate
-    first_cluster_high: u16, // DIR_FstClusHI
-    write_time: u16,       // DIR_WrtTime
-    write_date: u16,       // DIR_WrtDate
-    first_cluster_low: u16, // DIR_FstClusLO
-    pub(crate) file_size: u32,        // DIR_FileSize
+    name: [u8; 8],             // DIR_Name (first 8 bytes - filename)
+    extension: [u8; 3],        // DIR_Name (last 3 bytes - extension)
+    attributes: u8,            // DIR_Attr
+    nt_reserved: u8,           // DIR_NTRes
+    creation_time_tenth: u8,   // DIR_CrtTimeTenth
+    creation_time: u16,        // DIR_CrtTime
+    creation_date: u16,        // DIR_CrtDate
+    last_access_date: u16,     // DIR_LstAccDate
+    first_cluster_high: u16,   // DIR_FstClusHI
+    write_time: u16,           // DIR_WrtTime
+    write_date: u16,           // DIR_WrtDate
+    first_cluster_low: u16,    // DIR_FstClusLO
+    pub(crate) file_size: u32, // DIR_FileSize
 }
 
 impl FileEntry {
@@ -152,7 +152,7 @@ impl FileEntry {
     /// Creates a blank `FileEntry` with only a name and starting cluster set
     pub fn new(name: &str, extension: &str, starting_cluster: u32) -> Self {
         let mut name_arr = [b' '; 8]; // Default spaces for padding
-        let mut ext_arr = [b' '; 3];  // Default spaces for padding
+        let mut ext_arr = [b' '; 3]; // Default spaces for padding
         let name_upper = name.to_uppercase();
         let ext_upper = extension.to_uppercase();
 
@@ -181,13 +181,23 @@ impl FileEntry {
 
     /// Extracts the file name as a `String`
     pub fn get_name(&self) -> String {
-        let name_trimmed = self.name.iter().take_while(|&&c| c != b' ').copied().collect::<Vec<_>>();
+        let name_trimmed = self
+            .name
+            .iter()
+            .take_while(|&&c| c != b' ')
+            .copied()
+            .collect::<Vec<_>>();
         String::from_utf8_lossy(&name_trimmed).to_string()
     }
 
     /// Extracts the file extension as a `String`
     pub fn get_extension(&self) -> String {
-        let ext_trimmed = self.extension.iter().take_while(|&&c| c != b' ').copied().collect::<Vec<_>>();
+        let ext_trimmed = self
+            .extension
+            .iter()
+            .take_while(|&&c| c != b' ')
+            .copied()
+            .collect::<Vec<_>>();
         String::from_utf8_lossy(&ext_trimmed).to_string()
     }
     /// Returns the first cluster number as a `u32`
@@ -196,16 +206,15 @@ impl FileEntry {
     }
 }
 
-
 #[repr(C, packed)]
 struct InfoSector {
-    signature1: [u8; 4],                // Offset: 0x00 ("RRaA" - 0x52 0x52 0x61 0x41)
-    reserved1: [u8; 480],           // Offset: 0x04 - 0x1E3 (Reserved, usually 0)
-    signature2: [u8; 4],                // Offset: 0x1E4 ("rrAa" - 0x72 0x72 0x61 0x41)
-    free_clusters: u32,             // Offset: 0x1E8 (Last known free cluster count)
+    signature1: [u8; 4],             // Offset: 0x00 ("RRaA" - 0x52 0x52 0x61 0x41)
+    reserved1: [u8; 480],            // Offset: 0x04 - 0x1E3 (Reserved, usually 0)
+    signature2: [u8; 4],             // Offset: 0x1E4 ("rrAa" - 0x72 0x72 0x61 0x41)
+    free_clusters: u32,              // Offset: 0x1E8 (Last known free cluster count)
     recently_allocated_cluster: u32, // Offset: 0x1EC (Next free cluster hint)
-    reserved2: [u8; 12],            // Offset: 0x1F0 - 0x1FB (Reserved, should be 0)
-    signature3: u16,                // Offset: 0x1FC (0xAA55 - Boot sector signature)
+    reserved2: [u8; 12],             // Offset: 0x1F0 - 0x1FB (Reserved, should be 0)
+    signature3: u16,                 // Offset: 0x1FC (0xAA55 - Boot sector signature)
 }
 impl InfoSector {
     /// Reads an `InfoSector` from a 512-byte buffer
@@ -214,8 +223,18 @@ impl InfoSector {
             signature1: [buffer[0], buffer[1], buffer[2], buffer[3]],
             reserved1: [0; 480], // Reserved bytes
             signature2: [buffer[0x1E4], buffer[0x1E5], buffer[0x1E6], buffer[0x1E7]],
-            free_clusters: u32::from_le_bytes([buffer[0x1E8], buffer[0x1E9], buffer[0x1EA], buffer[0x1EB]]),
-            recently_allocated_cluster: u32::from_le_bytes([buffer[0x1EC], buffer[0x1ED], buffer[0x1EE], buffer[0x1EF]]),
+            free_clusters: u32::from_le_bytes([
+                buffer[0x1E8],
+                buffer[0x1E9],
+                buffer[0x1EA],
+                buffer[0x1EB],
+            ]),
+            recently_allocated_cluster: u32::from_le_bytes([
+                buffer[0x1EC],
+                buffer[0x1ED],
+                buffer[0x1EE],
+                buffer[0x1EF],
+            ]),
             reserved2: [0; 12], // Reserved bytes
             signature3: u16::from_le_bytes([buffer[0x1FE], buffer[0x1FF]]),
         };
@@ -228,13 +247,13 @@ impl InfoSector {
     }
     pub fn default() -> Self {
         InfoSector {
-            signature1: [0x52, 0x52, 0x61, 0x41],               // "RRaA" (0x52, 0x52, 0x61, 0x41)
+            signature1: [0x52, 0x52, 0x61, 0x41], // "RRaA" (0x52, 0x52, 0x61, 0x41)
             reserved1: [0; 480],                  // Reserved bytes (set to zero)
-            signature2: [0x72, 0x72, 0x41, 0x61],               // "rrAa" (0x72, 0x72, 0x61, 0x41)
+            signature2: [0x72, 0x72, 0x41, 0x61], // "rrAa" (0x72, 0x72, 0x61, 0x41)
             free_clusters: 0xFFFFFFFF,            // Free cluster count (unknown)
             recently_allocated_cluster: 0xFFFFFFFF, // Next free cluster hint (unknown)
             reserved2: [0; 12],                   // More reserved bytes
-            signature3: 0xAA55,                    // Boot sector signature
+            signature3: 0xAA55,                   // Boot sector signature
         }
     }
 }
@@ -259,7 +278,10 @@ impl FileSystem {
         if let Some(info) = InfoSector::from_buffer(&sector) {
             let sig3 = info.signature3;
             //println!("sig1: {:#?}, sig2: {:#?}, sig3: {:#x}", info.signature1, info.signature2, sig3);
-            if (info.signature1 == [0x52, 0x52, 0x61, 0x41] && info.signature2 == [0x72, 0x72, 0x41, 0x61] && info.signature3 == 0xAA55) {
+            if (info.signature1 == [0x52, 0x52, 0x61, 0x41]
+                && info.signature2 == [0x72, 0x72, 0x41, 0x61]
+                && info.signature3 == 0xAA55)
+            {
                 return true;
             }
         }
@@ -285,7 +307,10 @@ impl FileSystem {
         let mut boot_buffer = vec![0u8; 512];
         let part_size = part.size;
         //self.calculate_data_region_start() - RESERVED_SECTORS;
-        let bpb = BIOSParameterBlock::new((part_size / 512) as u32, Self::calculate_max_fat_size(part.size));
+        let bpb = BIOSParameterBlock::new(
+            (part_size / 512) as u32,
+            Self::calculate_max_fat_size(part.size),
+        );
         bpb.write_to_buffer(&mut boot_buffer);
         part.write(0, &boot_buffer);
 
@@ -295,12 +320,12 @@ impl FileSystem {
         info_sec_buffer[0x00..0x04].copy_from_slice(&info_sector.signature1);
         info_sec_buffer[0x1E4..0x1E8].copy_from_slice(&info_sector.signature2);
         info_sec_buffer[0x1E8..0x1EC].copy_from_slice(&info_sector.free_clusters.to_le_bytes());
-        info_sec_buffer[0x1EC..0x1F0].copy_from_slice(&info_sector.recently_allocated_cluster.to_le_bytes());
+        info_sec_buffer[0x1EC..0x1F0]
+            .copy_from_slice(&info_sector.recently_allocated_cluster.to_le_bytes());
         info_sec_buffer[0x1FE..0x200].copy_from_slice(&info_sector.signature3.to_le_bytes());
         let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
         part.write(INFO_SECTOR, &mut info_sec_buffer);
-
 
         // Write the FAT table to the partition
         let itr = info_sector.free_clusters / 512;
@@ -326,18 +351,14 @@ impl FileSystem {
         //wipe the root dir
         match Self::write_cluster(part, 2, &mut vec![0u8; CLUSTER_OFFSET as usize]) {
             Ok(_) => {}
-            Err(e) => { return Err(TooCorrupted) }
+            Err(e) => return Err(TooCorrupted),
         }
         info_sector.recently_allocated_cluster = 0;
 
         Ok(())
     }
 
-    fn update_fat(
-        part: &mut Partition,
-        cluster_number: u32,
-        next_cluster: u32,
-    ) {
+    fn update_fat(part: &mut Partition, cluster_number: u32, next_cluster: u32) {
         let fat_offset = cluster_number * 4;
         let sector_number = (fat_offset / 512) + RESERVED_SECTORS;
         let entry_offset = (fat_offset % 512) as usize;
@@ -367,13 +388,14 @@ impl FileSystem {
                     let free_cluster = Self::find_free_cluster(part, 0);
                     // Create the directory entry in the parent directory
 
-                    Self::write_file_to_dir(part,
-                                            dir_name,
-                                            "",
-                                            FileAttribute::Directory,
-                                            free_cluster,
-                                            parent_cluster,
-                                            0,
+                    Self::write_file_to_dir(
+                        part,
+                        dir_name,
+                        "",
+                        FileAttribute::Directory,
+                        free_cluster,
+                        parent_cluster,
+                        0,
                     )?;
                     Self::update_fat(part, free_cluster, 0xFFFFFFFF);
 
@@ -388,38 +410,47 @@ impl FileSystem {
         Ok(())
     }
 
-    fn initialize_directory(part: &mut Partition, new_cluster: u32, parent_cluster: u32) -> Result<(), FileStatus> {
+    fn initialize_directory(
+        part: &mut Partition,
+        new_cluster: u32,
+        parent_cluster: u32,
+    ) -> Result<(), FileStatus> {
         // Zero out the new directory cluster.
         let empty_buffer = vec![0u8; CLUSTER_OFFSET as usize];
         Self::write_cluster(part, new_cluster, &empty_buffer)?;
 
         // Create the '.' entry (self-reference)
-        Self::write_file_to_dir(part,
-                                ".",
-                                "",
-                                FileAttribute::Directory,
-                                new_cluster,
-                                new_cluster,
-                                0,
+        Self::write_file_to_dir(
+            part,
+            ".",
+            "",
+            FileAttribute::Directory,
+            new_cluster,
+            new_cluster,
+            0,
         )?;
 
         // For the '..' entry, if the parent is the root directory,
         // set the cluster reference to 0 as required.
-        let parent_cluster_ref = if parent_cluster == 2 { 0 } else { parent_cluster };
+        let parent_cluster_ref = if parent_cluster == 2 {
+            0
+        } else {
+            parent_cluster
+        };
 
         // Create the '..' entry
-        Self::write_file_to_dir(part,
-                                "..",
-                                "",
-                                FileAttribute::Directory,
-                                parent_cluster_ref,
-                                new_cluster,
-                                0,
+        Self::write_file_to_dir(
+            part,
+            "..",
+            "",
+            FileAttribute::Directory,
+            parent_cluster_ref,
+            new_cluster,
+            0,
         )?;
 
         Ok(())
     }
-
 
     pub fn read_dir(
         part: &mut Partition,
@@ -514,8 +545,8 @@ impl FileSystem {
         part: &mut Partition,
         file_name: &str,
         file_attribute: FileAttribute,
-        starting_cluster: u32)
-        -> Result<FileEntry, FileStatus> {
+        starting_cluster: u32,
+    ) -> Result<FileEntry, FileStatus> {
         let clusters = Self::get_all_clusters(part, starting_cluster);
 
         for i in 0..clusters.len() {
@@ -524,7 +555,10 @@ impl FileSystem {
             for j in 0..dir.len() {
                 let name = FileSystem::get_text_before_last_dot(file_name).to_string();
                 let extension = FileSystem::get_text_after_last_dot(file_name).to_string();
-                if (dir[j].get_name() == name && dir[j].get_extension() == extension && file_attribute as u8 == dir[j].attributes) {
+                if (dir[j].get_name() == name
+                    && dir[j].get_extension() == extension
+                    && file_attribute as u8 == dir[j].attributes)
+                {
                     return Ok(dir[j].clone());
                 }
             }
@@ -555,10 +589,7 @@ impl FileSystem {
         }
         Err(FileStatus::PathNotFound)
     }
-    pub fn find_dir(
-        part: &mut Partition,
-        path: &str,
-    ) -> Result<FileEntry, FileStatus> {
+    pub fn find_dir(part: &mut Partition, path: &str) -> Result<FileEntry, FileStatus> {
         if (path == "\\") {
             let mut root_dir = FileEntry::new("", "", 2);
             root_dir.attributes = u8::from(FileAttribute::Directory);
@@ -602,20 +633,21 @@ impl FileSystem {
 
                 // Create the file with an initial size of 0
                 Self::update_fat(part, free_cluster, 0xFFFFFFFF);
-                Self::write_file_to_dir(part,
-                                        file_name,
-                                        file_extension,
-                                        FileAttribute::Archive,
-                                        free_cluster,
-                                        dir.get_cluster(),
-                                        0,
+                Self::write_file_to_dir(
+                    part,
+                    file_name,
+                    file_extension,
+                    FileAttribute::Archive,
+                    free_cluster,
+                    dir.get_cluster(),
+                    0,
                 )?;
 
                 Ok(())
             }
-            Err(FileStatus::PathNotFound) => { Err(FileStatus::InternalError) }
+            Err(FileStatus::PathNotFound) => Err(FileStatus::InternalError),
 
-            Err(err) => { Err(err) }
+            Err(err) => Err(err),
         }
     }
 
@@ -639,7 +671,8 @@ impl FileSystem {
             let data_offset = i * cluster_size;
             let bytes_to_copy = core::cmp::min(cluster_size, file_data.len() - data_offset);
 
-            buffer[..bytes_to_copy].copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
+            buffer[..bytes_to_copy]
+                .copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
 
             // Write the buffer to the current cluster
             Self::write_cluster(part, current_cluster, &buffer)?;
@@ -674,7 +707,7 @@ impl FileSystem {
         }
         Ok(())
     }
-    pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus>{
+    pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus> {
         let dir_entry = Self::find_dir(part, path)?;
         let files = Self::read_dir(part, dir_entry.get_cluster())?;
         let file_names: Vec<String> = files
@@ -693,17 +726,13 @@ impl FileSystem {
         Ok(file_names)
     }
 
-
-    pub fn read_file(
-        part: &mut Partition,
-        path: &str,
-    ) -> Result<Vec<u8>, FileStatus> {
+    pub fn read_file(part: &mut Partition, path: &str) -> Result<Vec<u8>, FileStatus> {
         let entry = Self::find_file(part, path)?;
         let mut file_data = vec![0u8; entry.file_size as usize];
         let remainder = entry.file_size % CLUSTER_OFFSET;
         let clusters = Self::get_all_clusters(part, entry.get_cluster());
         for i in 0..clusters.len() {
-            let mut cluster = vec!(0u8; CLUSTER_OFFSET as usize);
+            let mut cluster = vec![0u8; CLUSTER_OFFSET as usize];
             Self::read_cluster(part, clusters[i], &mut cluster)?;
             let base_offset = i * CLUSTER_OFFSET as usize;
 
@@ -747,7 +776,8 @@ impl FileSystem {
         for i in 0..fat_sectors {
             let mut buffer = vec![0u8; 512];
             part.read(i + RESERVED_SECTORS, &mut buffer);
-            for j in 0..128 { // 128 = 512 bytes / 4 bytes per FAT entry
+            for j in 0..128 {
+                // 128 = 512 bytes / 4 bytes per FAT entry
                 let entry = u32::from_le_bytes([
                     buffer[j * 4],
                     buffer[j * 4 + 1],
@@ -763,7 +793,12 @@ impl FileSystem {
         0xFFFFFFFF
     }
     ///starting cluster is the cluster that will be searched for NOT the one it will be updated to
-    pub fn update_dir_entry(part: &mut Partition, path: &str, new_entry: FileEntry, starting_cluster: u32) -> Result<(), FileStatus> {
+    pub fn update_dir_entry(
+        part: &mut Partition,
+        path: &str,
+        new_entry: FileEntry,
+        starting_cluster: u32,
+    ) -> Result<(), FileStatus> {
         let dir_path = File::remove_file_from_path(path);
 
         let dir_entry = Self::find_dir(part, dir_path)?;
@@ -776,8 +811,8 @@ impl FileSystem {
             let entry_size = 32; // FAT entry size is always 32 bytes
             for i in (0..dir_buffer.len()).step_by(entry_size) {
                 let entry_starting_cluster = u32::from_le_bytes([
-                    dir_buffer[i + 26],   // Low byte
-                    dir_buffer[i + 27],   // High byte
+                    dir_buffer[i + 26], // Low byte
+                    dir_buffer[i + 27], // High byte
                     0,
                     0,
                 ]);
@@ -793,7 +828,6 @@ impl FileSystem {
 
         Err(FileStatus::PathNotFound) // File entry not found in directory
     }
-
 
     fn write_file_entry_to_buffer(buffer: &mut [u8], offset: usize, entry: &FileEntry) {
         // File name (8 bytes, space padded)
@@ -853,13 +887,19 @@ impl FileSystem {
                 Self::update_fat(part, clusters[clusters.len() - 1], free_cluster);
                 Self::update_fat(part, free_cluster, 0xFFFFFFFF);
 
-
-                return Self::write_file_to_dir(part, file_name, file_extension, file_attribute, start_cluster, start_cluster_of_dir, size);
+                return Self::write_file_to_dir(
+                    part,
+                    file_name,
+                    file_extension,
+                    file_attribute,
+                    start_cluster,
+                    start_cluster_of_dir,
+                    size,
+                );
             }
         }
 
         if let Some(offset) = entry_offset {
-
             // File name (8 bytes, space padded)
             let mut name_bytes = [0x20; 8]; // 0x20 is space
             let name_slice = &file_name.as_bytes()[0..file_name.len().min(8)];
@@ -919,7 +959,11 @@ impl FileSystem {
         Ok(())
     }
 
-    fn read_cluster(part: &mut Partition, cluster: u32, buffer: &mut [u8]) -> Result<(), FileStatus> {
+    fn read_cluster(
+        part: &mut Partition,
+        cluster: u32,
+        buffer: &mut [u8],
+    ) -> Result<(), FileStatus> {
         if cluster < 2 {
             return Err(FileStatus::CorruptFat);
         }
@@ -958,7 +1002,7 @@ impl FileSystem {
         out_vec.push(starting_cluster);
         let mut entry = 0x00000000;
         while (entry != 0xFFFFFFFF && entry >= 0x00000002) {
-            let mut sector = vec!(0u8; 512);
+            let mut sector = vec![0u8; 512];
             let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
             let sector_index = FileSystem::cluster_in_sector(starting_cluster);
             part.read(starting_sector, &mut sector);
@@ -989,7 +1033,8 @@ impl FileSystem {
 
     fn cluster_to_sector(volume_size: u64, cluster: u32) -> u32 {
         let cluster_offset = SECTORS_PER_CLUSTER;
-        let cluster_start = cluster_offset as u64 * cluster as u64 + Self::calculate_data_region_start(volume_size) as u64;
+        let cluster_start = cluster_offset as u64 * cluster as u64
+            + Self::calculate_data_region_start(volume_size) as u64;
         cluster_start as u32
     }
 }

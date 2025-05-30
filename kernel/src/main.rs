@@ -13,37 +13,37 @@
 
 extern crate alloc;
 
-mod idt;
 pub mod gdt;
+mod idt;
 
 mod console;
-mod util;
 mod cpu;
-mod syscalls;
-mod structs;
-mod scheduling;
-mod memory;
-mod file_system;
-mod exception_handlers;
 mod drivers;
+mod exception_handlers;
 mod executable;
+mod file_system;
+mod memory;
+mod scheduling;
+mod structs;
+mod syscalls;
+mod util;
 
 use crate::console::clear_screen;
 use crate::util::KERNEL_INITIALIZED;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
-use memory::paging::kernel_cr3;
-use x86_64::registers::control::Cr3;
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
+use memory::paging::kernel_cr3;
+use x86_64::registers::control::Cr3;
 
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     x86_64::instructions::interrupts::disable();
-     unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
     KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
     println!("{}", info);
     loop {}
@@ -61,8 +61,9 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 fn _start(boot_info: &'static mut BootInfo) -> ! {
-
-    unsafe { BOOT_INFO = Some(boot_info); } 
+    unsafe {
+        BOOT_INFO = Some(boot_info);
+    }
     clear_screen();
     unsafe {
         util::init();
@@ -79,4 +80,3 @@ pub fn test_runner(tests: &[&dyn Fn()]) {
         test();
     }
 }
-

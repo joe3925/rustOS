@@ -1,5 +1,6 @@
 use crate::console::print_queue;
 use crate::drivers::interrupt_index::{send_eoi, InterruptIndex};
+use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::util::KERNEL_INITIALIZED;
@@ -7,7 +8,6 @@ use core::arch::asm;
 use core::sync::atomic::Ordering;
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
-use crate::println;
 
 pub static TIMER: Mutex<SystemTimer> = Mutex::new(SystemTimer::new());
 pub struct SystemTimer {
@@ -26,7 +26,9 @@ impl SystemTimer {
 }
 pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut rax: u64;
-    unsafe { asm!("mov {0}, rax", lateout(reg) rax ); }
+    unsafe {
+        asm!("mov {0}, rax", lateout(reg) rax );
+    }
     let mut state = State::new(rax);
     state.rip = _stack_frame.instruction_pointer.as_u64();
     state.cs = _stack_frame.code_segment.0 as u64;
@@ -54,14 +56,17 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                 scheduler.schedule_next();
 
                 send_eoi(InterruptIndex::Timer.as_u8());
-                
-                if(!scheduler.get_current_task().parent_pid == 0){
-                    // The kernel may be holding locks that this needs, any other task won't be holding said locks 
+                let current_task = scheduler.get_current_task().parent_pid;
+
+                if (!(scheduler.get_current_task().parent_pid == 0)) {
+                    // The kernel may be holding locks that this needs, any other task won't be holding said locks
                     scheduler.restore_page_table();
                 }
-                scheduler.get_current_task().context.restore_stack_frame(_stack_frame);
+                scheduler
+                    .get_current_task()
+                    .context
+                    .restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
-
             }
         } else {
             // Kernel is not initialized yet, just send EOI and return to kernel

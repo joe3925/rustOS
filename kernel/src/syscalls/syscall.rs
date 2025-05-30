@@ -41,11 +41,21 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     let mut param3: u64;
     let mut extra_params: u64;
     //TODO: change from switch case
-    unsafe { asm!("mov {0}, rax", lateout(reg) rax); }
-    unsafe { asm!("mov {0}, r8", lateout(reg) param1); }
-    unsafe { asm!("mov {0}, r9", lateout(reg) param2); }
-    unsafe { asm!("mov {0}, r10", lateout(reg) param3); }
-    unsafe { asm!("mov {0}, r11", lateout(reg) extra_params); }
+    unsafe {
+        asm!("mov {0}, rax", lateout(reg) rax);
+    }
+    unsafe {
+        asm!("mov {0}, r8", lateout(reg) param1);
+    }
+    unsafe {
+        asm!("mov {0}, r9", lateout(reg) param2);
+    }
+    unsafe {
+        asm!("mov {0}, r10", lateout(reg) param3);
+    }
+    unsafe {
+        asm!("mov {0}, r11", lateout(reg) extra_params);
+    }
     x86_64::instructions::interrupts::disable();
 
     let return_value: usize = 0;
@@ -54,7 +64,9 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     match rax {
         //print syscall
         1 => {
-            if let Some(string) = u64_to_str_ptr(param1) { println_wrapper(string) }
+            if let Some(string) = u64_to_str_ptr(param1) {
+                println_wrapper(string)
+            }
         }
         //destroy task syscall
         2 => {
@@ -63,16 +75,15 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         }
         //create task
         3 => unsafe {
-            //TODO: add param for stack size 
+            //TODO: add param for stack size
             //SCHEDULER.lock().add_task(Task::new_usermode(param1 as usize, 0x2800, (*(param2 as *const String)).clone(), true));
-        }
+        },
         //file open syscall
         4 => {
             if let Some(path) = u64_to_str_ptr(param1) {
                 let flags_ptr = param2 as *const OpenFlags;
-                let flags: &[OpenFlags] = unsafe {
-                    slice::from_raw_parts(flags_ptr, param3 as usize)
-                };
+                let flags: &[OpenFlags] =
+                    unsafe { slice::from_raw_parts(flags_ptr, param3 as usize) };
                 if let Some(param) = params {
                     let file_ptr = param.param1 as (*mut Option<File>);
                     let result = File::open(path.as_str(), flags);
@@ -87,67 +98,60 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
         //TODO: File read and file write have arbitrary read write vulnerability
 
         // File Read
-        5 => {
-            unsafe {
-                let file_ptr = param1 as *mut File;
-                let buffer_ptr = param2 as *mut u8;
-                let buffer_len = param3 as usize;
+        5 => unsafe {
+            let file_ptr = param1 as *mut File;
+            let buffer_ptr = param2 as *mut u8;
+            let buffer_len = param3 as usize;
 
-                if file_ptr.is_null() || buffer_ptr.is_null() {
-                    return;
-                }
-
-                let file = &mut *file_ptr;
-                if let Ok(data) = file.read() {
-                    let len = core::cmp::min(data.len(), buffer_len);
-                    core::ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
-                }
+            if file_ptr.is_null() || buffer_ptr.is_null() {
+                return;
             }
-        }
+
+            let file = &mut *file_ptr;
+            if let Ok(data) = file.read() {
+                let len = core::cmp::min(data.len(), buffer_len);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
+            }
+        },
 
         // File Write
-        6 => {
-            unsafe {
-                let file_ptr = param1 as *mut File;
-                let buffer_ptr = param2 as *const u8;
-                let buffer_len = param3 as usize;
+        6 => unsafe {
+            let file_ptr = param1 as *mut File;
+            let buffer_ptr = param2 as *const u8;
+            let buffer_len = param3 as usize;
 
-                if file_ptr.is_null() || buffer_ptr.is_null() {
-                    return;
-                }
-
-                let file = &mut *file_ptr;
-                let data = slice::from_raw_parts(buffer_ptr, buffer_len);
-                let _ = file.write(data);
+            if file_ptr.is_null() || buffer_ptr.is_null() {
+                return;
             }
-        }
+
+            let file = &mut *file_ptr;
+            let data = slice::from_raw_parts(buffer_ptr, buffer_len);
+            let _ = file.write(data);
+        },
 
         // File Delete
-        7 => {
-            unsafe {
-                let file_ptr = param1 as *mut File;
+        7 => unsafe {
+            let file_ptr = param1 as *mut File;
 
-                if file_ptr.is_null() {
-                    return;
-                }
-
-                let file = &mut *file_ptr;
-                let _ = file.delete();
+            if file_ptr.is_null() {
+                return;
             }
-        }
+
+            let file = &mut *file_ptr;
+            let _ = file.delete();
+        },
         //get current task id, param 1 buffer to place id in
-        8 => {
-            {
-                unsafe { *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize; }
-            }
-        }
+        8 => unsafe {
+            *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize;
+        },
+        //Request a message queue syscall
+        9 => {}
         _ => {
             println!("Unknown syscall number: {}", rax);
         }
     }
     send_eoi(SysCall.as_u8());
     x86_64::instructions::interrupts::enable();
-
 }
 ///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
 #[derive(Clone)]

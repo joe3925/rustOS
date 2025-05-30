@@ -7,6 +7,7 @@ use crate::memory::paging;
 use crate::{print, println};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
+use core::iter;
 use core::sync::atomic::AtomicBool;
 use pic8259::ChainedPics;
 use spin::Mutex;
@@ -173,10 +174,7 @@ impl ApicImpl {
         match apic_result {
             Ok(apic) => unsafe {
                 apic.init_local();
-
-                print!("Starting timer...   ");
                 apic.init_timer();
-                println!("Started");
 
                 apic.init_ioapic();
                 apic.init_keyboard();
@@ -186,6 +184,17 @@ impl ApicImpl {
         }
 
         Ok(x86_64::instructions::interrupts::enable())
+    }
+    pub fn start_aps() -> Result<(), ()> {
+        //TODO: add errors
+        let apics = ACPI_TABLES
+            .get_plat_info()
+            .ok_or(())?
+            .processor_info
+            .ok_or(())?
+            .application_processors;
+        for apic in apics.iter().enumerate() {}
+        Ok(())
     }
 }
 

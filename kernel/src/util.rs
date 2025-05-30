@@ -11,11 +11,15 @@ use crate::scheduling::scheduler::SCHEDULER;
 use alloc::fmt::format;
 use alloc::string::{String, ToString};
 use spin::Mutex;
+use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::{init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, RangeTracker, KERNEL_RANGE_TRACKER};
+use crate::memory::paging::{
+    init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, RangeTracker,
+    KERNEL_RANGE_TRACKER,
+};
 use crate::{cpu, executable, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
@@ -31,21 +35,26 @@ pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub unsafe fn init() {
     let boot_info = boot_info();
 
-    let mem_offset: VirtAddr = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mem_offset: VirtAddr =
+        VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
 
     let mut mapper = init_mapper(mem_offset);
     let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
     init_heap(&mut mapper, &mut frame_allocator.clone());
 
     init_kernel_cr3();
-    
+
     gdt::init();
     PICS.lock().initialize();
     load_idt();
     println!("PIC loaded");
     match ApicImpl::init_apic_full() {
-        Ok(_) => { println!("APIC transition successful!"); }
-        Err(err) => { println!("APIC transition failed {}!", err.to_str()); }
+        Ok(_) => {
+            println!("APIC transition successful!");
+        }
+        Err(err) => {
+            println!("APIC transition failed {}!", err.to_str());
+        }
     }
     test_full_heap();
 
@@ -56,23 +65,46 @@ pub unsafe fn init() {
         match drives.drives[1].format_gpt() {
             Ok(_) => {
                 println!("Drive init successful");
-                drives.drives[1].add_partition(1024 * 1024 * 1024 * 9, MicrosoftBasicData.to_u8_16(), "MAIN VOLUME".to_string()).expect("TODO: panic message");
+                drives.drives[1]
+                    .add_partition(
+                        1024 * 1024 * 1024 * 9,
+                        MicrosoftBasicData.to_u8_16(),
+                        "MAIN VOLUME".to_string(),
+                    )
+                    .expect("TODO: panic message");
             }
-            Err(err) => { println!("Error init drive {} {}", (drives.drives)[1].info.model, err.to_str()) }
+            Err(err) => {
+                println!(
+                    "Error init drive {} {}",
+                    (drives.drives)[1].info.model,
+                    err.to_str()
+                )
+            }
         }
     }
     {
         let mut partitions = VOLUMES.lock();
         partitions.enumerate_parts();
+
+        match partitions
+            .find_partition_by_name("MAIN VOLUME")
+            .unwrap()
+            .format()
+        {
+            Ok(_) => println!("Formatted"),
+            Err(e) => println!("{:#?}", e),
+        }
         partitions.print_parts();
     }
 
     println!("Init Done");
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
-    loop{asm!("hlt");}
+    loop {
+        asm!("hlt");
+    }
 }
 
-// Things to be tested after kernel init go here 
+// Things to be tested after kernel init go here
 pub fn kernel_main() {
     let program = Program {
         title: "".to_string(),
@@ -93,7 +125,7 @@ pub fn kernel_main() {
         if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
             system_volume.label.clone()
         } else {
-            return; // no main volume found
+            panic!("System Volume unavailable or corrupted")
         }
     };
 
@@ -107,20 +139,24 @@ pub fn kernel_main() {
         s
     };
 
-    let entries = File::list_dir(&full_path)
-        .expect("Failed to load system mod directory");
+    let entries = File::list_dir(&full_path).expect("Failed to load system mod directory");
 
     for name in entries {
         if !name.to_ascii_lowercase().ends_with(".dll") {
             continue;
         }
         path_buffer.clear();
-        path_buffer.push_str(&label);       
-        path_buffer.push_str(base_path); 
-        path_buffer.push_str("\\");   
-        path_buffer.push_str(&name);        
+        path_buffer.push_str(&label);
+        path_buffer.push_str(base_path);
+        path_buffer.push_str("\\");
+        path_buffer.push_str(&name);
 
-        match PROGRAM_MANAGER.write().get_mut(pid).unwrap().load_module(path_buffer.clone()) {
+        match PROGRAM_MANAGER
+            .write()
+            .get_mut(pid)
+            .unwrap()
+            .load_module(path_buffer.clone())
+        {
             Ok(_) => {
                 println!("Loaded module: {}", name);
             }
@@ -129,7 +165,14 @@ pub fn kernel_main() {
             }
         }
     }
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info().memory_regions);
+    let frame: PhysFrame<Size4KiB> = frame_allocator.allocate_frame().unwrap();
 
+    println!("{:#x}", frame.start_address());
+
+    // if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
+    //     loadable.load();
+    // }
     loop {}
 }
 #[no_mangle]
@@ -169,11 +212,7 @@ pub fn random_number() -> u64 {
 }
 
 pub fn boot_info() -> &'static mut BootInfo {
-    unsafe {
-        BOOT_INFO
-            .as_mut()
-            .expect("BOOT_INFO not initialized")
-    }
+    unsafe { BOOT_INFO.as_mut().expect("BOOT_INFO not initialized") }
 }
 
 pub fn generate_guid() -> [u8; 16] {
@@ -192,7 +231,6 @@ pub fn generate_guid() -> [u8; 16] {
 
     guid
 }
-
 
 pub struct Random {
     rng: Xoshiro256PlusPlus,

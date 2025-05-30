@@ -51,8 +51,14 @@ impl Screen {
                     green_offset = 1;
                     blue_offset = 0;
                 }
-                PixelFormat::U8 => { is_greyscale = true; }
-                PixelFormat::Unknown { red_position, green_position, blue_position } => {
+                PixelFormat::U8 => {
+                    is_greyscale = true;
+                }
+                PixelFormat::Unknown {
+                    red_position,
+                    green_position,
+                    blue_position,
+                } => {
                     red_offset = red_position;
                     green_offset = green_position;
                     blue_offset = blue_position;
@@ -97,7 +103,10 @@ impl Screen {
 
 impl Dimensions for Screen {
     fn bounding_box(&self) -> Rectangle {
-        Rectangle::new(Point::zero(), Size::new(self.width as u32, self.height as u32))
+        Rectangle::new(
+            Point::zero(),
+            Size::new(self.width as u32, self.height as u32),
+        )
     }
 }
 
@@ -107,7 +116,7 @@ impl DrawTarget for Screen {
 
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
     where
-        I: IntoIterator<Item=Pixel<Self::Color>>,
+        I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels {
             if coord.x >= 0 && coord.y >= 0 {
@@ -133,68 +142,65 @@ impl Console {
         let screen = Screen::new().unwrap();
         Console {
             screen,
-            cursor_pose: Cursor { x: 0, y: FONT_HEIGHT },
+            cursor_pose: Cursor {
+                x: 0,
+                y: FONT_HEIGHT,
+            },
         }
     }
 
-
     pub(crate) fn print(&mut self, str: &[u8]) {
         let style = MonoTextStyle::new(&FONT_9X18, Rgb888::new(52, 100, 235));
-        let mut text = String::new();
 
         for &b in str {
             match b {
                 b'\x08' => {
-                    text.pop(); // remove last character
+                    // backspace: move cursor back and overwrite with space
+                    if self.cursor_pose.x >= FONT_WIDTH {
+                        self.cursor_pose.x -= FONT_WIDTH;
+                        Text::with_text_style(
+                            " ",
+                            Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
+                            style,
+                            TextStyleBuilder::new().baseline(Baseline::Top).build(),
+                        )
+                        .draw(&mut self.screen)
+                        .unwrap();
+                    }
                 }
                 b'\n' => {
-                    // Draw current line
+                    self.cursor_pose.x = 0;
+                    self.cursor_pose.y += FONT_HEIGHT;
+                    if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
+                        self.scroll_up();
+                    }
+                }
+                _ => {
+                    let ch = b as char;
+                    let buf = [ch as u8];
+                    let s = core::str::from_utf8(&buf).unwrap();
+
                     Text::with_text_style(
-                        &text,
+                        s,
                         Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
                         style,
                         TextStyleBuilder::new().baseline(Baseline::Top).build(),
                     )
-                        .draw(&mut self.screen)
-                        .unwrap();
-                    self.cursor_pose.y += FONT_HEIGHT;
+                    .draw(&mut self.screen)
+                    .unwrap();
 
-                    if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
-                        self.scroll_up();
+                    self.cursor_pose.x += FONT_WIDTH;
+                    if self.cursor_pose.x + FONT_WIDTH > self.screen.width {
+                        self.cursor_pose.x = 0;
+                        self.cursor_pose.y += FONT_HEIGHT;
+                        if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
+                            self.scroll_up();
+                        }
                     }
-
-                    self.cursor_pose.x = 0;
-                    text.clear();
-                }
-                _ => {
-                    text.push(b as char);
-                }
-            }
-        }
-
-        if !text.is_empty() {
-            Text::with_text_style(
-                &text,
-                Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32),
-                style,
-                TextStyleBuilder::new().baseline(Baseline::Top).build(),
-            )
-                .draw(&mut self.screen)
-                .unwrap();
-
-            self.cursor_pose.x += text.len() * FONT_WIDTH;
-
-            if self.cursor_pose.x + FONT_WIDTH > self.screen.width {
-                self.cursor_pose.x = 0;
-                self.cursor_pose.y += FONT_HEIGHT;
-
-                if self.cursor_pose.y + FONT_HEIGHT > self.screen.height {
-                    self.scroll_up();
                 }
             }
         }
     }
-
 
     /*pub(crate) fn print(&mut self, str: &[u8]) {
         let style = MonoTextStyle::new(&FONT_7X14, Rgb888::new(255, 255, 255));
@@ -286,7 +292,10 @@ struct BufferWriter<'a> {
 
 impl<'a> BufferWriter<'a> {
     fn new(buffer: &'a mut [u8]) -> Self {
-        BufferWriter { buffer, position: 0 }
+        BufferWriter {
+            buffer,
+            position: 0,
+        }
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -311,4 +320,3 @@ impl<'a> Write for BufferWriter<'a> {
         Ok(())
     }
 }
-

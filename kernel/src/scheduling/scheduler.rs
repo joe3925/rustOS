@@ -1,19 +1,18 @@
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::{KERNEL_CR3_U64, KERNEL_STACK_SIZE};
+use crate::println;
 use crate::scheduling::task::{idle_task, Task};
 use crate::util::kernel_main;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use x86_64::registers::control::Cr3;
 use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use crate::println;
+use x86_64::registers::control::Cr3;
 
 pub enum TaskError {
     NotFound(u64),
-
 }
 lazy_static! {
     pub static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -22,7 +21,7 @@ lazy_static! {
 pub struct Scheduler {
     tasks: Vec<Task>,
     current_task: AtomicUsize,
-    id: u64
+    id: u64,
 }
 
 impl Scheduler {
@@ -30,7 +29,7 @@ impl Scheduler {
         Self {
             tasks: Vec::new(),
             current_task: AtomicUsize::new(0),
-            id: 0
+            id: 0,
         }
     }
 
@@ -39,18 +38,20 @@ impl Scheduler {
         task.id = self.id;
         self.id += 1;
         self.tasks.push(task);
-
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
-    pub fn restore_page_table(&mut self){
-        if let Some(prorgam) =   PROGRAM_MANAGER.read().get(self.get_current_task().parent_pid){
+    pub fn restore_page_table(&mut self) {
+        if let Some(prorgam) = PROGRAM_MANAGER
+            .read()
+            .get(self.get_current_task().parent_pid)
+        {
             unsafe { Cr3::write(prorgam.cr3, Cr3::read().1) };
-        }else{
-            // Attempt to recover 
-            // Worse case we spin through all the tasks and end up with only the idle task 
-            if(self.tasks.len() > 1){
+        } else {
+            // Attempt to recover
+            // Worse case we spin through all the tasks and end up with only the idle task
+            if (self.tasks.len() > 1) {
                 let task_id = self.get_current_task().id;
                 self.delete_task(task_id);
                 self.schedule_next();
@@ -64,19 +65,17 @@ impl Scheduler {
     pub fn schedule_next(&mut self) {
         self.end_task();
         if self.tasks.len() < 1 {
-            let kernel_task = Task::new_kernelmode(kernel_main as usize, KERNEL_STACK_SIZE, "kernel".to_string(), 0);
+            let kernel_task = Task::new_kernelmode(
+                kernel_main as usize,
+                KERNEL_STACK_SIZE,
+                "kernel".to_string(),
+                0,
+            );
             self.add_task(kernel_task);
         }
 
         if self.tasks.len() > 0 {
-            let mut next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
-            if (self.tasks.len() > 1) {
-                let next_task_id = self.tasks[next_task].id;
-                //don't schedule the idle task if there are other tasks available
-                if (next_task_id == 0) {
-                    next_task = (self.current_task.load(Ordering::SeqCst) + 2) % self.tasks.len();
-                }
-            }
+            let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
             self.current_task.store(next_task, Ordering::SeqCst);
         }
     }

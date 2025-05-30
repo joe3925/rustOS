@@ -1,21 +1,31 @@
-
 use alloc::{string::String, sync::Arc, vec::Vec};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
-use x86_64::{structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB}, PhysAddr, VirtAddr};
+use x86_64::{
+    structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
-use crate::{memory::paging::{init_mapper, BootInfoFrameAllocator, RangeTracker}, scheduling::{scheduler::{self, Scheduler, SCHEDULER}, task::Task}, util::boot_info};
+use crate::{
+    memory::paging::{init_mapper, BootInfoFrameAllocator, RangeTracker},
+    println,
+    scheduling::{
+        scheduler::{self, Scheduler, SCHEDULER},
+        task::Task,
+    },
+    util::boot_info,
+};
 
 use super::pe_loadable::{self, LoadError};
-pub struct Module{
+pub struct Module {
     pub title: String,
-    pub image_path: String, 
+    pub image_path: String,
     pub parent_pid: u64,
     pub image_base: VirtAddr,
 }
 pub struct Program {
     pub title: String,
-    pub image_path: String, 
+    pub image_path: String,
     pub pid: u64,
     pub image_base: VirtAddr,
     pub main_thread: Option<Task>,
@@ -23,10 +33,13 @@ pub struct Program {
     pub modules: Mutex<Vec<Module>>,
     pub cr3: PhysFrame,
     pub tracker: Arc<RangeTracker>,
-
 }
 impl Program {
-    pub fn virtual_map_alloc(&self, virt_addr: VirtAddr, size: usize) -> Result<(), MapToError<Size4KiB>> {
+    pub fn virtual_map_alloc(
+        &self,
+        virt_addr: VirtAddr,
+        size: usize,
+    ) -> Result<(), MapToError<Size4KiB>> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
@@ -45,7 +58,8 @@ impl Program {
         let mut mapper = init_mapper(phys_mem_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
         for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
             let page = Page::containing_address(VirtAddr::new(addr));
@@ -55,8 +69,12 @@ impl Program {
         Ok(())
     }
 
-    ///Saftey: User must make sure the address mapped by this function is allocated by the range tracker or virtual_map_alloc will silently fail 
-    pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), MapToError<Size4KiB>> {
+    ///Saftey: User must make sure the address mapped by this function is allocated by the range tracker or virtual_map_alloc will silently fail
+    pub unsafe fn virtual_map(
+        &self,
+        virt_addr: VirtAddr,
+        size: usize,
+    ) -> Result<(), MapToError<Size4KiB>> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
@@ -71,7 +89,8 @@ impl Program {
         let mut mapper = init_mapper(phys_mem_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
         for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
             let page = Page::containing_address(VirtAddr::new(addr));
@@ -80,11 +99,11 @@ impl Program {
 
         Ok(())
     }
-    pub fn load_module(&mut self, path: String) -> Result<(), LoadError>{
+    pub fn load_module(&mut self, path: String) -> Result<(), LoadError> {
         if let Some(mut dll) = pe_loadable::PELoader::new("C:\\BIN\\TEST.DLL") {
             let module = dll.dll_load(self.pid)?;
             self.modules.lock().push(module);
-            return Ok(())
+            return Ok(());
         }
         Err(LoadError::NoFile)
     }
@@ -99,7 +118,7 @@ impl ProgramManager {
     pub const fn new() -> Self {
         Self {
             programs: Vec::new(),
-            next_pid: 1,
+            next_pid: 0,
         }
     }
 
@@ -107,19 +126,19 @@ impl ProgramManager {
         let pid = self.next_pid;
         self.next_pid += 1;
         program.pid = pid;
-        if let Some(ref mut task) = program.main_thread{
+        if let Some(ref mut task) = program.main_thread {
             task.parent_pid = pid;
         }
         self.programs.push(program);
         pid
     }
-    ///Returns the thread id of the main thread if succsesful 
-    pub fn start_pid(&self, pid: u64) -> Option<u64>{
+    ///Returns the thread id of the main thread if succsesful
+    pub fn start_pid(&self, pid: u64) -> Option<u64> {
         let program = self.get(pid)?;
         let mut scheduler = SCHEDULER.lock();
         let task = program.main_thread.clone()?;
         scheduler.add_task(task);
-        return Some(scheduler.get_task_by_name(program.title.clone())?.id)
+        return Some(scheduler.get_task_by_name(program.title.clone())?.id);
     }
 
     pub fn remove_program(&mut self, pid: u64) {
@@ -140,6 +159,5 @@ impl ProgramManager {
 }
 
 lazy_static! {
-    pub static ref PROGRAM_MANAGER: RwLock<ProgramManager> =
-        RwLock::new(ProgramManager::new());
+    pub static ref PROGRAM_MANAGER: RwLock<ProgramManager> = RwLock::new(ProgramManager::new());
 }
