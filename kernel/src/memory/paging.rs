@@ -13,7 +13,7 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags,
-    PageTableIndex, PhysFrame, Size2MiB, Size4KiB,
+    PageTableIndex, PhysFrame, Size2MiB, Size4KiB, Size1GiB
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -84,6 +84,13 @@ impl BootInfoFrameAllocator {
         let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(2 * 1024 * 1024));
         frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
+    fn usable_1gb_frames(&self) -> impl Iterator<Item = PhysFrame<Size1GiB>> {
+        let regions = self.memory_regions.iter();
+        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
+        let addr_ranges = usable.map(|r| r.start..r.end);
+        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(1 << 30));
+        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
@@ -105,6 +112,21 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
 
         let base_frame = self.usable_2mb_frames().nth(*next / 512);
         *next += 512;
+
+        base_frame
+    }
+}
+
+unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size1GiB>> {
+        let mut next = NEXT.lock();
+
+        if *next % (1 << 18) != 0 {
+            *next += (1 << 18) - (*next % (1 << 18)); // align to 1GiB (2^30 / 4096 = 2^18 pages)
+        }
+
+        let base_frame = self.usable_1gb_frames().nth(*next / (1 << 18));
+        *next += 1 << 18;
 
         base_frame
     }
@@ -569,4 +591,160 @@ fn get_or_create_table(
         entry.set_frame(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
         table
     }
+}
+/// Safety: Only safe if the frame is identity mapped via offset map and exclusively mapped.
+
+//I HATE I NEED TO DO THIS
+
+//TODO: FIX THIS PEACE OF SHIT
+
+pub fn relocate_frame_preserve_virtual(
+    old_phys: PhysAddr,
+    identity_map_old: bool,
+) -> Result<(), MapToError<Size4KiB>> {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(
+        boot_info.physical_memory_offset.into_option().unwrap(),
+    );
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut mapper = init_mapper(phys_mem_offset);
+
+    let virt_addr = phys_mem_offset + old_phys.as_u64();
+    let page_4k = Page::<Size4KiB>::containing_address(virt_addr);
+
+    match is_mapped_via_huge_page(virt_addr) {
+        Some(1) => {
+            // 1 GiB huge page
+        let aligned_virt = virt_addr.align_down(1u64 << 30);
+        let huge_page = Page::<Size1GiB>::containing_address(aligned_virt);
+
+            unsafe {
+                if let Ok((_, flush)) = mapper.unmap(huge_page) {
+                    flush.flush();
+                }
+            }
+
+            // Allocate and map new 1 GiB page
+            let new_frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
+
+            unsafe {
+                mapper
+                    .map_to(
+                        huge_page,
+                        new_frame,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE,
+                        &mut frame_allocator,
+                    ).unwrap()
+                    .flush();
+            }
+        }
+        Some(2) => {
+            // 2 MiB huge page
+            let aligned_virt = virt_addr.align_down(1u64 << 21);
+            let huge_page = Page::<Size2MiB>::containing_address(aligned_virt);
+
+            unsafe {
+                if let Ok((_, flush)) = mapper.unmap(huge_page) {
+                    flush.flush();
+                }
+            }
+
+            // Allocate and map new 2 MiB page
+            let new_frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
+
+            unsafe {
+                mapper
+                    .map_to(
+                        huge_page,
+                        new_frame,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE,
+                        &mut frame_allocator,
+                    ).unwrap()
+                    .flush();
+            }
+        }
+        _ => {
+            // Regular 4 KiB page
+            let new_frame = frame_allocator
+                .allocate_frame()
+                .ok_or(MapToError::FrameAllocationFailed)?;
+
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    (phys_mem_offset + old_phys.as_u64()).as_ptr::<u8>(),
+                    (phys_mem_offset + new_frame.start_address().as_u64()).as_mut_ptr::<u8>(),
+                    4096,
+                );
+
+                if let Ok((_, flush)) = mapper.unmap(page_4k) {
+                    flush.flush();
+                }
+
+                mapper
+                    .map_to(
+                        page_4k,
+                        new_frame,
+                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                        &mut frame_allocator,
+                    )?
+                    .flush();
+            }
+        }
+    }
+
+    // Identity map just the original 4KiB physical page
+    if identity_map_old {
+        identity_map_page(
+            old_phys,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Returns Some(level) if huge page mapping exists at level 2 (2 MiB) or 3 (1 GiB).
+/// Returns None if normal 4 KiB mapping or unmapped.
+fn is_mapped_via_huge_page(virt: VirtAddr) -> Option<u8> {
+    let phys_mem_offset =
+        VirtAddr::new(boot_info().physical_memory_offset.into_option()?);
+    let l4 = get_level4_page_table(phys_mem_offset);
+
+    let l3 = {
+        let entry = &l4[virt.p4_index()];
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        let l3_ptr = (phys_mem_offset + entry.addr().as_u64()).as_mut_ptr::<PageTable>();
+        unsafe { &mut *l3_ptr }
+    };
+
+    let l2 = {
+        let entry = &l3[virt.p3_index()];
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Some(1); // 1 GiB huge page
+        }
+        let l2_ptr = (phys_mem_offset + entry.addr().as_u64()).as_mut_ptr::<PageTable>();
+        unsafe { &mut *l2_ptr }
+    };
+
+    let l1 = {
+        let entry = &l2[virt.p2_index()];
+        if !entry.flags().contains(PageTableFlags::PRESENT) {
+            return None;
+        }
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Some(2); // 2 MiB huge page
+        }
+        // Else 4 KiB normal page
+    };
+
+    None
 }

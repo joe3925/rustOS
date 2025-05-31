@@ -2,7 +2,7 @@ extern crate rand_xoshiro;
 
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::{calibrate_tsc, wait_using_pit_50ms, ApicImpl};
+use crate::drivers::interrupt_index::{calibrate_tsc, wait_millis, wait_using_pit_50ms, ApicImpl};
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::executable::pe_loadable;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
@@ -39,7 +39,7 @@ pub unsafe fn init() {
         VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
 
     let mut mapper = init_mapper(mem_offset);
-    let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
     init_heap(&mut mapper, &mut frame_allocator.clone());
 
     init_kernel_cr3();
@@ -47,6 +47,8 @@ pub unsafe fn init() {
     gdt::init();
     PICS.lock().initialize();
     load_idt();
+    let frame: PhysFrame<Size4KiB> = frame_allocator.allocate_frame().unwrap();
+    println!("{:#x}", frame.start_address());
     println!("PIC loaded");
 
     // TSC calibration
@@ -58,7 +60,9 @@ pub unsafe fn init() {
     match ApicImpl::init_apic_full() {
         Ok(_) => {
             println!("APIC transition successful!");
+            x86_64::instructions::interrupts::disable();
             APIC.lock().as_ref().unwrap().start_aps();
+            x86_64::instructions::interrupts::enable();
         }
         Err(err) => {
             println!("APIC transition failed {}!", err.to_str());

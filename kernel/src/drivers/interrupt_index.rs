@@ -3,7 +3,7 @@ use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
 use crate::drivers::ACPI::ACPI_TABLES;
-use crate::memory::paging::{self, virtual_to_phys};
+use crate::memory::paging::{self, relocate_frame_preserve_virtual, virtual_to_phys};
 use crate::{print, println};
 use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
@@ -306,7 +306,10 @@ impl ApicImpl {
             .application_processors;
         let startup_frame: PhysFrame<Size4KiB> =
             PhysFrame::containing_address(virtual_to_phys(VirtAddr::new(ap_startup as u64)));
-        let startup = startup_frame.start_address();
+            
+        let startup = PhysAddr::new(0x4000);
+        relocate_frame_preserve_virtual(startup, true).expect("Failed to map startup region");
+        unsafe { (startup.as_u64() as *mut u8).write(0x0f) };
 
         for apic in apics.iter() {
             unsafe {
