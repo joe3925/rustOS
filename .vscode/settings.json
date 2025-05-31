@@ -46,7 +46,9 @@
     "lldb.dereferencePointers": true,
     "lldb.consoleMode": "commands",
     "cSpell.words": [
+        "ACPI",
         "apic",
+        "apics",
         "Virt"
     ]
 }

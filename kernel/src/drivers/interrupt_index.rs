@@ -1,16 +1,18 @@
-use crate::cpu::get_cpu_info;
+use crate::cpu::{self, get_cpu_info};
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
 use crate::drivers::ACPI::ACPI_TABLES;
-use crate::memory::paging;
+use crate::memory::paging::{self, virtual_to_phys};
 use crate::{print, println};
-use acpi::platform::interrupt::Apic;
+use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
 use core::iter;
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pic8259::ChainedPics;
 use spin::Mutex;
+use x86_64::instructions::port::Port;
+use x86_64::structures::paging::{PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -20,6 +22,16 @@ pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
 pub static USE_APIC: AtomicBool = AtomicBool::new(false);
+
+pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+
+pub const TIMER_FREQ: u64 = 2400;
+
+const PIT_FREQUENCY_HZ: u32 = 1_193_182;
+const PIT_CONTROL_PORT: u16 = 0x43;
+const PIT_CHANNEL2_PORT: u16 = 0x42;
+const PIT_MODE_PORT: u16 = 0x61;
+
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 
@@ -36,6 +48,52 @@ impl InterruptIndex {
         self as u8
     }
 }
+pub fn calibrate_tsc(tsc_start: u64, tsc_end: u64, delay_ms: u64) {
+    let tsc_freq = (tsc_end - tsc_start) * 1000 / delay_ms;
+    TSC_HZ.store(tsc_freq, Ordering::SeqCst);
+}
+
+pub fn wait_millis(ms: u64) {
+    let tsc_freq = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_freq == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    let start = unsafe { cpu::get_cycles() };
+    let target_delta = ms as u128 * tsc_freq as u128 / 1000;
+    cpu::wait_cycle(target_delta);
+}
+
+pub fn wait_using_pit_50ms() {
+    let counts_for_50ms: u16 = (PIT_FREQUENCY_HZ / 20) as u16;
+
+    unsafe {
+        let mut control = Port::new(PIT_CONTROL_PORT);
+        let mut ch2 = Port::new(PIT_CHANNEL2_PORT);
+        let mut mode = Port::new(PIT_MODE_PORT);
+
+        // Configure channel 2, one-shot, binary, mode 0
+        control.write(0b1011_0000u8);
+
+        // Write count (low byte, high byte)
+        ch2.write((counts_for_50ms & 0xFF) as u8);
+        ch2.write((counts_for_50ms >> 8) as u8);
+
+        // Set gate high (bit 0 = 1), speaker off (bit 1 = 0)
+        let mut val: u8 = mode.read();
+        val = (val & !0b11) | 0b01;
+        mode.write(val);
+
+        // Wait for OUT pin (bit 5) to go high
+        loop {
+            let status: u8 = mode.read();
+            if (status & 0b0010_0000) != 0 {
+                break;
+            }
+        }
+    }
+}
+
 #[inline(never)]
 pub fn send_eoi(irq: u8) {
     unsafe {
@@ -68,36 +126,163 @@ impl ApicErrors {
     }
 }
 
+pub trait LocalApic {
+    fn init(&self);
+    fn init_timer(&self);
+    fn end_interrupt(&self);
+    unsafe fn send_ipi(&self, apic_id: u8, kind: IpiKind);
+    unsafe fn write(&self, offset: usize, value: u32);
+}
+
+pub trait IoApic {
+    fn init_keyboard(&self);
+}
+pub struct Lapic {
+    base_addr: VirtAddr,
+}
+
+impl Lapic {
+    pub fn new(phys: PhysAddr) -> Result<Self, ()> {
+        let virt = paging::map_mmio_region(phys, 0x1000).map_err(|_| ())?;
+        Ok(Self { base_addr: virt })
+    }
+
+    fn ptr(&self) -> *mut u32 {
+        self.base_addr.as_mut_ptr()
+    }
+}
+
+impl LocalApic for Lapic {
+    fn init(&self) {
+        unsafe {
+            let svr = self.ptr().add(APICOffset::Svr as usize / 4);
+            svr.write_volatile(svr.read_volatile() | 0x100);
+        }
+    }
+
+    fn init_timer(&self) {
+        unsafe {
+            let base = self.ptr();
+            base.add(APICOffset::Svr as usize / 4)
+                .write_volatile(base.add(APICOffset::Svr as usize / 4).read_volatile() | 0x100);
+            base.add(APICOffset::LvtT as usize / 4)
+                .write_volatile(0x20 | (1 << 17));
+            base.add(APICOffset::Tdcr as usize / 4).write_volatile(0x3);
+            base.add(APICOffset::Ticr as usize / 4)
+                .write_volatile(TIMER_FREQ as u32);
+        }
+    }
+
+    fn end_interrupt(&self) {
+        unsafe {
+            self.ptr()
+                .add(APICOffset::Eoi as usize / 4)
+                .write_volatile(0);
+        }
+    }
+
+    unsafe fn send_ipi(&self, apic_id: u8, kind: IpiKind) {
+        let icr_base = self.ptr();
+
+        let icr_low = icr_base.add(APICOffset::Icr1 as usize / 4);
+        let icr_high = icr_base.add(APICOffset::Icr2 as usize / 4);
+
+        icr_high.write_volatile((apic_id as u32) << 24);
+
+        let icr_value = match kind {
+            IpiKind::Init => {
+                0b0000_0101_0000_0000u32 // INIT IPI
+            }
+
+            IpiKind::Startup { vector_phys_addr } => {
+                let vector = (vector_phys_addr.as_u64() >> 12) as u8;
+                (vector as u32) | 0b0000_0110_0000_0000u32
+            }
+        };
+
+        icr_low.write_volatile(icr_value);
+    }
+    unsafe fn write(&self, offset: usize, value: u32) {
+        self.ptr().add(offset / 4).write_volatile(value);
+    }
+}
+pub struct Ioapic {
+    base_addr: VirtAddr,
+}
+
+impl Ioapic {
+    pub fn new(phys: PhysAddr) -> Result<Self, ()> {
+        let virt = paging::map_mmio_region(phys, 0x2048).map_err(|_| ())?;
+        Ok(Self { base_addr: virt })
+    }
+
+    fn ptr(&self) -> *mut u32 {
+        self.base_addr.as_mut_ptr()
+    }
+}
+
+impl IoApic for Ioapic {
+    fn init_keyboard(&self) {
+        unsafe {
+            self.ptr().add(0).write_volatile(0x12);
+            self.ptr()
+                .add(4)
+                .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
+        }
+    }
+}
 pub struct ApicImpl {
     pub apic_info: Apic<'static, Global>,
-    pub lapic_virt_addr: VirtAddr,
+    pub lapic: Lapic,
+    pub ioapic: Ioapic,
 }
 
 impl ApicImpl {
-    fn new() -> Result<Self, ApicErrors> {
-        if let info = get_cpu_info() {
-            let features = info.get_feature_info().ok_or(NoCPUID)?;
-            if (!features.has_apic()) {
-                return Err(NotAvailable);
-            }
-            if (!features.has_acpi()) {
-                return Err(NoACPI);
-            }
-            if let Some(table) = ACPI_TABLES.get_interrupt_model() {
-                let lapic_vaddr =
-                    paging::map_mmio_region(PhysAddr::new(table.local_apic_address), 0x1000)
-                        .expect("failed to map local apic to mmio space"); // your MMIO mapper
+    pub fn new() -> Result<Self, ApicErrors> {
+        let info = get_cpu_info();
+        let features = info.get_feature_info().ok_or(NoCPUID)?;
 
-                Ok(ApicImpl {
-                    apic_info: table,
-                    lapic_virt_addr: lapic_vaddr,
-                })
-            } else {
-                Err(BadInterruptModel)
-            }
-        } else {
-            Err(NoCPUID)
+        if !features.has_apic() {
+            return Err(NotAvailable);
         }
+        if !features.has_acpi() {
+            return Err(NoACPI);
+        }
+
+        let model = ACPI_TABLES.get_interrupt_model().ok_or(BadInterruptModel)?;
+        let lapic =
+            Lapic::new(PhysAddr::new(model.local_apic_address)).map_err(|_| BadInterruptModel)?;
+        let ioapic = Ioapic::new(PhysAddr::new(model.io_apics[0].address as u64))
+            .map_err(|_| BadInterruptModel)?;
+
+        Ok(Self {
+            apic_info: model,
+            lapic,
+            ioapic,
+        })
+    }
+    pub fn init_apic_full() -> Result<(), ApicErrors> {
+        x86_64::instructions::interrupts::disable();
+
+        {
+            if APIC.lock().is_some() {
+                return Err(ApicErrors::AlreadyInit);
+            }
+        }
+
+        match ApicImpl::new() {
+            Ok(apic) => unsafe {
+                apic.init_local();
+                apic.lapic.init_timer();
+                apic.ioapic.init_keyboard();
+                APIC.lock().replace(apic);
+                USE_APIC.store(true, Ordering::SeqCst);
+            },
+            Err(e) => return Err(e),
+        }
+
+        x86_64::instructions::interrupts::enable();
+        Ok(())
     }
 
     fn init_local(&self) {
@@ -106,96 +291,47 @@ impl ApicImpl {
                 PICS.lock().disable();
             }
         }
-
-        // Map and enable the local APIC for the current CPU
-        unsafe {
-            self.init_lapic();
-        }
-    }
-    unsafe fn init_lapic(&self) {
-        let lapic_ptr = self.lapic_virt_addr.as_mut_ptr::<u32>();
-
-        const LAPIC_SVR_OFFSET: usize = 0xF0 / 4;
-        let svr = lapic_ptr.add(LAPIC_SVR_OFFSET);
-        svr.write_volatile(svr.read_volatile() | 0x100); // enable LAPIC (bit 8)
-    }
-    unsafe fn init_timer(&self) {
-        let lapic_pointer = self.lapic_virt_addr.as_mut_ptr::<u32>();
-        let svr = lapic_pointer.offset(APICOffset::Svr as isize / 4);
-        svr.write_volatile(svr.read_volatile() | 0x100);
-
-        // Configure timer
-        // Vector 0x20, Periodic Mode (bit 17), Not masked (bit 16 = 0)
-        let lvt_timer = lapic_pointer.offset(APICOffset::LvtT as isize / 4);
-        lvt_timer.write_volatile(0x20 | (1 << 17));
-
-        // Set divider to 16
-        let tdcr = lapic_pointer.offset(APICOffset::Tdcr as isize / 4);
-        tdcr.write_volatile(0x3);
-
-        // Set initial count - smaller value for more frequent interrupts
-        let ticr = lapic_pointer.offset(APICOffset::Ticr as isize / 4);
-        ticr.write_volatile(2400);
-    }
-    unsafe fn init_ioapic(&self) {
-        let phys_addr = self.apic_info.io_apics[0].address;
-        let virt_addr = paging::map_mmio_region(PhysAddr::new(phys_addr as u64), 0x2048)
-            .expect("failed to map io apic");
-        let ioapic_pointer = virt_addr.as_mut_ptr::<u32>();
-
-        ioapic_pointer.offset(0).write_volatile(0x12);
-        ioapic_pointer
-            .offset(4)
-            .write_volatile(InterruptIndex::KeyboardIndex as u8 as u32);
-    }
-    unsafe fn init_keyboard(&self) {
-        let keyboard_register = self
-            .lapic_virt_addr
-            .as_mut_ptr::<u32>()
-            .offset(APICOffset::LvtLint1 as isize / 4);
-        keyboard_register.write_volatile(InterruptIndex::KeyboardIndex.as_u8() as u32);
+        self.lapic.init();
     }
     pub fn end_interrupt(&self) {
-        unsafe {
-            let lapic_ptr = self.lapic_virt_addr.as_mut_ptr::<u32>();
-            lapic_ptr
-                .offset(APICOffset::Eoi as isize / 4)
-                .write_volatile(0);
-        }
+        self.lapic.end_interrupt();
     }
-    pub fn init_apic_full() -> Result<(), ApicErrors> {
-        x86_64::instructions::interrupts::disable();
-        {
-            if APIC.lock().is_some() {
-                return Err(AlreadyInit);
-            }
-        }
-        let apic_result = ApicImpl::new();
-        match apic_result {
-            Ok(apic) => unsafe {
-                apic.init_local();
-                apic.init_timer();
 
-                apic.init_ioapic();
-                apic.init_keyboard();
-                APIC.lock().replace(apic);
-            },
-            Err(err) => return Err(err),
-        }
-
-        Ok(x86_64::instructions::interrupts::enable())
-    }
-    pub fn start_aps() -> Result<(), ()> {
-        //TODO: add errors
+    pub fn start_aps(&self) -> Result<(), ApicErrors> {
         let apics = ACPI_TABLES
             .get_plat_info()
-            .ok_or(())?
+            .ok_or(ApicErrors::BadInterruptModel)?
             .processor_info
-            .ok_or(())?
+            .ok_or(ApicErrors::BadInterruptModel)?
             .application_processors;
-        for apic in apics.iter().enumerate() {}
+        let startup_frame: PhysFrame<Size4KiB> =
+            PhysFrame::containing_address(virtual_to_phys(VirtAddr::new(ap_startup as u64)));
+        let startup = startup_frame.start_address();
+
+        for apic in apics.iter() {
+            unsafe {
+                self.lapic.send_ipi(apic.local_apic_id as u8, IpiKind::Init);
+                wait_millis(10);
+                self.lapic.send_ipi(
+                    apic.local_apic_id as u8,
+                    IpiKind::Startup {
+                        vector_phys_addr: startup,
+                    },
+                );
+                wait_millis(10);
+                self.lapic.send_ipi(
+                    apic.local_apic_id as u8,
+                    IpiKind::Startup {
+                        vector_phys_addr: startup,
+                    },
+                );
+            }
+        }
         Ok(())
     }
+}
+extern "C" fn ap_startup() {
+    loop {}
 }
 
 #[allow(non_camel_case_types)]
@@ -267,4 +403,8 @@ pub enum APICOffset {
     R0x3D0 = 0x3D0,   // RESERVED = 0x3D0
     Tdcr = 0x3E0,     // Divide Configuration Register (for Timer)
     R0x3F0 = 0x3F0,   // RESERVED = 0x3F0
+}
+pub enum IpiKind {
+    Init,
+    Startup { vector_phys_addr: PhysAddr },
 }

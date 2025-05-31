@@ -18,6 +18,7 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::util::boot_info;
+use crate::BOOT_INFO;
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 
@@ -158,7 +159,8 @@ fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
     unsafe { &mut *page_table_ptr }
 }
 
-pub(crate) fn virtual_to_phys(mem_offset: VirtAddr, to_phys: VirtAddr) -> PhysAddr {
+pub(crate) fn virtual_to_phys(to_phys: VirtAddr) -> PhysAddr {
+    let mem_offset = VirtAddr::new(boot_info().physical_memory_offset.into_option().unwrap());
     let l1_table = get_level1_page_table(mem_offset, to_phys);
     let page_entry = &l1_table[to_phys.p1_index()];
     page_entry.addr()
@@ -504,7 +506,7 @@ pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), MapToError<Siz
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
     )?;
 
-    let table_phys_addr = virtual_to_phys(VirtAddr::new(mem_offset), table_virt);
+    let table_phys_addr = virtual_to_phys(table_virt);
     let kernel_pml4 = get_level4_page_table(VirtAddr::new(mem_offset));
 
     let new_table: &mut PageTable = unsafe { &mut *(table_virt.as_mut_ptr()) };

@@ -2,8 +2,8 @@ extern crate rand_xoshiro;
 
 use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::ApicImpl;
-use crate::drivers::interrupt_index::PICS;
+use crate::drivers::interrupt_index::{calibrate_tsc, wait_using_pit_50ms, ApicImpl};
+use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::executable::pe_loadable;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
@@ -48,14 +48,23 @@ pub unsafe fn init() {
     PICS.lock().initialize();
     load_idt();
     println!("PIC loaded");
+
+    // TSC calibration
+    let tsc_start = cpu::get_cycles();
+    wait_using_pit_50ms();
+    let tsc_end = cpu::get_cycles();
+    calibrate_tsc(tsc_start, tsc_end, 50);
+
     match ApicImpl::init_apic_full() {
         Ok(_) => {
             println!("APIC transition successful!");
+            APIC.lock().as_ref().unwrap().start_aps();
         }
         Err(err) => {
             println!("APIC transition failed {}!", err.to_str());
         }
     }
+
     test_full_heap();
 
     {
