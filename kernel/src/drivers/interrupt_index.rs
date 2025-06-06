@@ -3,16 +3,19 @@ use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
 use crate::drivers::ACPI::ACPI_TABLES;
-use crate::memory::paging::{self, identity_map_page,  virtual_to_phys};
+use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, virtual_to_phys};
+use crate::util::{boot_info, AP_STARTUP_CODE};
 use crate::{print, println};
 use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
-use core::iter;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::{iter, ptr};
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PhysAddr, VirtAddr};
 
 pub(crate) const PIC_1_OFFSET: u8 = 0x20;
@@ -31,6 +34,21 @@ const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;
 const PIT_CHANNEL2_PORT: u16 = 0x42;
 const PIT_MODE_PORT: u16 = 0x61;
+
+/// Physical address of the first trampoline page.
+const TRAMPOLINE_BASE: u64 = 0x0000_8000;
+/// Distance (in bytes) between consecutive trampolines.
+const TRAMPOLINE_STEP: u64 = 0x1000; // 4 KiB
+/// One-MiB per-AP kernel stack.
+const AP_STACK_SIZE: usize = 1024 * 1024;
+
+const OFF_BOOTED_FLAG: usize = 0x00;
+const OFF_PAGEMAP: usize = 0x04;
+const OFF_GDTR_LIMIT: usize = 0x0C;
+const OFF_GDTR_BASE: usize = 0x0E;
+const OFF_HHDM: usize = 0x16;
+const OFF_TEMP_STACK: usize = 0x1E;
+const OFF_START_STACK: usize = 0x26;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -297,44 +315,89 @@ impl ApicImpl {
         self.lapic.end_interrupt();
     }
 
-    pub fn start_aps(&self) -> Result<(), ApicErrors> {
+    pub fn start_aps(&self) {
+        // -------- BSP state we need to copy into every trampoline ----------
+        let gdtr: DescriptorTablePointer = unsafe { x86_64::instructions::tables::sgdt() };
+
         let apics = ACPI_TABLES
             .get_plat_info()
-            .ok_or(ApicErrors::BadInterruptModel)?
+            .expect("bad interrupt model")
             .processor_info
-            .ok_or(ApicErrors::BadInterruptModel)?
+            .expect("bad interrupt model")
             .application_processors;
-        let startup_frame: PhysFrame<Size4KiB> =
-            PhysFrame::containing_address(virtual_to_phys(VirtAddr::new(ap_startup as u64)));
-            
-        let startup = PhysAddr::new(0x8000);
-        identity_map_page(startup, PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE);
-        unsafe { (startup.as_u64() as *mut u8).write(0x0f) };
 
-        for apic in apics.iter() {
+        for (idx, apic) in apics.iter().enumerate() {
+            let tramp_phys = TRAMPOLINE_BASE + (idx as u64) * TRAMPOLINE_STEP;
+            let tramp_phys = PhysAddr::new(tramp_phys);
+
+            identity_map_page(
+                tramp_phys,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+            )
+            .expect("identity-map for trampoline failed");
+
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    AP_STARTUP_CODE.as_ptr(),
+                    tramp_phys.as_u64() as *mut u8,
+                    AP_STARTUP_CODE.len(),
+                );
+            }
+            assert!(
+                AP_STARTUP_CODE.len() <= 0x1000,
+                "trampoline bigger than one page"
+            );
+
+            let stack_top = allocate_kernel_stack(AP_STACK_SIZE as u64)
+                .expect("could not allocate AP stack")
+                .as_u64();
+
+            unsafe {
+                let (frame, flags): (PhysFrame, u16) = Cr3::read_raw();
+                let cr3_val = frame.start_address().as_u64() | (flags as u64);
+
+                let base = tramp_phys.as_u64() as *mut u8;
+
+                #[inline(always)]
+                unsafe fn poke<T: Copy>(base: *mut u8, off: usize, val: T) {
+                    ptr::write_unaligned(base.add(off) as *mut T, val);
+                }
+
+                poke::<u8>(base, OFF_BOOTED_FLAG, 0);
+                poke::<u64>(base, OFF_PAGEMAP, cr3_val);
+                poke::<u16>(base, OFF_GDTR_LIMIT, gdtr.limit);
+                poke::<u64>(base, OFF_GDTR_BASE, gdtr.base.as_u64());
+                poke::<u64>(
+                    base,
+                    OFF_HHDM,
+                    boot_info().physical_memory_offset.into_option().unwrap(),
+                );
+                poke::<u64>(base, OFF_TEMP_STACK, stack_top);
+                poke::<u16>(base, OFF_START_STACK, 0x7000);
+            }
+
             unsafe {
                 self.lapic.send_ipi(apic.local_apic_id as u8, IpiKind::Init);
                 wait_millis(10);
-                self.lapic.send_ipi(
-                    apic.local_apic_id as u8,
-                    IpiKind::Startup {
-                        vector_phys_addr: startup,
-                    },
-                );
-                wait_millis(10);
-                self.lapic.send_ipi(
-                    apic.local_apic_id as u8,
-                    IpiKind::Startup {
-                        vector_phys_addr: startup,
-                    },
-                );
+
+                for _ in 0..2 {
+                    self.lapic.send_ipi(
+                        apic.local_apic_id as u8,
+                        IpiKind::Startup {
+                            vector_phys_addr: tramp_phys,
+                        },
+                    );
+                    wait_millis(10);
+                }
             }
         }
-        Ok(())
     }
 }
-extern "C" fn ap_startup() {
-    loop {}
+
+extern "C" fn ap_startup() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
 }
 
 #[allow(non_camel_case_types)]

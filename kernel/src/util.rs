@@ -30,6 +30,8 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use x86_64::VirtAddr;
 
+pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
+
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub unsafe fn init() {
@@ -47,8 +49,7 @@ pub unsafe fn init() {
     gdt::init();
     PICS.lock().initialize();
     load_idt();
-    let frame: PhysFrame<Size4KiB> = frame_allocator.allocate_frame().unwrap();
-    println!("{:#x}", frame.start_address());
+
     println!("PIC loaded");
 
     // TSC calibration
@@ -60,6 +61,7 @@ pub unsafe fn init() {
     match ApicImpl::init_apic_full() {
         Ok(_) => {
             println!("APIC transition successful!");
+
             x86_64::instructions::interrupts::disable();
             APIC.lock().as_ref().unwrap().start_aps();
             x86_64::instructions::interrupts::enable();

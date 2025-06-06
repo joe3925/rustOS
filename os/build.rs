@@ -1,9 +1,8 @@
 use bootloader::{BiosBoot, BootConfig, UefiBoot};
+use std::{env, fs, path::PathBuf, process::Command};
 
-use std::{env, fs, path::PathBuf};
-// Make sure both are imported
+const UEFI: bool = true;
 
-const UEFI: bool = true; // true = build UEFI, false = build BIOS
 fn main() {
     let kernel_path =
         env::var("CARGO_BIN_FILE_KERNEL_kernel").expect("Could not find kernel binary");
@@ -17,14 +16,35 @@ fn main() {
         .unwrap()
         .parent()
         .unwrap();
+    let kernel_source = target_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("kernel")
+        .join("src");
 
     let image_path = target_dir.join("boot.img");
     let efi_path = target_dir.join("kernel.efi");
 
-    // Create boot image
+    // Assemble ap_startup.asm → ap_startup.bin
+    let asm_src = PathBuf::from(kernel_source.join("ap_startup.asm"));
+    let asm_bin = target_dir.parent().unwrap().join("ap_startup.bin");
+
+    let status = Command::new("nasm")
+        .args(&["-f", "bin", "-o"])
+        .arg(&asm_bin)
+        .arg(&asm_src)
+        .status()
+        .expect("Failed to run nasm");
+    assert!(status.success(), "nasm failed");
+
+    // Let Cargo rebuild if ASM changes
+    println!("cargo:rerun-if-changed=src/ap_startup.asm");
+
+    // UEFI/BIOS bootloader image generation
     if UEFI {
         let mut config = BootConfig::default();
-
         let mut uefi_boot = UefiBoot::new(&kernel_path);
         uefi_boot.set_boot_config(&config);
         uefi_boot
@@ -36,11 +56,10 @@ fn main() {
             .expect("Failed to create BIOS image");
     }
 
-    // Copy the kernel .efi binary for GDB usage
+    // Copy kernel.efi for GDB usage
     fs::copy(&kernel_path, &efi_path).expect("Failed to copy EFI file");
 
-    // Let cargo know where the bootloader image is
+    // Export paths
     println!("cargo:rustc-env=BOOTLOADER_IMAGE={}", image_path.display());
-    // Also export EFI path if needed
     println!("cargo:rustc-env=KERNEL_EFI={}", efi_path.display());
 }
