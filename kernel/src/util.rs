@@ -17,8 +17,8 @@ use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{
-    init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, RangeTracker,
-    KERNEL_RANGE_TRACKER,
+    identity_map_page, init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator,
+    RangeTracker, KERNEL_RANGE_TRACKER,
 };
 use crate::{cpu, executable, gdt, println, BOOT_INFO};
 use alloc::vec::Vec;
@@ -28,8 +28,9 @@ use core::ptr::addr_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
+use x86_64::structures::paging::PageTableFlags;
+use x86_64::PhysAddr;
 use x86_64::VirtAddr;
-
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);

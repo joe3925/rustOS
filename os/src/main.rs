@@ -24,7 +24,7 @@ fn main() {
                 "-machine",
                 "type=pc,accel=tcg",
                 "-smp",
-                "2",
+                "4",
                 "-gdb",
                 "tcp::1234",
                 "-S",
@@ -44,7 +44,6 @@ fn main() {
                 return;
             }
         };
-
     } else {
         // === Release mode ===
         let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)

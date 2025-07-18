@@ -32,6 +32,7 @@ use crate::console::clear_screen;
 use crate::util::KERNEL_INITIALIZED;
 
 use bootloader_api::config::Mapping;
+use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
@@ -60,16 +61,53 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
+
 fn _start(boot_info: &'static mut BootInfo) -> ! {
+    reserve_low_64kiB(&mut *boot_info.memory_regions);
+
     unsafe {
         BOOT_INFO = Some(boot_info);
     }
+
     clear_screen();
     unsafe {
         util::init();
     }
+
     loop {}
 }
+fn reserve_low_64kiB(regions: &mut [MemoryRegion]) {
+    const LOW_START: u64 = 0x0;
+    const LOW_END: u64 = 0x10000;
+
+    // 1. Exact match
+    if let Some(r) = regions
+        .iter_mut()
+        .find(|r| r.start == LOW_START && r.end == LOW_END)
+    {
+        r.kind = MemoryRegionKind::Bootloader;
+        return;
+    }
+
+    // 2. Reuse an empty slot
+    if let Some(slot) = regions.iter_mut().find(|r| r.start == 0 && r.end == 0) {
+        *slot = MemoryRegion {
+            start: LOW_START,
+            end: LOW_END,
+            kind: MemoryRegionKind::Bootloader,
+        };
+        return;
+    }
+
+    // 3. Fallback: retag the first overlapping region
+    if let Some(r) = regions
+        .iter_mut()
+        .find(|r| r.end > LOW_START && r.start < LOW_END)
+    {
+        r.kind = MemoryRegionKind::Bootloader;
+    }
+}
+
 pub fn function(x: i64) -> i64 {
     return x;
 }

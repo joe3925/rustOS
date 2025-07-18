@@ -1,19 +1,24 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+fn run(cmd: &mut Command) {
+    let status = cmd.status().expect("failed to spawn command");
+    assert!(status.success(), "command failed: {cmd:?}");
+}
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let bin_out = out_dir.join("ap_startup.bin");
+    let asm_src = PathBuf::from("src/ap_startup.asm");
 
-    let status = Command::new("nasm")
-        .args(&["-f", "bin", "src/ap_startup.asm", "-o"])
-        .arg(&bin_out)
-        .status()
-        .expect("Failed to run nasm");
-    assert!(status.success(), "nasm failed");
+    let bin_out = out_dir.join("ap_startup.bin"); // flat page
+    let lib_out = out_dir.join("libap_startup.a"); // static archive
 
-    // Tell Cargo to re-run if ASM changes
-    println!("cargo:rerun-if-changed=src/ap_startup.asm");
+    run(Command::new("nasm")
+        .args(["-f", "bin"])
+        .arg(&asm_src)
+        .args(["-o"])
+        .arg(&bin_out));
 
-    // Export location of the binary to kernel code
+    println!("cargo:rerun-if-changed={}", asm_src.display());
     println!("cargo:rustc-env=AP_STARTUP_BIN={}", bin_out.display());
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
 }

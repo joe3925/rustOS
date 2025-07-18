@@ -13,7 +13,7 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags,
-    PageTableIndex, PhysFrame, Size2MiB, Size4KiB, Size1GiB
+    PageTableIndex, PhysFrame, Size1GiB, Size2MiB, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -456,6 +456,7 @@ pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
 }
 pub fn identity_map_page(
     phys_addr: PhysAddr,
+    range: usize,
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
     let boot_info = boot_info();
@@ -465,22 +466,26 @@ pub fn identity_map_page(
             .into_option()
             .ok_or(MapToError::FrameAllocationFailed)?,
     );
-
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let page_size = 0x1000;
 
-    let page = Page::containing_address(VirtAddr::new(phys_addr.as_u64()));
-    let frame = PhysFrame::containing_address(phys_addr);
+    let num_pages = (range + 0xFFF) / page_size;
+    for i in 0..num_pages {
+        let addr = PhysAddr::new(phys_addr.as_u64() + (page_size * i) as u64);
+        let page = Page::containing_address(VirtAddr::new(addr.as_u64()));
+        let frame = PhysFrame::containing_address(addr);
 
-    unsafe {
-        mapper
-            .map_to(
-                page,
-                frame,
-                flags | PageTableFlags::PRESENT,
-                &mut frame_allocator,
-            )?
-            .flush();
+        unsafe {
+            mapper
+                .map_to(
+                    page,
+                    frame,
+                    flags | PageTableFlags::PRESENT,
+                    &mut frame_allocator,
+                )?
+                .flush();
+        }
     }
 
     Ok(())

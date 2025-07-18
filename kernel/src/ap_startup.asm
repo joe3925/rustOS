@@ -1,87 +1,67 @@
-bits 16
-section .rodata
 
-global smp_trampoline_start
-smp_trampoline_start:
+
+ORG 0x8000
+SECTION .text
+USE16
+
+trampoline:
+    jmp short startup_ap
+    times 8 - ($ - trampoline) nop      
+
+    .pagemap       dq 0     
+    .gdtr_limit    dw 0     
+    .gdtr_base     dq 0     
+    .temp_stack    dd 0     
+    .start_stack   dq 0     
+    .start_address dq 0      
+
+startup_ap:
     cli
-    cld
-
-    ; Load null IDT
-    o32 lidt [invalid_idt]
-
-    ; Load GDT
-    o32 lgdt [passed_info.gdtr]
-
-    ; Set segment registers
-    mov ax, 0x10
+    xor ax, ax
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
     mov ss, ax
+    mov sp, word [trampoline.temp_stack] 
 
-    ; Setup temporary stack
-    mov esp, [passed_info.temp_stack]
+    mov eax, dword [trampoline.pagemap]
+    mov cr3, eax                           
 
-    ; Enter protected mode
-    mov eax, cr0
-    or eax, 1       ; PE
-    mov cr0, eax
-    jmp 0x08:pm_start
-
-bits 32
-pm_start:
-    ; Enable PAE
     mov eax, cr4
-    or eax, 1 << 5
+    or  eax, 1 << 5                        ; CR4.PAE
     mov cr4, eax
 
-    ; Load page tables
-    mov eax, [passed_info.pagemap]
-    mov cr3, eax
-
-    ; Enable long mode via EFER
-    mov ecx, 0xC0000080  ; IA32_EFER
+    mov ecx, 0xC0000080                   ; IA32_EFER MSR
     rdmsr
-    or eax, 1 << 8       ; LME
+    or  eax, 1 << 8                       ; EFER.LME
     wrmsr
 
-    ; Enable paging
     mov eax, cr0
-    or eax, 1 << 31      ; PG
+    or  eax, 1 << 31 | 1                  ; CR0.PG | CR0.PE
     mov cr0, eax
 
-    ; Far jump to long mode
-    jmp 0x28:lm_start
+    lgdt [trampoline.gdtr_limit]         
 
-bits 64
-lm_start:
-    ; Set 64-bit stack
-    mov rsp, [passed_info.start_stack]
+    jmp 0x08:long_mode_entry
 
-    ; Jump to start_address (absolute jump)
-    mov rax, [passed_info.start_address]
-    jmp rax
+USE64
+long_mode_entry:
+    mov ax, 0x10        
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
 
-    hlt
+    mov rsp, [trampoline.start_stack]      
+    mov rax, [trampoline.start_address]    
+    jmp rax                               
 
-invalid_idt:
-    dw 0
-    dd 0
+SECTION .rodata
+align 8
+gdt:
+    dq 0                                   
+    dq 0x00AF9A000000FFFF                  
+    dq 0x00AF92000000FFFF                  
+gdt_end:
 
-align 16
-passed_info:
-    .pagemap:       dq 0
-    .gdtr:
-        dw 0
-        dq 0
-    .temp_stack:    dd 0
-    .start_stack:   dq 0
-    .start_address: dq 0
-
-smp_trampoline_end:
-
-global smp_trampoline_size
-smp_trampoline_size dq smp_trampoline_end - smp_trampoline_start
-
-section .note.GNU-stack noalloc noexec nowrite progbits
+gdtr:
+    dw gdt_end - gdt - 1
+    dq gdt

@@ -9,7 +9,7 @@ use crate::{print, println};
 use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use core::{iter, ptr};
+use core::{iter, mem, ptr};
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -28,7 +28,7 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
-pub const TIMER_FREQ: u64 = 2400;
+pub const TIMER_FREQ: u64 = 1200;
 
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;
@@ -38,21 +38,34 @@ const PIT_MODE_PORT: u16 = 0x61;
 const TRAMPOLINE_BASE: u64 = 0x0000_8000;
 const TRAMPOLINE_STEP: u64 = 0x1000;
 const AP_STACK_SIZE: usize = 1024 * 1024;
-/// dq (8 bytes)
-pub const OFFSET_PAGEMAP: usize     = 0x00; 
-/// dw (2 bytes)
-pub const OFFSET_GDTR_LIMIT: usize  = 0x08; 
-/// dq (8 bytes, unaligned)
-pub const OFFSET_GDTR_BASE: usize   = 0x0A; 
-/// dd (4 bytes)
-pub const OFFSET_TEMP_STACK: usize  = 0x12;
-/// dq (8 bytes)
-pub const OFFSET_START_STACK: usize = 0x16; 
-/// dq (8 bytes)
-pub const OFFSET_START_ADDRESS: usize   = 0x1E;
 
+const PAGEMAP_OFF: usize = 0x08;
+const GDTR_LIMIT_OFF: usize = 0x10;
+const GDTR_BASE_OFF: usize = 0x12;
+const TEMP_STACK_OFF: usize = 0x1A;
+const START_STACK_OFF: usize = 0x1E;
+const START_ADDR_OFF: usize = 0x26;
 
-pub const SIZE_PASSED_INFO: usize   = 0x26;
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct PassedInfo {
+    pub pagemap: u64,
+    pub gdtr_limit: u16,
+    pub gdtr_base: u64,
+    pub temp_stack: u32,
+    pub start_stack: u64,
+    pub start_address: u64,
+}
+
+// Symbols exported by `ap_startup.o
+
+extern "C" {
+    pub static smp_trampoline_start: u8;
+    pub static smp_trampoline_end: u8;
+    pub static smp_trampoline_size: u64;
+
+    pub static mut passed_info: PassedInfo;
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -64,7 +77,12 @@ pub enum InterruptIndex {
     SecondaryDrive = PIC_1_OFFSET + 0xF,
     SysCall = PIC_1_OFFSET + 0x60,
 }
-
+pub fn get_current_logical_id() -> u8 {
+    let info = get_cpu_info();
+    info.get_feature_info()
+        .expect("cpu id not available?")
+        .initial_local_apic_id()
+}
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
@@ -149,7 +167,7 @@ impl ApicErrors {
 }
 
 pub trait LocalApic {
-    fn init(&self);
+    unsafe fn init(&self, logical_id: u8);
     fn init_timer(&self);
     fn end_interrupt(&self);
     unsafe fn send_ipi(&self, apic_id: u8, kind: IpiKind);
@@ -175,11 +193,21 @@ impl Lapic {
 }
 
 impl LocalApic for Lapic {
-    fn init(&self) {
-        unsafe {
-            let svr = self.ptr().add(APICOffset::Svr as usize / 4);
-            svr.write_volatile(svr.read_volatile() | 0x100);
-        }
+    unsafe fn init(&self, logical_id: u8) {
+        let base = self.ptr();
+
+        // 1. enable LAPIC (SVR)
+        let svr = base.add(APICOffset::Svr as usize / 4);
+        svr.write_volatile(svr.read_volatile() | 0x100);
+
+        // 2. flat logical mode (DFR = 0xFFFF_FFFF, LDR = bit per CPU)
+        base.add(APICOffset::Dfr as usize / 4)
+            .write_volatile(0xFFFF_FFFF);
+        base.add(APICOffset::Ldr as usize / 4)
+            .write_volatile((logical_id as u32) << 24);
+
+        // 3. accept all interrupts
+        base.add(APICOffset::Tpr as usize / 4).write_volatile(0);
     }
 
     fn init_timer(&self) {
@@ -284,149 +312,126 @@ impl ApicImpl {
         })
     }
     pub fn init_apic_full() -> Result<(), ApicErrors> {
-        x86_64::instructions::interrupts::disable();
+        use core::sync::atomic::Ordering;
+        use x86_64::instructions::interrupts;
 
-        {
-            if APIC.lock().is_some() {
-                return Err(ApicErrors::AlreadyInit);
+        interrupts::disable();
+
+        // Already installed?  Nothing to do.
+        if APIC.lock().is_some() {
+            interrupts::enable();
+            return Err(ApicErrors::AlreadyInit);
+        }
+
+        let first_time = !USE_APIC.load(Ordering::SeqCst);
+
+        let apic = ApicImpl::new()?;
+
+        unsafe {
+            if apic.apic_info.also_has_legacy_pics {
+                unsafe {
+                    PICS.lock().disable();
+                }
             }
-        }
 
-        match ApicImpl::new() {
-            Ok(apic) => unsafe {
-                apic.init_local();
-                apic.lapic.init_timer();
+            let logical_id = get_current_logical_id();
+            apic.lapic.init(logical_id);
+            apic.lapic.init_timer();
+
+            if first_time {
                 apic.ioapic.init_keyboard();
-                APIC.lock().replace(apic);
-                USE_APIC.store(true, Ordering::SeqCst);
-            },
-            Err(e) => return Err(e),
+            }
+            APIC.lock().replace(apic);
+            USE_APIC.store(true, Ordering::SeqCst);
         }
 
-        x86_64::instructions::interrupts::enable();
+        interrupts::enable();
         Ok(())
     }
 
-    fn init_local(&self) {
-        if self.apic_info.also_has_legacy_pics {
-            unsafe {
-                PICS.lock().disable();
-            }
-        }
-        self.lapic.init();
-    }
     pub fn end_interrupt(&self) {
         self.lapic.end_interrupt();
     }
 
-pub fn start_aps(&self) {
-    use x86_64::structures::gdt::SegmentSelector;
-
-    // Manually defined GDT with flat 32-bit and 64-bit code/data segments
-    static GDT: [u64; 4] = [
-        0x0000000000000000, // Null
-        0x00CF9A000000FFFF, // 0x08: 32-bit code
-        0x00CF92000000FFFF, // 0x10: 32-bit data
-        0x00AF9A000000FFFF, // 0x28: 64-bit code
-    ];
-
-    // Fixed GDT location in low memory (must be below 0x7000)
-    const GDT_PHYS_ADDR: u64 = 0x6000;
-
-    // Prepare GDTR to load into the trampoline
-    let gdtr = DescriptorTablePointer {
-        base: VirtAddr::new(GDT_PHYS_ADDR),
-        limit: (core::mem::size_of::<[u64; 4]>() - 1) as u16,
-    };
-
-    unsafe {
-        ptr::copy_nonoverlapping(
-            GDT.as_ptr() as *const u8,
-            GDT_PHYS_ADDR as *mut u8,
-            core::mem::size_of_val(&GDT),
-        );
-    }
-
-    let apics = ACPI_TABLES
-        .get_plat_info()
-        .expect("bad interrupt model")
-        .processor_info
-        .expect("bad interrupt model")
-        .application_processors;
-
-    for (idx, apic) in apics.iter().enumerate() {
-        let tramp_phys = PhysAddr::new(TRAMPOLINE_BASE + (idx as u64) * TRAMPOLINE_STEP);
-
-        identity_map_page(
-            tramp_phys,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
-        )
-        .expect("identity-map for trampoline failed");
-        identity_map_page(
-            PhysAddr::new(0x7000),
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
-        )
-        .expect("identity-map for stack failed");
+    pub fn start_aps(&self) {
         identity_map_page(
             PhysAddr::new(0x6000),
+            0x3000,
             PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
         )
-        .expect("identity-map for temp gdt failed");
+        .expect("map low RAM");
 
+        const GDT_PHYS: u64 = 0x6000;
+        static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00AF_9200_0000_FFFF];
         unsafe {
             ptr::copy_nonoverlapping(
-                AP_STARTUP_CODE.as_ptr(),
-                tramp_phys.as_u64() as *mut u8,
-                AP_STARTUP_CODE.len(),
+                GDT.as_ptr() as *const u8,
+                GDT_PHYS as *mut u8,
+                mem::size_of_val(&GDT),
             );
         }
-        assert!(
-            AP_STARTUP_CODE.len() <= 0x1000,
-            "trampoline bigger than one page"
-        );
+        let gdtr = DescriptorTablePointer {
+            base: VirtAddr::new(GDT_PHYS),
+            limit: (mem::size_of::<[u64; 3]>() - 1) as u16,
+        };
 
-        let stack_top = allocate_kernel_stack(AP_STACK_SIZE as u64)
-            .expect("could not allocate AP stack")
-            .as_u64();
+        let apics = ACPI_TABLES
+            .get_plat_info()
+            .expect("bad interrupt model")
+            .processor_info
+            .expect("bad interrupt model")
+            .application_processors;
 
-        unsafe {
-            let (frame, _flags): (PhysFrame, u16) = Cr3::read_raw();
-            let cr3_val = frame.start_address().as_u64();
-            let base = tramp_phys.as_u64() as *mut u8;
+        for (idx, apic) in apics.iter().enumerate() {
+            let tramp_phys = PhysAddr::new(TRAMPOLINE_BASE);
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    AP_STARTUP_CODE.as_ptr(),
+                    tramp_phys.as_u64() as *mut u8,
+                    AP_STARTUP_CODE.len(),
+                );
+            }
+            unsafe {
+                let info = tramp_phys.as_u64() as *mut u8;
 
-            #[inline(always)]
-            unsafe fn poke<T: Copy>(base: *mut u8, off: usize, val: T) {
-                ptr::write_unaligned(base.add(off) as *mut T, val);
+                let (frame, _flags): (PhysFrame, u16) = Cr3::read_raw();
+                ptr::write_unaligned(
+                    info.add(PAGEMAP_OFF) as *mut u64,
+                    frame.start_address().as_u64(),
+                );
+
+                ptr::write_unaligned(info.add(GDTR_LIMIT_OFF) as *mut u16, gdtr.limit);
+                ptr::write_unaligned(info.add(GDTR_BASE_OFF) as *mut u64, gdtr.base.as_u64());
+
+                ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, 0x7000u32);
+
+                let stack_top = allocate_kernel_stack(AP_STACK_SIZE as u64)
+                    .expect("AP stack")
+                    .as_u64();
+                ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
+
+                ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as u64);
             }
 
-            poke::<u64>(base, OFFSET_PAGEMAP, cr3_val);
-            poke::<u16>(base, OFFSET_GDTR_LIMIT, gdtr.limit);
-            poke::<u64>(base, OFFSET_GDTR_BASE, gdtr.base.as_u64());
-            poke::<u32>(base, OFFSET_TEMP_STACK, 0x00007000);
-            poke::<u64>(base, OFFSET_START_STACK, stack_top);
-            poke::<u64>(base, OFFSET_START_ADDRESS, ap_startup as u64);
-        }
+            unsafe {
+                self.lapic.send_ipi(apic.local_apic_id as u8, IpiKind::Init);
+                wait_millis(10);
 
-        unsafe {
-            self.lapic.send_ipi(apic.local_apic_id as u8, IpiKind::Init);
-            wait_millis(10);
-
-            for _ in 0..2 {
                 self.lapic.send_ipi(
                     apic.local_apic_id as u8,
                     IpiKind::Startup {
                         vector_phys_addr: tramp_phys,
                     },
                 );
-                wait_millis(10);
+                wait_millis(1);
             }
         }
     }
 }
-}
 
 extern "C" fn ap_startup() -> ! {
     loop {
+        //TODO: Set to same gdt, idt, and scheduler as the BSP
     }
 }
 
