@@ -10,7 +10,7 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::PrivilegeLevel;
 
 lazy_static! {
-    static ref IDT: InterruptDescriptorTable = unsafe{
+    pub static ref IDT: InterruptDescriptorTable = unsafe{
         let mut idt = InterruptDescriptorTable::new();
         idt.divide_error.set_handler_fn(exception_handlers::divide_by_zero_fault);
         idt.debug.set_handler_fn(exception_handlers::debug_exception);

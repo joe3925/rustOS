@@ -1,4 +1,5 @@
-use crate::gdt::GDT;
+use crate::cpu::get_cpu_info;
+use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::{
      allocate_kernel_stack, KERNEL_STACK_ALLOCATOR
 };
@@ -24,6 +25,9 @@ pub struct Task {
 }
 impl Task {
 pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_pointer: VirtAddr, parent_pid: u64) -> Self {
+    let gdt = PER_CPU_GDT.lock();
+    let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id();
+
     let stack_top = stack_pointer.as_u64();
 
     let mut state = State::new(0);
@@ -36,8 +40,8 @@ pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_poi
         *stack_ptr = kernel_task_end as u64;
     }
 
-    state.cs = GDT.1.user_code_selector.0 as u64 | 3;
-    state.ss = GDT.1.user_data_selector.0 as u64 | 3;
+    state.cs = gdt.selectors_per_cpu.get(id as usize).expect("").user_code_selector.0 as u64 | 3;
+    state.ss = gdt.selectors_per_cpu.get(id as usize).expect("").user_data_selector.0 as u64 as u64 | 3;
 
     println!(
         "User-mode task created with RIP {:X}, STACK {:X}",
@@ -56,6 +60,8 @@ pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_poi
     }
 }
 pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String, parent_pid: u64) -> Self {
+    let gdt = PER_CPU_GDT.lock();
+    let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id();
     let stack_top = unsafe { allocate_kernel_stack(stack_size) }
         .expect("Failed to allocate kernel-mode stack");
 
@@ -69,8 +75,8 @@ pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String, parent_
         *stack_ptr = kernel_task_end as u64;
     }
 
-    state.cs = GDT.1.kernel_code_selector.0 as u64;
-    state.ss = GDT.1.kernel_data_selector.0 as u64;
+    state.cs = gdt.selectors_per_cpu.get(id as usize).expect("").kernel_code_selector.0 as u64;
+    state.ss = gdt.selectors_per_cpu.get(id as usize).expect("").kernel_data_selector.0 as u64;
 
     println!(
         "Kernel-mode task created with RIP {:X}, STACK {:X}",

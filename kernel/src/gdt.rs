@@ -1,33 +1,67 @@
+
+use core::mem::MaybeUninit;
+use core::ptr::{null_mut, write_volatile};
+use core::{mem, ptr};
+
+use alloc::sync::Arc;
+use alloc::vec::{self, Vec};
 use lazy_static::lazy_static;
+use spin::Mutex;
 use x86_64::instructions::segmentation::SS;
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
+use x86_64::structures::paging::PageTableFlags;
 use x86_64::structures::tss::TaskStateSegment;
+use x86_64::structures::DescriptorTablePointer;
 use x86_64::VirtAddr;
+
+use crate::cpu::get_cpu_info;
+use crate::memory::paging::{allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE};
+use crate::println;
+use crate::structs::per_core_storage::PCS;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;
 
-
-
 lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
+    pub static ref PER_CPU_GDT: Mutex<(GDTTracker)> = Mutex::new(GDTTracker::new());
+}
 
-        static mut TIMER_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];
-        static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];
-        static mut PRIVILEGE_STACK: [u8; KERNEL_STACK_SIZE as usize] = [0; KERNEL_STACK_SIZE as usize];
+pub struct GDTTracker {
+    pub gdt_array: PCS<*const GlobalDescriptorTable>,
+    pub selectors_per_cpu: PCS<Selectors>,
+    pub base: *mut u8,
+    pub size: usize,
+}
+unsafe impl Send for GDTTracker {}
+impl GDTTracker {
+    pub fn new() -> Self {
+        let base = allocate_auto_kernel_range_mapped(
+            0x1000,
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+        )
+        .expect("failed to alloc GDT page")
+        .as_mut_ptr::<u8>();
+        GDTTracker {
+            gdt_array: PCS::new( ),
+            selectors_per_cpu: PCS::new( ),
+            base,
+            size: 0,
+        }
+    }
+    pub unsafe fn init_gdt(&mut self) {
+        static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_SIZE as usize] =
+            [0; KERNEL_STACK_SIZE as usize];
 
-        tss.interrupt_stack_table[TIMER_IST_INDEX as usize] = unsafe {
-            let stack_end = VirtAddr::new(TIMER_STACK.as_ptr() as u64 + KERNEL_STACK_SIZE as u64);
-            let stack_start = stack_end - KERNEL_STACK_SIZE;
-            println!(
-                "TIMER_STACK: start = 0x{:x}, end = 0x{:x}",
-                stack_start.as_u64(),
-                stack_end.as_u64()
-            );
-            stack_end
-        };
+        // --- Step 1: Allocate and initialize per-core TSS ---
+        let tss_size = core::mem::size_of::<TaskStateSegment>();
+        let tss_ptr = self.base.add(self.size) as *mut TaskStateSegment;
+        ptr::write(tss_ptr, TaskStateSegment::new());
+        let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
 
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = unsafe {
+        // Stacks
+        let timer_stack =
+            allocate_kernel_stack(KERNEL_STACK_SIZE).expect("Failed to alloc timer stack");
+        let double_fault_stack = unsafe {
             let stack_end =
                 VirtAddr::new(DOUBLE_FAULT_STACK.as_ptr() as u64 + KERNEL_STACK_SIZE as u64);
             let stack_start = stack_end - KERNEL_STACK_SIZE;
@@ -38,77 +72,57 @@ lazy_static! {
             );
             stack_end
         };
+        let privilege_stack =
+            allocate_kernel_stack(KERNEL_STACK_SIZE).expect("Failed to alloc privilege stack ");
 
-        // (used when transitioning from ring 3 to ring 0).
-        tss.privilege_stack_table[0] = unsafe {
-            let stack_end =
-                VirtAddr::new(PRIVILEGE_STACK.as_ptr() as u64 + KERNEL_STACK_SIZE as u64);
-            let stack_start = stack_end - KERNEL_STACK_SIZE;
-            println!(
-                "PRIVILEGE_STACK: start = 0x{:x}, end = 0x{:x}",
-                stack_start.as_u64(),
-                stack_end.as_u64()
-            );
-            stack_end
-        };
+        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] =
+            timer_stack + KERNEL_STACK_SIZE;
+        tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            double_fault_stack + KERNEL_STACK_SIZE;
+        tss_static.privilege_stack_table[0] = privilege_stack + KERNEL_STACK_SIZE;
 
-        tss
-    };
-}
+        let tss_size = core::mem::size_of::<TaskStateSegment>();
+        let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct
+        let gdt_size_bytes = gdt_max_entries * mem::size_of::<u64>();
+
+        // Compute raw pointer to GDT region
+        let gdt_ptr_base = self.base.add(self.size + tss_size) as *mut GlobalDescriptorTable;
+        ptr::write(gdt_ptr_base, GlobalDescriptorTable::new());
+
+        let kernel_code_selector = (*gdt_ptr_base).append(Descriptor::kernel_code_segment());
+        let kernel_data_selector = (*gdt_ptr_base).append(Descriptor::kernel_data_segment());
+        let user_code_selector = (*gdt_ptr_base).append(Descriptor::user_code_segment());
+        let user_data_selector = (*gdt_ptr_base).append(Descriptor::user_data_segment());
+        let tss_selector = (*gdt_ptr_base).append(Descriptor::tss_segment(tss_static));
+        (*gdt_ptr_base).load();
 
 
-use crate::memory::paging::KERNEL_STACK_SIZE;
-use crate::println;
-use x86_64::structures::gdt::SegmentSelector;
-use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
+        // Update allocation offset
+        self.size += tss_size + gdt_size_bytes;
 
-lazy_static! {
-    pub static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
+        // --- Step 3: Load segments ---
+        use x86_64::instructions::segmentation::{Segment, CS, SS};
+        use x86_64::instructions::tables::load_tss;
 
-        // Kernel mode segments
-        let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
-        let kernel_data_selector = gdt.append(Descriptor::kernel_data_segment());
-
-        // User mode segments (ring 3)
-        let user_code_selector = gdt.append(Descriptor::user_code_segment());
-
-        let user_data_selector = gdt.append(Descriptor::user_data_segment());
-
-        let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
-
-        (
-            gdt,
-            Selectors {
+        CS::set_reg(kernel_code_selector);
+        SS::set_reg(kernel_data_selector);
+        load_tss(tss_selector);
+        let selectors =             Selectors {
                 kernel_code_selector,
                 kernel_data_selector,
                 user_code_selector,
                 user_data_selector,
                 tss_selector,
-            }
-        )
-    };
+            };
+        let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id() as usize;
+        self.gdt_array.init(id, gdt_ptr_base);
+        self.selectors_per_cpu.init(id, selectors);
+    }
 }
-
 pub struct Selectors {
     pub(crate) kernel_code_selector: SegmentSelector,
     pub(crate) kernel_data_selector: SegmentSelector,
     pub(crate) user_code_selector: SegmentSelector,
     pub(crate) user_data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
-}
-
-
-pub fn init() {
-    use x86_64::instructions::segmentation::{Segment, CS};
-    use x86_64::instructions::tables::load_tss;
-
-    GDT.0.load();
-
-    unsafe {
-        CS::set_reg(GDT.1.kernel_code_selector);
-        SS::set_reg(GDT.1.kernel_data_selector);
-
-        load_tss(GDT.1.tss_selector);
-    }
 }

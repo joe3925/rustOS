@@ -382,7 +382,7 @@ pub fn allocate_kernel_range(base: u64, size: u64) -> Result<VirtAddr, RangeAllo
     let addr = KERNEL_RANGE_TRACKER.alloc(base, size)?;
     Ok(addr)
 }
-
+/// Allocates whatever kernel range addr is free 
 pub fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageTableFlags,
@@ -406,7 +406,7 @@ pub fn allocate_auto_kernel_range_mapped(
         Err(MapToError::FrameAllocationFailed)
     }
 }
-
+/// Attempts an allocation on a given addr fails if not free 
 pub fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,

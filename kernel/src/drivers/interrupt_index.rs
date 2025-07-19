@@ -3,11 +3,14 @@ use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
 use crate::drivers::ACPI::ACPI_TABLES;
-use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, virtual_to_phys};
+use crate::gdt::PER_CPU_GDT;
+use crate::idt::IDT;
+use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, unmap_range, virtual_to_phys};
 use crate::util::{boot_info, AP_STARTUP_CODE};
 use crate::{print, println};
 use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
+use x86_64::instructions::tables::sgdt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{iter, mem, ptr};
 use pic8259::ChainedPics;
@@ -45,6 +48,8 @@ const GDTR_BASE_OFF: usize = 0x12;
 const TEMP_STACK_OFF: usize = 0x1A;
 const START_STACK_OFF: usize = 0x1E;
 const START_ADDR_OFF: usize = 0x26;
+const LONGMODE_GDTR_LIMIT_OFF: usize = 0x2E;
+const LONGMODE_GDTR_BASE_OFF: usize = 0x30;
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
@@ -55,16 +60,8 @@ pub struct PassedInfo {
     pub temp_stack: u32,
     pub start_stack: u64,
     pub start_address: u64,
-}
-
-// Symbols exported by `ap_startup.o
-
-extern "C" {
-    pub static smp_trampoline_start: u8;
-    pub static smp_trampoline_end: u8;
-    pub static smp_trampoline_size: u64;
-
-    pub static mut passed_info: PassedInfo;
+    pub longmode_gdtr_limit: u16,
+    pub longmode_gdtr_base: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -374,6 +371,7 @@ impl ApicImpl {
             base: VirtAddr::new(GDT_PHYS),
             limit: (mem::size_of::<[u64; 3]>() - 1) as u16,
         };
+        let longmode_gdt = sgdt();
 
         let apics = ACPI_TABLES
             .get_plat_info()
@@ -411,6 +409,9 @@ impl ApicImpl {
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
 
                 ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as u64);
+                ptr::write_unaligned(info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16, longmode_gdt.limit);
+                ptr::write_unaligned(info.add(LONGMODE_GDTR_BASE_OFF) as *mut u64, longmode_gdt.base.as_u64());
+
             }
 
             unsafe {
@@ -426,10 +427,22 @@ impl ApicImpl {
                 wait_millis(1);
             }
         }
+        //TODO: properly wait for all cpus to finish 
+        wait_millis(100);
+        unmap_range(VirtAddr::new(0x6000), 0x3000);
+
     }
 }
 
 extern "C" fn ap_startup() -> ! {
+    {
+    unsafe { PER_CPU_GDT.lock().init_gdt() };
+    //IDT.load();
+
+    //unsafe { APIC.lock().as_ref().unwrap().lapic.init(get_current_logical_id()) };
+    //x86_64::instructions::interrupts::enable();
+    }
+
     loop {
         //TODO: Set to same gdt, idt, and scheduler as the BSP
     }

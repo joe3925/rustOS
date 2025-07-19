@@ -7,6 +7,7 @@ use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::executable::pe_loadable;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
+use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::SCHEDULER;
 use alloc::fmt::format;
 use alloc::string::{String, ToString};
@@ -47,7 +48,7 @@ pub unsafe fn init() {
 
     init_kernel_cr3();
 
-    gdt::init();
+    PER_CPU_GDT.lock().init_gdt();
     PICS.lock().initialize();
     load_idt();
 
