@@ -29,17 +29,12 @@ pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin"
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
+pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 pub unsafe fn init() {
     {
-        let boot_info = boot_info();
-
-        let mem_offset: VirtAddr =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-
-        let mut mapper = init_mapper(mem_offset);
-        let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        init_heap(&mut mapper, &mut frame_allocator.clone());
+        let init_lock = INIT_LOCK.lock();
+        init_heap();
 
         init_kernel_cr3();
 
@@ -60,6 +55,7 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
 
                 x86_64::instructions::interrupts::disable();
+                println!("Lock is still held {}", init_lock);
                 APIC.lock().as_ref().unwrap().start_aps();
                 x86_64::instructions::interrupts::enable();
             }

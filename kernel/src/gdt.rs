@@ -9,7 +9,7 @@ use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
 use crate::memory::paging::{
-    allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE,
+    align_up_2mib, allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE,
 };
 use crate::println;
 use crate::structs::per_core_storage::PCS;
@@ -52,10 +52,22 @@ impl GDTTracker {
         let tss_ptr = self.base.add(self.size) as *mut TaskStateSegment;
         ptr::write(tss_ptr, TaskStateSegment::new());
         let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
-
+        let kernel_stack_size = align_up_2mib(KERNEL_STACK_SIZE);
         // Stacks
         let timer_stack =
-            allocate_kernel_stack(KERNEL_STACK_SIZE).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc timer stack");
+        println!(
+            "TIMER_STACK: start = 0x{:x}, end = 0x{:x}",
+            timer_stack.as_u64(),
+            timer_stack.as_u64() + kernel_stack_size
+        );
+        let privilege_stack =
+            allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc privilege stack ");
+        println!(
+            "PRIVILEGE STACK: start = 0x{:x}, end = 0x{:x}",
+            privilege_stack.as_u64(),
+            privilege_stack.as_u64() + kernel_stack_size
+        );
         let double_fault_stack = unsafe {
             let stack_end =
                 VirtAddr::new(DOUBLE_FAULT_STACK.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64);
@@ -67,14 +79,12 @@ impl GDTTracker {
             );
             stack_end
         };
-        let privilege_stack =
-            allocate_kernel_stack(KERNEL_STACK_SIZE).expect("Failed to alloc privilege stack ");
 
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] =
-            timer_stack + KERNEL_STACK_SIZE;
+            timer_stack + kernel_stack_size;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             double_fault_stack + KERNEL_STACK_SIZE;
-        tss_static.privilege_stack_table[0] = privilege_stack + KERNEL_STACK_SIZE;
+        tss_static.privilege_stack_table[0] = privilege_stack + kernel_stack_size;
 
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct

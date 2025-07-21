@@ -6,7 +6,7 @@ use crate::drivers::interrupt_index::ApicErrors::{
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
 use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, unmap_range};
-use crate::util::{AP_STARTUP_CODE, CORE_LOCK};
+use crate::util::{AP_STARTUP_CODE, CORE_LOCK, INIT_LOCK};
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
@@ -438,6 +438,7 @@ impl ApicImpl {
 
 extern "C" fn ap_startup() -> ! {
     CORE_LOCK.fetch_add(1, Ordering::SeqCst);
+    println!("WHY WONT YOU LOCK {}", *INIT_LOCK.lock());
     {
         unsafe { PER_CPU_GDT.lock().init_gdt() };
         println!("gdt init");
