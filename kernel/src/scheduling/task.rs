@@ -1,8 +1,7 @@
 use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
-use crate::memory::paging::{
-     allocate_kernel_stack, KERNEL_STACK_ALLOCATOR
-};
+use crate::memory::paging::RangeTracker;
+use crate::memory::paging::{allocate_kernel_stack, KERNEL_STACK_ALLOCATOR};
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
 use crate::{function, println};
@@ -11,7 +10,6 @@ use alloc::string::String;
 use core::arch::asm;
 use spin::Mutex;
 use x86_64::VirtAddr;
-use crate::memory::paging::RangeTracker;
 
 #[derive(Debug, Clone)]
 pub struct Task {
@@ -21,83 +19,119 @@ pub struct Task {
     pub id: u64,
     pub terminated: bool,
     pub is_user_mode: bool,
-    pub parent_pid: u64
+    pub parent_pid: u64,
+    pub executer_id: Option<u16>,
 }
 impl Task {
-pub fn new_usermode(entry_point: usize, stack_size: u64, name: String, stack_pointer: VirtAddr, parent_pid: u64) -> Self {
-    let gdt = PER_CPU_GDT.lock();
-    let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id();
+    pub fn new_usermode(
+        entry_point: usize,
+        stack_size: u64,
+        name: String,
+        stack_pointer: VirtAddr,
+        parent_pid: u64,
+    ) -> Self {
+        let gdt = PER_CPU_GDT.lock();
+        let id = get_cpu_info()
+            .get_feature_info()
+            .expect("NO CPUID")
+            .initial_local_apic_id();
 
-    let stack_top = stack_pointer.as_u64();
+        let stack_top = stack_pointer.as_u64();
 
-    let mut state = State::new(0);
-    state.rip = entry_point as u64;
-    state.rsp = stack_top - 8;
-    state.rflags = 0x00000202;
+        let mut state = State::new(0);
+        state.rip = entry_point as u64;
+        state.rsp = stack_top - 8;
+        state.rflags = 0x00000202;
 
-    unsafe {
-        let stack_ptr = state.rsp as *mut u64;
-        *stack_ptr = kernel_task_end as u64;
+        unsafe {
+            let stack_ptr = state.rsp as *mut u64;
+            *stack_ptr = kernel_task_end as u64;
+        }
+
+        state.cs = gdt
+            .selectors_per_cpu
+            .get(id as usize)
+            .expect("")
+            .user_code_selector
+            .0 as u64
+            | 3;
+        state.ss = gdt
+            .selectors_per_cpu
+            .get(id as usize)
+            .expect("")
+            .user_data_selector
+            .0 as u64 as u64
+            | 3;
+
+        println!(
+            "User-mode task created with RIP {:X}, STACK {:X}",
+            state.rip, state.rsp,
+        );
+
+        Self {
+            name,
+            context: state,
+            stack_start: stack_top,
+            id: 0,
+            terminated: false,
+            is_user_mode: true,
+            parent_pid,
+            executer_id: None,
+        }
     }
+    pub fn new_kernelmode(
+        entry_point: usize,
+        stack_size: u64,
+        name: String,
+        parent_pid: u64,
+    ) -> Self {
+        let gdt = PER_CPU_GDT.lock();
+        let id = get_cpu_info()
+            .get_feature_info()
+            .expect("NO CPUID")
+            .initial_local_apic_id();
+        let stack_top = unsafe { allocate_kernel_stack(stack_size) }
+            .expect("Failed to allocate kernel-mode stack");
 
-    state.cs = gdt.selectors_per_cpu.get(id as usize).expect("").user_code_selector.0 as u64 | 3;
-    state.ss = gdt.selectors_per_cpu.get(id as usize).expect("").user_data_selector.0 as u64 as u64 | 3;
+        let mut state = State::new(0);
+        state.rip = entry_point as u64;
+        state.rsp = stack_top.as_u64() - 8;
+        state.rflags = 0x00000202;
 
-    println!(
-        "User-mode task created with RIP {:X}, STACK {:X}",
-        state.rip,
-        state.rsp,
-    );
+        unsafe {
+            let stack_ptr = state.rsp as *mut u64;
+            *stack_ptr = kernel_task_end as u64;
+        }
 
-    Self {
-        name,
-        context: state,
-        stack_start: stack_top,
-        id: 0,
-        terminated: false,
-        is_user_mode: true,
-        parent_pid
+        state.cs = gdt
+            .selectors_per_cpu
+            .get(id as usize)
+            .expect("")
+            .kernel_code_selector
+            .0 as u64;
+        state.ss = gdt
+            .selectors_per_cpu
+            .get(id as usize)
+            .expect("")
+            .kernel_data_selector
+            .0 as u64;
+
+        println!(
+            "Kernel-mode task created with RIP {:X}, STACK {:X}",
+            state.rip, state.rsp,
+        );
+
+        Self {
+            name,
+            context: state,
+            stack_start: stack_top.as_u64(),
+            id: 0,
+            terminated: false,
+            is_user_mode: false,
+            parent_pid,
+            executer_id: None,
+        }
     }
-}
-pub fn new_kernelmode(entry_point: usize, stack_size: u64, name: String, parent_pid: u64) -> Self {
-    let gdt = PER_CPU_GDT.lock();
-    let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id();
-    let stack_top = unsafe { allocate_kernel_stack(stack_size) }
-        .expect("Failed to allocate kernel-mode stack");
-
-    let mut state = State::new(0);
-    state.rip = entry_point as u64;
-    state.rsp = stack_top.as_u64() - 8;
-    state.rflags = 0x00000202;
-
-    unsafe {
-        let stack_ptr = state.rsp as *mut u64;
-        *stack_ptr = kernel_task_end as u64;
-    }
-
-    state.cs = gdt.selectors_per_cpu.get(id as usize).expect("").kernel_code_selector.0 as u64;
-    state.ss = gdt.selectors_per_cpu.get(id as usize).expect("").kernel_data_selector.0 as u64;
-
-    println!(
-        "Kernel-mode task created with RIP {:X}, STACK {:X}",
-        state.rip,
-        state.rsp,
-    );
-
-
-
-    Self {
-        name,
-        context: state,
-        stack_start: stack_top.as_u64(),
-        id: 0,
-        terminated: false,
-        is_user_mode: false,
-        parent_pid
-    }
-}
-
-
 
     pub fn update_from_context(&mut self, context: State) {
         self.context = context;

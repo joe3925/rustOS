@@ -47,7 +47,7 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
     unsafe {
         asm!("mov {0}, r8", lateout(reg) param1);
     }
-    unsafe {        
+    unsafe {
         asm!("mov {0}, r9", lateout(reg) param2);
     }
     unsafe {

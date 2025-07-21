@@ -263,7 +263,6 @@ macro_rules! println {
     };
 }
 pub(crate) unsafe fn print_queue() {
-    CONSOLE.force_unlock();
     let mut console = CONSOLE.lock();
     while !QUEUE.is_empty() {
         console.print(&(QUEUE.pop_front().unwrap()))

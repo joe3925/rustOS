@@ -5,17 +5,19 @@ use crate::drivers::interrupt_index::ApicErrors::{
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
-use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, unmap_range, virtual_to_phys};
-use crate::util::{boot_info, AP_STARTUP_CODE};
-use crate::{print, println};
+use crate::memory::paging::{
+    self, allocate_kernel_stack, identity_map_page, unmap_range, virtual_to_phys,
+};
+use crate::util::{boot_info, AP_STARTUP_CODE, CORE_LOCK};
+use crate::{print, println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::{Apic, TriggerMode};
 use alloc::alloc::Global;
-use x86_64::instructions::tables::sgdt;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{iter, mem, ptr};
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
+use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::structures::DescriptorTablePointer;
@@ -409,9 +411,14 @@ impl ApicImpl {
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
 
                 ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as u64);
-                ptr::write_unaligned(info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16, longmode_gdt.limit);
-                ptr::write_unaligned(info.add(LONGMODE_GDTR_BASE_OFF) as *mut u64, longmode_gdt.base.as_u64());
-
+                ptr::write_unaligned(
+                    info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16,
+                    longmode_gdt.limit,
+                );
+                ptr::write_unaligned(
+                    info.add(LONGMODE_GDTR_BASE_OFF) as *mut u64,
+                    longmode_gdt.base.as_u64(),
+                );
             }
 
             unsafe {
@@ -427,23 +434,34 @@ impl ApicImpl {
                 wait_millis(1);
             }
         }
-        //TODO: properly wait for all cpus to finish 
+        //TODO: properly wait for all cpus to finish
         wait_millis(100);
         unmap_range(VirtAddr::new(0x6000), 0x3000);
-
     }
 }
 
 extern "C" fn ap_startup() -> ! {
+    CORE_LOCK.fetch_add(1, Ordering::SeqCst);
     {
-    unsafe { PER_CPU_GDT.lock().init_gdt() };
-    //IDT.load();
+        unsafe { PER_CPU_GDT.lock().init_gdt() };
+        println!("gdt init");
+        IDT.load();
+        println!("idt load");
 
-    //unsafe { APIC.lock().as_ref().unwrap().lapic.init(get_current_logical_id()) };
-    //x86_64::instructions::interrupts::enable();
+        unsafe {
+            APIC.lock()
+                .as_ref()
+                .unwrap()
+                .lapic
+                .init(get_current_logical_id())
+        };
+        x86_64::instructions::interrupts::enable();
     }
+    CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
+    while (!KERNEL_INITIALIZED.load(Ordering::SeqCst)) {}
 
     loop {
+
         //TODO: Set to same gdt, idt, and scheduler as the BSP
     }
 }

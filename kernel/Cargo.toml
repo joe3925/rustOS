@@ -34,6 +34,7 @@ goblin = { version = "0.9.3", features = [
     "archive",
     "te",
 ], default-features = false }
+hashbrown = "0.15.4"
 rustos-api = { path = "../rustos-api/" }
 [dependencies.lazy_static]
 version = "1.0"

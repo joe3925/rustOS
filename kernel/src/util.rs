@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
 use core::ptr::addr_of;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use x86_64::structures::paging::PageTableFlags;
@@ -35,86 +35,91 @@ use x86_64::VirtAddr;
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
+pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 
 pub unsafe fn init() {
-    let boot_info = boot_info();
-
-    let mem_offset: VirtAddr =
-        VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-
-    let mut mapper = init_mapper(mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-    init_heap(&mut mapper, &mut frame_allocator.clone());
-
-    init_kernel_cr3();
-
-    PER_CPU_GDT.lock().init_gdt();
-    PICS.lock().initialize();
-    load_idt();
-
-    println!("PIC loaded");
-
-    // TSC calibration
-    let tsc_start = cpu::get_cycles();
-    wait_using_pit_50ms();
-    let tsc_end = cpu::get_cycles();
-    calibrate_tsc(tsc_start, tsc_end, 50);
-
-    match ApicImpl::init_apic_full() {
-        Ok(_) => {
-            println!("APIC transition successful!");
-
-            x86_64::instructions::interrupts::disable();
-            APIC.lock().as_ref().unwrap().start_aps();
-            x86_64::instructions::interrupts::enable();
-        }
-        Err(err) => {
-            println!("APIC transition failed {}!", err.to_str());
-        }
-    }
-
-    test_full_heap();
-
     {
-        let mut drives = DRIVECOLLECTION.lock();
-        drives.enumerate_drives();
+        let boot_info = boot_info();
 
-        match drives.drives[1].format_gpt() {
+        let mem_offset: VirtAddr =
+            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+
+        let mut mapper = init_mapper(mem_offset);
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        init_heap(&mut mapper, &mut frame_allocator.clone());
+
+        init_kernel_cr3();
+
+        PER_CPU_GDT.lock().init_gdt();
+        PICS.lock().initialize();
+        load_idt();
+
+        println!("PIC loaded");
+
+        // TSC calibration
+        let tsc_start = cpu::get_cycles();
+        wait_using_pit_50ms();
+        let tsc_end = cpu::get_cycles();
+        calibrate_tsc(tsc_start, tsc_end, 50);
+
+        match ApicImpl::init_apic_full() {
             Ok(_) => {
-                println!("Drive init successful");
-                drives.drives[1]
-                    .add_partition(
-                        1024 * 1024 * 1024 * 9,
-                        MicrosoftBasicData.to_u8_16(),
-                        "MAIN VOLUME".to_string(),
-                    )
-                    .expect("TODO: panic message");
+                println!("APIC transition successful!");
+
+                x86_64::instructions::interrupts::disable();
+                APIC.lock().as_ref().unwrap().start_aps();
+                x86_64::instructions::interrupts::enable();
             }
             Err(err) => {
-                println!(
-                    "Error init drive {} {}",
-                    (drives.drives)[1].info.model,
-                    err.to_str()
-                )
+                println!("APIC transition failed {}!", err.to_str());
             }
         }
-    }
-    {
-        let mut partitions = VOLUMES.lock();
-        partitions.enumerate_parts();
 
-        match partitions
-            .find_partition_by_name("MAIN VOLUME")
-            .unwrap()
-            .format()
+        test_full_heap();
+
         {
-            Ok(_) => println!("Formatted"),
-            Err(e) => println!("{:#?}", e),
-        }
-        partitions.print_parts();
-    }
+            let mut drives = DRIVECOLLECTION.lock();
+            drives.enumerate_drives();
 
-    println!("Init Done");
+            match drives.drives[1].format_gpt() {
+                Ok(_) => {
+                    println!("Drive init successful");
+                    drives.drives[1]
+                        .add_partition(
+                            1024 * 1024 * 1024 * 9,
+                            MicrosoftBasicData.to_u8_16(),
+                            "MAIN VOLUME".to_string(),
+                        )
+                        .expect("TODO: panic message");
+                }
+                Err(err) => {
+                    println!(
+                        "Error init drive {} {}",
+                        (drives.drives)[1].info.model,
+                        err.to_str()
+                    )
+                }
+            }
+        }
+        {
+            let mut partitions = VOLUMES.lock();
+            partitions.enumerate_parts();
+
+            match partitions
+                .find_partition_by_name("MAIN VOLUME")
+                .unwrap()
+                .format()
+            {
+                Ok(_) => println!("Formatted"),
+                Err(e) => println!("{:#?}", e),
+            }
+            partitions.print_parts();
+        }
+        println!("Init Done");
+    }
+    while (CORE_LOCK.load(Ordering::SeqCst) != 0) {
+        asm!("hlt");
+    }
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     loop {
         asm!("hlt");
@@ -182,10 +187,6 @@ pub fn kernel_main() {
             }
         }
     }
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info().memory_regions);
-    let frame: PhysFrame<Size4KiB> = frame_allocator.allocate_frame().unwrap();
-
-    println!("{:#x}", frame.start_address());
 
     // if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
     //     loadable.load();

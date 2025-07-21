@@ -1,4 +1,3 @@
-
 use core::mem::MaybeUninit;
 use core::ptr::{null_mut, write_volatile};
 use core::{mem, ptr};
@@ -15,7 +14,9 @@ use x86_64::structures::DescriptorTablePointer;
 use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::{allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE};
+use crate::memory::paging::{
+    allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE,
+};
 use crate::println;
 use crate::structs::per_core_storage::PCS;
 
@@ -42,8 +43,8 @@ impl GDTTracker {
         .expect("failed to alloc GDT page")
         .as_mut_ptr::<u8>();
         GDTTracker {
-            gdt_array: PCS::new( ),
-            selectors_per_cpu: PCS::new( ),
+            gdt_array: PCS::new(),
+            selectors_per_cpu: PCS::new(),
             base,
             size: 0,
         }
@@ -96,7 +97,6 @@ impl GDTTracker {
         let tss_selector = (*gdt_ptr_base).append(Descriptor::tss_segment(tss_static));
         (*gdt_ptr_base).load();
 
-
         // Update allocation offset
         self.size += tss_size + gdt_size_bytes;
 
@@ -107,16 +107,19 @@ impl GDTTracker {
         CS::set_reg(kernel_code_selector);
         SS::set_reg(kernel_data_selector);
         load_tss(tss_selector);
-        let selectors =             Selectors {
-                kernel_code_selector,
-                kernel_data_selector,
-                user_code_selector,
-                user_data_selector,
-                tss_selector,
-            };
-        let id = get_cpu_info().get_feature_info().expect("NO CPUID").initial_local_apic_id() as usize;
-        self.gdt_array.init(id, gdt_ptr_base);
-        self.selectors_per_cpu.init(id, selectors);
+        let selectors = Selectors {
+            kernel_code_selector,
+            kernel_data_selector,
+            user_code_selector,
+            user_data_selector,
+            tss_selector,
+        };
+        let id = get_cpu_info()
+            .get_feature_info()
+            .expect("NO CPUID")
+            .initial_local_apic_id() as usize;
+        self.gdt_array.set(id, gdt_ptr_base);
+        self.selectors_per_cpu.set(id, selectors);
     }
 }
 pub struct Selectors {

@@ -1,11 +1,15 @@
+use crate::drivers::interrupt_index::get_current_logical_id;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::{KERNEL_CR3_U64, KERNEL_STACK_SIZE};
 use crate::println;
 use crate::scheduling::task::{idle_task, Task};
+use crate::structs::per_core_storage::{PCSGuard, PCS};
 use crate::util::kernel_main;
+use alloc::collections::vec_deque::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::arch::asm;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -19,16 +23,16 @@ lazy_static! {
 }
 
 pub struct Scheduler {
-    tasks: Vec<Task>,
-    current_task: AtomicUsize,
+    tasks: VecDeque<Task>,
+    current_task: PCS<u64>,
     id: u64,
 }
 
 impl Scheduler {
     pub fn new() -> Self {
         Self {
-            tasks: Vec::new(),
-            current_task: AtomicUsize::new(0),
+            tasks: VecDeque::new(),
+            current_task: PCS::new(),
             id: 0,
         }
     }
@@ -37,23 +41,23 @@ impl Scheduler {
     pub fn add_task(&mut self, mut task: Task) {
         task.id = self.id;
         self.id += 1;
-        self.tasks.push(task);
+        self.tasks.push_back(task);
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
     }
     pub fn restore_page_table(&mut self) {
-        if let Some(prorgam) = PROGRAM_MANAGER
-            .read()
-            .get(self.get_current_task().parent_pid)
-        {
+        let program_manager = PROGRAM_MANAGER.read();
+        let program_option = { program_manager.get(self.get_current_task().parent_pid) };
+        if let Some(prorgam) = program_option {
             unsafe { Cr3::write(prorgam.cr3, Cr3::read().1) };
         } else {
             // Attempt to recover
-            // Worse case we spin through all the tasks and end up with only the idle task
+            // Worst case we spin through all the tasks and end up with only the idle task
             if (self.tasks.len() > 1) {
                 let task_id = self.get_current_task().id;
                 self.delete_task(task_id);
+                self.reap_task();
                 self.schedule_next();
                 self.restore_page_table();
             }
@@ -63,7 +67,8 @@ impl Scheduler {
     // round-robin
     #[inline]
     pub fn schedule_next(&mut self) {
-        self.end_task();
+        let logical_id = get_current_logical_id() as usize;
+        self.reap_task();
         if self.tasks.len() < 1 {
             let kernel_task = Task::new_kernelmode(
                 kernel_main as usize,
@@ -75,22 +80,62 @@ impl Scheduler {
         }
 
         if self.tasks.len() > 0 {
-            let next_task = (self.current_task.load(Ordering::SeqCst) + 1) % self.tasks.len();
-            self.current_task.store(next_task, Ordering::SeqCst);
+            let cur_id = self.current_task.get(logical_id).map(|g| *g);
+
+            if let Some(id) = cur_id {
+                let current_task = self.get_task_by_id(id).unwrap();
+                current_task.executer_id = None;
+                self.reset_task_by_id(id);
+            }
+            let current_task_id: Option<u64> = self
+                .tasks
+                .iter() // borrow each Task
+                .find(|t| t.executer_id.is_none())
+                .map(|t| t.id);
+            if let Some(id) = current_task_id {
+                let task = self.get_task_by_id(id).unwrap();
+                self.current_task.set(logical_id, id);
+                self.get_current_task().executer_id = Some(logical_id as u16);
+            } else {
+                return;
+            }
         }
     }
 
     pub fn get_current_task(&mut self) -> &mut Task {
-        let index = self.current_task.load(Ordering::SeqCst);
-        &mut self.tasks[index]
+        let task_id = {
+            let guard = self
+                .current_task
+                .get(get_current_logical_id() as usize)
+                .expect("no current task for this core");
+            guard.clone()
+        };
+        self.get_task_by_id(task_id)
+            .expect("scheduler lost current task")
+    }
+    pub fn get_task_by_id(&mut self, id: u64) -> Option<&mut Task> {
+        for task in &mut self.tasks {
+            if task.id == id {
+                return Some(task);
+            }
+        }
+        None
+    }
+    pub fn reset_task_by_id(&mut self, id: u64) -> Result<(), TaskError> {
+        // Locate the index of the task (O(n))
+        if let Some(idx) = self.tasks.iter().position(|t| t.id == id) {
+            let task = self.tasks.remove(idx).expect("index just found");
+            self.tasks.push_back(task);
+            Ok(())
+        } else {
+            Err(TaskError::NotFound(id))
+        }
     }
     ///marks task for deletion will be deleted next scheduler cycle
     pub(crate) fn delete_task(&mut self, id: u64) -> Result<(), TaskError> {
-        for i in 0..self.tasks.len() {
-            if self.tasks[i].id == id {
-                self.tasks[i].terminated = true;
-                return Ok(());
-            }
+        if let Some(task) = self.get_task_by_id(id) {
+            task.terminated = true;
+            return Ok(());
         }
         Err(TaskError::NotFound(id))
     }
@@ -102,7 +147,7 @@ impl Scheduler {
         }
         None
     }
-    fn end_task(&mut self) {
+    fn reap_task(&mut self) {
         for i in (0..self.tasks.len()).rev() {
             if self.tasks[i].terminated {
                 self.tasks[i].destroy();
@@ -133,6 +178,8 @@ pub fn kernel_task_end() -> ! {
         "mov rax, {0}",          //move syscall number into rax
         "mov r8, {1}",          //first argument
         "int 0x80",
+        "2:",
+        "jmp 2b",
         in(reg) syscall_number,
         in(reg) arg1,
         );

@@ -51,11 +51,15 @@ impl<T> PCS<T> {
         })
     }
 
-    pub fn init(&self, logical_id: usize, value: T) -> PCSGuard<'_, T> {
+    pub fn set(&self, logical_id: usize, value: T) -> PCSGuard<'_, T> {
         let mut lock = self.data.lock();
 
+        // Either overwrite the existing entry or insert a new one
         let index = match lock.logical_id_map.get(&logical_id) {
-            Some(&idx) => idx,
+            Some(&idx) => {
+                lock.items[idx] = value; // replace old value
+                idx
+            }
             None => {
                 let idx = lock.items.len();
                 lock.items.push(value);
