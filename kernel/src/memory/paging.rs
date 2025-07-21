@@ -42,10 +42,18 @@ lazy_static! {
     ));
 }
 
-// Global NEXT counter (still required)
-static NEXT: Mutex<usize> = Mutex::new(0);
+pub const BOOT_MEMORY_SIZE: usize = 1024 * 1024 * 1024;
+pub static MEMORY_BITMAP: Mutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
+    Mutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
 
-const MMIO_BASE: u64 = 0xFFFF_9000_0000_0000;
+pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
+
+const FRAMES_PER_2M: usize = 512; // 2 MiB / 4 KiB
+const FRAMES_PER_1G: usize = 1 << 18; // 1 GiB / 4 KiB
+const WORDS_PER_2M: usize = FRAMES_PER_2M / 64; // 8
+const WORDS_PER_1G: usize = FRAMES_PER_1G / 64; // 4096
+
+pub const MMIO_BASE: u64 = 0xFFFF_9000_0000_0000;
 const MAX_PENDING_FREES: usize = 64;
 
 const MANAGED_KERNEL_RANGE_START: u64 = MMIO_BASE;
@@ -82,78 +90,146 @@ impl From<MapToError<Size1GiB>> for PageMapError {
     }
 }
 
+pub const fn num_frames_4k(size: usize) -> usize {
+    ((size + 0xFFF) >> 12)
+}
 #[derive(Clone)]
 
-pub struct BootInfoFrameAllocator {
-    memory_regions: &'static [MemoryRegion],
-}
+// This struct doesnt do anything anymore but remains so old code still works
+pub struct BootInfoFrameAllocator {}
 
 impl BootInfoFrameAllocator {
+    pub fn init_start(memory_regions: &'static [MemoryRegion]) {
+        let mut memory_map = (MEMORY_BITMAP.lock());
+        for region in memory_regions {
+            if region.kind != MemoryRegionKind::Usable {
+                let start_frame = (region.start >> 12) as usize;
+                let end_frame = ((region.end + 0xFFF) >> 12) as usize - 1;
+
+                if start_frame / 64 >= memory_map.len() {
+                    continue;
+                }
+
+                let first_word = start_frame / 64;
+                let last_word = end_frame / 64;
+
+                let first_mask = !0u64 << (start_frame & 63);
+                let last_mask = (!0u64) >> (63 - (end_frame & 63));
+
+                if first_word == last_word {
+                    memory_map[first_word] |= first_mask & last_mask;
+                    continue;
+                }
+
+                memory_map[first_word] |= first_mask;
+
+                for w in (first_word + 1)..last_word {
+                    memory_map[w] = !0u64;
+                }
+
+                memory_map[last_word] |= last_mask;
+            }
+        }
+        return;
+    }
     pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
-        BootInfoFrameAllocator { memory_regions }
-    }
-
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        let regions = self.memory_regions.iter();
-        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-        let addr_ranges = usable.map(|r| r.start..r.end);
-        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(4096));
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
-    }
-
-    fn usable_2mb_frames(&self) -> impl Iterator<Item = PhysFrame<Size2MiB>> {
-        let regions = self.memory_regions.iter();
-        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-        let addr_ranges = usable.map(|r| r.start..r.end);
-        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(2 * 1024 * 1024));
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
-    }
-    fn usable_1gb_frames(&self) -> impl Iterator<Item = PhysFrame<Size1GiB>> {
-        let regions = self.memory_regions.iter();
-        let usable = regions.filter(|r| r.kind == MemoryRegionKind::Usable);
-        let addr_ranges = usable.map(|r| r.start..r.end);
-        let frame_addresses = addr_ranges.flat_map(|r| (r.start..r.end).step_by(1 << 30));
-        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+        BootInfoFrameAllocator {}
     }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
-    //TODO: THis method has become an issue TOO SLOW
+    #[inline]
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let mut next = NEXT.lock();
-        let frame = self.usable_frames().nth(*next);
-        *next += 1;
-        frame
+        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+
+        for (word_idx, word) in bm.iter_mut().enumerate() {
+            if *word == u64::MAX {
+                continue; // fully allocated
+            }
+
+            // first zero bit in this word
+            let free_bit = (!*word).trailing_zeros() as usize;
+            *word |= 1u64 << free_bit; // mark allocated
+
+            let frame_idx = word_idx * 64 + free_bit;
+            let phys = (frame_idx as u64) << 12; // * 4096
+            USED_MEMORY.fetch_add(1024, Ordering::SeqCst);
+            return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
+        }
+        None
     }
 }
 
 unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
-        let mut next = NEXT.lock();
+        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+        let words = bm.len();
 
-        if *next % 512 != 0 {
-            *next += 512 - (*next % 512);
+        for (word_idx, word) in bm.iter().enumerate() {
+            if *word == u64::MAX {
+                continue; // no free bit here
+            }
+
+            // any zero‑bit in this word gives us a candidate index
+            let bit = (!*word).trailing_zeros() as usize;
+            let idx = word_idx * 64 + bit; // frame index
+            let base = idx & !(FRAMES_PER_2M - 1); // align down to 512
+
+            // check whole 2 MiB block
+            let start_w = base / 64;
+            if start_w + WORDS_PER_2M > words {
+                break; // out of bitmap
+            }
+            let all_free = bm[start_w..start_w + WORDS_PER_2M].iter().all(|w| *w == 0);
+            if !all_free {
+                continue;
+            }
+
+            // mark 512 bits allocated
+            for w in &mut bm[start_w..start_w + WORDS_PER_2M] {
+                *w = u64::MAX;
+            }
+
+            let phys = (base as u64) << 12;
+            USED_MEMORY.fetch_add(FRAMES_PER_2M * 4 * 1024, Ordering::SeqCst);
+            return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
-
-        let base_frame = self.usable_2mb_frames().nth(*next / 512);
-        *next += 512;
-
-        base_frame
+        None
     }
 }
 
 unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size1GiB>> {
-        let mut next = NEXT.lock();
+        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+        let words = bm.len();
 
-        if *next % (1 << 18) != 0 {
-            *next += (1 << 18) - (*next % (1 << 18)); // align to 1GiB (2^30 / 4096 = 2^18 pages)
+        for (word_idx, word) in bm.iter().enumerate() {
+            if *word == u64::MAX {
+                continue;
+            }
+
+            let bit = (!*word).trailing_zeros() as usize;
+            let idx = word_idx * 64 + bit;
+            let base = idx & !(FRAMES_PER_1G - 1); // align 1 GiB
+
+            let start_w = base / 64;
+            if start_w + WORDS_PER_1G > words {
+                break;
+            }
+            let all_free = bm[start_w..start_w + WORDS_PER_1G].iter().all(|w| *w == 0);
+            if !all_free {
+                continue;
+            }
+
+            for w in &mut bm[start_w..start_w + WORDS_PER_1G] {
+                *w = u64::MAX;
+            }
+
+            let phys = (base as u64) << 12;
+            USED_MEMORY.fetch_add(FRAMES_PER_1G * 4 * 1024, Ordering::SeqCst);
+            return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
-
-        let base_frame = self.usable_1gb_frames().nth(*next / (1 << 18));
-        *next += 1 << 18;
-
-        base_frame
+        None
     }
 }
 pub fn map_page(
@@ -176,7 +252,7 @@ fn map_1gib_page<M, FA>(
     addr: VirtAddr,
     flags: PageTableFlags,
     fa: &mut FA,
-) -> Result<MapperFlush<Size1GiB>, MapToError<Size1GiB>>
+) -> Result<(), MapToError<Size1GiB>>
 where
     M: Mapper<Size1GiB>,
     FA: FrameAllocator<Size1GiB> + FrameAllocator<Size4KiB>,
@@ -185,7 +261,18 @@ where
     let frame = fa
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
-    unsafe { mapper.map_to(page, frame, flags, fa) }
+
+    // ── ensure HUGE_PAGE flag ─────────────────────────────────────────────
+    let effective_flags = if flags.contains(PageTableFlags::HUGE_PAGE) {
+        flags
+    } else {
+        flags | PageTableFlags::HUGE_PAGE
+    };
+
+    unsafe {
+        mapper.map_to(page, frame, effective_flags, fa)?.flush();
+    }
+    Ok(())
 }
 
 #[inline(always)]
@@ -194,7 +281,7 @@ fn map_2mib_page<M, FA>(
     addr: VirtAddr,
     flags: PageTableFlags,
     fa: &mut FA,
-) -> Result<MapperFlush<Size2MiB>, MapToError<Size2MiB>>
+) -> Result<(), MapToError<Size2MiB>>
 where
     M: Mapper<Size2MiB>,
     FA: FrameAllocator<Size2MiB> + FrameAllocator<Size4KiB>,
@@ -203,7 +290,18 @@ where
     let frame = fa
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
-    unsafe { mapper.map_to(page, frame, flags, fa) }
+
+    // ── ensure HUGE_PAGE flag ─────────────────────────────────────────────
+    let effective_flags = if flags.contains(PageTableFlags::HUGE_PAGE) {
+        flags
+    } else {
+        flags | PageTableFlags::HUGE_PAGE
+    };
+
+    unsafe {
+        mapper.map_to(page, frame, effective_flags, fa)?.flush();
+    }
+    Ok(())
 }
 
 fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
@@ -304,6 +402,12 @@ pub fn allocate_kernel_stack(size: u64) -> Result<VirtAddr, PageMapError> {
     let total_size = align_up_4k(size + 0x1000);
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    {
+        // println!(
+        //     "bump pointer: {:#X?}",
+        //     KERNEL_RANGE_TRACKER.allocations.lock()
+        // );
+    }
     let stack_start_addr = (allocate_auto_kernel_range_mapped(total_size, flags))?;
     Ok((stack_start_addr + total_size) - 0x1000)
 }
@@ -409,7 +513,7 @@ pub const fn align_up_4k(x: u64) -> u64 {
 }
 #[inline(always)]
 pub const fn align_up_2mib(x: u64) -> u64 {
-    const TWO_MIB: u64 = 2 * 1024 * 1024;   // 2 MiB
+    const TWO_MIB: u64 = 2 * 1024 * 1024; // 2 MiB
     (x + (TWO_MIB - 1)) & !(TWO_MIB - 1)
 }
 
@@ -443,7 +547,8 @@ where
     M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
 {
     let mut cur = addr;
-    let mut remaining = size;
+    debug_assert_eq!(cur.as_u64() & 0xFFF, 0);
+    let mut remaining = align_up_4k(size);
     let gib = 1u64 << 30;
     let mib2 = 2u64 * 1024 * 1024;
     let supports_1g = get_cpu_info()
@@ -452,23 +557,34 @@ where
         .has_1gib_pages();
 
     while remaining > 0 {
-        // ── 1 GiB page ───────────────────────────────────────────────────────
         if supports_1g && remaining >= gib && (cur.as_u64() & (gib - 1)) == 0 {
-            map_1gib_page(mapper, cur, flags, fa)?.flush();
-            cur += gib;
-            remaining -= gib;
-            continue;
+            match map_1gib_page(mapper, cur, flags, fa) {
+                Ok(_) => {
+                    cur += gib;
+                    remaining -= gib;
+                    continue;
+                }
+                Err(MapToError::FrameAllocationFailed) => {}
+                Err(e) => {
+                    return Err(PageMapError::Page1GiB(e));
+                }
+            };
         }
 
-        // ── 2 MiB page ───────────────────────────────────────────────────────
         if remaining >= mib2 && (cur.as_u64() & (mib2 - 1)) == 0 {
-            map_2mib_page(mapper, cur, flags, fa)?.flush();
-            cur += mib2;
-            remaining -= mib2;
-            continue;
+            match map_2mib_page(mapper, cur, flags, fa) {
+                Ok(_) => {
+                    cur += mib2;
+                    remaining -= mib2;
+                    continue;
+                }
+                Err(MapToError::FrameAllocationFailed) => {}
+                Err(e) => {
+                    return Err(PageMapError::Page2MiB(e));
+                }
+            };
         }
 
-        // ── fallback: single 4 KiB page ─────────────────────────────────────
         let page4k = Page::<Size4KiB>::containing_address(cur);
         map_page(mapper, page4k, fa, flags)?;
         cur += 0x1000;
@@ -482,14 +598,16 @@ pub fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageTableFlags,
 ) -> Result<VirtAddr, PageMapError> {
-    let addr = allocate_auto_kernel_range(size).ok_or(PageMapError::NoMemory())?;
+    let align_size = align_up_4k(size);
+    let addr = allocate_auto_kernel_range(align_size).ok_or(PageMapError::NoMemory())?;
+    debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
 
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, size, &mut frame_allocator, flags)?;
+    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
     Ok(addr)
 }
 
@@ -498,14 +616,18 @@ pub fn allocate_kernel_range_mapped(
     size: u64,
     flags: PageTableFlags,
 ) -> Result<VirtAddr, PageMapError> {
-    let addr = allocate_kernel_range(base, size).map_err(|_| PageMapError::NoMemory())?;
+    let align_size = align_up_4k(size);
+    debug_assert_eq!(base & 0xFFF, 0);
+
+    let addr = allocate_kernel_range(base, align_size).map_err(|_| PageMapError::NoMemory())?;
+    debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
 
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, size, &mut frame_allocator, flags)?;
+    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
     Ok(addr)
 }
 

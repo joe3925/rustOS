@@ -10,12 +10,15 @@ use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::SCHEDULER;
 use alloc::string::{String, ToString};
 use spin::Mutex;
+use x86_64::structures::paging::{FrameAllocator, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{
-    init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER,
+    allocate_auto_kernel_range_mapped, init_kernel_cr3, init_mapper, kernel_cr3,
+    map_range_with_huge_pages, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER, MMIO_BASE,
+    USED_MEMORY,
 };
 use crate::{cpu, println, BOOT_INFO};
 use alloc::vec::Vec;
@@ -32,9 +35,15 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 pub unsafe fn init() {
+    init_kernel_cr3();
+    let memory_map = &boot_info().memory_regions;
+    BootInfoFrameAllocator::init_start(memory_map);
+
+
     {
         let init_lock = INIT_LOCK.lock();
         init_heap();
+        test_full_heap();
 
         init_kernel_cr3();
 
@@ -55,7 +64,6 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
 
                 x86_64::instructions::interrupts::disable();
-                println!("Lock is still held {}", init_lock);
                 APIC.lock().as_ref().unwrap().start_aps();
                 x86_64::instructions::interrupts::enable();
             }
@@ -63,8 +71,6 @@ pub unsafe fn init() {
                 println!("APIC transition failed {}!", err.to_str());
             }
         }
-
-        test_full_heap();
 
         {
             let mut drives = DRIVECOLLECTION.lock();

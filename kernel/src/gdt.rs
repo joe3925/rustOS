@@ -56,27 +56,14 @@ impl GDTTracker {
         // Stacks
         let timer_stack =
             allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc timer stack");
-        println!(
-            "TIMER_STACK: start = 0x{:x}, end = 0x{:x}",
-            timer_stack.as_u64(),
-            timer_stack.as_u64() + kernel_stack_size
-        );
+
         let privilege_stack =
             allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc privilege stack ");
-        println!(
-            "PRIVILEGE STACK: start = 0x{:x}, end = 0x{:x}",
-            privilege_stack.as_u64(),
-            privilege_stack.as_u64() + kernel_stack_size
-        );
+
         let double_fault_stack = unsafe {
             let stack_end =
                 VirtAddr::new(DOUBLE_FAULT_STACK.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64);
             let stack_start = stack_end - KERNEL_STACK_SIZE;
-            println!(
-                "DOUBLE_FAULT_STACK: start = 0x{:x}, end = 0x{:x}",
-                stack_start.as_u64(),
-                stack_end.as_u64()
-            );
             stack_end
         };
 

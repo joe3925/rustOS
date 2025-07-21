@@ -56,7 +56,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config.kernel_stack_size = 10 * 100 * 1024;
     config.mappings.kernel_stack = Mapping::Dynamic;
     config.mappings.dynamic_range_start = Some(0xFFFF_8000_0000_0000);
-    config.mappings.dynamic_range_end = Some(0xFFFF_84FF_FFFF_FFFF);
+    config.mappings.dynamic_range_end = Some(0xFFFF_8300_0000_0000);
 
     config.mappings.framebuffer = Mapping::Dynamic;
     config
@@ -64,7 +64,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 
 fn _start(boot_info: &'static mut BootInfo) -> ! {
-    reserve_low_64kiB(&mut *boot_info.memory_regions);
+    reserve_low_2mib(&mut *boot_info.memory_regions);
 
     unsafe {
         BOOT_INFO = Some(boot_info);
@@ -78,9 +78,9 @@ fn _start(boot_info: &'static mut BootInfo) -> ! {
     loop {}
 }
 #[allow(non_snake_case)]
-fn reserve_low_64kiB(regions: &mut [MemoryRegion]) {
+fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0x0;
-    const LOW_END: u64 = 0x10000;
+    const LOW_END: u64 = 0x200000;
 
     // 1. Exact match
     if let Some(r) = regions

@@ -438,7 +438,7 @@ impl ApicImpl {
 
 extern "C" fn ap_startup() -> ! {
     CORE_LOCK.fetch_add(1, Ordering::SeqCst);
-    println!("WHY WONT YOU LOCK {}", *INIT_LOCK.lock());
+    INIT_LOCK.lock();
     {
         unsafe { PER_CPU_GDT.lock().init_gdt() };
         println!("gdt init");
