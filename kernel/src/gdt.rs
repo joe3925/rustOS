@@ -1,16 +1,10 @@
-use core::mem::MaybeUninit;
-use core::ptr::{null_mut, write_volatile};
 use core::{mem, ptr};
 
-use alloc::sync::Arc;
-use alloc::vec::{self, Vec};
 use lazy_static::lazy_static;
 use spin::Mutex;
-use x86_64::instructions::segmentation::SS;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::structures::DescriptorTablePointer;
 use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
@@ -64,7 +58,7 @@ impl GDTTracker {
             allocate_kernel_stack(KERNEL_STACK_SIZE).expect("Failed to alloc timer stack");
         let double_fault_stack = unsafe {
             let stack_end =
-                VirtAddr::new(DOUBLE_FAULT_STACK.as_ptr() as u64 + KERNEL_STACK_SIZE as u64);
+                VirtAddr::new(DOUBLE_FAULT_STACK.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64);
             let stack_start = stack_end - KERNEL_STACK_SIZE;
             println!(
                 "DOUBLE_FAULT_STACK: start = 0x{:x}, end = 0x{:x}",

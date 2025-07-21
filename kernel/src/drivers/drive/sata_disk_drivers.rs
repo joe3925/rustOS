@@ -140,50 +140,49 @@ impl AHCIController {
     /// Setup command tables and initialize Command Headers for each port.
     unsafe fn setup_command_tables(&mut self) {
         for port in 0..self.total_ports.clone() {
-            if let boot_info = boot_info() {
-                let mem_offset =
-                    VirtAddr::new((boot_info.physical_memory_offset.into_option().unwrap()));
+            let boot_info = boot_info();
+            let mem_offset =
+                VirtAddr::new((boot_info.physical_memory_offset.into_option().unwrap()));
 
-                // Set Command List Base (clb) and clbu
-                let command_list_address = virtual_to_phys(VirtAddr::new(
-                    &self.command_list_buffers[port as usize].buffer as *const _ as u64,
-                ));
-                write_volatile(
-                    self.ports_registers[port as usize].clb,
-                    command_list_address.as_u64() as u32,
-                );
-                write_volatile(
-                    self.ports_registers[port as usize].clbu,
-                    (command_list_address.as_u64() >> 32) as u32,
-                );
+            // Set Command List Base (clb) and clbu
+            let command_list_address = virtual_to_phys(VirtAddr::new(
+                &self.command_list_buffers[port as usize].buffer as *const _ as u64,
+            ));
+            write_volatile(
+                self.ports_registers[port as usize].clb,
+                command_list_address.as_u64() as u32,
+            );
+            write_volatile(
+                self.ports_registers[port as usize].clbu,
+                (command_list_address.as_u64() >> 32) as u32,
+            );
 
-                // Set FIS Base (fb) and fbu
-                let fis_address = virtual_to_phys(VirtAddr::new(
-                    &self.fis_buffer[port as usize].buffer as *const _ as u64,
-                ));
-                write_volatile(
-                    self.ports_registers[port as usize].fb,
-                    fis_address.as_u64() as u32,
-                );
-                write_volatile(
-                    self.ports_registers[port as usize].fbu,
-                    (fis_address.as_u64() >> 32) as u32,
-                );
+            // Set FIS Base (fb) and fbu
+            let fis_address = virtual_to_phys(VirtAddr::new(
+                &self.fis_buffer[port as usize].buffer as *const _ as u64,
+            ));
+            write_volatile(
+                self.ports_registers[port as usize].fb,
+                fis_address.as_u64() as u32,
+            );
+            write_volatile(
+                self.ports_registers[port as usize].fbu,
+                (fis_address.as_u64() >> 32) as u32,
+            );
 
-                // Allocate an 8KiB buffer for the Command Table (CT)
-                let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
+            // Allocate an 8KiB buffer for the Command Table (CT)
+            let command_table_buffer = AlignedBuffer128::new(); // Allocating 8KiB buffer for Command Table
 
-                // Calculate the physical address of the Command Table
-                self.command_table_virt_addr.push(VirtAddr::new(
-                    &command_table_buffer.buffer as *const _ as u64,
-                ));
-                let command_table_address = virtual_to_phys(VirtAddr::new(
-                    &command_table_buffer.buffer as *const _ as u64,
-                ));
+            // Calculate the physical address of the Command Table
+            self.command_table_virt_addr.push(VirtAddr::new(
+                &command_table_buffer.buffer as *const _ as u64,
+            ));
+            let command_table_address = virtual_to_phys(VirtAddr::new(
+                &command_table_buffer.buffer as *const _ as u64,
+            ));
 
-                // Initialize Command Headers
-                self.initialize_command_headers(port, command_table_address);
-            }
+            // Initialize Command Headers
+            self.initialize_command_headers(port, command_table_address);
         }
     }
 

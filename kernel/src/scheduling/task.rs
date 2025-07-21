@@ -1,14 +1,12 @@
 use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
-use crate::memory::paging::RangeTracker;
 use crate::memory::paging::{allocate_kernel_stack, KERNEL_STACK_ALLOCATOR};
+use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
-use crate::{function, println};
 use alloc::boxed::Box;
 use alloc::string::String;
 use core::arch::asm;
-use spin::Mutex;
 use x86_64::VirtAddr;
 
 #[derive(Debug, Clone)]
@@ -23,7 +21,7 @@ pub struct Task {
     pub executer_id: Option<u16>,
 }
 impl Task {
-    pub fn new_usermode(
+    pub fn new_user_mode(
         entry_point: usize,
         stack_size: u64,
         name: String,
@@ -79,7 +77,7 @@ impl Task {
             executer_id: None,
         }
     }
-    pub fn new_kernelmode(
+    pub fn new_kernel_mode(
         entry_point: usize,
         stack_size: u64,
         name: String,
@@ -90,8 +88,8 @@ impl Task {
             .get_feature_info()
             .expect("NO CPUID")
             .initial_local_apic_id();
-        let stack_top = unsafe { allocate_kernel_stack(stack_size) }
-            .expect("Failed to allocate kernel-mode stack");
+        let stack_top =
+            allocate_kernel_stack(stack_size).expect("Failed to allocate kernel-mode stack");
 
         let mut state = State::new(0);
         state.rip = entry_point as u64;

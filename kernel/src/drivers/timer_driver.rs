@@ -1,7 +1,7 @@
 use crate::console::print_queue;
 use crate::drivers::interrupt_index::{get_current_logical_id, send_eoi, InterruptIndex};
 use crate::println;
-use crate::scheduling::scheduler::{self, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::util::KERNEL_INITIALIZED;
 use core::arch::asm;
@@ -49,13 +49,11 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                 )
             }
             if (timer.get_current_tick() % 10000 == 0) {
-                unsafe {
-                    println!(
-                        "timer tick: {}, current cpu: {}",
-                        timer.get_current_tick(),
-                        get_current_logical_id()
-                    )
-                };
+                println!(
+                    "timer tick: {}, current cpu: {}",
+                    timer.get_current_tick(),
+                    get_current_logical_id()
+                );
             }
 
             print_queue();

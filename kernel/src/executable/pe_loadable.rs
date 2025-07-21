@@ -2,30 +2,19 @@ use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
 use crate::file_system::file::{File, OpenFlags};
-use crate::memory::allocator;
-use crate::memory::paging::{
-    init_mapper, map_page, map_page_in_page_table, new_user_mode_page_table,
-    BootInfoFrameAllocator, RangeTracker,
-};
-use crate::scheduling::scheduler::{self, SCHEDULER};
+use crate::memory::paging::{new_user_mode_page_table, RangeTracker};
 use crate::scheduling::task::Task;
-use crate::util::boot_info;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use bitflags::Flags;
-use embedded_graphics::pixelcolor::raw::LittleEndian;
-use goblin::pe::data_directories::DataDirectory;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
-use goblin::pe::{relocation, PE};
+use goblin::pe::PE;
 use goblin::Object;
 use spin::mutex::Mutex;
-use x86_64::registers::control::{Cr2, Cr3, Cr3Flags};
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageTable, PageTableFlags, PhysFrame,
-};
+use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
 use super::program::{Module, Program, PROGRAM_MANAGER};
@@ -144,10 +133,13 @@ impl PELoader {
         {
             let relocation = self.calculate_relocation_base(&program.tracker)?;
             self.current_base = relocation;
-            program.virtual_map_alloc(relocation, image_size as usize);
+            match program.virtual_map_alloc(relocation, image_size as usize) {
+                Ok(_) => {}
+                Err(_) => return Err(LoadError::NoMemory),
+            };
 
-            self.load_sections();
-            self.relocate();
+            self.load_sections()?;
+            self.relocate()?;
             let module = Module {
                 title: File::remove_file_from_path(self.path.as_str()).to_string(),
                 image_path: self.path.clone(),
@@ -158,12 +150,20 @@ impl PELoader {
         }
 
         unsafe {
-            program.virtual_map(
+            match program.virtual_map(
                 VirtAddr::new(opt_hdr.windows_fields.image_base),
                 image_size as usize,
-            )
+            ) {
+                Ok(_) => {}
+                Err(MapToError::PageAlreadyMapped(_)) => {
+                    return Err(LoadError::UnsupportedImageBase)
+                }
+                Err(_) => {
+                    return Err(LoadError::NoMemory);
+                }
+            }
         };
-        self.load_sections();
+        self.load_sections()?;
         let module = Module {
             title: File::remove_file_from_path(self.path.as_str()).to_string(),
             image_path: self.path.clone(),
@@ -247,7 +247,7 @@ impl PELoader {
             Ok(_) => (),
         }
 
-        let thread = Task::new_usermode(
+        let thread = Task::new_user_mode(
             (self.pe.entry as i64 + self.current_base.as_u64() as i64) as usize,
             stack_size,
             File::remove_file_from_path(self.path.as_str()).to_string(),

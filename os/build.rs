@@ -44,7 +44,7 @@ fn main() {
 
     // UEFI/BIOS bootloader image generation
     if UEFI {
-        let mut config = BootConfig::default();
+        let config = BootConfig::default();
         let mut uefi_boot = UefiBoot::new(&kernel_path);
         uefi_boot.set_boot_config(&config);
         uefi_boot

@@ -1,20 +1,17 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::memory::paging::{KERNEL_CR3_U64, KERNEL_STACK_SIZE};
-use crate::println;
-use crate::scheduling::task::{idle_task, Task};
-use crate::structs::per_core_storage::{PCSGuard, PCS};
+use crate::memory::paging::KERNEL_STACK_SIZE;
+use crate::scheduling::task::Task;
+use crate::structs::per_core_storage::PCS;
 use crate::util::kernel_main;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use core::arch::asm;
-use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::registers::control::Cr3;
 
+#[derive(Debug)]
 pub enum TaskError {
     NotFound(u64),
 }
@@ -49,14 +46,15 @@ impl Scheduler {
     pub fn restore_page_table(&mut self) {
         let program_manager = PROGRAM_MANAGER.read();
         let program_option = { program_manager.get(self.get_current_task().parent_pid) };
-        if let Some(prorgam) = program_option {
-            unsafe { Cr3::write(prorgam.cr3, Cr3::read().1) };
+        if let Some(program) = program_option {
+            unsafe { Cr3::write(program.cr3, Cr3::read().1) };
         } else {
             // Attempt to recover
             // Worst case we spin through all the tasks and end up with only the idle task
             if (self.tasks.len() > 1) {
                 let task_id = self.get_current_task().id;
-                self.delete_task(task_id);
+                self.delete_task(task_id)
+                    .expect("This should not be possible");
                 self.reap_task();
                 self.schedule_next();
                 self.restore_page_table();
@@ -70,7 +68,7 @@ impl Scheduler {
         let logical_id = get_current_logical_id() as usize;
         self.reap_task();
         if self.tasks.len() < 1 {
-            let kernel_task = Task::new_kernelmode(
+            let kernel_task = Task::new_kernel_mode(
                 kernel_main as usize,
                 KERNEL_STACK_SIZE,
                 "kernel".to_string(),
@@ -85,7 +83,7 @@ impl Scheduler {
             if let Some(id) = cur_id {
                 let current_task = self.get_task_by_id(id).unwrap();
                 current_task.executer_id = None;
-                self.reset_task_by_id(id);
+                self.reset_task_by_id(id).expect("This should not happen");
             }
             let current_task_id: Option<u64> = self
                 .tasks

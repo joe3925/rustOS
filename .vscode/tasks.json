@@ -2,12 +2,6 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "ap startup build",
-            "type": "shell",
-            "command": "nasm -f bin ${workspaceFolder}/kernel/src/ap_startup.asm -o ${workspaceFolder}/target/ap_startup.bin",
-            "problemMatcher": []
-        },
-        {
             "label": "dbg build",
             "type": "shell",
             "command": "cd ${workspaceFolder}/os; cargo build",
@@ -23,7 +17,6 @@
         {
             "label": "dbg chain",
             "dependsOn": [
-                "ap startup build"
                 "dbg build",
                 "dbg launch"
             ],

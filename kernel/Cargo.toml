@@ -8,7 +8,7 @@ name = "kernel"
 path = "src/main.rs"
 
 [dependencies]
-bootloader_api = "0.11"
+bootloader_api = "0.11.10"
 x86_64 = "=0.15.2"
 spin = "0.9.8"
 pic8259 = "0.10.1"

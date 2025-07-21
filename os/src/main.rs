@@ -1,6 +1,4 @@
-use std::process::{Child, Command, Stdio};
-use std::thread::sleep;
-use std::time::Duration;
+use std::process::{Child, Command};
 
 //legacy
 fn spawn_in_new_terminal(command: &str, args: &[&str]) -> std::io::Result<Child> {
@@ -37,7 +35,7 @@ fn main() {
             ],
         );
 
-        let qemu = match qemu {
+        let _qemu = match qemu {
             Ok(child) => child,
             Err(e) => {
                 eprintln!("Failed to start QEMU: {}", e);

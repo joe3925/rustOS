@@ -1,9 +1,8 @@
 use crate::util::{boot_info, KERNEL_INITIALIZED};
 use alloc::collections::VecDeque;
-use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
-use core::fmt::{Pointer, Write};
+use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -34,7 +33,7 @@ pub struct Screen {
 
 impl Screen {
     pub fn new() -> Option<Self> {
-        let mut boot_info = boot_info();
+        let boot_info = boot_info();
         if let Some(framebuffer) = boot_info.framebuffer.as_mut() {
             //byte offset
             let mut red_offset = 0;

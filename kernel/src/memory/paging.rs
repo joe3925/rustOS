@@ -1,24 +1,20 @@
-use alloc::borrow::ToOwned;
 use alloc::collections::LinkedList;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
-use core::net::Ipv4Addr;
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
-use spin::{Lazy, Mutex};
+use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags,
-    PageTableIndex, PhysFrame, Size1GiB, Size2MiB, Size4KiB,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PageTableIndex,
+    PhysFrame, Size1GiB, Size2MiB, Size4KiB,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::util::boot_info;
-use crate::BOOT_INFO;
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
 
@@ -293,7 +289,6 @@ pub enum RangeAllocationError {
 pub struct RangeTracker {
     allocations: Mutex<Vec<(u64, u64)>>,
 
-    //the range that this allocartor manages
     pub start: u64,
     pub end: u64,
 }
@@ -382,31 +377,27 @@ pub fn allocate_kernel_range(base: u64, size: u64) -> Result<VirtAddr, RangeAllo
     let addr = KERNEL_RANGE_TRACKER.alloc(base, size)?;
     Ok(addr)
 }
-/// Allocates whatever kernel range addr is free 
+/// Allocates whatever kernel range addr is free
 pub fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageTableFlags,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {
     let addr = allocate_auto_kernel_range(size).ok_or(MapToError::FrameAllocationFailed)?;
 
-    if let boot_info = boot_info() {
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let mut mapper = init_mapper(phys_mem_offset);
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut mapper = init_mapper(phys_mem_offset);
 
-        let num_pages = (size + 0xFFF) / 0x1000;
-        for i in 0..num_pages {
-            let page = Page::containing_address(addr + i * 0x1000);
-            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
-        }
-
-        Ok(addr)
-    } else {
-        Err(MapToError::FrameAllocationFailed)
+    let num_pages = (size + 0xFFF) / 0x1000;
+    for i in 0..num_pages {
+        let page = Page::containing_address(addr + i * 0x1000);
+        map_page(&mut mapper, page, &mut frame_allocator, flags)?;
     }
+
+    Ok(addr)
 }
-/// Attempts an allocation on a given addr fails if not free 
+/// Attempts an allocation on a given addr fails if not free
 pub fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
@@ -414,22 +405,18 @@ pub fn allocate_kernel_range_mapped(
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {
     let addr = allocate_kernel_range(base, size).map_err(|_| MapToError::FrameAllocationFailed)?;
 
-    if let boot_info = boot_info() {
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let mut mapper = init_mapper(phys_mem_offset);
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut mapper = init_mapper(phys_mem_offset);
 
-        let num_pages = (size + 0xFFF) / 0x1000;
-        for i in 0..num_pages {
-            let page = Page::containing_address(addr + i * 0x1000);
-            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
-        }
-
-        Ok(addr)
-    } else {
-        Err(MapToError::FrameAllocationFailed)
+    let num_pages = (size + 0xFFF) / 0x1000;
+    for i in 0..num_pages {
+        let page = Page::containing_address(addr + i * 0x1000);
+        map_page(&mut mapper, page, &mut frame_allocator, flags)?;
     }
+
+    Ok(addr)
 }
 
 /// Deallocates a previously allocated kernel range.
@@ -437,7 +424,7 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), size);
 }
 
-/// Unmaps and deallocates a previously allocated kernel range.
+/// Un-maps and deallocates a previously allocated kernel range.
 pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
@@ -447,10 +434,8 @@ pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     let num_pages = (size + 0xFFF) / 4096;
     for i in 0..num_pages {
         let page = Page::<Size4KiB>::containing_address(virtual_addr + i * 4096);
-        unsafe {
-            if let Ok((_, flush)) = mapper.unmap(page) {
-                flush.flush();
-            }
+        if let Ok((_, flush)) = mapper.unmap(page) {
+            flush.flush();
         }
     }
 }
@@ -501,24 +486,20 @@ pub fn map_mmio_region(
     let virtual_addr =
         allocate_auto_kernel_range(mmio_size).ok_or_else(|| MapToError::FrameAllocationFailed)?;
 
-    if let boot_info = boot_info() {
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-        for i in 0..num_pages {
-            let page = Page::containing_address(virtual_addr + i * 4096);
-            let flags =
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-            unsafe {
-                mapper
-                    .map_to(page, phys_frame + i, flags, &mut frame_allocator)?
-                    .flush();
-            }
+    for i in 0..num_pages {
+        let page = Page::containing_address(virtual_addr + i * 4096);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        unsafe {
+            mapper
+                .map_to(page, phys_frame + i, flags, &mut frame_allocator)?
+                .flush();
         }
     }
-
     Ok(virtual_addr)
 }
 

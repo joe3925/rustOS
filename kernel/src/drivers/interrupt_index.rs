@@ -1,25 +1,23 @@
 use crate::cpu::{self, get_cpu_info};
+use crate::drivers::acpi::ACPI_TABLES;
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
-use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
-use crate::memory::paging::{
-    self, allocate_kernel_stack, identity_map_page, unmap_range, virtual_to_phys,
-};
-use crate::util::{boot_info, AP_STARTUP_CODE, CORE_LOCK};
-use crate::{print, println, KERNEL_INITIALIZED};
-use acpi::platform::interrupt::{Apic, TriggerMode};
+use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, unmap_range};
+use crate::util::{AP_STARTUP_CODE, CORE_LOCK};
+use crate::{println, KERNEL_INITIALIZED};
+use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use core::{iter, mem, ptr};
+use core::{mem, ptr};
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::instructions::tables::sgdt;
 use x86_64::registers::control::Cr3;
-use x86_64::structures::paging::{PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{PageTableFlags, PhysFrame};
 use x86_64::structures::DescriptorTablePointer;
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -98,7 +96,7 @@ pub fn wait_millis(ms: u64) {
         panic!("TSC not calibrated");
     }
 
-    let start = unsafe { cpu::get_cycles() };
+    let start = cpu::get_cycles();
     let target_delta = ms as u128 * tsc_freq as u128 / 1000;
     cpu::wait_cycle(target_delta);
 }
@@ -328,9 +326,7 @@ impl ApicImpl {
 
         unsafe {
             if apic.apic_info.also_has_legacy_pics {
-                unsafe {
-                    PICS.lock().disable();
-                }
+                PICS.lock().disable();
             }
 
             let logical_id = get_current_logical_id();

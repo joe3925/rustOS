@@ -1,36 +1,29 @@
 extern crate rand_xoshiro;
 
-use crate::drivers::drive::generic_drive::{DriveController, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::{calibrate_tsc, wait_millis, wait_using_pit_50ms, ApicImpl};
+use crate::drivers::interrupt_index::{calibrate_tsc, wait_using_pit_50ms, ApicImpl};
 use crate::drivers::interrupt_index::{APIC, PICS};
-use crate::executable::pe_loadable;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::SCHEDULER;
-use alloc::fmt::format;
 use alloc::string::{String, ToString};
 use spin::Mutex;
-use x86_64::structures::paging::{FrameAllocator, PhysFrame, Size4KiB};
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{
-    identity_map_page, init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator,
-    RangeTracker, KERNEL_RANGE_TRACKER,
+    init_kernel_cr3, init_mapper, kernel_cr3, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER,
 };
-use crate::{cpu, executable, gdt, println, BOOT_INFO};
+use crate::{cpu, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
 use core::arch::asm;
-use core::ptr::addr_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
-use x86_64::structures::paging::PageTableFlags;
-use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
@@ -45,7 +38,7 @@ pub unsafe fn init() {
             VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
 
         let mut mapper = init_mapper(mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
         init_heap(&mut mapper, &mut frame_allocator.clone());
 
         init_kernel_cr3();

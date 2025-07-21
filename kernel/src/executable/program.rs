@@ -3,16 +3,12 @@ use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
     structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
-    PhysAddr, VirtAddr,
+    VirtAddr,
 };
 
 use crate::{
     memory::paging::{init_mapper, BootInfoFrameAllocator, RangeTracker},
-    println,
-    scheduling::{
-        scheduler::{self, Scheduler, SCHEDULER},
-        task::Task,
-    },
+    scheduling::{scheduler::SCHEDULER, task::Task},
     util::boot_info,
 };
 
@@ -69,7 +65,7 @@ impl Program {
         Ok(())
     }
 
-    ///Saftey: User must make sure the address mapped by this function is allocated by the range tracker or virtual_map_alloc will silently fail
+    ///Safety: User must make sure the address mapped by this function is allocated by the range tracker or virtual_map will silently fail
     pub unsafe fn virtual_map(
         &self,
         virt_addr: VirtAddr,
@@ -132,7 +128,7 @@ impl ProgramManager {
         self.programs.push(program);
         pid
     }
-    ///Returns the thread id of the main thread if succsesful
+    ///Returns the thread id of the main thread if successful
     pub fn start_pid(&self, pid: u64) -> Option<u64> {
         let program = self.get(pid)?;
         let mut scheduler = SCHEDULER.lock();

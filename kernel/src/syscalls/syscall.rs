@@ -3,7 +3,6 @@ use crate::drivers::interrupt_index::InterruptIndex::SysCall;
 use crate::file_system::file::{File, OpenFlags};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::task::Task;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -74,10 +73,10 @@ pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame)
             scheduler.delete_task(param1).ok();
         }
         //create task
-        3 => unsafe {
+        3 => {
             //TODO: add param for stack size
             //SCHEDULER.lock().add_task(Task::new_usermode(param1 as usize, 0x2800, (*(param2 as *const String)).clone(), true));
-        },
+        }
         //file open syscall
         4 => {
             if let Some(path) = u64_to_str_ptr(param1) {

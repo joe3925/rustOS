@@ -10,6 +10,7 @@
 #![feature(allocator_api)]
 #![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
+#![allow(static_mut_refs)]
 
 extern crate alloc;
 
@@ -76,6 +77,7 @@ fn _start(boot_info: &'static mut BootInfo) -> ! {
 
     loop {}
 }
+#[allow(non_snake_case)]
 fn reserve_low_64kiB(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0x0;
     const LOW_END: u64 = 0x10000;
@@ -99,7 +101,7 @@ fn reserve_low_64kiB(regions: &mut [MemoryRegion]) {
         return;
     }
 
-    // 3. Fallback: retag the first overlapping region
+    // 3. Fallback: re-tag the first overlapping region
     if let Some(r) = regions
         .iter_mut()
         .find(|r| r.end > LOW_START && r.start < LOW_END)

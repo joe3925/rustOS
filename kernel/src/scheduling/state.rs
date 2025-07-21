@@ -14,7 +14,7 @@ pub(crate) struct State {
     pub(crate) rsi: u64,
     pub(crate) rdi: u64,
     pub(crate) rbp: u64,
-    pub(crate) rsp: u64,   // Stack pointer
+    pub(crate) rsp: u64, // Stack pointer
     pub(crate) r8: u64,
     pub(crate) r9: u64,
     pub(crate) r10: u64,
@@ -23,14 +23,13 @@ pub(crate) struct State {
     pub(crate) r13: u64,
     pub(crate) r14: u64,
     pub(crate) r15: u64,
-    pub(crate) rip: u64,   // Instruction pointer
+    pub(crate) rip: u64, // Instruction pointer
     pub(crate) rflags: u64,
-    pub(crate) cs: u64,    // Code segment register
-    pub(crate) ss: u64,    // Stack segment register
+    pub(crate) cs: u64, // Code segment register
+    pub(crate) ss: u64, // Stack segment register
 }
 impl State {
     #[inline(always)]
-    #[no_mangle]
     //rustc is protesting inlining this function so rax must be saved before call
     pub fn new(rax: u64) -> Self {
         let mut state = State {
@@ -52,8 +51,8 @@ impl State {
             r15: 0,
             rip: 0,
             rflags: 0,
-            cs: 0,    // Initialize with zero
-            ss: 0,    // Initialize with zero
+            cs: 0, // Initialize with zero
+            ss: 0, // Initialize with zero
         };
         state.update(rax);
         state
@@ -68,7 +67,6 @@ impl State {
 
     /// Save the current CPU context into this `State` struct
     #[inline(always)]
-    #[no_mangle]
     pub extern "C" fn update(&mut self, rax: u64) {
         unsafe {
             asm!(
@@ -111,16 +109,17 @@ impl State {
     }
     pub unsafe fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
         self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
-        //self.rflags = 0x00000202;
-        let new_stack_frame = InterruptStackFrame::new(VirtAddr::new(self.rip),
-                                                       SegmentSelector(self.cs as u16),
-                                                       RFlags::from_bits_retain(self.rflags),
-                                                       VirtAddr::new(self.rsp),
-                                                       SegmentSelector(self.ss as u16));
+                               //self.rflags = 0x00000202;
+        let new_stack_frame = InterruptStackFrame::new(
+            VirtAddr::new(self.rip),
+            SegmentSelector(self.cs as u16),
+            RFlags::from_bits_retain(self.rflags),
+            VirtAddr::new(self.rsp),
+            SegmentSelector(self.ss as u16),
+        );
         _stack_frame.as_mut().write(*new_stack_frame);
     }
     #[inline(always)]
-    #[no_mangle]
     pub unsafe extern "C" fn restore(&mut self) {
         asm!(
         "mov rax, {0}",
@@ -158,25 +157,24 @@ impl State {
         in(reg) self.r15,
         );
         /*
-        self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
+               self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
 
-        asm!(
-        "push {0}",     // Push SS
-        "push {1}",     // push rsp
-        "push {2}",     // Push RFLAGS
-        "push {3}",     // Push CS
-        "push {4}",     // Push RIP (instruction pointer)
-        in(reg) self.ss,
-        in(reg) self.rsp,
-        in(reg) self.rflags,
-        in(reg) self.cs,
-        in(reg) self.rip,
-        );
-        send_eoi(Timer.as_u8());
-        x86_64::instructions::bochs_breakpoint();
-        asm!("iretq", options(noreturn));
- */
+               asm!(
+               "push {0}",     // Push SS
+               "push {1}",     // push rsp
+               "push {2}",     // Push RFLAGS
+               "push {3}",     // Push CS
+               "push {4}",     // Push RIP (instruction pointer)
+               in(reg) self.ss,
+               in(reg) self.rsp,
+               in(reg) self.rflags,
+               in(reg) self.cs,
+               in(reg) self.rip,
+               );
+               send_eoi(Timer.as_u8());
+               x86_64::instructions::bochs_breakpoint();
+               asm!("iretq", options(noreturn));
+        */
     }
 }
 fn function() {}
-

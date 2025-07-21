@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, path::PathBuf, process::Command};
 
 fn run(cmd: &mut Command) {
     let status = cmd.status().expect("failed to spawn command");
@@ -10,7 +10,7 @@ fn main() {
     let asm_src = PathBuf::from("src/ap_startup.asm");
 
     let bin_out = out_dir.join("ap_startup.bin"); // flat page
-    let lib_out = out_dir.join("libap_startup.a"); // static archive
+    let _lib_out = out_dir.join("libap_startup.a"); // static archive
 
     run(Command::new("nasm")
         .args(["-f", "bin"])

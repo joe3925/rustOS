@@ -78,7 +78,7 @@ pub fn sys_create_task(entry_point: usize, name: &str) {
 }
 
 pub fn sys_open_file(path: &str, flags: &[OpenFlags]) -> *mut Option<File> {
-    let mut file_ptr: *mut Option<File> = Box::into_raw(Box::new(None));
+    let file_ptr: *mut Option<File> = Box::into_raw(Box::new(None));
     let params: *const SyscallParams = &SyscallParams {
         param1: file_ptr as u64,
         param2: 0,
@@ -96,11 +96,11 @@ pub fn sys_open_file(path: &str, flags: &[OpenFlags]) -> *mut Option<File> {
         in("r11") params as u64,
         );
     }
-    unsafe { file_ptr }
+    file_ptr
 }
 
 pub fn sys_read_file(file: &mut File, buffer: &mut [u8]) -> usize {
-    let mut bytes_read = 0;
+    let mut bytes_read;
     unsafe {
         asm!(
         "int 0x80",
@@ -115,7 +115,7 @@ pub fn sys_read_file(file: &mut File, buffer: &mut [u8]) -> usize {
 }
 
 pub fn sys_write_file(file: &mut File, data: &[u8]) -> usize {
-    let mut bytes_written = 0;
+    let mut bytes_written;
     unsafe {
         asm!(
         "int 0x80",
