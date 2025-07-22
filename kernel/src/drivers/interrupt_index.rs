@@ -31,7 +31,7 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
-pub const TIMER_FREQ: u64 = 1200;
+pub const TIMER_FREQ: u64 = 2400;
 
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;
@@ -441,19 +441,17 @@ extern "C" fn ap_startup() -> ! {
     INIT_LOCK.lock();
     {
         unsafe { PER_CPU_GDT.lock().init_gdt() };
-        println!("gdt init");
         IDT.load();
-        println!("idt load");
-
         unsafe {
-            APIC.lock()
-                .as_ref()
-                .unwrap()
-                .lapic
-                .init(get_current_logical_id())
-        };
+            let mut guard = APIC.lock();
+            if let Some(apic) = guard.as_mut() {
+                apic.lapic.init(get_current_logical_id());
+                apic.lapic.init_timer();
+            }
+        } 
         x86_64::instructions::interrupts::enable();
     }
+    println!("AP #{} init", get_current_logical_id());
     CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     while (!KERNEL_INITIALIZED.load(Ordering::SeqCst)) {}
 

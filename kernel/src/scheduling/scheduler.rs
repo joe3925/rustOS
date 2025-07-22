@@ -1,7 +1,7 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::KERNEL_STACK_SIZE;
-use crate::scheduling::task::Task;
+use crate::scheduling::task::{idle_task, Task};
 use crate::structs::per_core_storage::PCS;
 use crate::util::kernel_main;
 use alloc::collections::vec_deque::VecDeque;
@@ -61,6 +61,26 @@ impl Scheduler {
             }
         }
     }
+    pub fn has_core_init(&self) -> bool{
+        self.current_task.get(get_current_logical_id() as usize).is_some()
+    }
+    pub fn runnable_task(&self) -> usize {
+        let mut runnable_task = 0;
+        for task in &self.tasks {
+            if task.executer_id.is_none() {
+                runnable_task += 1;
+            }
+        }
+        runnable_task
+    }
+    pub fn should_idle(&self) -> bool {
+        for task in &self.tasks {
+            if task.name != "idle_task" && task.executer_id.is_none() {
+                return false;
+            }
+        }
+        return true;
+    }
 
     // round-robin
     #[inline]
@@ -76,6 +96,15 @@ impl Scheduler {
             );
             self.add_task(kernel_task);
         }
+        if (self.runnable_task() == 0 && !self.has_core_init()) {
+            let idle_task = Task::new_kernel_mode(
+                idle_task as usize,
+                KERNEL_STACK_SIZE,
+                "idle_task".to_string(),
+                0,
+            );
+            self.add_task(idle_task);
+        }
 
         if self.tasks.len() > 0 {
             let cur_id = self.current_task.get(logical_id).map(|g| *g);
@@ -85,17 +114,23 @@ impl Scheduler {
                 current_task.executer_id = None;
                 self.reset_task_by_id(id).expect("This should not happen");
             }
-            let current_task_id: Option<u64> = self
-                .tasks
-                .iter() // borrow each Task
-                .find(|t| t.executer_id.is_none())
-                .map(|t| t.id);
-            if let Some(id) = current_task_id {
-                let task = self.get_task_by_id(id).unwrap();
+            let next_task_id: Option<u64> = if self.should_idle() {
+                self.tasks
+                    .iter()
+                    .find(|t| t.name == "idle_task" && t.executer_id.is_none())
+                    .map(|t| t.id)
+            } else {
+                self.tasks
+                    .iter()
+                    .find(|t| t.name != "idle_task" && t.executer_id.is_none())
+                    .map(|t| t.id)
+            };
+
+            if let Some(id) = next_task_id {
                 self.current_task.set(logical_id, id);
                 self.get_current_task().executer_id = Some(logical_id as u16);
             } else {
-                return;
+                return; 
             }
         }
     }

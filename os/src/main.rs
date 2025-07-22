@@ -15,7 +15,7 @@ fn main() {
             "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
             &[
                 "-m",
-                "1024M",
+                "8024M",
                 "-no-reboot",
                 "-cpu",
                 "qemu64,+apic,+acpi",

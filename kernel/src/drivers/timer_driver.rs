@@ -1,29 +1,19 @@
+
 use crate::console::print_queue;
 use crate::drivers::interrupt_index::{get_current_logical_id, send_eoi, InterruptIndex};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
+use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
 use core::arch::asm;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::structures::idt::InterruptStackFrame;
 
-pub static TIMER: Mutex<SystemTimer> = Mutex::new(SystemTimer::new());
-pub struct SystemTimer {
-    tick: u128,
-}
-impl SystemTimer {
-    pub const fn new() -> Self {
-        SystemTimer { tick: 0 }
-    }
-    pub fn increment(&mut self) {
-        self.tick += 1;
-    }
-    pub fn get_current_tick(&self) -> u128 {
-        self.tick
-    }
-}
+pub static TIMER: AtomicUsize = AtomicUsize::new(0);
+pub static TIMER_TIME: AtomicUsize = AtomicUsize::new(0);
+
 pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut rax: u64;
     unsafe {
@@ -35,23 +25,15 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     state.rflags = _stack_frame.cpu_flags.bits().clone();
     state.rsp = _stack_frame.stack_pointer.as_u64();
     state.ss = _stack_frame.stack_segment.0 as u64;
-    let mut timer = TIMER.lock();
-    timer.increment();
+    let ticks = TIMER.fetch_add(1, Ordering::SeqCst);
 
     // Force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
     unsafe {
         if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
-            if (get_current_logical_id() != 0) {
+            if (ticks % 100000 == 0) {
                 println!(
                     "timer tick: {}, current cpu: {}",
-                    timer.get_current_tick(),
-                    get_current_logical_id()
-                )
-            }
-            if (timer.get_current_tick() % 10000 == 0) {
-                println!(
-                    "timer tick: {}, current cpu: {}",
-                    timer.get_current_tick(),
+                    ticks,
                     get_current_logical_id()
                 );
             }
@@ -60,8 +42,9 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
 
             // Avoid spin locking in an interrupt
             if (!SCHEDULER.is_locked()) {
+                let stopwatch = Stopwatch::start();
                 let mut scheduler = SCHEDULER.lock();
-                if (!scheduler.is_empty()) {
+                if (!scheduler.is_empty() && scheduler.has_core_init()) {
                     scheduler.get_current_task().update_from_context(state);
                 }
                 scheduler.schedule_next();
@@ -78,6 +61,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
                     .context
                     .restore_stack_frame(_stack_frame);
                 scheduler.get_current_task().context.restore();
+                TIMER_TIME.fetch_add(stopwatch.elapsed_micros() as usize, Ordering::Relaxed);
             } else {
                 send_eoi(InterruptIndex::Timer.as_u8());
             }

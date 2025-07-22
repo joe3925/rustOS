@@ -9,8 +9,7 @@ use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, MapperFlush};
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PageTableIndex,
-    PhysFrame, Size1GiB, Size2MiB, Size4KiB,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PageTableIndex, PhysFrame, Size1GiB, Size2MiB, Size4KiB
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -42,7 +41,7 @@ lazy_static! {
     ));
 }
 
-pub const BOOT_MEMORY_SIZE: usize = 1024 * 1024 * 1024;
+pub const BOOT_MEMORY_SIZE: usize = 1024 * 1024 * 1024 * 128;
 pub static MEMORY_BITMAP: Mutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
     Mutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
 
@@ -93,6 +92,15 @@ impl From<MapToError<Size1GiB>> for PageMapError {
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
 }
+
+pub fn total_usable_bytes() -> u64 {
+    boot_info()
+        .memory_regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| r.end - r.start)
+        .sum()
+}
 #[derive(Clone)]
 
 // This struct doesnt do anything anymore but remains so old code still works
@@ -135,12 +143,25 @@ impl BootInfoFrameAllocator {
     pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
         BootInfoFrameAllocator {}
     }
+        pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
+        let base_idx = (frame.start_address().as_u64() >> 12) as usize;
+        let (len, bytes) = match S::SIZE {
+            Size4KiB::SIZE => (1, 0x1000),
+            Size2MiB::SIZE => (FRAMES_PER_2M, 0x20_0000),
+            Size1GiB::SIZE => (FRAMES_PER_1G, 0x4000_0000),
+            _ => return, 
+        };
+
+        let mut bm = MEMORY_BITMAP.lock();
+        clear_range(bm.as_mut_slice(), base_idx, len);
+        USED_MEMORY.fetch_sub(bytes, Ordering::SeqCst);
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     #[inline]
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+        let mut bm =MEMORY_BITMAP.lock();
 
         for (word_idx, word) in bm.iter_mut().enumerate() {
             if *word == u64::MAX {
@@ -162,7 +183,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 
 unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
-        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+        let mut bm = MEMORY_BITMAP.lock();
         let words = bm.len();
 
         for (word_idx, word) in bm.iter().enumerate() {
@@ -200,7 +221,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
 
 unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size1GiB>> {
-        let mut bm = unsafe { MEMORY_BITMAP.lock() };
+        let mut bm = MEMORY_BITMAP.lock();
         let words = bm.len();
 
         for (word_idx, word) in bm.iter().enumerate() {
@@ -231,6 +252,32 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
         }
         None
     }
+}
+fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
+    if len == 0 { return; }
+
+    let end = start + len - 1;
+    let words = bitmap.len();
+    if start / 64 >= words { return; }
+
+    let end = core::cmp::min(end, words * 64 - 1);
+
+    let first_word = start / 64;
+    let last_word  = end   / 64;
+
+    if first_word == last_word {
+        let mask = ((!0u64) << (start & 63)) & ((!0u64) >> (63 - (end & 63)));
+        bitmap[first_word] &= !mask;
+        return;
+    }
+
+    bitmap[first_word] &= !(!0u64 << (start & 63));
+
+    for w in (first_word + 1)..last_word {
+        bitmap[w] = 0;
+    }
+
+    bitmap[last_word] &= !(!0u64 >> (63 - (end & 63)));
 }
 pub fn map_page(
     mapper: &mut impl Mapper<Size4KiB>,
@@ -640,46 +687,50 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
 
 /// Un-maps and deallocates a previously allocated kernel range.
 pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
+    let boot_info        = boot_info();
+    let phys_mem_offset  =
+        VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper       = init_mapper(phys_mem_offset);
 
     deallocate_kernel_range(virtual_addr, size);
 
-    let mut cur = virtual_addr;
-    let mut remaining = align_up_4k(size);
-    const GiB: u64 = 1 << 30;
+    let frame_allocator  =
+        BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    let mut cur        = virtual_addr;
+    let mut remaining  = align_up_4k(size);
+    const GiB : u64 = 1 << 30;
     const MiB2: u64 = 2 * 1024 * 1024;
 
     while remaining > 0 {
-        // ── try 1 GiB page ────────────────────────────────────────────────
-        if remaining >= GiB && cur.as_u64() & (GiB - 1) == 0 {
+        if remaining >= GiB && (cur.as_u64() & (GiB - 1)) == 0 {
             let page = Page::<Size1GiB>::containing_address(cur);
-            if let Ok((_, flush)) = mapper.unmap(page) {
-                flush.flush();
+            if let Ok((frame, flush)) = mapper.unmap(page) {
+                flush.flush();                       
+                frame_allocator.deallocate_frame(frame);
                 cur += GiB;
                 remaining -= GiB;
                 continue;
             }
         }
 
-        // ── try 2 MiB page ────────────────────────────────────────────────
-        if remaining >= MiB2 && cur.as_u64() & (MiB2 - 1) == 0 {
+        if remaining >= MiB2 && (cur.as_u64() & (MiB2 - 1)) == 0 {
             let page = Page::<Size2MiB>::containing_address(cur);
-            if let Ok((_, flush)) = mapper.unmap(page) {
+            if let Ok((frame, flush)) = mapper.unmap(page) {
                 flush.flush();
+                frame_allocator.deallocate_frame(frame);
                 cur += MiB2;
                 remaining -= MiB2;
                 continue;
             }
         }
 
-        // ── fall back to 4 KiB page ───────────────────────────────────────
         let page4k = Page::<Size4KiB>::containing_address(cur);
-        if let Ok((_, flush)) = mapper.unmap(page4k) {
+        if let Ok((frame, flush)) = mapper.unmap(page4k) {
             flush.flush();
+            frame_allocator.deallocate_frame(frame);
         }
-        cur += 0x1000;
+        cur       += 0x1000;
         remaining -= 0x1000;
     }
 }

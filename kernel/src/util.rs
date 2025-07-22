@@ -2,14 +2,16 @@ extern crate rand_xoshiro;
 
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::{calibrate_tsc, wait_using_pit_50ms, ApicImpl};
+use crate::drivers::interrupt_index::{calibrate_tsc, wait_millis, wait_using_pit_50ms, ApicImpl};
 use crate::drivers::interrupt_index::{APIC, PICS};
+use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::SCHEDULER;
+use crate::structs::stopwatch::Stopwatch;
 use alloc::string::{String, ToString};
-use spin::Mutex;
+use spin::{Mutex, Once};
 use x86_64::structures::paging::{FrameAllocator, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
@@ -34,11 +36,12 @@ pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
+static TOTAL_TIME: Once<Stopwatch> = Once::new();
+
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
-
 
     {
         let init_lock = INIT_LOCK.lock();
@@ -49,6 +52,7 @@ pub unsafe fn init() {
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
+
         load_idt();
 
         println!("PIC loaded");
@@ -115,6 +119,7 @@ pub unsafe fn init() {
     while (CORE_LOCK.load(Ordering::SeqCst) != 0) {
         asm!("hlt");
     }
+    TOTAL_TIME.call_once(Stopwatch::start);
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     loop {
         asm!("hlt");
@@ -182,11 +187,21 @@ pub fn kernel_main() {
             }
         }
     }
+    println!("Used memory {}", USED_MEMORY.load(Ordering::SeqCst));
 
     // if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
     //     loadable.load();
     // }
-    loop {}
+    loop {
+        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 100; // µs → ms
+        let total_ms = TOTAL_TIME.wait().elapsed_millis();
+        let percent_x10 = (timer_ms as u128 * 1000) / total_ms as u128; // 0‑1000
+        let int_part = percent_x10 / 10;
+        let frac_part = percent_x10 % 10;
+
+        println!("Timer: {} ms, Total: {} ms, % in timer: {}.{}%", timer_ms, total_ms, int_part, frac_part);
+        wait_millis(1000);
+    }
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]
