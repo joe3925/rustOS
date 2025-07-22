@@ -69,7 +69,7 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
 
                 x86_64::instructions::interrupts::disable();
-                //APIC.lock().as_ref().unwrap().start_aps();
+                APIC.lock().as_ref().unwrap().start_aps();
                 x86_64::instructions::interrupts::enable();
             }
             Err(err) => {
@@ -195,16 +195,16 @@ pub fn kernel_main() {
     print_mem_report();
     println!("");
     loop {
-        wait_millis(30000);
-        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 100 / 4; // µs → ms
+        wait_millis(300000);
+        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 4; // µs → ms
         let total_ms = TOTAL_TIME.wait().elapsed_millis();
-        let percent_x10 = (timer_ms as u128 * 1000) / total_ms as u128; // 0‑1000
-        let int_part = percent_x10 / 10;
-        let frac_part = percent_x10 % 10;
+        let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
+        let int_part = percent_x10 / 1000;
+        let frac_part = percent_x10 % 1000;
 
         println!(
-            "Timer: {} ms, Total: {} ms, % in timer: {}.{}%",
-            timer_ms / 1000 / 60, total_ms / 1000 / 60, int_part, frac_part
+            "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
+            timer_ms * 4 / 1000, timer_ms / 1000, total_ms / 1000 / 60, int_part, frac_part
         );
         print_mem_report();
         println!("\n");

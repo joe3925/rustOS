@@ -1,4 +1,3 @@
-
 use crate::console::print_queue;
 use crate::drivers::interrupt_index::{get_current_logical_id, send_eoi, InterruptIndex};
 use crate::println;
@@ -28,36 +27,38 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     let ticks = TIMER.fetch_add(1, Ordering::SeqCst);
 
     // Force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
-unsafe {
-    if KERNEL_INITIALIZED.load(Ordering::SeqCst) && !SCHEDULER.is_locked() {
-        let mut scheduler = SCHEDULER.lock();
-        let stopwatch = Stopwatch::start();
-        print_queue();
+    unsafe {
+        if KERNEL_INITIALIZED.load(Ordering::SeqCst) && !SCHEDULER.is_locked() {
+            let stopwatch = Stopwatch::start();
 
-        if !scheduler.is_empty() && scheduler.has_core_init() {
-            scheduler.get_current_task().update_from_context(&state);
+            let (ctx_ptr, needs_restore) = {
+                let mut scheduler = SCHEDULER.lock();
+                print_queue();
+
+                if !scheduler.is_empty() && scheduler.has_core_init() {
+                    scheduler.get_current_task().update_from_context(&state);
+                }
+
+                scheduler.schedule_next();
+                send_eoi(InterruptIndex::Timer.as_u8());
+
+                let task = scheduler.get_current_task();
+                let restore = task.parent_pid != 0;
+                let ctx_ptr: *mut State = &mut task.context as *mut State;
+
+                (ctx_ptr, restore)
+            };
+
+            if needs_restore {
+                SCHEDULER.lock().restore_page_table();
+            }
+
+
+            (*ctx_ptr).restore_stack_frame(_stack_frame);
+            TIMER_TIME.fetch_add(stopwatch.elapsed_millis() as usize, Ordering::Relaxed);
+            (*ctx_ptr).restore(); 
+        } else {
+            send_eoi(InterruptIndex::Timer.as_u8());
         }
-
-        scheduler.schedule_next();
-        send_eoi(InterruptIndex::Timer.as_u8());
-
-        let needs_restore = {
-            let task = scheduler.get_current_task();  
-            let restore = task.parent_pid != 0;
-
-            task.context.restore_stack_frame(_stack_frame);
-            task.context.restore();
-
-            restore                               
-        };
-
-        if needs_restore {
-            scheduler.restore_page_table();
-        }
-
-        TIMER_TIME.fetch_add(stopwatch.elapsed_micros() as usize, Ordering::Relaxed);
-    } else {
-        send_eoi(InterruptIndex::Timer.as_u8());
     }
-}
 }
