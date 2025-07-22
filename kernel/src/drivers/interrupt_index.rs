@@ -31,7 +31,7 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
-pub const TIMER_FREQ: u64 = 1200;
+pub const TIMER_FREQ: u64 = 600;
 
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;

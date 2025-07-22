@@ -3,12 +3,13 @@ extern crate rand_xoshiro;
 use crate::cpu::get_cpu_info;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::interrupt_index::{calibrate_tsc, wait_millis, wait_using_pit_50ms, ApicImpl};
+use crate::drivers::interrupt_index::{calibrate_tsc, get_current_logical_id, wait_millis, wait_using_pit_50ms, ApicImpl};
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
+use crate::memory::allocator::ALLOCATOR;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use alloc::string::{String, ToString};
@@ -196,7 +197,9 @@ pub fn kernel_main() {
     println!("");
     loop {
         wait_millis(300000);
-        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 4; // µs → ms
+        x86_64::instructions::interrupts::disable();
+        let timer_ms = TIMER_TIME.lock().get(get_current_logical_id() as usize).unwrap().load(Ordering::SeqCst);
+        x86_64::instructions::interrupts::enable();
         let total_ms = TOTAL_TIME.wait().elapsed_millis();
         let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
         let int_part = percent_x10 / 1000;
@@ -204,28 +207,45 @@ pub fn kernel_main() {
 
         println!(
             "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
-            timer_ms * 4 / 1000, timer_ms / 1000, total_ms / 1000 / 60, int_part, frac_part
+            timer_ms / 1000, timer_ms * 4 / 1000, total_ms / 1000 / 60, int_part, frac_part
         );
         print_mem_report();
         println!("\n");
 
     }
 }
-pub fn print_mem_report(){
-            let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
-        let total_bytes = total_usable_bytes();
+pub fn used_memory() -> usize {
+    let allocator = unsafe { ALLOCATOR.lock() };
+    HEAP_SIZE - allocator.free_memory()
+}
+pub fn print_mem_report() {
+    let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
+    let total_bytes = total_usable_bytes();
 
-        let used_mb = used_bytes / 1_048_576;
-        let total_mb = total_bytes / 1_048_576;
+    let used_mb = used_bytes / 1_048_576;
+    let total_mb = total_bytes / 1_048_576;
 
-        let percent_x10 = (used_bytes as u128 * 1000) / total_bytes as u128;
-        let int_part = percent_x10 / 10;
-        let frac_part = percent_x10 % 10;
+    let percent_x10 = (used_bytes as u128 * 1000) / total_bytes as u128;
+    let int_part = percent_x10 / 10;
+    let frac_part = percent_x10 % 10;
 
-        println!(
-            "Used memory {} MB / {} MB ({}.{})%",
-            used_mb, total_mb, int_part, frac_part
-        );
+    println!(
+        "Used memory {} MB / {} MB ({}.{})%",
+        used_mb, total_mb, int_part, frac_part
+    );
+
+    let heap_used = used_memory();
+    let heap_used_mb = heap_used / 1_048_576;
+    let heap_total_mb = HEAP_SIZE / 1_048_576;
+
+    let heap_percent_x10 = (heap_used as u128 * 1000) / HEAP_SIZE as u128;
+    let heap_int_part = heap_percent_x10 / 10;
+    let heap_frac_part = heap_percent_x10 % 10;
+
+    println!(
+        "Heap usage: {} MB / {} MB ({}.{})%",
+        heap_used_mb, heap_total_mb, heap_int_part, heap_frac_part
+    );
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]
