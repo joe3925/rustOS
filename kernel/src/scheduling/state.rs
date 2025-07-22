@@ -67,7 +67,7 @@ impl State {
 
     /// Save the current CPU context into this `State` struct
     #[inline(always)]
-    pub extern "C" fn update(&mut self, rax: u64) {
+    pub fn update(&mut self, rax: u64) {
         unsafe {
             asm!(
             "mov {0}, rbx",
@@ -120,7 +120,7 @@ impl State {
         _stack_frame.as_mut().write(*new_stack_frame);
     }
     #[inline(always)]
-    pub unsafe extern "C" fn restore(&mut self) {
+    pub unsafe extern "C" fn restore(&self) {
         asm!(
         "mov rax, {0}",
         "mov rbx, {1}",
@@ -156,25 +156,7 @@ impl State {
         in(reg) self.r14,
         in(reg) self.r15,
         );
-        /*
-               self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
 
-               asm!(
-               "push {0}",     // Push SS
-               "push {1}",     // push rsp
-               "push {2}",     // Push RFLAGS
-               "push {3}",     // Push CS
-               "push {4}",     // Push RIP (instruction pointer)
-               in(reg) self.ss,
-               in(reg) self.rsp,
-               in(reg) self.rflags,
-               in(reg) self.cs,
-               in(reg) self.rip,
-               );
-               send_eoi(Timer.as_u8());
-               x86_64::instructions::bochs_breakpoint();
-               asm!("iretq", options(noreturn));
-        */
     }
 }
 fn function() {}

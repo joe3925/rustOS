@@ -28,46 +28,36 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
     let ticks = TIMER.fetch_add(1, Ordering::SeqCst);
 
     // Force unlocks are used as the timer and scheduler can not be allowed to spin lock on a resource
-    unsafe {
-        if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
-            if (ticks % 100000 == 0) {
-                println!(
-                    "timer tick: {}, current cpu: {}",
-                    ticks,
-                    get_current_logical_id()
-                );
-            }
+unsafe {
+    if KERNEL_INITIALIZED.load(Ordering::SeqCst) && !SCHEDULER.is_locked() {
+        let mut scheduler = SCHEDULER.lock();
+        let stopwatch = Stopwatch::start();
+        print_queue();
 
-            print_queue();
-
-            // Avoid spin locking in an interrupt
-            if (!SCHEDULER.is_locked()) {
-                let stopwatch = Stopwatch::start();
-                let mut scheduler = SCHEDULER.lock();
-                if (!scheduler.is_empty() && scheduler.has_core_init()) {
-                    scheduler.get_current_task().update_from_context(state);
-                }
-                scheduler.schedule_next();
-
-                send_eoi(InterruptIndex::Timer.as_u8());
-                let current_task = scheduler.get_current_task().parent_pid;
-
-                if (!(scheduler.get_current_task().parent_pid == 0)) {
-                    // The kernel may be holding locks that this needs, any other task won't be holding said locks
-                    scheduler.restore_page_table();
-                }
-                scheduler
-                    .get_current_task()
-                    .context
-                    .restore_stack_frame(_stack_frame);
-                scheduler.get_current_task().context.restore();
-                TIMER_TIME.fetch_add(stopwatch.elapsed_micros() as usize, Ordering::Relaxed);
-            } else {
-                send_eoi(InterruptIndex::Timer.as_u8());
-            }
-        } else {
-            // Kernel is not initialized yet, just send EOI and return to kernel
-            send_eoi(InterruptIndex::Timer.as_u8());
+        if !scheduler.is_empty() && scheduler.has_core_init() {
+            scheduler.get_current_task().update_from_context(&state);
         }
+
+        scheduler.schedule_next();
+        send_eoi(InterruptIndex::Timer.as_u8());
+
+        let needs_restore = {
+            let task = scheduler.get_current_task();  
+            let restore = task.parent_pid != 0;
+
+            task.context.restore_stack_frame(_stack_frame);
+            task.context.restore();
+
+            restore                               
+        };
+
+        if needs_restore {
+            scheduler.restore_page_table();
+        }
+
+        TIMER_TIME.fetch_add(stopwatch.elapsed_micros() as usize, Ordering::Relaxed);
+    } else {
+        send_eoi(InterruptIndex::Timer.as_u8());
     }
+}
 }

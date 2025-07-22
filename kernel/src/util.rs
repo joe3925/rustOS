@@ -1,5 +1,6 @@
 extern crate rand_xoshiro;
 
+use crate::cpu::get_cpu_info;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index::{calibrate_tsc, wait_millis, wait_using_pit_50ms, ApicImpl};
@@ -19,8 +20,8 @@ use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::{
     allocate_auto_kernel_range_mapped, init_kernel_cr3, init_mapper, kernel_cr3,
-    map_range_with_huge_pages, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER, MMIO_BASE,
-    USED_MEMORY,
+    map_range_with_huge_pages, total_usable_bytes, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER,
+    MMIO_BASE, USED_MEMORY,
 };
 use crate::{cpu, println, BOOT_INFO};
 use alloc::vec::Vec;
@@ -68,7 +69,7 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
 
                 x86_64::instructions::interrupts::disable();
-                APIC.lock().as_ref().unwrap().start_aps();
+                //APIC.lock().as_ref().unwrap().start_aps();
                 x86_64::instructions::interrupts::enable();
             }
             Err(err) => {
@@ -187,21 +188,44 @@ pub fn kernel_main() {
             }
         }
     }
-    println!("Used memory {}", USED_MEMORY.load(Ordering::SeqCst));
-
+    //TODO: Move to a function
     // if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
     //     loadable.load();
     // }
+    print_mem_report();
+    println!("");
     loop {
-        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 100; // µs → ms
+        wait_millis(30000);
+        let timer_ms = TIMER_TIME.load(Ordering::SeqCst) / 100 / 4; // µs → ms
         let total_ms = TOTAL_TIME.wait().elapsed_millis();
         let percent_x10 = (timer_ms as u128 * 1000) / total_ms as u128; // 0‑1000
         let int_part = percent_x10 / 10;
         let frac_part = percent_x10 % 10;
 
-        println!("Timer: {} ms, Total: {} ms, % in timer: {}.{}%", timer_ms, total_ms, int_part, frac_part);
-        wait_millis(1000);
+        println!(
+            "Timer: {} ms, Total: {} ms, % in timer: {}.{}%",
+            timer_ms / 1000 / 60, total_ms / 1000 / 60, int_part, frac_part
+        );
+        print_mem_report();
+        println!("\n");
+
     }
+}
+pub fn print_mem_report(){
+            let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
+        let total_bytes = total_usable_bytes();
+
+        let used_mb = used_bytes / 1_048_576;
+        let total_mb = total_bytes / 1_048_576;
+
+        let percent_x10 = (used_bytes as u128 * 1000) / total_bytes as u128;
+        let int_part = percent_x10 / 10;
+        let frac_part = percent_x10 % 10;
+
+        println!(
+            "Used memory {} MB / {} MB ({}.{})%",
+            used_mb, total_mb, int_part, frac_part
+        );
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

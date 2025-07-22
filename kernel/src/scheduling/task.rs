@@ -131,8 +131,8 @@ impl Task {
         }
     }
 
-    pub fn update_from_context(&mut self, context: State) {
-        self.context = context;
+    pub fn update_from_context(&mut self, context: &State) {
+        self.context = *context;
     }
     pub fn destroy(&mut self) {
         if (self.is_user_mode) {

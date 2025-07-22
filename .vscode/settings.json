@@ -41,7 +41,7 @@
             }
         }
     },
-    "lldb.displayFormat": "auto",
+    "lldb.displayFormat": "hex",
     "lldb.showDisassembly": "auto",
     "lldb.dereferencePointers": true,
     "lldb.consoleMode": "commands",
