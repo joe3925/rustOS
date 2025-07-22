@@ -30,7 +30,7 @@ impl Scheduler {
         Self {
             tasks: VecDeque::new(),
             current_task: PCS::new(),
-            id: 0,
+            id: 1,
         }
     }
 
@@ -62,7 +62,14 @@ impl Scheduler {
         }
     }
     pub fn has_core_init(&self) -> bool{
-        self.current_task.get(get_current_logical_id() as usize).is_some()
+        if let Some(task) = self.current_task.get(get_current_logical_id() as usize){
+            if *task == 0 {
+                return false;
+            }
+            true
+        }else{
+            false
+        }
     }
     pub fn runnable_task(&self) -> usize {
         let mut runnable_task = 0;
@@ -107,9 +114,9 @@ impl Scheduler {
         }
 
         if self.tasks.len() > 0 {
-            let cur_id = self.current_task.get(logical_id).map(|g| *g);
 
-            if let Some(id) = cur_id {
+            if self.has_core_init() {
+                let id = self.current_task.get(logical_id).map(|g| *g).unwrap();
                 let current_task = self.get_task_by_id(id).unwrap();
                 current_task.executer_id = None;
                 self.reset_task_by_id(id).expect("This should not happen");
@@ -183,6 +190,9 @@ impl Scheduler {
     fn reap_task(&mut self) {
         for i in (0..self.tasks.len()).rev() {
             if self.tasks[i].terminated {
+                if let Some(executer_id) = self.tasks[i].executer_id{
+                    self.current_task.set(executer_id as usize, 0);
+                }
                 self.tasks[i].destroy();
                 self.tasks.remove(i);
             }

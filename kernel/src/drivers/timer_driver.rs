@@ -37,7 +37,7 @@ pub(crate) extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: Inter
             let stopwatch = Stopwatch::start();
             let timer_time = TIMER_TIME.lock();
             let cpu_id = get_current_logical_id();
-            
+
             let (ctx_ptr, needs_restore) = {
                 let mut scheduler = SCHEDULER.lock();
 
