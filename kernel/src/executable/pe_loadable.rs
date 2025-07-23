@@ -2,8 +2,9 @@ use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
 use crate::file_system::file::{File, OpenFlags};
-use crate::memory::paging::{new_user_mode_page_table, RangeTracker};
+use crate::memory::paging::{new_user_mode_page_table};
 use crate::scheduling::task::Task;
+use crate::structs::range_tracker::RangeTracker;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -409,6 +410,7 @@ pub enum LoadError {
     BadPID,
     NotDLL,
     NoFile,
+    NoMainThread,
 }
 
 #[derive(Debug)]

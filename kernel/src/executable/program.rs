@@ -7,9 +7,7 @@ use x86_64::{
 };
 
 use crate::{
-    memory::paging::{init_mapper, BootInfoFrameAllocator, RangeTracker},
-    scheduling::{scheduler::SCHEDULER, task::Task},
-    util::boot_info,
+    memory::paging::{init_mapper, unmap_range, unmap_range_unchecked, BootInfoFrameAllocator}, scheduling::{scheduler::{self, SCHEDULER}, task::Task}, structs::range_tracker::RangeTracker, util::boot_info
 };
 
 use super::pe_loadable::{self, LoadError};
@@ -102,6 +100,33 @@ impl Program {
             return Ok(());
         }
         Err(LoadError::NoFile)
+    }
+    pub fn kill(&mut self) -> Result<(), LoadError>{
+        if let Some(main_id) = &self.main_thread{
+            let mut can_kill = false;
+            let managed_threads = self.managed_threads.lock();
+            let mut scheduler = SCHEDULER.lock();
+            while(!can_kill){
+                let mut running_threads = managed_threads.len() + 1;
+                if(scheduler.get_task_by_id(main_id.id).is_none()){
+                    running_threads -= 1;
+                }
+                for id in &*managed_threads{
+                                    if(scheduler.get_task_by_id(*id).is_none()){
+                    running_threads -= 1;
+                }
+                }
+                if(running_threads == 0){
+                    can_kill = true;
+                }
+            }
+            for allocation in self.tracker.get_allocations(){
+                unsafe { unmap_range_unchecked(VirtAddr::new(allocation.0), allocation.1 - allocation.0) };
+            }
+            Ok(())
+        }else{
+            Err(LoadError::NoMainThread)
+        }
     }
 }
 

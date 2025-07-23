@@ -11,6 +11,7 @@
 #![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
+#![feature(let_chains)]
 
 extern crate alloc;
 

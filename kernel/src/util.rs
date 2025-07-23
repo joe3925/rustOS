@@ -195,6 +195,7 @@ pub fn kernel_main() {
     // }
     print_mem_report();
     println!("");
+    return;
     loop {
         wait_millis(300000);
         x86_64::instructions::interrupts::disable();

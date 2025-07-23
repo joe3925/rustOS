@@ -5,7 +5,7 @@ use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use core::ptr;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
-use spin::Mutex;
+use spin::{Mutex, MutexGuard};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::{MapToError, MapperFlush};
 use x86_64::structures::paging::{
@@ -15,6 +15,7 @@ use x86_64::{PhysAddr, VirtAddr};
 
 use crate::cpu::get_cpu_info;
 use crate::println;
+use crate::structs::range_tracker::{RangeAllocationError, RangeTracker};
 use crate::util::boot_info;
 
 pub static KERNEL_CR3_U64: AtomicU64 = AtomicU64::new(0);
@@ -143,7 +144,7 @@ impl BootInfoFrameAllocator {
     pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
         BootInfoFrameAllocator {}
     }
-        pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
+    pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
         let base_idx = (frame.start_address().as_u64() >> 12) as usize;
         let (len, bytes) = match S::SIZE {
             Size4KiB::SIZE => (1, 0x1000),
@@ -466,94 +467,6 @@ pub fn deallocate_kernel_stack(stack_top: VirtAddr, size: u64) {
     unmap_range(full_range_start, total_size);
 }
 
-pub enum RangeAllocationError {
-    Overlap,
-    OutOfRange,
-    Unaligned,
-}
-#[derive(Debug)]
-pub struct RangeTracker {
-    allocations: Mutex<Vec<(u64, u64)>>,
-
-    pub start: u64,
-    pub end: u64,
-}
-
-impl RangeTracker {
-    pub fn new(start: u64, end: u64) -> Self {
-        Self {
-            allocations: Mutex::new(Vec::new()),
-            start,
-            end,
-        }
-    }
-
-    pub fn alloc(&self, base: u64, size: u64) -> Result<VirtAddr, RangeAllocationError> {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        let mut lock = self.allocations.lock();
-        if (base < self.start || base + aligned_size > self.end) {
-            return Err(RangeAllocationError::OutOfRange);
-        }
-        // Ensure no overlap
-        if lock.iter().any(|&(a, s)| {
-            let end = a + s;
-            let req_end = base + aligned_size;
-            !(base >= end || req_end <= a)
-        }) {
-            return Err(RangeAllocationError::Overlap);
-        }
-
-        lock.push((base, aligned_size));
-        Ok(VirtAddr::new(base))
-    }
-
-    pub fn dealloc(&self, base: u64, size: u64) {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        let mut lock = self.allocations.lock();
-        if let Some(index) = lock
-            .iter()
-            .position(|&(a, s)| a == base && s == aligned_size)
-        {
-            lock.remove(index);
-        }
-    }
-
-    // Finds a free region of at least `size` bytes and allocates it
-    pub fn alloc_auto(&self, size: u64) -> Option<VirtAddr> {
-        let aligned_size = (size + 0xFFF) & !0xFFF;
-        let mut lock = self.allocations.lock();
-
-        // Sort existing allocations by base address
-        lock.sort_unstable_by_key(|&(base, _)| base);
-
-        let mut current = self.start;
-
-        for &(alloc_base, alloc_size) in lock.iter() {
-            let alloc_end = alloc_base;
-
-            if current + aligned_size <= alloc_end {
-                // Found gap
-                lock.push((current, aligned_size));
-                return Some(VirtAddr::new(current));
-            }
-
-            // Move past this allocation
-            current = alloc_base + alloc_size;
-            if current > self.end {
-                return None;
-            }
-        }
-
-        // Check space at the end
-        if current + aligned_size <= self.end {
-            lock.push((current, aligned_size));
-            return Some(VirtAddr::new(current));
-        }
-
-        None
-    }
-}
-
 #[inline(always)]
 pub const fn align_up_4k(x: u64) -> u64 {
     (x + 0xFFF) & !0xFFF
@@ -678,60 +591,87 @@ pub fn allocate_kernel_range_mapped(
     Ok(addr)
 }
 
-/// Deallocates a previously allocated kernel range.
 pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
-    let aligned_size = align_up_4k(size); // length rounded‑up
+    let aligned_size = align_up_4k(size); 
     KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), aligned_size);
 }
 
-/// Un-maps and deallocates a previously allocated kernel range.
 pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
-    let boot_info        = boot_info();
-    let phys_mem_offset  =
-        VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper       = init_mapper(phys_mem_offset);
-
     deallocate_kernel_range(virtual_addr, size);
 
-    let frame_allocator  =
-        BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    unsafe { unmap_range_impl(virtual_addr, size) };
+}
 
-    let mut cur        = virtual_addr;
-    let mut remaining  = align_up_4k(size);
-    const GiB : u64 = 1 << 30;
-    const MiB2: u64 = 2 * 1024 * 1024;
+/// Saftey: caller promises that the address range is already
+pub unsafe fn unmap_range_unchecked(virtual_addr: VirtAddr, size: u64) {
+    unmap_range_impl(virtual_addr, size)
+}
+
+unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
+    let boot_info       = boot_info();
+    let phys_mem_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect("missing phys‑mem offset"),
+    );
+
+    let mut mapper          = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    // Constants
+    const GiB  : u64 = 1 << 30;
+    const MiB2 : u64 = 2 * 1024 * 1024;
+    const KiB4 : u64 = 4 * 1024;
+
+    let mut cur       = virtual_addr;
+    let mut remaining = align_up_4k(size);
 
     while remaining > 0 {
+        // Try 1 GiB page
         if remaining >= GiB && (cur.as_u64() & (GiB - 1)) == 0 {
-            let page = Page::<Size1GiB>::containing_address(cur);
-            if let Ok((frame, flush)) = mapper.unmap(page) {
-                flush.flush();                       
-                frame_allocator.deallocate_frame(frame);
+            if unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur) {
                 cur += GiB;
                 remaining -= GiB;
                 continue;
             }
         }
 
+        // Try 2 MiB page
         if remaining >= MiB2 && (cur.as_u64() & (MiB2 - 1)) == 0 {
-            let page = Page::<Size2MiB>::containing_address(cur);
-            if let Ok((frame, flush)) = mapper.unmap(page) {
-                flush.flush();
-                frame_allocator.deallocate_frame(frame);
+            if unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur) {
                 cur += MiB2;
                 remaining -= MiB2;
                 continue;
             }
         }
 
-        let page4k = Page::<Size4KiB>::containing_address(cur);
-        if let Ok((frame, flush)) = mapper.unmap(page4k) {
-            flush.flush();
-            frame_allocator.deallocate_frame(frame);
+        // Fall back to 4 KiB page
+        if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {
+            // nothing else to do
         }
-        cur       += 0x1000;
-        remaining -= 0x1000;
+        cur += KiB4;
+        remaining -= KiB4;
+    }
+}
+
+/// Generic helper for a single unmap + frame free.
+/// Returns `true` on success so the caller can adjust its cursors.
+fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
+    mapper: &mut impl Mapper<S>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    addr: VirtAddr,
+) -> bool {
+    let page = Page::<S>::containing_address(addr);
+    match mapper.unmap(page) {
+        Ok((frame, flush)) => {
+            flush.flush();
+            // SAFETY: the frame is no longer mapped
+            unsafe { frame_allocator.deallocate_frame(frame) };
+            true
+        }
+        Err(_) => false,
     }
 }
 pub fn identity_map_page(

@@ -190,11 +190,13 @@ impl Scheduler {
     fn reap_task(&mut self) {
         for i in (0..self.tasks.len()).rev() {
             if self.tasks[i].terminated {
-                if let Some(executer_id) = self.tasks[i].executer_id{
-                    self.current_task.set(executer_id as usize, 0);
+                if let Some(executer_id) = self.tasks[i].executer_id {
+                    if(executer_id == get_current_logical_id() as u16){
+                        self.current_task.set(executer_id as usize, 0);
+                        self.tasks[i].destroy();
+                        self.tasks.remove(i);
+                    }
                 }
-                self.tasks[i].destroy();
-                self.tasks.remove(i);
             }
         }
     }

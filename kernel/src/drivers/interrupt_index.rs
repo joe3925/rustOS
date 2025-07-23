@@ -451,7 +451,6 @@ extern "C" fn ap_startup() -> ! {
         } 
         x86_64::instructions::interrupts::enable();
     }
-    println!("AP #{} init", get_current_logical_id());
     CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     while (!KERNEL_INITIALIZED.load(Ordering::SeqCst)) {}
 
