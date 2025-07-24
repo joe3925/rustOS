@@ -12,6 +12,7 @@
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
 #![feature(let_chains)]
+#![feature(naked_functions)]
 
 extern crate alloc;
 

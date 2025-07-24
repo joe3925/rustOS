@@ -37,8 +37,6 @@ lazy_static! {
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(primary_drive_irq_handler);
         idt[drivers::interrupt_index::InterruptIndex::SecondaryDrive.as_u8()].set_handler_fn(secondary_drive_irq_handler);
-        idt[drivers::interrupt_index::InterruptIndex::SysCall.as_u8()].set_handler_fn(syscall_handler).set_privilege_level(PrivilegeLevel::Ring3);
-
 
 
         idt

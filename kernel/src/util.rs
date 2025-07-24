@@ -12,8 +12,10 @@ use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
+use crate::syscalls::syscall::syscall_init;
 use alloc::string::{String, ToString};
 use spin::{Mutex, Once};
+use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::structures::paging::{FrameAllocator, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
@@ -56,8 +58,9 @@ pub unsafe fn init() {
         PICS.lock().initialize();
 
         load_idt();
-
         println!("PIC loaded");
+        syscall_init();
+        asm!("syscall");
 
         // TSC calibration
         let tsc_start = cpu::get_cycles();
@@ -195,7 +198,6 @@ pub fn kernel_main() {
     // }
     print_mem_report();
     println!("");
-    return;
     loop {
         wait_millis(300000);
         x86_64::instructions::interrupts::disable();
