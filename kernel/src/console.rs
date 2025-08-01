@@ -2,6 +2,7 @@ use crate::util::{boot_info};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
+use x86_64::instructions::interrupts;
 use core::fmt::Write;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -265,16 +266,12 @@ macro_rules! println {
 }
 
 pub(crate) fn _print(args: core::fmt::Arguments) {
-    x86_64::instructions::interrupts::disable();
-    let mut buffer = [0u8; 1024];
-    let mut writer = BufferWriter::new(&mut buffer);
-
-    write!(writer, "{}", args).unwrap();
-
-    let data = writer.as_bytes();
-            CONSOLE.lock().print(data);
-     x86_64::instructions::interrupts::enable();
-
+    interrupts::without_interrupts(move || {
+        let mut buffer = [0u8; 1024];
+        let mut writer = BufferWriter::new(&mut buffer);
+        core::fmt::write(&mut writer, args).unwrap();
+        CONSOLE.lock().print(writer.as_bytes());
+    });
 }
 
 struct BufferWriter<'a> {

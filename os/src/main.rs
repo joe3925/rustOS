@@ -19,7 +19,7 @@ fn main() {
                 "-cpu",
                 "qemu64,+apic,+acpi,invtsc,tsc-frequency=3800000000",
                 "-machine", "type=pc,accel=tcg",
-                "-smp", "4",
+                "-smp", "24",
                 "-gdb", "tcp::1234",
                 "-S",
                 "-drive",

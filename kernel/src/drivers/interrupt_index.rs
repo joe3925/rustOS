@@ -104,6 +104,16 @@ pub fn wait_millis(ms: u64) {
     cpu::wait_cycle(target_delta);
 }
 
+pub fn wait_millis_idle(ms: u64) {
+    let tsc_freq = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_freq == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    let start = cpu::get_cycles();
+    let target_delta = ms as u128 * tsc_freq as u128 / 1000;
+    cpu::wait_cycle_idle(target_delta);
+}
 pub fn wait_using_pit_50ms() {
     let counts_for_50ms: u16 = (PIT_FREQUENCY_HZ / 20) as u16;
 
@@ -430,7 +440,7 @@ impl ApicImpl {
                         vector_phys_addr: tramp_phys,
                     },
                 );
-                wait_millis(1);
+                wait_millis(10);
             }
         }
         //TODO: properly wait for all cpus to finish

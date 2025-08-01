@@ -15,4 +15,4 @@ pub(crate) const MANAGED_KERNEL_RANGE_START: u64 = MMIO_BASE;
 pub(crate)const MANAGED_KERNEL_RANGE_END: u64 = 0xFFFF_FFFF_8000_0000;
 
 pub const BOOT_MEMORY_SIZE: usize = 1024 * 1024 * 1024 * 16;
-pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024 * 5;
+pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024 * 2;

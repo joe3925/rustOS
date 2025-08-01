@@ -13,6 +13,7 @@ use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
 use goblin::Object;
 use spin::mutex::Mutex;
+use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
@@ -180,7 +181,10 @@ impl PELoader {
     ///
     /// Ok: PID of the loaded program
     pub fn load(&mut self) -> Result<u64, LoadError> {
-        x86_64::instructions::interrupts::disable();
+        let were_enabled = interrupts::are_enabled();
+        if were_enabled {
+            interrupts::disable();
+        }
         if self.pe.is_lib {
             return Err(LoadError::IsNotExecutable);
         }
@@ -266,8 +270,10 @@ impl PELoader {
         let pid = PROGRAM_MANAGER.write().add_program(program);
         PROGRAM_MANAGER.write().start_pid(pid);
 
-        x86_64::instructions::interrupts::enable();
-        Err(LoadError::NotImplemented)
+        if were_enabled {
+            interrupts::enable();
+        }
+        Ok(pid)
     }
     pub fn calculate_allocation_size(&self) -> Result<usize, LoadError> {
         let opt_hdr = self
@@ -307,7 +313,7 @@ impl PELoader {
                 }
             }
         }
-
+        
         Ok(())
     }
     pub fn relocate(&mut self) -> Result<(), LoadError> {

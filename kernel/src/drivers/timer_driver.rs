@@ -19,13 +19,11 @@ const STATE_BYTES: usize = 15 * 8;
 
 extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     unsafe {
-        // Fast-exit if the kernel is not up yet.
         if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
             send_eoi(InterruptIndex::Timer.as_u8());
             return;
         }
 
-        // Take both locks once and keep the guards alive to the end.
         let (mut scheduler, timer_time) = match (SCHEDULER.try_lock(), TIMER_TIME.try_lock()) {
             (Some(s), Some(t)) => (s, t),
             _ => {
@@ -51,12 +49,11 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
 
         scheduler.schedule_next();
 
-        // --- temporary borrow of the task; ends when this block ends ---
+
         let (needs_restore, ctx_ptr): (bool, *mut State) = {
             let task = scheduler.get_current_task();
             (task.parent_pid != 0, &task.context as *const _ as *mut State)
         };
-        // ----------------------------------------------------------------
 
         if needs_restore {
             scheduler.restore_page_table();
@@ -70,14 +67,13 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         send_eoi(InterruptIndex::Timer.as_u8());
 
         (*ctx_ptr).restore(state);
-        // scheduler and timer_time guards go out of scope *here*,
-        // so the locks are released only now.
     }
 }
 #[naked]
 pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
     unsafe {
         naked_asm!(
+            "cli",
             /* save GPRs … */                          /* as you already had */
             "push r15","push r14","push r13","push r12",
             "push r11","push r10","push r9","push r8",
@@ -96,7 +92,7 @@ pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
             "pop  rbp","pop  rsi","pop  rdi","pop  r8",
             "pop  r9","pop  r10","pop  r11","pop  r12",
             "pop  r13","pop  r14","pop  r15",
-
+            "sti",
             "iretq",
             handler = sym timer_interrupt_handler_c,
         );

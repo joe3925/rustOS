@@ -29,6 +29,6 @@ pub(crate) extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: In
             }
         }
 
-        send_eoi(InterruptIndex::KeyboardIndex.as_u8())
+        send_eoi(InterruptIndex::KeyboardIndex.as_u8());
     }
 }
