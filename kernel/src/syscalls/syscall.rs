@@ -1,17 +1,14 @@
-use crate::drivers::interrupt_index::InterruptIndex::SysCall;
-use crate::drivers::interrupt_index::{get_current_logical_id, send_eoi};
-use crate::file_system::file::{File, OpenFlags};
+use crate::drivers::interrupt_index::{get_current_logical_id};
+
 use crate::gdt::PER_CPU_GDT;
 use crate::println;
-use crate::scheduling::scheduler::SCHEDULER;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::arch::{asm, naked_asm};
+use core::arch::{ naked_asm};
 use core::slice;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
-use x86_64::structures::idt::InterruptStackFrame;
 use x86_64::VirtAddr;
 
 fn println_wrapper(message_ptr: String) {
@@ -62,7 +59,7 @@ pub fn syscall_init() {
         .expect("")
         .user_data_selector;
 
-    Star::write(user_cs, user_ss, kernel_cs, kernel_ss);
+    Star::write(user_cs, user_ss, kernel_cs, kernel_ss).expect("Bad STAR segment selectors");
 }
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

@@ -1,6 +1,6 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::memory::paging::KERNEL_STACK_SIZE;
+use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::task::{idle_task, Task};
 use crate::structs::per_core_storage::PCS;
 use crate::util::kernel_main;
@@ -14,6 +14,7 @@ use x86_64::registers::control::Cr3;
 #[derive(Debug)]
 pub enum TaskError {
     NotFound(u64),
+    BadName,
 }
 lazy_static! {
     pub static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -35,10 +36,11 @@ impl Scheduler {
     }
 
     #[inline]
-    pub fn add_task(&mut self, mut task: Task) {
+    pub fn add_task(&mut self, mut task: Task) -> Result<(), TaskError> {
         task.id = self.id;
         self.id += 1;
         self.tasks.push_back(task);
+        Ok(())
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
@@ -82,7 +84,7 @@ impl Scheduler {
     }
     pub fn should_idle(&self) -> bool {
         for task in &self.tasks {
-            if task.name != "idle_task" && task.executer_id.is_none() {
+            if task.name != "" && task.executer_id.is_none() {
                 return false;
             }
         }
@@ -107,7 +109,7 @@ impl Scheduler {
             let idle_task = Task::new_kernel_mode(
                 idle_task as usize,
                 KERNEL_STACK_SIZE,
-                "idle_task".to_string(),
+                "".to_string(),
                 0,
             );
             self.add_task(idle_task);
@@ -124,12 +126,12 @@ impl Scheduler {
             let next_task_id: Option<u64> = if self.should_idle() {
                 self.tasks
                     .iter()
-                    .find(|t| t.name == "idle_task" && t.executer_id.is_none())
+                    .find(|t| t.name == "" && t.executer_id.is_none())
                     .map(|t| t.id)
             } else {
                 self.tasks
                     .iter()
-                    .find(|t| t.name != "idle_task" && t.executer_id.is_none())
+                    .find(|t| t.name != "" && t.executer_id.is_none())
                     .map(|t| t.id)
             };
 

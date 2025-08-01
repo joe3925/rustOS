@@ -1,13 +1,12 @@
 use crate::drivers;
 use crate::drivers::drive::ide_disk_driver::{primary_drive_irq_handler, secondary_drive_irq_handler};
 use crate::drivers::kbd_driver::keyboard_interrupt_handler;
-use crate::drivers::timer_driver::timer_interrupt_handler;
+use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
-use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
-use crate::syscalls::syscall::syscall_handler;
+use crate::gdt::{DOUBLE_FAULT_IST_INDEX};
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptDescriptorTable;
-use x86_64::PrivilegeLevel;
+use x86_64::VirtAddr;
 
 lazy_static! {
     pub static ref IDT: InterruptDescriptorTable = unsafe{
@@ -33,7 +32,7 @@ lazy_static! {
         idt.virtualization.set_handler_fn(exception_handlers::virtualization_exception);
 
         //hardware interrupts
-        idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler); // .set_stack_index(TIMER_IST_INDEX);
+        idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_addr(VirtAddr::new(timer_interrupt_entry as u64)); // .set_stack_index(TIMER_IST_INDEX);
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(primary_drive_irq_handler);
         idt[drivers::interrupt_index::InterruptIndex::SecondaryDrive.as_u8()].set_handler_fn(secondary_drive_irq_handler);

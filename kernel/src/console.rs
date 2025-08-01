@@ -1,9 +1,8 @@
-use crate::util::{boot_info, KERNEL_INITIALIZED};
+use crate::util::{boot_info};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
 use core::fmt::Write;
-use core::sync::atomic::Ordering;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -177,7 +176,10 @@ impl Console {
                 _ => {
                     let ch = b as char;
                     let buf = [ch as u8];
-                    let s = core::str::from_utf8(&buf).unwrap();
+                    let s = match core::str::from_utf8(&buf) {
+                        Ok(text) => text,      
+                        Err(_)   => continue, 
+                    };
 
                     Text::with_text_style(
                         s,
@@ -261,26 +263,18 @@ macro_rules! println {
         $crate::print!("{}\n", format_args!($($arg)*))
     };
 }
-pub(crate) unsafe fn print_queue() {
-    let mut console = CONSOLE.lock();
-    while !QUEUE.is_empty() {
-        console.print(&(QUEUE.pop_front().unwrap()))
-    }
-}
+
 pub(crate) fn _print(args: core::fmt::Arguments) {
+    x86_64::instructions::interrupts::disable();
     let mut buffer = [0u8; 1024];
     let mut writer = BufferWriter::new(&mut buffer);
 
     write!(writer, "{}", args).unwrap();
 
     let data = writer.as_bytes();
-    unsafe {
-        if KERNEL_INITIALIZED.load(Ordering::SeqCst) {
-            QUEUE.push_front(data.to_vec());
-        } else {
             CONSOLE.lock().print(data);
-        }
-    }
+     x86_64::instructions::interrupts::enable();
+
 }
 
 struct BufferWriter<'a> {

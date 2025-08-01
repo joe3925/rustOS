@@ -1,4 +1,4 @@
-use crate::memory::paging::kernel_cr3;
+use crate::memory::paging::tables::kernel_cr3;
 use crate::println;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};

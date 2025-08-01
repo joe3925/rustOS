@@ -8,12 +8,14 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::{
-    align_up_2mib, allocate_auto_kernel_range_mapped, allocate_kernel_stack, KERNEL_STACK_SIZE,
-};
-use crate::println;
+use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::memory::paging::paging::align_up_2mib;
+use crate::memory::paging::stack::allocate_kernel_stack;
+use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::structs::per_core_storage::PCS;
 
+use x86_64::instructions::segmentation::{Segment, CS, SS};
+use x86_64::instructions::tables::load_tss;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;
 
@@ -47,7 +49,6 @@ impl GDTTracker {
         static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_SIZE as usize] =
             [0; KERNEL_STACK_SIZE as usize];
 
-        // --- Step 1: Allocate and initialize per-core TSS ---
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let tss_ptr = self.base.add(self.size) as *mut TaskStateSegment;
         ptr::write(tss_ptr, TaskStateSegment::new());
@@ -71,29 +72,25 @@ impl GDTTracker {
             timer_stack + kernel_stack_size;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             double_fault_stack + KERNEL_STACK_SIZE;
-        tss_static.privilege_stack_table[0] = privilege_stack + kernel_stack_size;
+        //tss_static.privilege_stack_table[0] = privilege_stack + kernel_stack_size;
 
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct
         let gdt_size_bytes = gdt_max_entries * mem::size_of::<u64>();
 
-        // Compute raw pointer to GDT region
         let gdt_ptr_base = self.base.add(self.size + tss_size) as *mut GlobalDescriptorTable;
         ptr::write(gdt_ptr_base, GlobalDescriptorTable::new());
 
         let kernel_code_selector = (*gdt_ptr_base).append(Descriptor::kernel_code_segment());
         let kernel_data_selector = (*gdt_ptr_base).append(Descriptor::kernel_data_segment());
-        let user_code_selector = (*gdt_ptr_base).append(Descriptor::user_code_segment());
+        // Swap this append order if it causes issues
         let user_data_selector = (*gdt_ptr_base).append(Descriptor::user_data_segment());
+        let user_code_selector = (*gdt_ptr_base).append(Descriptor::user_code_segment());
+
         let tss_selector = (*gdt_ptr_base).append(Descriptor::tss_segment(tss_static));
         (*gdt_ptr_base).load();
 
-        // Update allocation offset
         self.size += tss_size + gdt_size_bytes;
-
-        // --- Step 3: Load segments ---
-        use x86_64::instructions::segmentation::{Segment, CS, SS};
-        use x86_64::instructions::tables::load_tss;
 
         CS::set_reg(kernel_code_selector);
         SS::set_reg(kernel_data_selector);

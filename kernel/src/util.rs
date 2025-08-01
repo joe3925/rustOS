@@ -1,6 +1,5 @@
 extern crate rand_xoshiro;
 
-use crate::cpu::get_cpu_info;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::interrupt_index::{calibrate_tsc, get_current_logical_id, wait_millis, wait_using_pit_50ms, ApicImpl};
@@ -10,22 +9,19 @@ use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
+use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
+use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
+use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use alloc::string::{String, ToString};
 use spin::{Mutex, Once};
-use x86_64::registers::control::{Efer, EferFlags};
-use x86_64::structures::paging::{FrameAllocator, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
+
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::{
-    allocate_auto_kernel_range_mapped, init_kernel_cr3, init_mapper, kernel_cr3,
-    map_range_with_huge_pages, total_usable_bytes, BootInfoFrameAllocator, KERNEL_RANGE_TRACKER,
-    MMIO_BASE, USED_MEMORY,
-};
 use crate::{cpu, println, BOOT_INFO};
 use alloc::vec::Vec;
 use bootloader_api::BootInfo;
@@ -46,7 +42,6 @@ pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
-
     {
         let init_lock = INIT_LOCK.lock();
         init_heap();
@@ -60,8 +55,6 @@ pub unsafe fn init() {
         load_idt();
         println!("PIC loaded");
         syscall_init();
-        asm!("syscall");
-
         // TSC calibration
         let tsc_start = cpu::get_cycles();
         wait_using_pit_50ms();
@@ -200,9 +193,7 @@ pub fn kernel_main() {
     println!("");
     loop {
         wait_millis(300000);
-        x86_64::instructions::interrupts::disable();
         let timer_ms = TIMER_TIME.lock().get(get_current_logical_id() as usize).unwrap().load(Ordering::SeqCst);
-        x86_64::instructions::interrupts::enable();
         let total_ms = TOTAL_TIME.wait().elapsed_millis();
         let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
         let int_part = percent_x10 / 1000;
@@ -214,7 +205,6 @@ pub fn kernel_main() {
         );
         print_mem_report();
         println!("\n");
-
     }
 }
 pub fn used_memory() -> usize {

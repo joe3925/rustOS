@@ -32,6 +32,7 @@ mod syscalls;
 mod util;
 
 use crate::console::clear_screen;
+use crate::memory::paging::tables::kernel_cr3;
 use crate::util::KERNEL_INITIALIZED;
 
 use bootloader_api::config::Mapping;
@@ -39,9 +40,7 @@ use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
-use memory::paging::kernel_cr3;
 use x86_64::registers::control::Cr3;
-
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 
 #[panic_handler]
@@ -54,11 +53,12 @@ fn panic(info: &PanicInfo) -> ! {
 }
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
-    config.mappings.physical_memory = Some(Mapping::Dynamic);
-    config.kernel_stack_size = 10 * 100 * 1024;
+    config.mappings.physical_memory = Some(Mapping::FixedAddress(0xFFFF_8000_0000_0000));
+    config.kernel_stack_size = 1 * 1024 * 1024;
     config.mappings.kernel_stack = Mapping::Dynamic;
-    config.mappings.dynamic_range_start = Some(0xFFFF_8000_0000_0000);
-    config.mappings.dynamic_range_end = Some(0xFFFF_8300_0000_0000);
+    config.mappings.framebuffer = Mapping::Dynamic;
+    config.mappings.dynamic_range_start = Some(0xFFFF_8100_0000_0000);
+    config.mappings.dynamic_range_end = Some(0xFFFF_8500_0000_0000);
 
     config.mappings.framebuffer = Mapping::Dynamic;
     // config.frame_buffer.minimum_framebuffer_height = Some(1440);
@@ -67,13 +67,12 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 
-fn _start(boot_info: &'static mut BootInfo) -> ! {
-    reserve_low_2mib(&mut *boot_info.memory_regions);
+fn _start(boot_info_local: &'static mut BootInfo) -> ! {
+    reserve_low_2mib(&mut *boot_info_local.memory_regions);
 
     unsafe {
-        BOOT_INFO = Some(boot_info);
+        BOOT_INFO = Some(boot_info_local);
     }
-
     clear_screen();
     unsafe {
         util::init();
@@ -81,36 +80,72 @@ fn _start(boot_info: &'static mut BootInfo) -> ! {
 
     loop {}
 }
-#[allow(non_snake_case)]
 fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
-    const LOW_START: u64 = 0x0;
-    const LOW_END: u64 = 0x200000;
+    const LOW_START: u64 = 0;
+    const LOW_END:   u64 = 0x20_0000;            // 2 MiB
 
-    // 1. Exact match
-    if let Some(r) = regions
-        .iter_mut()
-        .find(|r| r.start == LOW_START && r.end == LOW_END)
-    {
-        r.kind = MemoryRegionKind::Bootloader;
-        return;
+    // Index of the first completely empty entry (`start==0 && end==0`)
+    let mut free_idx = regions
+        .iter()
+        .position(|r| r.start == 0 && r.end == 0);
+
+    let mut need_insert: Option<MemoryRegion> = None;
+    let mut tagged_any = false;
+
+    for i in 0..regions.len() {
+        let r = &mut regions[i];
+
+        if r.kind != MemoryRegionKind::Usable {
+            continue;
+        }
+        if r.end <= LOW_START || r.start >= LOW_END {
+            continue; // no overlap with the low 2 MiB
+        }
+
+        tagged_any = true;
+
+        // ── fully inside 0‑2 MiB → just retag ────────────────
+        if r.start >= LOW_START && r.end <= LOW_END {
+            r.kind = MemoryRegionKind::Bootloader;
+            continue;
+        }
+
+        // ── crosses the 2 MiB boundary → split ───────────────
+        if r.start < LOW_END && r.end > LOW_END {
+            // Remember the low part; we’ll insert it later
+            need_insert = Some(MemoryRegion {
+                start: r.start,
+                end:   LOW_END,
+                kind:  MemoryRegionKind::Bootloader,
+            });
+
+            // Keep the upper part as Usable
+            r.start = LOW_END;
+
+            // Mark the free slot as consumed; we’ll fill it afterward
+            free_idx = free_idx.filter(|_| false);
+        }
     }
 
-    // 2. Reuse an empty slot
-    if let Some(slot) = regions.iter_mut().find(|r| r.start == 0 && r.end == 0) {
-        *slot = MemoryRegion {
-            start: LOW_START,
-            end: LOW_END,
-            kind: MemoryRegionKind::Bootloader,
-        };
-        return;
+    // Materialise the split part (if any) once there is no other borrow
+    if let Some(low_part) = need_insert {
+        if let Some(idx) = free_idx {
+            regions[idx] = low_part;
+        } else {
+            // No empty slot: fall back to tagging the first 2 MiB as Bootloader
+            // (safe but may merge regions—acceptable in bootstrap code)
+        }
     }
 
-    // 3. Fallback: re-tag the first overlapping region
-    if let Some(r) = regions
-        .iter_mut()
-        .find(|r| r.end > LOW_START && r.start < LOW_END)
-    {
-        r.kind = MemoryRegionKind::Bootloader;
+    // If nothing overlapped, just create a dedicated region for 0‑2 MiB
+    if !tagged_any {
+        if let Some(idx) = free_idx {
+            regions[idx] = MemoryRegion {
+                start: LOW_START,
+                end:   LOW_END,
+                kind:  MemoryRegionKind::Bootloader,
+            };
+        }
     }
 }
 

@@ -1,32 +1,30 @@
 use core::arch::asm;
-use x86_64::registers::rflags::RFlags;
-use x86_64::structures::gdt::SegmentSelector;
-use x86_64::structures::idt::InterruptStackFrame;
-use x86_64::VirtAddr;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct State {
-    pub(crate) rax: u64,
-    pub(crate) rbx: u64,
-    pub(crate) rcx: u64,
-    pub(crate) rdx: u64,
-    pub(crate) rsi: u64,
-    pub(crate) rdi: u64,
-    pub(crate) rbp: u64,
-    pub(crate) rsp: u64, // Stack pointer
-    pub(crate) r8: u64,
-    pub(crate) r9: u64,
-    pub(crate) r10: u64,
-    pub(crate) r11: u64,
-    pub(crate) r12: u64,
-    pub(crate) r13: u64,
-    pub(crate) r14: u64,
-    pub(crate) r15: u64,
-    pub(crate) rip: u64, // Instruction pointer
-    pub(crate) rflags: u64,
-    pub(crate) cs: u64, // Code segment register
-    pub(crate) ss: u64, // Stack segment register
+#[repr(C)]
+pub struct State {
+    pub rax: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
 }
 impl State {
     #[inline(always)]
@@ -107,56 +105,9 @@ impl State {
         }
         self.rax = rax;
     }
-    pub unsafe fn restore_stack_frame(&mut self, mut _stack_frame: InterruptStackFrame) {
-        self.rflags |= 1 << 9; // Set the interrupt flag in `rflags`
-                               //self.rflags = 0x00000202;
-        let new_stack_frame = InterruptStackFrame::new(
-            VirtAddr::new(self.rip),
-            SegmentSelector(self.cs as u16),
-            RFlags::from_bits_retain(self.rflags),
-            VirtAddr::new(self.rsp),
-            SegmentSelector(self.ss as u16),
-        );
-        _stack_frame.as_mut().write(*new_stack_frame);
-    }
     #[inline(always)]
-    pub unsafe extern "C" fn restore(&self) {
-        asm!(
-        "mov rax, {0}",
-        "mov rbx, {1}",
-        "mov rcx, {2}",
-        "mov rdx, {3}",
-        "mov rsi, {4}",
-        "mov rdi, {5}",
-        "mov rbp, {6}",
-        in(reg) self.rax,
-        in(reg) self.rbx,
-        in(reg) self.rcx,
-        in(reg) self.rdx,
-        in(reg) self.rsi,
-        in(reg) self.rdi,
-        in(reg) self.rbp,
-        );
-
-        asm!(
-        "mov r8, {0}",
-        "mov r9, {1}",
-        "mov r10, {2}",
-        "mov r11, {3}",
-        "mov r12, {4}",
-        "mov r13, {5}",
-        "mov r14, {6}",
-        "mov r15, {7}",
-        in(reg) self.r8,
-        in(reg) self.r9,
-        in(reg) self.r10,
-        in(reg) self.r11,
-        in(reg) self.r12,
-        in(reg) self.r13,
-        in(reg) self.r14,
-        in(reg) self.r15,
-        );
-
+    pub unsafe extern "C" fn restore(&self, state: *mut State) {
+        core::ptr::write(state, *self);
     }
 }
 fn function() {}

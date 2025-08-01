@@ -10,61 +10,44 @@ fn spawn_in_new_terminal(command: &str, args: &[&str]) -> std::io::Result<Child>
 
 fn main() {
     if cfg!(debug_assertions) {
-        // === Launch QEMU ===
+        // === Launch QEMU (debug) ===
         let qemu = spawn_in_new_terminal(
-            "C:\\Program Files\\qemu\\qemu-system-x86_64w.exe",
+            r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#,
             &[
-                "-m",
-                "8024M",
+                "-m", "8G",
                 "-no-reboot",
                 "-cpu",
-                "qemu64,+apic,+acpi",
-                "-machine",
-                "type=pc,accel=tcg",
-                "-smp",
-                "4",
-                "-gdb",
-                "tcp::1234",
+                "qemu64,+apic,+acpi,invtsc,tsc-frequency=3800000000",
+                "-machine", "type=pc,accel=tcg",
+                "-smp", "4",
+                "-gdb", "tcp::1234",
                 "-S",
                 "-drive",
                 "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
-                "-drive",
-                "file=boot.img,format=raw",
-                "-drive",
-                "file=rustOS.vhdx,if=ide",
+                "-drive", "file=boot.img,format=raw",
+                "-drive", "file=rustOS.vhdx,if=ide",
             ],
         );
 
-        let _qemu = match qemu {
-            Ok(child) => child,
-            Err(e) => {
-                eprintln!("Failed to start QEMU: {}", e);
-                return;
-            }
-        };
+        if let Err(e) = qemu { eprintln!("Failed to start QEMU: {e}"); }
     } else {
         // === Release mode ===
         let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)
             .args([
-                "-m",
-                "1024M",
+                "-m", "1024M",
                 "-no-reboot",
                 "-cpu",
-                "qemu64,+apic,+acpi",
-                "-machine",
-                "type=pc,accel=tcg",
-                "-smp",
-                "2",
+                "qemu64,+apic,+acpi,invtsc,tsc-frequency=3800000000",
+                "-machine", "type=pc,accel=tcg",
+                "-smp", "2",
                 "-drive",
                 "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
-                "-drive",
-                "file=boot.img,format=raw",
-                "-drive",
-                "file=rustOS.vhdx,if=ide",
+                "-drive", "file=boot.img,format=raw",
+                "-drive", "file=rustOS.vhdx,if=ide",
             ])
             .status()
             .expect("Failed to run QEMU");
 
-        println!("QEMU exited with: {}", status);
+        println!("QEMU exited with: {status}");
     }
 }

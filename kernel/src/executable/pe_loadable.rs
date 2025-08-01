@@ -2,7 +2,7 @@ use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
 use crate::file_system::file::{File, OpenFlags};
-use crate::memory::paging::{new_user_mode_page_table};
+use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
 use alloc::boxed::Box;

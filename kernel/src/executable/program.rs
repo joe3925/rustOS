@@ -7,8 +7,9 @@ use x86_64::{
 };
 
 use crate::{
-    memory::paging::{init_mapper, unmap_range, unmap_range_unchecked, BootInfoFrameAllocator}, scheduling::{scheduler::{self, SCHEDULER}, task::Task}, structs::range_tracker::RangeTracker, util::boot_info
+     memory::paging::{frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper}, scheduling::{scheduler::{ SCHEDULER}, task::Task}, structs::range_tracker::RangeTracker, util::boot_info
 };
+use crate::memory::paging::paging::map_page;
 
 use super::pe_loadable::{self, LoadError};
 pub struct Module {
@@ -57,7 +58,7 @@ impl Program {
 
         for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
             let page = Page::containing_address(VirtAddr::new(addr));
-            crate::memory::paging::map_page(&mut mapper, page, &mut frame_allocator, flags)?;
+           map_page(&mut mapper, page, &mut frame_allocator, flags)?;
         }
 
         Ok(())
@@ -88,7 +89,7 @@ impl Program {
 
         for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
             let page = Page::containing_address(VirtAddr::new(addr));
-            crate::memory::paging::map_page(&mut mapper, page, &mut frame_allocator, flags)?;
+            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
         }
 
         Ok(())

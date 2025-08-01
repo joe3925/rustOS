@@ -1,11 +1,11 @@
-use crate::memory::paging::{
-    align_up_4k, init_mapper, map_page, map_range_with_huge_pages, BootInfoFrameAllocator,
-};
+
+use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::paging::{align_up_4k, map_range_with_huge_pages};
+use crate::memory::paging::tables::init_mapper;
 use crate::println;
 use crate::structs::linked_list::ListNode;
 use crate::util::boot_info;
-use x86_64::structures::paging::FrameAllocator;
-use x86_64::structures::paging::{Mapper, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{PageTableFlags};
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;

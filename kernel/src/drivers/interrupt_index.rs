@@ -5,9 +5,12 @@ use crate::drivers::interrupt_index::ApicErrors::{
 };
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
-use crate::memory::paging::{self, allocate_kernel_stack, identity_map_page, unmap_range};
+use crate::memory::paging::mmio::map_mmio_region;
+use crate::memory::paging::paging::{ identity_map_page};
+use crate::memory::paging::stack::allocate_kernel_stack;
+use crate::memory::paging::virt_tracker::unmap_range;
 use crate::util::{AP_STARTUP_CODE, CORE_LOCK, INIT_LOCK};
-use crate::{println, KERNEL_INITIALIZED};
+use crate::{KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,7 +34,7 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 
-pub const TIMER_FREQ: u64 = 600;
+pub const TIMER_FREQ: u64 = 300;
 
 const PIT_FREQUENCY_HZ: u32 = 1_193_182;
 const PIT_CONTROL_PORT: u16 = 0x43;
@@ -180,7 +183,7 @@ pub struct Lapic {
 
 impl Lapic {
     pub fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = paging::map_mmio_region(phys, 0x1000).map_err(|_| ())?;
+        let virt = map_mmio_region(phys, 0x1000).map_err(|_| ())?;
         Ok(Self { base_addr: virt })
     }
 
@@ -259,7 +262,7 @@ pub struct Ioapic {
 
 impl Ioapic {
     pub fn new(phys: PhysAddr) -> Result<Self, ()> {
-        let virt = paging::map_mmio_region(phys, 0x2048).map_err(|_| ())?;
+        let virt = map_mmio_region(phys, 0x2048).map_err(|_| ())?;
         Ok(Self { base_addr: virt })
     }
 

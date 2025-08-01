@@ -1,6 +1,8 @@
 use crate::drivers::drive::generic_drive::DriveInfo;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
-use crate::memory::paging::{map_mmio_region, virtual_to_phys, BootInfoFrameAllocator};
+use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::mmio::map_mmio_region;
+use crate::memory::paging::tables::virtual_to_phys;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
@@ -229,7 +231,6 @@ impl AHCIController {
     pub fn map(mapper: &mut OffsetPageTable, frame_allocator: &mut BootInfoFrameAllocator) {
         if let Some(base_addr) = AHCIController::find_sata_controller() {
             println!("found controller at {}", base_addr);
-            //TODO: make mmio addr dyn
             map_mmio_region(PhysAddr::new(base_addr), 8192).expect("TODO: panic message");
         }
     }
