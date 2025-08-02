@@ -1,6 +1,10 @@
 [package]
-name = "rustos-api"
+name    = "rustos-api"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[features]
+default = []          
+heap    = []        
+
+[dependencies]       

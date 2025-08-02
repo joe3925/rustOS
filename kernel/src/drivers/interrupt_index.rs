@@ -9,6 +9,7 @@ use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::{ identity_map_page};
 use crate::memory::paging::stack::allocate_kernel_stack;
 use crate::memory::paging::virt_tracker::unmap_range;
+use crate::syscalls::syscall::syscall_init;
 use crate::util::{AP_STARTUP_CODE, CORE_LOCK, INIT_LOCK};
 use crate::{KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
@@ -462,6 +463,7 @@ extern "C" fn ap_startup() -> ! {
                 apic.lapic.init_timer();
             }
         } 
+        syscall_init();
         x86_64::instructions::interrupts::enable();
     }
     CORE_LOCK.fetch_sub(1, Ordering::SeqCst);

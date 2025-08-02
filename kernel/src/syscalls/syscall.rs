@@ -59,12 +59,9 @@ pub struct SyscallFrame {
     pub rbp: u64,
     pub rax: u64,
 }
-//TODO: ensure windows syscall abi support 
 #[naked]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
-
-
         "push rax",
         "push rbp",
         "push rbx",
@@ -166,7 +163,7 @@ pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
     let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;
 
     frame.rax = if let Some(h) = SYSCALL_TABLE.get(num) {
-        unsafe { h(frame.rcx, frame.rdx, frame.r8, frame.r9, rest_ptr) }
+        unsafe { h(frame.r10, frame.rdx, frame.r8, frame.r9, rest_ptr) }
     } else {
         0
     };

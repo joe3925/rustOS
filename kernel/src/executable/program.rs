@@ -2,14 +2,18 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
-    structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
-    VirtAddr,
+    instructions::hlt, structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB}, VirtAddr
 };
 
-use crate::{
-     memory::paging::{frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper}, scheduling::{scheduler::{ SCHEDULER}, task::Task}, structs::range_tracker::RangeTracker, util::boot_info
-};
 use crate::memory::paging::paging::map_page;
+use crate::{
+    memory::paging::{
+        frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper,
+    },
+    scheduling::{scheduler::SCHEDULER, task::Task},
+    structs::range_tracker::RangeTracker,
+    util::boot_info,
+};
 
 use super::pe_loadable::{self, LoadError};
 pub struct Module {
@@ -58,7 +62,7 @@ impl Program {
 
         for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
             let page = Page::containing_address(VirtAddr::new(addr));
-           map_page(&mut mapper, page, &mut frame_allocator, flags)?;
+            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
         }
 
         Ok(())
@@ -95,37 +99,39 @@ impl Program {
         Ok(())
     }
     pub fn load_module(&mut self, path: String) -> Result<(), LoadError> {
-        if let Some(mut dll) = pe_loadable::PELoader::new("C:\\BIN\\TEST.DLL") {
+        if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
             let module = dll.dll_load(self.pid)?;
             self.modules.lock().push(module);
             return Ok(());
         }
         Err(LoadError::NoFile)
     }
-    pub fn kill(&mut self) -> Result<(), LoadError>{
-        if let Some(main_id) = &self.main_thread{
-            let mut can_kill = false;
+    pub fn kill(&mut self) -> Result<(), LoadError> {
+        if let Some(main_id) = &self.main_thread {
             let managed_threads = self.managed_threads.lock();
-            let mut scheduler = SCHEDULER.lock();
-            while(!can_kill){
-                let mut running_threads = managed_threads.len() + 1;
-                if(scheduler.get_task_by_id(main_id.id).is_none()){
-                    running_threads -= 1;
+            loop {
+                hlt();
+
+                let mut scheduler = SCHEDULER.lock();
+                let mut running = managed_threads.len() + 1;
+                if scheduler.get_task_by_id(main_id.id).is_none() {
+                    running -= 1;
                 }
-                for id in &*managed_threads{
-                                    if(scheduler.get_task_by_id(*id).is_none()){
-                    running_threads -= 1;
+                for id in &*managed_threads {
+                    if scheduler.get_task_by_id(*id).is_none() {
+                        running -= 1;
+                    }
                 }
-                }
-                if(running_threads == 0){
-                    can_kill = true;
+
+                if running == 0 {
+                    break;
                 }
             }
-            for allocation in self.tracker.get_allocations(){
-                unsafe { unmap_range_unchecked(VirtAddr::new(allocation.0), allocation.1 - allocation.0) };
+            for (start, end) in self.tracker.get_allocations() {
+                unsafe { unmap_range_unchecked(VirtAddr::new(start), end - start) };
             }
             Ok(())
-        }else{
+        } else {
             Err(LoadError::NoMainThread)
         }
     }

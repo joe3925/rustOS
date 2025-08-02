@@ -69,10 +69,10 @@ impl GDTTracker {
         };
 
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] =
-            timer_stack + kernel_stack_size;
+            timer_stack;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             double_fault_stack + KERNEL_STACK_SIZE;
-        //tss_static.privilege_stack_table[0] = privilege_stack + kernel_stack_size;
+        tss_static.privilege_stack_table[0] = privilege_stack;
 
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct

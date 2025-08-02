@@ -8,6 +8,7 @@ use crate::drivers::interrupt_index::{
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::timer_driver::TIMER_TIME;
+use crate::executable::pe_loadable;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
@@ -188,10 +189,9 @@ pub fn kernel_main() {
             }
         }
     }
-    //TODO: Move to a function
-    // if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
-    //     loadable.load();
-    // }
+    if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
+         loadable.load();
+    }
     print_mem_report();
     println!("");
     loop {

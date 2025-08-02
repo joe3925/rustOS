@@ -14,7 +14,7 @@ lazy_static! {
         idt.divide_error.set_handler_fn(exception_handlers::divide_by_zero_fault);
         idt.debug.set_handler_fn(exception_handlers::debug_exception);
         idt.non_maskable_interrupt.set_handler_fn(exception_handlers::non_maskable_interrupt);
-        idt.breakpoint.set_handler_fn(exception_handlers::breakpoint_exception);
+        idt.breakpoint.set_handler_fn(exception_handlers::breakpoint_exception).set_privilege_level(x86_64::PrivilegeLevel::Ring3);
         idt.overflow.set_handler_fn(exception_handlers::overflow_exception);
         idt.bound_range_exceeded.set_handler_fn(exception_handlers::bound_range_exceeded_exception);
         idt.invalid_opcode.set_handler_fn(exception_handlers::invalid_opcode_exception);
