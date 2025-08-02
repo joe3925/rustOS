@@ -1,9 +1,10 @@
 use crate::drivers::interrupt_index::{get_current_logical_id};
 
+use crate::file_system::file::{File, OpenFlags};
 use crate::gdt::PER_CPU_GDT;
 use crate::println;
-use alloc::string::String;
-use alloc::vec;
+use crate::syscalls::syscall_impl::{self, sys_create_task, sys_destroy_task, sys_file_delete, sys_file_open, sys_file_read, sys_file_write, sys_get_tid, sys_mq_request, sys_print};
+use alloc::string::{String};
 use alloc::vec::Vec;
 use core::arch::{ naked_asm};
 use core::slice;
@@ -11,28 +12,6 @@ use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
 use x86_64::VirtAddr;
 
-fn println_wrapper(message_ptr: String) {
-    let message = &*message_ptr;
-    println!("{}", message);
-}
-fn u64_to_str_ptr(value: u64) -> Option<String> {
-    // Convert u64 to a raw pointer
-    let ptr = value as *const u8;
-
-    if ptr.is_null() {
-        return None;
-    }
-
-    let mut len = 0;
-    unsafe {
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
-
-        let slice = slice::from_raw_parts(ptr, len);
-        String::from_utf8(Vec::from(slice)).ok()
-    }
-}
 pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
     unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
@@ -79,8 +58,6 @@ pub struct SyscallFrame {
     pub rbx: u64,
     pub rbp: u64,
     pub rax: u64,
-}
-pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
 }
 //TODO: ensure windows syscall abi support 
 #[naked]
@@ -133,143 +110,64 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         handler = sym syscall_handler,
     );
 }
+type Handler = unsafe fn(u64, u64, u64, u64, *const u64) -> u64;
 
-// pub extern "x86-interrupt" fn syscall_handler(_stack_frame: InterruptStackFrame) {
-//     let mut rax: u64;
-//     let mut param1: u64;
-//     let mut param2: u64;
-//     let mut param3: u64;
-//     let mut extra_params: u64;
-//     //TODO: change from switch case
-//     unsafe {
-//         asm!("mov {0}, rax", lateout(reg) rax);
-//     }
-//     unsafe {
-//         asm!("mov {0}, r8", lateout(reg) param1);
-//     }
-//     unsafe {
-//         asm!("mov {0}, r9", lateout(reg) param2);
-//     }
-//     unsafe {
-//         asm!("mov {0}, r10", lateout(reg) param3);
-//     }
-//     unsafe {
-//         asm!("mov {0}, r11", lateout(reg) extra_params);
-//     }
-//     x86_64::instructions::interrupts::disable();
-
-//     let return_value: usize = 0;
-//     let params = unsafe { (extra_params as *mut SyscallParams).as_mut() };
-//     //all returns are buffers because im lazy
-//     match rax {
-//         //print syscall
-//         1 => {
-//             if let Some(string) = u64_to_str_ptr(param1) {
-//                 println_wrapper(string)
-//             }
-//         }
-//         //destroy task syscall
-//         2 => {
-//             let mut scheduler = SCHEDULER.lock();
-//             scheduler.delete_task(param1).ok();
-//         }
-//         //create task
-//         3 => {
-//             //TODO: add param for stack size
-//             //SCHEDULER.lock().add_task(Task::new_usermode(param1 as usize, 0x2800, (*(param2 as *const String)).clone(), true));
-//         }
-//         //file open syscall
-//         4 => {
-//             if let Some(path) = u64_to_str_ptr(param1) {
-//                 let flags_ptr = param2 as *const OpenFlags;
-//                 let flags: &[OpenFlags] =
-//                     unsafe { slice::from_raw_parts(flags_ptr, param3 as usize) };
-//                 if let Some(param) = params {
-//                     let file_ptr = param.param1 as (*mut Option<File>);
-//                     let result = File::open(path.as_str(), flags);
-//                     if let Ok(file) = result {
-//                         unsafe {
-//                             *file_ptr = Some(file);
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//         //TODO: File read and file write have arbitrary read write vulnerability
-
-//         // File Read
-//         5 => unsafe {
-//             let file_ptr = param1 as *mut File;
-//             let buffer_ptr = param2 as *mut u8;
-//             let buffer_len = param3 as usize;
-
-//             if file_ptr.is_null() || buffer_ptr.is_null() {
-//                 return;
-//             }
-
-//             let file = &mut *file_ptr;
-//             if let Ok(data) = file.read() {
-//                 let len = core::cmp::min(data.len(), buffer_len);
-//                 core::ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, len);
-//             }
-//         },
-
-//         // File Write
-//         6 => unsafe {
-//             let file_ptr = param1 as *mut File;
-//             let buffer_ptr = param2 as *const u8;
-//             let buffer_len = param3 as usize;
-
-//             if file_ptr.is_null() || buffer_ptr.is_null() {
-//                 return;
-//             }
-
-//             let file = &mut *file_ptr;
-//             let data = slice::from_raw_parts(buffer_ptr, buffer_len);
-//             let _ = file.write(data);
-//         },
-
-//         // File Delete
-//         7 => unsafe {
-//             let file_ptr = param1 as *mut File;
-
-//             if file_ptr.is_null() {
-//                 return;
-//             }
-
-//             let file = &mut *file_ptr;
-//             let _ = file.delete();
-//         },
-//         //get current task id, param 1 buffer to place id in
-//         8 => unsafe {
-//             *(param1 as *mut usize) = SCHEDULER.lock().get_current_task().id as usize;
-//         },
-//         //Request a message queue syscall
-//         9 => {}
-//         _ => {
-//             println!("Unknown syscall number: {}", rax);
-//         }
-//     }
-//     send_eoi(SysCall.as_u8());
-//     x86_64::instructions::interrupts::enable();
-// }
-///r8 - r10 first 3 params extra params in Syscallparams passed by a ptr in r11
-#[derive(Clone)]
-struct SyscallParams {
-    param1: u64,
-    param2: u64,
-    param3: u64,
-    param4: u64,
-    extra_params: Vec<u64>,
-}
-impl SyscallParams {
-    fn new() -> Self {
-        SyscallParams {
-            param1: 0,
-            param2: 0,
-            param3: 0,
-            param4: 0,
-            extra_params: vec![],
+macro_rules! make_wrapper {
+    ($wrap:ident, $real:path $(, $t:ty )* $(,)?) => {
+        #[inline(always)]
+        unsafe fn $wrap(rcx: u64, rdx: u64, r8: u64, r9: u64,
+                        rest: *const u64) -> u64 {
+            let regs = [rcx, rdx, r8, r9];
+            let mut idx = 0usize;
+            #[inline(always)]
+            unsafe fn next(regs: &[u64;4], rest: *const u64, idx: &mut usize) -> u64 {
+                let v = if *idx < 4 { regs[*idx] } else { *rest.add(*idx - 4) };
+                *idx += 1;
+                v
+            }
+            $real(
+                $( next(&regs, rest, &mut idx) as $t ),*
+            ) as u64
         }
-    }
+    };
+}
+
+
+
+
+make_wrapper!(wrap_print      , sys_print       , *const u8);
+make_wrapper!(wrap_destroy    , sys_destroy_task, u64);
+make_wrapper!(wrap_create     , sys_create_task , usize);
+make_wrapper!(wrap_file_open  , sys_file_open   ,
+                               *const u8, *const OpenFlags, usize, *mut File);
+make_wrapper!(wrap_file_read  , sys_file_read   , *mut File, usize);
+make_wrapper!(wrap_file_write , sys_file_write  , *mut File, *const u8, usize);
+make_wrapper!(wrap_file_delete, sys_file_delete , *mut File);
+make_wrapper!(wrap_get_tid    , sys_get_tid     ,);
+make_wrapper!(wrap_mq_request , sys_mq_request  );
+
+
+const SYSCALL_TABLE: &[Handler] = &[
+    wrap_print,        // 0
+    wrap_destroy,      // 1
+    wrap_create,       // 2
+    wrap_file_open,    // 3
+    wrap_file_read,    // 4
+    wrap_file_write,   // 5
+    wrap_file_delete,  // 6
+    wrap_get_tid,      // 7
+    wrap_mq_request,   // 8
+];
+
+#[no_mangle]
+pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
+    let num = frame.rax as usize;
+    // stack args start immediately after the pushed register block
+    let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;
+
+    frame.rax = if let Some(h) = SYSCALL_TABLE.get(num) {
+        unsafe { h(frame.rcx, frame.rdx, frame.r8, frame.r9, rest_ptr) }
+    } else {
+        0
+    };
 }
