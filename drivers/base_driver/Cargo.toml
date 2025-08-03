@@ -1,10 +1,13 @@
 cargo-features = ["profile-rustflags"]
 
-[workspace]
-members = [ "driver_test",
-    "elf_test",
-]
-resolver = "2"
+[package]
+name = "base_driver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "BASE"
+crate-type = ["cdylib"]
 
 [profile.dev]
 panic = "abort"
@@ -12,7 +15,6 @@ codegen-units = 1
 lto = true
 strip = true
 opt-level = "z"
-
 
 [profile.release]
 panic = "abort"

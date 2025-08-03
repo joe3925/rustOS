@@ -24,6 +24,7 @@ mod cpu;
 mod drivers;
 mod exception_handlers;
 mod executable;
+mod exports;
 mod file_system;
 mod memory;
 mod scheduling;
@@ -36,15 +37,15 @@ use crate::memory::paging::tables::kernel_cr3;
 use crate::util::KERNEL_INITIALIZED;
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use alloc::{format, vec};
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
-use x86_64::registers::control::Cr3;
 use lazy_static::lazy_static;
-use alloc::vec::Vec;
-use alloc::{format, vec};
+use x86_64::registers::control::Cr3;
 
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 #[panic_handler]
@@ -86,12 +87,10 @@ fn _start(boot_info_local: &'static mut BootInfo) -> ! {
 }
 fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0;
-    const LOW_END:   u64 = 0x20_0000;            // 2 MiB
+    const LOW_END: u64 = 0x20_0000; // 2 MiB
 
     // Index of the first completely empty entry (`start==0 && end==0`)
-    let mut free_idx = regions
-        .iter()
-        .position(|r| r.start == 0 && r.end == 0);
+    let mut free_idx = regions.iter().position(|r| r.start == 0 && r.end == 0);
 
     let mut need_insert: Option<MemoryRegion> = None;
     let mut tagged_any = false;
@@ -119,8 +118,8 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
             // Remember the low part; we’ll insert it later
             need_insert = Some(MemoryRegion {
                 start: r.start,
-                end:   LOW_END,
-                kind:  MemoryRegionKind::Bootloader,
+                end: LOW_END,
+                kind: MemoryRegionKind::Bootloader,
             });
 
             // Keep the upper part as Usable
@@ -146,8 +145,8 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
         if let Some(idx) = free_idx {
             regions[idx] = MemoryRegion {
                 start: LOW_START,
-                end:   LOW_END,
-                kind:  MemoryRegionKind::Bootloader,
+                end: LOW_END,
+                kind: MemoryRegionKind::Bootloader,
             };
         }
     }
@@ -167,7 +166,7 @@ const fn get_rva(addr: usize) -> usize {
     let base = 0xFFFF_8500_0000_0000usize; // your known kernel base
     addr - base
 }
-
+#[macro_export]
 macro_rules! export {
     ($($name:ident),* $(,)?) => {
         lazy_static::lazy_static! {
@@ -178,7 +177,4 @@ macro_rules! export {
             ];
         }
     };
-}
-export! {
-    function,
 }

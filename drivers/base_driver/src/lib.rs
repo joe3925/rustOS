@@ -1,7 +1,11 @@
+#![no_std]
+#![no_main]
 #![cfg(target_env = "msvc")]
 #![allow(non_upper_case_globals)]
 
-use core::ffi::c_void;
+mod include;
+use crate::include::function;
+use core::panic::PanicInfo;
 
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;
@@ -18,4 +22,14 @@ pub extern "C" fn fma(_x: f64, _y: f64, z: f64) -> f64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn fmaf(_x: f32, _y: f32, z: f32) -> f32 {
     z
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {}
+}
+
+#[unsafe(export_name = "driver_entry")]
+extern "win64" fn driver_entry() {
+    unsafe { function(2) };
 }
