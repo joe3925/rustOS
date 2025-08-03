@@ -713,13 +713,27 @@ impl FileSystem {
         let file_names: Vec<String> = files
             .iter()
             .map(|entry| {
-                let raw = entry.name;
-                let trimmed = raw
+                let name = entry
+                    .name
                     .iter()
-                    .take_while(|&&c| c != 0 && c != b' ') // trim nulls and spaces
+                    .take_while(|&&c| c != 0 && c != b' ')
                     .cloned()
                     .collect::<Vec<u8>>();
-                String::from_utf8_lossy(&trimmed).to_string()
+
+                let ext = entry
+                    .extension
+                    .iter()
+                    .take_while(|&&c| c != 0 && c != b' ')
+                    .cloned()
+                    .collect::<Vec<u8>>();
+
+                let mut full_name = String::from_utf8_lossy(&name).to_string();
+                if !ext.is_empty() {
+                    full_name.push('.');
+                    full_name.push_str(&String::from_utf8_lossy(&ext));
+                }
+
+                full_name
             })
             .collect();
 

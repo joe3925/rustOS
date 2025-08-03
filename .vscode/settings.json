@@ -120,5 +120,6 @@
         "wrmsr",
         "xoshiro",
         "Xoshiro"
-    ]
+    ],
+    "git.untrackedChanges": "separate"
 }

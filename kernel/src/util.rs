@@ -170,6 +170,7 @@ pub fn kernel_main() {
     };
 
     let entries = File::list_dir(&full_path).expect("Failed to load system mod directory");
+    println!("{:#?}", entries);
 
     for name in entries {
         if !name.to_ascii_lowercase().ends_with(".dll") {
@@ -212,58 +213,11 @@ pub fn kernel_main() {
         {
             let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
             let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
-            println!("Calling driver_entry for module {}", module.title);
+            println!("Calling driver_entry for module {}", module.image_path);
             unsafe { driver_entry() };
         } else {
             println!("No driver_entry found in {}", module.title);
         }
-    }
-    if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
-        loadable.load();
     }
     print_mem_report();
     println!("");

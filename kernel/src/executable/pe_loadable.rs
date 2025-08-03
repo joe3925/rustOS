@@ -1,8 +1,10 @@
 use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
+use crate::file_system::fat::FileSystem;
 use crate::file_system::file::{File, OpenFlags};
 use crate::memory::paging::tables::new_user_mode_page_table;
+use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
@@ -59,9 +61,10 @@ impl PELoader {
     }
     pub fn list_import_dlls(&self) -> Vec<String> {
         let mut dlls = Vec::new();
-
+        println!("imports total {}", self.pe.imports.len());
         for imp in &self.pe.imports {
-            let name = imp.name.to_string();
+            let name = imp.dll.to_string();
+            println!("imports {}", name);
             dlls.push(name.to_ascii_lowercase());
         }
         dlls
@@ -156,8 +159,15 @@ impl PELoader {
                 self.load_sections()?;
                 self.relocate()?;
                 self.resolve_imports(program);
-                Self::patch_imports(program);
-
+                self.patch_imports(program);
+                let module = Module {
+                    title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
+                    image_path: self.path.clone(),
+                    parent_pid: program.pid,
+                    image_base: self.current_base,
+                    symbols: exports,
+                };
+                program.modules.lock().push(module);
                 return Ok(());
             }
 
@@ -172,9 +182,9 @@ impl PELoader {
             self.current_base = VirtAddr::new(preferred_base);
             self.load_sections()?;
             self.resolve_imports(program);
-            Self::patch_imports(program);
+            self.patch_imports(program);
             let module = Module {
-                title: File::remove_file_from_path(&self.path).to_string(),
+                title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
                 image_path: self.path.clone(),
                 parent_pid: program.pid,
                 image_base: self.current_base,
@@ -245,7 +255,7 @@ impl PELoader {
         let heap_addr = self.current_base + image_size + 0x1000 + stack_size + 0x10;
 
         let mut program = Program {
-            title: File::remove_file_from_path(self.path.as_str()).to_string(),
+            title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
             image_path: self.path.clone(),
             pid: 0,
             image_base: self.current_base,
@@ -280,7 +290,7 @@ impl PELoader {
             self.relocate()?;
         }
         self.resolve_imports(&mut program);
-        Self::patch_imports(&mut program);
+        self.patch_imports(&mut program);
 
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
 
@@ -300,6 +310,7 @@ impl PELoader {
 
             for m in &snapshot {
                 for dll in self.list_import_dlls() {
+                    println!("loading mod, {}", dll);
                     if program.has_module(&dll) {
                         continue;
                     }
@@ -415,48 +426,16 @@ impl PELoader {
         }
         out
     }
-    pub fn patch_imports(program: &mut Program) -> Result<(), LoadError> {
-        use hashbrown::HashMap;
-        let map: HashMap<_, _> = {
-            let binding = program.modules.lock();
-            binding
-                .iter()
-                .map(|m| {
-                    (m.title.clone(), (m.clone(), m.symbols.clone()))
-                })
-                .collect()
-        };
+    pub fn patch_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
+        for imp in &self.pe.imports {
+            let dll_name = imp.dll.to_ascii_lowercase();
+            let symbol_name = &imp.name;
 
-        for m in program.modules.lock().iter() {
-            let loader = match PELoader::new(&m.image_path) {
-                Some(l) => l,
-                None => continue,
-            };
+            let abs_addr = program.find_import(dll_name.as_str(), symbol_name.to_string().as_str()).ok_or(LoadError::NoSuchSymbol)?;
 
-            for imp in &loader.pe.imports {
-                let dll_name = imp.dll.to_ascii_lowercase();
-                let (prov_mod, exports) = map.get(dll_name.as_str()).ok_or(LoadError::NoFile)?;
-
-                let target_rva = match &imp.name {
-                    Cow::Borrowed(n) => exports
-                        .iter()
-                        .find(|(nm, _)| nm.eq_ignore_ascii_case(n))
-                        .map(|(_, rva)| *rva)
-                        .ok_or(LoadError::MissingSections)?,
-                    Cow::Owned(n) => exports
-                        .iter()
-                        .find(|(nm, _)| nm.eq_ignore_ascii_case(n.as_str()))
-                        .map(|(_, rva)| *rva)
-                        .ok_or(LoadError::MissingSections)?,
-                };
-
-                let abs_addr = prov_mod.image_base.as_u64() + target_rva as u64;
-
-                let slot_va = m.image_base.as_u64() + imp.rva as u64;
-                unsafe { (slot_va as *mut usize).write(abs_addr as usize) };
-            }
+            let slot_va = self.current_base.as_u64() + imp.offset as u64;
+            unsafe { (slot_va as *mut u64).write(abs_addr.as_u64()) };
         }
-
         Ok(())
     }
 }
@@ -519,6 +498,7 @@ pub enum LoadError {
     NotDLL,
     NoFile,
     NoMainThread,
+    NoSuchSymbol,
 }
 
 #[repr(u16)]

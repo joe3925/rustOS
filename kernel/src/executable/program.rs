@@ -154,6 +154,19 @@ impl Program {
             Err(LoadError::NoMainThread)
         }
     }
+    pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Option<VirtAddr> {
+        let modules = self.modules.lock();
+
+        for module in modules.iter() {
+            if module.title.eq_ignore_ascii_case(dll_name) {
+                if let Some(symbol) = module.symbols.iter().find(|(name, _)| name == symbol_name) {
+                    return Some(module.image_base + symbol.1 as u64);
+                }
+            }
+        }
+
+        None
+    }
     pub fn has_module(&self, name_lc: &str) -> bool {
         self.modules
             .lock()
