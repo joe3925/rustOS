@@ -34,7 +34,7 @@ fn u64_to_str_ptr(value: *const u8) -> Option<String> {
 fn is_user_addr(addr: u64) -> bool { addr < KERNEL_SPACE_BASE && addr >= 0x1000 }
 
 #[inline(always)]
-fn user_ptr_ok<T>(ptr: *const T, bytes: usize) -> bool {
+pub fn user_ptr_ok<T>(ptr: *const T, bytes: usize) -> bool {
     let a = ptr as u64;
     is_user_addr(a) &&
     a.checked_add(bytes as u64)

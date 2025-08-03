@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "driver_test"
+version = "0.1.0"
+
+[[package]]
 name = "elf_test"
 version = "0.1.0"
 dependencies = [

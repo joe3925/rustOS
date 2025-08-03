@@ -266,12 +266,10 @@ macro_rules! println {
 }
 
 pub(crate) fn _print(args: core::fmt::Arguments) {
-    interrupts::without_interrupts(move || {
         let mut buffer = [0u8; 1024];
         let mut writer = BufferWriter::new(&mut buffer);
         core::fmt::write(&mut writer, args).unwrap();
         CONSOLE.lock().print(writer.as_bytes());
-    });
 }
 
 struct BufferWriter<'a> {

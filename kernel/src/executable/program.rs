@@ -2,10 +2,16 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
-    instructions::hlt, structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB}, VirtAddr
+    instructions::hlt,
+    registers::control::Cr3,
+    structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
+    VirtAddr,
 };
 
-use crate::{memory::paging::paging::map_page, scheduling::scheduler::{self, Scheduler}};
+use crate::{
+    memory::paging::paging::map_page,
+    scheduling::scheduler::{self, Scheduler},
+};
 use crate::{
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper,
@@ -16,15 +22,17 @@ use crate::{
 };
 
 use super::pe_loadable::{self, LoadError};
+#[derive(Clone)]
 pub struct Module {
     pub title: String,
     pub image_path: String,
     pub parent_pid: u64,
     pub image_base: VirtAddr,
+    pub symbols: Vec<(String, usize)>,
 }
 pub struct Program {
     pub title: String,
-    pub image_path: String,
+    pub image_path: String, 
     pub pid: u64,
     pub image_base: VirtAddr,
     pub main_thread: Option<Task>,
@@ -46,29 +54,35 @@ impl Program {
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| MapToError::FrameAllocationFailed)?;
 
-        let boot_info = boot_info();
-        let phys_mem_offset = VirtAddr::new(
-            boot_info
-                .physical_memory_offset
-                .into_option()
-                .expect("physical_memory_offset missing"),
-        );
+        let old_cr3 = Cr3::read();
+        unsafe { Cr3::write(self.cr3, old_cr3.1) };
 
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let res = (|| {
+            let boot_info = boot_info();
+            let phys_mem_offset = VirtAddr::new(
+                boot_info
+                    .physical_memory_offset
+                    .into_option()
+                    .expect("phys mem off missing"),
+            );
+            let mut mapper = init_mapper(phys_mem_offset);
+            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
 
-        let flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
+                let page = Page::containing_address(VirtAddr::new(addr));
+                map_page(&mut mapper, page, &mut frame_alloc, flags)?;
+            }
+            Ok(())
+        })();
 
-        for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
-            let page = Page::containing_address(VirtAddr::new(addr));
-            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
-        }
-
-        Ok(())
+        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+        res
     }
 
-    ///Safety: User must make sure the address mapped by this function is allocated by the range tracker or virtual_map will silently fail
+    /// Map an already-tracked range.  Caller must ensure the range was reserved.
     pub unsafe fn virtual_map(
         &self,
         virt_addr: VirtAddr,
@@ -77,31 +91,36 @@ impl Program {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
-        let boot_info = boot_info();
-        let phys_mem_offset = VirtAddr::new(
-            boot_info
-                .physical_memory_offset
-                .into_option()
-                .expect("physical_memory_offset missing"),
-        );
+        let old_cr3 = Cr3::read();
+        Cr3::write(self.cr3, old_cr3.1);
 
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let result = (|| {
+            let boot_info = boot_info();
+            let phys_mem_offset = VirtAddr::new(
+                boot_info
+                    .physical_memory_offset
+                    .into_option()
+                    .expect("phys mem off missing"),
+            );
+            let mut mapper = init_mapper(phys_mem_offset);
+            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+            let flags = PageTableFlags::PRESENT
+                | PageTableFlags::WRITABLE
+                | PageTableFlags::USER_ACCESSIBLE;
 
-        let flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
+                let page = Page::containing_address(VirtAddr::new(addr));
+                map_page(&mut mapper, page, &mut frame_alloc, flags)?;
+            }
+            Ok(())
+        })();
 
-        for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
-            let page = Page::containing_address(VirtAddr::new(addr));
-            map_page(&mut mapper, page, &mut frame_allocator, flags)?;
-        }
-
-        Ok(())
+        Cr3::write(old_cr3.0, old_cr3.1);
+        result
     }
     pub fn load_module(&mut self, path: String) -> Result<(), LoadError> {
         if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
-            let module = dll.dll_load(self.pid)?;
-            self.modules.lock().push(module);
+            let module = dll.dll_load(self)?;
             return Ok(());
         }
         Err(LoadError::NoFile)
@@ -134,6 +153,12 @@ impl Program {
         } else {
             Err(LoadError::NoMainThread)
         }
+    }
+    pub fn has_module(&self, name_lc: &str) -> bool {
+        self.modules
+            .lock()
+            .iter()
+            .any(|m| m.title.eq_ignore_ascii_case(name_lc))
     }
 }
 
@@ -168,8 +193,10 @@ impl ProgramManager {
         return Some(scheduler.get_task_by_name(program.title.clone())?.id);
     }
 
-    pub fn remove_program(&mut self, pid: u64) {
+    pub fn kill_program(&mut self, pid: u64) -> Result<(), LoadError> {
+        self.get_mut(pid).ok_or(LoadError::BadPID)?.kill();
         self.programs.retain(|p| p.pid != pid);
+        Ok(())
     }
 
     pub fn get(&self, pid: u64) -> Option<&Program> {

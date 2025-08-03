@@ -1,7 +1,7 @@
 cargo-features = ["profile-rustflags"]
 
 [workspace]
-members = [
+members = [ "driver_test",
     "elf_test",
 ]
 resolver = "2"

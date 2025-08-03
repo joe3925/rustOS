@@ -35,14 +35,18 @@ use crate::console::clear_screen;
 use crate::memory::paging::tables::kernel_cr3;
 use crate::util::KERNEL_INITIALIZED;
 
+use alloc::string::{String, ToString};
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
 use core::sync::atomic::Ordering;
 use x86_64::registers::control::Cr3;
-static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
+use lazy_static::lazy_static;
+use alloc::vec::Vec;
+use alloc::{format, vec};
 
+static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     x86_64::instructions::interrupts::disable();
@@ -149,7 +153,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     }
 }
 
-pub fn function(x: i64) -> i64 {
+pub extern "win64" fn function(x: i64) -> i64 {
     return x;
 }
 #[cfg(test)]
@@ -158,4 +162,23 @@ pub fn test_runner(tests: &[&dyn Fn()]) {
     for test in tests {
         test();
     }
+}
+const fn get_rva(addr: usize) -> usize {
+    let base = 0xFFFF_8500_0000_0000usize; // your known kernel base
+    addr - base
+}
+
+macro_rules! export {
+    ($($name:ident),* $(,)?) => {
+        lazy_static::lazy_static! {
+            pub static ref EXPORTS: Vec<(String, usize)> = vec![
+                $(
+                    (stringify!($name).to_string(), get_rva($name as usize)),
+                )*
+            ];
+        }
+    };
+}
+export! {
+    function,
 }

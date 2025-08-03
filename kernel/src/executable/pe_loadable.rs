@@ -6,7 +6,9 @@ use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -54,6 +56,15 @@ impl PELoader {
             path: path.to_string(),
             current_base: base,
         })
+    }
+    pub fn list_import_dlls(&self) -> Vec<String> {
+        let mut dlls = Vec::new();
+
+        for imp in &self.pe.imports {
+            let name = imp.name.to_string();
+            dlls.push(name.to_ascii_lowercase());
+        }
+        dlls
     }
     pub fn is_pic(&self) -> bool {
         let dynbase = {
@@ -105,75 +116,77 @@ impl PELoader {
 
         Some(parse_base_relocations(buffer))
     }
-
-    pub fn dll_load(&mut self, pid: u64) -> Result<Module, LoadError> {
+    pub fn dll_load(&mut self, program: &mut Program) -> Result<(), LoadError> {
+        // ---------- sanity checks ----------
         if !self.pe.is_lib {
             return Err(LoadError::NotDLL);
         }
-
         if !self.pe.is_64 {
             return Err(LoadError::Not64Bit);
         }
 
-        let binding = PROGRAM_MANAGER.read();
-        let program = binding.get(pid).ok_or(LoadError::BadPID)?;
-        let cr3 = program.cr3;
+        let new_cr3 = program.cr3; // target address space
+        let exports = self.collect_exports(); // (name, rva) list
 
-        let opt_hdr = self
+        let opt = self
             .pe
             .header
             .optional_header
             .as_ref()
             .ok_or(LoadError::MissingSections)?;
-        let image_size = opt_hdr.windows_fields.size_of_image as u64;
+        let image_size = opt.windows_fields.size_of_image as u64;
+        let preferred_base = opt.windows_fields.image_base; // u32
 
-        unsafe { Cr3::write(cr3, Cr3::read().1) };
-        if (program
-            .tracker
-            .alloc(opt_hdr.windows_fields.image_base, image_size)
-            .is_err()
-            || self.needs_relocation())
-        {
-            let relocation = self.calculate_relocation_base(&program.tracker)?;
-            self.current_base = relocation;
-            match program.virtual_map_alloc(relocation, image_size as usize) {
-                Ok(_) => {}
-                Err(_) => return Err(LoadError::NoMemory),
-            };
+        let old_cr3 = Cr3::read();
+        unsafe { Cr3::write(new_cr3, old_cr3.1) };
 
-            self.load_sections()?;
-            self.relocate()?;
-            let module = Module {
-                title: File::remove_file_from_path(self.path.as_str()).to_string(),
-                image_path: self.path.clone(),
-                parent_pid: pid,
-                image_base: relocation,
-            };
-            return Ok(module);
-        }
+        let result = (|| {
+            let need_reloc = program.tracker.alloc(preferred_base, image_size).is_err()
+                || self.needs_relocation();
 
-        unsafe {
-            match program.virtual_map(
-                VirtAddr::new(opt_hdr.windows_fields.image_base),
-                image_size as usize,
-            ) {
-                Ok(_) => {}
-                Err(MapToError::PageAlreadyMapped(_)) => {
-                    return Err(LoadError::UnsupportedImageBase)
-                }
-                Err(_) => {
-                    return Err(LoadError::NoMemory);
-                }
+            if need_reloc {
+                // ----- relocated path -----
+                let new_base = self.calculate_relocation_base(&program.tracker)?;
+                self.current_base = new_base;
+
+                program
+                    .virtual_map_alloc(new_base, image_size as usize)
+                    .map_err(|_| LoadError::NoMemory)?;
+
+                self.load_sections()?;
+                self.relocate()?;
+                self.resolve_imports(program);
+                Self::patch_imports(program);
+
+                return Ok(());
             }
-        };
-        self.load_sections()?;
-        let module = Module {
-            title: File::remove_file_from_path(self.path.as_str()).to_string(),
-            image_path: self.path.clone(),
-            parent_pid: pid,
-            image_base: VirtAddr::new(opt_hdr.windows_fields.image_base),
-        };
-        return Ok(module);
+
+            unsafe {
+                program
+                    .virtual_map(VirtAddr::new(preferred_base), image_size as usize)
+                    .map_err(|e| match e {
+                        MapToError::PageAlreadyMapped(_) => LoadError::UnsupportedImageBase,
+                        _ => LoadError::NoMemory,
+                    })?;
+            }
+            self.current_base = VirtAddr::new(preferred_base);
+            self.load_sections()?;
+            self.resolve_imports(program);
+            Self::patch_imports(program);
+            let module = Module {
+                title: File::remove_file_from_path(&self.path).to_string(),
+                image_path: self.path.clone(),
+                parent_pid: program.pid,
+                image_base: self.current_base,
+                symbols: exports,
+            };
+            program.modules.lock().push(module);
+            Ok(())
+        })();
+
+        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+
+        result
     }
 
     /// Loads the PE into memory and prepares it for execution.
@@ -266,16 +279,43 @@ impl PELoader {
         if (self.needs_relocation()) {
             self.relocate()?;
         }
+        self.resolve_imports(&mut program);
+        Self::patch_imports(&mut program);
+
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
 
         let pid = PROGRAM_MANAGER.write().add_program(program);
         let mut scheduler = SCHEDULER.lock();
         PROGRAM_MANAGER.write().start_pid(pid, &mut scheduler);
-
         if were_enabled {
             interrupts::enable();
         }
         Ok(pid)
+    }
+    pub fn resolve_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
+        loop {
+            let mut added = false;
+
+            let snapshot = program.modules.lock().clone();
+
+            for m in &snapshot {
+                for dll in self.list_import_dlls() {
+                    if program.has_module(&dll) {
+                        continue;
+                    }
+
+                    let path = format!(r"C:\BIN\MOD\{}", dll);
+                    program.load_module(path);
+
+                    added = true;
+                }
+            }
+
+            if !added {
+                break;
+            }
+        }
+        Ok(())
     }
     pub fn calculate_allocation_size(&self) -> Result<usize, LoadError> {
         let opt_hdr = self
@@ -315,31 +355,37 @@ impl PELoader {
                 }
             }
         }
-        
+
         Ok(())
     }
-pub fn relocate(&mut self) -> Result<(), LoadError> {
-    let opt_hdr   = self.pe.header.optional_header.ok_or(LoadError::MissingSections)?;
-    let old_base  = opt_hdr.windows_fields.image_base as u64;
-    let delta     = self.current_base.as_u64().wrapping_sub(old_base);
+    pub fn relocate(&mut self) -> Result<(), LoadError> {
+        let opt_hdr = self
+            .pe
+            .header
+            .optional_header
+            .ok_or(LoadError::MissingSections)?;
+        let old_base = opt_hdr.windows_fields.image_base as u64;
+        let delta = self.current_base.as_u64().wrapping_sub(old_base);
 
-    let relocs = self.reloc_table().ok_or(LoadError::UnsupportedRelocationFormat)?;
+        let relocs = self
+            .reloc_table()
+            .ok_or(LoadError::UnsupportedRelocationFormat)?;
 
-    for entry in relocs {
-        match entry.relocation_type {
-            BaseRelocType::Absolute => continue,                
-            BaseRelocType::Dir64 => {
-                let target = self.current_base.as_u64() + entry.virtual_address as u64;
-                unsafe {
-                    let p = target as *mut u64;
-                    p.write(p.read().wrapping_add(delta));
+        for entry in relocs {
+            match entry.relocation_type {
+                BaseRelocType::Absolute => continue,
+                BaseRelocType::Dir64 => {
+                    let target = self.current_base.as_u64() + entry.virtual_address as u64;
+                    unsafe {
+                        let p = target as *mut u64;
+                        p.write(p.read().wrapping_add(delta));
+                    }
                 }
+                _ => return Err(LoadError::UnsupportedRelocationFormat),
             }
-            _ => return Err(LoadError::UnsupportedRelocationFormat),
         }
+        Ok(())
     }
-    Ok(())
-}
     pub fn calculate_relocation_base(
         &mut self,
         range_tracker: &RangeTracker,
@@ -360,6 +406,59 @@ pub fn relocate(&mut self) -> Result<(), LoadError> {
         range_tracker.dealloc(new_base.as_u64(), alloc_size as u64);
         Ok(new_base)
     }
+    fn collect_exports(&self) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        for export in &self.pe.exports {
+            if let Some(name) = export.name {
+                out.push((name.to_string(), export.rva));
+            }
+        }
+        out
+    }
+    pub fn patch_imports(program: &mut Program) -> Result<(), LoadError> {
+        use hashbrown::HashMap;
+        let map: HashMap<_, _> = {
+            let binding = program.modules.lock();
+            binding
+                .iter()
+                .map(|m| {
+                    (m.title.clone(), (m.clone(), m.symbols.clone()))
+                })
+                .collect()
+        };
+
+        for m in program.modules.lock().iter() {
+            let loader = match PELoader::new(&m.image_path) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            for imp in &loader.pe.imports {
+                let dll_name = imp.dll.to_ascii_lowercase();
+                let (prov_mod, exports) = map.get(dll_name.as_str()).ok_or(LoadError::NoFile)?;
+
+                let target_rva = match &imp.name {
+                    Cow::Borrowed(n) => exports
+                        .iter()
+                        .find(|(nm, _)| nm.eq_ignore_ascii_case(n))
+                        .map(|(_, rva)| *rva)
+                        .ok_or(LoadError::MissingSections)?,
+                    Cow::Owned(n) => exports
+                        .iter()
+                        .find(|(nm, _)| nm.eq_ignore_ascii_case(n.as_str()))
+                        .map(|(_, rva)| *rva)
+                        .ok_or(LoadError::MissingSections)?,
+                };
+
+                let abs_addr = prov_mod.image_base.as_u64() + target_rva as u64;
+
+                let slot_va = m.image_base.as_u64() + imp.rva as u64;
+                unsafe { (slot_va as *mut usize).write(abs_addr as usize) };
+            }
+        }
+
+        Ok(())
+    }
 }
 pub struct RelocationEntry {
     pub relocation_type: BaseRelocType,
@@ -376,7 +475,7 @@ pub fn parse_base_relocations(reloc_data: &[u8]) -> impl Iterator<Item = Relocat
         let va = u32::from_le_bytes(reloc_data[offset..offset + 4].try_into().unwrap());
         let block_size = u32::from_le_bytes(reloc_data[offset + 4..offset + 8].try_into().unwrap());
         if block_size < 8 {
-            return None;                  
+            return None;
         }
         let entry_count = ((block_size - 8) / 2) as usize;
 
@@ -427,8 +526,8 @@ pub enum LoadError {
 
 pub enum BaseRelocType {
     Absolute = 0x0000,
-    HighLow  = 0x0003,
-    Dir64    = 0x000A,
+    HighLow = 0x0003,
+    Dir64 = 0x000A,
 }
 
 impl core::convert::TryFrom<u16> for BaseRelocType {
@@ -439,7 +538,7 @@ impl core::convert::TryFrom<u16> for BaseRelocType {
             0x0000 => Ok(BaseRelocType::Absolute),
             0x0003 => Ok(BaseRelocType::HighLow),
             0x000A => Ok(BaseRelocType::Dir64),
-            _      => Err(()),                 // unknown/unsupported code
+            _ => Err(()), // unknown/unsupported code
         }
     }
 }

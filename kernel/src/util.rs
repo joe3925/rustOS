@@ -9,7 +9,7 @@ use crate::drivers::interrupt_index::{
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
-use crate::executable::program::{Program, PROGRAM_MANAGER};
+use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
@@ -26,8 +26,8 @@ use x86_64::instructions::interrupts;
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::{cpu, println, BOOT_INFO};
-use alloc::vec::Vec;
+use crate::{cpu, println, BOOT_INFO, EXPORTS};
+use alloc::{vec, vec::{Vec}};
 use bootloader_api::BootInfo;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -131,13 +131,19 @@ pub unsafe fn init() {
 // Things to be tested after kernel init go here
 pub fn kernel_main() {
     let program = Program {
-        title: "".to_string(),
+        title: "KRNL".to_string(),
         image_path: "".to_string(),
         pid: 0,
         image_base: VirtAddr::new(0xFFFF850000000000),
         main_thread: Some(SCHEDULER.lock().get_current_task().clone()),
         managed_threads: Mutex::new(Vec::new()),
-        modules: Mutex::new(Vec::new()),
+        modules: Mutex::new(vec![Module {
+            title: "KRNL.DLL".into(),
+            image_path: "".into(),
+            parent_pid: 0,
+            image_base: VirtAddr::new(0xFFFF850000000000),
+            symbols: EXPORTS.to_vec(),
+        }]),
         cr3: kernel_cr3(),
         tracker: KERNEL_RANGE_TRACKER.clone(),
     };
@@ -187,6 +193,29 @@ pub fn kernel_main() {
             Err(e) => {
                 println!("Failed to load module '{}': {:?}", name, e);
             }
+        }
+    }
+    type DriverEntryFn = unsafe extern "C" fn() -> ();
+
+    for module in PROGRAM_MANAGER
+        .read()
+        .get(pid)
+        .expect("Invalid PID")
+        .modules
+        .lock()
+        .iter()
+    {
+        if let Some((_, rva)) = module
+            .symbols
+            .iter()
+            .find(|(name, _)| name == "driver_entry")
+        {
+            let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
+            let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
+            println!("Calling driver_entry for module {}", module.title);
+            unsafe { driver_entry() };
+        } else {
+            println!("No driver_entry found in {}", module.title);
         }
     }
     if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {

@@ -62,7 +62,6 @@ pub struct SyscallFrame {
 #[naked]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
-        "cli",
         "push rax",
         "push rbp",
         "push rbx",
@@ -136,8 +135,7 @@ macro_rules! make_wrapper {
 make_wrapper!(wrap_print      , sys_print       , *const u8);
 make_wrapper!(wrap_destroy    , sys_destroy_task, u64);
 make_wrapper!(wrap_create     , sys_create_task , usize);
-make_wrapper!(wrap_file_open  , sys_file_open   ,
-                               *const u8, *const OpenFlags, usize, *mut File);
+make_wrapper!(wrap_file_open  , sys_file_open   ,*const u8, *const OpenFlags, usize, *mut File);
 make_wrapper!(wrap_file_read  , sys_file_read   , *mut File, usize);
 make_wrapper!(wrap_file_write , sys_file_write  , *mut File, *const u8, usize);
 make_wrapper!(wrap_file_delete, sys_file_delete , *mut File);
