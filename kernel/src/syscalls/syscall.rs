@@ -62,6 +62,7 @@ pub struct SyscallFrame {
 #[naked]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
+        "cli",
         "push rax",
         "push rbp",
         "push rbx",
@@ -101,7 +102,7 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "pop  rbx",
         "pop  rbp",
         "pop  rax",
-
+        
         "sysretq",
 
         handler = sym syscall_handler,

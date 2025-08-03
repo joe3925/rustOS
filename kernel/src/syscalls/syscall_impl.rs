@@ -7,6 +7,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use alloc::slice;
 use alloc::string::{ String, ToString};
 use alloc::vec::Vec;
+use x86_64::instructions::interrupts;
 
 fn println_wrapper(message_ptr: String) {
     let message = &*message_ptr;

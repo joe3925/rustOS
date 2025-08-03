@@ -190,7 +190,51 @@ pub fn kernel_main() {
         }
     }
     if let Some(mut loadable) = pe_loadable::PELoader::new("C:\\BIN\\TEST.EXE") {
-         loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
+        loadable.load();
     }
     print_mem_report();
     println!("");

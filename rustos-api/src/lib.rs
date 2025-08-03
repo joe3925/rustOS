@@ -104,7 +104,7 @@ macro_rules! make_syscall {
     (fn $name:ident ( $( $arg:ident : $ty:ty ),* $(,)? )
         -> $ret:ty , $num:expr $(,)?) => {
         #[inline(always)]
-        pub unsafe fn $name( $( $arg : $ty ),* ) -> $ret {
+        unsafe fn $name( $( $arg : $ty ),* ) -> $ret {
             // Pack the first four arguments (or fewer) into a fixed array.
             let mut regs = [0u64; 4];
             let mut i = 0usize;
@@ -132,4 +132,37 @@ macro_rules! make_syscall {
             out as $ret
         }
     };
+}
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+
+        // 128 bytes is enough for short diagnostic strings; enlarge if needed.
+        let mut buf = [0u8; 128];
+        let mut len = 0usize;
+
+        struct Writer<'a>(&'a mut [u8], &'a mut usize);
+        impl<'a> Write for Writer<'a> {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let end = *self.1 + s.len();
+                if end > self.0.len() { return Err(core::fmt::Error) }
+                self.0[*self.1 .. end].copy_from_slice(s.as_bytes());
+                *self.1 = end;
+                Ok(())
+            }
+        }
+
+        let mut w = Writer(&mut buf, &mut len);
+        core::write!(&mut w, $($arg)*).unwrap();
+        $crate::sys_print(core::str::from_utf8(&buf[..len]).unwrap());
+    }}
+}
+
+/// `println!` – same as `print!` but appends `\n`
+#[macro_export]
+macro_rules! println {
+    () => { $crate::print!("\n") };
+    ($fmt:expr) => { $crate::print!(concat!($fmt, "\n")) };
+    ($fmt:expr, $($arg:tt)*) => { $crate::print!(concat!($fmt, "\n"), $($arg)* ) };
 }

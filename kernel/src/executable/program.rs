@@ -5,7 +5,7 @@ use x86_64::{
     instructions::hlt, structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB}, VirtAddr
 };
 
-use crate::memory::paging::paging::map_page;
+use crate::{memory::paging::paging::map_page, scheduling::scheduler::{self, Scheduler}};
 use crate::{
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper,
@@ -161,9 +161,8 @@ impl ProgramManager {
         pid
     }
     ///Returns the thread id of the main thread if successful
-    pub fn start_pid(&self, pid: u64) -> Option<u64> {
+    pub fn start_pid(&self, pid: u64, scheduler: &mut Scheduler) -> Option<u64> {
         let program = self.get(pid)?;
-        let mut scheduler = SCHEDULER.lock();
         let task = program.main_thread.clone()?;
         scheduler.add_task(task);
         return Some(scheduler.get_task_by_name(program.title.clone())?.id);
