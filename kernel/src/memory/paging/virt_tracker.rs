@@ -1,9 +1,17 @@
-use core::sync::atomic::AtomicUsize;
+use crate::{
+    memory::paging::{
+        constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
+        frame_alloc::BootInfoFrameAllocator,
+        paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl, PageMapError},
+        tables::init_mapper,
+    },
+    structs::range_tracker::{RangeAllocationError, RangeTracker},
+    util::boot_info,
+};
 use alloc::sync::Arc;
-use x86_64::{structures::paging::PageTableFlags, VirtAddr};
-use crate::{memory::paging::{constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START}, frame_alloc::BootInfoFrameAllocator, paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl, PageMapError}, tables::init_mapper}, structs::range_tracker::{RangeAllocationError, RangeTracker}, util::boot_info};
+use core::sync::atomic::AtomicUsize;
 use lazy_static::lazy_static;
-
+use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;
 static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
@@ -34,7 +42,7 @@ pub fn allocate_kernel_range(base: u64, size: u64) -> Result<VirtAddr, RangeAllo
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
     Ok(addr)
 }
-pub fn allocate_auto_kernel_range_mapped(
+pub extern "win64" fn allocate_auto_kernel_range_mapped(
     size: u64,
     flags: PageTableFlags,
 ) -> Result<VirtAddr, PageMapError> {
@@ -51,7 +59,7 @@ pub fn allocate_auto_kernel_range_mapped(
     Ok(addr)
 }
 
-pub fn allocate_kernel_range_mapped(
+pub extern "win64" fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
     flags: PageTableFlags,
@@ -71,13 +79,13 @@ pub fn allocate_kernel_range_mapped(
     Ok(addr)
 }
 
-pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
+pub extern "win64" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
     let aligned_size = align_up_4k(size);
     KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), aligned_size);
 }
 
-pub fn unmap_range(virtual_addr: VirtAddr, size: u64) {
+pub extern "win64" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     deallocate_kernel_range(virtual_addr, size);
 
     unsafe { unmap_range_impl(virtual_addr, size) };

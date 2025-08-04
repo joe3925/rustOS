@@ -36,11 +36,11 @@ impl Scheduler {
     }
 
     #[inline]
-    pub fn add_task(&mut self, mut task: Task) -> Result<(), TaskError> {
+    pub fn add_task(&mut self, mut task: Task) -> Result<u64, TaskError> {
         task.id = self.id;
         self.id += 1;
         self.tasks.push_back(task);
-        Ok(())
+        Ok(self.id - 1)
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
@@ -63,13 +63,13 @@ impl Scheduler {
             }
         }
     }
-    pub fn has_core_init(&self) -> bool{
-        if let Some(task) = self.current_task.get(get_current_logical_id() as usize){
+    pub fn has_core_init(&self) -> bool {
+        if let Some(task) = self.current_task.get(get_current_logical_id() as usize) {
             if *task == 0 {
                 return false;
             }
             true
-        }else{
+        } else {
             false
         }
     }
@@ -106,17 +106,12 @@ impl Scheduler {
             self.add_task(kernel_task);
         }
         if (self.runnable_task() == 0 && !self.has_core_init()) {
-            let idle_task = Task::new_kernel_mode(
-                idle_task as usize,
-                KERNEL_STACK_SIZE,
-                "".to_string(),
-                0,
-            );
+            let idle_task =
+                Task::new_kernel_mode(idle_task as usize, KERNEL_STACK_SIZE, "".to_string(), 0);
             self.add_task(idle_task);
         }
 
         if self.tasks.len() > 0 {
-
             if self.has_core_init() {
                 let id = self.current_task.get(logical_id).map(|g| *g).unwrap();
                 let current_task = self.get_task_by_id(id).unwrap();
@@ -139,7 +134,7 @@ impl Scheduler {
                 self.current_task.set(logical_id, id);
                 self.get_current_task().executer_id = Some(logical_id as u16);
             } else {
-                return; 
+                return;
             }
         }
     }
@@ -193,7 +188,7 @@ impl Scheduler {
         for i in (0..self.tasks.len()).rev() {
             if self.tasks[i].terminated {
                 if let Some(executer_id) = self.tasks[i].executer_id {
-                    if(executer_id == get_current_logical_id() as u16){
+                    if (executer_id == get_current_logical_id() as u16) {
                         self.current_task.set(executer_id as usize, 0);
                         self.tasks[i].destroy();
                         self.tasks.remove(i);

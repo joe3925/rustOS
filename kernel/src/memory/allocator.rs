@@ -6,8 +6,7 @@ use core::ptr;
 use x86_64::{align_up, VirtAddr};
 
 #[global_allocator]
-pub static mut ALLOCATOR: Locked<Allocator> =
-    Locked::new(Allocator::new());
+pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
 pub struct Locked<A> {
     inner: spin::Mutex<A>,
 }
@@ -79,9 +78,7 @@ impl Allocator {
 
         None
     }
-    fn alloc_from_region(region: &mut ListNode, size: usize, align: usize)
-                         -> Result<usize, ()>
-    {
+    fn alloc_from_region(region: &mut ListNode, size: usize, align: usize) -> Result<usize, ()> {
         let alloc_start = align_up(region.start_addr() as u64, align as u64);
         let alloc_end = alloc_start.checked_add(size as u64).ok_or(())?;
 
@@ -198,5 +195,3 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
         allocator.merge_free_list();
     }
 }
-
-

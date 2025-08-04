@@ -6,7 +6,7 @@ use crate::{memory::paging::{constants::MMIO_BASE, frame_alloc::BootInfoFrameAll
 
 
 static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
-pub fn map_mmio_region(
+pub extern "win64" fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
 ) -> Result<VirtAddr, MapToError<Size4KiB>> {

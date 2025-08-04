@@ -2,9 +2,20 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use spin::Mutex;
-use x86_64::{structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB}, PhysAddr};
+use x86_64::{
+    structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
+    PhysAddr,
+};
 
-use crate::{memory::paging::{constants::{BOOT_MEMORY_SIZE, FRAMES_PER_1G, FRAMES_PER_2M, LOW_FRAMES, WORDS_PER_1G, WORDS_PER_2M}, paging::num_frames_4k}, util::boot_info};
+use crate::{
+    memory::paging::{
+        constants::{
+            BOOT_MEMORY_SIZE, FRAMES_PER_1G, FRAMES_PER_2M, LOW_FRAMES, WORDS_PER_1G, WORDS_PER_2M,
+        },
+        paging::num_frames_4k,
+    },
+    util::boot_info,
+};
 
 pub static MEMORY_BITMAP: Mutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
     Mutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
@@ -25,47 +36,48 @@ pub fn total_usable_bytes() -> u64 {
 pub struct BootInfoFrameAllocator {}
 
 impl BootInfoFrameAllocator {
-pub fn init_start(memory_regions: &'static [MemoryRegion]) {
-    let mut memory_map = MEMORY_BITMAP.lock();
+    pub fn init_start(memory_regions: &'static [MemoryRegion]) {
+        let mut memory_map = MEMORY_BITMAP.lock();
 
-    let words = (LOW_FRAMES + 63) / 64;         
-    for w in 0..words.min(memory_map.len()) {
-        memory_map[w] = !0u64;                    // mark every bit in the word
+        let words = (LOW_FRAMES + 63) / 64;
+        for w in 0..words.min(memory_map.len()) {
+            memory_map[w] = !0u64; // mark every bit in the word
+        }
+
+        /* ── 2. Tag all non‑Usable regions from the firmware/bootloader map ───── */
+        for region in memory_regions {
+            if region.kind == MemoryRegionKind::Usable {
+                continue;
+            }
+
+            let start_frame = (region.start >> 12) as usize;
+            let end_frame = ((region.end + 0xFFF) >> 12) as usize - 1;
+
+            if start_frame / 64 >= memory_map.len() {
+                continue; // outside our bitmap
+            }
+
+            let first_word = start_frame / 64;
+            let last_word = end_frame / 64;
+
+            let first_mask = !0u64 << (start_frame & 63);
+            let last_mask = !0u64 >> (63 - (end_frame & 63));
+
+            if first_word == last_word {
+                memory_map[first_word] |= first_mask & last_mask;
+                continue;
+            }
+
+            memory_map[first_word] |= first_mask; // partial first word
+
+            for w in (first_word + 1)..last_word {
+                // full words in the middle
+                memory_map[w] = !0u64;
+            }
+
+            memory_map[last_word] |= last_mask; // partial last word
+        }
     }
-
-    /* ── 2. Tag all non‑Usable regions from the firmware/bootloader map ───── */
-    for region in memory_regions {
-        if region.kind == MemoryRegionKind::Usable {
-            continue;
-        }
-
-        let start_frame = (region.start >> 12) as usize;
-        let end_frame   = ((region.end + 0xFFF) >> 12) as usize - 1;
-
-        if start_frame / 64 >= memory_map.len() {
-            continue;                             // outside our bitmap
-        }
-
-        let first_word = start_frame / 64;
-        let last_word  = end_frame   / 64;
-
-        let first_mask = !0u64 << (start_frame & 63);
-        let last_mask  = !0u64 >> (63 - (end_frame & 63));
-
-        if first_word == last_word {
-            memory_map[first_word] |= first_mask & last_mask;
-            continue;
-        }
-
-        memory_map[first_word] |= first_mask;     // partial first word
-
-        for w in (first_word + 1)..last_word {    // full words in the middle
-            memory_map[w] = !0u64;
-        }
-
-        memory_map[last_word]  |= last_mask;      // partial last word
-    }
-}
     pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
         BootInfoFrameAllocator {}
     }

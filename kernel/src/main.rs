@@ -28,6 +28,7 @@ mod exports;
 mod file_system;
 mod memory;
 mod scheduling;
+mod static_handlers;
 mod structs;
 mod syscalls;
 mod util;

@@ -1,6 +1,16 @@
-use x86_64::{structures::paging::{mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB, Size2MiB, Size4KiB}, PhysAddr, VirtAddr};
+use x86_64::{
+    structures::paging::{
+        mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB,
+        Size2MiB, Size4KiB,
+    },
+    PhysAddr, VirtAddr,
+};
 
-use crate::{cpu::get_cpu_info, memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper}, util::boot_info};
+use crate::{
+    cpu::get_cpu_info,
+    memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
+    util::boot_info,
+};
 
 #[derive(Debug)]
 pub enum PageMapError {
@@ -30,7 +40,6 @@ impl From<MapToError<Size1GiB>> for PageMapError {
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
 }
-
 
 pub fn map_range_with_huge_pages<M>(
     mapper: &mut M,
@@ -169,7 +178,7 @@ pub const fn align_up_2mib(x: u64) -> u64 {
     const TWO_MIB: u64 = 2 * 1024 * 1024; // 2 MiB
     (x + (TWO_MIB - 1)) & !(TWO_MIB - 1)
 }
-pub fn identity_map_page(
+pub extern "win64" fn identity_map_page(
     phys_addr: PhysAddr,
     range: usize,
     flags: PageTableFlags,
