@@ -1,12 +1,13 @@
-use crate::drivers::interrupt_index::{get_current_logical_id};
+use crate::drivers::interrupt_index::get_current_logical_id;
 
+use crate::executable::program::{Message, UserHandle};
 use crate::file_system::file::{File, OpenFlags};
 use crate::gdt::PER_CPU_GDT;
 use crate::println;
-use crate::syscalls::syscall_impl::{self, sys_create_task, sys_destroy_task, sys_file_delete, sys_file_open, sys_file_read, sys_file_write, sys_get_tid, sys_mq_request, sys_print};
-use alloc::string::{String};
+use crate::syscalls::syscall_impl::*;
+use alloc::string::String;
 use alloc::vec::Vec;
-use core::arch::{ naked_asm};
+use core::arch::naked_asm;
 use core::slice;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
@@ -101,7 +102,7 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "pop  rbx",
         "pop  rbp",
         "pop  rax",
-        
+
         "sysretq",
 
         handler = sym syscall_handler,
@@ -129,30 +130,47 @@ macro_rules! make_wrapper {
     };
 }
 
-
-
-
-make_wrapper!(wrap_print      , sys_print       , *const u8);
-make_wrapper!(wrap_destroy    , sys_destroy_task, u64);
-make_wrapper!(wrap_create     , sys_create_task , usize);
-make_wrapper!(wrap_file_open  , sys_file_open   ,*const u8, *const OpenFlags, usize, *mut File);
-make_wrapper!(wrap_file_read  , sys_file_read   , *mut File, usize);
-make_wrapper!(wrap_file_write , sys_file_write  , *mut File, *const u8, usize);
-make_wrapper!(wrap_file_delete, sys_file_delete , *mut File);
-make_wrapper!(wrap_get_tid    , sys_get_tid     ,);
-make_wrapper!(wrap_mq_request , sys_mq_request  );
-
+make_wrapper!(wrap_print, sys_print, *const u8);
+make_wrapper!(wrap_destroy, sys_destroy_task, u64);
+make_wrapper!(wrap_create, sys_create_task, usize);
+make_wrapper!(
+    wrap_file_open,
+    sys_file_open,
+    *const u8,
+    *const OpenFlags,
+    usize,
+    *mut File
+);
+make_wrapper!(wrap_file_read, sys_file_read, *mut File, usize);
+make_wrapper!(wrap_file_write, sys_file_write, *mut File, *const u8, usize);
+make_wrapper!(wrap_file_delete, sys_file_delete, *mut File);
+make_wrapper!(wrap_get_tid, sys_get_tid,);
+make_wrapper!(wrap_mq_request, sys_mq_request, UserHandle, *mut Message);
+make_wrapper!(wrap_mq_route_add, sys_route_add, *const UserRoutingRule);
+make_wrapper!(wrap_mq_route_clear, sys_route_clear, *const UserRoutingRule);
+make_wrapper!(wrap_mq_peek, sys_mq_peek, UserHandle, *mut Message);
+make_wrapper!(
+    wrap_mq_receive,
+    sys_mq_receive,
+    UserHandle,
+    *mut Message,
+    u32
+);
 
 const SYSCALL_TABLE: &[Handler] = &[
-    wrap_print,        // 0
-    wrap_destroy,      // 1
-    wrap_create,       // 2
-    wrap_file_open,    // 3
-    wrap_file_read,    // 4
-    wrap_file_write,   // 5
-    wrap_file_delete,  // 6
-    wrap_get_tid,      // 7
-    wrap_mq_request,   // 8
+    wrap_print,          // 0
+    wrap_destroy,        // 1
+    wrap_create,         // 2
+    wrap_file_open,      // 3
+    wrap_file_read,      // 4
+    wrap_file_write,     // 5
+    wrap_file_delete,    // 6
+    wrap_get_tid,        // 7
+    wrap_mq_request,     // 8
+    wrap_mq_route_add,   // 9
+    wrap_mq_route_clear, // 10
+    wrap_mq_peek,        // 11
+    wrap_mq_receive,     // 12
 ];
 
 #[no_mangle]

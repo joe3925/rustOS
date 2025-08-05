@@ -9,7 +9,7 @@ use crate::drivers::interrupt_index::{
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
-use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
+use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
@@ -21,7 +21,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use alloc::string::{String, ToString};
-use spin::{Mutex, Once};
+use spin::{Mutex, Once, RwLock};
 use x86_64::instructions::interrupts;
 
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
@@ -129,28 +129,30 @@ pub unsafe fn init() {
     }
 }
 
-// Things to be tested after kernel init go here
 pub fn kernel_main() {
-    let program = Program {
-        title: "KRNL".to_string(),
-        image_path: "".to_string(),
-        pid: 0,
-        image_base: VirtAddr::new(0xFFFF850000000000),
-        main_thread: Some(SCHEDULER.lock().get_current_task().clone()),
-        managed_threads: Mutex::new(Vec::new()),
-        modules: Mutex::new(vec![Module {
+    let mut program = Program::new(
+        "KRNL".to_string(),
+        "".to_string(),
+        VirtAddr::new(0xFFFF8500_0000_0000),
+        kernel_cr3(),
+        KERNEL_RANGE_TRACKER.clone(),
+    );
+
+    program.main_thread = Some(SCHEDULER.lock().get_current_task());
+
+    program.modules = Mutex::new(
+        vec![Module {
             title: "KRNL.DLL".into(),
             image_path: "".into(),
             parent_pid: 0,
-            image_base: VirtAddr::new(0xFFFF850000000000),
+            image_base: VirtAddr::new(0xFFFF8500_0000_0000),
             symbols: EXPORTS.to_vec(),
-        }]),
-        cr3: kernel_cr3(),
-        tracker: KERNEL_RANGE_TRACKER.clone(),
-    };
-    let pid = PROGRAM_MANAGER.write().add_program(program);
+        }]
+        .into(),
+    );
 
-    // Extract label and drop the VOLUMES lock early
+    let pid = PROGRAM_MANAGER.add_program(program);
+
     let label = {
         let mut volumes = VOLUMES.lock();
         if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
@@ -177,73 +179,66 @@ pub fn kernel_main() {
         if !name.to_ascii_lowercase().ends_with(".dll") {
             continue;
         }
+
         path_buffer.clear();
         path_buffer.push_str(&label);
         path_buffer.push_str(base_path);
-        path_buffer.push_str("\\");
+        path_buffer.push('\\');
         path_buffer.push_str(&name);
 
-        match PROGRAM_MANAGER
-            .write()
-            .get_mut(pid)
-            .unwrap()
-            .load_module(path_buffer.clone())
+        let handle = PROGRAM_MANAGER.get(pid).expect("invalid PID");
+
         {
-            Ok(_) => {
-                println!("Loaded module: {}", name);
-            }
-            Err(e) => {
-                println!("Failed to load module '{}': {:?}", name, e);
+            let mut prog = handle.write();
+            match prog.load_module(path_buffer.clone()) {
+                Ok(_) => println!("Loaded module: {}", name),
+                Err(e) => println!("Failed to load module '{}': {:?}", name, e),
             }
         }
-    }
-    type DriverEntryFn = unsafe extern "C" fn() -> ();
 
-    for module in PROGRAM_MANAGER
-        .read()
-        .get(pid)
-        .expect("Invalid PID")
-        .modules
-        .lock()
-        .iter()
-    {
-        if let Some((_, rva)) = module
-            .symbols
-            .iter()
-            .find(|(name, _)| name == "driver_entry")
-        {
-            let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
-            let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
-            println!("Calling driver_entry for module {}", module.image_path);
-            unsafe { driver_entry() };
+        type DriverEntryFn = unsafe extern "C" fn();
+
+        if let Some(handle) = PROGRAM_MANAGER.get(pid) {
+            let prog = handle.read();
+            for module in prog.modules.lock().iter() {
+                if let Some((_, rva)) = module.symbols.iter().find(|(sym, _)| sym == "driver_entry")
+                {
+                    let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
+                    let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
+                    println!("Calling driver_entry for module {}", module.image_path);
+                    unsafe { driver_entry() };
+                } else {
+                    println!("No driver_entry found in {}", module.title);
+                }
+            }
         } else {
-            println!("No driver_entry found in {}", module.title);
+            println!("invalid PID {}", pid);
         }
-    }
-    print_mem_report();
-    println!("");
-    loop {
-        wait_millis_idle(300000);
-        let timer_ms = TIMER_TIME
-            .lock()
-            .get(get_current_logical_id() as usize)
-            .unwrap()
-            .load(Ordering::SeqCst);
-        let total_ms = TOTAL_TIME.wait().elapsed_millis();
-        let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
-        let int_part = percent_x10 / 1000;
-        let frac_part = percent_x10 % 1000;
-
-        println!(
-            "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
-            timer_ms / 1000,
-            timer_ms * 4 / 1000,
-            total_ms / 1000 / 60,
-            int_part,
-            frac_part
-        );
         print_mem_report();
-        println!("\n");
+        println!("");
+        loop {
+            wait_millis_idle(300000);
+            let timer_ms = TIMER_TIME
+                .lock()
+                .get(get_current_logical_id() as usize)
+                .unwrap()
+                .load(Ordering::SeqCst);
+            let total_ms = TOTAL_TIME.wait().elapsed_millis();
+            let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
+            let int_part = percent_x10 / 1000;
+            let frac_part = percent_x10 % 1000;
+
+            println!(
+                "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
+                timer_ms / 1000,
+                timer_ms * 4 / 1000,
+                total_ms / 1000 / 60,
+                int_part,
+                frac_part
+            );
+            print_mem_report();
+            println!("\n");
+        }
     }
 }
 pub fn used_memory() -> usize {

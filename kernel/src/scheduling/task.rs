@@ -5,8 +5,12 @@ use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::arch::asm;
+use spin::RwLock;
 use x86_64::VirtAddr;
+
+use super::scheduler::TaskHandle;
 
 #[derive(Debug, Clone)]
 pub struct Task {
@@ -16,6 +20,7 @@ pub struct Task {
     pub id: u64,
     pub terminated: bool,
     pub is_user_mode: bool,
+    pub is_sleeping: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u16>,
 }
@@ -26,7 +31,7 @@ impl Task {
         name: String,
         stack_pointer: VirtAddr,
         parent_pid: u64,
-    ) -> Self {
+    ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let id = get_cpu_info()
             .get_feature_info()
@@ -41,8 +46,7 @@ impl Task {
         state.rflags = 0x00000202;
 
         unsafe {
-            let stack_ptr = state.rsp as *mut u64;
-            *stack_ptr = kernel_task_end as u64;
+            *(state.rsp as *mut u64) = kernel_task_end as u64;
         }
 
         state.cs = gdt
@@ -60,7 +64,7 @@ impl Task {
             .0 as u64 as u64
             | 3;
 
-        Self {
+        Arc::new(RwLock::new(Self {
             name,
             context: state,
             stack_start: stack_top,
@@ -69,19 +73,22 @@ impl Task {
             is_user_mode: true,
             parent_pid,
             executer_id: None,
-        }
+            is_sleeping: false,
+        }))
     }
+
     pub fn new_kernel_mode(
         entry_point: usize,
         stack_size: u64,
         name: String,
         parent_pid: u64,
-    ) -> Self {
+    ) -> TaskHandle {
         let gdt = PER_CPU_GDT.lock();
         let id = get_cpu_info()
             .get_feature_info()
             .expect("NO CPUID")
             .initial_local_apic_id();
+
         let stack_top =
             allocate_kernel_stack(stack_size).expect("Failed to allocate kernel-mode stack");
 
@@ -91,8 +98,7 @@ impl Task {
         state.rflags = 0x00000202;
 
         unsafe {
-            let stack_ptr = state.rsp as *mut u64;
-            *stack_ptr = kernel_task_end as u64;
+            *(state.rsp as *mut u64) = kernel_task_end as u64;
         }
 
         state.cs = gdt
@@ -108,7 +114,7 @@ impl Task {
             .kernel_data_selector
             .0 as u64;
 
-        Self {
+        Arc::new(RwLock::new(Self {
             name,
             context: state,
             stack_start: stack_top.as_u64(),
@@ -117,9 +123,9 @@ impl Task {
             is_user_mode: false,
             parent_pid,
             executer_id: None,
-        }
+            is_sleeping: false,
+        }))
     }
-
     pub fn update_from_context(&mut self, context: &State) {
         self.context = *context;
     }

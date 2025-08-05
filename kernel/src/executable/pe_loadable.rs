@@ -18,13 +18,14 @@ use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
 use goblin::Object;
 use spin::mutex::Mutex;
+use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
-use super::program::{Module, Program, PROGRAM_MANAGER};
+use super::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -161,7 +162,10 @@ impl PELoader {
                 self.resolve_imports(program);
                 self.patch_imports(program);
                 let module = Module {
-                    title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
+                    title: FileSystem::file_parser(&self.path)
+                        .last()
+                        .unwrap()
+                        .to_string(),
                     image_path: self.path.clone(),
                     parent_pid: program.pid,
                     image_base: self.current_base,
@@ -184,7 +188,10 @@ impl PELoader {
             self.resolve_imports(program);
             self.patch_imports(program);
             let module = Module {
-                title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
+                title: FileSystem::file_parser(&self.path)
+                    .last()
+                    .unwrap()
+                    .to_string(),
                 image_path: self.path.clone(),
                 parent_pid: program.pid,
                 image_base: self.current_base,
@@ -254,17 +261,18 @@ impl PELoader {
         let heap_size = opt_hdr.windows_fields.size_of_heap_reserve;
         let heap_addr = self.current_base + image_size + 0x1000 + stack_size + 0x10;
 
-        let mut program = Program {
-            title: FileSystem::file_parser(&self.path).last().unwrap().to_string(),
-            image_path: self.path.clone(),
-            pid: 0,
-            image_base: self.current_base,
-            main_thread: None,
-            managed_threads: Mutex::new(Vec::new()),
-            modules: Mutex::new(Vec::new()),
-            cr3: new_frame,
-            tracker: range_tracker,
-        };
+        let title = FileSystem::file_parser(&self.path)
+            .last()
+            .unwrap()
+            .to_string();
+
+        let mut program = Program::new(
+            title,
+            self.path.clone(),
+            self.current_base,
+            new_frame,
+            range_tracker,
+        );
 
         // Allocates the image + a guard page + the stack + the heap
         match program.virtual_map_alloc(
@@ -294,12 +302,15 @@ impl PELoader {
 
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
 
-        let pid = PROGRAM_MANAGER.write().add_program(program);
-        let mut scheduler = SCHEDULER.lock();
-        PROGRAM_MANAGER.write().start_pid(pid, &mut scheduler);
+        let pid = PROGRAM_MANAGER.add_program(program);
+        {
+            let mut scheduler = SCHEDULER.lock();
+            PROGRAM_MANAGER.start_pid(pid, &mut scheduler);
+        }
         if were_enabled {
             interrupts::enable();
         }
+
         Ok(pid)
     }
     pub fn resolve_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
@@ -431,7 +442,9 @@ impl PELoader {
             let dll_name = imp.dll.to_ascii_lowercase();
             let symbol_name = &imp.name;
 
-            let abs_addr = program.find_import(dll_name.as_str(), symbol_name.to_string().as_str()).ok_or(LoadError::NoSuchSymbol)?;
+            let abs_addr = program
+                .find_import(dll_name.as_str(), symbol_name.to_string().as_str())
+                .ok_or(LoadError::NoSuchSymbol)?;
 
             let slot_va = self.current_base.as_u64() + imp.offset as u64;
             unsafe { (slot_va as *mut u64).write(abs_addr.as_u64()) };

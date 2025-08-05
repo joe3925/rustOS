@@ -4,7 +4,7 @@ use crate::scheduling::state::State;
 use crate::structs::per_core_storage::PCS;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
-use core::arch::{naked_asm};
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -33,7 +33,7 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         };
 
         let stopwatch = Stopwatch::start();
-        let cpu_id    = get_current_logical_id();
+        let cpu_id = get_current_logical_id();
 
         if !scheduler.has_core_init() {
             timer_time.set(cpu_id as usize, AtomicUsize::new(0));
@@ -44,15 +44,20 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         if !scheduler.is_empty() && scheduler.has_core_init() {
             scheduler
                 .get_current_task()
+                .write()
                 .update_from_context(state.as_mut().unwrap());
         }
 
         scheduler.schedule_next();
 
+        let task_handle = scheduler.get_current_task();
 
         let (needs_restore, ctx_ptr): (bool, *mut State) = {
-            let task = scheduler.get_current_task();
-            (task.parent_pid != 0, &task.context as *const _ as *mut State)
+            let task = task_handle.read();
+            (
+                task.parent_pid != 0,
+                &task.context as *const _ as *mut State,
+            )
         };
 
         if needs_restore {
