@@ -71,6 +71,7 @@
         "gdtr",
         "greyscale",
         "hashbrown",
+        "htab",
         "iend",
         "Ioapic",
         "iretq",

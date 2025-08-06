@@ -146,8 +146,8 @@ make_wrapper!(wrap_file_write, sys_file_write, *mut File, *const u8, usize);
 make_wrapper!(wrap_file_delete, sys_file_delete, *mut File);
 make_wrapper!(wrap_get_tid, sys_get_tid,);
 make_wrapper!(wrap_mq_request, sys_mq_request, UserHandle, *mut Message);
-make_wrapper!(wrap_mq_route_add, sys_route_add, *const UserRoutingRule);
-make_wrapper!(wrap_mq_route_clear, sys_route_clear, *const UserRoutingRule);
+make_wrapper!(wrap_mq_route_add, sys_rule_add, *const UserRoutingRule);
+make_wrapper!(wrap_mq_route_clear, sys_rule_clear, *const UserRoutingRule);
 make_wrapper!(wrap_mq_peek, sys_mq_peek, UserHandle, *mut Message);
 make_wrapper!(
     wrap_mq_receive,
@@ -156,21 +156,25 @@ make_wrapper!(
     *mut Message,
     u32
 );
+make_wrapper!(wrap_get_default_mq_handle, sys_get_default_mq_handle,);
+make_wrapper!(wrap_create_mq, sys_create_mq,);
 
 const SYSCALL_TABLE: &[Handler] = &[
-    wrap_print,          // 0
-    wrap_destroy,        // 1
-    wrap_create,         // 2
-    wrap_file_open,      // 3
-    wrap_file_read,      // 4
-    wrap_file_write,     // 5
-    wrap_file_delete,    // 6
-    wrap_get_tid,        // 7
-    wrap_mq_request,     // 8
-    wrap_mq_route_add,   // 9
-    wrap_mq_route_clear, // 10
-    wrap_mq_peek,        // 11
-    wrap_mq_receive,     // 12
+    wrap_print,                 // 0
+    wrap_destroy,               // 1
+    wrap_create,                // 2
+    wrap_file_open,             // 3
+    wrap_file_read,             // 4
+    wrap_file_write,            // 5
+    wrap_file_delete,           // 6
+    wrap_get_tid,               // 7
+    wrap_mq_request,            // 8
+    wrap_mq_route_add,          // 9
+    wrap_mq_route_clear,        // 10
+    wrap_mq_peek,               // 11
+    wrap_mq_receive,            // 12
+    wrap_get_default_mq_handle, // 13
+    wrap_create_mq,             // 14
 ];
 
 #[no_mangle]

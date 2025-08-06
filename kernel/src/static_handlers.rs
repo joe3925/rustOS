@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-pub extern "win64" fn create_kernel_task(entry: usize, name: String) -> Result<u64, TaskError> {
+pub extern "win64" fn create_kernel_task(entry: usize, name: String) -> u64 {
     let task = Task::new_kernel_mode(entry, KERNEL_STACK_SIZE, name, 0);
     SCHEDULER.lock().add_task(task)
 }

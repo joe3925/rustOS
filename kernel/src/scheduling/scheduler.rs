@@ -37,7 +37,7 @@ impl Scheduler {
     }
 
     #[inline]
-    pub fn add_task(&mut self, task: TaskHandle) -> Result<u64, TaskError> {
+    pub fn add_task(&mut self, task: TaskHandle) -> u64 {
         {
             // mutate via write-lock
             let mut t = task.write();
@@ -45,7 +45,7 @@ impl Scheduler {
         }
         self.id += 1;
         self.tasks.push_back(task);
-        Ok(self.id - 1)
+        self.id - 1
     }
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
@@ -104,13 +104,13 @@ impl Scheduler {
         if self.tasks.is_empty() {
             let kernel_task =
                 Task::new_kernel_mode(kernel_main as usize, KERNEL_STACK_SIZE, "kernel".into(), 0);
-            self.add_task(kernel_task).unwrap();
+            self.add_task(kernel_task);
         }
 
         if self.runnable_task() == 0 && !self.has_core_init() {
             let idle_task =
                 Task::new_kernel_mode(idle_task as usize, KERNEL_STACK_SIZE, "".into(), 0);
-            self.add_task(idle_task).unwrap();
+            self.add_task(idle_task);
         }
 
         if !self.tasks.is_empty() {

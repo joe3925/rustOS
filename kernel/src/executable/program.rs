@@ -18,7 +18,7 @@ use x86_64::{
 use crate::{
     memory::paging::paging::map_page,
     scheduling::scheduler::{self, Scheduler, TaskHandle},
-    util::generate_guid,
+    util::{generate_guid, random_number},
 };
 use crate::{
     memory::paging::{
@@ -377,6 +377,28 @@ impl Program {
             }
         }
     }
+    pub fn create_user_handle(&self, target: HandleTarget) -> UserHandle {
+        let mut table = self.handle_table.write();
+
+        loop {
+            let raw = random_number();
+
+            if raw != 0 && !table.handles.contains_key(&raw) {
+                table.handles.insert(raw, target.clone());
+                return raw;
+            }
+        }
+    }
+    pub fn new_mq(&self) -> HandleTarget {
+        let handle = {
+            let qh = Arc::new(RwLock::new(MessageQueue {
+                queue: VecDeque::new(),
+            }));
+            HandleTarget::MessageQueue(self.pid, qh)
+        };
+
+        handle
+    }
     pub fn has_handle(&self, pid: u64) -> Option<UserHandle> {
         self.handle_table.read().handle_to_program(pid)
     }
@@ -430,28 +452,6 @@ impl ProgramManager {
 
         handle.write().kill()?;
         Ok(())
-    }
-    pub fn generate_user_handle(&self, requestor_pid: u64, target_pid: u64) -> Option<UserHandle> {
-        let target = self.get(target_pid)?;
-        let requestor = self.get(requestor_pid)?;
-
-        let handle = loop {
-            let guid = generate_guid();
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&guid[..8]);
-            let candidate = u64::from_le_bytes(raw);
-
-            let requestor_guard = requestor.write();
-            let mut table = requestor_guard.handle_table.write();
-            if !table.handles.contains_key(&candidate) {
-                table
-                    .handles
-                    .insert(candidate, HandleTarget::Program(target));
-                break candidate;
-            }
-        };
-
-        Some(handle)
     }
     pub fn all(&self) -> Vec<ProgramHandle> {
         self.programs.read().values().cloned().collect()

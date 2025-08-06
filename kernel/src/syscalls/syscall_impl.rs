@@ -2,9 +2,11 @@ use crate::executable::program::{
     HandleTarget, Message, MessageId, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::file_system::file::{File, OpenFlags};
-use crate::memory::paging::constants::KERNEL_SPACE_BASE;
+use crate::format;
+use crate::memory::paging::constants::{KERNEL_SPACE_BASE, KERNEL_STACK_SIZE};
 use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::task::Task;
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -70,7 +72,7 @@ const NOWAIT: u32 = 0x01;
 #[repr(u16)]
 pub enum ErrClass {
     Common = 0x0001,
-    Task = 0x0002,
+    TaskClass = 0x0002,
     File = 0x0003,
     Message = 0x0004,
     Program = 0x0005,
@@ -152,15 +154,59 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
     }
 }
 
-pub(crate) fn sys_destroy_task(tid: u64) -> u64 {
+pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
+    use ErrClass::*;
+
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+
+    let program = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return make_err(Program, ProgErr::NotFound as u16, caller_pid as u32),
+    };
+
+    let target = match program.read().resolve_handle(task_handle) {
+        Some(HandleTarget::Thread(task)) => task,
+        _ => return make_err(Common, CommonErr::InvalidHandle as u16, task_handle as u32),
+    };
+
+    let tid = target.read().id;
+
     match SCHEDULER.lock().delete_task(tid) {
         Ok(_) => 0,
-        Err(_) => make_err(ErrClass::Task, TaskErr::NotFound as u16, tid as u32),
+        Err(_) => make_err(TaskClass, TaskErr::NotFound as u16, tid as u32),
     }
 }
 
-pub(crate) fn sys_create_task(_entry: usize) -> u64 {
-    make_err(ErrClass::Common, CommonErr::NotImplemented as u16, 0)
+pub(crate) fn sys_create_task(_entry: usize) -> UserHandle {
+    use ErrClass::*;
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return make_err(Program, ProgErr::NotFound as u16, caller_pid as u32),
+    };
+    let managed = { caller.read().managed_threads.lock().len() };
+    let stack = if let Some(range) = caller.write().tracker.alloc_auto(KERNEL_STACK_SIZE) {
+        unsafe {
+            caller
+                .write()
+                .virtual_map(range, KERNEL_STACK_SIZE as usize)
+        };
+        range + KERNEL_STACK_SIZE
+    } else {
+        return 0;
+    };
+    let task = Task::new_user_mode(
+        _entry,
+        KERNEL_STACK_SIZE,
+        format!("{} Worker {}", caller.read().title, managed),
+        stack,
+        caller_pid,
+    );
+    SCHEDULER.lock().add_task(task.clone());
+    let x = caller
+        .write()
+        .create_user_handle(HandleTarget::Thread(task));
+    x
 }
 
 pub(crate) fn sys_file_open(
@@ -296,10 +342,9 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
                 if let Some(h) = prog_h.read().has_handle(sender_pid) {
                     h
                 } else {
-                    match PROGRAM_MANAGER.generate_user_handle(prog_h.read().pid, sender_pid) {
-                        Some(h) => h,
-                        None => return make_err(Program, NotFound as u16, sender_pid as u32),
-                    }
+                    prog_h
+                        .write()
+                        .create_user_handle(HandleTarget::Program(sender_proc))
                 }
             };
             message.sender = Some(sender_handle_for_recipient);
@@ -318,10 +363,9 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
                 if let Some(h) = owner_proc.read().has_handle(sender_pid) {
                     h
                 } else {
-                    match PROGRAM_MANAGER.generate_user_handle(owner_pid, sender_pid) {
-                        Some(h) => h,
-                        None => return make_err(Program, NotFound as u16, sender_pid as u32),
-                    }
+                    owner_proc
+                        .write()
+                        .create_user_handle(HandleTarget::Program(sender_proc))
                 }
             };
             message.sender = Some(sender_handle_for_owner);
@@ -333,7 +377,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
         HandleTarget::Thread(_) => make_err(Message, UnsupportedTargetType as u16, 0),
     }
 }
-pub(crate) fn sys_route_add(rule_ptr: *const UserRoutingRule) -> u64 {
+pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     use ErrClass::*;
     if rule_ptr.is_null() || !user_ptr(rule_ptr) {
         return make_err(Common, CommonErr::InvalidPtr as u16, 0);
@@ -442,7 +486,7 @@ pub(crate) fn sys_route_add(rule_ptr: *const UserRoutingRule) -> u64 {
     0
 }
 
-pub(crate) fn sys_route_clear(rule_ptr: *const UserRoutingRule) -> u64 {
+pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     use ErrClass::*;
     if rule_ptr.is_null() || !user_ptr(rule_ptr) {
         return make_err(Common, CommonErr::InvalidPtr as u16, 0);
@@ -497,7 +541,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
         }
     };
 
-    let mut q = q_handle.write();
+    let q = q_handle.write();
     match q.queue.front() {
         Some(m) => unsafe {
             core::ptr::write(msg_ptr, m.clone());
@@ -554,4 +598,26 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
         drop(q);
         hlt();
     }
+}
+pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let mq = caller.read().default_queue.clone();
+    let handle = caller
+        .write()
+        .create_user_handle(HandleTarget::MessageQueue(caller.read().pid, mq));
+    handle
+}
+pub(crate) fn sys_create_mq() -> UserHandle {
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let handle = caller.write().new_mq();
+    let x = caller.write().create_user_handle(handle);
+    x
 }
