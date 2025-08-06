@@ -583,8 +583,7 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
     };
 
     loop {
-        let mut q = q_handle.write();
-        if let Some(m) = q.queue.pop_front() {
+        if let Some(m) = q_handle.write().queue.pop_front() {
             unsafe {
                 core::ptr::write(msg_ptr, m);
             }
@@ -594,8 +593,6 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
         if flags & NOWAIT == NOWAIT {
             return make_err(Message, TargetResolveFailed as u16, 1); // empty + NOWAIT
         }
-
-        drop(q);
         hlt();
     }
 }
