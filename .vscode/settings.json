@@ -89,6 +89,7 @@
         "nonoverlapping",
         "noreturn",
         "nostack",
+        "NOWAIT",
         "OVMF",
         "pagemap",
         "PCIBUS",

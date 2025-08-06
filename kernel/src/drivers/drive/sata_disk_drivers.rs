@@ -2,7 +2,7 @@ use crate::drivers::drive::generic_drive::DriveInfo;
 use crate::drivers::pci::pci_bus::{PciBus, PCIBUS};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::mmio::map_mmio_region;
-use crate::memory::paging::tables::virtual_to_phys;
+use crate::memory::paging::tables::virt_to_phys;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
@@ -147,7 +147,7 @@ impl AHCIController {
                 VirtAddr::new((boot_info.physical_memory_offset.into_option().unwrap()));
 
             // Set Command List Base (clb) and clbu
-            let command_list_address = virtual_to_phys(VirtAddr::new(
+            let command_list_address = virt_to_phys(VirtAddr::new(
                 &self.command_list_buffers[port as usize].buffer as *const _ as u64,
             ));
             write_volatile(
@@ -160,7 +160,7 @@ impl AHCIController {
             );
 
             // Set FIS Base (fb) and fbu
-            let fis_address = virtual_to_phys(VirtAddr::new(
+            let fis_address = virt_to_phys(VirtAddr::new(
                 &self.fis_buffer[port as usize].buffer as *const _ as u64,
             ));
             write_volatile(
@@ -179,7 +179,7 @@ impl AHCIController {
             self.command_table_virt_addr.push(VirtAddr::new(
                 &command_table_buffer.buffer as *const _ as u64,
             ));
-            let command_table_address = virtual_to_phys(VirtAddr::new(
+            let command_table_address = virt_to_phys(VirtAddr::new(
                 &command_table_buffer.buffer as *const _ as u64,
             ));
 

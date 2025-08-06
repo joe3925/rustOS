@@ -109,6 +109,7 @@ pub enum MsgErr {
     TargetResolveFailed = 2,
     TargetProcessMissing = 3,
     UnsupportedTargetType = 4,
+    NoMessageInQueue = 5,
 }
 #[repr(u16)]
 pub enum ProgErr {
@@ -312,9 +313,18 @@ pub(crate) fn sys_file_delete(file: *mut File) -> u64 {
     }
 }
 
-pub(crate) fn sys_get_tid() -> u64 {
-    // If this can fail, return an error; otherwise:
-    SCHEDULER.lock().get_current_task().read().id as u64
+pub(crate) fn sys_get_thread() -> UserHandle {
+    let binding = SCHEDULER.lock().get_current_task();
+    let caller_task = binding.read();
+    let caller_pid = caller_task.parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return 0,
+    };
+    let x = caller
+        .write()
+        .create_user_handle(HandleTarget::Thread(SCHEDULER.lock().get_current_task()));
+    x
 }
 
 pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u64 {
@@ -584,14 +594,15 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
 
     loop {
         if let Some(m) = q_handle.write().queue.pop_front() {
+            // TODO: find a way to yield this till there are items in the queue
             unsafe {
                 core::ptr::write(msg_ptr, m);
             }
-            return 0; // success
+            return 0;
         }
 
         if flags & NOWAIT == NOWAIT {
-            return make_err(Message, TargetResolveFailed as u16, 1); // empty + NOWAIT
+            return make_err(Message, NoMessageInQueue as u16, 1); // empty + NOWAIT
         }
         hlt();
     }

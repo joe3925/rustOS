@@ -5,6 +5,7 @@ use crate::function;
 use crate::get_rva;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
+use crate::memory::paging::tables::virt_to_phys;
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
@@ -33,4 +34,5 @@ export! {
     file_read,
     file_write,
     file_delete,
+    virt_to_phys,
 }
