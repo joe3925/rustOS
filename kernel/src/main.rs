@@ -27,6 +27,7 @@ mod executable;
 mod exports;
 mod file_system;
 mod memory;
+mod registry;
 mod scheduling;
 mod static_handlers;
 mod structs;

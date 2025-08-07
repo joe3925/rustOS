@@ -1,17 +1,17 @@
 use crate::cpu::{self, get_cpu_info};
-use crate::drivers::acpi::ACPI_TABLES;
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
+use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
 use crate::memory::paging::mmio::map_mmio_region;
-use crate::memory::paging::paging::{ identity_map_page};
+use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::allocate_kernel_stack;
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
 use crate::util::{AP_STARTUP_CODE, CORE_LOCK, INIT_LOCK};
-use crate::{KERNEL_INITIALIZED};
+use crate::KERNEL_INITIALIZED;
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -462,7 +462,7 @@ extern "C" fn ap_startup() -> ! {
                 apic.lapic.init(get_current_logical_id());
                 apic.lapic.init_timer();
             }
-        } 
+        }
         syscall_init();
         x86_64::instructions::interrupts::enable();
     }

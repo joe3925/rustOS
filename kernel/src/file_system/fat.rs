@@ -375,7 +375,7 @@ impl FileSystem {
     }
     pub fn create_dir(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
         let files = FileSystem::file_parser(path);
-        let mut current_cluster = 2; // Assuming cluster 2 is the root
+        let mut current_cluster = 2;
 
         for dir_name in files {
             // Preserve the parent's cluster before creating a new directory
@@ -399,8 +399,6 @@ impl FileSystem {
                     )?;
                     Self::update_fat(part, free_cluster, 0xFFFFFFFF);
 
-                    // Initialize the new directory structure with the correct parent reference.
-                    // Notice: We pass parent_cluster, not free_cluster, as the parent.
                     Self::initialize_directory(part, free_cluster, parent_cluster)?;
                     current_cluster = free_cluster;
                 }
@@ -710,6 +708,9 @@ impl FileSystem {
     pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus> {
         let dir_entry = Self::find_dir(part, path)?;
         let files = Self::read_dir(part, dir_entry.get_cluster())?;
+        if files.last().unwrap().name == "..".as_bytes() {
+            return Err(FileStatus::BadPath);
+        }
         let file_names: Vec<String> = files
             .iter()
             .map(|entry| {

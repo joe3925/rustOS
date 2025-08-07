@@ -1,0 +1,5 @@
+image = "B.DLL"
+
+start = "boot"
+
+hwids = []

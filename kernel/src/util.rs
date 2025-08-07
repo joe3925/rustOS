@@ -2,6 +2,7 @@ extern crate rand_xoshiro;
 
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
+use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     calibrate_tsc, get_current_logical_id, wait_millis, wait_millis_idle, wait_using_pit_50ms,
     ApicImpl,
@@ -11,12 +12,14 @@ use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file::File;
+use crate::file_system::file::{File, FileStatus};
+use crate::format;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
+use crate::registry::{is_first_boot, reg};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
@@ -133,7 +136,7 @@ pub fn kernel_main() {
     let mut program = Program::new(
         "KRNL".to_string(),
         "".to_string(),
-        VirtAddr::new(0xFFFF8500_0000_0000),
+        VirtAddr::new(0xFFFF_8500_0000_0000),
         kernel_cr3(),
         KERNEL_RANGE_TRACKER.clone(),
     );
@@ -145,100 +148,103 @@ pub fn kernel_main() {
             title: "KRNL.DLL".into(),
             image_path: "".into(),
             parent_pid: 0,
-            image_base: VirtAddr::new(0xFFFF8500_0000_0000),
+            image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
             symbols: EXPORTS.to_vec(),
         }]
         .into(),
     );
 
     let pid = PROGRAM_MANAGER.add_program(program);
+    if (is_first_boot()) {
+        setup_file_layout();
+        install_prepacked_drivers().expect("Failed to install pre packed drivers");
+    }
+    reg::print_tree();
+    // let label = {
+    //     let mut volumes = VOLUMES.lock();
+    //     if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
+    //         system_volume.label.clone()
+    //     } else {
+    //         panic!("System Volume unavailable or corrupted")
+    //     }
+    // };
 
-    let label = {
-        let mut volumes = VOLUMES.lock();
-        if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
-            system_volume.label.clone()
-        } else {
-            panic!("System Volume unavailable or corrupted")
-        }
-    };
+    // let base_path = "\\SYSTEM\\MOD";
+    // let mut path_buffer = String::new();
 
-    let base_path = "\\SYSTEM\\MOD";
-    let mut path_buffer = String::new();
+    // let full_path = {
+    //     let mut s = String::with_capacity(label.len() + base_path.len());
+    //     s.push_str(&label);
+    //     s.push_str(base_path);
+    //     s
+    // };
 
-    let full_path = {
-        let mut s = String::with_capacity(label.len() + base_path.len());
-        s.push_str(&label);
-        s.push_str(base_path);
-        s
-    };
+    // let entries = File::list_dir(&full_path).expect("Failed to load system mod directory");
 
-    let entries = File::list_dir(&full_path).expect("Failed to load system mod directory");
-    println!("{:#?}", entries);
+    // for name in entries {
+    //     if !name.to_ascii_lowercase().ends_with(".dll") {
+    //         continue;
+    //     }
 
-    for name in entries {
-        if !name.to_ascii_lowercase().ends_with(".dll") {
-            continue;
-        }
+    //     path_buffer.clear();
+    //     path_buffer.push_str(&label);
+    //     path_buffer.push_str(base_path);
+    //     path_buffer.push('\\');
+    //     path_buffer.push_str(&name);
 
-        path_buffer.clear();
-        path_buffer.push_str(&label);
-        path_buffer.push_str(base_path);
-        path_buffer.push('\\');
-        path_buffer.push_str(&name);
+    //     let handle = PROGRAM_MANAGER.get(pid).expect("invalid PID");
 
-        let handle = PROGRAM_MANAGER.get(pid).expect("invalid PID");
+    //     {
+    //         let mut prog = handle.write();
+    //         match prog.load_module(path_buffer.clone()) {
+    //             Ok(_) => println!("Loaded module: {}", name),
+    //             Err(e) => println!("Failed to load module '{}': {:?}", name, e),
+    //         }
+    //     }
 
-        {
-            let mut prog = handle.write();
-            match prog.load_module(path_buffer.clone()) {
-                Ok(_) => println!("Loaded module: {}", name),
-                Err(e) => println!("Failed to load module '{}': {:?}", name, e),
-            }
-        }
+    //     type DriverEntryFn = unsafe extern "C" fn();
 
-        type DriverEntryFn = unsafe extern "C" fn();
+    //     if let Some(handle) = PROGRAM_MANAGER.get(pid) {
+    //         let prog = handle.read();
+    //         for module in prog.modules.lock().iter() {
+    //             if let Some((_, rva)) = module.symbols.iter().find(|(sym, _)| sym == "driver_entry")
+    //             {
+    //                 let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
+    //                 let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
+    //                 println!("Calling driver_entry for module {}", module.image_path);
+    //                 unsafe { driver_entry() };
+    //             } else {
+    //                 println!("No driver_entry found in {}", module.title);
+    //             }
+    //         }
+    //     } else {
+    //         println!("invalid PID {}", pid);
+    //     }
+    // }
+    print_mem_report();
+    println!("");
+    loop {
+        wait_millis_idle(300000);
+        let timer_ms = TIMER_TIME
+            .lock()
+            .get(get_current_logical_id() as usize)
+            .unwrap()
+            .load(Ordering::SeqCst);
+        let total_ms = TOTAL_TIME.wait().elapsed_millis();
+        let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
+        let int_part = percent_x10 / 1000;
+        let frac_part = percent_x10 % 1000;
 
-        if let Some(handle) = PROGRAM_MANAGER.get(pid) {
-            let prog = handle.read();
-            for module in prog.modules.lock().iter() {
-                if let Some((_, rva)) = module.symbols.iter().find(|(sym, _)| sym == "driver_entry")
-                {
-                    let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
-                    let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
-                    println!("Calling driver_entry for module {}", module.image_path);
-                    unsafe { driver_entry() };
-                } else {
-                    println!("No driver_entry found in {}", module.title);
-                }
-            }
-        } else {
-            println!("invalid PID {}", pid);
-        }
+        println!(
+            "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
+            timer_ms / 1000,
+            timer_ms * 4 / 1000,
+            total_ms / 1000 / 60,
+            int_part,
+            frac_part
+        );
         print_mem_report();
-        println!("");
-        loop {
-            wait_millis_idle(300000);
-            let timer_ms = TIMER_TIME
-                .lock()
-                .get(get_current_logical_id() as usize)
-                .unwrap()
-                .load(Ordering::SeqCst);
-            let total_ms = TOTAL_TIME.wait().elapsed_millis();
-            let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
-            let int_part = percent_x10 / 1000;
-            let frac_part = percent_x10 % 1000;
-
-            println!(
-                "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
-                timer_ms / 1000,
-                timer_ms * 4 / 1000,
-                total_ms / 1000 / 60,
-                int_part,
-                frac_part
-            );
-            print_mem_report();
-            println!("\n");
-        }
+        println!("\n");
     }
 }
 pub fn used_memory() -> usize {
@@ -275,6 +281,48 @@ pub fn print_mem_report() {
             heap_used_kb, heap_total_kb, heap_int_part, heap_frac_part
         );
     });
+}
+pub fn setup_file_layout() -> Result<(), FileStatus> {
+    let drive_label = {
+        let mut binding = VOLUMES.lock();
+        let system_volume = binding
+            .find_partition_by_name("MAIN VOLUME")
+            .expect("System volume not found");
+
+        let dl = system_volume.label.clone();
+        dl
+    };
+    let mod_path = format!("{}\\SYSTEM\\MOD", drive_label);
+    let inf_path = format!("{}\\SYSTEM\\TOML", drive_label);
+
+    match File::make_dir(mod_path.clone()) {
+        Ok(_) => {}
+        Err(FileStatus::PathNotFound) => {
+            let system_path = format!("{}\\SYSTEM", drive_label);
+            File::make_dir(system_path).expect("Failed to create SYSTEM directory");
+            File::make_dir(mod_path.clone()).expect("Failed to create MOD directory");
+            println!("Created {}", mod_path);
+        }
+        e => {
+            return e;
+        }
+    }
+
+    match File::make_dir(inf_path.clone()) {
+        Ok(_) => {
+            return Ok(());
+        }
+        Err(FileStatus::PathNotFound) => {
+            let system_path = format!("{}\\SYSTEM", drive_label);
+            File::make_dir(system_path).expect("Failed to create SYSTEM directory");
+            File::make_dir(inf_path.clone()).expect("Failed to create INF directory");
+            println!("Created {}", inf_path);
+            Ok(())
+        }
+        e => {
+            return e;
+        }
+    }
 }
 #[no_mangle]
 #[allow(unconditional_recursion)]

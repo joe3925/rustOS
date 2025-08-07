@@ -1,9 +1,9 @@
-cargo-features = ["profile-rustflags"]
 
 [package]
 name = "base_driver"
 version = "0.1.0"
 edition = "2024"
+autotests = false
 
 [lib]
 name = "BASE"

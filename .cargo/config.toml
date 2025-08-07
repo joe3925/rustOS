@@ -3,14 +3,20 @@ bindeps = true
 
 [profile.dev.package.kernel]
 rustflags = [
-    "-C", "link-args=--image-base=0xFFFF850000000000",
-    "-C", "relocation-model=static",
-    "-C", "code-model=large"
+    "-C",
+    "link-args=--image-base=0xFFFF850000000000",
+    "-C",
+    "relocation-model=static",
+    "-C",
+    "code-model=large",
 ]
 
 [profile.release.package.kernel]
 rustflags = [
-    "-C", "link-args=--image-base=0xFFFF850000000000",
-    "-C", "relocation-model=static",
-    "-C", "code-model=large"
+    "-C",
+    "link-args=--image-base=0xFFFF850000000000",
+    "-C",
+    "relocation-model=static",
+    "-C",
+    "code-model=large",
 ]

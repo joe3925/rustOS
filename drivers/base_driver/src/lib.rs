@@ -1,5 +1,4 @@
 #![no_std]
-#![no_main]
 
 mod include;
 mod msvc_shims;
@@ -10,5 +9,6 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-#[unsafe(export_name = "driver_entry")]
-extern "win64" fn driver_entry() {}
+//#[unsafe(export_name = "driver_entry")]
+#[unsafe(no_mangle)]
+fn driver_entry() {}

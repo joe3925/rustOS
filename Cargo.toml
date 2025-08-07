@@ -5,3 +5,4 @@ cargo-features = ["profile-rustflags"]
 members = ["os", "kernel", "drivers/base_driver"]
 exclude = ["rustos-api"]
 resolver = "2"
+[profile.dev.package.kernel]
