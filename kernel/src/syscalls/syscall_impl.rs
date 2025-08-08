@@ -1,7 +1,9 @@
 use crate::executable::program::{
-    HandleTarget, Message, MessageId, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
+    HandleTarget, Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle,
+    PROGRAM_MANAGER,
 };
 use crate::file_system::file::{File, OpenFlags};
+use crate::file_system::path::Path;
 use crate::format;
 use crate::memory::paging::constants::{KERNEL_SPACE_BASE, KERNEL_STACK_SIZE};
 use crate::println;
@@ -30,6 +32,12 @@ fn u64_to_str_ptr(value: *const u8) -> Option<String> {
         let slice = slice::from_raw_parts(value, len);
         String::from_utf8(Vec::from(slice)).ok()
     }
+}
+#[inline]
+fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> String {
+    let base = caller.read().working_dir.clone();
+    let p = Path::parse(raw, Some(&base));
+    p.to_string()
 }
 
 #[inline(always)]
@@ -210,41 +218,6 @@ pub(crate) fn sys_create_task(_entry: usize) -> UserHandle {
     x
 }
 
-pub(crate) fn sys_file_open(
-    path: *const u8,
-    flags: *const OpenFlags,
-    n: usize,
-    out: *mut File,
-) -> u64 {
-    if path.is_null()
-        || !user_ptr(path)
-        || flags.is_null()
-        || !user_ptr(flags)
-        || out.is_null()
-        || !user_ptr(out)
-        || !user_ptr_ok(flags, n * core::mem::size_of::<OpenFlags>())
-    {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-
-    let pname = unsafe { core::ffi::CStr::from_ptr(path as *const i8) }
-        .to_str()
-        .unwrap_or("");
-    if pname.is_empty() {
-        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
-    }
-
-    let flg = unsafe { core::slice::from_raw_parts(flags, n) };
-
-    match File::open(pname, flg) {
-        Ok(f) => unsafe {
-            core::ptr::write(out, f);
-            0
-        },
-        Err(_) => make_err(ErrClass::File, FileErr::Io as u16, 0),
-    }
-}
-
 pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
     if file.is_null() || !user_ptr(file) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
@@ -282,7 +255,7 @@ pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
             core::ptr::copy_nonoverlapping(data.as_ptr(), va.as_mut_ptr::<u8>(), len);
         }
 
-        va.as_u64() // success: user VA (assumed below high-bit)
+        va.as_u64()
     }
 }
 
@@ -291,7 +264,7 @@ pub(crate) fn sys_file_write(file: *mut File, buf: *const u8, len: usize) -> u64
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     if len == 0 {
-        return 0; // no-op success
+        return 0;
     }
 
     let f = unsafe { &mut *file };
@@ -301,7 +274,110 @@ pub(crate) fn sys_file_write(file: *mut File, buf: *const u8, len: usize) -> u64
         Err(_) => make_err(ErrClass::File, FileErr::WriteFailed as u16, 0),
     }
 }
+pub(crate) fn list_dir(path: *const u8) -> u64 {
+    if path.is_null() || !user_ptr(path) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+    let pname = unsafe { core::ffi::CStr::from_ptr(path as *const i8) }
+        .to_str()
+        .unwrap_or("");
+    if pname.is_empty() {
+        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
+    }
 
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => {
+            return make_err(
+                ErrClass::Program,
+                ProgErr::NotFound as u16,
+                caller_pid as u32,
+            )
+        }
+    };
+
+    let abs_path = resolve_with_working_dir(&caller, pname);
+
+    let entries = match File::list_dir(&abs_path) {
+        Ok(v) => v,
+        Err(_) => return make_err(ErrClass::File, FileErr::Io as u16, 0),
+    };
+
+    let joined = if entries.is_empty() {
+        String::new()
+    } else {
+        entries.join("\n")
+    };
+    let bytes = joined.as_bytes();
+    let total = bytes.len() + 1;
+
+    let va = {
+        let mut prog = caller.write();
+        let Some(dst) = prog.tracker.alloc_auto(total as u64) else {
+            return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
+        };
+        if unsafe { prog.virtual_map(dst, total) }.is_err() {
+            return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
+        }
+        dst
+    };
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), va.as_mut_ptr::<u8>(), bytes.len());
+        *va.as_mut_ptr::<u8>().add(bytes.len()) = 0;
+    }
+
+    va.as_u64()
+}
+pub(crate) fn sys_file_open(
+    path: *const u8,
+    flags: *const OpenFlags,
+    n: usize,
+    out: *mut File,
+) -> u64 {
+    if path.is_null()
+        || !user_ptr(path)
+        || flags.is_null()
+        || !user_ptr(flags)
+        || out.is_null()
+        || !user_ptr(out)
+        || !user_ptr_ok(flags, n * core::mem::size_of::<OpenFlags>())
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+
+    let pname = unsafe { core::ffi::CStr::from_ptr(path as *const i8) }
+        .to_str()
+        .unwrap_or("");
+    if pname.is_empty() {
+        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
+    }
+
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => {
+            return make_err(
+                ErrClass::Program,
+                ProgErr::NotFound as u16,
+                caller_pid as u32,
+            )
+        }
+    };
+
+    let abs_path = resolve_with_working_dir(&caller, pname);
+
+    let flg = unsafe { core::slice::from_raw_parts(flags, n) };
+
+    match File::open(&abs_path, flg) {
+        Ok(f) => unsafe {
+            core::ptr::write(out, f);
+            0
+        },
+        Err(_) => make_err(ErrClass::File, FileErr::Io as u16, 0),
+    }
+}
 pub(crate) fn sys_file_delete(file: *mut File) -> u64 {
     if file.is_null() || !user_ptr(file) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
@@ -628,4 +704,82 @@ pub(crate) fn sys_create_mq() -> UserHandle {
     let handle = caller.write().new_mq();
     let x = caller.write().create_user_handle(handle);
     x
+}
+pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
+    if path.is_null() || !user_ptr(path) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => {
+            return make_err(
+                ErrClass::Program,
+                ProgErr::NotFound as u16,
+                caller_pid as u32,
+            )
+        }
+    };
+
+    let c = unsafe { core::ffi::CStr::from_ptr(path as *const i8) };
+    let raw = match c.to_str() {
+        Ok(s) if !s.is_empty() => s,
+        _ => return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0),
+    };
+
+    let abs_str = {
+        let base = caller.read().working_dir.clone();
+        let newp = Path::parse(raw, Some(&base));
+        newp.to_string()
+    };
+
+    if File::list_dir(&abs_str).is_err() {
+        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 1);
+    }
+
+    caller.write().working_dir = Path::parse(&abs_str, None);
+    0
+}
+
+pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
+    use ErrClass::*;
+
+    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller = match PROGRAM_MANAGER.get(caller_pid) {
+        Some(p) => p,
+        None => return make_err(Program, ProgErr::NotFound as u16, caller_pid as u32),
+    };
+
+    let target_arc = if target_prog == 0 {
+        caller.clone()
+    } else {
+        let opt = caller.read().resolve_handle(target_prog);
+        match opt {
+            Some(HandleTarget::Program(p)) => p,
+            _ => return make_err(Common, CommonErr::InvalidHandle as u16, target_prog as u32),
+        }
+    };
+
+    let s = target_arc.read().working_dir.to_string();
+    let bytes = s.as_bytes();
+    let total = bytes.len() + 1;
+
+    let va = {
+        let mut pg = caller.write();
+        let Some(dst) = pg.tracker.alloc_auto(total as u64) else {
+            return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
+        };
+        if unsafe { pg.virtual_map(dst, total) }.is_err() {
+            return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
+        }
+        dst
+    };
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), va.as_mut_ptr::<u8>(), bytes.len());
+        *va.as_mut_ptr::<u8>().add(bytes.len()) = 0;
+    }
+
+    va.as_u64()
 }

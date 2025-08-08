@@ -109,7 +109,6 @@ pub unsafe fn init() {
         {
             let mut partitions = VOLUMES.lock();
             partitions.enumerate_parts();
-            partitions.print_parts();
             match partitions
                 .find_partition_by_name("MAIN VOLUME")
                 .unwrap()
@@ -155,13 +154,11 @@ pub fn kernel_main() {
     );
 
     let pid = PROGRAM_MANAGER.add_program(program);
-    // File::list_dir("C:\\SYSTEM\\TOML");
-    // File::list_dir("C:\\INSTALL\\DRIVERS\\BASE");
     if (is_first_boot()) {
         setup_file_layout().expect("Failed to create system volume layout");
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
-    // reg::print_tree();
+    reg::print_tree();
 
     // let label = {
     //     let mut volumes = VOLUMES.lock();

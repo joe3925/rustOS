@@ -17,7 +17,8 @@ use spin::Lazy;
 
 pub static VOLUMES: Lazy<Mutex<PartitionCollection>> =
     Lazy::new(|| Mutex::new(PartitionCollection::new()));
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+
 pub enum GptPartitionType {
     EfiSystemPartition,
     MicrosoftReserved,
@@ -25,42 +26,40 @@ pub enum GptPartitionType {
     LinuxFilesystem,
     LinuxSwap,
     LinuxRootX86_64,
-    Unknown([u8; 16]), // Fallback for unrecognized GUIDs
+    Unknown { raw: [u8; 16] },
 }
 
 impl GptPartitionType {
-    /// Converts the partition type into a 16-byte GUID (stored in little-endian format)
     pub fn to_u8_16(&self) -> [u8; 16] {
         match self {
-            GptPartitionType::EfiSystemPartition => [
+            Self::EfiSystemPartition => [
                 0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E,
                 0xC9, 0x3B,
             ],
-            GptPartitionType::MicrosoftReserved => [
+            Self::MicrosoftReserved => [
                 0x16, 0xE3, 0xC9, 0xE3, 0x5C, 0x0B, 0xB8, 0x4D, 0x81, 0x7D, 0xF9, 0x2D, 0xF0, 0x02,
                 0x15, 0xAE,
             ],
-            GptPartitionType::MicrosoftBasicData => [
+            Self::MicrosoftBasicData => [
                 0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26,
                 0x99, 0xC7,
             ],
-            GptPartitionType::LinuxFilesystem => [
+            Self::LinuxFilesystem => [
                 0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
                 0x7D, 0xE4,
             ],
-            GptPartitionType::LinuxSwap => [
+            Self::LinuxSwap => [
                 0x6D, 0xFD, 0x57, 0x06, 0xAB, 0xA4, 0xC4, 0x43, 0x84, 0xE5, 0x09, 0x33, 0xC8, 0x4B,
                 0x4F, 0x4F,
             ],
-            GptPartitionType::LinuxRootX86_64 => [
+            Self::LinuxRootX86_64 => [
                 0xE3, 0xBC, 0x68, 0x4F, 0xCD, 0xE8, 0xB1, 0x4D, 0x96, 0xE7, 0xFB, 0xCA, 0xF9, 0x84,
                 0xB7, 0x09,
             ],
-            GptPartitionType::Unknown(guid) => *guid,
+            Self::Unknown { raw, .. } => *raw,
         }
     }
 
-    /// Converts a `[u8; 16]` GUID to a `GptPartitionType`
     pub fn from_u8_16(guid: [u8; 16]) -> Self {
         match guid {
             [0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B] => {
@@ -81,11 +80,10 @@ impl GptPartitionType {
             [0xE3, 0xBC, 0x68, 0x4F, 0xCD, 0xE8, 0xB1, 0x4D, 0x96, 0xE7, 0xFB, 0xCA, 0xF9, 0x84, 0xB7, 0x09] => {
                 Self::LinuxRootX86_64
             }
-            _ => Self::Unknown(guid),
+            _ => Self::Unknown { raw: guid },
         }
     }
 }
-
 pub struct Gpt {
     /// The GPT header
     pub header: GptHeader,
@@ -320,6 +318,10 @@ impl PartitionCollection {
             for (i, partition) in self.parts.iter().enumerate() {
                 println!("Part: ({})", partition.label);
                 println!("Name: ({})", partition.name);
+                println!(
+                    "Type: ({:#?})",
+                    GptPartitionType::from_u8_16(partition.gpt_entry.partition_type_guid)
+                );
                 println!("is fat: {}", partition.is_fat);
                 println!("parent drive: {}", partition.parent_drive_index);
                 println!("Capacity: {}", partition.size);
@@ -354,7 +356,7 @@ impl PartitionCollection {
     }
 }
 pub struct Partition {
-    gpt_entry: GptPartitionEntry,
+    pub(crate) gpt_entry: GptPartitionEntry,
     parent_drive_index: u64,
     name: String,
     pub(crate) label: String,

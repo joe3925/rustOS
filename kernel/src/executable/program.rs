@@ -16,6 +16,7 @@ use x86_64::{
 };
 
 use crate::{
+    file_system::path::Path,
     memory::paging::paging::map_page,
     scheduling::scheduler::{self, Scheduler, TaskHandle},
     util::{generate_guid, random_number},
@@ -143,7 +144,7 @@ pub struct Program {
     pub cr3: PhysFrame,
     pub tracker: Arc<RangeTracker>,
     pub handle_table: RwLock<HandleTable>,
-    pub working_dir: String,
+    pub working_dir: Path,
     pub default_queue: QueueHandle,
     pub extra_queues: Mutex<BTreeMap<u64, QueueHandle>>,
     pub routing_rules: Mutex<RuleList>,
@@ -167,7 +168,7 @@ impl Program {
             cr3,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
-            working_dir: image_path,
+            working_dir: Path::from_string(&image_path),
             default_queue: Arc::new(RwLock::new(MessageQueue {
                 queue: VecDeque::new(),
             })),

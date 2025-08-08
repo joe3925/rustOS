@@ -907,9 +907,6 @@ impl FileSystem {
         let parsed = FileSystem::file_parser(path);
         let dir_entry = Self::find_dir(part, path)?;
         let files = Self::read_dir(part, dir_entry.get_cluster())?;
-        for file in &files {
-            println!("{} {}", file.get_name(), file.get_extension())
-        }
         if let Some(last) = parsed.last() {
             if last.to_string() == ".." {
                 return Err(FileStatus::BadPath);
@@ -1167,9 +1164,6 @@ impl FileSystem {
             let entries = FileEntry::new_long_name(&name_part, &ext_part, entry.get_cluster());
 
             for e in &entries {
-                if (e.attributes == FileAttribute::Archive as u8) {
-                    println!("{}, {}", e.get_name(), e.get_extension());
-                }
                 Self::write_file_to_dir(part, e, start_cluster_of_dir, None)?;
             }
             return Ok(());
