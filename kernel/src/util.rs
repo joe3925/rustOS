@@ -12,7 +12,7 @@ use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file::{File, FileStatus};
+use crate::file_system::file::{File, FileStatus, OpenFlags};
 use crate::format;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
@@ -109,7 +109,7 @@ pub unsafe fn init() {
         {
             let mut partitions = VOLUMES.lock();
             partitions.enumerate_parts();
-
+            partitions.print_parts();
             match partitions
                 .find_partition_by_name("MAIN VOLUME")
                 .unwrap()
@@ -155,11 +155,14 @@ pub fn kernel_main() {
     );
 
     let pid = PROGRAM_MANAGER.add_program(program);
+    // File::list_dir("C:\\SYSTEM\\TOML");
+    // File::list_dir("C:\\INSTALL\\DRIVERS\\BASE");
     if (is_first_boot()) {
         setup_file_layout().expect("Failed to create system volume layout");
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
-    reg::print_tree();
+    // reg::print_tree();
+
     // let label = {
     //     let mut volumes = VOLUMES.lock();
     //     if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
@@ -297,6 +300,7 @@ pub fn setup_file_layout() -> Result<(), FileStatus> {
 
     match File::make_dir(mod_path.clone()) {
         Ok(_) => {}
+        Err(FileStatus::FileAlreadyExist) => {}
         e => {
             return e;
         }
@@ -304,6 +308,9 @@ pub fn setup_file_layout() -> Result<(), FileStatus> {
 
     match File::make_dir(inf_path.clone()) {
         Ok(_) => {
+            return Ok(());
+        }
+        Err(FileStatus::FileAlreadyExist) => {
             return Ok(());
         }
         e => {

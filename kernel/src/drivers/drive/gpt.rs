@@ -391,12 +391,22 @@ impl Partition {
     pub fn format(&mut self) -> Result<(), FormatStatus> {
         if (self.is_fat == false) {
             let fs = FileSystem::new(self.label.clone(), self.size);
-            return FileSystem::format_drive(self);
+            let status = FileSystem::format_drive(self);
+            if status.is_ok() {
+                self.is_fat = true;
+                return Ok(());
+            }
+            return status;
         }
         Err(FormatStatus::AlreadyFat32)
     }
     pub fn force_format(&mut self) -> Result<(), FormatStatus> {
-        FileSystem::format_drive(self)
+        let status = FileSystem::format_drive(self);
+        if status.is_ok() {
+            self.is_fat = true;
+            return Ok(());
+        }
+        return status;
     }
     pub fn read(&mut self, sector: u32, buffer: &mut [u8]) {
         self.controller

@@ -5,18 +5,37 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cmp::PartialEq;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileAttribute {
     ReadOnly = 0x01,
     Hidden = 0x02,
     System = 0x04,
     VolumeLabel = 0x08,
+    LFN = 0x0F,
     Directory = 0x10,
     Archive = 0x20,
+    Unknown = 0xFF,
 }
 impl From<FileAttribute> for u8 {
     fn from(attribute: FileAttribute) -> Self {
         attribute as u8
+    }
+}
+
+impl TryFrom<u8> for FileAttribute {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(FileAttribute::ReadOnly),
+            0x02 => Ok(FileAttribute::Hidden),
+            0x04 => Ok(FileAttribute::System),
+            0x08 => Ok(FileAttribute::VolumeLabel),
+            0x0F => Ok(FileAttribute::LFN),
+            0x10 => Ok(FileAttribute::Directory),
+            0x20 => Ok(FileAttribute::Archive),
+            _ => Ok(FileAttribute::Unknown),
+        }
     }
 }
 #[derive(Debug)]
@@ -165,7 +184,11 @@ impl File {
                         if flags.contains(&OpenFlags::Create)
                             || flags.contains(&OpenFlags::CreateNew)
                         {
-                            FileSystem::create_dir(part, File::remove_file_from_path(path))?;
+                            match FileSystem::create_dir(part, File::remove_file_from_path(path)) {
+                                Ok(_) => {}
+                                Err(FileStatus::FileAlreadyExist) => {}
+                                Err(e) => return Err(e),
+                            };
 
                             match FileSystem::create_file(
                                 part,
@@ -177,8 +200,8 @@ impl File {
                                     let file_entry = FileSystem::find_file(part, path);
                                     match file_entry {
                                         Ok(file_entry) => Ok(File {
-                                            name: file_entry.get_name().clone(),
-                                            extension: file_entry.get_extension().clone(),
+                                            name: (file_name).to_string(),
+                                            extension: (file_extension).to_string(),
                                             size: file_entry.file_size as u64,
                                             starting_cluster: file_entry.get_cluster(),
                                             drive_label: drive_letter.clone(),

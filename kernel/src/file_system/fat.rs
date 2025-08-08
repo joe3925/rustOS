@@ -189,20 +189,47 @@ impl FileEntry {
 
     /// Creates a blank `FileEntry` with only a name and starting cluster set
     pub fn new(name: &str, extension: &str, starting_cluster: u32) -> Self {
-        let (mut name_arr, mut ext_arr) = Self::make_sfn(name, extension);
-        let name_upper = name.to_uppercase();
-        let ext_upper = extension.to_uppercase();
+        let mut name_arr = [b' '; 8];
+        let mut ext_arr = [b' '; 3];
 
-        let name_bytes = name_upper.as_bytes();
-        let ext_bytes = ext_upper.as_bytes();
+        // Special-case . and ..
+        if name == "." || name == ".." {
+            let bytes = name.as_bytes();
+            name_arr[..bytes.len()].copy_from_slice(bytes);
+        } else {
+            let name_bytes = name
+                .chars()
+                .map(|c| c.to_ascii_uppercase())
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c as u8
+                    } else {
+                        b'_'
+                    }
+                })
+                .take(8)
+                .collect::<Vec<u8>>();
+            name_arr[..name_bytes.len()].copy_from_slice(&name_bytes);
+        }
 
-        name_arr[..name_bytes.len().min(8)].copy_from_slice(&name_bytes[..name_bytes.len().min(8)]);
-        ext_arr[..ext_bytes.len().min(3)].copy_from_slice(&ext_bytes[..ext_bytes.len().min(3)]);
+        let ext_bytes = extension
+            .chars()
+            .map(|c| c.to_ascii_uppercase())
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c as u8
+                } else {
+                    b'_'
+                }
+            })
+            .take(3)
+            .collect::<Vec<u8>>();
+        ext_arr[..ext_bytes.len()].copy_from_slice(&ext_bytes);
 
         FileEntry {
             name: name_arr,
             extension: ext_arr,
-            attributes: 0x20, // Default to ATTR_ARCHIVE
+            attributes: 0x20, // ATTR_ARCHIVE
             nt_reserved: 0,
             creation_time_tenth: 0,
             creation_time: 0,
@@ -212,7 +239,7 @@ impl FileEntry {
             write_time: 0,
             write_date: 0,
             first_cluster_low: (starting_cluster & 0xFFFF) as u16,
-            file_size: 0, // Default size 0
+            file_size: 0,
         }
     }
 
@@ -259,35 +286,29 @@ impl FileEntry {
         let chk = Self::lfn_checksum(&sfn_bytes);
 
         let mut utf16: Vec<u16> = long_full.encode_utf16().collect();
-
-        // insert null terminator
         utf16.push(0x0000);
 
-        // pad with 0xFFFF up to 39 UTF-16 entries
-        if utf16.len() < 39 {
-            utf16.resize(39, 0xFFFF);
-        } else {
-            utf16.truncate(39);
+        let total_slots = (utf16.len() + 12) / 13;
+
+        utf16.resize(total_slots * 13, 0xFFFF);
+
+        let mut out = Vec::with_capacity(total_slots + 1);
+        for slot_idx in (0..total_slots).rev() {
+            let seq_num = (slot_idx + 1) as u8
+                | if slot_idx == total_slots - 1 {
+                    0x40
+                } else {
+                    0x00
+                };
+            let chunk = &utf16[slot_idx * 13..slot_idx * 13 + 13];
+            out.push(FileEntry::from_buffer(&Self::build_lfn_slot(
+                seq_num, chk, chunk,
+            )));
         }
 
-        let chunks: Vec<&[u16]> = (0..3).map(|i| &utf16[i * 13..i * 13 + 13]).collect();
-
-        let mut out = Vec::with_capacity(4);
-        out.push(FileEntry::from_buffer(&Self::build_lfn_slot(
-            0x40 | 3,
-            chk,
-            chunks[2],
-        )));
-        out.push(FileEntry::from_buffer(&Self::build_lfn_slot(
-            2, chk, chunks[1],
-        )));
-        out.push(FileEntry::from_buffer(&Self::build_lfn_slot(
-            1, chk, chunks[0],
-        )));
         out.push(sfn);
         out
     }
-
     fn lfn_checksum(sfn: &[u8; 11]) -> u8 {
         let mut sum: u8 = 0;
         for b in sfn {
@@ -327,25 +348,36 @@ impl FileEntry {
     }
 
     fn make_sfn(name: &str, ext: &str) -> ([u8; 8], [u8; 3]) {
-        fn clean(s: &str) -> String {
+        fn clean_ascii(s: &str) -> Vec<u8> {
             s.chars()
                 .map(|c| c.to_ascii_uppercase())
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() {
+                        c as u32 as u8
+                    } else {
+                        b'_'
+                    }
+                })
                 .collect()
         }
-        let mut base = clean(name);
-        let mut extc = clean(ext);
-        if base.len() > 8 {
-            base = base.chars().take(6).collect::<String>() + "~1";
-        }
+
         let mut name_arr = [b' '; 8];
         let mut ext_arr = [b' '; 3];
-        for (i, b) in base.as_bytes().iter().take(8).enumerate() {
-            name_arr[i] = *b;
-        }
-        for (i, b) in extc.as_bytes().iter().take(3).enumerate() {
-            ext_arr[i] = *b;
-        }
+
+        let name_c = clean_ascii(name);
+        let ext_c = clean_ascii(ext);
+
+        let prefix_len = name_c.len().min(6);
+        let mut base = Vec::with_capacity(8);
+        base.extend_from_slice(&name_c[..prefix_len]);
+        base.extend_from_slice(b"~1");
+
+        let copy_len = base.len().min(8);
+        name_arr[..copy_len].copy_from_slice(&base[..copy_len]);
+
+        let ext_len = ext_c.len().min(3);
+        ext_arr[..ext_len].copy_from_slice(&ext_c[..ext_len]);
+
         (name_arr, ext_arr)
     }
 }
@@ -518,6 +550,9 @@ impl FileSystem {
         part.write(sector_number, &mut buffer);
     }
     pub fn create_dir(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
+        if Self::find_dir(part, path).is_ok() {
+            return Err(FileStatus::FileAlreadyExist);
+        }
         let files = FileSystem::file_parser(path);
         let mut current_cluster = 2;
 
@@ -571,17 +606,13 @@ impl FileSystem {
         new_cluster: u32,
         parent_cluster: u32,
     ) -> Result<(), FileStatus> {
-        // Zero out the new directory cluster.
         let empty_buffer = vec![0u8; CLUSTER_OFFSET as usize];
         Self::write_cluster(part, new_cluster, &empty_buffer)?;
 
-        // Create the '.' entry (self-reference)
         let mut entry = FileEntry::new(".", "", new_cluster);
         entry.attributes = FileAttribute::Directory as u8;
         Self::write_file_to_dir(part, &entry, new_cluster, None)?;
 
-        // For the '..' entry, if the parent is the root directory,
-        // set the cluster reference to 0 as required.
         let parent_cluster_ref = if parent_cluster == 2 {
             0
         } else {
@@ -695,72 +726,10 @@ impl FileSystem {
         for &cluster in &clusters {
             let dir = Self::read_dir(part, cluster)?;
 
-            let mut assembled: Vec<(String, u8, usize)> = Vec::new();
-            let mut pending_lfn_parts: Vec<FileEntry> = Vec::new();
-
-            for (idx, entry) in dir.iter().enumerate() {
-                let attr = entry.attributes;
-
-                if attr == 0x0F {
-                    pending_lfn_parts.push(*entry);
-                    continue;
-                }
-
-                if entry.name[0] == 0x00 || entry.name[0] == 0xE5 {
-                    pending_lfn_parts.clear();
-                    continue;
-                }
-
-                let full_name = if !pending_lfn_parts.is_empty() {
-                    pending_lfn_parts.reverse();
-
-                    let mut utf16_name = Vec::new();
-                    for lfn in &pending_lfn_parts {
-                        let raw: [u8; 32] = unsafe { core::mem::transmute(*lfn) };
-
-                        for k in (1..11).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                        for k in (14..26).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                        for k in (28..32).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                    }
-
-                    if let Some(pos) = utf16_name.iter().position(|&c| c == 0x0000) {
-                        utf16_name.truncate(pos);
-                    }
-
-                    pending_lfn_parts.clear();
-                    String::from_utf16_lossy(&utf16_name)
-                } else {
-                    let name = entry
-                        .name
-                        .iter()
-                        .take_while(|&&c| c != 0 && c != b' ')
-                        .copied()
-                        .collect::<Vec<u8>>();
-                    let ext = entry
-                        .extension
-                        .iter()
-                        .take_while(|&&c| c != 0 && c != b' ')
-                        .copied()
-                        .collect::<Vec<u8>>();
-                    let mut s = String::from_utf8_lossy(&name).to_string();
-                    if !ext.is_empty() {
-                        s.push('.');
-                        s.push_str(&String::from_utf8_lossy(&ext));
-                    }
-                    s
-                };
-
-                assembled.push((full_name, attr, idx));
-            }
+            let assembled = Self::assemble_entries(&dir);
 
             for (name, attr, idx) in assembled {
-                if name.eq_ignore_ascii_case(file_name) && attr == file_attribute as u8 {
+                if name.eq_ignore_ascii_case(file_name) && attr == file_attribute {
                     return Ok(dir[idx].clone());
                 }
             }
@@ -836,7 +805,8 @@ impl FileSystem {
 
                 // Create the file entry
                 Self::update_fat(part, free_cluster, 0xFFFFFFFF);
-                let entry = FileEntry::new(file_name, file_extension, free_cluster);
+                let mut entry = FileEntry::new(file_name, file_extension, free_cluster);
+                entry.file_size = CLUSTER_SIZE;
 
                 // Check if this file name needs a long name
                 let full_name = if file_extension.is_empty() {
@@ -928,117 +898,100 @@ impl FileSystem {
         file_entry.file_size = file_data.len() as u32;
         let starting_cluster = file_entry.get_cluster();
 
-        // Determine if LFN is needed
-        let full_name = {
-            let name = file_entry.get_name();
-            let ext = file_entry.get_extension();
-            if ext.is_empty() {
-                name
-            } else {
-                format!("{}.{}", name, ext)
-            }
-        };
-
-        let needs_lfn = {
-            let upper = full_name.to_uppercase();
-            let parts: Vec<&str> = upper.split('.').collect();
-            let name_ok = parts[0].len() <= 8
-                && parts[0]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
-            let ext_ok = parts.len() == 1
-                || (parts[1].len() <= 3
-                    && parts[1]
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_'));
-            !(name_ok && ext_ok)
-        };
-
-        if needs_lfn {
-            if Self::update_dir_entry(part, path, file_entry, starting_cluster, Some(full_name))
-                .is_err()
-            {
-                return Err(FileStatus::UnknownFail);
-            }
-        } else {
-            if Self::update_dir_entry(part, path, file_entry, starting_cluster, None).is_err() {
-                return Err(FileStatus::UnknownFail);
-            }
+        if Self::update_dir_entry(part, path, file_entry, starting_cluster, None).is_err() {
+            return Err(FileStatus::UnknownFail);
         }
-
         Ok(())
     }
     pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus> {
+        let parsed = FileSystem::file_parser(path);
         let dir_entry = Self::find_dir(part, path)?;
         let files = Self::read_dir(part, dir_entry.get_cluster())?;
-
-        if files.last().unwrap().name == "..".as_bytes() {
-            return Err(FileStatus::BadPath);
+        for file in &files {
+            println!("{} {}", file.get_name(), file.get_extension())
         }
-
-        let mut results = Vec::new();
-        let mut pending_lfn_parts: Vec<FileEntry> = Vec::new();
-
-        for entry in &files {
-            if entry.attributes == 0x0F {
-                // This is an LFN entry — store it for later assembly
-                pending_lfn_parts.push(entry.clone());
-            } else if entry.name[0] == 0x00 || entry.name[0] == 0xE5 {
-                // Unused or deleted entry, clear any pending LFN data
-                pending_lfn_parts.clear();
-            } else {
-                if !pending_lfn_parts.is_empty() {
-                    pending_lfn_parts.reverse();
-
-                    let mut utf16_name = Vec::new();
-                    for lfn in &pending_lfn_parts {
-                        let raw: [u8; 32] = unsafe { core::mem::transmute(*lfn) };
-
-                        for k in (1..11).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                        for k in (14..26).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                        for k in (28..32).step_by(2) {
-                            utf16_name.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
-                        }
-                    }
-
-                    if let Some(pos) = utf16_name.iter().position(|&c| c == 0x0000) {
-                        utf16_name.truncate(pos);
-                    }
-
-                    let assembled_name = String::from_utf16_lossy(&utf16_name);
-                    results.push(assembled_name);
-
-                    pending_lfn_parts.clear();
-                } else {
-                    let name = entry
-                        .name
-                        .iter()
-                        .take_while(|&&c| c != 0 && c != b' ')
-                        .cloned()
-                        .collect::<Vec<u8>>();
-
-                    let ext = entry
-                        .extension
-                        .iter()
-                        .take_while(|&&c| c != 0 && c != b' ')
-                        .cloned()
-                        .collect::<Vec<u8>>();
-
-                    let mut full_name = String::from_utf8_lossy(&name).to_string();
-                    if !ext.is_empty() {
-                        full_name.push('.');
-                        full_name.push_str(&String::from_utf8_lossy(&ext));
-                    }
-                    results.push(full_name);
-                }
+        if let Some(last) = parsed.last() {
+            if last.to_string() == ".." {
+                return Err(FileStatus::BadPath);
             }
         }
+        let names: Vec<String> = Self::assemble_entries(&files)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
 
-        Ok(results)
+        Ok(names)
+    }
+    pub fn assemble_entries(files: &[FileEntry]) -> Vec<(String, FileAttribute, usize)> {
+        let mut out: Vec<(String, FileAttribute, usize)> = Vec::new();
+        let mut pending_lfn: Vec<FileEntry> = Vec::new();
+
+        for (i, entry) in files.iter().enumerate() {
+            let attr = FileAttribute::try_from(entry.attributes).unwrap();
+
+            if attr == FileAttribute::LFN {
+                pending_lfn.push(*entry);
+                continue;
+            }
+
+            if entry.name.get(0).copied() == Some(0x00) || entry.name.get(0).copied() == Some(0xE5)
+            {
+                pending_lfn.clear();
+                continue;
+            }
+
+            let name = if !pending_lfn.is_empty() {
+                pending_lfn.reverse();
+                let mut utf16: Vec<u16> = Vec::new();
+
+                for lfn in &pending_lfn {
+                    let raw: [u8; 32] =
+                        unsafe { core::mem::transmute::<FileEntry, [u8; 32]>(*lfn) };
+
+                    for k in (1..11).step_by(2) {
+                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                    }
+                    for k in (14..26).step_by(2) {
+                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                    }
+                    for k in (28..32).step_by(2) {
+                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                    }
+                }
+
+                if let Some(pos) = utf16.iter().position(|&w| w == 0x0000) {
+                    utf16.truncate(pos);
+                }
+                utf16.retain(|&w| w != 0xFFFF);
+
+                pending_lfn.clear();
+                String::from_utf16_lossy(&utf16)
+            } else {
+                let base_raw = entry
+                    .name
+                    .iter()
+                    .take_while(|&&c| c != 0 && c != b' ')
+                    .copied()
+                    .collect::<Vec<u8>>();
+                let ext_raw = entry
+                    .extension
+                    .iter()
+                    .take_while(|&&c| c != 0 && c != b' ')
+                    .copied()
+                    .collect::<Vec<u8>>();
+
+                let mut s = String::from_utf8_lossy(&base_raw).to_string();
+                if !ext_raw.is_empty() {
+                    s.push('.');
+                    s.push_str(&String::from_utf8_lossy(&ext_raw));
+                }
+                s
+            };
+
+            out.push((name, attr, i));
+        }
+
+        out
     }
 
     pub fn read_file(part: &mut Partition, path: &str) -> Result<Vec<u8>, FileStatus> {
@@ -1214,11 +1167,13 @@ impl FileSystem {
             let entries = FileEntry::new_long_name(&name_part, &ext_part, entry.get_cluster());
 
             for e in &entries {
+                if (e.attributes == FileAttribute::Archive as u8) {
+                    println!("{}, {}", e.get_name(), e.get_extension());
+                }
                 Self::write_file_to_dir(part, e, start_cluster_of_dir, None)?;
             }
             return Ok(());
         }
-
         let mut dir_buf = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         let clusters = Self::get_all_clusters(part, start_cluster_of_dir);
         Self::read_cluster(part, clusters[clusters.len() - 1], &mut dir_buf)?;
@@ -1238,7 +1193,7 @@ impl FileSystem {
             if free_cluster != 0xFFFFFFFF {
                 Self::update_fat(part, clusters[clusters.len() - 1], free_cluster);
                 Self::update_fat(part, free_cluster, 0xFFFFFFFF);
-                return Self::write_file_to_dir(part, entry, start_cluster_of_dir, None);
+                return Self::write_file_to_dir(part, entry, start_cluster_of_dir, long_name);
             }
         }
 
