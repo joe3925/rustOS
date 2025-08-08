@@ -42,9 +42,9 @@ pub struct Module {
 
 pub type ProgramHandle = Arc<RwLock<Program>>;
 pub type QueueHandle = Arc<RwLock<MessageQueue>>;
+pub type ModuleHandle = Arc<RwLock<Module>>;
 
 pub type UserHandle = u64;
-
 pub struct MessageQueue {
     pub queue: VecDeque<Message>,
 }
@@ -54,6 +54,7 @@ pub enum HandleTarget {
     Program(ProgramHandle),
     MessageQueue(u64, QueueHandle),
     Thread(TaskHandle),
+    Module(ModuleHandle),
 }
 pub struct HandleTable {
     pub handles: BTreeMap<UserHandle, HandleTarget>,
@@ -140,7 +141,7 @@ pub struct Program {
     pub image_base: VirtAddr,
     pub main_thread: Option<TaskHandle>,
     pub managed_threads: Mutex<Vec<TaskHandle>>,
-    pub modules: Mutex<Vec<Module>>,
+    pub modules: RwLock<Vec<ModuleHandle>>,
     pub cr3: PhysFrame,
     pub tracker: Arc<RangeTracker>,
     pub handle_table: RwLock<HandleTable>,
@@ -164,7 +165,7 @@ impl Program {
             image_base,
             main_thread: None,
             managed_threads: Mutex::new(Vec::new()),
-            modules: Mutex::new(Vec::new()),
+            modules: RwLock::new(Vec::new()),
             cr3,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
@@ -252,10 +253,10 @@ impl Program {
         Cr3::write(old_cr3.0, old_cr3.1);
         result
     }
-    pub fn load_module(&mut self, path: String) -> Result<(), LoadError> {
+    pub fn load_module(&mut self, path: String) -> Result<ModuleHandle, LoadError> {
         if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
             let module = dll.dll_load(self)?;
-            return Ok(());
+            return Ok(module);
         }
         Err(LoadError::NoFile)
     }
@@ -294,12 +295,17 @@ impl Program {
         Ok(())
     }
     pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Option<VirtAddr> {
-        let modules = self.modules.lock();
+        let modules = self.modules.read();
 
         for module in modules.iter() {
-            if module.title.eq_ignore_ascii_case(dll_name) {
-                if let Some(symbol) = module.symbols.iter().find(|(name, _)| name == symbol_name) {
-                    return Some(module.image_base + symbol.1 as u64);
+            if module.read().title.eq_ignore_ascii_case(dll_name) {
+                if let Some(symbol) = module
+                    .read()
+                    .symbols
+                    .iter()
+                    .find(|(name, _)| name == symbol_name)
+                {
+                    return Some(module.read().image_base + symbol.1 as u64);
                 }
             }
         }
@@ -308,9 +314,9 @@ impl Program {
     }
     pub fn has_module(&self, name_lc: &str) -> bool {
         self.modules
-            .lock()
+            .read()
             .iter()
-            .any(|m| m.title.eq_ignore_ascii_case(name_lc))
+            .any(|m| m.read().title.eq_ignore_ascii_case(name_lc))
     }
     pub fn resolve_handle(&self, handle: UserHandle) -> Option<HandleTarget> {
         let table = self.handle_table.read();

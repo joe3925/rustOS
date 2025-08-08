@@ -1,3 +1,4 @@
+use crate::executable::pe_loadable::LoadError;
 use crate::registry::RegError;
 use crate::{format, println};
 use alloc::{string::String, vec::Vec};
@@ -23,6 +24,7 @@ pub enum DriverError {
     TomlParse,
     DriverAlreadyInstalled,
     Registry(crate::registry::RegError),
+    LoadErr(LoadError),
 }
 impl From<crate::file_system::file::FileStatus> for DriverError {
     fn from(e: crate::file_system::file::FileStatus) -> Self {
@@ -38,7 +40,12 @@ impl From<crate::registry::RegError> for DriverError {
         DriverError::Registry(e)
     }
 }
-#[derive(Debug, Clone, Copy)]
+impl From<LoadError> for DriverError {
+    fn from(e: LoadError) -> Self {
+        DriverError::LoadErr(e)
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootType {
     Boot = 0,
     System = 1,

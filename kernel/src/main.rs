@@ -155,7 +155,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
 }
 
 pub extern "win64" fn function(x: i64) -> i64 {
-    return x;
+    return (x - 10) / 10;
 }
 #[cfg(test)]
 pub fn test_runner(tests: &[&dyn Fn()]) {

@@ -261,6 +261,65 @@ pub mod reg {
         let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])?;
         file.write(&bytes).map_err(RegError::from)
     }
+    pub fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
+        fn join(base: &str, seg: &str) -> String {
+            if base.is_empty() {
+                seg.to_string()
+            } else {
+                alloc::format!("{}/{}", base, seg)
+            }
+        }
+        fn dfs(prefix: &str, key: &Key, out: &mut Vec<String>) {
+            for (name, sub) in &key.sub_keys {
+                let abs = join(prefix, name);
+                out.push(abs.clone());
+                dfs(&abs, sub, out);
+            }
+        }
+
+        ensure_loaded();
+        let base_norm = base_path.trim_matches('/');
+        let reg = REGISTRY.read();
+        let start = if base_norm.is_empty() {
+            let mut tmp = Key::empty();
+            tmp.sub_keys = reg.root.clone();
+
+            let mut v = Vec::new();
+            dfs("", &tmp, &mut v);
+            return Ok(v);
+        } else {
+            walk(&reg.root, base_norm).ok_or(RegError::KeyNotFound)?
+        };
+
+        let mut out = Vec::new();
+        dfs(base_norm, start, &mut out);
+        Ok(out)
+    }
+
+    pub fn list_values(base_path: &str) -> Result<Vec<String>, RegError> {
+        fn join(base: &str, seg: &str) -> String {
+            if base.is_empty() {
+                seg.to_string()
+            } else {
+                alloc::format!("{}/{}", base, seg)
+            }
+        }
+
+        ensure_loaded();
+        let base_norm = base_path.trim_matches('/');
+        let reg = REGISTRY.read();
+
+        if base_norm.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let key = walk(&reg.root, base_norm).ok_or(RegError::KeyNotFound)?;
+        let mut out = Vec::new();
+        for (val_name, _) in &key.values {
+            out.push(join(base_norm, val_name));
+        }
+        Ok(out)
+    }
 }
 pub fn is_first_boot() -> bool {
     matches!(

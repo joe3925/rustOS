@@ -460,7 +460,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
             0
         }
 
-        HandleTarget::Thread(_) => make_err(Message, UnsupportedTargetType as u16, 0),
+        _ => make_err(Message, UnsupportedTargetType as u16, 0),
     }
 }
 pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {

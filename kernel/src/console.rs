@@ -1,8 +1,7 @@
-use crate::util::{boot_info};
+use crate::util::boot_info;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
-use x86_64::instructions::interrupts;
 use core::fmt::Write;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -12,6 +11,7 @@ use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text, TextStyleBuilder};
 use lazy_static::lazy_static;
 use spin::Mutex;
+use x86_64::instructions::interrupts;
 
 static mut QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
 pub(crate) struct Cursor {
@@ -178,8 +178,8 @@ impl Console {
                     let ch = b as char;
                     let buf = [ch as u8];
                     let s = match core::str::from_utf8(&buf) {
-                        Ok(text) => text,      
-                        Err(_)   => continue, 
+                        Ok(text) => text,
+                        Err(_) => continue,
                     };
 
                     Text::with_text_style(
@@ -266,10 +266,10 @@ macro_rules! println {
 }
 
 pub(crate) fn _print(args: core::fmt::Arguments) {
-        let mut buffer = [0u8; 1024];
-        let mut writer = BufferWriter::new(&mut buffer);
-        core::fmt::write(&mut writer, args).unwrap();
-        CONSOLE.lock().print(writer.as_bytes());
+    let mut buffer = [0u8; 1024];
+    let mut writer = BufferWriter::new(&mut buffer);
+    core::fmt::write(&mut writer, args).unwrap();
+    CONSOLE.lock().print(writer.as_bytes());
 }
 
 struct BufferWriter<'a> {

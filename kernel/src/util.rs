@@ -8,6 +8,7 @@ use crate::drivers::interrupt_index::{
     ApicImpl,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
+use crate::drivers::pnp_manager::{PnpManager, PNP_MANAGER};
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
@@ -24,6 +25,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use spin::{Mutex, Once, RwLock};
 use x86_64::instructions::interrupts;
 
@@ -142,16 +144,13 @@ pub fn kernel_main() {
 
     program.main_thread = Some(SCHEDULER.lock().get_current_task());
 
-    program.modules = Mutex::new(
-        vec![Module {
-            title: "KRNL.DLL".into(),
-            image_path: "".into(),
-            parent_pid: 0,
-            image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
-            symbols: EXPORTS.to_vec(),
-        }]
-        .into(),
-    );
+    program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
+        title: "KRNL.DLL".into(),
+        image_path: "".into(),
+        parent_pid: 0,
+        image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
+        symbols: EXPORTS.to_vec(),
+    }))]);
 
     let pid = PROGRAM_MANAGER.add_program(program);
     if (is_first_boot()) {
@@ -159,6 +158,9 @@ pub fn kernel_main() {
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
     reg::print_tree();
+    PNP_MANAGER
+        .init_from_registry()
+        .expect("Driver init failed");
 
     // let label = {
     //     let mut volumes = VOLUMES.lock();
@@ -179,48 +181,6 @@ pub fn kernel_main() {
     //     s
     // };
 
-    // let entries = File::list_dir(&full_path).expect("Failed to load system mod directory");
-
-    // for name in entries {
-    //     if !name.to_ascii_lowercase().ends_with(".dll") {
-    //         continue;
-    //     }
-
-    //     path_buffer.clear();
-    //     path_buffer.push_str(&label);
-    //     path_buffer.push_str(base_path);
-    //     path_buffer.push('\\');
-    //     path_buffer.push_str(&name);
-
-    //     let handle = PROGRAM_MANAGER.get(pid).expect("invalid PID");
-
-    //     {
-    //         let mut prog = handle.write();
-    //         match prog.load_module(path_buffer.clone()) {
-    //             Ok(_) => println!("Loaded module: {}", name),
-    //             Err(e) => println!("Failed to load module '{}': {:?}", name, e),
-    //         }
-    //     }
-
-    //     type DriverEntryFn = unsafe extern "C" fn();
-
-    //     if let Some(handle) = PROGRAM_MANAGER.get(pid) {
-    //         let prog = handle.read();
-    //         for module in prog.modules.lock().iter() {
-    //             if let Some((_, rva)) = module.symbols.iter().find(|(sym, _)| sym == "driver_entry")
-    //             {
-    //                 let entry_addr = (module.image_base.as_u64() + *rva as u64) as *const ();
-    //                 let driver_entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
-    //                 println!("Calling driver_entry for module {}", module.image_path);
-    //                 unsafe { driver_entry() };
-    //             } else {
-    //                 println!("No driver_entry found in {}", module.title);
-    //             }
-    //         }
-    //     } else {
-    //         println!("invalid PID {}", pid);
-    //     }
-    // }
     print_mem_report();
     println!("");
     loop {

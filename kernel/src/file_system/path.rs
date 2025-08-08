@@ -22,7 +22,10 @@ impl Path {
         if b.get(start) == Some(&b'\\') || b.get(start) == Some(&b'/') {
             start += 1;
         } else {
-            panic!("from_string() expects absolute path, got: {}", abs);
+            return Self {
+                drive: None,
+                components: Vec::new(),
+            };
         }
 
         let comps = abs[start..]

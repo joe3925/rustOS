@@ -25,7 +25,7 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
-use super::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
+use super::program::{HandleTable, Module, ModuleHandle, Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -120,7 +120,7 @@ impl PELoader {
 
         Some(parse_base_relocations(buffer))
     }
-    pub fn dll_load(&mut self, program: &mut Program) -> Result<(), LoadError> {
+    pub fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
         // ---------- sanity checks ----------
         if !self.pe.is_lib {
             return Err(LoadError::NotDLL);
@@ -171,8 +171,9 @@ impl PELoader {
                     image_base: self.current_base,
                     symbols: exports,
                 };
-                program.modules.lock().push(module);
-                return Ok(());
+                let handle = Arc::new(RwLock::new(module));
+                program.modules.write().push(handle.clone());
+                return Ok(handle);
             }
 
             unsafe {
@@ -197,8 +198,9 @@ impl PELoader {
                 image_base: self.current_base,
                 symbols: exports,
             };
-            program.modules.lock().push(module);
-            Ok(())
+            let handle = Arc::new(RwLock::new(module));
+            program.modules.write().push(handle.clone());
+            Ok(handle)
         })();
 
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
@@ -317,20 +319,20 @@ impl PELoader {
         loop {
             let mut added = false;
 
-            let snapshot = program.modules.lock().clone();
+            let (dlls, present): (Vec<String>, alloc::collections::BTreeSet<String>) = {
+                let snapshot = program.modules.read();
+                let dlls = self.list_import_dlls();
+                let present = snapshot.iter().map(|m| m.read().title.clone()).collect();
+                (dlls, present)
+            };
 
-            for m in &snapshot {
-                for dll in self.list_import_dlls() {
-                    println!("loading mod, {}", dll);
-                    if program.has_module(&dll) {
-                        continue;
-                    }
-
-                    let path = format!(r"C:\BIN\MOD\{}", dll);
-                    program.load_module(path);
-
-                    added = true;
+            for dll in dlls {
+                if present.contains(&dll) {
+                    continue;
                 }
+                let path = alloc::format!(r"C:\BIN\MOD\{}", dll);
+                program.load_module(path)?;
+                added = true;
             }
 
             if !added {
