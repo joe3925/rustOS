@@ -9,7 +9,7 @@ use alloc::{
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
-    instructions::hlt,
+    instructions::{hlt, interrupts},
     registers::control::Cr3,
     structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
     VirtAddr,
@@ -420,7 +420,9 @@ impl ProgramManager {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
-            task.write().parent_pid = pid;
+            interrupts::without_interrupts(move || {
+                task.write().parent_pid = pid;
+            });
         }
 
         let handle = Arc::new(RwLock::new(prog));

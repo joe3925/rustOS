@@ -1,4 +1,4 @@
-image = "B.DLL"
+image = "BASE.DLL"
 
 start = "boot"
 

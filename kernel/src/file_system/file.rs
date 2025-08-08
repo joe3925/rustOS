@@ -141,13 +141,15 @@ impl File {
             if let Some(part) = VOLUMES.lock().find_volume(drive_letter.clone()) {
                 // Check if the file exists
                 let file_entry = FileSystem::find_file(part, path);
-
+                let name = FileSystem::file_parser(path);
+                let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
+                let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
                 match file_entry {
                     Ok(file_entry) => {
                         if (!flags.contains(&OpenFlags::CreateNew)) {
                             Ok(File {
-                                name: file_entry.get_name().clone(),
-                                extension: file_entry.get_extension().clone(),
+                                name: file_name.to_string(),
+                                extension: file_extension.to_string(),
                                 size: file_entry.file_size as u64,
                                 starting_cluster: file_entry.get_cluster(),
                                 drive_label: drive_letter.clone(),
@@ -163,15 +165,14 @@ impl File {
                         if flags.contains(&OpenFlags::Create)
                             || flags.contains(&OpenFlags::CreateNew)
                         {
-                            let name = FileSystem::file_parser(path);
-                            let file_name =
-                                FileSystem::get_text_before_last_dot(name[name.len() - 1]);
-                            let file_extension =
-                                FileSystem::get_text_after_last_dot(name[name.len() - 1]);
-
                             FileSystem::create_dir(part, File::remove_file_from_path(path))?;
 
-                            match FileSystem::create_file(part, &file_name, &file_extension, path) {
+                            match FileSystem::create_file(
+                                part,
+                                &file_name,
+                                &file_extension,
+                                File::remove_file_from_path(path),
+                            ) {
                                 Ok(_) => {
                                     let file_entry = FileSystem::find_file(part, path);
                                     match file_entry {
@@ -203,10 +204,10 @@ impl File {
         }
     }
 
-    /// Helper function to split file name and extension from the full path
     pub extern "win64" fn remove_drive_from_path(path: &str) -> &str {
-        if path.len() >= 3 && path[1..2] == ":".to_string() && path[2..3] == "\\".to_string() {
-            &path[3..]
+        let b = path.as_bytes();
+        if b.len() >= 2 && b[1] == b':' {
+            &path[2..]
         } else {
             path
         }
@@ -281,6 +282,7 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::NotFat); // Drive is not FAT
                 }
+
                 FileSystem::remove_dir(
                     part,
                     Self::remove_drive_from_path(path.as_str()).to_string(),
@@ -293,11 +295,12 @@ impl File {
         Self::check_path(path.as_str())?;
         if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
             if let Some(part) = VOLUMES.lock().find_volume(label) {
+                let path = Self::remove_drive_from_path(&path);
                 if !part.is_fat {
                     return Err(FileStatus::NotFat); // Drive is not FAT
                 }
-                FileSystem::create_dir(part, path.as_str())?;
-                match FileSystem::find_dir(part, path.as_str()) {
+                FileSystem::create_dir(part, path)?;
+                match FileSystem::find_dir(part, path) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e),
                 }
@@ -319,27 +322,26 @@ impl File {
     }
     pub extern "win64" fn check_path(path: &str) -> Result<(), FileStatus> {
         let sanitized_path = File::remove_drive_from_path(path);
-
         let components = FileSystem::file_parser(sanitized_path);
 
         for component in components {
-            let name = FileSystem::get_text_before_last_dot(component);
-            let extension = FileSystem::get_text_after_last_dot(component);
-
-            if name.len() > 8 {
+            if component.is_empty() || component == "." || component == ".." {
                 return Err(FileStatus::BadPath);
             }
 
-            if !extension.is_empty() && extension.len() > 3 {
+            if component.chars().count() > 255 {
                 return Err(FileStatus::BadPath);
             }
 
-            if name.chars().any(|c| c.is_ascii_lowercase()) {
+            if component.ends_with(' ') || component.ends_with('.') {
                 return Err(FileStatus::BadPath);
             }
 
-            if !extension.is_empty() && extension.chars().any(|c| c.is_ascii_lowercase()) {
-                return Err(FileStatus::BadPath);
+            let invalid = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+            for ch in component.chars() {
+                if ch < '\u{20}' || invalid.contains(&ch) {
+                    return Err(FileStatus::BadPath);
+                }
             }
         }
 

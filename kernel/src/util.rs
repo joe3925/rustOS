@@ -156,7 +156,7 @@ pub fn kernel_main() {
 
     let pid = PROGRAM_MANAGER.add_program(program);
     if (is_first_boot()) {
-        setup_file_layout();
+        setup_file_layout().expect("Failed to create system volume layout");
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
     reg::print_tree();
@@ -297,12 +297,6 @@ pub fn setup_file_layout() -> Result<(), FileStatus> {
 
     match File::make_dir(mod_path.clone()) {
         Ok(_) => {}
-        Err(FileStatus::PathNotFound) => {
-            let system_path = format!("{}\\SYSTEM", drive_label);
-            File::make_dir(system_path).expect("Failed to create SYSTEM directory");
-            File::make_dir(mod_path.clone()).expect("Failed to create MOD directory");
-            println!("Created {}", mod_path);
-        }
         e => {
             return e;
         }
@@ -311,13 +305,6 @@ pub fn setup_file_layout() -> Result<(), FileStatus> {
     match File::make_dir(inf_path.clone()) {
         Ok(_) => {
             return Ok(());
-        }
-        Err(FileStatus::PathNotFound) => {
-            let system_path = format!("{}\\SYSTEM", drive_label);
-            File::make_dir(system_path).expect("Failed to create SYSTEM directory");
-            File::make_dir(inf_path.clone()).expect("Failed to create INF directory");
-            println!("Created {}", inf_path);
-            Ok(())
         }
         e => {
             return e;

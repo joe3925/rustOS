@@ -1,4 +1,5 @@
-use crate::format;
+use crate::registry::RegError;
+use crate::{format, println};
 use alloc::{string::String, vec::Vec};
 use toml::de::DeTable;
 use toml::Spanned;
@@ -25,6 +26,9 @@ pub enum DriverError {
 }
 impl From<crate::file_system::file::FileStatus> for DriverError {
     fn from(e: crate::file_system::file::FileStatus) -> Self {
+        if e == FileStatus::FileAlreadyExist {
+            return DriverError::DriverAlreadyInstalled;
+        }
         DriverError::File(e)
     }
 }
@@ -100,11 +104,7 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
     })
 }
 pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
-    let file = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    let toml_bytes = file.read()?;
-    let toml_str = core::str::from_utf8(&toml_bytes).map_err(|_| DriverError::InvalidUtf8)?;
-
-    let driver = parse_driver_toml(toml_str).map_err(|_| DriverError::TomlParse)?;
+    let driver = parse_driver_toml(toml_path).map_err(|_| DriverError::TomlParse)?;
 
     let driver_name = driver
         .image
@@ -114,17 +114,19 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
 
     let key_path = format!("SYSTEM/CurrentControlSet/Services/{}", driver_name);
 
-    let inf_target_path = format!("C:\\SYSTEM\\TOML\\{}.toml", driver_name);
+    let toml_target_path = format!("C:\\SYSTEM\\TOML\\{}.toml", driver_name);
     let img_target_path = format!("C:\\SYSTEM\\MOD\\{}", driver.image);
 
     let img_src_path = toml_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
     let img_src_full = format!("{}\\{}", img_src_path, driver.image);
     let img_file = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
     let img_data = img_file.read()?;
-    let mut img_dest = File::open(&img_target_path, &[OpenFlags::Create])?;
+    let mut img_dest = File::open(&img_target_path, &[OpenFlags::CreateNew])?;
     img_dest.write(&img_data)?;
 
-    let mut toml_dest = File::open(&inf_target_path, &[OpenFlags::Create])?;
+    let file = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
+    let toml_bytes = file.read()?;
+    let mut toml_dest = File::open(&toml_target_path, &[OpenFlags::CreateNew])?;
     toml_dest.write(&toml_bytes)?;
 
     reg::create_key(&key_path)?;
@@ -133,7 +135,11 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         "ImagePath",
         Data::Str(img_target_path.to_string()),
     )?;
-    reg::set_value(&key_path, "InfPath", Data::Str(inf_target_path.to_string()))?;
+    reg::set_value(
+        &key_path,
+        "TomlPath",
+        Data::Str(toml_target_path.to_string()),
+    )?;
     reg::set_value(&key_path, "Start", Data::U32(driver.start.as_u32()))?;
 
     Ok(())
@@ -151,9 +157,33 @@ pub fn install_prepacked_drivers() -> Result<(), DriverError> {
             Err(_) => continue,
         };
 
-        if let Some(toml_name) = entries.iter().find(|n| n.ends_with(".TOML")) {
+        if let Some(toml_name) = entries
+            .iter()
+            .find(|n| n.to_ascii_lowercase().ends_with(".toml"))
+        {
             let toml_path = alloc::format!("{}\\{}", pkg_path, toml_name);
-            install_driver_toml(&toml_path)?;
+            //TODO: log every non fatal error
+            match install_driver_toml(&toml_path) {
+                Ok(_) => {
+                    println!("Installed {}", toml_path);
+                }
+                Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
+                    println!(
+                        "Couldn't install driver {} failed with error: {:#?}",
+                        toml_path,
+                        DriverError::Registry(RegError::KeyAlreadyExists)
+                    );
+                }
+                Err(DriverError::Registry(e)) => {
+                    return Err(DriverError::Registry(e));
+                }
+                Err(e) => {
+                    println!(
+                        "Couldn't install driver {} failed with error: {:#?}",
+                        toml_path, e
+                    );
+                }
+            }
         }
     }
 
