@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::pe_loadable::{self, LoadError};
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Module {
     pub title: String,
     pub image_path: String,

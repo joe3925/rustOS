@@ -8,7 +8,7 @@ use crate::drivers::interrupt_index::{
     ApicImpl,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
-use crate::drivers::pnp_manager::{PnpManager, PNP_MANAGER};
+use crate::drivers::pnp::pnp_manager::PNP_MANAGER;
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
