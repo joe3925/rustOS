@@ -68,8 +68,8 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     config.mappings.dynamic_range_end = Some(0xFFFF_8500_0000_0000);
 
     config.mappings.framebuffer = Mapping::Dynamic;
-    // config.frame_buffer.minimum_framebuffer_height = Some(1440);
-    // config.frame_buffer.minimum_framebuffer_width = Some(2560);
+    config.frame_buffer.minimum_framebuffer_height = Some(1440);
+    config.frame_buffer.minimum_framebuffer_width = Some(2560);
     config
 };
 entry_point!(_start, config = &BOOTLOADER_CONFIG);

@@ -308,7 +308,33 @@ fn reg_append_class_filter(
         Data::Str(service.to_string()),
     )
 }
-
+fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
+    let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
+    if reg::get_key(&class_key).is_none() {
+        let _ = reg::create_key(&class_key);
+    }
+    let members_key = alloc::format!("{}/Members", class_key);
+    if reg::get_key(&members_key).is_none() {
+        let _ = reg::create_key(&members_key);
+    }
+    if let Some(k) = reg::get_key(&members_key) {
+        for (_k, v) in k.values {
+            if let Data::Str(s) = v {
+                if s == service {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let idx = reg::get_key(&members_key)
+        .map(|k| k.values.len())
+        .unwrap_or(0);
+    reg::set_value(
+        &members_key,
+        &alloc::format!("{}", idx),
+        Data::Str(service.to_string()),
+    )
+}
 fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
@@ -360,7 +386,10 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         DriverRole::Function => {
             if let Some(cls) = &driver.class {
                 reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
+                ensure_class_key(cls)?;
+                reg_append_class_member(cls, driver_name)?;
             }
+
             if !driver.hwids.is_empty() {
                 let hwk = alloc::format!("{}/Hwids", key_path);
                 reg::create_key(&hwk)?;

@@ -9,31 +9,28 @@ use bincode::{Decode, Encode};
 use lazy_static::lazy_static;
 use spin::{Once, RwLock};
 
-/// ----------------------------------------------
-///  File location & on-disk format
-/// ----------------------------------------------
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
-const CLASS_LIST: &[&str] = &[
-    "disk",
-    "volume",
-    "storage",
-    "kbd",
-    "mouse",
-    "hid",
-    "display",
-    "gpu",
-    "net",
-    "audio",
-    "media",
-    "usb",
-    "battery",
-    "sensor",
-    "bluetooth",
-    "wifi",
-    "serial",
-    "parallel",
-    "camera",
-    "printer",
+const CLASS_LIST: &[(&str, &str)] = &[
+    ("disk", "Disk devices / block storage"),
+    ("volume", "Logical volumes / partitions"),
+    ("storage", "Storage stack infrastructure"),
+    ("kbd", "Keyboards"),
+    ("mouse", "Pointing devices (mouse, touch)"),
+    ("hid", "Human Interface Devices"),
+    ("display", "Display controller (generic)"),
+    ("gpu", "3D accelerator / graphics adapter"),
+    ("net", "Network adapters"),
+    ("audio", "Audio devices"),
+    ("media", "Multimedia controllers / codecs"),
+    ("usb", "USB host controllers / hubs"),
+    ("battery", "Battery / power sources"),
+    ("sensor", "Sensors (IMU, ambient, etc.)"),
+    ("bluetooth", "Bluetooth radios / controllers"),
+    ("wifi", "Wireless LAN"),
+    ("serial", "Serial ports / UART"),
+    ("parallel", "Parallel ports"),
+    ("camera", "Cameras / imaging"),
+    ("printer", "Printers"),
 ];
 
 /* ---------- data layer -------------- */
@@ -106,10 +103,10 @@ fn init_class_catalog(reg: &mut Registry) {
         .entry("Class".into())
         .or_insert_with(Key::empty);
 
-    for &c in CLASS_LIST {
+    for &(id, desc) in CLASS_LIST {
         let ck = class_root
             .sub_keys
-            .entry(c.to_string())
+            .entry(id.to_string())
             .or_insert_with(Key::empty);
 
         ck.values
@@ -118,7 +115,7 @@ fn init_class_catalog(reg: &mut Registry) {
 
         ck.values
             .entry("Description".into())
-            .or_insert(Data::Str(c.to_string()));
+            .or_insert(Data::Str(desc.to_string()));
 
         ck.sub_keys
             .entry("UpperFilters".into())
@@ -126,10 +123,14 @@ fn init_class_catalog(reg: &mut Registry) {
         ck.sub_keys
             .entry("LowerFilters".into())
             .or_insert_with(Key::empty);
+        ck.sub_keys
+            .entry("Members".into())
+            .or_insert_with(Key::empty);
 
         ck.values.entry("Version".into()).or_insert(Data::U32(1));
     }
 }
+
 fn ensure_loaded() {
     use bincode::config::standard;
     static LOADER: Once = Once::new();
