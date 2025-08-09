@@ -14,13 +14,8 @@ fn main() {
     let drivers_root = ws_root.join("target").join("DRIVERS");
     let dest_dir = drivers_root.join(crate_name);
 
-    if cfg!(target_env = "msvc") {
-        let out_file = dest_dir.join(format!("{crate_name}.dll"));
-        println!("cargo:rustc-link-arg=/OUT:{}", out_file.display());
-    } else {
-        let out_file = dest_dir.join(format!("lib{crate_name}.so"));
-        println!("cargo:rustc-link-arg=-o{}", out_file.display());
-    }
+    let out_file = dest_dir.join(format!("{crate_name}.dll"));
+    println!("cargo:rustc-link-arg=/OUT:{}", out_file.display());
 
     // ensure rerun
     println!("cargo:rerun-if-changed=build.rs");
