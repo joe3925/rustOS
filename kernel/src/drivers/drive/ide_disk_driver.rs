@@ -31,8 +31,10 @@ pub fn has_ide_controller() -> bool {
     for device in &PCIBUS.device_collection.devices {
         // IDE controller class code is 0x01 and subclass code is 0x01
         if device.class_code == 0x01 && device.subclass == 0x01 {
-            println!("IDE Controller found at Bus {}, Device {}, Function {}",
-                     device.bus, device.device, device.function);
+            println!(
+                "IDE Controller found at Bus {}, Device {}, Function {}",
+                device.bus, device.device, device.function
+            );
             return true;
         }
     }
@@ -45,10 +47,14 @@ static DRIVE_IRQ_RECEIVED: AtomicBool = AtomicBool::new(false);
 pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
         let mut status_port = Port::new(PRIMARY_CMD_BASE + 7);
-        let status: u8 = status_port.read();  // Read the status register
+        let status: u8 = status_port.read(); // Read the status register
 
-        while status & 0x40 == 0 { println!("Drive not ready"); }
-        while status & 0x20 != 0 { println!("Drive faulted!"); }
+        while status & 0x40 == 0 {
+            println!("Drive not ready");
+        }
+        while status & 0x20 != 0 {
+            println!("Drive faulted!");
+        }
 
         if status & 0x01 != 0 {
             println!("Error: Read sector failed!");
@@ -56,19 +62,19 @@ pub(crate) extern "x86-interrupt" fn primary_drive_irq_handler(_stack_frame: Int
 
         DRIVE_IRQ_RECEIVED.store(true, Ordering::SeqCst);
 
-
         // 3. Send End of Interrupt (EOI) to both PICs
         send_eoi(drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8());
     }
 }
-pub(crate) extern "x86-interrupt" fn secondary_drive_irq_handler(_stack_frame: InterruptStackFrame) {
+pub(crate) extern "x86-interrupt" fn secondary_drive_irq_handler(
+    _stack_frame: InterruptStackFrame,
+) {
     // Set the global flag to indicate that the IRQ was received
     DRIVE_IRQ_RECEIVED.store(true, Ordering::SeqCst);
     println!("secondary: {}", get_cycles());
     // Acknowledge the IRQ (send End of Interrupt to PIC)
     send_eoi(drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8());
 }
-
 
 pub struct IdeController {
     data_port: Port<u16>,
@@ -123,7 +129,7 @@ impl IdeController {
                     .flat_map(|&word| vec![(word >> 8) as u8, (word & 0xFF) as u8]) // Swap the bytes of each word
                     .collect::<Vec<u8>>(),
             )
-                .to_string();
+            .to_string();
 
             let model = String::from_utf8_lossy(
                 &data[27..47]
@@ -131,7 +137,7 @@ impl IdeController {
                     .flat_map(|&word| vec![(word >> 8) as u8, (word & 0xFF) as u8]) // Swap the bytes of each word
                     .collect::<Vec<u8>>(),
             )
-                .to_string();
+            .to_string();
 
             let capacity = ((data[60] as u64) | ((data[61] as u64) << 16)) * 512; // Assuming 512 bytes per sector
 
@@ -150,35 +156,40 @@ impl IdeController {
 
 impl DriveController for IdeController {
     fn read(&mut self, lba: u32, buffer: &mut [u8]) {
-        assert_eq!(buffer.len(), 512);  // Ensure buffer size is 512 bytes (one sector)
+        assert_eq!(buffer.len(), 512); // Ensure buffer size is 512 bytes (one sector)
 
         unsafe {
             let drive_selector = self.managed_port;
 
             // Wait until the drive is not busy
-            while self.command_port.read() & 0x80 != 0 {}  // BSY
+            while self.command_port.read() & 0x80 != 0 {} // BSY
 
             // Ensure drive is ready and no fault occurred
             //while self.command_port.read() & 0x40 == 0 {  }
-            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.command_port.read() & 0x20 != 0 {
+                println!("Drive faulted!");
+            }
 
             if self.command_port.read() & 0x01 != 0 {
                 println!("Error: IDE command failed!");
             }
 
             // Send command to read from the sector
-            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
-            while self.command_port.read() & 0x80 != 0 {}  // BSY
+            self.drive_head_port
+                .write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            while self.command_port.read() & 0x80 != 0 {} // BSY
 
-            self.sector_count_port.write(1);  // Request 1 sector
+            self.sector_count_port.write(1); // Request 1 sector
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            self.command_port.write(0x20);  // Command to read
+            self.command_port.write(0x20); // Command to read
 
-            while self.command_port.read() & 0x80 != 0 {}  // BSY
-            while self.command_port.read() & 0x40 == 0 {  }
-            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.command_port.read() & 0x80 != 0 {} // BSY
+            while self.command_port.read() & 0x40 == 0 {}
+            while self.command_port.read() & 0x20 != 0 {
+                println!("Drive faulted!");
+            }
 
             // Check if there was an error
             if self.command_port.read() & 0x01 != 0 {
@@ -191,9 +202,9 @@ impl DriveController for IdeController {
 
             // Transfer data in chunks of 2 bytes (16-bit data)
             for chunk in buffer.chunks_mut(2) {
-                let data = self.data_port.read();  // Read 16-bit data
-                chunk[0] = (data & 0xFF) as u8;    // Lower byte
-                chunk[1] = ((data >> 8) & 0xFF) as u8;  // Upper byte
+                let data = self.data_port.read(); // Read 16-bit data
+                chunk[0] = (data & 0xFF) as u8; // Lower byte
+                chunk[1] = ((data >> 8) & 0xFF) as u8; // Upper byte
             }
         }
     }
@@ -203,28 +214,35 @@ impl DriveController for IdeController {
         unsafe {
             let drive_selector = self.managed_port;
             // Wait until the drive is not busy
-            while self.alternative_command_port.read() & 0x80 != 0 {}  // BSY
+            while self.alternative_command_port.read() & 0x80 != 0 {} // BSY
 
             // Ensure drive is ready and no fault occurred
             while self.alternative_command_port.read() & 0x40 == 0 {}
-            while self.alternative_command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.alternative_command_port.read() & 0x20 != 0 {
+                println!("Drive faulted!");
+            }
 
             if self.alternative_command_port.read() & 0x01 != 0 {
                 println!("Error: IDE command failed!");
             }
 
             // Send command to write to the sector
-            self.drive_head_port.write(drive_selector | (((lba >> 24) & 0x0F) as u8));
-            while self.command_port.read() & 0x80 != 0 {}  // BSY
+            self.drive_head_port
+                .write(drive_selector | (((lba >> 24) & 0x0F) as u8));
+            while self.command_port.read() & 0x80 != 0 {} // BSY
             self.sector_count_port.write(1);
             self.lba_lo_port.write((lba & 0xFF) as u8);
             self.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
             self.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            self.command_port.write(0x30);  // Command to write
+            self.command_port.write(0x30); // Command to write
 
-            while self.command_port.read() & 0x80 != 0 { println!("Drive busy"); }  // BSY
+            while self.command_port.read() & 0x80 != 0 {
+                println!("Drive busy");
+            } // BSY
             while self.command_port.read() & 0x40 == 0 {}
-            while self.command_port.read() & 0x20 != 0 { println!("Drive faulted!"); }
+            while self.command_port.read() & 0x20 != 0 {
+                println!("Drive faulted!");
+            }
 
             //while !DRIVE_IRQ_RECEIVED.load(Ordering::SeqCst) {  }
             // Check if there was an error
@@ -252,17 +270,24 @@ impl DriveController for IdeController {
         unsafe {
             if let Some(info) = IdeController::identify_drive(0) {
                 if (info.capacity != 0) {
-                    drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Master as u32))));
+                    drive_list.push(Drive::new(
+                        -1,
+                        info,
+                        Box::new(IdeController::new(DriveType::Master as u32)),
+                    ));
                 }
             }
         }
-
 
         // Check for the slave drive
         unsafe {
             if let Some(info) = IdeController::identify_drive(1) {
                 if (info.capacity != 0) {
-                    drive_list.push(Drive::new(-1, info, Box::new(IdeController::new(DriveType::Slave as u32))));
+                    drive_list.push(Drive::new(
+                        -1,
+                        info,
+                        Box::new(IdeController::new(DriveType::Slave as u32)),
+                    ));
                 }
             }
         }

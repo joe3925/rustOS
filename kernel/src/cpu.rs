@@ -15,13 +15,12 @@ pub fn wait_cycle(cycles: u128) {
 pub fn wait_cycle_idle(cycles: u128) {
     let start = get_cycles() as u128;
     loop {
-        unsafe{asm!("hlt")};
+        unsafe { asm!("hlt") };
         if (get_cycles() as u128 >= cycles + start) {
             return;
         }
     }
 }
-
 
 pub fn get_cpu_info() -> CpuId<CpuIdReaderNative> {
     let info = CpuId::new();

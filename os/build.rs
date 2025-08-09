@@ -1,5 +1,9 @@
 use bootloader::{BiosBoot, BootConfig, UefiBoot};
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 const UEFI: bool = true;
 
@@ -16,19 +20,12 @@ fn main() {
         .unwrap()
         .parent()
         .unwrap();
-    let kernel_source = target_dir
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("kernel")
-        .join("src");
-
+    let root_dir = target_dir.parent().unwrap().parent().unwrap();
+    let kernel_source = root_dir.join("kernel").join("src");
     let image_path = target_dir.join("boot.img");
     let efi_path = target_dir.join("kernel.efi");
 
-    // Assemble ap_startup.asm → ap_startup.bin
-    let asm_src = PathBuf::from(kernel_source.join("ap_startup.asm"));
+    let asm_src = kernel_source.join("ap_startup.asm");
     let asm_bin = target_dir.parent().unwrap().join("ap_startup.bin");
 
     let status = Command::new("nasm")
@@ -39,10 +36,8 @@ fn main() {
         .expect("Failed to run nasm");
     assert!(status.success(), "nasm failed");
 
-    // Let Cargo rebuild if ASM changes
     println!("cargo:rerun-if-changed=src/ap_startup.asm");
 
-    // UEFI/BIOS bootloader image generation
     if UEFI {
         let config = BootConfig::default();
         let mut uefi_boot = UefiBoot::new(&kernel_path);
@@ -56,10 +51,8 @@ fn main() {
             .expect("Failed to create BIOS image");
     }
 
-    // Copy kernel.efi for GDB usage
     fs::copy(&kernel_path, &efi_path).expect("Failed to copy EFI file");
 
-    // Export paths
     println!("cargo:rustc-env=BOOTLOADER_IMAGE={}", image_path.display());
     println!("cargo:rustc-env=KERNEL_EFI={}", efi_path.display());
 }

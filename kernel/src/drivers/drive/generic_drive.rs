@@ -14,9 +14,8 @@ use spin::Lazy;
 use strum_macros::Display;
 
 // Macro to derive iteration
-pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> = Lazy::new(|| {
-    Mutex::new(DriveCollection::new())
-});
+pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> =
+    Lazy::new(|| Mutex::new(DriveCollection::new()));
 pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
@@ -57,7 +56,7 @@ impl PartitionErrors {
         match self {
             NoSpace => "Not enough space for partition",
             BadName => "Name is too long must be less then 72 characters",
-            NotGPT => "The drive is not formatted as GPT"
+            NotGPT => "The drive is not formatted as GPT",
         }
     }
 }
@@ -116,20 +115,21 @@ impl Drive {
     }
 }
 
-
 pub struct DriveCollection {
     pub drives: Vec<Drive>,
-
 }
 
 impl DriveCollection {
     fn new() -> Self {
-        DriveCollection {
-            drives: Vec::new(),
-        }
+        DriveCollection { drives: Vec::new() }
     }
 
-    pub(crate) fn new_drive(&mut self, index: i64, info: DriveInfo, controller: Box<dyn DriveController + Send>) {
+    pub(crate) fn new_drive(
+        &mut self,
+        index: i64,
+        info: DriveInfo,
+        controller: Box<dyn DriveController + Send>,
+    ) {
         let drive = Drive::new(index, info, controller);
         self.drives.push(drive);
     }
@@ -142,10 +142,10 @@ impl DriveCollection {
         for mut drive in drives {
             if (drive.index == -1) {
                 drive.index = self.drives.len() as i64;
-                let mut header_buffer = vec!(0u8; 512);
+                let mut header_buffer = vec![0u8; 512];
                 drive.controller.read(1, &mut header_buffer);
                 if let Some(header) = GptHeader::new(&header_buffer) {
-                    let mut partition_buffer = vec!(0u8; 512);
+                    let mut partition_buffer = vec![0u8; 512];
                     let mut partitions = Vec::new();
                     for i in 2..33 {
                         drive.controller.read(i, &mut partition_buffer);

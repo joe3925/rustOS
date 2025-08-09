@@ -68,8 +68,7 @@ impl GDTTracker {
             stack_end
         };
 
-        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] =
-            timer_stack;
+        tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
             double_fault_stack + KERNEL_STACK_SIZE;
         tss_static.privilege_stack_table[0] = privilege_stack;

@@ -2,7 +2,10 @@ use alloc::collections::linked_list::LinkedList;
 use spin::Mutex;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
-use crate::memory::paging::{paging::{align_up_4k, PageMapError}, virt_tracker::{allocate_auto_kernel_range_mapped, unmap_range}};
+use crate::memory::paging::{
+    paging::{align_up_4k, PageMapError},
+    virt_tracker::{allocate_auto_kernel_range_mapped, unmap_range},
+};
 
 pub static KERNEL_STACK_ALLOCATOR: Mutex<StackAllocator> = Mutex::new(StackAllocator::new(
     VirtAddr::new(0xFFFF_FFFF_8000_0000), // Kernel stacks start here

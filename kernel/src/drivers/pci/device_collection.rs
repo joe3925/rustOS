@@ -1,6 +1,5 @@
 use alloc::vec::Vec;
 
-
 pub(crate) struct Device {
     pub(crate) bus: u8,
     pub(crate) device: u8,
@@ -10,7 +9,14 @@ pub(crate) struct Device {
     pub(crate) subclass: u8,
 }
 impl Device {
-    pub const fn new(bus: u8, device: u8, function: u8, id: u32, class_code: u8, subclass: u8) -> Self {
+    pub const fn new(
+        bus: u8,
+        device: u8,
+        function: u8,
+        id: u32,
+        class_code: u8,
+        subclass: u8,
+    ) -> Self {
         Device {
             bus,
             device,

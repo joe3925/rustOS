@@ -4,7 +4,7 @@ use x86_64::VirtAddr;
 
 pub struct AllocationIter<'a> {
     guard: MutexGuard<'a, Vec<(u64, u64)>>,
-    idx:   usize,
+    idx: usize,
 }
 
 impl<'a> Iterator for AllocationIter<'a> {
@@ -69,10 +69,10 @@ impl RangeTracker {
     pub fn get_allocations(&self) -> AllocationIter<'_> {
         AllocationIter {
             guard: self.allocations.lock(),
-            idx:   0,
+            idx: 0,
         }
     }
-    
+
     pub fn dealloc(&self, base: u64, size: u64) {
         let aligned_size = (size + 0xFFF) & !0xFFF;
         let mut lock = self.allocations.lock();

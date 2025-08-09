@@ -159,12 +159,6 @@ impl PnpManager {
         Ok(())
     }
 
-    pub fn bind_pdo(&self, ids_descending_specificity: &[&str]) -> Option<Arc<DriverPackage>> {
-        let hw = self.hw.read();
-        hw.match_best(ids_descending_specificity)
-            .map(|d| d.pkg.clone())
-    }
-
     fn start_driver(&self, pkg: &Arc<DriverPackage>) -> Result<(), DriverError> {
         if let Some(rt) = self.drivers.read().get(&pkg.name).cloned() {
             match rt.get_state() {

@@ -1,9 +1,19 @@
 use core::sync::atomic::AtomicU64;
 
-use x86_64::{structures::paging::{mapper::MapToError, Mapper as _, Page, PageTableFlags, PhysFrame, Size4KiB}, PhysAddr, VirtAddr};
+use x86_64::{
+    structures::paging::{
+        mapper::MapToError, Mapper as _, Page, PageTableFlags, PhysFrame, Size4KiB,
+    },
+    PhysAddr, VirtAddr,
+};
 
-use crate::{memory::paging::{constants::MMIO_BASE, frame_alloc::BootInfoFrameAllocator, tables::init_mapper, virt_tracker::allocate_auto_kernel_range}, util::boot_info};
-
+use crate::{
+    memory::paging::{
+        constants::MMIO_BASE, frame_alloc::BootInfoFrameAllocator, tables::init_mapper,
+        virt_tracker::allocate_auto_kernel_range,
+    },
+    util::boot_info,
+};
 
 static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
 pub extern "win64" fn map_mmio_region(

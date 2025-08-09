@@ -74,9 +74,8 @@ impl AcpiHandler for ACPIImpl {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
-        let virt_addr =
-            map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
-                .expect("failed to map io space for ACPI");
+        let virt_addr = map_mmio_region(PhysAddr::new(physical_address as u64), size as u64)
+            .expect("failed to map io space for ACPI");
         PhysicalMapping::new(
             physical_address,
             NonNull::new(virt_addr.as_mut_ptr()).unwrap(),

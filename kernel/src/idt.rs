@@ -1,5 +1,7 @@
 use crate::drivers;
-use crate::drivers::drive::ide_disk_driver::{primary_drive_irq_handler, secondary_drive_irq_handler};
+use crate::drivers::drive::ide_disk_driver::{
+    primary_drive_irq_handler, secondary_drive_irq_handler,
+};
 use crate::drivers::kbd_driver::keyboard_interrupt_handler;
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;

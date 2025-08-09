@@ -12,7 +12,7 @@ use crate::{cpu, drivers::interrupt_index::TSC_HZ};
 /// ```
 pub struct Stopwatch {
     start_cycles: u64,
-    tsc_hz:       u64,
+    tsc_hz: u64,
 }
 
 impl Stopwatch {
@@ -23,7 +23,7 @@ impl Stopwatch {
 
         Stopwatch {
             start_cycles: cpu::get_cycles(),
-            tsc_hz:       freq,
+            tsc_hz: freq,
         }
     }
 

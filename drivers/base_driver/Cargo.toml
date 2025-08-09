@@ -8,6 +8,7 @@ autotests = false
 [lib]
 name = "BASE"
 crate-type = ["cdylib"]
+test = false
 
 [profile.dev]
 panic = "abort"

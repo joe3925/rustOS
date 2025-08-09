@@ -1,8 +1,6 @@
 #![cfg(target_env = "msvc")]
 #![allow(non_upper_case_globals)]
 
-use core::ffi::c_void;
-
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;
 
