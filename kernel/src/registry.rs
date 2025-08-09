@@ -13,6 +13,28 @@ use spin::{Once, RwLock};
 ///  File location & on-disk format
 /// ----------------------------------------------
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
+const CLASS_LIST: &[&str] = &[
+    "disk",
+    "volume",
+    "storage",
+    "kbd",
+    "mouse",
+    "hid",
+    "display",
+    "gpu",
+    "net",
+    "audio",
+    "media",
+    "usb",
+    "battery",
+    "sensor",
+    "bluetooth",
+    "wifi",
+    "serial",
+    "parallel",
+    "camera",
+    "printer",
+];
 
 /* ---------- data layer -------------- */
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
@@ -73,6 +95,41 @@ lazy_static! {
     static ref REGISTRY: RwLock<Arc<Registry>> = RwLock::new(Arc::new(Registry::empty()));
 }
 
+fn init_class_catalog(reg: &mut Registry) {
+    let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
+    let ccset = system
+        .sub_keys
+        .entry("CurrentControlSet".into())
+        .or_insert_with(Key::empty);
+    let class_root = ccset
+        .sub_keys
+        .entry("Class".into())
+        .or_insert_with(Key::empty);
+
+    for &c in CLASS_LIST {
+        let ck = class_root
+            .sub_keys
+            .entry(c.to_string())
+            .or_insert_with(Key::empty);
+
+        ck.values
+            .entry("Class".into())
+            .or_insert(Data::Str(String::new()));
+
+        ck.values
+            .entry("Description".into())
+            .or_insert(Data::Str(c.to_string()));
+
+        ck.sub_keys
+            .entry("UpperFilters".into())
+            .or_insert_with(Key::empty);
+        ck.sub_keys
+            .entry("LowerFilters".into())
+            .or_insert_with(Key::empty);
+
+        ck.values.entry("Version".into()).or_insert(Data::U32(1));
+    }
+}
 fn ensure_loaded() {
     use bincode::config::standard;
     static LOADER: Once = Once::new();
@@ -92,13 +149,13 @@ fn ensure_loaded() {
         let mut reg = Registry::empty();
 
         let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
-
         let setup = system
             .sub_keys
             .entry("SETUP".into())
             .or_insert_with(Key::empty);
-
         setup.values.insert("FirstBoot".into(), Data::Bool(true));
+
+        init_class_catalog(&mut reg);
 
         if let Ok(mut f) = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]) {
             let bytes = bincode::encode_to_vec(&reg, standard()).unwrap();

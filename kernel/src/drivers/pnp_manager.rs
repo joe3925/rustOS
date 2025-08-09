@@ -46,11 +46,11 @@ impl DriverRuntime {
 }
 #[derive(Debug, Clone)]
 pub struct DriverPackage {
-    pub name: String,       // Services/<name>
-    pub image_path: String, // from registry ImagePath (post-move path)
-    pub toml_path: String,  // from registry TomlPath
-    pub start: BootType,    // from registry Start (u32 or map)
-    pub hwids: Vec<String>, // from TOML
+    pub name: String,
+    pub image_path: String,
+    pub toml_path: String,
+    pub start: BootType,
+    pub hwids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,7 +137,7 @@ impl PnpManager {
         }
     }
     pub fn init_from_registry(&self) -> Result<(), RegError> {
-        self.rebuild_index();
+        self.rebuild_index()?;
 
         // Start BOOT drivers
         {
