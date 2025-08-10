@@ -11,6 +11,8 @@ use crate::{
     registry::{reg, Data},
 };
 
+use super::pnp::pnp_manager::PNP_MANAGER;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverRole {
     Function,
@@ -432,28 +434,21 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
             reg_add_filter_index(&f.target, f.position, f.order, driver_name)?;
         }
 
-        DriverRole::Base => {
-            // nothing extra
-        }
+        DriverRole::Base => {}
 
         DriverRole::Class => {
-            // Enforce: no HWIDs, class present, demand start
             if !driver.hwids.is_empty() || driver.class.is_none() {
                 return Err(DriverError::TomlParse);
             }
             let cls = driver.class.as_ref().unwrap();
 
-            // Persist class on the service for diagnostics
             reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
-            // Force Demand start regardless of TOML
             reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))?;
 
-            // Ensure class registry node exists and map service
             ensure_class_key(cls)?;
             let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
             reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string()))?;
 
-            // Optional: defaults if missing
             if reg::get_value(&class_key, "Version").is_none() {
                 let _ = reg::set_value(&class_key, "Version", Data::U32(1));
             }
@@ -462,6 +457,7 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
             }
         }
     }
+    PNP_MANAGER.rebuild_index();
     Ok(())
 }
 pub fn install_prepacked_drivers() -> Result<(), DriverError> {

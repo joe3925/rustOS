@@ -1,3 +1,6 @@
+use crate::alloc::vec;
+use crate::drivers::pnp::driver_object::PnpRequest;
+use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Weak;
 use alloc::{
@@ -20,8 +23,16 @@ use crate::static_handlers::create_kernel_task;
 use lazy_static::lazy_static;
 
 use super::driver_object::{
-    DeviceInit, DeviceObject, DriverObject, DriverStatus, Request, RequestType,
+    DeviceInit, DeviceObject, DriverObject, DriverStatus, PnpMinorFunction, Request, RequestType,
 };
+
+pub type CompletionRoutine = fn(request: &mut Request, context: usize);
+
+#[derive(Clone)]
+pub struct IoTarget {
+    target_device: Arc<DeviceObject>,
+}
+
 pub type DpcFn = fn(usize);
 #[derive(Clone, Copy)]
 pub struct Dpc {
@@ -158,6 +169,7 @@ pub enum DevNodeState {
     Stopped,
     SurpriseRemoved,
     Deleted,
+    Faulted,
 }
 #[derive(Debug, Clone)]
 pub struct StackLayer {
@@ -196,6 +208,15 @@ impl DeviceStack {
         }
     }
 
+    pub fn get_top_device_object(&self) -> Option<Arc<DeviceObject>> {
+        self.class
+            .as_ref()
+            .and_then(|l| l.devobj.clone())
+            .or_else(|| self.upper.last().and_then(|l| l.devobj.clone()))
+            .or_else(|| self.function.as_ref().and_then(|l| l.devobj.clone()))
+            .or_else(|| self.lower.last().and_then(|l| l.devobj.clone()))
+    }
+
     pub fn all_layers_bottom_to_top(&self) -> Vec<Arc<DriverObject>> {
         let mut out = Vec::new();
         out.extend(self.lower.iter().map(|l| l.driver.clone()));
@@ -217,12 +238,9 @@ pub struct DevNode {
     pub instance_path: String,
     pub ids: DeviceIds,
     pub class: Option<String>,
-    pub state: AtomicU8, // DevNodeState as u8
+    pub state: AtomicU8,
 
-    /// PDO device object for this devnode (owned by the enumerating bus).
     pub pdo: RwLock<Option<Arc<DeviceObject>>>,
-
-    /// Bound driver stack (PDO/filters/function/class). None until bound.
     pub stack: RwLock<Option<DeviceStack>>,
 }
 
@@ -239,7 +257,7 @@ impl DevNode {
             },
             class: None,
             state: AtomicU8::new(DevNodeState::Initialized as u8),
-            pdo: RwLock::new(None), // <-- add
+            pdo: RwLock::new(None),
             stack: RwLock::new(Some(DeviceStack::new())),
         })
     }
@@ -264,6 +282,18 @@ impl DevNode {
         });
         parent.children.write().push(dn.clone());
         dn
+    }
+
+    pub fn find_child_by_path(&self, path: &str) -> Option<Arc<DevNode>> {
+        for child in self.children.read().iter() {
+            if child.instance_path == path {
+                return Some(child.clone());
+            }
+            if let Some(found) = child.find_child_by_path(path) {
+                return Some(found);
+            }
+        }
+        None
     }
 
     #[inline]
@@ -306,15 +336,56 @@ impl PnpManager {
     pub fn init_from_registry(&self) -> Result<(), RegError> {
         self.rebuild_index()?;
 
-        // Start BOOT drivers (not device-bound; e.g., storage bus).
+        let root_node = self.root();
+
         {
+            println!("PNP: Initializing boot-start drivers as root devices...");
             let hw = self.hw.read();
-            for pkg in hw.by_driver.values() {
-                if pkg.start == BootType::Boot {
-                    let _ = self.ensure_started(pkg);
+            let boot_packages: Vec<_> = hw
+                .by_driver
+                .values()
+                .filter(|pkg| pkg.start == BootType::Boot)
+                .cloned()
+                .collect();
+
+            for pkg in boot_packages {
+                println!("  -> Processing boot-start driver: {}", &pkg.name);
+
+                match self.ensure_loaded(&pkg) {
+                    Ok(driver_object) => {
+                        let instance_path = alloc::format!("ROOT\\{}\\0000", &pkg.name);
+                        let device_ids = DeviceIds {
+                            hardware: vec![instance_path.clone()],
+                            compatible: Vec::new(),
+                        };
+
+                        println!(
+                            "     -> Creating root DevNode with path: {}",
+                            &instance_path
+                        );
+
+                        let (devnode, _pdo) = self.create_child_devnode_and_pdo(
+                            &root_node,
+                            &driver_object,
+                            pkg.name.clone(),
+                            instance_path,
+                            device_ids,
+                            None,
+                        );
+
+                        println!("     -> Binding and starting device stack...");
+                        self.bind_and_start(&devnode);
+                    }
+                    Err(e) => {
+                        println!(
+                            "  -> ERROR: Failed to load boot-start driver binary {}: {:?}",
+                            &pkg.name, e
+                        );
+                    }
                 }
             }
         }
+
         self.init_io_dispatcher();
         Ok(())
     }
@@ -325,62 +396,85 @@ impl PnpManager {
         Ok(())
     }
 
-    pub fn add_child_pdo(
+    pub fn create_child_devnode_and_pdo(
         &self,
-        parent: &Arc<DevNode>,
-        name: &str,
-        instance_path: &str,
+        parent_dev_node: &Arc<DevNode>,
+        bus_driver: &Arc<DriverObject>,
+        name: String,
+        instance_path: String,
         ids: DeviceIds,
         class: Option<String>,
-        pdo_bus_service: Option<&str>,
-    ) -> Arc<DevNode> {
-        let dn = DevNode::new_child(
-            name.to_string(),
-            instance_path.to_string(),
-            ids,
-            class,
-            parent,
-        );
-        if let Some(svc) = pdo_bus_service {
-            if let Some(stk) = dn.stack.write().as_mut() {
-                stk.pdo_bus_service = Some(svc.to_string());
-            }
+    ) -> (Arc<DevNode>, Arc<DeviceObject>) {
+        let dev_node = DevNode::new_child(name, instance_path, ids, class, parent_dev_node);
+        let pdo = DeviceObject::new(0);
+
+        unsafe {
+            let pdo_mut = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
+            pdo_mut.dev_node = Arc::downgrade(&dev_node);
         }
-        dn
+
+        dev_node.set_pdo(pdo.clone());
+
+        (dev_node, pdo)
     }
 
     pub fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         self.bind_device(dn)?;
-        self.start_stack(dn)?;
+        self.start_stack(dn);
         Ok(())
     }
 
     fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
-        let ids_slice: Vec<&str> = dn
-            .ids
-            .hardware
-            .iter()
-            .map(|s| s.as_str())
-            .chain(dn.ids.compatible.iter().map(|s| s.as_str()))
-            .collect();
+        let mut func_pkg: Option<Arc<DriverPackage>> = None;
 
-        let func_pkg = {
+        if let Some(hwid) = dn.ids.hardware.get(0) {
+            if hwid.starts_with("ROOT\\") {
+                if let Some(driver_name) = hwid.split('\\').nth(1) {
+                    if let Some(pkg) = self.hw.read().by_driver.get(driver_name) {
+                        func_pkg = Some(pkg.clone());
+                    }
+                }
+            }
+        }
+
+        if func_pkg.is_none() {
+            let ids_slice: Vec<&str> = dn
+                .ids
+                .hardware
+                .iter()
+                .map(|s| s.as_str())
+                .chain(dn.ids.compatible.iter().map(|s| s.as_str()))
+                .collect();
+
             let hw = self.hw.read();
             if let Some(best) = hw.match_best(&ids_slice) {
-                best.pkg.clone()
-            } else {
-                dn.set_state(DevNodeState::Initialized);
-                return Ok(());
+                func_pkg = Some(best.pkg.clone());
             }
+        }
+
+        let Some(resolved_func_pkg) = func_pkg else {
+            dn.set_state(DevNodeState::Initialized);
+            println!(
+                "   -> NOTE: No function driver found for device '{}'.",
+                dn.name
+            );
+            return Ok(());
         };
 
-        let func_drv = self.ensure_started(&func_pkg)?;
+        let func_drv = self.ensure_loaded(&resolved_func_pkg)?;
 
         let class_name = dn.class.as_deref();
-        let (lower_pkgs, upper_pkgs) =
-            self.resolve_filters(&ids_slice, class_name, &func_pkg.name)?;
+        let (lower_pkgs, upper_pkgs) = self.resolve_filters(
+            &dn.ids
+                .hardware
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>(),
+            class_name,
+            &resolved_func_pkg.name,
+        )?;
         let class_drv = match self.resolve_class_driver(class_name)? {
-            Some(pkg) => Some(self.ensure_started(&pkg)?),
+            Some(pkg) => Some(self.ensure_loaded(&pkg)?),
             None => None,
         };
 
@@ -388,7 +482,7 @@ impl PnpManager {
             .into_iter()
             .map(|pkg| {
                 Ok(StackLayer {
-                    driver: self.ensure_started(&pkg)?,
+                    driver: self.ensure_loaded(&pkg)?,
                     devobj: None,
                 })
             })
@@ -398,7 +492,7 @@ impl PnpManager {
             .into_iter()
             .map(|pkg| {
                 Ok(StackLayer {
-                    driver: self.ensure_started(&pkg)?,
+                    driver: self.ensure_loaded(&pkg)?,
                     devobj: None,
                 })
             })
@@ -426,7 +520,6 @@ impl PnpManager {
         dn.set_state(DevNodeState::DriversBound);
         Ok(())
     }
-
     fn resolve_class_driver(
         &self,
         class_opt: Option<&str>,
@@ -479,10 +572,6 @@ impl PnpManager {
         return Ok(Some(pkg));
     }
 
-    /// Gather lower/upper filter services from registry indices:
-    ///   SYSTEM/CurrentControlSet/Filters/{hwid|class|driver}/<key>/{upper|lower}/<service> with "Order"=u32
-    /// And class filters:
-    ///   SYSTEM/CurrentControlSet/Class/<class>/{UpperFilters|LowerFilters}/(0..n) = "<service>"
     fn resolve_filters(
         &self,
         ids: &[&str],
@@ -663,82 +752,194 @@ impl PnpManager {
         }))
     }
 
-    fn start_stack(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
-        let mut guard = dn.stack.write();
-        let stk = guard.as_mut().expect("stack");
+    fn start_stack(&self, dn: &Arc<DevNode>) {
+        println!("   -> PHASE 1: Building device stack for '{}'", dn.name);
 
-        let mut layers: Vec<*mut StackLayer> = Vec::new();
-        for l in stk.lower.iter_mut() {
-            layers.push(l as *mut _);
-        }
-        if let Some(f) = stk.function.as_mut() {
-            layers.push(f as *mut _);
-        }
-        for u in stk.upper.iter_mut() {
-            layers.push(u as *mut _);
-        }
-        if let Some(c) = stk.class.as_mut() {
-            layers.push(c as *mut _);
-        }
+        let top_of_stack: Option<Arc<DeviceObject>> = {
+            let mut guard = dn.stack.write();
+            let stk = guard
+                .as_mut()
+                .expect("A device stack must exist to be started.");
 
-        let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
+            {
+                let mut layers: Vec<*mut StackLayer> = Vec::new();
+                for l in stk.lower.iter_mut() {
+                    layers.push(l as *mut _);
+                }
+                if let Some(f) = stk.function.as_mut() {
+                    layers.push(f as *mut _);
+                }
+                for u in stk.upper.iter_mut() {
+                    layers.push(u as *mut _);
+                }
+                if let Some(c) = stk.class.as_mut() {
+                    layers.push(c as *mut _);
+                }
 
-        for layer_ptr in layers {
-            let layer = unsafe { &mut *layer_ptr };
-            let drv = &layer.driver;
-            let runtime = &drv.runtime;
-            match runtime.get_state() {
-                DriverState::Started | DriverState::Loaded => {}
-                _ => {
-                    let module = runtime.module.clone();
-                    let m = module.read();
+                let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
 
-                    if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "driver_entry") {
-                        let entry_addr = (m.image_base.as_u64() + *rva as u64) as *const ();
-                        let entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
+                for layer_ptr in layers {
+                    let layer = unsafe { &mut *layer_ptr };
+                    let drv = &layer.driver;
+                    let runtime = &drv.runtime;
 
-                        let status = unsafe { entry(Arc::as_ptr(drv)) };
-                        println!("Driver {} DriverEntry -> {:?}", m.title, status);
+                    if !matches!(
+                        runtime.get_state(),
+                        DriverState::Started | DriverState::Loaded
+                    ) {
+                        let module = runtime.module.clone();
+                        let m = module.read();
 
-                        match status {
-                            DriverStatus::Success | DriverStatus::Pending => {
-                                runtime.set_state(DriverState::Started);
-                            }
-                            _ => {
+                        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "driver_entry")
+                        {
+                            let entry: DriverEntryFn = unsafe {
+                                core::mem::transmute(
+                                    (m.image_base.as_u64() + *rva as u64) as *const (),
+                                )
+                            };
+                            let status = unsafe { entry(Arc::as_ptr(drv)) };
+                            println!("      -> Driver {} DriverEntry -> {:?}", m.title, status);
+
+                            if !matches!(status, DriverStatus::Success | DriverStatus::Pending) {
                                 runtime.set_state(DriverState::Failed);
+                                continue;
                             }
+                            runtime.set_state(DriverState::Loaded);
+                        } else {
+                            println!(
+                                "      -> ERROR: Driver {} missing symbol: driver_entry",
+                                m.title
+                            );
+                            runtime.set_state(DriverState::Failed);
+                            continue;
                         }
-                    } else {
-                        println!("Driver {} missing symbol: driver_entry", m.title);
-                        runtime.set_state(DriverState::Failed);
+                    }
+
+                    if let Some(cb) = drv.evt_device_add {
+                        let mut dev_init = DeviceInit::new();
+                        let status = cb(drv, &mut dev_init);
+
+                        if status == DriverStatus::Success {
+                            dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
+                            let devobj = DeviceObject::new(dev_init.dev_ext_size);
+                            unsafe {
+                                let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
+                                me.dev_init = dev_init;
+                                me.dev_node = Arc::downgrade(dn);
+                            }
+                            DeviceObject::set_lower_upper(&devobj, prev_do.clone());
+                            layer.devobj = Some(devobj.clone());
+                            prev_do = Some(devobj);
+                        } else {
+                            println!(
+                                "      -> NOTE: Driver {} rejected device add: {:?}",
+                                drv.driver_name, status
+                            );
+                        }
                     }
                 }
             }
 
-            if let Some(cb) = drv.evt_device_add {
-                let mut dev_init = DeviceInit::new();
-                let status = cb(drv, &mut dev_init);
-                if status == DriverStatus::Success {
-                    let devobj = DeviceObject::new(dev_init.dev_ext_size);
-                    unsafe {
-                        let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
-                        me.dev_init = dev_init;
-                    }
-                    DeviceObject::set_lower_upper(&devobj, prev_do.clone());
-                    layer.devobj = Some(devobj.clone());
-                    prev_do = Some(devobj);
+            let function_driver_failed = if let Some(func_layer) = &stk.function {
+                if func_layer.devobj.is_none() {
+                    println!(
+                        "   -> CRITICAL: Function driver '{}' failed to attach. Aborting start.",
+                        func_layer.driver.driver_name
+                    );
+                    true
                 } else {
-                    println!("Driver {} rejected device: {:?}", drv.driver_name, status);
+                    false
                 }
             } else {
+                println!("   -> CRITICAL: No function driver was bound. Aborting start.");
+                true
+            };
+
+            if function_driver_failed {
+                stk.lower.clear();
+                stk.upper.clear();
+                stk.class = None;
+                stk.function = None;
+                None
+            } else {
+                stk.lower.retain(|layer| layer.devobj.is_some());
+                stk.upper.retain(|layer| layer.devobj.is_some());
+                if stk.class.as_ref().is_some_and(|l| l.devobj.is_none()) {
+                    stk.class = None;
+                }
+
+                let mut current_bottom = dn.get_pdo();
+                let all_valid_layers = stk
+                    .lower
+                    .iter()
+                    .chain(stk.function.iter())
+                    .chain(stk.upper.iter())
+                    .chain(stk.class.iter());
+
+                for layer in all_valid_layers {
+                    let current_do = layer.devobj.as_ref().unwrap();
+                    DeviceObject::set_lower_upper(current_do, current_bottom.clone());
+                    current_bottom = Some(current_do.clone());
+                }
+
+                current_bottom
             }
+        };
+
+        if let Some(top_device) = top_of_stack {
+            let top_device_name = top_device.dev_node.upgrade().unwrap().name.clone();
+            println!(
+                "   -> PHASE 2: Sending PnP StartDevice request to stack top '{}'",
+                top_device_name
+            );
+
+            let pnp_payload = PnpRequest {
+                minor_function: PnpMinorFunction::StartDevice,
+            };
+            let mut start_request = Request::new(RequestType::Pnp, Box::new([]), None);
+            start_request.pnp = Some(pnp_payload);
+
+            let devnode_ptr_as_context = Arc::as_ptr(dn) as usize;
+            start_request.set_completion(Self::start_io, devnode_ptr_as_context);
+
+            let target = IoTarget {
+                target_device: top_device,
+            };
+            self.send_request(&target, &mut start_request);
+        } else {
+            println!(
+                "   -> FAILURE: Stack startup for '{}' aborted. Setting state to Faulted.",
+                dn.name
+            );
+            dn.set_state(DevNodeState::Faulted);
         }
-
-        dn.set_state(DevNodeState::Started);
-        Ok(())
     }
+    pub fn start_io(req: &mut Request, context: usize) {
+        if context == 0 {
+            return;
+        }
+        let dev_node = unsafe {
+            let temp_arc = Arc::from_raw(context as *const DevNode);
+            let cloned_arc = temp_arc.clone();
+            core::mem::forget(temp_arc);
+            cloned_arc
+        };
 
-    fn ensure_started(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
+        if req.status == DriverStatus::Success {
+            println!(
+                "   -> SUCCESS: PnP StartDevice completed for '{}'. Device is now fully started.",
+                dev_node.name
+            );
+            dev_node.set_state(DevNodeState::Started);
+        } else {
+            println!(
+            "   -> FAILURE: PnP StartDevice failed for '{}' with status {:?}. Device is stopped.",
+            dev_node.name, req.status
+        );
+            dev_node.set_state(DevNodeState::Stopped);
+        }
+    }
+    fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
         if let Some(rt) = self.drivers.read().get(&pkg.name).cloned() {
             if matches!(
                 rt.runtime.get_state(),
@@ -846,14 +1047,12 @@ impl PnpManager {
 
         Ok(idx)
     }
+
     pub fn dispatch_forever(&self) -> ! {
         loop {
             let mut did_work = false;
-
             did_work |= self.run_one_dpc();
-
             did_work |= self.run_one_device_request();
-
             if !did_work {
                 core::hint::spin_loop();
             }
@@ -887,7 +1086,7 @@ impl PnpManager {
 
             let has_more = { !dev.queue.lock().is_empty() };
             if has_more {
-                DISPATCH_DEVQ.lock().push_back(dev.clone());
+                self.schedule_device_dispatch(&dev);
             } else {
                 dev.dispatch_scheduled.store(false, Ordering::Release);
             }
@@ -898,51 +1097,113 @@ impl PnpManager {
             false
         }
     }
+    fn default_pnp_dispatch(device: &Arc<DeviceObject>, request: &mut Request) {
+        let pnp_manager = &*PNP_MANAGER;
 
-    fn call_device_handler(&self, dev: &Arc<DeviceObject>, req: &mut Request) {
-        match req.kind {
-            RequestType::Read(h_req) => {
-                if let Some(h) = dev.dev_init.io_read {
-                    h(dev, req, req.data.len());
-                } else {
-                    h_req(dev, req);
+        let Some(pnp_request) = request.pnp.as_ref() else {
+            pnp_manager.send_request_to_next_lower(device, request);
+            return;
+        };
+
+        match pnp_request.minor_function {
+            PnpMinorFunction::StartDevice => {
+                println!(
+                    "      -> PnP StartDevice request reached driver for: {}",
+                    device.dev_node.upgrade().unwrap().name
+                );
+
+                if let Some(prepare_cb) = device.dev_init.evt_device_prepare_hardware {
+                    let status = prepare_cb(device);
+                    if status != DriverStatus::Success {
+                        println!("      -> ERROR: EvtDevicePrepareHardware failed.");
+                        request.status = status;
+                        pnp_manager.complete_request(request);
+                        return;
+                    }
                 }
-            }
-            RequestType::Write(h_req) => {
-                if let Some(h) = dev.dev_init.io_write {
-                    h(dev, req, req.data.len());
-                } else {
-                    h_req(dev, req);
-                }
-            }
-            RequestType::DeviceControl(h_req) => {
-                if let Some(h) = dev.dev_init.io_device_control {
-                    h(dev, req, req.ioctl_code.unwrap_or(0));
-                } else {
-                    h_req(dev, req);
+
+                let status = pnp_manager.send_request_to_next_lower(device, request);
+
+                if status == DriverStatus::NoSuchDevice {
+                    request.status = DriverStatus::Success;
+                    pnp_manager.complete_request(request);
                 }
             }
         }
     }
-    pub fn send_lower(&self, from: &Arc<DeviceObject>, req: Request) -> DriverStatus {
-        let Some(target) = from.lower_device.clone() else {
-            return DriverStatus::NoSuchDevice;
-        };
-        let req_arc = Arc::new(spin::Mutex::new(req));
-        target.queue.lock().push_back(req_arc);
-        self.schedule_device_dispatch(&target);
+
+    fn call_device_handler(&self, dev: &Arc<DeviceObject>, req: &mut Request) {
+        match req.kind {
+            RequestType::Pnp => {
+                if let Some(h) = dev.dev_init.evt_pnp {
+                    h(dev, req);
+                } else {
+                    self.send_request_to_next_lower(dev, req);
+                }
+            }
+            RequestType::Read(_) => {
+                if let Some(h) = dev.dev_init.io_read {
+                    h(dev, req, req.data.len());
+                }
+            }
+            RequestType::Write(_) => {
+                if let Some(h) = dev.dev_init.io_write {
+                    h(dev, req, req.data.len());
+                }
+            }
+            RequestType::DeviceControl(_) => {
+                if let Some(h) = dev.dev_init.io_device_control {
+                    h(dev, req, req.ioctl_code.unwrap_or(0));
+                }
+            }
+            RequestType::Dummy => {}
+        }
+    }
+    pub fn get_device_target(&self, instance_path: &str) -> Option<IoTarget> {
+        self.dev_root
+            .find_child_by_path(instance_path)
+            .and_then(|dn| {
+                dn.stack
+                    .read()
+                    .as_ref()
+                    .and_then(|s| s.get_top_device_object())
+            })
+            .map(|dev_obj| IoTarget {
+                target_device: dev_obj,
+            })
+    }
+
+    pub fn send_request(&self, target: &IoTarget, req: &mut Request) -> DriverStatus {
+        let req_arc = Arc::new(spin::Mutex::new(core::mem::replace(req, Request::empty())));
+        target.target_device.queue.lock().push_back(req_arc);
+        self.schedule_device_dispatch(&target.target_device);
         DriverStatus::Pending
     }
 
-    pub fn send_upper(&self, from: &Arc<DeviceObject>, req: Request) -> DriverStatus {
-        let Some(target) = from.upper_device.read().as_ref().and_then(|w| w.upgrade()) else {
-            return DriverStatus::NoSuchDevice;
-        };
-        let req_arc = Arc::new(spin::Mutex::new(req));
-        target.queue.lock().push_back(req_arc);
-        self.schedule_device_dispatch(&target);
-        DriverStatus::Pending
+    pub fn send_request_to_next_lower(
+        &self,
+        from: &Arc<DeviceObject>,
+        req: &mut Request,
+    ) -> DriverStatus {
+        if let Some(target_dev) = from.lower_device.clone() {
+            let target = IoTarget {
+                target_device: target_dev,
+            };
+            self.send_request(&target, req)
+        } else {
+            DriverStatus::NoSuchDevice
+        }
     }
+
+    pub fn complete_request(&self, req: &mut Request) {
+        if let Some(completion) = req.completion_routine.take() {
+            completion(req, req.completion_context);
+        } else {
+            //TODO: handle this correctly
+            // Drop for now
+        }
+    }
+
     #[inline]
     fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
         if !dev.dispatch_scheduled.swap(true, Ordering::AcqRel) {

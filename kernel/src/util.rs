@@ -157,7 +157,6 @@ pub fn kernel_main() {
         setup_file_layout().expect("Failed to create system volume layout");
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
-    reg::print_tree();
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");

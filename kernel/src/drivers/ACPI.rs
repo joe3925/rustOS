@@ -5,6 +5,7 @@ use acpi;
 use acpi::platform::interrupt::Apic;
 use acpi::{AcpiHandler, AcpiTables, InterruptModel, PhysicalMapping, PlatformInfo};
 use alloc::alloc::Global;
+use alloc::sync::Arc;
 use core::ptr::NonNull;
 use lazy_static::lazy_static;
 use x86_64::{PhysAddr, VirtAddr};
@@ -29,7 +30,7 @@ pub struct Xsdp {
 unsafe impl Send for ACPI {}
 unsafe impl Sync for ACPI {}
 pub struct ACPI {
-    tables: AcpiTables<ACPIImpl>,
+    tables: Arc<AcpiTables<ACPIImpl>>,
 }
 impl ACPI {
     pub fn new() -> Self {
@@ -44,8 +45,8 @@ impl ACPI {
             )
             .expect("failed to parse ACPI")
         };
-
-        ACPI { tables }
+        let arc_tab = Arc::new(tables);
+        ACPI { tables: arc_tab }
     }
     pub fn get_interrupt_model(&self) -> Option<Apic<Global>> {
         let platform_info = self.tables.platform_info().ok()?;
@@ -56,6 +57,9 @@ impl ACPI {
     }
     pub fn get_plat_info(&self) -> Option<PlatformInfo<Global>> {
         self.tables.platform_info().ok()
+    }
+    pub fn get_tables(&self) -> Arc<AcpiTables<ACPIImpl>> {
+        self.tables.clone()
     }
 }
 unsafe impl Send for ACPIImpl {}

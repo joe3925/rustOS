@@ -3,7 +3,7 @@
 /* -------------------------------------------------------------------------- */
 
 use crate::{alloc::vec, util::random_number};
-use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::Arc};
+use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::Arc, sync::Weak};
 use core::{
     mem,
     sync::atomic::{AtomicBool, AtomicU32},
@@ -11,7 +11,7 @@ use core::{
 use spin::{Mutex, RwLock};
 use strum::Display;
 
-use super::pnp_manager::DriverRuntime;
+use super::pnp_manager::{CompletionRoutine, DevNode, DriverRuntime};
 
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,7 @@ pub struct DeviceObject {
     pub queue: Mutex<VecDeque<Arc<spin::Mutex<Request>>>>,
 
     pub dispatch_scheduled: AtomicBool,
+    pub dev_node: Weak<DevNode>,
 }
 
 impl DeviceObject {
@@ -49,6 +50,7 @@ impl DeviceObject {
             dev_init: DeviceInit::new(),
             queue: Mutex::new(VecDeque::new()),
             dispatch_scheduled: AtomicBool::new(false),
+            dev_node: Weak::new(),
         })
     }
 
@@ -89,7 +91,6 @@ impl DeviceObject {
         }
     }
 
-    /// Dev_ext casts
     #[inline]
     pub fn devext_mut<T>(&mut self) -> &mut T {
         assert!(self.dev_ext.len() >= mem::size_of::<T>());
@@ -106,16 +107,33 @@ fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {
     unsafe { Arc::from_raw(Arc::as_ptr(&Arc::new_uninit().assume_init())) }
 }
 pub type EvtDriverDeviceAdd = fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
+
 pub type EvtDriverUnload = fn(driver: &Arc<DriverObject>);
 
 pub type EvtIoRead = fn(&Arc<DeviceObject>, &mut Request, usize);
 pub type EvtIoWrite = fn(&Arc<DeviceObject>, &mut Request, usize);
 pub type EvtIoDeviceControl = fn(&Arc<DeviceObject>, &mut Request, u32);
+pub type EvtDevicePrepareHardware = fn(&Arc<DeviceObject>) -> DriverStatus;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PnpMinorFunction {
+    StartDevice,
+}
+
+#[derive(Debug, Clone)]
+pub struct PnpRequest {
+    pub minor_function: PnpMinorFunction,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum RequestType {
     Read(fn(&Arc<DeviceObject>, &mut Request)),
     Write(fn(&Arc<DeviceObject>, &mut Request)),
     DeviceControl(fn(&Arc<DeviceObject>, &mut Request)),
+
+    Pnp,
+
+    Dummy,
 }
 
 #[derive(Debug)]
@@ -126,6 +144,11 @@ pub struct Request {
     pub ioctl_code: Option<u32>,
     pub completed: bool,
     pub status: DriverStatus,
+
+    pub pnp: Option<PnpRequest>,
+
+    pub completion_routine: Option<CompletionRoutine>,
+    pub completion_context: usize,
 }
 
 impl Request {
@@ -138,16 +161,43 @@ impl Request {
             ioctl_code,
             completed: false,
             status: DriverStatus::Pending,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
         }
+    }
+    #[inline]
+    pub fn empty() -> Self {
+        let dummy_kind = RequestType::Dummy;
+
+        Self {
+            id: 0,
+            kind: dummy_kind,
+            data: Box::new([]),
+            ioctl_code: None,
+            completed: true,
+            status: DriverStatus::Success,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+        }
+    }
+    pub fn set_completion(&mut self, routine: CompletionRoutine, context: usize) {
+        self.completion_routine = Some(routine);
+        self.completion_context = context;
     }
 }
 //TODO: do something better
 #[derive(Debug)]
 pub struct DeviceInit {
     pub dev_ext_size: usize,
+
     pub io_read: Option<EvtIoRead>,
     pub io_write: Option<EvtIoWrite>,
     pub io_device_control: Option<EvtIoDeviceControl>,
+
+    pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
+    pub evt_pnp: Option<fn(&Arc<DeviceObject>, &mut Request)>,
 }
 
 impl DeviceInit {
@@ -157,6 +207,8 @@ impl DeviceInit {
             io_read: None,
             io_write: None,
             io_device_control: None,
+            evt_pnp: None,
+            evt_device_prepare_hardware: None,
         }
     }
 }

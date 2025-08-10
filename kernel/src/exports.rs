@@ -18,12 +18,16 @@ use alloc::vec::Vec;
 export! {
     function,
     create_kernel_task,
+    kill_kernel_task_by_id,
+
     allocate_auto_kernel_range_mapped,
     allocate_kernel_range_mapped,
     deallocate_kernel_range,
     unmap_range,
     identity_map_page,
     map_mmio_region,
+    virt_to_phys,
+
     kernel_alloc,
     kernel_free,
 
@@ -34,5 +38,11 @@ export! {
     file_read,
     file_write,
     file_delete,
-    virt_to_phys,
+
+    pnp_create_pdo,
+    pnp_bind_and_start,
+    pnp_forward_request_to_next_lower,
+    pnp_get_device_target,
+    pnp_complete_request,
+    pnp_queue_dpc,
 }

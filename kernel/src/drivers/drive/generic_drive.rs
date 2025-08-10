@@ -1,6 +1,6 @@
 use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
 use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry};
-use crate::drivers::drive::ide_disk_driver::{has_ide_controller, IdeController};
+use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 // Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
@@ -135,9 +135,7 @@ impl DriveCollection {
     }
     pub(crate) fn enumerate_drives(&mut self) {
         let mut drives = Vec::new();
-        if (has_ide_controller()) {
-            drives.extend(<IdeController as DriveController>::enumerate_drives());
-        }
+        drives.extend(<IdeController as DriveController>::enumerate_drives());
         //drives.extend(<AHCIController as DriveController>::enumerate_drives());
         for mut drive in drives {
             if (drive.index == -1) {
