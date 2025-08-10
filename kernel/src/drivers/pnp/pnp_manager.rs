@@ -1,3 +1,4 @@
+use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Weak;
 use alloc::{
     collections::btree_map::BTreeMap,
@@ -5,7 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use spin::{Mutex, RwLock};
 
 use crate::drivers::driver_install;
@@ -15,9 +16,28 @@ use crate::file_system::file::{File, FileStatus, OpenFlags};
 use crate::println;
 use crate::registry::reg;
 use crate::registry::{self as regmod, Data, RegError};
+use crate::static_handlers::create_kernel_task;
 use lazy_static::lazy_static;
 
-type DriverEntryFn = unsafe extern "C" fn() -> u64;
+use super::driver_object::{
+    DeviceInit, DeviceObject, DriverObject, DriverStatus, Request, RequestType,
+};
+pub type DpcFn = fn(usize);
+#[derive(Clone, Copy)]
+pub struct Dpc {
+    pub func: DpcFn,
+    pub arg: usize,
+}
+
+lazy_static! {
+    static ref DISPATCH_DEVQ: spin::Mutex<VecDeque<Arc<DeviceObject>>> =
+        spin::Mutex::new(VecDeque::new());
+    static ref GLOBAL_DPCQ: spin::Mutex<VecDeque<Dpc>> = spin::Mutex::new(VecDeque::new());
+}
+
+static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
+
+type DriverEntryFn = unsafe extern "C" fn() -> DriverStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
@@ -139,24 +159,32 @@ pub enum DevNodeState {
     SurpriseRemoved,
     Deleted,
 }
+#[derive(Debug, Clone)]
+pub struct StackLayer {
+    /// The loaded driver object for this layer (contains callbacks and per-driver config)
+    pub driver: Arc<DriverObject>,
+
+    /// The device object this driver created for this specific stack layer
+    pub devobj: Option<Arc<DeviceObject>>,
+}
 
 #[derive(Debug)]
 pub struct DeviceStack {
-    /// Service name (driver name) of the bus that created the PDO (optional, for diagnostics).
     pub pdo_bus_service: Option<String>,
 
-    /// Lower filters (nearest to PDO first, topologically they sit below the function driver).
-    pub lower: Vec<Arc<DriverRuntime>>,
+    /// Lower filters (nearest to PDO first)
+    pub lower: Vec<StackLayer>,
 
-    /// Function driver bound to this device (FDO owner).
-    pub function: Option<Arc<DriverRuntime>>,
+    /// Function driver for the PDO
+    pub function: Option<StackLayer>,
 
-    /// Upper filters (above the function driver; order is bottom-to-top).
-    pub upper: Vec<Arc<DriverRuntime>>,
+    /// Upper filters (above the function driver)
+    pub upper: Vec<StackLayer>,
 
-    /// Optional class driver (logically an upper filter specialized for the device class).
-    pub class: Option<Arc<DriverRuntime>>,
+    /// Optional class driver (treated like an upper filter)
+    pub class: Option<StackLayer>,
 }
+
 impl DeviceStack {
     fn new() -> Self {
         Self {
@@ -167,43 +195,37 @@ impl DeviceStack {
             class: None,
         }
     }
-    pub fn all_layers_bottom_to_top(&self) -> Vec<Arc<DriverRuntime>> {
+
+    pub fn all_layers_bottom_to_top(&self) -> Vec<Arc<DriverObject>> {
         let mut out = Vec::new();
-        out.extend(self.lower.iter().cloned());
+        out.extend(self.lower.iter().map(|l| l.driver.clone()));
         if let Some(f) = &self.function {
-            out.push(f.clone());
+            out.push(f.driver.clone());
         }
-        out.extend(self.upper.iter().cloned());
+        out.extend(self.upper.iter().map(|l| l.driver.clone()));
         if let Some(c) = &self.class {
-            out.push(c.clone());
+            out.push(c.driver.clone());
         }
         out
     }
 }
-
 #[derive(Debug)]
 pub struct DevNode {
-    /// Human readable name or address under its parent (e.g., "PCI0", "0000:00:1F.2", "HID\VID_...").
     pub name: String,
-
     pub parent: RwLock<Option<alloc::sync::Weak<DevNode>>>,
     pub children: RwLock<Vec<Arc<DevNode>>>,
-
-    /// PnP instance path like `ROOT\XYZ\0001` (unique per device).
     pub instance_path: String,
-
-    /// IDs used for binding.
     pub ids: DeviceIds,
-
-    /// Optional device class (e.g., "Mouse", "Keyboard", "Disk", custom).
     pub class: Option<String>,
-
-    /// Current state.
     pub state: AtomicU8, // DevNodeState as u8
+
+    /// PDO device object for this devnode (owned by the enumerating bus).
+    pub pdo: RwLock<Option<Arc<DeviceObject>>>,
 
     /// Bound driver stack (PDO/filters/function/class). None until bound.
     pub stack: RwLock<Option<DeviceStack>>,
 }
+
 impl DevNode {
     pub fn new_root() -> Arc<Self> {
         Arc::new(Self {
@@ -217,9 +239,11 @@ impl DevNode {
             },
             class: None,
             state: AtomicU8::new(DevNodeState::Initialized as u8),
+            pdo: RwLock::new(None), // <-- add
             stack: RwLock::new(Some(DeviceStack::new())),
         })
     }
+
     pub fn new_child(
         name: String,
         instance_path: String,
@@ -235,11 +259,23 @@ impl DevNode {
             ids,
             class,
             state: AtomicU8::new(DevNodeState::Initialized as u8),
+            pdo: RwLock::new(None), // <-- add
             stack: RwLock::new(Some(DeviceStack::new())),
         });
         parent.children.write().push(dn.clone());
         dn
     }
+
+    #[inline]
+    pub fn set_pdo(&self, pdo: Arc<DeviceObject>) {
+        *self.pdo.write() = Some(pdo);
+    }
+
+    #[inline]
+    pub fn get_pdo(&self) -> Option<Arc<DeviceObject>> {
+        self.pdo.read().clone()
+    }
+
     fn set_state(&self, s: DevNodeState) {
         self.state.store(s as u8, Ordering::Release);
     }
@@ -250,7 +286,7 @@ impl DevNode {
 
 pub struct PnpManager {
     hw: RwLock<Arc<HwIndex>>,
-    drivers: RwLock<BTreeMap<String, Arc<DriverRuntime>>>,
+    drivers: RwLock<BTreeMap<String, Arc<DriverObject>>>,
     dev_root: Arc<DevNode>,
 }
 
@@ -279,6 +315,7 @@ impl PnpManager {
                 }
             }
         }
+        self.init_io_dispatcher();
         Ok(())
     }
 
@@ -327,6 +364,7 @@ impl PnpManager {
             .chain(dn.ids.compatible.iter().map(|s| s.as_str()))
             .collect();
 
+        // 1. Match and load function driver
         let func_pkg = {
             let hw = self.hw.read();
             if let Some(best) = hw.match_best(&ids_slice) {
@@ -337,20 +375,54 @@ impl PnpManager {
             }
         };
 
-        let func_rt = self.ensure_started(&func_pkg)?;
+        let func_drv = self.ensure_started(&func_pkg)?;
 
         let class_name = dn.class.as_deref();
-        let (lower_list, upper_list) =
+        let (lower_pkgs, upper_pkgs) =
             self.resolve_filters(&ids_slice, class_name, &func_pkg.name)?;
-        let class_rt = self.resolve_class_driver(class_name)?;
+        let class_drv = match self.resolve_class_driver(class_name)? {
+            Some(pkg) => Some(self.ensure_started(&pkg)?),
+            None => None,
+        };
 
+        let lower_layers: Vec<StackLayer> = lower_pkgs
+            .into_iter()
+            .map(|pkg| {
+                Ok(StackLayer {
+                    driver: self.ensure_started(&pkg)?,
+                    devobj: None,
+                })
+            })
+            .collect::<Result<_, DriverError>>()?;
+
+        let upper_layers: Vec<StackLayer> = upper_pkgs
+            .into_iter()
+            .map(|pkg| {
+                Ok(StackLayer {
+                    driver: self.ensure_started(&pkg)?,
+                    devobj: None,
+                })
+            })
+            .collect::<Result<_, DriverError>>()?;
+
+        let function_layer = StackLayer {
+            driver: func_drv,
+            devobj: None,
+        };
+
+        let class_layer = class_drv.map(|drv| StackLayer {
+            driver: drv,
+            devobj: None,
+        });
+
+        // 4. Commit to device stack
         {
             let mut guard = dn.stack.write();
             let stk = guard.as_mut().expect("Device stack must exist");
-            stk.function = Some(func_rt);
-            stk.lower = lower_list;
-            stk.upper = upper_list;
-            stk.class = class_rt;
+            stk.function = Some(function_layer);
+            stk.lower = lower_layers;
+            stk.upper = upper_layers;
+            stk.class = class_layer;
         }
 
         dn.set_state(DevNodeState::DriversBound);
@@ -360,7 +432,7 @@ impl PnpManager {
     fn resolve_class_driver(
         &self,
         class_opt: Option<&str>,
-    ) -> Result<Option<Arc<DriverRuntime>>, DriverError> {
+    ) -> Result<Option<Arc<DriverPackage>>, DriverError> {
         let Some(class) = class_opt else {
             return Ok(None);
         };
@@ -374,7 +446,7 @@ impl PnpManager {
 
         // Find package by driver/service name via index or Services node
         if let Some(pkg) = self.hw.read().by_driver.get(&svc) {
-            return self.ensure_started(pkg).map(Some);
+            return Ok(Some(pkg.clone()));
         }
 
         // Fallback: look under Services/<svc>
@@ -406,7 +478,7 @@ impl PnpManager {
             hwids: Vec::new(),
         });
 
-        self.ensure_started(&pkg).map(Some)
+        return Ok(Some(pkg));
     }
 
     /// Gather lower/upper filter services from registry indices:
@@ -418,7 +490,7 @@ impl PnpManager {
         ids: &[&str],
         class_opt: Option<&str>,
         function_service: &str,
-    ) -> Result<(Vec<Arc<DriverRuntime>>, Vec<Arc<DriverRuntime>>), DriverError> {
+    ) -> Result<(Vec<Arc<DriverPackage>>, Vec<Arc<DriverPackage>>), DriverError> {
         #[derive(Clone)]
         struct Item {
             order: u32,
@@ -547,19 +619,13 @@ impl PnpManager {
 
         let mut lower_rts = Vec::new();
         for svc in lower_svcs {
-            if let Some(rt) = self
-                .pkg_by_service(&svc)
-                .and_then(|p| self.ensure_started(&p).ok())
-            {
+            if let Some(rt) = self.pkg_by_service(&svc) {
                 lower_rts.push(rt);
             }
         }
         let mut upper_rts = Vec::new();
         for svc in upper_svcs {
-            if let Some(rt) = self
-                .pkg_by_service(&svc)
-                .and_then(|p| self.ensure_started(&p).ok())
-            {
+            if let Some(rt) = self.pkg_by_service(&svc) {
                 upper_rts.push(rt);
             }
         }
@@ -600,17 +666,34 @@ impl PnpManager {
     }
 
     fn start_stack(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
-        let layers = {
-            let guard = dn.stack.read();
-            let stk = guard.as_ref().expect("stack");
-            stk.all_layers_bottom_to_top()
-        };
+        let mut guard = dn.stack.write();
+        let stk = guard.as_mut().expect("stack");
 
-        for rt in layers {
-            match rt.get_state() {
+        let mut layers: Vec<*mut StackLayer> = Vec::new();
+        for l in stk.lower.iter_mut() {
+            layers.push(l as *mut _);
+        }
+        if let Some(f) = stk.function.as_mut() {
+            layers.push(f as *mut _);
+        }
+        for u in stk.upper.iter_mut() {
+            layers.push(u as *mut _);
+        }
+        if let Some(c) = stk.class.as_mut() {
+            layers.push(c as *mut _);
+        }
+
+        let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
+
+        for layer_ptr in layers {
+            let layer = unsafe { &mut *layer_ptr };
+            let drv = &layer.driver;
+            let runtime = &drv.runtime;
+
+            match runtime.get_state() {
                 DriverState::Started | DriverState::Loaded => {}
                 _ => {
-                    let module = rt.module.clone();
+                    let module = runtime.module.clone();
                     if let Some((_, rva)) = module
                         .read()
                         .symbols
@@ -627,8 +710,26 @@ impl PnpManager {
                             status
                         );
                     }
-                    rt.set_state(DriverState::Started);
+                    runtime.set_state(DriverState::Started);
                 }
+            }
+
+            if let Some(cb) = drv.evt_device_add {
+                let mut dev_init = DeviceInit::new();
+                let status = cb(drv, &mut dev_init);
+                if status == DriverStatus::Success {
+                    let devobj = DeviceObject::new(dev_init.dev_ext_size);
+                    unsafe {
+                        let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
+                        me.dev_init = dev_init;
+                    }
+                    DeviceObject::set_lower_upper(&devobj, prev_do.clone());
+                    layer.devobj = Some(devobj.clone());
+                    prev_do = Some(devobj);
+                } else {
+                    println!("Driver {} rejected device: {:?}", drv.driver_name, status);
+                }
+            } else {
             }
         }
 
@@ -636,9 +737,12 @@ impl PnpManager {
         Ok(())
     }
 
-    fn ensure_started(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverRuntime>, DriverError> {
+    fn ensure_started(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
         if let Some(rt) = self.drivers.read().get(&pkg.name).cloned() {
-            if matches!(rt.get_state(), DriverState::Started | DriverState::Loaded) {
+            if matches!(
+                rt.runtime.get_state(),
+                DriverState::Started | DriverState::Loaded
+            ) {
                 return Ok(rt);
             }
         }
@@ -658,8 +762,11 @@ impl PnpManager {
             state: AtomicU8::new(DriverState::Loaded as u8),
             refcnt: AtomicU32::new(0),
         });
-        self.drivers.write().insert(pkg.name.clone(), rt.clone());
-        Ok(rt)
+        let drv_obj = DriverObject::allocate(rt, pkg.name.clone());
+        self.drivers
+            .write()
+            .insert(pkg.name.clone(), drv_obj.clone());
+        Ok(drv_obj)
     }
 
     fn build_hw_index() -> Result<HwIndex, RegError> {
@@ -738,6 +845,121 @@ impl PnpManager {
 
         Ok(idx)
     }
+    pub fn dispatch_forever(&self) -> ! {
+        loop {
+            let mut did_work = false;
+
+            // 1) Run one global DPC if any
+            did_work |= self.run_one_dpc();
+
+            // 2) Run one request from one device (round-robin)
+            did_work |= self.run_one_device_request();
+
+            if !did_work {
+                // Idle hint — replace with arch-specific pause/yield if available.
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    #[inline]
+    fn run_one_dpc(&self) -> bool {
+        let dpc_opt = GLOBAL_DPCQ.lock().pop_front();
+        if let Some(dpc) = dpc_opt {
+            (dpc.func)(dpc.arg);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    fn run_one_device_request(&self) -> bool {
+        let dev_opt = DISPATCH_DEVQ.lock().pop_front();
+        let Some(dev) = dev_opt else {
+            return false;
+        };
+
+        let req_arc_opt = { dev.queue.lock().pop_front() };
+        if let Some(req_arc) = req_arc_opt {
+            {
+                let mut req = req_arc.lock();
+                self.call_device_handler(&dev, &mut *req);
+            }
+
+            let has_more = { !dev.queue.lock().is_empty() };
+            if has_more {
+                DISPATCH_DEVQ.lock().push_back(dev.clone());
+            } else {
+                dev.dispatch_scheduled.store(false, Ordering::Release);
+            }
+
+            true
+        } else {
+            dev.dispatch_scheduled.store(false, Ordering::Release);
+            false
+        }
+    }
+
+    fn call_device_handler(&self, dev: &Arc<DeviceObject>, req: &mut Request) {
+        match req.kind {
+            RequestType::Read(h_req) => {
+                if let Some(h) = dev.dev_init.io_read {
+                    h(dev, req, req.data.len());
+                } else {
+                    h_req(dev, req);
+                }
+            }
+            RequestType::Write(h_req) => {
+                if let Some(h) = dev.dev_init.io_write {
+                    h(dev, req, req.data.len());
+                } else {
+                    h_req(dev, req);
+                }
+            }
+            RequestType::DeviceControl(h_req) => {
+                if let Some(h) = dev.dev_init.io_device_control {
+                    h(dev, req, req.ioctl_code.unwrap_or(0));
+                } else {
+                    h_req(dev, req);
+                }
+            }
+        }
+    }
+    pub fn send_lower(&self, from: &Arc<DeviceObject>, req: Request) -> DriverStatus {
+        let Some(target) = from.lower_device.clone() else {
+            return DriverStatus::NoSuchDevice;
+        };
+        let req_arc = Arc::new(spin::Mutex::new(req));
+        target.queue.lock().push_back(req_arc);
+        self.schedule_device_dispatch(&target);
+        DriverStatus::Pending
+    }
+
+    pub fn send_upper(&self, from: &Arc<DeviceObject>, req: Request) -> DriverStatus {
+        let Some(target) = from.upper_device.read().as_ref().and_then(|w| w.upgrade()) else {
+            return DriverStatus::NoSuchDevice;
+        };
+        let req_arc = Arc::new(spin::Mutex::new(req));
+        target.queue.lock().push_back(req_arc);
+        self.schedule_device_dispatch(&target);
+        DriverStatus::Pending
+    }
+    #[inline]
+    fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
+        if !dev.dispatch_scheduled.swap(true, Ordering::AcqRel) {
+            DISPATCH_DEVQ.lock().push_back(dev.clone());
+        }
+    }
+
+    pub fn queue_dpc(&self, func: DpcFn, arg: usize) {
+        GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });
+    }
+    pub fn init_io_dispatcher(&self) {
+        if !DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
+            create_kernel_task(io_dispatcher_trampoline as usize, "io-dispatch".to_string());
+        }
+    }
 }
 
 fn classify_id(id: &str) -> MatchClass {
@@ -760,6 +982,10 @@ fn escape_key(s: &str) -> alloc::string::String {
         });
     }
     out
+}
+
+extern "C" fn io_dispatcher_trampoline() {
+    PNP_MANAGER.dispatch_forever();
 }
 
 lazy_static! {
