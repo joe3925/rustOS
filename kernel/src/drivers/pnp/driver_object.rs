@@ -40,7 +40,6 @@ pub struct DeviceObject {
 }
 
 impl DeviceObject {
-    /// Create a new device object with a devext of `dev_ext_size` bytes
     pub fn new(dev_ext_size: usize) -> Arc<Self> {
         let dev_ext = vec![0u8; dev_ext_size].into_boxed_slice();
         Arc::new(Self {
@@ -53,27 +52,21 @@ impl DeviceObject {
         })
     }
 
-    /// Wire this DO above `lower` (sets both directions; upper link is Weak to avoid cycles)
     pub fn set_lower_upper(this: &Arc<Self>, lower: Option<Arc<DeviceObject>>) {
-        // set downward on `this`
         {
-            // SAFETY: we own an Arc to `this`; mut borrow of its fields is okay via unique ptr cast
             let me = unsafe { &mut *(Arc::as_ptr(this) as *mut DeviceObject) };
             me.lower_device = lower.clone();
         }
-        // set upward on the lower
         if let Some(low) = lower {
             *low.upper_device.write() = Some(Arc::downgrade(this));
         }
     }
 
-    /// Get the immediate upper DO (if any)
     #[inline]
     pub fn upper(&self) -> Option<Arc<DeviceObject>> {
         self.upper_device.read().as_ref().and_then(|w| w.upgrade())
     }
 
-    /// Walk to the bottom-most DO starting from `start`
     #[inline]
     pub fn bottom_from(start: &Arc<DeviceObject>) -> Arc<DeviceObject> {
         let mut cur = start.clone();
@@ -83,7 +76,6 @@ impl DeviceObject {
         cur
     }
 
-    /// Walk to the top-most DO starting from `start`
     #[inline]
     pub fn top_from(start: &Arc<DeviceObject>) -> Arc<DeviceObject> {
         let mut cur = start.clone();
@@ -97,7 +89,7 @@ impl DeviceObject {
         }
     }
 
-    /// Devext casts
+    /// Dev_ext casts
     #[inline]
     pub fn devext_mut<T>(&mut self) -> &mut T {
         assert!(self.dev_ext.len() >= mem::size_of::<T>());
@@ -176,7 +168,6 @@ pub struct DriverObject {
     pub driver_name: String,
     pub flags: u32,
 
-    /* Framework callbacks */
     pub evt_device_add: Option<EvtDriverDeviceAdd>,
     pub evt_driver_unload: Option<EvtDriverUnload>,
 }
@@ -209,7 +200,7 @@ impl DriverObject {
 }
 
 pub struct DriverConfig {
-    driver: *const DriverObject, // opaque pointer to framework-owned object
+    driver: *const DriverObject,
 }
 
 impl DriverConfig {

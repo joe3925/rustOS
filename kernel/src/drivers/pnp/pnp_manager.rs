@@ -259,7 +259,7 @@ impl DevNode {
             ids,
             class,
             state: AtomicU8::new(DevNodeState::Initialized as u8),
-            pdo: RwLock::new(None), // <-- add
+            pdo: RwLock::new(None),
             stack: RwLock::new(Some(DeviceStack::new())),
         });
         parent.children.write().push(dn.clone());
@@ -364,7 +364,6 @@ impl PnpManager {
             .chain(dn.ids.compatible.iter().map(|s| s.as_str()))
             .collect();
 
-        // 1. Match and load function driver
         let func_pkg = {
             let hw = self.hw.read();
             if let Some(best) = hw.match_best(&ids_slice) {
@@ -415,7 +414,6 @@ impl PnpManager {
             devobj: None,
         });
 
-        // 4. Commit to device stack
         {
             let mut guard = dn.stack.write();
             let stk = guard.as_mut().expect("Device stack must exist");
@@ -852,14 +850,11 @@ impl PnpManager {
         loop {
             let mut did_work = false;
 
-            // 1) Run one global DPC if any
             did_work |= self.run_one_dpc();
 
-            // 2) Run one request from one device (round-robin)
             did_work |= self.run_one_device_request();
 
             if !did_work {
-                // Idle hint — replace with arch-specific pause/yield if available.
                 core::hint::spin_loop();
             }
         }
