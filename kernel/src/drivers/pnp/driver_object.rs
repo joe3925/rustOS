@@ -194,30 +194,35 @@ impl DriverObject {
 
     pub fn configure<F: FnOnce(&mut DriverConfig)>(this: &Arc<Self>, f: F) {
         let mut cfg = DriverConfig {
-            driver: this.clone(),
+            driver: Arc::as_ptr(this),
         };
+        f(&mut cfg);
+    }
+
+    pub unsafe fn configure_raw<F: FnOnce(&mut DriverConfig)>(
+        driver_ptr: *const DriverObject,
+        f: F,
+    ) {
+        let mut cfg = DriverConfig { driver: driver_ptr };
         f(&mut cfg);
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* DriverConfig - fluent API to set callbacks                                 */
-/* -------------------------------------------------------------------------- */
-
 pub struct DriverConfig {
-    driver: Arc<DriverObject>,
+    driver: *const DriverObject, // opaque pointer to framework-owned object
 }
 
 impl DriverConfig {
-    pub fn on_device_add(mut self, cb: EvtDriverDeviceAdd) -> Self {
-        let me = unsafe { &mut *(Arc::as_ptr(&self.driver) as *mut DriverObject) };
-        me.evt_device_add = Some(cb);
+    pub fn on_device_add(&mut self, cb: EvtDriverDeviceAdd) -> &mut Self {
+        unsafe {
+            (*(self.driver as *mut DriverObject)).evt_device_add = Some(cb);
+        }
         self
     }
-
-    pub fn on_unload(mut self, cb: EvtDriverUnload) -> Self {
-        let me = unsafe { &mut *(Arc::as_ptr(&self.driver) as *mut DriverObject) };
-        me.evt_driver_unload = Some(cb);
+    pub fn on_unload(&mut self, cb: EvtDriverUnload) -> &mut Self {
+        unsafe {
+            (*(self.driver as *mut DriverObject)).evt_driver_unload = Some(cb);
+        }
         self
     }
 }

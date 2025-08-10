@@ -37,7 +37,7 @@ lazy_static! {
 
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 
-type DriverEntryFn = unsafe extern "C" fn() -> DriverStatus;
+pub type DriverEntryFn = unsafe extern "C" fn(driver: *const DriverObject) -> DriverStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
@@ -689,28 +689,31 @@ impl PnpManager {
             let layer = unsafe { &mut *layer_ptr };
             let drv = &layer.driver;
             let runtime = &drv.runtime;
-
             match runtime.get_state() {
                 DriverState::Started | DriverState::Loaded => {}
                 _ => {
                     let module = runtime.module.clone();
-                    if let Some((_, rva)) = module
-                        .read()
-                        .symbols
-                        .iter()
-                        .find(|(s, _)| s == "driver_entry")
-                    {
-                        let entry_addr =
-                            (module.read().image_base.as_u64() + *rva as u64) as *const ();
+                    let m = module.read();
+
+                    if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "driver_entry") {
+                        let entry_addr = (m.image_base.as_u64() + *rva as u64) as *const ();
                         let entry: DriverEntryFn = unsafe { core::mem::transmute(entry_addr) };
-                        let status = unsafe { entry() };
-                        println!(
-                            "Driver {} exited with status {}",
-                            module.read().title,
-                            status
-                        );
+
+                        let status = unsafe { entry(Arc::as_ptr(drv)) };
+                        println!("Driver {} DriverEntry -> {:?}", m.title, status);
+
+                        match status {
+                            DriverStatus::Success | DriverStatus::Pending => {
+                                runtime.set_state(DriverState::Started);
+                            }
+                            _ => {
+                                runtime.set_state(DriverState::Failed);
+                            }
+                        }
+                    } else {
+                        println!("Driver {} missing symbol: driver_entry", m.title);
+                        runtime.set_state(DriverState::Failed);
                     }
-                    runtime.set_state(DriverState::Started);
                 }
             }
 
