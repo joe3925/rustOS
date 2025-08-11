@@ -7,6 +7,7 @@ autotests = false
 
 [lib]
 name = "BASE"
+path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
 
@@ -14,12 +15,13 @@ test = false
 panic = "abort"
 codegen-units = 1
 lto = true
-strip = true
 opt-level = "z"
 
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
-strip = true
 opt-level = "z"
+
+[dependencies]
+kernel_api = { path = "../../kernel_api" }

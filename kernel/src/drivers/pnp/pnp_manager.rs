@@ -48,11 +48,12 @@ lazy_static! {
 
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 
-pub type DriverEntryFn = unsafe extern "C" fn(driver: *const DriverObject) -> DriverStatus;
+pub type DriverEntryFn = unsafe extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
     Loaded,
+    Pending,
     Started,
     Stopped,
     Failed,
@@ -785,29 +786,27 @@ impl PnpManager {
 
                     if !matches!(
                         runtime.get_state(),
-                        DriverState::Started | DriverState::Loaded
+                        DriverState::Started | DriverState::Pending
                     ) {
                         let module = runtime.module.clone();
                         let m = module.read();
-
-                        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "driver_entry")
-                        {
+                        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
                             let entry: DriverEntryFn = unsafe {
                                 core::mem::transmute(
                                     (m.image_base.as_u64() + *rva as u64) as *const (),
                                 )
                             };
-                            let status = unsafe { entry(Arc::as_ptr(drv)) };
+                            let status = unsafe { entry(drv) };
                             println!("      -> Driver {} DriverEntry -> {:?}", m.title, status);
 
                             if !matches!(status, DriverStatus::Success | DriverStatus::Pending) {
                                 runtime.set_state(DriverState::Failed);
                                 continue;
                             }
-                            runtime.set_state(DriverState::Loaded);
+                            runtime.set_state(DriverState::Pending);
                         } else {
                             println!(
-                                "      -> ERROR: Driver {} missing symbol: driver_entry",
+                                "      -> ERROR: Driver {} missing symbol: DriverEntry",
                                 m.title
                             );
                             runtime.set_state(DriverState::Failed);
@@ -817,9 +816,11 @@ impl PnpManager {
 
                     if let Some(cb) = drv.evt_device_add {
                         let mut dev_init = DeviceInit::new();
+
                         let status = cb(drv, &mut dev_init);
 
                         if status == DriverStatus::Success {
+                            // The rest of your logic follows...
                             dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
                             let devobj = DeviceObject::new(dev_init.dev_ext_size);
                             unsafe {

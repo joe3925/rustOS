@@ -17,8 +17,12 @@ use alloc::vec::Vec;
 
 export! {
     function,
+    print,
+    wait_ms,
     create_kernel_task,
     kill_kernel_task_by_id,
+
+    get_acpi_tables,
 
     allocate_auto_kernel_range_mapped,
     allocate_kernel_range_mapped,
@@ -45,4 +49,9 @@ export! {
     pnp_get_device_target,
     pnp_complete_request,
     pnp_queue_dpc,
+    pnp_send_request,
+    driver_get_name,
+    driver_get_flags,
+    driver_set_evt_device_add,
+    driver_set_evt_driver_unload,
 }

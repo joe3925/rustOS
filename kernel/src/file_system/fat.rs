@@ -265,7 +265,7 @@ impl FileEntry {
         String::from_utf8_lossy(&ext_trimmed).to_string()
     }
     pub fn get_cluster(&self) -> u32 {
-        ((self.first_cluster_high as u32) << 16) | (self.first_cluster_low as u32)
+        (((self.first_cluster_high as u32) << 16) | (self.first_cluster_low as u32)) & 0x0FFF_FFFF
     }
     pub fn new_long_name(name: &str, extension: &str, starting_cluster: u32) -> Vec<FileEntry> {
         let long_full = if extension.is_empty() {
@@ -468,11 +468,12 @@ impl FileSystem {
         let mut info_sec = vec![0u8; 512];
         part.read(1, &mut info_sec);
         if (Self::is_fat_present(info_sec)) {
-            let clusters = Self::get_all_clusters(part, 2);
+            let clusters = match Self::get_all_clusters(part, 2) {
+                Ok(v) => v,
+                Err(_) => return Err(TooCorrupted),
+            };
 
-            // If the root directory has been corrupted remove what we can
             if (*clusters.last().unwrap() == 0) {
-                // Prevents a fault from the corrupted root dir
                 Self::update_fat(part, 2, 0xFFFFFFFF);
             }
             let res = Self::remove_dir(part, "\\".to_string());
@@ -535,18 +536,22 @@ impl FileSystem {
     }
 
     fn update_fat(part: &mut Partition, cluster_number: u32, next_cluster: u32) {
-        let fat_offset = cluster_number * 4;
-        let sector_number = (fat_offset / 512) + RESERVED_SECTORS;
-        let entry_offset = (fat_offset % 512) as usize;
+        let fat_off = cluster_number * 4;
+        let sector_number = (fat_off / 512) + RESERVED_SECTORS;
+        let entry_off = (fat_off % 512) as usize;
 
         let mut buffer = vec![0u8; 512];
         part.read(sector_number, &mut buffer);
 
-        buffer[entry_offset] = (next_cluster & 0xFF) as u8;
-        buffer[entry_offset + 1] = ((next_cluster >> 8) & 0xFF) as u8;
-        buffer[entry_offset + 2] = ((next_cluster >> 16) & 0xFF) as u8;
-        buffer[entry_offset + 3] = ((next_cluster >> 24) & 0xFF) as u8;
+        let mut cur = u32::from_le_bytes([
+            buffer[entry_off],
+            buffer[entry_off + 1],
+            buffer[entry_off + 2],
+            buffer[entry_off + 3],
+        ]);
+        cur = (cur & 0xF000_0000) | (next_cluster & 0x0FFF_FFFF);
 
+        buffer[entry_off..entry_off + 4].copy_from_slice(&cur.to_le_bytes());
         part.write(sector_number, &mut buffer);
     }
     pub fn create_dir(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
@@ -630,7 +635,7 @@ impl FileSystem {
         part: &mut Partition,
         starting_cluster: u32,
     ) -> Result<Vec<FileEntry>, FileStatus> {
-        let dirs = Self::get_all_clusters(part, starting_cluster);
+        let dirs = Self::get_all_clusters(part, starting_cluster)?;
 
         let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
         let entry_size = 32;
@@ -721,7 +726,7 @@ impl FileSystem {
         file_attribute: FileAttribute,
         starting_cluster: u32,
     ) -> Result<FileEntry, FileStatus> {
-        let clusters = Self::get_all_clusters(part, starting_cluster);
+        let clusters = Self::get_all_clusters(part, starting_cluster)?;
 
         for &cluster in &clusters {
             let dir = Self::read_dir(part, cluster)?;
@@ -806,7 +811,7 @@ impl FileSystem {
                 // Create the file entry
                 Self::update_fat(part, free_cluster, 0xFFFFFFFF);
                 let mut entry = FileEntry::new(file_name, file_extension, free_cluster);
-                entry.file_size = CLUSTER_SIZE;
+                entry.file_size = 0;
 
                 // Check if this file name needs a long name
                 let full_name = if file_extension.is_empty() {
@@ -853,7 +858,7 @@ impl FileSystem {
         let mut file_entry = Self::find_file(part, path)?;
         let cluster_size = CLUSTER_OFFSET as usize;
         let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
-        let old_clusters = Self::get_all_clusters(part, file_entry.get_cluster());
+        let old_clusters = Self::get_all_clusters(part, file_entry.get_cluster())?;
         let old_clusters_needed = old_clusters.len();
 
         let mut buffer = vec![0u8; cluster_size];
@@ -993,25 +998,26 @@ impl FileSystem {
 
     pub fn read_file(part: &mut Partition, path: &str) -> Result<Vec<u8>, FileStatus> {
         let entry = Self::find_file(part, path)?;
-        let mut file_data = vec![0u8; entry.file_size as usize];
-        let remainder = entry.file_size % CLUSTER_OFFSET;
-        let clusters = Self::get_all_clusters(part, entry.get_cluster());
-        for i in 0..clusters.len() {
-            let mut cluster = vec![0u8; CLUSTER_OFFSET as usize];
-            Self::read_cluster(part, clusters[i], &mut cluster)?;
-            let base_offset = i * CLUSTER_OFFSET as usize;
+        let file_size = entry.file_size as usize;
+        let cluster_sz = CLUSTER_OFFSET as usize;
+        let clusters = Self::get_all_clusters(part, entry.get_cluster())?;
 
-            if (i + 1) != clusters.len() || remainder == 0 {
-                for j in 0..cluster.len() {
-                    file_data[j + base_offset] = cluster[j];
-                }
-            } else {
-                for j in 0..remainder as usize {
-                    file_data[j + base_offset] = cluster[j];
-                }
+        let mut file_data = vec![0u8; file_size];
+        let mut cluster = vec![0u8; cluster_sz];
+
+        for (i, &cl) in clusters.iter().enumerate() {
+            let base = i * cluster_sz;
+            if base >= file_size {
+                break;
             }
+            Self::read_cluster(part, cl, &mut cluster)?;
+
+            let remaining = file_size - base;
+            let take = core::cmp::min(cluster_sz, remaining);
+            file_data[base..base + take].copy_from_slice(&cluster[..take]);
         }
-        return Ok(file_data);
+
+        Ok(file_data)
     }
     pub fn delete_file(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
         if path == "\\" {
@@ -1025,12 +1031,12 @@ impl FileSystem {
             Self::find_file(part, path)?
         };
 
-        let clusters = Self::get_all_clusters(part, entry.get_cluster());
+        let clusters = Self::get_all_clusters(part, entry.get_cluster())?;
 
         // Locate and delete both LFN and SFN entries
         let dir_path = File::remove_file_from_path(path);
         let dir_entry = Self::find_dir(part, dir_path)?;
-        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster());
+        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster())?;
         let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
 
         for cluster in dir_clusters {
@@ -1070,26 +1076,28 @@ impl FileSystem {
         Ok(())
     }
     ///set ignore cluster to 0 to ignore no clusters
-    fn find_free_cluster(part: &mut Partition, ignore_cluster: u32) -> u32 {
+    fn find_free_cluster(part: &mut Partition, ignore: u32) -> u32 {
         let fat_sectors = Self::calculate_max_fat_size(part.size);
         for i in 0..fat_sectors {
-            let mut buffer = vec![0u8; 512];
-            part.read(i + RESERVED_SECTORS, &mut buffer);
+            let mut buf = vec![0u8; 512];
+            part.read(i + RESERVED_SECTORS, &mut buf);
             for j in 0..128 {
-                // 128 = 512 bytes / 4 bytes per FAT entry
-                let entry = u32::from_le_bytes([
-                    buffer[j * 4],
-                    buffer[j * 4 + 1],
-                    buffer[j * 4 + 2],
-                    buffer[j * 4 + 3],
-                ]);
-                if entry == 0x00000000 {
-                    return (i * 128 + j as u32);
+                let idx = i * 128 + j as u32;
+                if idx < 2 || idx == ignore {
+                    continue;
+                }
+                let ent = u32::from_le_bytes([
+                    buf[j * 4],
+                    buf[j * 4 + 1],
+                    buf[j * 4 + 2],
+                    buf[j * 4 + 3],
+                ]) & 0x0FFF_FFFF;
+                if ent == 0 {
+                    return idx;
                 }
             }
         }
-
-        0xFFFFFFFF
+        0xFFFF_FFFF
     }
     ///starting cluster is the cluster that will be searched for NOT the one it will be updated to
     pub fn update_dir_entry(
@@ -1101,7 +1109,7 @@ impl FileSystem {
     ) -> Result<(), FileStatus> {
         let dir_path = File::remove_file_from_path(path);
         let dir_entry = Self::find_dir(part, dir_path)?;
-        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster());
+        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster())?;
         let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
 
         for cluster in dir_clusters {
@@ -1169,7 +1177,7 @@ impl FileSystem {
             return Ok(());
         }
         let mut dir_buf = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
-        let clusters = Self::get_all_clusters(part, start_cluster_of_dir);
+        let clusters = Self::get_all_clusters(part, start_cluster_of_dir)?;
         Self::read_cluster(part, clusters[clusters.len() - 1], &mut dir_buf)?;
 
         let entry_size = 32;
@@ -1205,8 +1213,10 @@ impl FileSystem {
             return Err(FileStatus::CorruptFat);
         }
 
-        let real_cluster = cluster.checked_sub(2).ok_or(FileStatus::CorruptFat)?;
-        let start_sector = Self::cluster_to_sector(part.size, real_cluster as u32);
+        if cluster < 2 {
+            return Err(FileStatus::CorruptFat);
+        }
+        let start_sector = Self::cluster_to_sector(part.size, cluster);
 
         let sector_count = SECTORS_PER_CLUSTER;
 
@@ -1234,8 +1244,10 @@ impl FileSystem {
             return Err(FileStatus::CorruptFat);
         }
 
-        let real_cluster = cluster.checked_sub(2).ok_or(FileStatus::CorruptFat)?;
-        let start_sector = Self::cluster_to_sector(part.size, real_cluster);
+        if cluster < 2 {
+            return Err(FileStatus::CorruptFat);
+        }
+        let start_sector = Self::cluster_to_sector(part.size, cluster);
 
         let sector_count = SECTORS_PER_CLUSTER;
 
@@ -1263,30 +1275,47 @@ impl FileSystem {
     fn cluster_in_sector(cluster: u32) -> usize {
         ((cluster as usize % (512 / 4)) * 4)
     }
-    fn get_all_clusters(part: &mut Partition, mut starting_cluster: u32) -> Vec<u32> {
-        let mut out_vec: Vec<u32> = Vec::new();
-        out_vec.push(starting_cluster);
-        let mut entry = 0x00000000;
-        while (entry != 0xFFFFFFFF && entry >= 0x00000002) {
-            let mut sector = vec![0u8; 512];
-            let starting_sector = FileSystem::sector_for_cluster(starting_cluster);
-            let sector_index = FileSystem::cluster_in_sector(starting_cluster);
-            part.read(starting_sector, &mut sector);
-            entry = u32::from_le_bytes([
-                sector[sector_index],
-                sector[sector_index + 1],
-                sector[sector_index + 2],
-                sector[sector_index + 3],
-            ]);
-            if entry != 0xFFFFFFFF && entry >= 0x00000002 {
-                out_vec.push(entry);
-            } else if (entry >= 0x00000002) {
-                println!("maybe corrupt");
-                //TODO: corruption warning
+    fn fat_entry(part: &mut Partition, cl: u32) -> Result<u32, FileStatus> {
+        let bps = SECTOR_SIZE as usize;
+        let fat_start = RESERVED_SECTORS;
+        let byte_off = (cl as u64) * 4;
+        let sector = fat_start + (byte_off / SECTOR_SIZE as u64) as u32;
+        let off = (byte_off % SECTOR_SIZE as u64) as usize;
+
+        let mut sec = vec![0u8; bps];
+        part.read(sector, &mut sec);
+
+        let raw = u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]);
+        Ok(raw & 0x0FFF_FFFF)
+    }
+
+    fn is_eoc(v: u32) -> bool {
+        v >= 0x0FFF_FFF8 && v <= 0x0FFF_FFFF
+    }
+
+    pub fn get_all_clusters(part: &mut Partition, start: u32) -> Result<Vec<u32>, FileStatus> {
+        let mut out = Vec::new();
+        let mut cl = start & 0x0FFF_FFFF;
+
+        if cl < 2 {
+            return Ok(out);
+        } // empty/invalid
+
+        loop {
+            out.push(cl);
+            let next = Self::fat_entry(part, cl)?;
+            if Self::is_eoc(next) {
+                break;
             }
-            starting_cluster = entry;
+            if next == 0x0FFF_FFF7 {
+                return Err(FileStatus::CorruptFat);
+            }
+            if next < 2 {
+                break;
+            }
+            cl = next;
         }
-        out_vec
+        Ok(out)
     }
     fn calculate_max_fat_size(volume_size: u64) -> u32 {
         let size = volume_size - (RESERVED_SECTORS * 512) as u64;
@@ -1298,9 +1327,9 @@ impl FileSystem {
     }
 
     fn cluster_to_sector(volume_size: u64, cluster: u32) -> u32 {
-        let cluster_offset = SECTORS_PER_CLUSTER;
-        let cluster_start = cluster_offset as u64 * cluster as u64
-            + Self::calculate_data_region_start(volume_size) as u64;
-        cluster_start as u32
+        let cluster_offset = SECTORS_PER_CLUSTER as u64;
+        let data_start = Self::calculate_data_region_start(volume_size) as u64;
+        let cluster_index = cluster as u64 - 2; // adjust for FAT cluster numbering
+        (cluster_index * cluster_offset + data_start) as u32
     }
 }

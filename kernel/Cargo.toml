@@ -23,7 +23,7 @@ crc-any = "2.0.0"
 embedded-graphics = "0.8.1"
 raw-cpuid = "11.5.0"
 acpi = "5.2.0"
-goblin = { version = "0.9.3", features = [
+goblin = { version = "0.10.0", features = [
     "endian_fd",
     "elf64",
     "elf32",

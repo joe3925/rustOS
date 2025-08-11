@@ -106,14 +106,15 @@ impl DeviceObject {
 fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {
     unsafe { Arc::from_raw(Arc::as_ptr(&Arc::new_uninit().assume_init())) }
 }
-pub type EvtDriverDeviceAdd = fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
+pub type EvtDriverDeviceAdd =
+    extern "win64" fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
 
-pub type EvtDriverUnload = fn(driver: &Arc<DriverObject>);
+pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>);
 
-pub type EvtIoRead = fn(&Arc<DeviceObject>, &mut Request, usize);
-pub type EvtIoWrite = fn(&Arc<DeviceObject>, &mut Request, usize);
-pub type EvtIoDeviceControl = fn(&Arc<DeviceObject>, &mut Request, u32);
-pub type EvtDevicePrepareHardware = fn(&Arc<DeviceObject>) -> DriverStatus;
+pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
+pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
+pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request, u32);
+pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PnpMinorFunction {
@@ -188,6 +189,7 @@ impl Request {
     }
 }
 //TODO: do something better
+#[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {
     pub dev_ext_size: usize,

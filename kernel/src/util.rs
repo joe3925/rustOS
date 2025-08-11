@@ -211,35 +211,33 @@ pub fn used_memory() -> usize {
     HEAP_SIZE - allocator.free_memory()
 }
 pub fn print_mem_report() {
-    interrupts::without_interrupts(move || {
-        let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
-        let total_bytes = total_usable_bytes();
+    let heap_used = interrupts::without_interrupts(move || used_memory());
+    let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
+    let total_bytes = total_usable_bytes();
 
-        let used_mb = used_bytes / 1_048_576;
-        let total_mb = total_bytes / 1_048_576;
+    let used_mb = used_bytes / 1_048_576;
+    let total_mb = total_bytes / 1_048_576;
 
-        let percent_x10 = (used_bytes as u128 * 1000) / total_bytes as u128;
-        let int_part = percent_x10 / 10;
-        let frac_part = percent_x10 % 10;
+    let percent_x10 = (used_bytes as u128 * 1000) / total_bytes as u128;
+    let int_part = percent_x10 / 10;
+    let frac_part = percent_x10 % 10;
 
-        println!(
-            "Used memory {} MB / {} MB ({}.{})%",
-            used_mb, total_mb, int_part, frac_part
-        );
+    println!(
+        "Used memory {} MB / {} MB ({}.{})%",
+        used_mb, total_mb, int_part, frac_part
+    );
 
-        let heap_used = used_memory();
-        let heap_used_kb = heap_used / 1000;
-        let heap_total_kb = HEAP_SIZE / 1000;
+    let heap_used_kb = heap_used / 1000;
+    let heap_total_kb = HEAP_SIZE / 1000;
 
-        let heap_percent_x10 = (heap_used as u128 * 1000) / HEAP_SIZE as u128;
-        let heap_int_part = heap_percent_x10 / 10;
-        let heap_frac_part = heap_percent_x10 % 10;
+    let heap_percent_x10 = (heap_used as u128 * 1000) / HEAP_SIZE as u128;
+    let heap_int_part = heap_percent_x10 / 10;
+    let heap_frac_part = heap_percent_x10 % 10;
 
-        println!(
-            "Heap usage: {} KB / {} KB ({}.{})%",
-            heap_used_kb, heap_total_kb, heap_int_part, heap_frac_part
-        );
-    });
+    println!(
+        "Heap usage: {} KB / {} KB ({}.{})%",
+        heap_used_kb, heap_total_kb, heap_int_part, heap_frac_part
+    );
 }
 pub fn setup_file_layout() -> Result<(), FileStatus> {
     let drive_label = {

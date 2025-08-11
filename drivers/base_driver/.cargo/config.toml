@@ -1,6 +1,9 @@
 [build]
 target = "x86_64-pc-windows-msvc"
 
+[lib]
+crate-type = ["cdylib"]
+
 [target.x86_64-pc-windows-msvc]
 rustflags = [
     "-C",
@@ -10,8 +13,19 @@ rustflags = [
     "-C",
     "code-model=large",
     "-C",
-    "link-args=/NOENTRY /NODEFAULTLIB /SUBSYSTEM:NATIVE /DYNAMICBASE /FIXED:NO",
+    "link-arg=/SUBSYSTEM:NATIVE",
+    "-C",
+    "link-arg=/ENTRY:DriverEntry",
+    "-C",
+    "link-arg=/NODEFAULTLIB",
+    "-C",
+    "link-arg=/DYNAMICBASE",
+    "-C",
+    "link-arg=/FIXED:NO",
+    "-C",
+    "link-arg=/EXPORT:DriverEntry",
 ]
 [unstable]
-build-std = ["core", "compiler_builtins", "panic_abort"]
+build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
+
 build-std-features = ["compiler-builtins-mem"]

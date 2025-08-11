@@ -13,7 +13,10 @@ use crate::{
         driver_install::DriverError,
         interrupt_index::wait_millis,
         pnp::{
-            driver_object::{DeviceInit, DeviceObject, DriverObject, DriverStatus, Request},
+            driver_object::{
+                DeviceInit, DeviceObject, DriverObject, DriverStatus, EvtDriverDeviceAdd,
+                EvtDriverUnload, Request,
+            },
             pnp_manager::{DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
@@ -127,4 +130,27 @@ pub extern "win64" fn pnp_complete_request(req: &mut Request) {
 
 pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
     PNP_MANAGER.queue_dpc(func, arg)
+}
+pub extern "win64" fn driver_get_name(driver: &Arc<DriverObject>) -> String {
+    driver.driver_name.clone()
+}
+
+pub extern "win64" fn driver_get_flags(driver: &Arc<DriverObject>) -> u32 {
+    driver.flags
+}
+
+pub extern "win64" fn driver_set_evt_device_add(
+    driver: &Arc<DriverObject>,
+    callback: EvtDriverDeviceAdd,
+) {
+    let driver_mut = unsafe { &mut *(Arc::as_ptr(driver) as *mut DriverObject) };
+    driver_mut.evt_device_add = Some(callback);
+}
+
+pub extern "win64" fn driver_set_evt_driver_unload(
+    driver: &Arc<DriverObject>,
+    callback: EvtDriverUnload,
+) {
+    let driver_mut = unsafe { &mut *(Arc::as_ptr(driver) as *mut DriverObject) };
+    driver_mut.evt_driver_unload = Some(callback);
 }

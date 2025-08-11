@@ -62,10 +62,8 @@ impl PELoader {
     }
     pub fn list_import_dlls(&self) -> Vec<String> {
         let mut dlls = Vec::new();
-        println!("imports total {}", self.pe.imports.len());
         for imp in &self.pe.imports {
             let name = imp.dll.to_string();
-            println!("imports {}", name);
             dlls.push(name.to_ascii_lowercase());
         }
         dlls
