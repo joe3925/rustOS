@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use core::cmp::PartialEq;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+
 pub(crate) enum FileAttribute {
     ReadOnly = 0x01,
     Hidden = 0x02,
@@ -39,6 +41,8 @@ impl TryFrom<u8> for FileAttribute {
     }
 }
 #[derive(Debug)]
+#[repr(u32)]
+
 pub(crate) enum FileStatus {
     Success = 0x00,
     FileAlreadyExist = 0x01,

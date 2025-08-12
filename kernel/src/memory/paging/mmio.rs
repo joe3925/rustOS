@@ -15,16 +15,18 @@ use crate::{
     util::boot_info,
 };
 
+use super::paging::PageMapError;
+
 static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
 pub extern "win64" fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
-) -> Result<VirtAddr, MapToError<Size4KiB>> {
-    let phys_frame = PhysFrame::containing_address(mmio_base);
+) -> Result<VirtAddr, PageMapError> {
+    let phys_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(mmio_base);
     let num_pages = (mmio_size + 0xFFF) / 4096;
 
     let virtual_addr =
-        allocate_auto_kernel_range(mmio_size).ok_or_else(|| MapToError::FrameAllocationFailed)?;
+        allocate_auto_kernel_range(mmio_size).ok_or_else(|| PageMapError::NoMemory())?;
 
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());

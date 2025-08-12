@@ -13,6 +13,8 @@ use crate::{
 };
 
 #[derive(Debug)]
+#[repr(u32)]
+
 pub enum PageMapError {
     Page4KiB(MapToError<Size4KiB>),
     Page2MiB(MapToError<Size2MiB>),

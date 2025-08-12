@@ -13,6 +13,7 @@ use spin::{Mutex, RwLock};
 use x86_64::registers::control::Cr3;
 
 #[derive(Debug)]
+#[repr(u32)]
 pub enum TaskError {
     NotFound(u64),
     BadName,

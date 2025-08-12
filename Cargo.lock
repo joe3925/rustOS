@@ -12,6 +12,15 @@ dependencies = [
 
 [[package]]
 name = "acpi"
+version = "0.1.0"
+dependencies = [
+ "aml",
+ "kernel_api",
+ "spin 0.10.0",
+]
+
+[[package]]
+name = "acpi"
 version = "5.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94476c7ef97af4c4d998b3f422c1b01d5211aad57c80ed200baf148d1f1efab6"
@@ -26,6 +35,19 @@ name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+
+[[package]]
+name = "aml"
+version = "0.16.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4f8cba7d4260ea05671dda81029f6f718b54402a4ec926a0d9a41bdbb96b415"
+dependencies = [
+ "bit_field",
+ "bitvec",
+ "byteorder",
+ "log",
+ "spinning_top",
+]
 
 [[package]]
 name = "anyhow"
@@ -329,7 +351,7 @@ checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
 name = "kernel"
 version = "0.1.0"
 dependencies = [
- "acpi",
+ "acpi 5.2.0",
  "bincode 2.0.1",
  "bitflags 2.9.0",
  "bootloader_api",
@@ -344,7 +366,7 @@ dependencies = [
  "rand_core",
  "rand_xoshiro",
  "raw-cpuid",
- "spin",
+ "spin 0.9.8",
  "strum",
  "strum_macros",
  "toml",
@@ -355,9 +377,9 @@ dependencies = [
 name = "kernel_api"
 version = "0.1.0"
 dependencies = [
- "acpi",
- "spin",
- "x86_64 0.14.13",
+ "acpi 5.2.0",
+ "spin 0.10.0",
+ "x86_64 0.15.2",
 ]
 
 [[package]]
@@ -366,7 +388,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -624,6 +646,24 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
+name = "spinning_top"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b9eb1a2f4c41445a3a0ff9abc5221c5fcd28e1f13cd7c0397706f9ac938ddb0"
 dependencies = [
  "lock_api",
 ]

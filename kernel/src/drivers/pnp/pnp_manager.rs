@@ -1,5 +1,5 @@
 use crate::alloc::vec;
-use crate::drivers::pnp::driver_object::PnpRequest;
+use crate::drivers::pnp::driver_object::{PnpRequest, QueryIdType};
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::rc::Weak;
@@ -23,7 +23,8 @@ use crate::static_handlers::create_kernel_task;
 use lazy_static::lazy_static;
 
 use super::driver_object::{
-    DeviceInit, DeviceObject, DriverObject, DriverStatus, PnpMinorFunction, Request, RequestType,
+    DeviceInit, DeviceObject, DeviceRelationType, DriverObject, DriverStatus, PnpMinorFunction,
+    Request, RequestType,
 };
 
 pub type CompletionRoutine = fn(request: &mut Request, context: usize);
@@ -154,7 +155,7 @@ impl HwIndex {
             .flat_map(|v| v.iter())
     }
 }
-
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct DeviceIds {
     pub hardware: Vec<String>,   // e.g. ["PCI\VEN_8086&DEV_1234&SUBSYS_..."]
@@ -339,51 +340,54 @@ impl PnpManager {
 
         let root_node = self.root();
 
-        {
-            println!("PNP: Initializing boot-start drivers as root devices...");
+        let boot_packages: Vec<_> = {
             let hw = self.hw.read();
-            let boot_packages: Vec<_> = hw
-                .by_driver
+            hw.by_driver
                 .values()
                 .filter(|pkg| pkg.start == BootType::Boot)
                 .cloned()
-                .collect();
+                .collect()
+        };
 
-            for pkg in boot_packages {
-                println!("  -> Processing boot-start driver: {}", &pkg.name);
+        println!("PNP: Initializing boot-start drivers as root devices...");
+        for pkg in boot_packages {
+            println!("  -> Processing boot-start driver: {}", pkg.name);
 
-                match self.ensure_loaded(&pkg) {
-                    Ok(driver_object) => {
-                        let instance_path = alloc::format!("ROOT\\{}\\0000", &pkg.name);
-                        let device_ids = DeviceIds {
-                            hardware: vec![instance_path.clone()],
-                            compatible: Vec::new(),
-                        };
+            if let Err(e) = self.ensure_loaded(&pkg) {
+                println!(
+                    "  -> ERROR: Failed to load boot-start driver binary {}: {:?}",
+                    pkg.name, e
+                );
+                continue;
+            }
 
-                        println!(
-                            "     -> Creating root DevNode with path: {}",
-                            &instance_path
-                        );
+            let instance_path = alloc::format!("ROOT\\{}\\0000", pkg.name);
+            let device_ids = DeviceIds {
+                hardware: vec![alloc::format!("ROOT\\{}", pkg.name)],
+                compatible: Vec::new(),
+            };
 
-                        let (devnode, _pdo) = self.create_child_devnode_and_pdo(
-                            &root_node,
-                            &driver_object,
-                            pkg.name.clone(),
-                            instance_path,
-                            device_ids,
-                            None,
-                        );
+            println!("     -> Creating root DevNode with path: {}", instance_path);
 
-                        println!("     -> Binding and starting device stack...");
-                        self.bind_and_start(&devnode);
-                    }
-                    Err(e) => {
-                        println!(
-                            "  -> ERROR: Failed to load boot-start driver binary {}: {:?}",
-                            &pkg.name, e
-                        );
-                    }
-                }
+            let mut pdo_init = DeviceInit::new();
+            pdo_init.dev_ext_size = 0;
+            pdo_init.evt_pnp = Some(Self::pdo_pnp_dispatch);
+
+            let (devnode, _pdo) = self.create_child_devnode_and_pdo_with_init(
+                &root_node,
+                pkg.name.clone(),
+                instance_path,
+                device_ids,
+                None,
+                pdo_init,
+            );
+
+            println!("     -> Binding and starting device stack...");
+            if let Err(e) = self.bind_and_start(&devnode) {
+                println!(
+                    "     -> ERROR: bind/start failed for '{}': {:?}",
+                    devnode.name, e
+                );
             }
         }
 
@@ -399,26 +403,65 @@ impl PnpManager {
 
     pub fn create_child_devnode_and_pdo(
         &self,
-        parent_dev_node: &Arc<DevNode>,
-        bus_driver: &Arc<DriverObject>,
+        parent: &Arc<DevNode>,
         name: String,
         instance_path: String,
         ids: DeviceIds,
         class: Option<String>,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
-        let dev_node = DevNode::new_child(name, instance_path, ids, class, parent_dev_node);
+        let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
         let pdo = DeviceObject::new(0);
 
         unsafe {
-            let pdo_mut = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
-            pdo_mut.dev_node = Arc::downgrade(&dev_node);
+            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
+            p.dev_node = Arc::downgrade(&dev_node);
+            p.dev_init.evt_pnp = Some(Self::pdo_pnp_dispatch);
         }
 
         dev_node.set_pdo(pdo.clone());
-
         (dev_node, pdo)
     }
+    pub fn create_child_devnode_and_pdo_with_init(
+        &self,
+        parent: &Arc<DevNode>,
+        name: String,
+        instance_path: String,
+        ids: DeviceIds,
+        class: Option<String>,
+        init: DeviceInit,
+    ) -> (Arc<DevNode>, Arc<DeviceObject>) {
+        let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
 
+        let pdo = DeviceObject::new(init.dev_ext_size);
+        unsafe {
+            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
+            p.dev_node = Arc::downgrade(&dev_node);
+            p.dev_init = init;
+        }
+
+        dev_node.set_pdo(pdo.clone());
+        (dev_node, pdo)
+    }
+    extern "win64" fn pdo_pnp_dispatch(device: &Arc<DeviceObject>, request: &mut Request) {
+        let pnp_manager = &*PNP_MANAGER;
+
+        let Some(pnp_req) = request.pnp.as_ref() else {
+            request.status = DriverStatus::NoSuchDevice;
+            pnp_manager.complete_request(request);
+            return;
+        };
+
+        match pnp_req.minor_function {
+            PnpMinorFunction::StartDevice => {
+                request.status = DriverStatus::Success;
+                pnp_manager.complete_request(request);
+            }
+            _ => {
+                request.status = DriverStatus::NoSuchDevice;
+                pnp_manager.complete_request(request);
+            }
+        }
+    }
     pub fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         self.bind_device(dn)?;
         self.start_stack(dn);
@@ -820,8 +863,9 @@ impl PnpManager {
                         let status = cb(drv, &mut dev_init);
 
                         if status == DriverStatus::Success {
-                            // The rest of your logic follows...
-                            dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
+                            if dev_init.evt_pnp.is_none() {
+                                dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
+                            }
                             let devobj = DeviceObject::new(dev_init.dev_ext_size);
                             unsafe {
                                 let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
@@ -896,11 +940,15 @@ impl PnpManager {
 
             let pnp_payload = PnpRequest {
                 minor_function: PnpMinorFunction::StartDevice,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: QueryIdType::CompatibleIds,
+                ids_out: Vec::new(),
+                blob_out: Vec::new(),
             };
             let mut start_request = Request::new(RequestType::Pnp, Box::new([]), None);
             start_request.pnp = Some(pnp_payload);
 
-            let devnode_ptr_as_context = Arc::as_ptr(dn) as usize;
+            let devnode_ptr_as_context = Arc::into_raw(dn.clone()) as usize;
             start_request.set_completion(Self::start_io, devnode_ptr_as_context);
 
             let target = IoTarget {
@@ -919,12 +967,7 @@ impl PnpManager {
         if context == 0 {
             return;
         }
-        let dev_node = unsafe {
-            let temp_arc = Arc::from_raw(context as *const DevNode);
-            let cloned_arc = temp_arc.clone();
-            core::mem::forget(temp_arc);
-            cloned_arc
-        };
+        let dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
 
         if req.status == DriverStatus::Success {
             println!(
@@ -932,12 +975,87 @@ impl PnpManager {
                 dev_node.name
             );
             dev_node.set_state(DevNodeState::Started);
+
+            let pnp_manager = &*PNP_MANAGER;
+            if let Some(top_device) = dev_node
+                .stack
+                .read()
+                .as_ref()
+                .and_then(|s| s.get_top_device_object())
+            {
+                if top_device.dev_init.evt_bus_enumerate_devices.is_some() {
+                    println!(
+                        "   -> ACTION: Sending QueryDeviceRelations to bus driver for '{}'",
+                        dev_node.name
+                    );
+
+                    let pnp_payload = PnpRequest {
+                        minor_function: PnpMinorFunction::QueryDeviceRelations,
+                        relation: DeviceRelationType::BusRelations,
+                        id_type: QueryIdType::CompatibleIds,
+                        ids_out: Vec::new(),
+                        blob_out: Vec::new(),
+                    };
+                    let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]), None);
+                    bus_enum_request.pnp = Some(pnp_payload);
+
+                    let devnode_ptr_as_context = Arc::into_raw(dev_node.clone()) as usize;
+                    bus_enum_request
+                        .set_completion(Self::process_enumerated_children, devnode_ptr_as_context);
+
+                    let target = IoTarget {
+                        target_device: top_device,
+                    };
+                    pnp_manager.send_request(&target, &mut bus_enum_request);
+                }
+            }
         } else {
             println!(
-            "   -> FAILURE: PnP StartDevice failed for '{}' with status {:?}. Device is stopped.",
-            dev_node.name, req.status
+        "   -> FAILURE: PnP StartDevice failed for '{}' with status {:?}. Device is stopped.",
+        dev_node.name, req.status
         );
             dev_node.set_state(DevNodeState::Stopped);
+        }
+    }
+    pub fn process_enumerated_children(req: &mut Request, context: usize) {
+        if context == 0 {
+            return;
+        }
+        let parent_dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
+
+        if req.status != DriverStatus::Success {
+            println!(
+                "   -> FAILURE: Bus enumeration failed for '{}' with status {:?}.",
+                parent_dev_node.name, req.status
+            );
+            return;
+        }
+
+        println!(
+            "   -> COMPLETION: Bus enumeration complete for '{}'. Binding and starting children...",
+            parent_dev_node.name
+        );
+
+        let pnp_manager = &*PNP_MANAGER;
+
+        let children_to_start: Vec<Arc<DevNode>> = parent_dev_node
+            .children
+            .read()
+            .iter()
+            .filter(|child| child.get_state() == DevNodeState::Initialized)
+            .cloned()
+            .collect();
+
+        if children_to_start.is_empty() {
+            println!(
+                "   -> NOTE: Bus driver '{}' enumerated 0 new devices.",
+                parent_dev_node.name
+            );
+        }
+
+        for child_dn in children_to_start {
+            println!("  -> PNP: Processing enumerated child '{}'", child_dn.name);
+            pnp_manager.bind_and_start(&child_dn);
         }
     }
     fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
@@ -1098,7 +1216,7 @@ impl PnpManager {
             false
         }
     }
-    fn default_pnp_dispatch(device: &Arc<DeviceObject>, request: &mut Request) {
+    extern "win64" fn default_pnp_dispatch(device: &Arc<DeviceObject>, request: &mut Request) {
         let pnp_manager = &*PNP_MANAGER;
 
         let Some(pnp_request) = request.pnp.as_ref() else {
@@ -1130,6 +1248,21 @@ impl PnpManager {
                     pnp_manager.complete_request(request);
                 }
             }
+            PnpMinorFunction::QueryDeviceRelations => {
+                if let Some(enumerate_cb) = device.dev_init.evt_bus_enumerate_devices {
+                    let status = enumerate_cb(device);
+                    if status != DriverStatus::Success {
+                        println!("     -> ERROR: EvtBusEnumerateDevices failed.");
+                        request.status = status;
+                        pnp_manager.complete_request(request);
+                        return;
+                    }
+                }
+
+                request.status = DriverStatus::Success;
+                pnp_manager.complete_request(request);
+            }
+            _ => {}
         }
     }
 
@@ -1139,7 +1272,22 @@ impl PnpManager {
                 if let Some(h) = dev.dev_init.evt_pnp {
                     h(dev, req);
                 } else {
-                    self.send_request_to_next_lower(dev, req);
+                    let st = self.send_request_to_next_lower(dev, req);
+                    if st == DriverStatus::NoSuchDevice {
+                        if let Some(pnp) = req.pnp.as_ref() {
+                            match pnp.minor_function {
+                                PnpMinorFunction::StartDevice => {
+                                    req.status = DriverStatus::Success;
+                                }
+                                _ => {
+                                    req.status = DriverStatus::NoSuchDevice;
+                                }
+                            }
+                        } else {
+                            req.status = DriverStatus::NoSuchDevice;
+                        }
+                        self.complete_request(req);
+                    }
                 }
             }
             RequestType::Read(_) => {

@@ -3,7 +3,13 @@
 /* -------------------------------------------------------------------------- */
 
 use crate::{alloc::vec, util::random_number};
-use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::Arc, sync::Weak};
+use alloc::{
+    boxed::Box,
+    collections::vec_deque::VecDeque,
+    string::String,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use core::{
     mem,
     sync::atomic::{AtomicBool, AtomicU32},
@@ -28,6 +34,7 @@ pub enum DriverStatus {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 
 pub struct DeviceObject {
     pub lower_device: Option<Arc<DeviceObject>>,
@@ -115,18 +122,57 @@ pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
 pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
 pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request, u32);
 pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
+pub type EvtDeviceEnumerateDevices = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PnpMinorFunction {
-    StartDevice,
+#[repr(u32)]
+
+pub enum DeviceRelationType {
+    BusRelations,
+    EjectionRelations,
+    RemovalRelations,
+    TargetDeviceRelation,
+    PowerRelations,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum QueryIdType {
+    DeviceId,
+    HardwareIds,
+    CompatibleIds,
+    InstanceId,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ResourceKind {
+    Memory = 1,
+    Port = 2,
+    Interrupt = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PnpMinorFunction {
+    StartDevice,
+    QueryDeviceRelations,
+    QueryId,
+    QueryResources,
+}
+
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct PnpRequest {
     pub minor_function: PnpMinorFunction,
+    pub relation: DeviceRelationType,
+    pub id_type: QueryIdType,
+
+    pub ids_out: Vec<String>,
+    pub blob_out: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
+#[repr(C)]
 pub enum RequestType {
     Read(fn(&Arc<DeviceObject>, &mut Request)),
     Write(fn(&Arc<DeviceObject>, &mut Request)),
@@ -138,6 +184,7 @@ pub enum RequestType {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct Request {
     pub id: u64,
     pub kind: RequestType,
@@ -199,7 +246,8 @@ pub struct DeviceInit {
     pub io_device_control: Option<EvtIoDeviceControl>,
 
     pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
-    pub evt_pnp: Option<fn(&Arc<DeviceObject>, &mut Request)>,
+    pub evt_bus_enumerate_devices: Option<EvtDeviceEnumerateDevices>,
+    pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, &mut Request)>,
 }
 
 impl DeviceInit {
@@ -211,6 +259,7 @@ impl DeviceInit {
             io_device_control: None,
             evt_pnp: None,
             evt_device_prepare_hardware: None,
+            evt_bus_enumerate_devices: None,
         }
     }
 }

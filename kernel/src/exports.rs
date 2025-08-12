@@ -22,6 +22,7 @@ export! {
     create_kernel_task,
     kill_kernel_task_by_id,
 
+    get_rsdp,
     get_acpi_tables,
 
     allocate_auto_kernel_range_mapped,
@@ -50,6 +51,8 @@ export! {
     pnp_complete_request,
     pnp_queue_dpc,
     pnp_send_request,
+    pnp_create_child_devnode_and_pdo_with_init,
+
     driver_get_name,
     driver_get_flags,
     driver_set_evt_device_add,

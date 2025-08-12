@@ -105,6 +105,7 @@
         "resw",
         "rflags",
         "RFLAGS",
+        "rsdp",
         "rustc",
         "rustos",
         "Seedable",

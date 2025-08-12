@@ -2,6 +2,6 @@ cargo-features = ["profile-rustflags"]
 
 
 [workspace]
-members = ["os", "kernel", "drivers/base_driver", "kernel_api"]
+members = ["os", "kernel", "drivers/base_driver", "drivers/acpi", "kernel_api"]
 exclude = ["rustos-api"]
 resolver = "2"

@@ -1,0 +1,4 @@
+image = "acpi.dll"
+start = "boot"
+role = "base"
+hwids = []

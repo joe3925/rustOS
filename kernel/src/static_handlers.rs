@@ -27,6 +27,7 @@ use crate::{
         scheduler::{TaskError, SCHEDULER},
         task::Task,
     },
+    util::boot_info,
 };
 
 pub extern "win64" fn create_kernel_task(entry: usize, name: String) -> u64 {
@@ -89,20 +90,12 @@ pub extern "win64" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
 }
 pub extern "win64" fn pnp_create_pdo(
     parent_devnode: &Arc<DevNode>,
-    bus_driver: &Arc<DriverObject>,
     name: String,
     instance_path: String,
     ids: DeviceIds,
     class: Option<String>,
 ) -> (Arc<DevNode>, Arc<DeviceObject>) {
-    PNP_MANAGER.create_child_devnode_and_pdo(
-        parent_devnode,
-        bus_driver,
-        name,
-        instance_path,
-        ids,
-        class,
-    )
+    PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
 
 pub extern "win64" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
@@ -153,4 +146,24 @@ pub extern "win64" fn driver_set_evt_driver_unload(
 ) {
     let driver_mut = unsafe { &mut *(Arc::as_ptr(driver) as *mut DriverObject) };
     driver_mut.evt_driver_unload = Some(callback);
+}
+pub extern "win64" fn get_rsdp() -> u64 {
+    boot_info().rsdp_addr.into_option().unwrap()
+}
+pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
+    parent: &Arc<DevNode>,
+    name: String,
+    instance_path: String,
+    ids: DeviceIds,
+    class: Option<String>,
+    init: DeviceInit,
+) -> (Arc<DevNode>, Arc<DeviceObject>) {
+    PNP_MANAGER.create_child_devnode_and_pdo_with_init(
+        parent,
+        name,
+        instance_path,
+        ids,
+        class,
+        init,
+    )
 }

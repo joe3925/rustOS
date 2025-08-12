@@ -100,6 +100,7 @@ impl From<LoadError> for DriverError {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum BootType {
     Boot = 0,
     System = 1,
