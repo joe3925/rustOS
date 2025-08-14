@@ -103,16 +103,14 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 
         for (word_idx, word) in bm.iter_mut().enumerate() {
             if *word == u64::MAX {
-                continue; // fully allocated
+                continue;
             }
 
-            // first zero bit in this word
             let free_bit = (!*word).trailing_zeros() as usize;
-            *word |= 1u64 << free_bit; // mark allocated
+            *word |= 1u64 << free_bit;
 
             let frame_idx = word_idx * 64 + free_bit;
-            let phys = (frame_idx as u64) << 12; // * 4096
-            USED_MEMORY.fetch_add(1024, Ordering::SeqCst);
+            let phys = (frame_idx as u64) << 12;
             return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
         None

@@ -27,7 +27,7 @@ use super::driver_object::{
     Request, RequestType,
 };
 
-pub type CompletionRoutine = fn(request: &mut Request, context: usize);
+pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
 
 #[derive(Clone)]
 pub struct IoTarget {
@@ -963,7 +963,7 @@ impl PnpManager {
             dn.set_state(DevNodeState::Faulted);
         }
     }
-    pub fn start_io(req: &mut Request, context: usize) {
+    pub extern "win64" fn start_io(req: &mut Request, context: usize) {
         if context == 0 {
             return;
         }
@@ -1017,7 +1017,7 @@ impl PnpManager {
             dev_node.set_state(DevNodeState::Stopped);
         }
     }
-    pub fn process_enumerated_children(req: &mut Request, context: usize) {
+    pub extern "win64" fn process_enumerated_children(req: &mut Request, context: usize) {
         if context == 0 {
             return;
         }

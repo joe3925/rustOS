@@ -14,7 +14,6 @@ use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file::{File, FileStatus, OpenFlags};
-use crate::format;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
@@ -24,6 +23,7 @@ use crate::registry::{is_first_boot, reg};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
+use crate::{format, print_total_usable_gb};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use spin::{Mutex, Once, RwLock};
@@ -303,7 +303,7 @@ pub fn test_full_heap() {
         element_count
     );
 }
-pub fn random_number() -> u64 {
+pub extern "win64" fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
 }

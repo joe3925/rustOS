@@ -472,6 +472,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed089a1fbffe3337a1a345501c981f1eb1e47e69de5a40e852433e12953c3174"
 
 [[package]]
+name = "pci"
+version = "0.1.0"
+dependencies = [
+ "kernel_api",
+ "spin 0.10.0",
+]
+
+[[package]]
 name = "pic8259"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

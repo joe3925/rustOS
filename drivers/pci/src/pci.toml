@@ -1,0 +1,5 @@
+image = "pci.dll"
+start = "demand"
+role = "function"
+
+hwids = ["ACPI\\PNP0A03", "ACPI\\PNP0A08"]

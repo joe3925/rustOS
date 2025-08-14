@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
+use ffi::random_number;
 use spin::{Mutex, RwLock};
 pub use x86_64;
 use x86_64::structures::paging::mapper::MapToError;
@@ -81,7 +82,42 @@ pub struct Request {
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
 }
+impl Request {
+    #[inline]
+    pub fn new(kind: RequestType, data: Box<[u8]>, ioctl_code: Option<u32>) -> Self {
+        Self {
+            id: unsafe { random_number() },
+            kind,
+            data,
+            ioctl_code,
+            completed: false,
+            status: DriverStatus::Pending,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+        }
+    }
+    #[inline]
+    pub fn empty() -> Self {
+        let dummy_kind = RequestType::Dummy;
 
+        Self {
+            id: 0,
+            kind: dummy_kind,
+            data: Box::new([]),
+            ioctl_code: None,
+            completed: true,
+            status: DriverStatus::Success,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+        }
+    }
+    pub fn set_completion(&mut self, routine: CompletionRoutine, context: usize) {
+        self.completion_routine = Some(routine);
+        self.completion_context = context;
+    }
+}
 #[repr(C)]
 pub struct File {
     _private: [u8; 0],
@@ -288,7 +324,7 @@ pub mod alloc_api {
     pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 
-    pub type CompletionRoutine = fn(request: &mut Request, context: usize);
+    pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
     pub mod ffi {
         use super::*;
         #[link(name = "KRNL")]
@@ -370,6 +406,7 @@ pub mod ffi {
         pub fn get_rsdp() -> u64;
         pub fn print(s: &str);
         pub fn wait_ms(ms: u64);
+        pub fn random_number() -> u64;
     }
 }
 

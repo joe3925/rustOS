@@ -87,6 +87,39 @@ fn _start(boot_info_local: &'static mut BootInfo) -> ! {
 
     loop {}
 }
+#[inline]
+pub fn print_total_usable_gb(regions: &[MemoryRegion]) {
+    // Sum strictly usable ranges
+    let total_bytes: u128 = regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable && r.end > r.start)
+        .map(|r| (r.end - r.start) as u128)
+        .sum();
+
+    // Integer, no-std, no-float fixed-point formatting with 2 decimals
+    const GIB: u128 = 1024u128 * 1024u128 * 1024u128;
+    const GB10: u128 = 1_000_000_000u128;
+
+    let gib_int = total_bytes / GIB;
+    let gib_frac = ((total_bytes % GIB) * 100) / GIB; // 2 decimals
+
+    let gb_int = total_bytes / GB10;
+    let gb_frac = ((total_bytes % GB10) * 100) / GB10; // 2 decimals
+
+    println!(
+        "[mem] usable total: {}.{:02} GiB / {}.{:02} GB  ({} bytes)",
+        gib_int, gib_frac, gb_int, gb_frac, total_bytes
+    );
+}
+
+#[inline]
+pub fn total_usable_bytes(regions: &[MemoryRegion]) -> u128 {
+    regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable && r.end > r.start)
+        .map(|r| (r.end - r.start) as u128)
+        .sum()
+}
 fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0;
     const LOW_END: u64 = 0x20_0000; // 2 MiB
