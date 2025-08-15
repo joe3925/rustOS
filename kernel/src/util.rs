@@ -153,10 +153,10 @@ pub fn kernel_main() {
     }))]);
 
     let pid = PROGRAM_MANAGER.add_program(program);
-    // if (is_first_boot()) {
-    //     setup_file_layout().expect("Failed to create system volume layout");
-    //     install_prepacked_drivers().expect("Failed to install pre packed drivers");
-    // }
+    if (is_first_boot()) {
+        setup_file_layout().expect("Failed to create system volume layout");
+        install_prepacked_drivers().expect("Failed to install pre packed drivers");
+    }
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");

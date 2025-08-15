@@ -208,8 +208,6 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
     unsafe {
         ptr::write(ptr_ext, *p);
     }
-
-    let _ = unsafe { pnp_bind_and_start(&child_dn) };
 }
 
 #[unsafe(no_mangle)]

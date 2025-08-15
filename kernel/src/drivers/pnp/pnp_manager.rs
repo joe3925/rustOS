@@ -983,31 +983,29 @@ impl PnpManager {
                 .as_ref()
                 .and_then(|s| s.get_top_device_object())
             {
-                if top_device.dev_init.evt_bus_enumerate_devices.is_some() {
-                    println!(
-                        "   -> ACTION: Sending QueryDeviceRelations to bus driver for '{}'",
-                        dev_node.name
-                    );
+                println!(
+                    "   -> ACTION: Sending QueryDeviceRelations to bus driver for '{}'",
+                    dev_node.name
+                );
 
-                    let pnp_payload = PnpRequest {
-                        minor_function: PnpMinorFunction::QueryDeviceRelations,
-                        relation: DeviceRelationType::BusRelations,
-                        id_type: QueryIdType::CompatibleIds,
-                        ids_out: Vec::new(),
-                        blob_out: Vec::new(),
-                    };
-                    let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]), None);
-                    bus_enum_request.pnp = Some(pnp_payload);
+                let pnp_payload = PnpRequest {
+                    minor_function: PnpMinorFunction::QueryDeviceRelations,
+                    relation: DeviceRelationType::BusRelations,
+                    id_type: QueryIdType::CompatibleIds,
+                    ids_out: Vec::new(),
+                    blob_out: Vec::new(),
+                };
+                let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]), None);
+                bus_enum_request.pnp = Some(pnp_payload);
 
-                    let devnode_ptr_as_context = Arc::into_raw(dev_node.clone()) as usize;
-                    bus_enum_request
-                        .set_completion(Self::process_enumerated_children, devnode_ptr_as_context);
+                let devnode_ptr_as_context = Arc::into_raw(dev_node.clone()) as usize;
+                bus_enum_request
+                    .set_completion(Self::process_enumerated_children, devnode_ptr_as_context);
 
-                    let target = IoTarget {
-                        target_device: top_device,
-                    };
-                    pnp_manager.send_request(&target, &mut bus_enum_request);
-                }
+                let target = IoTarget {
+                    target_device: top_device,
+                };
+                pnp_manager.send_request(&target, &mut bus_enum_request);
             }
         } else {
             println!(
@@ -1355,9 +1353,9 @@ impl PnpManager {
 
     #[inline]
     fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
-        if !dev.dispatch_scheduled.swap(true, Ordering::AcqRel) {
-            DISPATCH_DEVQ.lock().push_back(dev.clone());
-        }
+        //if !dev.dispatch_scheduled.swap(true, Ordering::AcqRel) {
+        DISPATCH_DEVQ.lock().push_back(dev.clone());
+        //}
     }
 
     pub fn queue_dpc(&self, func: DpcFn, arg: usize) {
