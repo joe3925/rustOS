@@ -25,8 +25,8 @@ use kernel_api::{
     alloc_api::{
         DeviceIds, DeviceInit,
         ffi::{
-            driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-            pnp_forward_request_to_next_lower,
+            driver_set_evt_device_add, pnp_complete_request,
+            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
         },
     },
     println,
@@ -92,9 +92,9 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
         }
         PnpMinorFunction::QueryDeviceRelations => {
             if pnp.relation == kernel_api::DeviceRelationType::BusRelations {
-                enumerate_bus(device);
+                req.status = enumerate_bus(device);
             }
-            unsafe { pnp_forward_request_to_next_lower(device, req) };
+            unsafe { pnp_complete_request(req) }
         }
         _ => {
             unsafe { pnp_forward_request_to_next_lower(device, req) };

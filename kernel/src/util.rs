@@ -1,5 +1,6 @@
 extern crate rand_xoshiro;
 
+use crate::bootstrap::bootstrap_on_c_and_init_pnp;
 use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::driver_install::install_prepacked_drivers;
@@ -41,6 +42,7 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use x86_64::VirtAddr;
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
+pub static BOOTSET_IMG: &[u8] = include_bytes!("../../target/debug/bootset.img");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
@@ -84,43 +86,7 @@ pub unsafe fn init() {
             }
         }
 
-        {
-            let mut drives = DRIVECOLLECTION.lock();
-            drives.enumerate_drives();
-
-            match drives.drives[1].format_gpt() {
-                Ok(_) => {
-                    println!("Drive init successful");
-                    drives.drives[1]
-                        .add_partition(
-                            1024 * 1024 * 1024 * 9,
-                            MicrosoftBasicData.to_u8_16(),
-                            "MAIN VOLUME".to_string(),
-                        )
-                        .expect("TODO: panic message");
-                }
-                Err(err) => {
-                    println!(
-                        "Error init drive {} {}",
-                        (drives.drives)[1].info.model,
-                        err.to_str()
-                    )
-                }
-            }
-        }
-        {
-            let mut partitions = VOLUMES.lock();
-            partitions.enumerate_parts();
-            match partitions
-                .find_partition_by_name("MAIN VOLUME")
-                .unwrap()
-                .format()
-            {
-                Ok(_) => println!("Formatted"),
-                Err(e) => println!("{:#?}", e),
-            }
-            partitions.print_parts();
-        }
+        DRIVECOLLECTION.lock().init_drives();
         println!("Init Done");
     }
     while (CORE_LOCK.load(Ordering::SeqCst) != 0) {
@@ -153,13 +119,11 @@ pub fn kernel_main() {
     }))]);
 
     let pid = PROGRAM_MANAGER.add_program(program);
-    if (is_first_boot()) {
-        setup_file_layout().expect("Failed to create system volume layout");
-        install_prepacked_drivers().expect("Failed to install pre packed drivers");
-    }
-    PNP_MANAGER
-        .init_from_registry()
-        .expect("Driver init failed");
+    // if (is_first_boot()) {
+    //     setup_file_layout().expect("Failed to create system volume layout");
+    //     install_prepacked_drivers().expect("Failed to install pre packed drivers");
+    // }
+    bootstrap_on_c_and_init_pnp();
 
     // let label = {
     //     let mut volumes = VOLUMES.lock();

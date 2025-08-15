@@ -357,11 +357,11 @@ impl PartitionCollection {
 }
 pub struct Partition {
     pub(crate) gpt_entry: GptPartitionEntry,
-    parent_drive_index: u64,
-    name: String,
+    pub(crate) parent_drive_index: u64,
+    pub(crate) name: String,
     pub(crate) label: String,
     pub(crate) size: u64,
-    controller: PartitionController,
+    pub(crate) controller: PartitionController,
     pub(crate) is_fat: bool,
 }
 impl Partition {

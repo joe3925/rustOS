@@ -13,12 +13,16 @@ use spin::mutex::Mutex;
 use spin::Lazy;
 use strum_macros::Display;
 
+use super::gpt::{PartitionCollection, VOLUMES};
+use super::ram_disk::RamDiskController;
+
 // Macro to derive iteration
 pub static DRIVECOLLECTION: Lazy<Mutex<DriveCollection>> =
     Lazy::new(|| Mutex::new(DriveCollection::new()));
 pub enum Controller {
     AHCI(AHCIController),
     IDE(IdeController),
+    RAM(RamDiskController),
 }
 impl Controller {
     fn enumerate_drives() {
@@ -133,10 +137,13 @@ impl DriveCollection {
         let drive = Drive::new(index, info, controller);
         self.drives.push(drive);
     }
+    pub(crate) fn init_drives(&mut self) {
+        let new_partition = RamDiskController::new_partition();
+        VOLUMES.lock().parts.push(new_partition);
+    }
     pub(crate) fn enumerate_drives(&mut self) {
         let mut drives = Vec::new();
-        drives.extend(<IdeController as DriveController>::enumerate_drives());
-        //drives.extend(<AHCIController as DriveController>::enumerate_drives());
+        drives.extend(<RamDiskController as DriveController>::enumerate_drives());
         for mut drive in drives {
             if (drive.index == -1) {
                 drive.index = self.drives.len() as i64;

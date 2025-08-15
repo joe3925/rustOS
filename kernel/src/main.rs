@@ -13,12 +13,13 @@
 #![allow(static_mut_refs)]
 #![feature(let_chains)]
 #![feature(naked_functions)]
-
+#![feature(slice_as_array)]
 extern crate alloc;
 
 pub mod gdt;
 mod idt;
 
+mod bootstrap;
 mod console;
 mod cpu;
 mod drivers;
@@ -33,7 +34,6 @@ mod static_handlers;
 mod structs;
 mod syscalls;
 mod util;
-
 use crate::console::clear_screen;
 use crate::memory::paging::tables::kernel_cr3;
 use crate::util::KERNEL_INITIALIZED;

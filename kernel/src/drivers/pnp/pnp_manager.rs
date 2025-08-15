@@ -336,10 +336,11 @@ impl PnpManager {
     }
 
     pub fn init_from_registry(&self) -> Result<(), RegError> {
-        self.rebuild_index()?;
+        self.rebuild_index()?; // refresh HW index from registry
 
         let root_node = self.root();
 
+        // Gather Boot-start packages
         let boot_packages: Vec<_> = {
             let hw = self.hw.read();
             hw.by_driver
@@ -349,9 +350,18 @@ impl PnpManager {
                 .collect()
         };
 
-        println!("PNP: Initializing boot-start drivers as root devices...");
+        println!("PNP: (idempotent) Initialize boot-start drivers from registry...");
         for pkg in boot_packages {
-            println!("  -> Processing boot-start driver: {}", pkg.name);
+            // Skip if we already have a ROOT child named after this service
+            let already = root_node
+                .children
+                .read()
+                .iter()
+                .any(|dn| dn.name == pkg.name);
+            if already {
+                // Optionally start if not started yet (in case someone added registry but we didn’t start)
+                continue;
+            }
 
             if let Err(e) = self.ensure_loaded(&pkg) {
                 println!(
@@ -391,6 +401,7 @@ impl PnpManager {
             }
         }
 
+        // Safe to call more than once; guarded internally
         self.init_io_dispatcher();
         Ok(())
     }
