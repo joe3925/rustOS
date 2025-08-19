@@ -13,6 +13,7 @@
 #![allow(static_mut_refs)]
 #![feature(let_chains)]
 #![feature(naked_functions)]
+#![feature(slice_as_array)]
 
 extern crate alloc;
 

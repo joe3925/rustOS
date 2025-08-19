@@ -13,7 +13,9 @@
                 "gdb-remote localhost:1234",
                 "target modules load --file kernel.efi .text 0xFFFF850000000000"
             ],
-            "sourceLanguages": ["rust"],
+            "sourceLanguages": [
+                "rust"
+            ],
             "cwd": "${workspaceRoot}/kernel/src",
         }
     ]

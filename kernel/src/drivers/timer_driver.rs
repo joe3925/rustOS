@@ -74,7 +74,7 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         (*ctx_ptr).restore(state);
     }
 }
-#[naked]
+#[unsafe(naked)]
 pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
     unsafe {
         naked_asm!(

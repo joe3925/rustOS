@@ -1,12 +1,16 @@
 use crate::drivers::drive::generic_drive::PartitionErrors::{BadName, NoSpace, NotGPT};
-use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry};
+use crate::drivers::drive::gpt::{Gpt, GptHeader, GptPartitionEntry, VOLUMES};
 use crate::drivers::drive::ide_disk_driver::IdeController;
+use crate::drivers::drive::ram_disk::RamDiskController;
 use crate::drivers::drive::sata_disk_drivers::AHCIController;
 // Trait for iterating over enum variants
 use crate::drivers::pci::device_collection::Device;
+use crate::file_system::fat::format_boot_drive;
 use crate::println;
+use crate::util::BootPkg;
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::collections::btree_map::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use spin::mutex::Mutex;
@@ -171,4 +175,30 @@ impl DriveCollection {
             }
         }
     }
+}
+pub fn boot_part_init(boot: &[BootPkg]) {
+    let mut ram = RamDiskController {
+        sector_size: 512,
+        reported_sectors: (10 * 1024 * 1024 * 1024) / 512,
+        base: &[],
+        overlay: BTreeMap::new(),
+        views: BTreeMap::new(),
+    };
+
+    let mut part = ram.new_partition();
+    part.label = "C:".to_string();
+    if let Err(e) = format_boot_drive(&mut part, &mut ram, boot) {
+        println!("BOOT: format_boot_drive failed: {:?}", e);
+        return;
+    }
+
+    let cap = (10_u64 * 1024_u64 * 1024_u64 * 1024_u64);
+    let info = DriveInfo {
+        model: "RAMDISK".to_string(),
+        serial: "BOOTSET".to_string(),
+        port: 0,
+        capacity: cap,
+    };
+
+    VOLUMES.lock().parts.push(part);
 }

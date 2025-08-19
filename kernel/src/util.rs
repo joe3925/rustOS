@@ -1,6 +1,6 @@
 extern crate rand_xoshiro;
 
-use crate::drivers::drive::generic_drive::DRIVECOLLECTION;
+use crate::drivers::drive::generic_drive::{boot_part_init, DRIVECOLLECTION};
 use crate::drivers::drive::gpt::VOLUMES;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
@@ -29,6 +29,7 @@ use alloc::sync::Arc;
 use spin::{Mutex, Once, RwLock};
 use x86_64::instructions::interrupts;
 
+use crate::boot_packages;
 use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
 use crate::idt::load_idt;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
@@ -47,7 +48,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 static TOTAL_TIME: Once<Stopwatch> = Once::new();
-
+pub static BOOTSET: &[BootPkg] = boot_packages!["acpi", "pci"];
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -84,43 +85,43 @@ pub unsafe fn init() {
             }
         }
 
-        {
-            let mut drives = DRIVECOLLECTION.lock();
-            drives.enumerate_drives();
+        // {
+        //     let mut drives = DRIVECOLLECTION.lock();
+        //     drives.enumerate_drives();
 
-            match drives.drives[1].format_gpt() {
-                Ok(_) => {
-                    println!("Drive init successful");
-                    drives.drives[1]
-                        .add_partition(
-                            1024 * 1024 * 1024 * 9,
-                            MicrosoftBasicData.to_u8_16(),
-                            "MAIN VOLUME".to_string(),
-                        )
-                        .expect("TODO: panic message");
-                }
-                Err(err) => {
-                    println!(
-                        "Error init drive {} {}",
-                        (drives.drives)[1].info.model,
-                        err.to_str()
-                    )
-                }
-            }
-        }
-        {
-            let mut partitions = VOLUMES.lock();
-            partitions.enumerate_parts();
-            match partitions
-                .find_partition_by_name("MAIN VOLUME")
-                .unwrap()
-                .format()
-            {
-                Ok(_) => println!("Formatted"),
-                Err(e) => println!("{:#?}", e),
-            }
-            partitions.print_parts();
-        }
+        //     match drives.drives[1].format_gpt() {
+        //         Ok(_) => {
+        //             println!("Drive init successful");
+        //             drives.drives[1]
+        //                 .add_partition(
+        //                     1024 * 1024 * 1024 * 9,
+        //                     MicrosoftBasicData.to_u8_16(),
+        //                     "MAIN VOLUME".to_string(),
+        //                 )
+        //                 .expect("TODO: panic message");
+        //         }
+        //         Err(err) => {
+        //             println!(
+        //                 "Error init drive {} {}",
+        //                 (drives.drives)[1].info.model,
+        //                 err.to_str()
+        //             )
+        //         }
+        //     }
+        // }
+        // {
+        //     let mut partitions = VOLUMES.lock();
+        //     partitions.enumerate_parts();
+        //     match partitions
+        //         .find_partition_by_name("MAIN VOLUME")
+        //         .unwrap()
+        //         .format()
+        //     {
+        //         Ok(_) => println!("Formatted"),
+        //         Err(e) => println!("{:#?}", e),
+        //     }
+        //     partitions.print_parts();
+        // }
         println!("Init Done");
     }
     while (CORE_LOCK.load(Ordering::SeqCst) != 0) {
@@ -153,6 +154,7 @@ pub fn kernel_main() {
     }))]);
 
     let pid = PROGRAM_MANAGER.add_program(program);
+    boot_part_init(BOOTSET);
     if (is_first_boot()) {
         setup_file_layout().expect("Failed to create system volume layout");
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
@@ -160,7 +162,6 @@ pub fn kernel_main() {
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");
-
     // let label = {
     //     let mut volumes = VOLUMES.lock();
     //     if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
@@ -356,4 +357,33 @@ pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
     }
 
     buffer
+}
+#[derive(Clone, Copy)]
+pub struct BootPkg {
+    pub name: &'static str,
+    pub toml: &'static [u8],
+    pub image: &'static [u8],
+}
+
+#[macro_export]
+macro_rules! boot_packages {
+    ($($name:literal),+ $(,)?) => {{
+        &[
+            $(
+                $crate::util::BootPkg {
+                    name: $name,
+                    toml: include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../target/DRIVERS/",
+                        $name, "/", $name, ".toml"
+                    )),
+                    image: include_bytes!(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../target/DRIVERS/",
+                        $name, "/", $name, ".dll"
+                    )),
+                },
+            )+
+        ] as &[ $crate::util::BootPkg ]
+    }};
 }

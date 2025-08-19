@@ -82,6 +82,7 @@ pub(crate) struct File {
     pub drive_label: String,
     pub path: String,
     pub deleted: bool,
+    pub mount: FileSystem,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenFlags {
@@ -164,7 +165,8 @@ impl File {
             }
             if let Some(part) = VOLUMES.lock().find_volume(drive_letter.clone()) {
                 // Check if the file exists
-                let file_entry = FileSystem::find_file(part, path);
+                let file_system = FileSystem::mount(part)?;
+                let file_entry = file_system.find_file(part, path);
                 let name = FileSystem::file_parser(path);
                 let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
                 let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
@@ -179,6 +181,7 @@ impl File {
                                 drive_label: drive_letter.clone(),
                                 path: path.to_string(),
                                 deleted: false,
+                                mount: file_system,
                             })
                         } else {
                             Err(FileStatus::FileAlreadyExist)
@@ -189,20 +192,20 @@ impl File {
                         if flags.contains(&OpenFlags::Create)
                             || flags.contains(&OpenFlags::CreateNew)
                         {
-                            match FileSystem::create_dir(part, File::remove_file_from_path(path)) {
+                            match file_system.create_dir(part, File::remove_file_from_path(path)) {
                                 Ok(_) => {}
                                 Err(FileStatus::FileAlreadyExist) => {}
                                 Err(e) => return Err(e),
                             };
 
-                            match FileSystem::create_file(
+                            match file_system.create_file(
                                 part,
                                 &file_name,
                                 &file_extension,
                                 File::remove_file_from_path(path),
                             ) {
                                 Ok(_) => {
-                                    let file_entry = FileSystem::find_file(part, path);
+                                    let file_entry = file_system.find_file(part, path);
                                     match file_entry {
                                         Ok(file_entry) => Ok(File {
                                             name: (file_name).to_string(),
@@ -212,6 +215,7 @@ impl File {
                                             drive_label: drive_letter.clone(),
                                             path: path.to_string(),
                                             deleted: false,
+                                            mount: file_system,
                                         }),
                                         Err(e) => Err(FileStatus::UnknownFail),
                                     }
@@ -258,7 +262,8 @@ impl File {
                 return Err(FileStatus::NotFat); // Drive is not FAT
             }
             let path = Self::remove_drive_from_path(path);
-            return FileSystem::list_dir(part, path);
+            let fs = FileSystem::mount(part)?;
+            return fs.list_dir(part, path);
         } else {
             Err(FileStatus::DriveNotFound)
         }
@@ -270,7 +275,7 @@ impl File {
             if !part.is_fat {
                 return Err(FileStatus::NotFat); // Drive is not FAT
             }
-            FileSystem::read_file(part, self.path.as_str())
+            self.mount.read_file(part, self.path.as_str())
         } else {
             Err(DriveNotFound)
         }
@@ -281,7 +286,7 @@ impl File {
             if !part.is_fat {
                 return Err(FileStatus::NotFat); // Drive is not FAT
             }
-            FileSystem::write_file(part, data, self.path.as_str())
+            self.mount.write_file(part, data, self.path.as_str())
         } else {
             Err(DriveNotFound)
         }
@@ -291,7 +296,7 @@ impl File {
             if !part.is_fat {
                 return Err(FileStatus::NotFat); // Drive is not FAT
             }
-            let status = FileSystem::delete_file(part, self.path.as_str());
+            let status = self.mount.delete_file(part, self.path.as_str());
             match status {
                 Ok(_) => {
                     self.deleted = true;
@@ -310,8 +315,8 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::NotFat); // Drive is not FAT
                 }
-
-                FileSystem::remove_dir(
+                let fs = FileSystem::mount(part)?;
+                fs.remove_dir(
                     part,
                     Self::remove_drive_from_path(path.as_str()).to_string(),
                 )?;
@@ -327,8 +332,9 @@ impl File {
                 if !part.is_fat {
                     return Err(FileStatus::NotFat); // Drive is not FAT
                 }
-                FileSystem::create_dir(part, path)?;
-                match FileSystem::find_dir(part, path) {
+                let fs = FileSystem::mount(part)?;
+                fs.create_dir(part, path)?;
+                match fs.find_dir(part, path) {
                     Ok(_) => Ok(()),
                     Err(e) => Err(e),
                 }

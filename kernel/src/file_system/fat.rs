@@ -1,9 +1,11 @@
 use crate::drivers::drive::generic_drive::FormatStatus;
 use crate::drivers::drive::generic_drive::FormatStatus::TooCorrupted;
 use crate::drivers::drive::gpt::Partition;
+use crate::drivers::drive::ram_disk::RamDiskController;
 use crate::file_system::file::FileStatus::PathNotFound;
 use crate::file_system::file::{File, FileAttribute, FileStatus};
 use crate::println;
+use crate::util::BootPkg;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::{format, vec};
@@ -25,12 +27,26 @@ use core::fmt::Debug;
 //
 
 const CLUSTER_SIZE: u32 = 32; //in KiB
-const CLUSTER_OFFSET: u32 = CLUSTER_SIZE * 1024;
 const SECTORS_PER_CLUSTER: u32 = (CLUSTER_SIZE * 1024) / 512;
 const RESERVED_SECTORS: u32 = 32;
 pub const INFO_SECTOR: u32 = 1;
 const NUM_FATS: u8 = 1;
 const SECTOR_SIZE: u16 = 512;
+#[derive(Clone, Copy, Debug)]
+pub struct FatParams {
+    pub bps: u16,            // bytes per sector
+    pub spc: u8,             // sectors per cluster
+    pub rsvd: u16,           // reserved sectors
+    pub nfats: u8,           // number of FATs
+    pub fatsz: u32,          // sectors per FAT (FATSz32)
+    pub totsec: u32,         // total sectors (TotSec32 or 16)
+    pub root_clus: u32,      // BPB_RootClus
+    pub fsinfo_sec: u16,     // BPB_FSInfo
+    pub bkboot_sec: u16,     // BPB_BkBootSec
+    pub ext_flags: u16,      // BPB_ExtFlags (mirroring / active FAT)
+    pub fat_start_lba: u32,  // derived: first FAT LBA
+    pub data_start_lba: u32, // derived: first data sector LBA
+}
 #[repr(C, packed)]
 pub struct BIOSParameterBlock {
     pub jmp_boot: [u8; 3],         // Jump instruction to bootstrap code
@@ -383,6 +399,7 @@ impl FileEntry {
 }
 
 #[repr(C, packed)]
+#[derive(Debug)]
 struct InfoSector {
     signature1: [u8; 4],             // Offset: 0x00 ("RRaA" - 0x52 0x52 0x61 0x41)
     reserved1: [u8; 480],            // Offset: 0x04 - 0x1E3 (Reserved, usually 0)
@@ -438,22 +455,116 @@ struct Dir {
     files: Vec<FileEntry>,
     next_cluster: u8,
 }
+#[derive(Debug)]
 pub struct FileSystem {
-    info: InfoSector,
-    pub(crate) label: String,
+    pub params: FatParams,
+    pub info: InfoSector,
+    pub label: String,
 }
-
 impl FileSystem {
-    pub fn new(label: String, volume_size: u64) -> Self {
-        FileSystem {
-            info: InfoSector::default(),
-            label,
+    pub fn parse_bpb(part: &mut Partition) -> Result<FatParams, FileStatus> {
+        fn parse(sector: &[u8]) -> Option<FatParams> {
+            if sector.len() < 512 {
+                return None;
+            }
+            if u16::from_le_bytes([sector[510], sector[511]]) != 0xAA55 {
+                return None;
+            }
+
+            let bps = u16::from_le_bytes([sector[11], sector[12]]);
+            let spc = sector[13];
+            let rsvd = u16::from_le_bytes([sector[14], sector[15]]);
+            let nf = sector[16];
+            let root_ent_cnt = u16::from_le_bytes([sector[17], sector[18]]);
+            let tot16 = u16::from_le_bytes([sector[19], sector[20]]);
+            let media = sector[21];
+            let fatsz16 = u16::from_le_bytes([sector[22], sector[23]]);
+            let spt = u16::from_le_bytes([sector[24], sector[25]]);
+            let nheads = u16::from_le_bytes([sector[26], sector[27]]);
+            let hidsec = u32::from_le_bytes([sector[28], sector[29], sector[30], sector[31]]);
+            let tot32 = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
+            let fatsz32 = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
+            let ext_flags = u16::from_le_bytes([sector[40], sector[41]]);
+            let fs_ver = u16::from_le_bytes([sector[42], sector[43]]);
+            //let root_clus = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
+            let root_clus = 2;
+            let fsinfo_sec = u16::from_le_bytes([sector[48], sector[49]]);
+            let bkboot_sec = u16::from_le_bytes([sector[50], sector[51]]);
+
+            if bps == 0 || (bps & (bps - 1)) != 0 {
+                return None;
+            }
+            if spc == 0 || (spc & (spc - 1)) != 0 {
+                return None;
+            }
+            if nf == 0 {
+                return None;
+            }
+
+            let fatsz = if fatsz16 != 0 {
+                fatsz16 as u32
+            } else {
+                fatsz32
+            };
+            let totsec = if tot16 != 0 { tot16 as u32 } else { tot32 };
+            if fatsz == 0 || totsec == 0 {
+                return None;
+            }
+
+            let root_dir_sectors = ((root_ent_cnt as u32 * 32) + (bps as u32 - 1)) / bps as u32;
+
+            let fat_start_lba = rsvd as u32;
+            let first_data_lba = rsvd as u32 + (nf as u32) * fatsz + root_dir_sectors;
+            let data_sectors = totsec.saturating_sub(first_data_lba);
+            let cluster_count = data_sectors / spc as u32;
+
+            Some(FatParams {
+                bps,
+                spc,
+                rsvd,
+                nfats: nf,
+                fatsz,
+                totsec,
+                root_clus,
+                fsinfo_sec,
+                bkboot_sec,
+                ext_flags,
+                fat_start_lba: fat_start_lba,
+                data_start_lba: first_data_lba,
+            })
         }
+
+        let mut vbr = vec![0u8; 512];
+        part.read(0, &mut vbr);
+        if let Some(p) = parse(&vbr) {
+            return Ok(p);
+        }
+
+        let mut vbr_bk = vec![0u8; 512];
+        part.read(6, &mut vbr_bk);
+        if let Some(mut p) = parse(&vbr_bk) {
+            return Ok(p);
+        }
+
+        Err(FileStatus::NotFat)
+    }
+    pub fn mount(part: &mut Partition) -> Result<Self, FileStatus> {
+        let params = Self::parse_bpb(part)?;
+        let mut info_sec_buf = vec![0u8; params.bps as usize];
+        if params.fsinfo_sec != 0 && params.fsinfo_sec != 0xFFFF {
+            part.read(params.fsinfo_sec as u32, &mut info_sec_buf);
+        }
+        let info = InfoSector::from_buffer(&info_sec_buf).unwrap_or_else(InfoSector::default);
+
+        Ok(Self {
+            params,
+            info,
+            label: String::new(),
+        })
     }
     pub fn is_fat_present(sector: Vec<u8>) -> bool {
         if let Some(info) = InfoSector::from_buffer(&sector) {
             let sig3 = info.signature3;
-            //println!("sig1: {:#?}, sig2: {:#?}, sig3: {:#x}", info.signature1, info.signature2, sig3);
             if (info.signature1 == [0x52, 0x52, 0x61, 0x41]
                 && info.signature2 == [0x72, 0x72, 0x41, 0x61]
                 && info.signature3 == 0xAA55)
@@ -463,113 +574,202 @@ impl FileSystem {
         }
         false
     }
+    #[inline]
+    fn compute_fatsz32(totsec: u32, rsvd: u32, spc: u32, nfats: u32, bps: u32) -> u32 {
+        let mut fatsz = 1u32.max(((totsec.saturating_sub(rsvd)) + bps - 1) / bps);
+        loop {
+            let data_sec = totsec.saturating_sub(rsvd + nfats * fatsz);
+            let cluster_count = data_sec / spc.max(1);
+            let needed = cluster_count.saturating_add(2);
+            let new_fatsz = ((needed * 4) + (bps - 1)) / bps;
+            if new_fatsz == fatsz {
+                return fatsz;
+            }
+            fatsz = new_fatsz.max(1);
+        }
+    }
     pub fn format_drive(part: &mut Partition) -> Result<(), FormatStatus> {
-        let mut info_sector = InfoSector::default();
-        let mut info_sec = vec![0u8; 512];
-        part.read(1, &mut info_sec);
-        if (Self::is_fat_present(info_sec)) {
-            let clusters = match Self::get_all_clusters(part, 2) {
-                Ok(v) => v,
-                Err(_) => return Err(TooCorrupted),
-            };
-
-            if (*clusters.last().unwrap() == 0) {
-                Self::update_fat(part, 2, 0xFFFFFFFF);
-            }
-            let res = Self::remove_dir(part, "\\".to_string());
-            if res.is_err() {
-                return Err(TooCorrupted);
-            }
+        let bps = SECTOR_SIZE as u16;
+        if bps != 512 {
+            return Err(TooCorrupted);
         }
-        let mut boot_buffer = vec![0u8; 512];
-        let part_size = part.size;
-        //self.calculate_data_region_start() - RESERVED_SECTORS;
-        let bpb = BIOSParameterBlock::new(
-            (part_size / 512) as u32,
-            Self::calculate_max_fat_size(part.size),
-        );
-        bpb.write_to_buffer(&mut boot_buffer);
-        part.write(0, &boot_buffer);
+        let spc = SECTORS_PER_CLUSTER as u8;
+        let rsvd = RESERVED_SECTORS as u16;
+        let nfats = NUM_FATS;
+        let totsec = (part.size / bps as u64) as u32;
 
-        info_sector.free_clusters = (part_size / CLUSTER_OFFSET as u64) as u32;
-        info_sector.recently_allocated_cluster = 0;
-        let mut info_sec_buffer = vec![0x00; 512]; // Initialize buffer with zeros
-        info_sec_buffer[0x00..0x04].copy_from_slice(&info_sector.signature1);
-        info_sec_buffer[0x1E4..0x1E8].copy_from_slice(&info_sector.signature2);
-        info_sec_buffer[0x1E8..0x1EC].copy_from_slice(&info_sector.free_clusters.to_le_bytes());
-        info_sec_buffer[0x1EC..0x1F0]
-            .copy_from_slice(&info_sector.recently_allocated_cluster.to_le_bytes());
-        info_sec_buffer[0x1FE..0x200].copy_from_slice(&info_sector.signature3.to_le_bytes());
-        let mut buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
+        let fatsz =
+            Self::compute_fatsz32(totsec, rsvd as u32, spc as u32, nfats as u32, bps as u32);
 
-        part.write(INFO_SECTOR, &mut info_sec_buffer);
+        let mut bpb = BIOSParameterBlock::new(totsec, fatsz);
+        bpb.bytes_per_sector = bps;
+        bpb.sectors_per_cluster = spc;
+        bpb.reserved_sectors = rsvd;
+        bpb.num_fats = nfats;
+        bpb.media_descriptor = 0xF8;
+        bpb.root_cluster = 2;
+        bpb.fs_info_sector = 1;
+        bpb.backup_boot_sector = 6;
 
-        // Write the FAT table to the partition
-        let itr = info_sector.free_clusters / 512;
-
-        for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-            part.write((i) as u32, &mut buffer);
+        let mut vbr = vec![0u8; bps as usize];
+        bpb.write_to_buffer(&mut vbr);
+        vbr[510] = 0x55;
+        vbr[511] = 0xAA;
+        part.write(0, &vbr);
+        if bpb.backup_boot_sector != 0 {
+            part.write(bpb.backup_boot_sector as u32, &vbr);
         }
-        let mut read_buffer = vec![0u8; 512]; // Buffer of one sector size (512 bytes)
 
-        //validate data sectors
-        for i in RESERVED_SECTORS..itr + RESERVED_SECTORS {
-            part.read((i + 1) as u32, &mut read_buffer);
-            for j in 0..512 {
-                if (read_buffer[j] != buffer[j]) {
-                    println!("Sector {} is invalid", i);
-                    break;
-                }
+        let mut fsinfo = InfoSector::default();
+        fsinfo.free_clusters = 0xFFFF_FFFF; // unknown
+        fsinfo.recently_allocated_cluster = 0xFFFF_FFFF;
+        let mut fsinfo_buf = vec![0u8; bps as usize];
+        fsinfo_buf[0x00..0x04].copy_from_slice(&fsinfo.signature1);
+        fsinfo_buf[0x1E4..0x1E8].copy_from_slice(&fsinfo.signature2);
+        fsinfo_buf[0x1E8..0x1EC].copy_from_slice(&fsinfo.free_clusters.to_le_bytes());
+        fsinfo_buf[0x1EC..0x1F0].copy_from_slice(&fsinfo.recently_allocated_cluster.to_le_bytes());
+        fsinfo_buf[0x1FE..0x200].copy_from_slice(&fsinfo.signature3.to_le_bytes());
+        part.write(bpb.fs_info_sector as u32, &fsinfo_buf);
+
+        let fat_start_lba = rsvd as u32;
+        let mut zero = vec![0u8; bps as usize];
+        for copy in 0..(nfats as u32) {
+            let base = fat_start_lba + copy * fatsz;
+            for s in 0..fatsz {
+                part.write(base + s, &zero);
             }
         }
-        Self::update_fat(part, 0, 0xFFFFFFFF);
-        Self::update_fat(part, 1, 0xFFFFFFFF);
-        Self::update_fat(part, 2, 0xFFFFFFFF);
-        //wipe the root dir
-        match Self::write_cluster(part, 2, &mut vec![0u8; CLUSTER_OFFSET as usize]) {
-            Ok(_) => {}
-            Err(e) => return Err(TooCorrupted),
+
+        let mut fat0 = vec![0u8; bps as usize];
+        let fat0_val = (0x0FFF_FF00u32 | (bpb.media_descriptor as u32)).to_le_bytes();
+        fat0[0..4].copy_from_slice(&fat0_val);
+        fat0[4..8].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+        fat0[8..12].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+
+        for copy in 0..(nfats as u32) {
+            let lba = fat_start_lba + copy * fatsz;
+            part.write(lba, &fat0);
         }
-        info_sector.recently_allocated_cluster = 0;
+
+        let first_data_lba = rsvd as u32 + (nfats as u32) * fatsz;
+        let root_first_lba = first_data_lba + (bpb.root_cluster - 2) * (spc as u32);
+        for i in 0..(spc as u32) {
+            part.write(root_first_lba + i, &zero);
+        }
 
         Ok(())
     }
-
-    fn update_fat(part: &mut Partition, cluster_number: u32, next_cluster: u32) {
-        let fat_off = cluster_number * 4;
-        let sector_number = (fat_off / 512) + RESERVED_SECTORS;
-        let entry_off = (fat_off % 512) as usize;
-
-        let mut buffer = vec![0u8; 512];
-        part.read(sector_number, &mut buffer);
-
-        let mut cur = u32::from_le_bytes([
-            buffer[entry_off],
-            buffer[entry_off + 1],
-            buffer[entry_off + 2],
-            buffer[entry_off + 3],
-        ]);
-        cur = (cur & 0xF000_0000) | (next_cluster & 0x0FFF_FFFF);
-
-        buffer[entry_off..entry_off + 4].copy_from_slice(&cur.to_le_bytes());
-        part.write(sector_number, &mut buffer);
+    fn ensure_dir(&self, part: &mut Partition, path: &str) -> Result<(), FileStatus> {
+        match self.create_dir(part, path) {
+            Ok(()) => Ok(()),
+            Err(FileStatus::FileAlreadyExist) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
-    pub fn create_dir(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
-        if Self::find_dir(part, path).is_ok() {
+
+    pub fn attach_bytes_zero_copy(
+        &self,
+        part: &mut Partition,
+        ram: &mut RamDiskController,
+        path: &str,
+        src: &'static [u8],
+    ) -> Result<(), FileStatus> {
+        let mut entry = self.find_file(part, path)?;
+        let cluster_sz = self.calc_cluster_size();
+        let bps = self.params.bps as usize;
+        let spc = self.params.spc as usize;
+
+        let needed_clusters = core::cmp::max(1, (src.len() + cluster_sz - 1) / cluster_sz);
+
+        let mut chain = self.get_all_clusters(part, entry.get_cluster())?;
+
+        while chain.len() < needed_clusters {
+            let prev = *chain.last().unwrap();
+            let next = self.find_free_cluster(part, prev);
+            if next == 0xFFFF_FFFF {
+                return Err(FileStatus::UnknownFail);
+            }
+            self.update_fat(part, prev, next);
+            self.update_fat(part, next, 0xFFFF_FFFF);
+            chain.push(next);
+        }
+
+        for &cl in chain[needed_clusters..].iter() {
+            self.update_fat(part, cl, 0x0000_0000);
+        }
+        chain.truncate(needed_clusters);
+
+        entry.file_size = src.len() as u32;
+        self.update_dir_entry(part, path, entry, chain[0], None)?;
+
+        let mut off = 0usize;
+        for &cl in &chain {
+            let first_lba = self.cluster_to_sector(part.size, cl);
+            for s in 0..spc {
+                if off >= src.len() {
+                    break;
+                }
+                let lba = first_lba + s as u32;
+                ram.map_lba_from_slice(lba, src, off);
+                off = off.saturating_add(bps);
+            }
+        }
+        Ok(())
+    }
+    fn update_fat(&self, part: &mut Partition, cluster_number: u32, next_cluster: u32) {
+        let bps = self.params.bps as u32;
+        let fat_off_bytes = cluster_number * 4;
+
+        let sector_in_fat = fat_off_bytes / bps;
+        let entry_off = (fat_off_bytes % bps) as usize;
+
+        let mirroring_disabled = (self.params.ext_flags & 0x0080) != 0;
+        let active_idx = (self.params.ext_flags & 0x000F) as u32;
+
+        let mut write_copy = |fat_idx: u32, buf: &mut [u8]| {
+            let lba = self.params.fat_start_lba + fat_idx * self.params.fatsz + sector_in_fat;
+            part.read(lba, buf);
+
+            let mut cur = u32::from_le_bytes([
+                buf[entry_off],
+                buf[entry_off + 1],
+                buf[entry_off + 2],
+                buf[entry_off + 3],
+            ]);
+
+            let new_val = (cur & 0xF000_0000) | (next_cluster & 0x0FFF_FFFF);
+            buf[entry_off..entry_off + 4].copy_from_slice(&new_val.to_le_bytes());
+
+            part.write(lba, buf);
+        };
+
+        let mut secbuf = vec![0u8; self.params.bps as usize];
+
+        if mirroring_disabled {
+            write_copy(active_idx, &mut secbuf);
+        } else {
+            // Update all FAT copies
+            for i in 0..(self.params.nfats as u32) {
+                write_copy(i, &mut secbuf);
+            }
+        }
+    }
+    pub fn create_dir(&self, part: &mut Partition, path: &str) -> Result<(), FileStatus> {
+        if self.find_dir(part, path).is_ok() {
             return Err(FileStatus::FileAlreadyExist);
         }
         let files = FileSystem::file_parser(path);
-        let mut current_cluster = 2;
+        let mut current_cluster = self.params.root_clus;
 
         for dir_name in files {
             let parent_cluster = current_cluster;
 
-            match Self::file_present(part, dir_name, FileAttribute::Directory, parent_cluster) {
+            match self.file_present(part, dir_name, FileAttribute::Directory, parent_cluster) {
                 Ok(file) => {
                     current_cluster = file.get_cluster();
                 }
                 Err(FileStatus::PathNotFound) => {
-                    let free_cluster = Self::find_free_cluster(part, 0);
+                    let free_cluster = self.find_free_cluster(part, 0);
 
                     // Create base entry
                     let mut entry = FileEntry::new(dir_name, "", free_cluster);
@@ -586,18 +786,18 @@ impl FileSystem {
                     };
 
                     if needs_lfn {
-                        Self::write_file_to_dir(
+                        self.write_file_to_dir(
                             part,
                             &entry,
                             parent_cluster,
                             Some(dir_name.to_string()),
                         )?;
                     } else {
-                        Self::write_file_to_dir(part, &entry, parent_cluster, None)?;
+                        self.write_file_to_dir(part, &entry, parent_cluster, None)?;
                     }
 
-                    Self::update_fat(part, free_cluster, 0xFFFFFFFF);
-                    Self::initialize_directory(part, free_cluster, parent_cluster)?;
+                    self.update_fat(part, free_cluster, 0xFFFFFFFF);
+                    self.initialize_directory(part, free_cluster, parent_cluster)?;
                     current_cluster = free_cluster;
                 }
                 Err(e) => return Err(e),
@@ -607,18 +807,19 @@ impl FileSystem {
     }
 
     fn initialize_directory(
+        &self,
         part: &mut Partition,
         new_cluster: u32,
         parent_cluster: u32,
     ) -> Result<(), FileStatus> {
-        let empty_buffer = vec![0u8; CLUSTER_OFFSET as usize];
-        Self::write_cluster(part, new_cluster, &empty_buffer)?;
+        let empty_buffer = vec![0u8; self.params.bps as usize];
+        self.write_cluster(part, new_cluster, &empty_buffer)?;
 
         let mut entry = FileEntry::new(".", "", new_cluster);
         entry.attributes = FileAttribute::Directory as u8;
-        Self::write_file_to_dir(part, &entry, new_cluster, None)?;
+        self.write_file_to_dir(part, &entry, new_cluster, None)?;
 
-        let parent_cluster_ref = if parent_cluster == 2 {
+        let parent_cluster_ref = if parent_cluster == self.params.root_clus {
             0
         } else {
             parent_cluster
@@ -626,22 +827,24 @@ impl FileSystem {
         let mut entry = FileEntry::new("..", "", parent_cluster_ref);
         entry.attributes = FileAttribute::Directory as u8;
         // Create the '..' entry
-        Self::write_file_to_dir(part, &entry, new_cluster, None)?;
+        self.write_file_to_dir(part, &entry, new_cluster, None)?;
 
         Ok(())
     }
 
     pub fn read_dir(
+        &self,
         part: &mut Partition,
         starting_cluster: u32,
     ) -> Result<Vec<FileEntry>, FileStatus> {
-        let dirs = Self::get_all_clusters(part, starting_cluster)?;
+        let dirs = self.get_all_clusters(part, starting_cluster)?;
 
-        let mut root_dir = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
+        let mut root_dir =
+            vec![0u8; (self.params.spc as usize * self.params.bps as usize) as usize];
         let entry_size = 32;
         let mut file_entries = Vec::new();
         for j in 0..dirs.len() {
-            Self::read_cluster(part, dirs[j], &mut root_dir)?;
+            self.read_cluster(part, dirs[j], &mut root_dir)?;
 
             for i in (0..root_dir.len()).step_by(entry_size) {
                 if root_dir[i] == 0x00 {
@@ -657,10 +860,10 @@ impl FileSystem {
         }
         Ok(file_entries)
     }
-    pub fn remove_dir(part: &mut Partition, path: String) -> Result<(), FileStatus> {
+    pub fn remove_dir(&self, part: &mut Partition, path: String) -> Result<(), FileStatus> {
         // Get the directory and its contents.
-        let dir = Self::find_dir(part, &path)?;
-        let files = Self::read_dir(part, dir.get_cluster())?;
+        let dir = self.find_dir(part, &path)?;
+        let files = self.read_dir(part, dir.get_cluster())?;
 
         for entry in files {
             if entry.get_name() == "." || entry.get_name() == ".." {
@@ -668,29 +871,25 @@ impl FileSystem {
             }
 
             let child_path = if path == "\\" {
-                // If the parent path is the root "\" then simply prepend it.
                 format!("\\{}", entry.get_name())
             } else {
-                // Otherwise, combine parent and child with a single backslash.
                 format!("{}\\{}", path, entry.get_name())
             };
 
             if entry.attributes == u8::from(FileAttribute::Archive) {
-                // For files, append the extension.
                 let file_path = format!("{}.{}", child_path, entry.get_extension());
-                Self::delete_file(part, &file_path)?;
+                self.delete_file(part, &file_path)?;
             } else if entry.attributes == u8::from(FileAttribute::Directory) {
                 if (entry.get_name() == ".." || entry.get_name() == ".") {
-                    Self::delete_file(part, &child_path)?;
+                    self.delete_file(part, &child_path)?;
                     continue;
                 }
 
-                Self::remove_dir(part, child_path)?;
+                self.remove_dir(part, child_path)?;
             }
         }
 
-        // Remove the (now empty) directory.
-        Self::delete_file(part, &path)?;
+        self.delete_file(part, &path)?;
         Ok(())
     }
     pub(crate) fn file_parser(path: &str) -> Vec<&str> {
@@ -721,15 +920,16 @@ impl FileSystem {
         }
     }
     fn file_present(
+        &self,
         part: &mut Partition,
         file_name: &str,
         file_attribute: FileAttribute,
         starting_cluster: u32,
     ) -> Result<FileEntry, FileStatus> {
-        let clusters = Self::get_all_clusters(part, starting_cluster)?;
+        let clusters = self.get_all_clusters(part, starting_cluster)?;
 
         for &cluster in &clusters {
-            let dir = Self::read_dir(part, cluster)?;
+            let dir = self.read_dir(part, cluster)?;
 
             let assembled = Self::assemble_entries(&dir);
 
@@ -742,11 +942,15 @@ impl FileSystem {
 
         Err(FileStatus::PathNotFound)
     }
-    pub(crate) fn find_file(part: &mut Partition, path: &str) -> Result<FileEntry, FileStatus> {
+    pub(crate) fn find_file(
+        &self,
+        part: &mut Partition,
+        path: &str,
+    ) -> Result<FileEntry, FileStatus> {
         let files = Self::file_parser(path);
-        let mut current_cluster = 2;
+        let mut current_cluster = self.params.root_clus;
         if (path == "\\") {
-            let mut root_dir = FileEntry::new("", "", 2);
+            let mut root_dir = FileEntry::new("", "", self.params.root_clus);
             root_dir.attributes = u8::from(FileAttribute::Directory);
             return Ok(root_dir);
         }
@@ -756,7 +960,7 @@ impl FileSystem {
                 attribute = FileAttribute::Archive;
             }
 
-            let current_file = Self::file_present(part, files[i], attribute, current_cluster)?;
+            let current_file = self.file_present(part, files[i], attribute, current_cluster)?;
 
             if (i == files.len() - 1) {
                 return Ok(current_file);
@@ -766,18 +970,18 @@ impl FileSystem {
         }
         Err(FileStatus::PathNotFound)
     }
-    pub fn find_dir(part: &mut Partition, path: &str) -> Result<FileEntry, FileStatus> {
+    pub fn find_dir(&self, part: &mut Partition, path: &str) -> Result<FileEntry, FileStatus> {
         if (path == "\\") {
-            let mut root_dir = FileEntry::new("", "", 2);
+            let mut root_dir = FileEntry::new("", "", self.params.root_clus);
             root_dir.attributes = u8::from(FileAttribute::Directory);
             return Ok(root_dir);
         }
         let files = Self::file_parser(path);
-        let mut current_cluster = 2;
+        let mut current_cluster = self.params.root_clus;
         for i in 0..files.len() {
             let attribute = FileAttribute::Directory;
 
-            let current_file = Self::file_present(part, files[i], attribute, current_cluster)?;
+            let current_file = self.file_present(part, files[i], attribute, current_cluster)?;
 
             if i == files.len() - 1 {
                 return Ok(current_file);
@@ -788,6 +992,7 @@ impl FileSystem {
         Err(PathNotFound)
     }
     pub fn create_file(
+        &self,
         part: &mut Partition,
         file_name: &str,
         file_extension: &str,
@@ -795,25 +1000,22 @@ impl FileSystem {
     ) -> Result<(), FileStatus> {
         let file_path = format!("{}\\{}.{}", path, file_name, file_extension);
 
-        if Self::find_file(part, file_path.as_str()).is_ok() {
+        if self.find_file(part, file_path.as_str()).is_ok() {
             return Err(FileStatus::FileAlreadyExist);
         }
 
-        // Get the directory where the file will be created
-        let dir = Self::find_dir(part, File::remove_file_from_path(&file_path));
+        let dir = self.find_dir(part, File::remove_file_from_path(&file_path));
         match dir {
             Ok(dir) => {
-                let free_cluster = Self::find_free_cluster(part, 0);
+                let free_cluster = self.find_free_cluster(part, 0);
                 if free_cluster == 0xFFFFFFFF {
-                    return Err(FileStatus::UnknownFail); // No free cluster available
+                    return Err(FileStatus::UnknownFail);
                 }
 
-                // Create the file entry
-                Self::update_fat(part, free_cluster, 0xFFFFFFFF);
+                self.update_fat(part, free_cluster, 0xFFFFFFFF);
                 let mut entry = FileEntry::new(file_name, file_extension, free_cluster);
                 entry.file_size = 0;
 
-                // Check if this file name needs a long name
                 let full_name = if file_extension.is_empty() {
                     file_name.to_string()
                 } else {
@@ -822,7 +1024,6 @@ impl FileSystem {
 
                 let needs_lfn = {
                     let upper = full_name.to_uppercase();
-                    // LFN needed if >8.3, has spaces, or invalid chars for SFN
                     let parts: Vec<&str> = upper.split('.').collect();
                     let name_ok = parts[0].len() <= 8
                         && parts[0]
@@ -837,9 +1038,9 @@ impl FileSystem {
                 };
 
                 if needs_lfn {
-                    Self::write_file_to_dir(part, &entry, dir.get_cluster(), Some(full_name))?;
+                    self.write_file_to_dir(part, &entry, dir.get_cluster(), Some(full_name))?;
                 } else {
-                    Self::write_file_to_dir(part, &entry, dir.get_cluster(), None)?;
+                    self.write_file_to_dir(part, &entry, dir.get_cluster(), None)?;
                 }
 
                 Ok(())
@@ -848,23 +1049,24 @@ impl FileSystem {
             Err(err) => Err(err),
         }
     }
-
+    fn calc_cluster_size(&self) -> usize {
+        (self.params.bps as usize * self.params.spc as usize)
+    }
     pub fn write_file(
+        &self,
         part: &mut Partition,
         file_data: &[u8],
         path: &str,
     ) -> Result<(), FileStatus> {
-        // Find the file to overwrite
-        let mut file_entry = Self::find_file(part, path)?;
-        let cluster_size = CLUSTER_OFFSET as usize;
+        let mut file_entry = self.find_file(part, path)?;
+        let cluster_size = self.calc_cluster_size();
         let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
-        let old_clusters = Self::get_all_clusters(part, file_entry.get_cluster())?;
+        let old_clusters = self.get_all_clusters(part, file_entry.get_cluster())?;
         let old_clusters_needed = old_clusters.len();
 
         let mut buffer = vec![0u8; cluster_size];
         let mut current_cluster = file_entry.get_cluster();
 
-        // Write data to the existing clusters
         for i in 0..new_clusters_needed {
             let data_offset = i * cluster_size;
             let bytes_to_copy = core::cmp::min(cluster_size, file_data.len() - data_offset);
@@ -872,46 +1074,45 @@ impl FileSystem {
             buffer[..bytes_to_copy]
                 .copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
 
-            // Write the buffer to the current cluster
-            Self::write_cluster(part, current_cluster, &buffer)?;
+            self.write_cluster(part, current_cluster, &buffer)?;
 
-            // Check if we need more clusters
             if i < new_clusters_needed - 1 {
                 if i < old_clusters_needed - 1 {
                     current_cluster = old_clusters[i + 1];
                 } else {
-                    let next_cluster = Self::find_free_cluster(part, current_cluster);
+                    let next_cluster = self.find_free_cluster(part, current_cluster);
                     if next_cluster == 0xFFFFFFFF {
-                        return Err(FileStatus::UnknownFail); // No free cluster available
+                        return Err(FileStatus::UnknownFail);
                     }
-                    Self::update_fat(part, current_cluster, next_cluster);
+                    self.update_fat(part, current_cluster, next_cluster);
                     current_cluster = next_cluster;
                 }
             } else {
-                Self::update_fat(part, current_cluster, 0xFFFFFFFF); // End of chain
+                self.update_fat(part, current_cluster, 0xFFFFFFFF);
             }
         }
 
-        // If there are leftover clusters, free them
         if old_clusters_needed > new_clusters_needed {
             for cluster in &old_clusters[new_clusters_needed..] {
-                Self::update_fat(part, *cluster, 0x00000000); // Mark as free
+                self.update_fat(part, *cluster, 0x00000000);
             }
         }
 
-        // Update directory entry
         file_entry.file_size = file_data.len() as u32;
         let starting_cluster = file_entry.get_cluster();
 
-        if Self::update_dir_entry(part, path, file_entry, starting_cluster, None).is_err() {
+        if self
+            .update_dir_entry(part, path, file_entry, starting_cluster, None)
+            .is_err()
+        {
             return Err(FileStatus::UnknownFail);
         }
         Ok(())
     }
-    pub fn list_dir(part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus> {
+    pub fn list_dir(&self, part: &mut Partition, path: &str) -> Result<Vec<String>, FileStatus> {
         let parsed = FileSystem::file_parser(path);
-        let dir_entry = Self::find_dir(part, path)?;
-        let files = Self::read_dir(part, dir_entry.get_cluster())?;
+        let dir_entry = self.find_dir(part, path)?;
+        let files = self.read_dir(part, dir_entry.get_cluster())?;
         if let Some(last) = parsed.last() {
             if last.to_string() == ".." {
                 return Err(FileStatus::BadPath);
@@ -996,11 +1197,11 @@ impl FileSystem {
         out
     }
 
-    pub fn read_file(part: &mut Partition, path: &str) -> Result<Vec<u8>, FileStatus> {
-        let entry = Self::find_file(part, path)?;
+    pub fn read_file(&self, part: &mut Partition, path: &str) -> Result<Vec<u8>, FileStatus> {
+        let entry = self.find_file(part, path)?;
         let file_size = entry.file_size as usize;
-        let cluster_sz = CLUSTER_OFFSET as usize;
-        let clusters = Self::get_all_clusters(part, entry.get_cluster())?;
+        let cluster_sz = self.calc_cluster_size();
+        let clusters = self.get_all_clusters(part, entry.get_cluster())?;
 
         let mut file_data = vec![0u8; file_size];
         let mut cluster = vec![0u8; cluster_sz];
@@ -1010,7 +1211,7 @@ impl FileSystem {
             if base >= file_size {
                 break;
             }
-            Self::read_cluster(part, cl, &mut cluster)?;
+            self.read_cluster(part, cl, &mut cluster)?;
 
             let remaining = file_size - base;
             let take = core::cmp::min(cluster_sz, remaining);
@@ -1019,28 +1220,26 @@ impl FileSystem {
 
         Ok(file_data)
     }
-    pub fn delete_file(part: &mut Partition, path: &str) -> Result<(), FileStatus> {
+    pub fn delete_file(&self, part: &mut Partition, path: &str) -> Result<(), FileStatus> {
         if path == "\\" {
             return Ok(());
         }
 
-        // Figure out if it's a directory or a file
         let entry = if Self::get_text_after_last_dot(path).is_empty() {
-            Self::find_dir(part, path)?
+            self.find_dir(part, path)?
         } else {
-            Self::find_file(part, path)?
+            self.find_file(part, path)?
         };
 
-        let clusters = Self::get_all_clusters(part, entry.get_cluster())?;
+        let clusters = self.get_all_clusters(part, entry.get_cluster())?;
 
-        // Locate and delete both LFN and SFN entries
         let dir_path = File::remove_file_from_path(path);
-        let dir_entry = Self::find_dir(part, dir_path)?;
-        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster())?;
-        let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
+        let dir_entry = self.find_dir(part, dir_path)?;
+        let dir_clusters = self.get_all_clusters(part, dir_entry.get_cluster())?;
+        let mut dir_buffer = vec![0u8; (self.params.spc as usize * self.params.bps as usize)];
 
         for cluster in dir_clusters {
-            Self::read_cluster(part, cluster, &mut dir_buffer)?;
+            self.read_cluster(part, cluster, &mut dir_buffer)?;
             let entry_size = 32;
 
             for i in (0..dir_buffer.len()).step_by(entry_size) {
@@ -1048,10 +1247,8 @@ impl FileSystem {
                     u32::from_le_bytes([dir_buffer[i + 26], dir_buffer[i + 27], 0, 0]);
 
                 if entry_starting_cluster == entry.get_cluster() {
-                    // Delete SFN
                     dir_buffer[i] = 0xE5;
 
-                    // Delete any preceding LFN entries
                     let mut j = i;
                     while j >= entry_size {
                         if dir_buffer[j - entry_size + 11] == 0x0F {
@@ -1062,45 +1259,61 @@ impl FileSystem {
                         }
                     }
 
-                    Self::write_cluster(part, cluster, &dir_buffer)?;
+                    self.write_cluster(part, cluster, &dir_buffer)?;
                     break;
                 }
             }
         }
 
-        // Free all clusters used by the file/dir
         for cluster in clusters {
-            Self::update_fat(part, cluster, 0x00000000);
+            self.update_fat(part, cluster, 0x00000000);
         }
 
         Ok(())
     }
     ///set ignore cluster to 0 to ignore no clusters
-    fn find_free_cluster(part: &mut Partition, ignore: u32) -> u32 {
-        let fat_sectors = Self::calculate_max_fat_size(part.size);
+    fn find_free_cluster(&self, part: &mut Partition, ignore: u32) -> u32 {
+        let bps = self.params.bps as usize;
+        let ents_per_sec = (bps / 4) as u32;
+        let fat_sectors = self.params.fatsz;
+
+        let mirroring_disabled = (self.params.ext_flags & 0x0080) != 0;
+        let active = if mirroring_disabled {
+            (self.params.ext_flags & 0x000F) as u32
+        } else {
+            0
+        };
+        let base_lba = self.params.fat_start_lba + active * fat_sectors;
+
+        let cluster_count =
+            (self.params.totsec - self.params.data_start_lba) / self.params.spc as u32;
+
+        let mut sec = vec![0u8; bps];
         for i in 0..fat_sectors {
-            let mut buf = vec![0u8; 512];
-            part.read(i + RESERVED_SECTORS, &mut buf);
-            for j in 0..128 {
-                let idx = i * 128 + j as u32;
+            part.read(base_lba + i, &mut sec);
+            for j in 0..ents_per_sec {
+                let idx = i * ents_per_sec + j;
                 if idx < 2 || idx == ignore {
                     continue;
                 }
-                let ent = u32::from_le_bytes([
-                    buf[j * 4],
-                    buf[j * 4 + 1],
-                    buf[j * 4 + 2],
-                    buf[j * 4 + 3],
-                ]) & 0x0FFF_FFFF;
+                if idx >= cluster_count + 2 {
+                    continue;
+                }
+
+                let off = (j * 4) as usize;
+                let ent = u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]])
+                    & 0x0FFF_FFFF;
+
                 if ent == 0 {
+                    // free
                     return idx;
                 }
             }
         }
         0xFFFF_FFFF
     }
-    ///starting cluster is the cluster that will be searched for NOT the one it will be updated to
     pub fn update_dir_entry(
+        &self,
         part: &mut Partition,
         path: &str,
         new_entry: FileEntry,
@@ -1108,12 +1321,13 @@ impl FileSystem {
         long_name: Option<String>,
     ) -> Result<(), FileStatus> {
         let dir_path = File::remove_file_from_path(path);
-        let dir_entry = Self::find_dir(part, dir_path)?;
-        let dir_clusters = Self::get_all_clusters(part, dir_entry.get_cluster())?;
-        let mut dir_buffer = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
+        let dir_entry = self.find_dir(part, dir_path)?;
+        let dir_clusters = self.get_all_clusters(part, dir_entry.get_cluster())?;
+        let mut dir_buffer =
+            vec![0u8; (self.params.spc as usize * self.params.bps as usize) as usize];
 
         for cluster in dir_clusters {
-            Self::read_cluster(part, cluster, &mut dir_buffer)?;
+            self.read_cluster(part, cluster, &mut dir_buffer)?;
             let entry_size = 32;
 
             for i in (0..dir_buffer.len()).step_by(entry_size) {
@@ -1132,7 +1346,7 @@ impl FileSystem {
                             }
                         }
                         dir_buffer[i] = 0xE5;
-                        Self::write_cluster(part, cluster, &dir_buffer)?;
+                        self.write_cluster(part, cluster, &dir_buffer)?;
 
                         let (base, ext) = match ln.rsplit_once('.') {
                             Some((b, e)) => (b.to_string(), e.to_string()),
@@ -1142,12 +1356,12 @@ impl FileSystem {
                             FileEntry::new_long_name(&base, &ext, new_entry.get_cluster());
 
                         for e in &new_entries {
-                            Self::write_file_to_dir(part, e, dir_entry.get_cluster(), None)?;
+                            self.write_file_to_dir(part, e, dir_entry.get_cluster(), None)?;
                         }
                         return Ok(());
                     } else {
                         new_entry.write_to_buffer(&mut dir_buffer, i);
-                        Self::write_cluster(part, cluster, &dir_buffer)?;
+                        self.write_cluster(part, cluster, &dir_buffer)?;
                         return Ok(());
                     }
                 }
@@ -1158,6 +1372,7 @@ impl FileSystem {
     }
 
     fn write_file_to_dir(
+        &self,
         part: &mut Partition,
         entry: &FileEntry,
         start_cluster_of_dir: u32,
@@ -1172,13 +1387,13 @@ impl FileSystem {
             let entries = FileEntry::new_long_name(&name_part, &ext_part, entry.get_cluster());
 
             for e in &entries {
-                Self::write_file_to_dir(part, e, start_cluster_of_dir, None)?;
+                self.write_file_to_dir(part, e, start_cluster_of_dir, None)?;
             }
             return Ok(());
         }
-        let mut dir_buf = vec![0u8; (SECTORS_PER_CLUSTER * 512) as usize];
-        let clusters = Self::get_all_clusters(part, start_cluster_of_dir)?;
-        Self::read_cluster(part, clusters[clusters.len() - 1], &mut dir_buf)?;
+        let mut dir_buf = vec![0u8; (self.params.spc as usize * self.params.bps as usize) as usize];
+        let clusters = self.get_all_clusters(part, start_cluster_of_dir)?;
+        self.read_cluster(part, clusters[clusters.len() - 1], &mut dir_buf)?;
 
         let entry_size = 32;
         let mut entry_offset = None;
@@ -1191,24 +1406,29 @@ impl FileSystem {
         }
 
         if entry_offset.is_none() {
-            let free_cluster = Self::find_free_cluster(part, 0);
+            let free_cluster = self.find_free_cluster(part, 0);
             if free_cluster != 0xFFFFFFFF {
-                Self::update_fat(part, clusters[clusters.len() - 1], free_cluster);
-                Self::update_fat(part, free_cluster, 0xFFFFFFFF);
-                return Self::write_file_to_dir(part, entry, start_cluster_of_dir, long_name);
+                self.update_fat(part, clusters[clusters.len() - 1], free_cluster);
+                self.update_fat(part, free_cluster, 0xFFFFFFFF);
+                return self.write_file_to_dir(part, entry, start_cluster_of_dir, long_name);
             }
         }
 
         if let Some(offset) = entry_offset {
             entry.write_to_buffer(&mut dir_buf, offset);
-            Self::write_cluster(part, clusters[clusters.len() - 1], &dir_buf)?;
+            self.write_cluster(part, clusters[clusters.len() - 1], &dir_buf)?;
         } else {
             println!("No free directory entry found!");
         }
 
         Ok(())
     }
-    fn write_cluster(part: &mut Partition, cluster: u32, buffer: &[u8]) -> Result<(), FileStatus> {
+    fn write_cluster(
+        &self,
+        part: &mut Partition,
+        cluster: u32,
+        buffer: &[u8],
+    ) -> Result<(), FileStatus> {
         if cluster < 2 {
             return Err(FileStatus::CorruptFat);
         }
@@ -1216,17 +1436,17 @@ impl FileSystem {
         if cluster < 2 {
             return Err(FileStatus::CorruptFat);
         }
-        let start_sector = Self::cluster_to_sector(part.size, cluster);
+        let start_sector = self.cluster_to_sector(part.size, cluster);
 
-        let sector_count = SECTORS_PER_CLUSTER;
+        let sector_count = self.params.spc as u32;
 
-        if buffer.len() < (sector_count as usize * 512) {
+        if buffer.len() < (sector_count as usize * self.params.bps as usize) {
             return Err(FileStatus::UnknownFail);
         }
 
         for i in 0..sector_count {
-            let start_idx = (i * 512) as usize;
-            let end_idx = ((i + 1) * 512) as usize;
+            let start_idx = (i * self.params.bps as u32) as usize;
+            let end_idx = ((i + 1) * self.params.bps as u32) as usize;
             let sector = &buffer[start_idx..end_idx];
             let current_sector = start_sector + i;
 
@@ -1236,6 +1456,7 @@ impl FileSystem {
     }
 
     fn read_cluster(
+        &self,
         part: &mut Partition,
         cluster: u32,
         buffer: &mut [u8],
@@ -1247,63 +1468,89 @@ impl FileSystem {
         if cluster < 2 {
             return Err(FileStatus::CorruptFat);
         }
-        let start_sector = Self::cluster_to_sector(part.size, cluster);
+        let start_sector = self.cluster_to_sector(part.size, cluster);
 
-        let sector_count = SECTORS_PER_CLUSTER;
+        let sector_count = self.params.spc as u32;
 
-        if buffer.len() < (sector_count as usize * 512) {
+        if buffer.len() < (sector_count as usize * self.params.bps as usize) {
             return Err(FileStatus::UnknownFail);
         }
 
         for i in 0..sector_count {
-            let mut sector = [0u8; 512];
+            let mut sector = vec![0u8; self.params.bps as usize];
             part.read(start_sector + i, &mut sector);
-            buffer[(i * 512) as usize..((i + 1) * 512) as usize].copy_from_slice(&sector);
+            buffer[(i * self.params.bps as u32) as usize
+                ..((i + 1) * self.params.bps as u32) as usize]
+                .copy_from_slice(&sector);
         }
         Ok(())
     }
 
-    fn sector_for_cluster(cluster: u32) -> u32 {
-        (cluster / (512 / 4)) + RESERVED_SECTORS
-    }
-    fn is_cluster_in_sector(cluster: u32, sector: u32) -> bool {
-        if (FileSystem::sector_for_cluster(cluster) != sector) {
-            return false;
+    #[inline]
+    fn fat_base_lba(&self) -> u32 {
+        let mirroring_disabled = (self.params.ext_flags & 0x0080) != 0;
+        let active_idx = (self.params.ext_flags & 0x000F) as u32;
+        if mirroring_disabled {
+            self.params.fat_start_lba + active_idx * self.params.fatsz
+        } else {
+            self.params.fat_start_lba
         }
-        true
     }
-    fn cluster_in_sector(cluster: u32) -> usize {
-        ((cluster as usize % (512 / 4)) * 4)
+
+    #[inline]
+    fn fat_entries_per_sector(&self) -> u32 {
+        (self.params.bps as u32) / 4
     }
-    fn fat_entry(part: &mut Partition, cl: u32) -> Result<u32, FileStatus> {
-        let bps = SECTOR_SIZE as usize;
-        let fat_start = RESERVED_SECTORS;
-        let byte_off = (cl as u64) * 4;
-        let sector = fat_start + (byte_off / SECTOR_SIZE as u64) as u32;
-        let off = (byte_off % SECTOR_SIZE as u64) as usize;
+
+    fn sector_for_cluster(&self, cluster: u32) -> u32 {
+        let ents_per_sec = self.fat_entries_per_sector();
+        let sector_in_fat = cluster / ents_per_sec;
+        self.fat_base_lba() + sector_in_fat
+    }
+
+    fn is_cluster_in_sector(&self, cluster: u32, sector_lba: u32) -> bool {
+        self.sector_for_cluster(cluster) == sector_lba
+    }
+
+    fn cluster_in_sector(&self, cluster: u32) -> usize {
+        let ents_per_sec = self.fat_entries_per_sector();
+        let idx_in_sector = cluster % ents_per_sec;
+        (idx_in_sector * 4) as usize
+    }
+
+    fn fat_entry(&self, part: &mut Partition, cl: u32) -> Result<u32, FileStatus> {
+        let bps = self.params.bps as usize;
+
+        let sector = self.sector_for_cluster(cl);
+        let off = self.cluster_in_sector(cl);
 
         let mut sec = vec![0u8; bps];
         part.read(sector, &mut sec);
 
-        let raw = u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]);
-        Ok(raw & 0x0FFF_FFFF)
+        let raw =
+            u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF;
+        Ok(raw)
     }
 
     fn is_eoc(v: u32) -> bool {
         v >= 0x0FFF_FFF8 && v <= 0x0FFF_FFFF
     }
 
-    pub fn get_all_clusters(part: &mut Partition, start: u32) -> Result<Vec<u32>, FileStatus> {
+    pub fn get_all_clusters(
+        &self,
+        part: &mut Partition,
+        start: u32,
+    ) -> Result<Vec<u32>, FileStatus> {
         let mut out = Vec::new();
         let mut cl = start & 0x0FFF_FFFF;
 
         if cl < 2 {
             return Ok(out);
-        } // empty/invalid
+        }
 
         loop {
             out.push(cl);
-            let next = Self::fat_entry(part, cl)?;
+            let next = self.fat_entry(part, cl)?;
             if Self::is_eoc(next) {
                 break;
             }
@@ -1317,19 +1564,44 @@ impl FileSystem {
         }
         Ok(out)
     }
-    fn calculate_max_fat_size(volume_size: u64) -> u32 {
-        let size = volume_size - (RESERVED_SECTORS * 512) as u64;
-        let total_clusters = size / CLUSTER_OFFSET as u64;
-        ((total_clusters * 4) / 512) as u32
-    }
-    fn calculate_data_region_start(volume_size: u64) -> u32 {
-        Self::calculate_max_fat_size(volume_size) + RESERVED_SECTORS
+    #[inline]
+    fn calculate_data_region_start(&self) -> u32 {
+        self.params.rsvd as u32 + (self.params.nfats as u32) * self.params.fatsz
     }
 
-    fn cluster_to_sector(volume_size: u64, cluster: u32) -> u32 {
-        let cluster_offset = SECTORS_PER_CLUSTER as u64;
-        let data_start = Self::calculate_data_region_start(volume_size) as u64;
-        let cluster_index = cluster as u64 - 2; // adjust for FAT cluster numbering
+    fn cluster_to_sector(&self, volume_size: u64, cluster: u32) -> u32 {
+        let cluster_offset = self.params.spc as u64;
+        let data_start = self.calculate_data_region_start() as u64;
+        let cluster_index = cluster as u64 - 2;
         (cluster_index * cluster_offset + data_start) as u32
     }
+}
+pub fn format_boot_drive(
+    part: &mut Partition,
+    ram: &mut RamDiskController,
+    boot: &[BootPkg],
+) -> Result<(), FileStatus> {
+    FileSystem::format_drive(part).map_err(|_| FileStatus::InternalError)?;
+
+    let fs = FileSystem::mount(part)?;
+
+    fs.ensure_dir(part, "\\INSTALL")?;
+    fs.ensure_dir(part, "\\INSTALL\\DRIVERS")?;
+
+    for bp in boot {
+        let base_dir = alloc::format!("\\INSTALL\\DRIVERS\\{}", bp.name);
+        fs.ensure_dir(part, &base_dir)?;
+
+        // TOML
+        fs.create_file(part, bp.name, "toml", &base_dir)?;
+        let toml_path = alloc::format!("{}\\{}.toml", base_dir, bp.name);
+        fs.attach_bytes_zero_copy(part, ram, &toml_path, bp.toml)?;
+
+        // DLL
+        fs.create_file(part, bp.name, "dll", &base_dir)?;
+        let dll_path = alloc::format!("{}\\{}.dll", base_dir, bp.name);
+        fs.attach_bytes_zero_copy(part, ram, &dll_path, bp.image)?;
+    }
+
+    Ok(())
 }

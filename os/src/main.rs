@@ -40,27 +40,27 @@ fn main() {
         }
     } else {
         // === Release mode ===
-        let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)
-            .args([
-                "-m",
-                "1024M",
-                "-no-reboot",
-                "-cpu",
-                "qemu64,+apic,+acpi,invtsc,tsc-frequency=3800000000",
-                "-machine",
-                "type=pc,accel=tcg",
-                "-smp",
-                "2",
-                "-drive",
-                "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
-                "-drive",
-                "file=boot.img,format=raw",
-                "-drive",
-                "file=rustOS.vhdx,if=ide",
-            ])
-            .status()
-            .expect("Failed to run QEMU");
+        // let status = Command::new(r#"C:\Program Files\qemu\qemu-system-x86_64w.exe"#)
+        //     .args([
+        //         "-m",
+        //         "1024M",
+        //         "-no-reboot",
+        //         "-cpu",
+        //         "qemu64,+apic,+acpi,invtsc,tsc-frequency=3800000000",
+        //         "-machine",
+        //         "type=pc,accel=tcg",
+        //         "-smp",
+        //         "2",
+        //         "-drive",
+        //         "if=pflash,format=raw,readonly=on,file=C:\\Program Files\\qemu\\OVMF_X64.fd",
+        //         "-drive",
+        //         "file=boot.img,format=raw",
+        //         "-drive",
+        //         "file=rustOS.vhdx,if=ide",
+        //     ])
+        //     .status()
+        //     .expect("Failed to run QEMU");
 
-        println!("QEMU exited with: {status}");
+        // println!("QEMU exited with: {status}");
     }
 }

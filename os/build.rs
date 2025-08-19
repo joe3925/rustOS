@@ -1,11 +1,9 @@
-use bootloader::{BiosBoot, BootConfig, UefiBoot};
+use bootloader::{BootConfig, UefiBoot};
 use std::{
     env, fs,
     path::PathBuf,
     process::{Command, Stdio},
 };
-
-const UEFI: bool = true;
 
 fn main() {
     let kernel_path =
@@ -38,18 +36,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/ap_startup.asm");
 
-    if UEFI {
-        let config = BootConfig::default();
-        let mut uefi_boot = UefiBoot::new(&kernel_path);
-        uefi_boot.set_boot_config(&config);
-        uefi_boot
-            .create_disk_image(&image_path)
-            .expect("Failed to create UEFI image");
-    } else {
-        BiosBoot::new(&kernel_path)
-            .create_disk_image(&image_path)
-            .expect("Failed to create BIOS image");
-    }
+    let config = BootConfig::default();
+    let mut uefi_boot = UefiBoot::new(&kernel_path);
+    uefi_boot.set_boot_config(&config);
+    uefi_boot
+        .create_disk_image(&image_path)
+        .expect("Failed to create UEFI image");
 
     fs::copy(&kernel_path, &efi_path).expect("Failed to copy EFI file");
 

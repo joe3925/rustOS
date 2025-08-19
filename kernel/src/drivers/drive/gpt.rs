@@ -356,13 +356,13 @@ impl PartitionCollection {
     }
 }
 pub struct Partition {
-    pub(crate) gpt_entry: GptPartitionEntry,
-    parent_drive_index: u64,
-    name: String,
-    pub(crate) label: String,
-    pub(crate) size: u64,
-    controller: PartitionController,
-    pub(crate) is_fat: bool,
+    pub gpt_entry: GptPartitionEntry,
+    pub parent_drive_index: u64,
+    pub name: String,
+    pub label: String,
+    pub size: u64,
+    pub controller: PartitionController,
+    pub is_fat: bool,
 }
 impl Partition {
     pub fn new(
@@ -392,7 +392,6 @@ impl Partition {
     }
     pub fn format(&mut self) -> Result<(), FormatStatus> {
         if (self.is_fat == false) {
-            let fs = FileSystem::new(self.label.clone(), self.size);
             let status = FileSystem::format_drive(self);
             if status.is_ok() {
                 self.is_fat = true;

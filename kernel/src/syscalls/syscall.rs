@@ -60,7 +60,7 @@ pub struct SyscallFrame {
     pub rbp: u64,
     pub rax: u64,
 }
-#[naked]
+#[unsafe(naked)]
 pub unsafe extern "C" fn syscall_entry() -> ! {
     naked_asm!(
         "push rax",
