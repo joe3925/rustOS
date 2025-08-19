@@ -3,10 +3,12 @@ use core::cmp::min;
 use crate::drivers::drive::generic_drive::DriveInfo;
 use crate::vec;
 use alloc::string::ToString;
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec::Vec};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 
 use super::generic_drive::{Drive, DriveController};
 use super::gpt::{GptPartitionEntry, Partition, PartitionController};
+use spin::Mutex;
+
 #[derive(Clone)]
 pub enum SectorView {
     Slice { base: &'static [u8], off: usize },
@@ -16,18 +18,31 @@ pub struct RamDiskController {
     pub sector_size: u32,
     pub reported_sectors: u64,
     pub base: &'static [u8],
-    pub overlay: BTreeMap<u64, Box<[u8]>>,
-    pub views: BTreeMap<u64, SectorView>,
+    // Shared across clones returned by `factory()`:
+    pub overlay: Arc<Mutex<BTreeMap<u64, Box<[u8]>>>>, // LBA -> sector data (COW)
+    pub views: Arc<Mutex<BTreeMap<u64, SectorView>>>,  // LBA -> zero-copy view
 }
+
 impl RamDiskController {
     #[inline]
     fn ss(&self) -> usize {
         self.sector_size as usize
     }
 
-    // NEW: map an LBA to a slice window (no copying)
-    pub fn map_lba_from_slice(&mut self, lba: u32, src: &'static [u8], offset: usize) {
-        self.views.insert(
+    /// Convenience constructor to ensure shared state is initialized correctly.
+    pub fn new(sector_size: u32, reported_sectors: u64, base: &'static [u8]) -> Self {
+        Self {
+            sector_size,
+            reported_sectors,
+            base,
+            overlay: Arc::new(Mutex::new(BTreeMap::new())),
+            views: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// Map an LBA to a slice window (no copying). Safe to call on any clone.
+    pub fn map_lba_from_slice(&self, lba: u32, src: &'static [u8], offset: usize) {
+        self.views.lock().insert(
             lba as u64,
             SectorView::Slice {
                 base: src,
@@ -43,13 +58,13 @@ impl RamDiskController {
         }
 
         // 1) Overlay (written) takes precedence
-        if let Some(over) = self.overlay.get(&(lba as u64)) {
-            buf[..ss].copy_from_slice(&over);
+        if let Some(over) = self.overlay.lock().get(&(lba as u64)) {
+            buf[..ss].copy_from_slice(over);
             return;
         }
 
         // 2) Zero-copy view backed by &'static [u8]
-        if let Some(view) = self.views.get(&(lba as u64)) {
+        if let Some(view) = self.views.lock().get(&(lba as u64)) {
             match *view {
                 SectorView::Slice { base, off } => {
                     let end = core::cmp::min(base.len(), off + ss);
@@ -84,38 +99,37 @@ impl RamDiskController {
         if data.is_empty() {
             return;
         }
-        let mut dst = match self.overlay.get(&(lba as u64)) {
-            Some(existing) => existing.clone(),
-            None => {
-                // Seed from view or base so partial writes behave
-                let mut seeded = vec![0u8; ss].into_boxed_slice();
 
-                if let Some(view) = self.views.get(&(lba as u64)) {
-                    if let SectorView::Slice { base, off } = view {
-                        let end = core::cmp::min(base.len(), off + ss);
-                        let n = end.saturating_sub(*off);
-                        if n > 0 {
-                            seeded[..n].copy_from_slice(&base[*off..end]);
-                        }
-                    }
-                } else {
-                    let off = (lba as usize) * ss;
-                    if off < self.base.len() {
-                        let end = core::cmp::min(off + ss, self.base.len());
-                        let n = end - off;
-                        seeded[..n].copy_from_slice(&self.base[off..end]);
-                    }
+        // Seed from view or base so partial writes behave.
+        // Read the view descriptor without holding the overlay lock to avoid lock ordering issues.
+        let view_opt = { self.views.lock().get(&(lba as u64)).cloned() };
+
+        let mut ol = self.overlay.lock();
+        let dst = ol.entry(lba as u64).or_insert_with(|| {
+            let mut seeded = vec![0u8; ss].into_boxed_slice();
+
+            if let Some(SectorView::Slice { base, off }) = view_opt {
+                let end = min(base.len(), off + ss);
+                let n = end.saturating_sub(off);
+                if n > 0 {
+                    seeded[..n].copy_from_slice(&base[off..end]);
                 }
-
-                self.overlay.insert(lba as u64, seeded);
-                self.overlay.get(&(lba as u64)).unwrap().clone()
+            } else {
+                let off = (lba as usize) * ss;
+                if off < self.base.len() {
+                    let end = min(off + ss, self.base.len());
+                    let n = end - off;
+                    seeded[..n].copy_from_slice(&self.base[off..end]);
+                }
             }
-        };
 
-        let n = core::cmp::min(ss, data.len());
+            seeded
+        });
+
+        let n = min(ss, data.len());
         dst[..n].copy_from_slice(&data[..n]);
-        self.overlay.insert(lba as u64, dst);
     }
+
     pub fn new_partition(&self) -> Partition {
         let driver_controller = self.factory();
         let controller =
@@ -157,19 +171,22 @@ impl DriveController for RamDiskController {
         Vec::new()
     }
 
+    /// Return a controller that shares the *same* overlay and views via Arc.
     fn factory(&self) -> Box<dyn DriveController + Send + Sync> {
         Box::new(RamDiskController {
             sector_size: self.sector_size,
             reported_sectors: self.reported_sectors,
             base: self.base,
-            overlay: BTreeMap::new(),
-            views: self.views.clone(),
+            overlay: self.overlay.clone(), // shared
+            views: self.views.clone(),     // shared
         })
     }
+
     fn is_controller(_: &crate::drivers::pci::device_collection::Device) -> bool
     where
         Self: Sized,
     {
+        // Not PCI-backed
         false
     }
 }

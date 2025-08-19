@@ -11,6 +11,7 @@ use crate::util::BootPkg;
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use spin::mutex::Mutex;
@@ -181,24 +182,17 @@ pub fn boot_part_init(boot: &[BootPkg]) {
         sector_size: 512,
         reported_sectors: (10 * 1024 * 1024 * 1024) / 512,
         base: &[],
-        overlay: BTreeMap::new(),
-        views: BTreeMap::new(),
+        overlay: Arc::new(Mutex::new(BTreeMap::new())),
+        views: Arc::new(Mutex::new(BTreeMap::new())),
     };
 
     let mut part = ram.new_partition();
     part.label = "C:".to_string();
+    part.name = "MAIN VOLUME".to_string();
     if let Err(e) = format_boot_drive(&mut part, &mut ram, boot) {
         println!("BOOT: format_boot_drive failed: {:?}", e);
         return;
     }
-
-    let cap = (10_u64 * 1024_u64 * 1024_u64 * 1024_u64);
-    let info = DriveInfo {
-        model: "RAMDISK".to_string(),
-        serial: "BOOTSET".to_string(),
-        port: 0,
-        capacity: cap,
-    };
 
     VOLUMES.lock().parts.push(part);
 }

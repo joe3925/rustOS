@@ -93,7 +93,7 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut R
         }
 
         PnpMinorFunction::QueryDeviceRelations => {
-            req.status = DriverStatus::NoSuchDevice;
+            req.status = DriverStatus::Success;
             unsafe { pnp_complete_request(req) };
         }
     }

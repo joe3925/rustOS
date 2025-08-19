@@ -812,7 +812,7 @@ impl FileSystem {
         new_cluster: u32,
         parent_cluster: u32,
     ) -> Result<(), FileStatus> {
-        let empty_buffer = vec![0u8; self.params.bps as usize];
+        let empty_buffer = vec![0u8; self.params.bps as usize * self.params.spc as usize];
         self.write_cluster(part, new_cluster, &empty_buffer)?;
 
         let mut entry = FileEntry::new(".", "", new_cluster);

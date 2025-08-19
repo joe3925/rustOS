@@ -24,10 +24,10 @@ static CFG1_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Copy, Debug)]
 pub struct McfgSegment {
-    pub base: u64,     
-    pub seg: u16,      
-    pub start_bus: u8, 
-    pub end_bus: u8,  
+    pub base: u64,
+    pub seg: u16,
+    pub start_bus: u8,
+    pub end_bus: u8,
 }
 
 #[repr(C)]
@@ -38,16 +38,16 @@ pub struct DevExt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarKind {
     None,
-    Io,    
-    Mem32, 
-    Mem64, 
+    Io,
+    Mem32,
+    Mem64,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct Bar {
     pub kind: BarKind,
     pub base: u64,
-    pub size: u64, 
+    pub size: u64,
     pub prefetch: bool,
 }
 
@@ -78,14 +78,15 @@ pub struct PciPdoExt {
     pub prog_if: u8,
     pub revision: u8,
 
-    pub ss_vid: u16, 
-    pub ss_id: u16,  
+    pub ss_vid: u16,
+    pub ss_id: u16,
 
-    pub irq_pin: u8,  
+    pub irq_pin: u8,
     pub irq_line: u8,
 
     pub bars: [Bar; 6],
 }
+
 #[repr(C)]
 pub struct PrepareHardwareCtx {
     pub(crate) original_device: Arc<DeviceObject>,
@@ -94,7 +95,6 @@ pub struct PrepareHardwareCtx {
 
 #[inline]
 fn ecam_phys_addr(seg: &McfgSegment, bus: u8, dev: u8, func: u8, offset: u16) -> u64 {
-
     seg.base + ((bus as u64) << 20) + ((dev as u64) << 15) + ((func as u64) << 12) + (offset as u64)
 }
 
@@ -105,7 +105,6 @@ unsafe fn map_cfg_page(
     dev: u8,
     func: u8,
 ) -> Result<(VirtAddr, u64), PageMapError> {
-    // Map a single 4KiB function config page.
     let pa = PhysAddr::new(ecam_phys_addr(seg, bus, dev, func, 0));
     let sz = 4096u64;
     map_mmio_region(pa, sz).map(|va| (va, sz))
@@ -121,6 +120,7 @@ unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 {
     let p = (base.as_u64() + off as u64) as *const u32;
     core::ptr::read_volatile(p)
 }
+
 #[inline]
 unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
     let p = (base.as_u64() + off as u64) as *mut u32;
@@ -146,11 +146,9 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
     let subclass = ((class_rev >> 16) & 0xFF) as u8;
     let class = ((class_rev >> 24) & 0xFF) as u8;
 
-    // Header Type tells # of bars, and multi-function lives in bit 7.
     let hdr_type = ((unsafe { cfg_read32(va, 0x0C) } >> 16) & 0xFF) as u8;
     let hdr_kind = hdr_type & 0x7F;
 
-    // Subsystem IDs (only valid for type 0 header)
     let (ss_vid, ss_id) = if hdr_kind == 0x00 {
         let ss = unsafe { cfg_read32(va, 0x2C) };
         ((ss & 0xFFFF) as u16, ((ss >> 16) & 0xFFFF) as u16)
@@ -158,12 +156,10 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         (0, 0)
     };
 
-    // Interrupt line/pin
     let intr = unsafe { cfg_read32(va, 0x3C) };
     let irq_line = (intr & 0xFF) as u8;
     let irq_pin = ((intr >> 8) & 0xFF) as u8;
 
-    // BARs
     let mut bars = [Bar::default(); 6];
     let max_bars = if hdr_kind == 0x00 {
         6
@@ -183,14 +179,10 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         }
 
         if (orig & 0x1) == 0x1 {
-            // I/O BAR
             let base = (orig & 0xFFFFFFFC) as u64;
-
-            // Size probe
             unsafe { cfg_write32(va, off, 0xFFFF_FFFF) };
             let sz_mask = unsafe { cfg_read32(va, off) } & 0xFFFFFFFC;
             unsafe { cfg_write32(va, off, orig) };
-
             let size = ((!sz_mask).wrapping_add(1)) as u64;
 
             bars[i] = Bar {
@@ -201,16 +193,12 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
             };
             i += 1;
         } else {
-            // Memory BAR
             let prefetch = (orig & (1 << 3)) != 0;
             let mem_type = (orig >> 1) & 0x3;
 
             match mem_type {
                 0b00 => {
-                    // 32-bit
                     let base = (orig & 0xFFFF_FFF0) as u64;
-
-                    // size
                     unsafe { cfg_write32(va, off, 0xFFFF_FFF0) };
                     let mask = unsafe { cfg_read32(va, off) } & 0xFFFF_FFF0;
                     unsafe { cfg_write32(va, off, orig) };
@@ -225,11 +213,9 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
                     i += 1;
                 }
                 0b10 => {
-                    // 64-bit (consumes two BAR slots)
                     let orig_hi = unsafe { cfg_read32(va, off + 4) };
                     let base = ((orig_hi as u64) << 32) | ((orig as u64) & 0xFFFF_FFF0);
 
-                    // size
                     unsafe { cfg_write32(va, off, 0xFFFF_FFF0) };
                     unsafe { cfg_write32(va, off + 4, 0xFFFF_FFFF) };
                     let mask_lo = unsafe { cfg_read32(va, off) } & 0xFFFF_FFF0;
@@ -245,10 +231,9 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
                         size,
                         prefetch,
                     };
-                    i += 2; // consume the pair
+                    i += 2;
                 }
                 _ => {
-                    // reserved types (treat as absent)
                     i += 1;
                 }
             }
@@ -287,13 +272,6 @@ pub fn header_type(seg: &McfgSegment, bus: u8, dev: u8) -> Option<u8> {
     Some(ht)
 }
 
-/// Build a compact, self-describing resources blob:
-/// [u32 magic='RSRC'][u32 version=1][u32 count]
-/// then `count` entries of:
-///   u32 kind (1=Mem,2=Port,3=Interrupt)
-///   u32 flags (bit0=prefetch for Mem; Interrupt: pin in low 8)
-///   u64 start/base
-///   u64 length (0 if unknown)
 pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     use kernel_api::ResourceKind;
 
@@ -302,9 +280,7 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     for b in p.bars.iter() {
         match b.kind {
             BarKind::None => {}
-            BarKind::Io => {
-                items.push((ResourceKind::Port as u32, 0, b.base, b.size));
-            }
+            BarKind::Io => items.push((ResourceKind::Port as u32, 0, b.base, b.size)),
             BarKind::Mem32 | BarKind::Mem64 => {
                 let mut flags = 0u32;
                 if b.prefetch {
@@ -316,7 +292,7 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     }
 
     if p.irq_pin != 0 {
-        let flags = (p.irq_pin as u32) & 0xFF; // low8 := pin
+        let flags = (p.irq_pin as u32) & 0xFF;
         items.push((ResourceKind::Interrupt as u32, flags, p.irq_line as u64, 0));
     }
 
@@ -333,14 +309,13 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     out
 }
 
-
 #[inline]
 pub fn hwids_for(
     p: &PciPdoExt,
 ) -> (
     alloc::vec::Vec<alloc::string::String>,
     alloc::vec::Vec<alloc::string::String>,
-    alloc::string::String, 
+    alloc::string::String,
 ) {
     use alloc::format;
     use alloc::string::String;
@@ -398,11 +373,13 @@ pub fn instance_path_for(p: &PciPdoExt) -> alloc::string::String {
 pub fn name_for(p: &PciPdoExt) -> alloc::string::String {
     alloc::format!("PCI_{}_{}_{}", p.bus, p.dev, p.func)
 }
+
 struct WaitCtx {
     done: AtomicBool,
     status: UnsafeCell<DriverStatus>,
     blob: UnsafeCell<Vec<u8>>,
 }
+
 extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
@@ -418,9 +395,7 @@ extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) {
     w.done.store(true, Ordering::Release);
 }
 
-/// Synchronously ask the next-lower device (ACPI PDO) for its resources blob.
 fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
-    // Build a PnP QueryResources request
     let pnp_payload = PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
         relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
@@ -464,6 +439,7 @@ fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
     }
     Some(unsafe { core::ptr::read(wc.blob.get()) })
 }
+
 pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request, ctx: usize) {
     let prep_ctx = unsafe { Box::from_raw(ctx as *mut PrepareHardwareCtx) };
     let device = prep_ctx.original_device;
@@ -503,7 +479,6 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
         unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&mut original_start_request) };
     }
 }
-
 
 fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
     let mut segs = Vec::new();
@@ -577,6 +552,7 @@ fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 unsafe fn outl(port: u16, val: u32) {
     asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags));
 }
+
 #[inline]
 unsafe fn inl(port: u16) -> u32 {
     let v: u32;
@@ -584,21 +560,32 @@ unsafe fn inl(port: u16) -> u32 {
     v
 }
 
+// Unlocked helpers
 #[inline]
-fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    let _g = CFG1_LOCK.lock();
-    unsafe {
-        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-        inl(PCI_CFG1_DATA)
-    }
+unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
+    inl(PCI_CFG1_DATA)
 }
 
 #[inline]
-fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
+unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
+    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
+    outl(PCI_CFG1_DATA, val);
+}
+
+// Locked wrappers for general use
+#[inline]
+fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+    let _g = CFG1_LOCK.lock();
+    unsafe { cfg1_read32_unlocked(bus, dev, func, offset) }
+}
+
+#[inline]
+fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> u32 {
     let _g = CFG1_LOCK.lock();
     unsafe {
-        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-        outl(PCI_CFG1_DATA, val);
+        cfg1_write32_unlocked(bus, dev, func, offset, val);
+        val
     }
 }
 
@@ -611,7 +598,9 @@ pub fn header_type_legacy(bus: u8, dev: u8) -> Option<u8> {
 }
 
 pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
-    let did_vid = cfg1_read32(bus, dev, func, 0x00);
+    let _g = CFG1_LOCK.lock();
+
+    let did_vid = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x00) };
     let vendor = did_vid & 0xFFFF;
     if vendor == 0xFFFF {
         return None;
@@ -620,23 +609,23 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
     let device_id = ((did_vid >> 16) & 0xFFFF) as u16;
     let vendor_id = (did_vid & 0xFFFF) as u16;
 
-    let class_rev = cfg1_read32(bus, dev, func, 0x08);
+    let class_rev = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x08) };
     let revision = (class_rev & 0xFF) as u8;
     let prog_if = ((class_rev >> 8) & 0xFF) as u8;
     let subclass = ((class_rev >> 16) & 0xFF) as u8;
     let class = ((class_rev >> 24) & 0xFF) as u8;
 
-    let hdr_type = ((cfg1_read32(bus, dev, func, 0x0C) >> 16) & 0xFF) as u8;
+    let hdr_type = ((unsafe { cfg1_read32_unlocked(bus, dev, func, 0x0C) } >> 16) & 0xFF) as u8;
     let hdr_kind = hdr_type & 0x7F;
 
     let (ss_vid, ss_id) = if hdr_kind == 0x00 {
-        let ss = cfg1_read32(bus, dev, func, 0x2C);
+        let ss = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x2C) };
         ((ss & 0xFFFF) as u16, ((ss >> 16) & 0xFFFF) as u16)
     } else {
         (0, 0)
     };
 
-    let intr = cfg1_read32(bus, dev, func, 0x3C);
+    let intr = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x3C) };
     let irq_line = (intr & 0xFF) as u8;
     let irq_pin = ((intr >> 8) & 0xFF) as u8;
 
@@ -649,11 +638,10 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         0
     };
 
-    let _g = CFG1_LOCK.lock();
     let mut i = 0;
     while i < max_bars {
         let off = 0x10 + (i as u16) * 4;
-        let orig = cfg1_read32(bus, dev, func, off);
+        let orig = unsafe { cfg1_read32_unlocked(bus, dev, func, off) };
         if orig == 0 {
             i += 1;
             continue;
@@ -661,9 +649,9 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
 
         if (orig & 0x1) == 0x1 {
             let base: u64 = (orig & 0xFFFF_FFFC) as u64;
-            cfg1_write32(bus, dev, func, off, 0xFFFF_FFFF);
-            let mask = cfg1_read32(bus, dev, func, off) & 0xFFFF_FFFC;
-            cfg1_write32(bus, dev, func, off, orig);
+            unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFFF) };
+            let mask = unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFFC;
+            unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
             let size = ((!mask).wrapping_add(1)) as u64;
             bars[i] = Bar {
                 kind: BarKind::Io,
@@ -678,9 +666,9 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
             match mem_ty {
                 0b00 => {
                     let base = (orig & 0xFFFF_FFF0) as u64;
-                    cfg1_write32(bus, dev, func, off, 0xFFFF_FFF0);
-                    let mask = cfg1_read32(bus, dev, func, off) & 0xFFFF_FFF0;
-                    cfg1_write32(bus, dev, func, off, orig);
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFF0) };
+                    let mask = unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFF0;
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
                     let size = ((!mask).wrapping_add(1)) as u64;
                     bars[i] = Bar {
                         kind: BarKind::Mem32,
@@ -691,14 +679,15 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
                     i += 1;
                 }
                 0b10 => {
-                    let orig_hi = cfg1_read32(bus, dev, func, off + 4);
+                    let orig_hi = unsafe { cfg1_read32_unlocked(bus, dev, func, off + 4) };
                     let base = ((orig_hi as u64) << 32) | ((orig as u64) & 0xFFFF_FFF0);
-                    cfg1_write32(bus, dev, func, off, 0xFFFF_FFF0);
-                    cfg1_write32(bus, dev, func, off + 4, 0xFFFF_FFFF);
-                    let mask_lo = cfg1_read32(bus, dev, func, off) & 0xFFFF_FFF0;
-                    let mask_hi = cfg1_read32(bus, dev, func, off + 4);
-                    cfg1_write32(bus, dev, func, off, orig);
-                    cfg1_write32(bus, dev, func, off + 4, orig_hi);
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, 0xFFFF_FFF0) };
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off + 4, 0xFFFF_FFFF) };
+                    let mask_lo =
+                        unsafe { cfg1_read32_unlocked(bus, dev, func, off) } & 0xFFFF_FFF0;
+                    let mask_hi = unsafe { cfg1_read32_unlocked(bus, dev, func, off + 4) };
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off, orig) };
+                    unsafe { cfg1_write32_unlocked(bus, dev, func, off + 4, orig_hi) };
                     let mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
                     let size = ((!mask).wrapping_add(1)) as u64;
                     bars[i] = Bar {
@@ -711,11 +700,10 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
                 }
                 _ => {
                     i += 1;
-                } 
+                }
             }
         }
     }
-    drop(_g);
 
     Some(PciPdoExt {
         seg: 0,

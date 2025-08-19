@@ -42,7 +42,7 @@
         }
     },
     "lldb.displayFormat": "hex",
-    "lldb.showDisassembly": "never",
+    "lldb.showDisassembly": "auto",
     "lldb.dereferencePointers": true,
     "lldb.consoleMode": "commands",
     "cSpell.words": [
