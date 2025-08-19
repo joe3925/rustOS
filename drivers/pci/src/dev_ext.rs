@@ -560,7 +560,6 @@ unsafe fn inl(port: u16) -> u32 {
     v
 }
 
-// Unlocked helpers
 #[inline]
 unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
@@ -573,7 +572,6 @@ unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u3
     outl(PCI_CFG1_DATA, val);
 }
 
-// Locked wrappers for general use
 #[inline]
 fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
     let _g = CFG1_LOCK.lock();

@@ -29,7 +29,6 @@ impl RamDiskController {
         self.sector_size as usize
     }
 
-    /// Convenience constructor to ensure shared state is initialized correctly.
     pub fn new(sector_size: u32, reported_sectors: u64, base: &'static [u8]) -> Self {
         Self {
             sector_size,
@@ -39,8 +38,6 @@ impl RamDiskController {
             views: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
-
-    /// Map an LBA to a slice window (no copying). Safe to call on any clone.
     pub fn map_lba_from_slice(&self, lba: u32, src: &'static [u8], offset: usize) {
         self.views.lock().insert(
             lba as u64,
@@ -57,13 +54,11 @@ impl RamDiskController {
             return;
         }
 
-        // 1) Overlay (written) takes precedence
         if let Some(over) = self.overlay.lock().get(&(lba as u64)) {
             buf[..ss].copy_from_slice(over);
             return;
         }
 
-        // 2) Zero-copy view backed by &'static [u8]
         if let Some(view) = self.views.lock().get(&(lba as u64)) {
             match *view {
                 SectorView::Slice { base, off } => {
@@ -80,7 +75,6 @@ impl RamDiskController {
             }
         }
 
-        // 3) Fall back to base image (if present), else zeros
         let off = (lba as usize) * ss;
         if off >= self.base.len() {
             buf[..ss].fill(0);
@@ -100,8 +94,6 @@ impl RamDiskController {
             return;
         }
 
-        // Seed from view or base so partial writes behave.
-        // Read the view descriptor without holding the overlay lock to avoid lock ordering issues.
         let view_opt = { self.views.lock().get(&(lba as u64)).cloned() };
 
         let mut ol = self.overlay.lock();
@@ -171,14 +163,13 @@ impl DriveController for RamDiskController {
         Vec::new()
     }
 
-    /// Return a controller that shares the *same* overlay and views via Arc.
     fn factory(&self) -> Box<dyn DriveController + Send + Sync> {
         Box::new(RamDiskController {
             sector_size: self.sector_size,
             reported_sectors: self.reported_sectors,
             base: self.base,
-            overlay: self.overlay.clone(), // shared
-            views: self.views.clone(),     // shared
+            overlay: self.overlay.clone(),
+            views: self.views.clone(),    
         })
     }
 
@@ -186,7 +177,6 @@ impl DriveController for RamDiskController {
     where
         Self: Sized,
     {
-        // Not PCI-backed
         false
     }
 }
