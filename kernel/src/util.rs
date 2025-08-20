@@ -14,6 +14,7 @@ use crate::executable::pe_loadable;
 use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file::{File, FileStatus, OpenFlags};
+use crate::format;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
@@ -23,7 +24,6 @@ use crate::registry::{is_first_boot, reg};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
-use crate::{format, print_total_usable_gb};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use spin::{Mutex, Once, RwLock};
@@ -157,6 +157,7 @@ pub fn kernel_main() {
     boot_part_init(BOOTSET);
     if (is_first_boot()) {
         setup_file_layout().expect("Failed to create system volume layout");
+
         install_prepacked_drivers().expect("Failed to install pre packed drivers");
     }
     PNP_MANAGER
@@ -213,7 +214,8 @@ pub fn used_memory() -> usize {
 }
 pub fn print_mem_report() {
     let heap_used = interrupts::without_interrupts(move || used_memory());
-    let used_bytes = USED_MEMORY.load(Ordering::SeqCst);
+    let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst);
+    used_bytes += boot_info().kernel_len as usize;
     let total_bytes = total_usable_bytes();
 
     let used_mb = used_bytes / 1_048_576;

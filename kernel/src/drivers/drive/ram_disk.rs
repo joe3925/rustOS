@@ -1,3 +1,5 @@
+// ram_disk.rs
+
 use core::cmp::min;
 
 use crate::drivers::drive::generic_drive::DriveInfo;
@@ -14,13 +16,22 @@ pub enum SectorView {
     Slice { base: &'static [u8], off: usize },
 }
 
+#[derive(Clone)]
+pub struct ViewRun {
+    start_lba: u64,
+    sectors: u32,
+    base: &'static [u8],
+    off: usize,
+}
+
 pub struct RamDiskController {
     pub sector_size: u32,
     pub reported_sectors: u64,
     pub base: &'static [u8],
-    // Shared across clones returned by `factory()`:
-    pub overlay: Arc<Mutex<BTreeMap<u64, Box<[u8]>>>>, // LBA -> sector data (COW)
-    pub views: Arc<Mutex<BTreeMap<u64, SectorView>>>,  // LBA -> zero-copy view
+    pub cluster_bytes: usize,
+    pub overlay: Arc<Mutex<BTreeMap<u64, Box<[u8]>>>>,
+    pub views: Arc<Mutex<BTreeMap<u64, SectorView>>>,
+    pub runs: Arc<Mutex<BTreeMap<u64, ViewRun>>>,
 }
 
 impl RamDiskController {
@@ -34,14 +45,39 @@ impl RamDiskController {
             sector_size,
             reported_sectors,
             base,
+            cluster_bytes: 0,
             overlay: Arc::new(Mutex::new(BTreeMap::new())),
             views: Arc::new(Mutex::new(BTreeMap::new())),
+            runs: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
+
+    pub fn set_cluster_bytes(&mut self, cb: usize) {
+        self.cluster_bytes = cb;
+    }
+
     pub fn map_lba_from_slice(&self, lba: u32, src: &'static [u8], offset: usize) {
         self.views.lock().insert(
             lba as u64,
             SectorView::Slice {
+                base: src,
+                off: offset,
+            },
+        );
+    }
+
+    pub fn map_lba_range_from_slice(
+        &self,
+        start_lba: u32,
+        sectors: u32,
+        src: &'static [u8],
+        offset: usize,
+    ) {
+        self.runs.lock().insert(
+            start_lba as u64,
+            ViewRun {
+                start_lba: start_lba as u64,
+                sectors,
                 base: src,
                 off: offset,
             },
@@ -60,19 +96,42 @@ impl RamDiskController {
         }
 
         if let Some(view) = self.views.lock().get(&(lba as u64)) {
-            match *view {
-                SectorView::Slice { base, off } => {
-                    let end = core::cmp::min(base.len(), off + ss);
-                    let n = end.saturating_sub(off);
-                    if n > 0 {
-                        buf[..n].copy_from_slice(&base[off..end]);
-                    }
-                    if n < ss {
-                        buf[n..ss].fill(0);
-                    }
-                    return;
+            if let SectorView::Slice { base, off } = *view {
+                let end = core::cmp::min(base.len(), off + ss);
+                let n = end.saturating_sub(off);
+                if n > 0 {
+                    buf[..n].copy_from_slice(&base[off..end]);
                 }
+                if n < ss {
+                    buf[n..ss].fill(0);
+                }
+                return;
             }
+        }
+
+        let run_opt = {
+            let runs = self.runs.lock();
+            runs.range(..=lba as u64).next_back().and_then(|(_, r)| {
+                let rel = (lba as u64).wrapping_sub(r.start_lba);
+                if rel < r.sectors as u64 {
+                    Some((rel as usize, r.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+
+        if let Some((rel, r)) = run_opt {
+            let off = r.off + rel * ss;
+            let end = core::cmp::min(off + ss, r.base.len());
+            let n = end.saturating_sub(off);
+            if n > 0 {
+                buf[..n].copy_from_slice(&r.base[off..end]);
+            }
+            if n < ss {
+                buf[n..ss].fill(0);
+            }
+            return;
         }
 
         let off = (lba as usize) * ss;
@@ -96,6 +155,18 @@ impl RamDiskController {
 
         let view_opt = { self.views.lock().get(&(lba as u64)).cloned() };
 
+        let run_opt = {
+            let runs = self.runs.lock();
+            runs.range(..=lba as u64).next_back().and_then(|(_, r)| {
+                let rel = (lba as u64).wrapping_sub(r.start_lba);
+                if rel < r.sectors as u64 {
+                    Some((rel as usize, r.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+
         let mut ol = self.overlay.lock();
         let dst = ol.entry(lba as u64).or_insert_with(|| {
             let mut seeded = vec![0u8; ss].into_boxed_slice();
@@ -105,6 +176,13 @@ impl RamDiskController {
                 let n = end.saturating_sub(off);
                 if n > 0 {
                     seeded[..n].copy_from_slice(&base[off..end]);
+                }
+            } else if let Some((rel, r)) = run_opt {
+                let off = r.off + rel * ss;
+                let end = min(off + ss, r.base.len());
+                let n = end.saturating_sub(off);
+                if n > 0 {
+                    seeded[..n].copy_from_slice(&r.base[off..end]);
                 }
             } else {
                 let off = (lba as usize) * ss;
@@ -125,7 +203,7 @@ impl RamDiskController {
     pub fn new_partition(&self) -> Partition {
         let driver_controller = self.factory();
         let controller =
-            PartitionController::new(driver_controller, 0, (10 * 1024 * 1024 * 1024) / 512);
+            PartitionController::new(driver_controller, 0, (1 * 1024 * 1024 * 1024) / 512);
 
         let dummy = GptPartitionEntry {
             partition_type_guid: *(vec![0u8; 16].as_array().unwrap()),
@@ -168,8 +246,10 @@ impl DriveController for RamDiskController {
             sector_size: self.sector_size,
             reported_sectors: self.reported_sectors,
             base: self.base,
+            cluster_bytes: self.cluster_bytes,
             overlay: self.overlay.clone(),
-            views: self.views.clone(),    
+            views: self.views.clone(),
+            runs: self.runs.clone(),
         })
     }
 

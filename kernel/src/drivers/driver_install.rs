@@ -354,15 +354,15 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
     let img_src_dir = toml_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
     let img_src_full = alloc::format!("{}\\{}", img_src_dir, driver.image);
 
-    let img_file = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    let img_data = img_file.read()?;
-    let mut img_dest = File::open(&img_target_path, &[OpenFlags::CreateNew])?;
-    img_dest.write(&img_data)?;
+    let _ = File::make_dir("C:\\SYSTEM".to_string());
+    let _ = File::make_dir("C:\\SYSTEM\\TOML".to_string());
+    let _ = File::make_dir("C:\\SYSTEM\\MOD".to_string());
 
-    let file = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    let toml_bytes = file.read()?;
-    let mut toml_dest = File::open(&toml_target_path, &[OpenFlags::CreateNew])?;
-    toml_dest.write(&toml_bytes)?;
+    let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
+    img_src.move_no_copy(&img_target_path)?;
+
+    let toml_src = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
+    toml_src.move_no_copy(&toml_target_path)?;
 
     reg::create_key(&key_path)?;
     reg::set_value(
@@ -392,7 +392,6 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
                 ensure_class_key(cls)?;
                 reg_append_class_member(cls, driver_name)?;
             }
-
             if !driver.hwids.is_empty() {
                 let hwk = alloc::format!("{}/Hwids", key_path);
                 reg::create_key(&hwk)?;
@@ -412,7 +411,6 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
             };
             reg::set_value(&flt_key, "Position", Data::Str(pos_s.to_string()))?;
             reg::set_value(&flt_key, "Order", Data::U32(f.order))?;
-
             match &f.target {
                 FilterTarget::Hwid(s) => {
                     reg::set_value(&flt_key, "TargetKind", Data::Str("hwid".into()))?;
@@ -422,7 +420,6 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
                     reg::set_value(&flt_key, "TargetKind", Data::Str("class".into()))?;
                     reg::set_value(&flt_key, "Target", Data::Str(s.clone()))?;
                     reg_append_class_filter(s, f.position, driver_name)?;
-                    // force demand for class filters
                     if driver.start != BootType::Demand {
                         reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))?;
                     }
@@ -442,14 +439,11 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
                 return Err(DriverError::TomlParse);
             }
             let cls = driver.class.as_ref().unwrap();
-
             reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
             reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))?;
-
             ensure_class_key(cls)?;
             let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
             reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string()))?;
-
             if reg::get_value(&class_key, "Version").is_none() {
                 let _ = reg::set_value(&class_key, "Version", Data::U32(1));
             }
@@ -458,6 +452,7 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
             }
         }
     }
+
     PNP_MANAGER.rebuild_index();
     Ok(())
 }

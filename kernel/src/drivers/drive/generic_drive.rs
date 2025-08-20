@@ -7,7 +7,7 @@ use crate::drivers::drive::sata_disk_drivers::AHCIController;
 use crate::drivers::pci::device_collection::Device;
 use crate::file_system::fat::format_boot_drive;
 use crate::println;
-use crate::util::BootPkg;
+use crate::util::{print_mem_report, BootPkg};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
 use alloc::string::{String, ToString};
@@ -184,9 +184,11 @@ pub fn boot_part_init(boot: &[BootPkg]) {
         base: &[],
         overlay: Arc::new(Mutex::new(BTreeMap::new())),
         views: Arc::new(Mutex::new(BTreeMap::new())),
+        runs: Arc::new(Mutex::new(BTreeMap::new())),
+        cluster_bytes: 4096,
     };
-
     let mut part = ram.new_partition();
+
     part.label = "C:".to_string();
     part.name = "MAIN VOLUME".to_string();
     if let Err(e) = format_boot_drive(&mut part, &mut ram, boot) {

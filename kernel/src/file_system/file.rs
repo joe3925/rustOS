@@ -354,6 +354,25 @@ impl File {
         }
         None
     }
+    pub extern "win64" fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
+        let dst_drive = File::get_drive_letter(dst.as_bytes()).ok_or(FileStatus::DriveNotFound)?;
+        if dst_drive != self.drive_label {
+            return Err(FileStatus::DriveNotFound);
+        }
+        let dst_rel = File::remove_drive_from_path(dst);
+        let parent = File::remove_file_from_path(dst_rel);
+
+        if let Some(part) = VOLUMES.lock().find_volume(self.drive_label.clone()) {
+            if !part.is_fat {
+                return Err(FileStatus::NotFat);
+            }
+            let _ = self.mount.create_dir(part, parent);
+            self.mount
+                .move_file_nocopy(part, self.path.as_str(), dst_rel)
+        } else {
+            Err(FileStatus::DriveNotFound)
+        }
+    }
     pub extern "win64" fn check_path(path: &str) -> Result<(), FileStatus> {
         let sanitized_path = File::remove_drive_from_path(path);
         let components = FileSystem::file_parser(sanitized_path);

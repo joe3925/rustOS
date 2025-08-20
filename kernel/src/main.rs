@@ -77,7 +77,6 @@ entry_point!(_start, config = &BOOTLOADER_CONFIG);
 
 fn _start(boot_info_local: &'static mut BootInfo) -> ! {
     reserve_low_2mib(&mut *boot_info_local.memory_regions);
-
     unsafe {
         BOOT_INFO = Some(boot_info_local);
     }
@@ -87,30 +86,6 @@ fn _start(boot_info_local: &'static mut BootInfo) -> ! {
     }
 
     loop {}
-}
-#[inline]
-pub fn print_total_usable_gb(regions: &[MemoryRegion]) {
-    // Sum strictly usable ranges
-    let total_bytes: u128 = regions
-        .iter()
-        .filter(|r| r.kind == MemoryRegionKind::Usable && r.end > r.start)
-        .map(|r| (r.end - r.start) as u128)
-        .sum();
-
-    // Integer, no-std, no-float fixed-point formatting with 2 decimals
-    const GIB: u128 = 1024u128 * 1024u128 * 1024u128;
-    const GB10: u128 = 1_000_000_000u128;
-
-    let gib_int = total_bytes / GIB;
-    let gib_frac = ((total_bytes % GIB) * 100) / GIB; // 2 decimals
-
-    let gb_int = total_bytes / GB10;
-    let gb_frac = ((total_bytes % GB10) * 100) / GB10; // 2 decimals
-
-    println!(
-        "[mem] usable total: {}.{:02} GiB / {}.{:02} GB  ({} bytes)",
-        gib_int, gib_frac, gb_int, gb_frac, total_bytes
-    );
 }
 
 #[inline]
@@ -123,9 +98,8 @@ pub fn total_usable_bytes(regions: &[MemoryRegion]) -> u128 {
 }
 fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0;
-    const LOW_END: u64 = 0x20_0000; // 2 MiB
+    const LOW_END: u64 = 0x20_0000;
 
-    // Index of the first completely empty entry (`start==0 && end==0`)
     let mut free_idx = regions.iter().position(|r| r.start == 0 && r.end == 0);
 
     let mut need_insert: Option<MemoryRegion> = None;
@@ -138,45 +112,36 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
             continue;
         }
         if r.end <= LOW_START || r.start >= LOW_END {
-            continue; // no overlap with the low 2 MiB
+            continue;
         }
 
         tagged_any = true;
 
-        // ── fully inside 0‑2 MiB → just retag ────────────────
         if r.start >= LOW_START && r.end <= LOW_END {
             r.kind = MemoryRegionKind::Bootloader;
             continue;
         }
 
-        // ── crosses the 2 MiB boundary → split ───────────────
         if r.start < LOW_END && r.end > LOW_END {
-            // Remember the low part; we’ll insert it later
             need_insert = Some(MemoryRegion {
                 start: r.start,
                 end: LOW_END,
                 kind: MemoryRegionKind::Bootloader,
             });
 
-            // Keep the upper part as Usable
             r.start = LOW_END;
 
-            // Mark the free slot as consumed; we’ll fill it afterward
             free_idx = free_idx.filter(|_| false);
         }
     }
 
-    // Materialise the split part (if any) once there is no other borrow
     if let Some(low_part) = need_insert {
         if let Some(idx) = free_idx {
             regions[idx] = low_part;
         } else {
-            // No empty slot: fall back to tagging the first 2 MiB as Bootloader
-            // (safe but may merge regions—acceptable in bootstrap code)
         }
     }
 
-    // If nothing overlapped, just create a dedicated region for 0‑2 MiB
     if !tagged_any {
         if let Some(idx) = free_idx {
             regions[idx] = MemoryRegion {
