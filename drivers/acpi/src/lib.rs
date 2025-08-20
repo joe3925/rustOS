@@ -42,7 +42,6 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    println!("BaseBusDriver: DriverEntry called.\n");
     unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };
     DriverStatus::Success
 }
@@ -84,7 +83,6 @@ pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) ->
     );
 
     let dev_ext_ptr = device.dev_ext.as_ptr() as *const DevExt as *mut DevExt;
-    println!("Target address for DevExt: {:p}", dev_ext_ptr);
 
     let new_ext = DevExt {
         ctx: RwLock::new(aml_ctx),
@@ -116,7 +114,6 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
-    println!("[ACPI] Starting ACPI bus enumeration...");
     let dev_ext: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
@@ -149,6 +146,5 @@ pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus 
         create_pnp_bus_from_acpi(&dev_ext.ctx, &parent_dev_node, dev_name);
     }
 
-    println!("[ACPI] --- Enumeration Complete ---");
     DriverStatus::Success
 }

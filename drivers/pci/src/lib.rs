@@ -44,7 +44,6 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    println!("[PCI] DriverEntry");
     unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };
     DriverStatus::Success
 }
@@ -65,8 +64,6 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
 
     match pnp.minor_function {
         PnpMinorFunction::StartDevice => {
-            println!("[PCI] Received StartDevice. Querying parent for resources asynchronously.");
-
             let pnp_payload = kernel_api::alloc_api::PnpRequest {
                 minor_function: PnpMinorFunction::QueryResources,
                 relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
@@ -102,7 +99,6 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
     }
 }
 pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) -> DriverStatus {
-    println!("[PCI] prepare hardware");
     let ext_ptr = device.dev_ext.as_ptr() as *mut DevExt;
     let ext = load_segments_from_parent(device);
     unsafe {
@@ -117,7 +113,6 @@ pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) ->
 }
 
 pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
-    println!("[PCI] enumerate bus");
     let devnode = unsafe {
         (*(Arc::as_ptr(device) as *const DeviceObject))
             .dev_node
@@ -147,7 +142,6 @@ pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus 
                 }
             }
         }
-        println!("[PCI] Legacy enumeration complete: {} function(s).", found);
         return DriverStatus::Success;
     }
 
@@ -170,10 +164,6 @@ pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus 
         }
     }
 
-    println!(
-        "[PCI] Enumeration complete: {} function(s) reported.",
-        found
-    );
     DriverStatus::Success
 }
 

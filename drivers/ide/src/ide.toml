@@ -1,0 +1,4 @@
+image = "ide.dll"
+start = "demand"
+role = "function"
+hwids = ["PCI\\VEN_1234&DEV_1111"]

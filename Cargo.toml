@@ -8,6 +8,7 @@ members = [
     "drivers/base_driver",
     "drivers/acpi",
     "drivers/pci",
+    "drivers/ide",
     "kernel_api",
 ]
 exclude = ["rustos-api"]

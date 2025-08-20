@@ -1,0 +1,27 @@
+
+[package]
+name = "ide"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[lib]
+name = "ide"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+test = false
+
+[profile.dev]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+
+[dependencies]
+kernel_api = { path = "../../kernel_api" }

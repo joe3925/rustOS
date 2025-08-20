@@ -123,19 +123,15 @@ pub fn wait_using_pit_50ms() {
         let mut ch2 = Port::new(PIT_CHANNEL2_PORT);
         let mut mode = Port::new(PIT_MODE_PORT);
 
-        // Configure channel 2, one-shot, binary, mode 0
         control.write(0b1011_0000u8);
 
-        // Write count (low byte, high byte)
         ch2.write((counts_for_50ms & 0xFF) as u8);
         ch2.write((counts_for_50ms >> 8) as u8);
 
-        // Set gate high (bit 0 = 1), speaker off (bit 1 = 0)
         let mut val: u8 = mode.read();
         val = (val & !0b11) | 0b01;
         mode.write(val);
 
-        // Wait for OUT pin (bit 5) to go high
         loop {
             let status: u8 = mode.read();
             if (status & 0b0010_0000) != 0 {
@@ -207,17 +203,14 @@ impl LocalApic for Lapic {
     unsafe fn init(&self, logical_id: u8) {
         let base = self.ptr();
 
-        // 1. enable LAPIC (SVR)
         let svr = base.add(APICOffset::Svr as usize / 4);
         svr.write_volatile(svr.read_volatile() | 0x100);
 
-        // 2. flat logical mode (DFR = 0xFFFF_FFFF, LDR = bit per CPU)
         base.add(APICOffset::Dfr as usize / 4)
             .write_volatile(0xFFFF_FFFF);
         base.add(APICOffset::Ldr as usize / 4)
             .write_volatile((logical_id as u32) << 24);
 
-        // 3. accept all interrupts
         base.add(APICOffset::Tpr as usize / 4).write_volatile(0);
     }
 
@@ -328,7 +321,6 @@ impl ApicImpl {
 
         interrupts::disable();
 
-        // Already installed?  Nothing to do.
         if APIC.lock().is_some() {
             interrupts::enable();
             return Err(ApicErrors::AlreadyInit);

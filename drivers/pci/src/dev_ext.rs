@@ -457,8 +457,6 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
 
     if segments.is_empty() {
         println!("[PCI] no ECAM block found in parent resources");
-    } else {
-        println!("[PCI] ECAM segments from parent: {}", segments.len());
     }
 
     let ext_ptr = device.dev_ext.as_ptr() as *mut DevExt;
@@ -466,7 +464,6 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
         core::ptr::write(ext_ptr, DevExt { segments });
     }
 
-    println!("[PCI] PrepareHardware complete, forwarding original StartDevice request down.");
     let status = unsafe {
         kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower(
             &device,
@@ -533,8 +530,6 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> DevExt {
     let segs = parse_ecam_segments_from_blob(&blob);
     if segs.is_empty() {
         println!("[PCI] no ECAM block found in parent resources");
-    } else {
-        println!("[PCI] ECAM segments from parent: {}", segs.len());
     }
     DevExt { segments: segs }
 }
