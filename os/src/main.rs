@@ -22,7 +22,7 @@ fn main() {
                 "-machine",
                 "q35,accel=tcg",
                 "-smp",
-                "3",
+                "16",
                 "-gdb",
                 "tcp::1234",
                 "-S",

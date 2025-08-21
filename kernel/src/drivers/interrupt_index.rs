@@ -299,9 +299,6 @@ impl ApicImpl {
         if !features.has_apic() {
             return Err(NotAvailable);
         }
-        if !features.has_acpi() {
-            return Err(NoACPI);
-        }
 
         let model = ACPI_TABLES.get_interrupt_model().ok_or(BadInterruptModel)?;
         let lapic =

@@ -197,9 +197,8 @@ pub fn kernel_main() {
         let frac_part = percent_x10 % 1000;
 
         println!(
-            "Timer time per core: {}s, Timer time total {}s, Total: {}m, % in timer: {}.{}%",
+            "Timer time per core: {}s, Total: {}m, % in timer: {}.{}%",
             timer_ms / 1000,
-            timer_ms * 4 / 1000,
             total_ms / 1000 / 60,
             int_part,
             frac_part
