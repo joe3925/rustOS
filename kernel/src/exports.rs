@@ -53,6 +53,7 @@ export! {
     pnp_queue_dpc,
     pnp_send_request,
     pnp_create_child_devnode_and_pdo_with_init,
+    InvalidateDeviceRelations,
 
     driver_get_name,
     driver_get_flags,

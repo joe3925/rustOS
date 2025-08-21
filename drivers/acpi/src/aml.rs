@@ -1,5 +1,6 @@
 use crate::alloc::format;
 use crate::alloc::vec;
+use crate::map_aml;
 use crate::pdo::AcpiPdoExt;
 use crate::pdo::acpi_pdo_pnp_dispatch;
 use alloc::{
@@ -9,6 +10,9 @@ use alloc::{
 };
 use aml::Handler;
 use aml::resource::AddressSpaceDescriptor;
+use aml::value::Args;
+use kernel_api::acpi::mcfg::Mcfg;
+use kernel_api::alloc_api::ffi::get_acpi_tables;
 
 use crate::aml::acpi::address::AddressSpace as AmlAddressSpace;
 use aml::resource::{Resource as AmlResource, Resource};
@@ -24,7 +28,13 @@ use spin::RwLock;
 pub const PAGE_SIZE: usize = 4096;
 
 pub struct KernelAmlHandler;
-
+#[repr(C)]
+pub struct McfgSeg {
+    pub base: u64,
+    pub seg: u16,
+    pub sb: u8,
+    pub eb: u8,
+}
 #[inline]
 fn round_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
@@ -364,11 +374,39 @@ pub fn create_pnp_bus_from_acpi(
             init,
         )
     };
+    let seg = read_int_method(&mut ctx, &dev_name, "_SEG").unwrap_or(0) as u16;
+    let bbn = read_int_method(&mut ctx, &dev_name, "_BBN").unwrap_or(0) as u8;
+    let (sb, eb) = bus_range_from_crs(&mut ctx, &dev_name).unwrap_or((bbn, 0xFF));
+
+    let tables = unsafe { get_acpi_tables() };
+    let mut ecam = alloc::vec::Vec::new();
+
+    if let Ok(map) = tables.find_table::<Mcfg>() {
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                map.virtual_start().as_ptr() as *const u8,
+                map.region_length(),
+            )
+        };
+        for e in parse_mcfg(raw) {
+            if e.seg == seg && !(e.eb < sb || e.sb > eb) {
+                let csb = sb.max(e.sb);
+                let ceb = eb.min(e.eb);
+                ecam.push(McfgSeg {
+                    base: e.base,
+                    seg: e.seg,
+                    sb: csb,
+                    eb: ceb,
+                });
+            }
+        }
+    }
 
     let pext: &mut AcpiPdoExt = unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *mut AcpiPdoExt) };
     pext.acpi_path = dev_name;
     drop(ctx);
     pext.ctx = ctx_lock;
+    pext.ecam = ecam;
     true
 }
 
@@ -415,11 +453,124 @@ fn ser_irq(vector: u32, level: bool, sharable: bool) -> [u8; 12] {
     buf[8..12].copy_from_slice(&(sharable as u32).to_le_bytes());
     buf
 }
+#[inline]
+fn read_int_method(ctx: &mut AmlContext, dev: &AmlName, suffix: &str) -> Option<u64> {
+    let p = AmlName::from_str(&(dev.as_string() + "." + suffix)).ok()?;
+    match ctx.namespace.get_by_path(&p).ok()? {
+        AmlValue::Integer(n) => Some(*n as u64),
+        AmlValue::Method { .. } => match ctx.invoke_method(&p, Args::EMPTY).ok()? {
+            AmlValue::Integer(n) => Some(n as u64),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[inline]
+fn append_ecam(out: &mut Vec<u8>, base: u64, seg: u16, sb: u8, eb: u8) {
+    out.extend_from_slice(b"ECAM");
+    out.extend_from_slice(&1u32.to_le_bytes()); // count
+    out.extend_from_slice(&base.to_le_bytes());
+    out.extend_from_slice(&seg.to_le_bytes());
+    out.push(sb);
+    out.push(eb);
+}
+fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
+    use aml::value::Args;
+    let crs = AmlName::from_str(&(dev.as_string() + "._CRS")).ok()?;
+    let aml::AmlValue::Buffer(b) = ctx.invoke_method(&crs, Args::EMPTY).ok()? else {
+        return None;
+    };
+    let data = b.lock();
+    let mut bytes = data.as_slice();
+    let mut lo = None;
+    let mut hi = None;
+
+    while !bytes.is_empty() {
+        let b0 = bytes[0];
+        if (b0 & 0x80) != 0 {
+            if bytes.len() < 3 {
+                break;
+            }
+            let len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+            if bytes.len() < 3 + len {
+                break;
+            }
+            let body = &bytes[3..3 + len];
+            let typ = b0 & 0x7F;
+
+            if matches!(typ, 0x07 | 0x08 | 0x0A) {
+                if body.len() >= 6 + 2 * 5 {
+                    let res_ty = body[0];
+                    let mut off = 3;
+                    let mut rd = |n: usize| {
+                        let mut t = [0u8; 8];
+                        t[..n].copy_from_slice(&body[off..off + n]);
+                        off += n;
+                        u64::from_le_bytes(t)
+                    };
+                    let _gran = rd(2);
+                    let min = rd(2);
+                    let max = rd(2);
+                    let tra = rd(2);
+                    let lenv = rd(2);
+                    if res_ty == 2 {
+                        let sb = (min + tra) as u8;
+                        let eb = if lenv == 0 {
+                            max as u8
+                        } else {
+                            (min + tra + lenv - 1) as u8
+                        };
+                        lo = Some(sb);
+                        hi = Some(eb);
+                    }
+                }
+            }
+            bytes = &bytes[3 + len..];
+        } else {
+            let len = (b0 & 0x07) as usize;
+            if bytes.len() < 1 + len {
+                break;
+            }
+            bytes = &bytes[1 + len..];
+        }
+    }
+    Some((lo?, hi?))
+}
+
+fn parse_mcfg(raw: &[u8]) -> alloc::vec::Vec<McfgSeg> {
+    let mut v = alloc::vec::Vec::new();
+    if raw.len() < 44 {
+        return v;
+    }
+    let mut off = 44;
+    while off + 16 <= raw.len() {
+        let base = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        let seg = u16::from_le_bytes(raw[off + 8..off + 10].try_into().unwrap());
+        let sb = raw[off + 10];
+        let eb = raw[off + 11];
+        v.push(McfgSeg { base, seg, sb, eb });
+        off += 16;
+    }
+    v
+}
+
+pub fn append_ecam_list(out: &mut Vec<u8>, segs: &[McfgSeg]) {
+    out.extend_from_slice(b"ECAM");
+    out.extend_from_slice(&(segs.len() as u32).to_le_bytes());
+    for s in segs {
+        out.extend_from_slice(&s.base.to_le_bytes());
+        out.extend_from_slice(&s.seg.to_le_bytes());
+        out.push(s.sb);
+        out.push(s.eb);
+    }
+}
 
 pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) -> Option<Vec<u8>> {
     use aml::value::AmlValue;
+
     let crs_path = AmlName::from_str(&(dev.as_string() + "._CRS")).ok()?;
-    let val = ctx.invoke_method(&crs_path, aml::value::Args::EMPTY).ok()?;
+    let val = ctx.invoke_method(&crs_path, Args::EMPTY).ok()?;
     let buf = match val {
         AmlValue::Buffer(b) => b,
         _ => return None,
@@ -428,6 +579,9 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
     let data = buf.lock();
     let mut bytes = data.as_slice();
     let mut out = Vec::new();
+
+    let mut bus_lo: Option<u8> = None;
+    let mut bus_hi: Option<u8> = None;
 
     while !bytes.is_empty() {
         let b0 = bytes[0];
@@ -440,6 +594,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
             if bytes.len() < 3 + len {
                 break;
             }
+
             let body = &bytes[3..3 + len];
             let typ = b0 & 0x7F;
 
@@ -481,11 +636,11 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 
                         let _gran = read_u(w);
                         let min = read_u(w);
-                        let _max = read_u(w);
+                        let max = read_u(w);
                         let tra = read_u(w);
                         let lenv = read_u(w);
 
-                        let start = min + tra;
+                        let start = min.wrapping_add(tra);
                         let mut flags = 0u32;
                         if (general & 0b10) != 0 {
                             flags |= 1 << 1;
@@ -502,6 +657,16 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
                                 ResourceKind::Port,
                                 ser_mem_port(start, lenv, flags),
                             ),
+                            2 => {
+                                let sb = start as u8;
+                                let eb = if lenv == 0 {
+                                    max as u8
+                                } else {
+                                    (start + lenv - 1) as u8
+                                };
+                                bus_lo = Some(sb);
+                                bus_hi = Some(eb);
+                            }
                             _ => {}
                         }
                     }
@@ -541,10 +706,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
                         if mask != 0 {
                             let info = if len >= 3 { Some(body[2]) } else { None };
                             let vector = mask.trailing_zeros().min(15) as u32;
-                            let level = match info {
-                                Some(i) => (i & 0x01) == 0,
-                                None => false,
-                            };
+                            let level = info.map(|i| (i & 0x01) == 0).unwrap_or(false);
                             let sharable = info.map(|i| (i & (1 << 4)) != 0).unwrap_or(false);
                             tlv(
                                 &mut out,
@@ -572,12 +734,25 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
                         );
                     }
                 }
+                // EndTag
                 0x0F => break,
                 _ => {}
             }
 
             bytes = &bytes[1 + len..];
         }
+    }
+
+    let seg = read_int_method(ctx, dev, "_SEG").unwrap_or(0) as u16;
+    let bbn = read_int_method(ctx, dev, "_BBN").unwrap_or(0) as u8;
+    let base = read_int_method(ctx, dev, "_CBA");
+
+    if let Some(cba) = base {
+        let (sb, eb) = match (bus_lo, bus_hi) {
+            (Some(lo), Some(hi)) => (lo, hi),
+            _ => (bbn, 0xFF),
+        };
+        append_ecam(&mut out, cba, seg, sb, eb);
     }
 
     Some(out)

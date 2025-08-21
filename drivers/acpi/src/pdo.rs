@@ -5,12 +5,13 @@ use alloc::{
 use aml::{AmlContext, AmlName, AmlValue, value::Args};
 use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, QueryIdType, Request, println};
 
-use crate::aml::{build_query_resources_blob, read_ids};
+use crate::aml::{McfgSeg, append_ecam_list, build_query_resources_blob, read_ids};
 
 #[repr(C)]
 pub struct AcpiPdoExt {
     pub acpi_path: aml::AmlName,
     pub ctx: *const spin::RwLock<aml::AmlContext>,
+    pub ecam: alloc::vec::Vec<McfgSeg>,
 }
 
 #[unsafe(no_mangle)]
@@ -69,16 +70,17 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut R
             let ctx_lock: &spin::RwLock<aml::AmlContext> = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
 
-            match build_query_resources_blob(&mut ctx, &ext.acpi_path) {
-                Some(blob) => {
-                    pnp.blob_out = blob;
-                    req.status = DriverStatus::Success;
-                }
-                None => {
-                    req.status = DriverStatus::NoSuchDevice;
-                }
+            let mut blob = build_query_resources_blob(&mut ctx, &ext.acpi_path).unwrap_or_default();
+            if !ext.ecam.is_empty() {
+                append_ecam_list(&mut blob, &ext.ecam);
             }
 
+            if blob.is_empty() {
+                req.status = DriverStatus::NoSuchDevice;
+            } else {
+                pnp.blob_out = blob;
+                req.status = DriverStatus::Success;
+            }
             drop(ctx);
             unsafe { pnp_complete_request(req) };
         }

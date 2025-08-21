@@ -360,6 +360,10 @@ pub mod alloc_api {
             ) -> DriverStatus;
             pub fn pnp_send_request(target: &IoTarget, req: &mut Request) -> DriverStatus;
             pub fn pnp_complete_request(req: &mut Request);
+            pub fn InvalidateDeviceRelations(
+                device: &Arc<DeviceObject>,
+                relation: DeviceRelationType,
+            ) -> DriverStatus;
             pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
             pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
             pub fn driver_set_evt_device_add(

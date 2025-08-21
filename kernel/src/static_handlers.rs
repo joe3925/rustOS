@@ -14,8 +14,8 @@ use crate::{
         interrupt_index::wait_millis,
         pnp::{
             driver_object::{
-                DeviceInit, DeviceObject, DriverObject, DriverStatus, EvtDriverDeviceAdd,
-                EvtDriverUnload, Request,
+                DeviceInit, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
+                EvtDriverDeviceAdd, EvtDriverUnload, Request,
             },
             pnp_manager::{DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
         },
@@ -166,4 +166,15 @@ pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
         class,
         init,
     )
+}
+#[no_mangle]
+pub extern "win64" fn InvalidateDeviceRelations(
+    device: &Arc<DeviceObject>,
+    relation: DeviceRelationType,
+) -> DriverStatus {
+    let mgr = &*PNP_MANAGER;
+    let Some(dn) = device.dev_node.upgrade() else {
+        return DriverStatus::NoSuchDevice;
+    };
+    mgr.invalidate_device_relations_for_node(&dn, relation)
 }

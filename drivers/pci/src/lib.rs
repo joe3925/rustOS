@@ -248,7 +248,6 @@ pub extern "win64" fn pci_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut ke
         }
 
         PnpMinorFunction::StartDevice => {
-            // Nothing to do for PDO; success and complete.
             req.status = DriverStatus::Success;
             unsafe { pnp_complete_request(req) };
         }
