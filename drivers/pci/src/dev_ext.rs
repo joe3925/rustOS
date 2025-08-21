@@ -408,7 +408,6 @@ fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
         id: 0,
         kind: RequestType::Pnp,
         data: alloc::boxed::Box::new([]),
-        ioctl_code: None,
         completed: false,
         status: DriverStatus::Pending,
         pnp: Some(pnp_payload),

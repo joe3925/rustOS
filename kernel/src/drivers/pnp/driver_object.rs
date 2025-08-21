@@ -120,7 +120,7 @@ pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>);
 
 pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
 pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
-pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request, u32);
+pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request);
 pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 pub type EvtDeviceEnumerateDevices = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 
@@ -174,9 +174,9 @@ pub struct PnpRequest {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum RequestType {
-    Read(fn(&Arc<DeviceObject>, &mut Request)),
-    Write(fn(&Arc<DeviceObject>, &mut Request)),
-    DeviceControl(fn(&Arc<DeviceObject>, &mut Request)),
+    Read { offset: u64, len: usize },
+    Write { offset: u64, len: usize },
+    DeviceControl(u32),
 
     Pnp,
 
@@ -189,7 +189,6 @@ pub struct Request {
     pub id: u64,
     pub kind: RequestType,
     pub data: Box<[u8]>,
-    pub ioctl_code: Option<u32>,
     pub completed: bool,
     pub status: DriverStatus,
 
@@ -201,12 +200,11 @@ pub struct Request {
 
 impl Request {
     #[inline]
-    pub fn new(kind: RequestType, data: Box<[u8]>, ioctl_code: Option<u32>) -> Self {
+    pub fn new(kind: RequestType, data: Box<[u8]>) -> Self {
         Self {
             id: random_number(),
             kind,
             data,
-            ioctl_code,
             completed: false,
             status: DriverStatus::Pending,
             pnp: None,
@@ -222,7 +220,6 @@ impl Request {
             id: 0,
             kind: dummy_kind,
             data: Box::new([]),
-            ioctl_code: None,
             completed: true,
             status: DriverStatus::Success,
             pnp: None,

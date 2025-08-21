@@ -912,7 +912,7 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 blob_out: Vec::new(),
             };
-            let mut start_request = Request::new(RequestType::Pnp, Box::new([]), None);
+            let mut start_request = Request::new(RequestType::Pnp, Box::new([]));
             start_request.pnp = Some(pnp_payload);
 
             let devnode_ptr_as_context = Arc::into_raw(dn.clone()) as usize;
@@ -959,7 +959,7 @@ impl PnpManager {
                     ids_out: Vec::new(),
                     blob_out: Vec::new(),
                 };
-                let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]), None);
+                let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]));
                 bus_enum_request.pnp = Some(pnp_payload);
 
                 let devnode_ptr_as_context = Arc::into_raw(dev_node.clone()) as usize;
@@ -1257,19 +1257,19 @@ impl PnpManager {
                     }
                 }
             }
-            RequestType::Read(_) => {
+            RequestType::Read { offset: _, len: _ } => {
                 if let Some(h) = dev.dev_init.io_read {
                     h(dev, req, req.data.len());
                 }
             }
-            RequestType::Write(_) => {
+            RequestType::Write { offset: _, len: _ } => {
                 if let Some(h) = dev.dev_init.io_write {
                     h(dev, req, req.data.len());
                 }
             }
             RequestType::DeviceControl(_) => {
                 if let Some(h) = dev.dev_init.io_device_control {
-                    h(dev, req, req.ioctl_code.unwrap_or(0));
+                    h(dev, req);
                 }
             }
             RequestType::Dummy => {}
@@ -1358,7 +1358,7 @@ impl PnpManager {
             blob_out: Vec::new(),
         };
 
-        let mut req = Request::new(RequestType::Pnp, Box::new([]), None);
+        let mut req = Request::new(RequestType::Pnp, Box::new([]));
         req.pnp = Some(pnp_payload);
 
         let ctx = Arc::into_raw(dev_node.clone()) as usize;

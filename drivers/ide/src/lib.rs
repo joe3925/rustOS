@@ -5,8 +5,8 @@ extern crate alloc;
 
 mod dev_ext;
 mod msvc_shims;
-
-use alloc::{boxed::Box, string::ToString, sync::Arc};
+use crate::alloc::format;
+use alloc::{boxed::Box, string::ToString, sync::Arc, vec};
 use core::{mem::size_of, panic::PanicInfo, ptr};
 use dev_ext::DevExt;
 use kernel_api::{
@@ -33,11 +33,6 @@ fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
-// =========================== IOCTLs & wire formats ===========================
-
-pub const IOCTL_IDE_IDENTIFY: u32 = 0x8000_0100;
-pub const IOCTL_IDE_READ_LBA28: u32 = 0x8000_0101;
-
 #[repr(C)]
 pub struct IdeReadLba28 {
     pub lba: u32,     // 28-bit effective
@@ -54,6 +49,8 @@ const ATA_SR_DRDY: u8 = 1 << 6;
 const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_ERR: u8 = 1 << 0;
 
+const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
 // =========================== Driver entry ===========================
 
 #[unsafe(no_mangle)]
@@ -66,9 +63,11 @@ pub extern "win64" fn ide_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
-    dev_init_ptr.dev_ext_size = size_of::<DevExt>();
+    dev_init_ptr.dev_ext_size = core::mem::size_of::<DevExt>();
     dev_init_ptr.evt_pnp = Some(ide_pnp_dispatch);
-    dev_init_ptr.io_device_control = Some(ioctl_handler);
+    dev_init_ptr.io_read = Some(ide_read);
+    dev_init_ptr.io_write = Some(ide_write);
+    dev_init_ptr.io_device_control = None;
     DriverStatus::Success
 }
 
@@ -101,7 +100,6 @@ pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Reques
                 id: 0,
                 kind: RequestType::Pnp,
                 data: Box::new([]),
-                ioctl_code: None,
                 completed: false,
                 status: DriverStatus::Pending,
                 pnp: Some(PnpRequest {
@@ -293,9 +291,17 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 
     let ids = DeviceIds {
-        hardware: alloc::vec![alloc::string::String::from("IDE\\DISK")],
-        compatible: alloc::vec![alloc::string::String::from("IDE\\GenDisk")],
+        hardware: vec![
+            "STORAGE\\Disk".into(),
+            format!("STORAGE\\Disk&CH_{:02}&DRV_{:02}", channel, drive),
+        ],
+        compatible: vec![
+            "STORAGE\\GenDisk".into(),
+            "DISK\\GenDisk".into(),
+            "GenDisk".into(),
+        ],
     };
+    let class = Some("Disk".to_string());
 
     let child_init = DeviceInit {
         dev_ext_size: 0,
@@ -312,12 +318,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 
     let (pdo, _) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
-            &parent_dn,
-            short_name,
-            instance,
-            ids,
-            Some("disk".to_string()),
-            child_init,
+            &parent_dn, short_name, instance, ids, class, child_init,
         )
     };
 }
@@ -343,7 +344,9 @@ fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
 
 // =========================== IOCTL path ===========================
 
-pub extern "win64" fn ioctl_handler(device: &Arc<DeviceObject>, request: &mut Request, code: u32) {
+pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {
+    use kernel_api::alloc_api::ffi::pnp_complete_request;
+
     let dx: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
@@ -353,30 +356,186 @@ pub extern "win64" fn ioctl_handler(device: &Arc<DeviceObject>, request: &mut Re
         return;
     }
 
-    match code {
-        IOCTL_IDE_IDENTIFY => {
-            let ok = ata_identify(dx, request);
-            request.status = if ok {
-                DriverStatus::Success
-            } else {
-                DriverStatus::IoError
-            };
-            unsafe { pnp_complete_request(request) };
-        }
-        IOCTL_IDE_READ_LBA28 => {
-            let ok = ata_read_lba28(dx, request);
-            request.status = if ok {
-                DriverStatus::Success
-            } else {
-                DriverStatus::IoError
-            };
-            unsafe { pnp_complete_request(request) };
-        }
+    // Expect RequestType::Read(offset)
+    let offset_bytes: u64 = match request.kind {
+        RequestType::Read {
+            offset: off,
+            len: _,
+        } => off,
         _ => {
             request.status = DriverStatus::InvalidParameter;
             unsafe { pnp_complete_request(request) };
+            return;
         }
+    };
+
+    // Require 512B alignment for now
+    if (offset_bytes & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+        request.status = DriverStatus::InvalidParameter;
+        unsafe { pnp_complete_request(request) };
+        return;
     }
+
+    if len == 0 {
+        request.status = DriverStatus::Success;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+
+    let lba: u32 = (offset_bytes >> 9) as u32; // /512
+    let sectors_total: u32 = (len as u32) >> 9; // /512
+
+    // 28-bit LBA limit
+    if (lba >> 28) != 0 {
+        request.status = DriverStatus::InvalidParameter;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+
+    let out = &mut request.data[..len];
+    let ok = ata_pio_read(dx, lba, sectors_total as u32, out);
+
+    request.status = if ok {
+        DriverStatus::Success
+    } else {
+        DriverStatus::IoError
+    };
+    unsafe { pnp_complete_request(request) };
+}
+
+pub extern "win64" fn ide_write(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {
+    use kernel_api::alloc_api::ffi::pnp_complete_request;
+
+    let dx: &mut DevExt =
+        unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+
+    if !dx.present {
+        request.status = DriverStatus::NoSuchDevice;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+    let offset_bytes: u64 = match request.kind {
+        RequestType::Write {
+            offset: off,
+            len: _,
+        } => off,
+        _ => {
+            request.status = DriverStatus::InvalidParameter;
+            unsafe { pnp_complete_request(request) };
+            return;
+        }
+    };
+
+    if (offset_bytes & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+        request.status = DriverStatus::InvalidParameter;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+
+    if len == 0 {
+        request.status = DriverStatus::Success;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+
+    let lba: u32 = (offset_bytes >> 9) as u32;
+    let sectors_total: u32 = (len as u32) >> 9;
+
+    if (lba >> 28) != 0 {
+        request.status = DriverStatus::InvalidParameter;
+        unsafe { pnp_complete_request(request) };
+        return;
+    }
+
+    let ok = ata_pio_write(dx, lba, sectors_total as u32, &request.data[..len]);
+
+    request.status = if ok {
+        DriverStatus::Success
+    } else {
+        DriverStatus::IoError
+    };
+    unsafe { pnp_complete_request(request) };
+}
+
+fn ata_pio_read(dx: &mut DevExt, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
+    let mut off = 0usize;
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
+        unsafe {
+            // master for now; TODO: select by PDO (0xE0 master / 0xF0 slave)
+            dx.drive_head_port.write(0xE0 | ((lba >> 24) as u8 & 0x0F));
+        }
+        io_wait_400ns(&mut dx.alternative_command_port);
+
+        unsafe {
+            dx.sector_count_port.write(sc);
+            dx.lba_lo_port.write((lba & 0xFF) as u8);
+            dx.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
+            dx.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
+            dx.command_port.write(ATA_CMD_READ_SECTORS);
+        }
+
+        for _ in 0..chunk {
+            if !wait_drq_set(&mut dx.alternative_command_port) {
+                return false;
+            }
+            // read one sector (256 words)
+            for _ in 0..256 {
+                let w: u16 = unsafe { dx.data_port.read() };
+                out[off] = (w & 0xFF) as u8;
+                out[off + 1] = (w >> 8) as u8;
+                off += 2;
+            }
+        }
+
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
+    }
+    true
+}
+
+fn ata_pio_write(dx: &mut DevExt, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
+    let mut off = 0usize;
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
+        unsafe {
+            dx.drive_head_port.write(0xE0 | ((lba >> 24) as u8 & 0x0F));
+        }
+        io_wait_400ns(&mut dx.alternative_command_port);
+
+        unsafe {
+            dx.sector_count_port.write(sc);
+            dx.lba_lo_port.write((lba & 0xFF) as u8);
+            dx.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
+            dx.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
+            dx.command_port.write(ATA_CMD_WRITE_SECTORS);
+        }
+
+        for _ in 0..chunk {
+            if !wait_drq_set(&mut dx.alternative_command_port) {
+                return false;
+            }
+            // write one sector (256 words)
+            for _ in 0..256 {
+                let lo = data[off] as u16;
+                let hi = data[off + 1] as u16;
+                let w = lo | (hi << 8);
+                unsafe { dx.data_port.write(w) };
+                off += 2;
+            }
+        }
+
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
+    }
+
+    // best-effort cache flush
+    unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
+    wait_not_busy(&mut dx.alternative_command_port)
 }
 
 // =========================== ATA helpers and ops ===========================

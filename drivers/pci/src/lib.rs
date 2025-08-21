@@ -72,7 +72,7 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
                 blob_out: Vec::new(),
             };
 
-            let mut query_req = Request::new(RequestType::Pnp, Box::new([]), None);
+            let mut query_req = Request::new(RequestType::Pnp, Box::new([]));
             query_req.pnp = Some(pnp_payload);
 
             let original_req_box = Box::new(core::mem::replace(req, Request::empty()));
