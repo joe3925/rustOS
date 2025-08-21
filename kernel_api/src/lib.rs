@@ -1,5 +1,5 @@
 #![no_std]
-
+#![allow(improper_ctypes, improper_ctypes_definitions)]
 pub extern crate alloc;
 
 pub use acpi;
@@ -328,7 +328,6 @@ pub mod alloc_api {
     pub mod ffi {
         use super::*;
         #[link(name = "KRNL")]
-        #[no_mangle]
         extern "win64" {
             pub fn create_kernel_task(entry: usize, name: String) -> u64;
             pub fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus>;
@@ -379,7 +378,6 @@ pub mod alloc_api {
 pub mod ffi {
     use super::*;
     #[link(name = "KRNL")]
-    #[no_mangle]
 
     extern "win64" {
         pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;

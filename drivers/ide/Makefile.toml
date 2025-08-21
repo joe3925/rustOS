@@ -1,5 +1,5 @@
 [env]
-DRIVER_IMAGE = "BASE"
+DRIVER_IMAGE = "ide"
 
 [tasks.build-driver]
 description = ""

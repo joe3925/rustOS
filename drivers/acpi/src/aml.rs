@@ -285,14 +285,6 @@ pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<Str
 
 const BUS_HIDS: &[&str] = &["ACPI\\PNP0A03", "ACPI\\PNP0A08"];
 
-const SKIP_HIDS: &[&str] = &[
-    "ACPI\\PNP0C0F",
-    "ACPI\\PNP0103",
-    "ACPI\\PNP0C0C",
-    "ACPI\\PNP0C0E",
-    "ACPI\\PNP0C09",
-];
-
 fn read_uid(ctx: &mut AmlContext, dev: &AmlName) -> Option<String> {
     let path = AmlName::from_str(&(dev.as_string() + "._UID")).ok()?;
     match ctx.namespace.get_by_path(&path).ok() {
@@ -352,7 +344,7 @@ pub fn create_pnp_bus_from_acpi(
     } else {
         dev_name.as_string()
     };
-    let mut init = kernel_api::alloc_api::DeviceInit {
+    let init = kernel_api::alloc_api::DeviceInit {
         dev_ext_size: core::mem::size_of::<AcpiPdoExt>(),
         io_read: None,
         io_write: None,
@@ -401,11 +393,6 @@ pub fn pnp_id_from_u32(id: u32) -> String {
 fn le32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
-#[inline]
-fn le64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
 fn tlv(out: &mut Vec<u8>, kind: ResourceKind, payload: impl AsRef<[u8]>) {
     let p = payload.as_ref();
     le32(out, kind as u32);

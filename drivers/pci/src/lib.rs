@@ -1,21 +1,21 @@
 #![no_std]
 #![no_main]
-#![feature(core_intrinsics)]
 extern crate alloc;
 
 mod dev_ext;
 mod msvc_shims;
 
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+#[cfg(not(test))]
+use core::panic::PanicInfo;
 use core::{
     mem::{size_of, zeroed},
-    panic::PanicInfo,
     ptr,
 };
 
 use dev_ext::{
-    DevExt, McfgSegment, PciPdoExt, PrepareHardwareCtx, build_resources_blob, header_type,
-    hwids_for, instance_path_for, load_segments_from_parent, name_for, on_query_resources_complete,
+    DevExt, PciPdoExt, PrepareHardwareCtx, build_resources_blob, header_type, hwids_for,
+    instance_path_for, load_segments_from_parent, name_for, on_query_resources_complete,
     probe_function,
 };
 
@@ -168,8 +168,6 @@ pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus 
 }
 
 fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
-    use kernel_api::alloc_api::ffi::pnp_bind_and_start;
-
     let (hardware, compatible, class_tag) = hwids_for(p);
     let ids = DeviceIds {
         hardware,
@@ -183,7 +181,7 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
     let name = name_for(p);
     let instance_path = instance_path_for(p);
 
-    let (child_dn, child_pdo) = unsafe {
+    let (_child_dn, child_pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             parent,
             name,

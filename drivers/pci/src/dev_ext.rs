@@ -6,9 +6,8 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::{mem::size_of, ptr};
 use kernel_api::alloc_api::PnpRequest;
-use kernel_api::alloc_api::ffi::{get_acpi_tables, pnp_forward_request_to_next_lower};
+use kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower;
 use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, RequestType};
 use kernel_api::{
     PageMapError,
@@ -107,24 +106,26 @@ unsafe fn map_cfg_page(
 ) -> Result<(VirtAddr, u64), PageMapError> {
     let pa = PhysAddr::new(ecam_phys_addr(seg, bus, dev, func, 0));
     let sz = 4096u64;
-    map_mmio_region(pa, sz).map(|va| (va, sz))
+    unsafe { map_mmio_region(pa, sz).map(|va| (va, sz)) }
 }
 
 #[inline]
 unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
-    unmap_range(va, size);
+    unsafe { unmap_range(va, size) };
 }
 
 #[inline]
 unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 {
     let p = (base.as_u64() + off as u64) as *const u32;
-    core::ptr::read_volatile(p)
+    unsafe { core::ptr::read_volatile(p) }
 }
 
 #[inline]
 unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
     let p = (base.as_u64() + off as u64) as *mut u32;
-    core::ptr::write_volatile(p, v);
+    unsafe {
+        core::ptr::write_volatile(p, v);
+    }
 }
 
 pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
@@ -318,7 +319,6 @@ pub fn hwids_for(
     alloc::string::String,
 ) {
     use alloc::format;
-    use alloc::string::String;
     let ven = p.vendor_id as u32;
     let dev = p.device_id as u32;
     let rev = p.revision as u32;
@@ -545,26 +545,26 @@ fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 
 #[inline]
 unsafe fn outl(port: u16, val: u32) {
-    asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags));
+    unsafe { asm!("out dx, eax", in("dx") port, in("eax") val, options(nostack, preserves_flags)) };
 }
 
 #[inline]
 unsafe fn inl(port: u16) -> u32 {
     let v: u32;
-    asm!("in eax, dx", in("dx") port, out("eax") v, options(nostack, preserves_flags));
+    unsafe { asm!("in eax, dx", in("dx") port, out("eax") v, options(nostack, preserves_flags)) };
     v
 }
 
 #[inline]
 unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
-    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-    inl(PCI_CFG1_DATA)
+    unsafe { outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset)) };
+    unsafe { inl(PCI_CFG1_DATA) }
 }
 
 #[inline]
 unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
-    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-    outl(PCI_CFG1_DATA, val);
+    unsafe { outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset)) };
+    unsafe { outl(PCI_CFG1_DATA, val) };
 }
 
 #[inline]

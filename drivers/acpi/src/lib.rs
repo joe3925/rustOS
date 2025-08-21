@@ -7,25 +7,21 @@ mod aml;
 mod dev_ext;
 mod msvc_shims;
 mod pdo;
-use core::{
-    intrinsics::{offset, size_of},
-    mem,
-    panic::PanicInfo,
-    ptr,
-};
+#[cfg(not(test))]
+use core::panic::PanicInfo;
+use core::{intrinsics::size_of, mem, ptr};
 
-use ::aml::{AmlContext, AmlName, AmlValue, DebugVerbosity, LevelType, value::Args};
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
+use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::{
-    DevNode, DeviceObject, DriverObject, DriverStatus, KernelAllocator,
-    acpi::{AcpiTables, AmlTable},
+    DeviceObject, DriverObject, DriverStatus, KernelAllocator,
     alloc_api::{
-        DeviceInit, KernelAcpiHandler,
+        DeviceInit,
         ffi::{driver_set_evt_device_add, get_acpi_tables},
     },
-    ffi::{self, get_rsdp},
+    ffi::{self},
     println,
     x86_64::PhysAddr,
 };
@@ -47,7 +43,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    driver: &Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init_ptr.dev_ext_size = size_of::<DevExt>();

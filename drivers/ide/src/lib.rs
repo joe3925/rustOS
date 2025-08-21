@@ -7,13 +7,13 @@ use core::panic::PanicInfo;
 
 use alloc::sync::Arc;
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator,
     alloc_api::{
-        DeviceInit,
         ffi::{driver_set_evt_device_add, pnp_complete_request},
+        DeviceInit,
     },
     println,
     x86_64::instructions::port::Port,
+    DeviceObject, DriverObject, DriverStatus, KernelAllocator,
 };
 
 use crate::dev_ext::DevExt;
