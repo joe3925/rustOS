@@ -17,3 +17,5 @@ pub extern "C" fn fma(_x: f64, _y: f64, z: f64) -> f64 {
 pub extern "C" fn fmaf(_x: f32, _y: f32, z: f32) -> f32 {
     z
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn __chkstk() {}

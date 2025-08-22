@@ -6,7 +6,12 @@ extern crate alloc;
 mod dev_ext;
 mod msvc_shims;
 use crate::alloc::format;
-use alloc::{boxed::Box, string::ToString, sync::Arc, vec};
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+};
 use core::{mem::size_of, panic::PanicInfo, ptr};
 use dev_ext::DevExt;
 use kernel_api::{
@@ -281,8 +286,76 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
         // nothing found; do nothing else
     }
 }
-
+fn id_string(words: &[u16]) -> String {
+    let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(words.len() * 2);
+    for w in words {
+        let lo = (*w & 0x00FF) as u8;
+        let hi = (*w >> 8) as u8;
+        bytes.push(hi);
+        bytes.push(lo);
+    }
+    let s = core::str::from_utf8(&bytes)
+        .unwrap_or("")
+        .trim_matches(|c| c == '\0' || c == ' ');
+    let mut out = String::with_capacity(s.len());
+    let mut last_ws = false;
+    for ch in s.chars() {
+        let ws = ch.is_ascii_whitespace();
+        if ws {
+            if !last_ws {
+                out.push('_');
+            }
+        } else if ch.is_ascii_graphic() {
+            out.push(ch);
+        }
+        last_ws = ws;
+    }
+    while out.starts_with('_') {
+        out.remove(0);
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
 fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
+    let dx: &mut DevExt =
+        unsafe { &mut *((&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+
+    let dh = if drive == 0 { 0xE0 } else { 0xF0 };
+    let id_words_opt = ata_identify_words(dx, dh);
+
+    let (hardware, compatible) = if let Some(words) = id_words_opt {
+        let model = id_string(&words[27..=46]);
+        let fw = id_string(&words[23..=26]);
+
+        let mut hw = vec![];
+        if !model.is_empty() && !fw.is_empty() {
+            hw.push(alloc::format!("IDE\\Disk{model}_{fw}"));
+        } else if !model.is_empty() {
+            hw.push(alloc::format!("IDE\\Disk{model}"));
+        }
+        hw.push(alloc::format!(
+            "IDE\\Disk&CH_{:02}&DRV_{:02}",
+            channel,
+            drive
+        ));
+
+        let comp = vec!["IDE\\Disk".into(), "GenDisk".into()];
+        (hw, comp)
+    } else {
+        (
+            vec![alloc::format!(
+                "IDE\\Disk&CH_{:02}&DRV_{:02}",
+                channel,
+                drive
+            )],
+            vec!["IDE\\Disk".into(), "GenDisk".into()],
+        )
+    };
+
+    let class = Some("DiskDrive".to_string());
+
     let parent_dn = unsafe {
         (*(Arc::as_ptr(parent) as *const DeviceObject))
             .dev_node
@@ -291,17 +364,9 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 
     let ids = DeviceIds {
-        hardware: vec![
-            "STORAGE\\Disk".into(),
-            format!("STORAGE\\Disk&CH_{:02}&DRV_{:02}", channel, drive),
-        ],
-        compatible: vec![
-            "STORAGE\\GenDisk".into(),
-            "DISK\\GenDisk".into(),
-            "GenDisk".into(),
-        ],
+        hardware,
+        compatible,
     };
-    let class = Some("Disk".to_string());
 
     let child_init = DeviceInit {
         dev_ext_size: 0,
@@ -316,14 +381,13 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
     let instance = alloc::format!("IDE\\CH_{:02}&DRV_{:02}", channel, drive);
 
-    let (pdo, _) = unsafe {
+    let (_pdo, _) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             &parent_dn, short_name, instance, ids, class, child_init,
         )
     };
 }
-
-fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
+fn ata_identify_words(dx: &mut DevExt, dh: u8) -> Option<[u16; 256]> {
     unsafe {
         dx.drive_head_port.write(dh);
     }
@@ -333,15 +397,19 @@ fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
 
     let st: u8 = unsafe { dx.command_port.read() };
     if st == 0 || (st & ATA_SR_ERR) != 0 {
-        return false;
+        return None;
     }
 
-    for _ in 0..256 {
-        let _w: u16 = unsafe { dx.data_port.read() };
+    let mut words = [0u16; 256];
+    for i in 0..256 {
+        words[i] = unsafe { dx.data_port.read() };
     }
-    true
+    Some(words)
 }
 
+fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
+    ata_identify_words(dx, dh).is_some()
+}
 // =========================== IOCTL path ===========================
 
 pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {

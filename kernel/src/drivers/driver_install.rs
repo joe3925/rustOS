@@ -18,7 +18,6 @@ pub enum DriverRole {
     Function,
     Filter,
     Base,
-    Class,
 }
 
 impl DriverRole {
@@ -27,7 +26,6 @@ impl DriverRole {
             "function" | "" => Some(Self::Function),
             "filter" => Some(Self::Filter),
             "base" => Some(Self::Base),
-            "class" => Some(Self::Class),
             _ => None,
         }
     }
@@ -149,13 +147,20 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
         .and_then(BootType::from_str)
         .ok_or(FileStatus::BadPath)?;
 
-    // role defaults to function
-    let role = tbl
-        .get("role")
-        .and_then(|v| inner(v).as_str())
-        .map(DriverRole::from_str)
-        .unwrap_or(Some(DriverRole::Function))
-        .ok_or(FileStatus::BadPath)?;
+    let has_filter_tbl = tbl
+        .get("filter")
+        .and_then(|v| inner(v).as_table())
+        .is_some();
+
+    let explicit_role = tbl.get("role").and_then(|v| inner(v).as_str());
+    let mut role = if has_filter_tbl {
+        DriverRole::Filter
+    } else {
+        match explicit_role {
+            Some("base") => DriverRole::Base,
+            _ => DriverRole::Function,
+        }
+    };
 
     let hwids = tbl
         .get("hwids")
@@ -188,7 +193,6 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
                 .and_then(deint_to_u32)
                 .unwrap_or(100);
 
-            // exactly one target key
             let tgt = if let Some(s) = ftbl.get("hwid").and_then(|v| inner(v).as_str()) {
                 FilterTarget::Hwid(s.to_string())
             } else if let Some(s) = ftbl.get("class").and_then(|v| inner(v).as_str()) {
@@ -205,20 +209,10 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
                 target: tgt,
             })
         })
-        .transpose()?; // Option<Result<..>> -> Result<Option<..>>
+        .transpose()?;
 
     if role == DriverRole::Filter && filter.is_none() {
         return Err(FileStatus::BadPath);
-    }
-
-    if role == DriverRole::Function && class.is_some() && hwids.is_empty() {
-        return Err(FileStatus::BadPath);
-    }
-
-    if role == DriverRole::Class {
-        if !hwids.is_empty() || class.is_none() {
-            return Err(FileStatus::BadPath);
-        }
     }
 
     Ok(DriverToml {
@@ -381,7 +375,6 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         DriverRole::Function => 0,
         DriverRole::Filter => 1,
         DriverRole::Base => 2,
-        DriverRole::Class => 3,
     };
     reg::set_value(&key_path, "Role", Data::U32(role_u32))?;
 
@@ -391,7 +384,19 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
                 reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
                 ensure_class_key(cls)?;
                 reg_append_class_member(cls, driver_name)?;
+
+                if driver.hwids.is_empty() {
+                    let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
+                    reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string()))?;
+                    if reg::get_value(&class_key, "Version").is_none() {
+                        let _ = reg::set_value(&class_key, "Version", Data::U32(1));
+                    }
+                    if reg::get_value(&class_key, "Description").is_none() {
+                        let _ = reg::set_value(&class_key, "Description", Data::Str(cls.clone()));
+                    }
+                }
             }
+
             if !driver.hwids.is_empty() {
                 let hwk = alloc::format!("{}/Hwids", key_path);
                 reg::create_key(&hwk)?;
@@ -433,29 +438,12 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         }
 
         DriverRole::Base => {}
-
-        DriverRole::Class => {
-            if !driver.hwids.is_empty() || driver.class.is_none() {
-                return Err(DriverError::TomlParse);
-            }
-            let cls = driver.class.as_ref().unwrap();
-            reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
-            reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))?;
-            ensure_class_key(cls)?;
-            let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
-            reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string()))?;
-            if reg::get_value(&class_key, "Version").is_none() {
-                let _ = reg::set_value(&class_key, "Version", Data::U32(1));
-            }
-            if reg::get_value(&class_key, "Description").is_none() {
-                let _ = reg::set_value(&class_key, "Description", Data::Str(cls.clone()));
-            }
-        }
     }
 
     PNP_MANAGER.rebuild_index();
     Ok(())
 }
+
 pub fn install_prepacked_drivers() -> Result<(), DriverError> {
     const DRIVER_ROOT: &str = "C:\\INSTALL\\DRIVERS";
 
