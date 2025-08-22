@@ -89,7 +89,7 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
         }
         PnpMinorFunction::QueryDeviceRelations => {
             if pnp.relation == kernel_api::DeviceRelationType::BusRelations {
-                enumerate_bus(device);
+                req.status = enumerate_bus(device);
             }
             unsafe { pnp_forward_request_to_next_lower(device, req) };
         }
@@ -248,10 +248,11 @@ pub extern "win64" fn pci_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut ke
         }
 
         PnpMinorFunction::StartDevice => {
-            req.status = DriverStatus::Success;
             unsafe { pnp_complete_request(req) };
         }
-
+        PnpMinorFunction::QueryDeviceRelations => {
+            unsafe { pnp_complete_request(req) };
+        }
         _ => {
             req.status = DriverStatus::NoSuchDevice;
             unsafe { pnp_complete_request(req) };

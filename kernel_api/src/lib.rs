@@ -14,6 +14,7 @@ use x86_64::structures::paging::mapper::MapToError;
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::AtomicBool;
+use strum::Display;
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
@@ -120,14 +121,18 @@ pub struct File {
     _private: [u8; 0],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(i32)]
+#[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStatus {
-    Success,
-    Pending,
-    IoError,
-    NoSuchDevice,
-    InvalidParameter,
+    Success = 0x0000_0000,
+    Pending = 0x0000_0103,
+    NotImplemented = 0xC000_0002u32 as i32,
+    InvalidParameter = 0xC000_000Du32 as i32,
+    InsufficientResources = 0xC000_009Au32 as i32,
+    NoSuchDevice = 0xC000_000Eu32 as i32,
+    NoSuchFile = 0xC000_000Fu32 as i32,
+    DeviceNotReady = 0xC000_00A3u32 as i32,
+    Unsuccessful = 0xC000_0001u32 as i32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

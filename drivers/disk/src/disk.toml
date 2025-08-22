@@ -1,5 +1,5 @@
 image = "disk.dll"
-start = "boot"
+start = "demand"
 role = "function"
 class = "disk"
 hwids = ["GenDisk"]

@@ -17,7 +17,7 @@ use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator,
     alloc_api::{
         DeviceInit,
-        ffi::{driver_set_evt_device_add, get_acpi_tables},
+        ffi::{driver_set_evt_device_add, get_acpi_tables, pnp_send_request},
     },
     ffi::{self},
     println,

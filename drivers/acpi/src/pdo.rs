@@ -18,6 +18,7 @@ pub struct AcpiPdoExt {
 pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Request) {
     use kernel_api::alloc_api::ffi::pnp_complete_request;
     let Some(pnp) = req.pnp.as_mut() else {
+        println!("NoSuchDevice");
         req.status = DriverStatus::NoSuchDevice;
         unsafe { pnp_complete_request(req) };
         return;
@@ -25,6 +26,7 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut R
 
     match pnp.minor_function {
         PnpMinorFunction::QueryId => {
+            println!("QueryId");
             let ext: &AcpiPdoExt = unsafe { &*((&*dev.dev_ext).as_ptr() as *const AcpiPdoExt) };
             let ctx_lock = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
@@ -66,6 +68,8 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut R
         }
 
         PnpMinorFunction::QueryResources => {
+            println!("QueryResources");
+
             let ext: &AcpiPdoExt = unsafe { &*((&*dev.dev_ext).as_ptr() as *const AcpiPdoExt) };
             let ctx_lock: &spin::RwLock<aml::AmlContext> = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
@@ -86,12 +90,17 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut R
         }
 
         PnpMinorFunction::StartDevice => {
+            println!("StartDevice");
+
             req.status = DriverStatus::Success;
             unsafe { pnp_complete_request(req) };
         }
 
         PnpMinorFunction::QueryDeviceRelations => {
-            req.status = DriverStatus::Success;
+            unsafe { pnp_complete_request(req) };
+        }
+        _ => {
+            req.status = DriverStatus::NotImplemented;
             unsafe { pnp_complete_request(req) };
         }
     }

@@ -90,7 +90,6 @@ pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Reques
 
     let Some(pnp) = req.pnp.as_mut() else {
         req.status = DriverStatus::InvalidParameter;
-        unsafe { pnp_complete_request(req) };
         return;
     };
 
@@ -124,7 +123,6 @@ pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Reques
             if pnp.relation == DeviceRelationType::BusRelations {
                 ide_enumerate_bus(dev);
                 req.status = DriverStatus::Success;
-                unsafe { pnp_complete_request(req) };
             } else {
                 let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
             }
@@ -173,7 +171,6 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
     dx.present = true;
     dx.enumerated = false;
 
-    // Forward original Start down. If lower stack returns NoSuchDevice, complete Success.
     let status = unsafe { pnp_forward_request_to_next_lower(&device, &mut prep.start_req) };
     if status == DriverStatus::NoSuchDevice {
         prep.start_req.status = DriverStatus::Success;
@@ -187,19 +184,16 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
 
 #[derive(Default, Clone, Copy)]
 struct IdeBars {
-    // Primary channel only for minimal path
-    cmd: u16, // BAR0 or legacy 0x1F0
-    ctl: u16, // BAR1 control-block BASE (legacy 0x3F4); ALT-STATUS at base+2
-    bm: u16,  // BMIDE BAR (BAR4), optional
+    cmd: u16,
+    ctl: u16,
+    bm: u16,
 }
 
 fn parse_ide_bars(blob: &[u8]) -> IdeBars {
-    // Parent blob format: "RSRC"<ver><count> repeating (kind,u32)(flags,u32)(start,u64)(len,u64)
     let mut bars = IdeBars::default();
     if blob.len() < 12 || &blob[0..4] != b"RSRC" {
-        // Legacy fallback: cmd at 0x1F0, control-block base at 0x3F4
         bars.cmd = 0x1F0;
-        bars.ctl = 0x3F4; // not 0x3F6; ALT-STATUS is ctl+2 == 0x3F6
+        bars.ctl = 0x3F4;
         return bars;
     }
 
@@ -413,14 +407,11 @@ fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
 // =========================== IOCTL path ===========================
 
 pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {
-    use kernel_api::alloc_api::ffi::pnp_complete_request;
-
     let dx: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
     if !dx.present {
         request.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
@@ -432,7 +423,6 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
         } => off,
         _ => {
             request.status = DriverStatus::InvalidParameter;
-            unsafe { pnp_complete_request(request) };
             return;
         }
     };
@@ -440,13 +430,11 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
     // Require 512B alignment for now
     if (offset_bytes & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         request.status = DriverStatus::InvalidParameter;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
     if len == 0 {
         request.status = DriverStatus::Success;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
@@ -456,7 +444,6 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
     // 28-bit LBA limit
     if (lba >> 28) != 0 {
         request.status = DriverStatus::InvalidParameter;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
@@ -466,20 +453,16 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
     request.status = if ok {
         DriverStatus::Success
     } else {
-        DriverStatus::IoError
+        DriverStatus::Unsuccessful
     };
-    unsafe { pnp_complete_request(request) };
 }
 
 pub extern "win64" fn ide_write(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {
-    use kernel_api::alloc_api::ffi::pnp_complete_request;
-
     let dx: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
     if !dx.present {
         request.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(request) };
         return;
     }
     let offset_bytes: u64 = match request.kind {
@@ -489,20 +472,17 @@ pub extern "win64" fn ide_write(device: &Arc<DeviceObject>, request: &mut Reques
         } => off,
         _ => {
             request.status = DriverStatus::InvalidParameter;
-            unsafe { pnp_complete_request(request) };
             return;
         }
     };
 
     if (offset_bytes & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         request.status = DriverStatus::InvalidParameter;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
     if len == 0 {
         request.status = DriverStatus::Success;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
@@ -511,7 +491,6 @@ pub extern "win64" fn ide_write(device: &Arc<DeviceObject>, request: &mut Reques
 
     if (lba >> 28) != 0 {
         request.status = DriverStatus::InvalidParameter;
-        unsafe { pnp_complete_request(request) };
         return;
     }
 
@@ -520,9 +499,8 @@ pub extern "win64" fn ide_write(device: &Arc<DeviceObject>, request: &mut Reques
     request.status = if ok {
         DriverStatus::Success
     } else {
-        DriverStatus::IoError
+        DriverStatus::Unsuccessful
     };
-    unsafe { pnp_complete_request(request) };
 }
 
 fn ata_pio_read(dx: &mut DevExt, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {

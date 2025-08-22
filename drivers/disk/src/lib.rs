@@ -6,14 +6,14 @@ extern crate alloc;
 use alloc::sync::Arc;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use kernel_api::println;
 use kernel_api::KernelAllocator;
+use kernel_api::println;
 use kernel_api::{
-    alloc_api::{
-        ffi::{driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower},
-        DeviceInit,
-    },
     DeviceObject, DriverObject, DriverStatus, Request,
+    alloc_api::{
+        DeviceInit,
+        ffi::{driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower},
+    },
 };
 mod msvc_shims;
 #[global_allocator]
@@ -52,7 +52,6 @@ pub extern "win64" fn disk_read(
     let st = unsafe { pnp_forward_request_to_next_lower(device, request) };
     if st == DriverStatus::NoSuchDevice {
         request.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(request) };
     }
 }
 
@@ -64,6 +63,5 @@ pub extern "win64" fn disk_write(
     let st = unsafe { pnp_forward_request_to_next_lower(device, request) };
     if st == DriverStatus::NoSuchDevice {
         request.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(request) };
     }
 }

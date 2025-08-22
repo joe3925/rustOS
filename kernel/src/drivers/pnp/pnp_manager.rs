@@ -19,7 +19,7 @@ use crate::file_system::file::{File, FileStatus, OpenFlags};
 use crate::println;
 use crate::registry::reg;
 use crate::registry::{self as regmod, Data, RegError};
-use crate::static_handlers::create_kernel_task;
+use crate::static_handlers::{create_kernel_task, pnp_forward_request_to_next_lower};
 use lazy_static::lazy_static;
 
 use super::driver_object::{
@@ -433,7 +433,6 @@ impl PnpManager {
                 pnp_manager.complete_request(request);
             }
             _ => {
-                request.status = DriverStatus::NoSuchDevice;
                 pnp_manager.complete_request(request);
             }
         }
@@ -973,11 +972,6 @@ impl PnpManager {
                 .as_ref()
                 .and_then(|s| s.get_top_device_object())
             {
-                println!(
-                    "   -> ACTION: Sending QueryDeviceRelations to bus driver for '{}'",
-                    dev_node.name
-                );
-
                 let pnp_payload = PnpRequest {
                     minor_function: PnpMinorFunction::QueryDeviceRelations,
                     relation: DeviceRelationType::BusRelations,
@@ -1010,7 +1004,9 @@ impl PnpManager {
             return;
         }
         let parent_dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
-
+        if req.status == DriverStatus::NotImplemented {
+            return;
+        }
         if req.status != DriverStatus::Success {
             println!(
                 "   -> FAILURE: Bus enumeration failed for '{}' with status {:?}.",
@@ -1237,17 +1233,31 @@ impl PnpManager {
             }
             PnpMinorFunction::QueryDeviceRelations => {
                 if let Some(enumerate_cb) = device.dev_init.evt_bus_enumerate_devices {
-                    let status = enumerate_cb(device);
-                    if status != DriverStatus::Success {
-                        println!("     -> ERROR: EvtBusEnumerateDevices failed.");
-                        request.status = status;
+                    match enumerate_cb(device) {
+                        DriverStatus::Success => {
+                            request.status = DriverStatus::Success;
+                            pnp_manager.complete_request(request);
+                        }
+                        DriverStatus::Pending => {
+                            let st = pnp_manager.send_request_to_next_lower(device, request);
+                            if st == DriverStatus::NoSuchDevice {
+                                request.status = DriverStatus::Success;
+                                pnp_manager.complete_request(request);
+                            }
+                        }
+                        err => {
+                            println!("     -> ERROR: EvtBusEnumerateDevices failed: {:?}", err);
+                            request.status = err;
+                            pnp_manager.complete_request(request);
+                        }
+                    }
+                } else {
+                    let st = pnp_manager.send_request_to_next_lower(device, request);
+                    if st == DriverStatus::NoSuchDevice {
+                        request.status = DriverStatus::Success;
                         pnp_manager.complete_request(request);
-                        return;
                     }
                 }
-
-                request.status = DriverStatus::Success;
-                pnp_manager.complete_request(request);
             }
             _ => {
                 let st = pnp_manager.send_request_to_next_lower(device, request);
@@ -1264,40 +1274,112 @@ impl PnpManager {
             RequestType::Pnp => {
                 if let Some(h) = dev.dev_init.evt_pnp {
                     h(dev, req);
+
+                    if req.status == DriverStatus::Pending {
+                        let st = self.send_request_to_next_lower(dev, req);
+                        if st == DriverStatus::NoSuchDevice {
+                            if let Some(pnp) = req.pnp.as_ref() {
+                                req.status = match pnp.minor_function {
+                                    PnpMinorFunction::StartDevice => DriverStatus::Success,
+                                    _ => DriverStatus::NotImplemented,
+                                };
+                            } else {
+                                req.status = DriverStatus::NotImplemented;
+                            }
+                            if !req.completed {
+                                self.complete_request(req);
+                            }
+                        }
+                    } else if !req.completed {
+                        self.complete_request(req);
+                    }
                 } else {
                     let st = self.send_request_to_next_lower(dev, req);
                     if st == DriverStatus::NoSuchDevice {
                         if let Some(pnp) = req.pnp.as_ref() {
-                            match pnp.minor_function {
-                                PnpMinorFunction::StartDevice => {
-                                    req.status = DriverStatus::Success;
-                                }
-                                _ => {
-                                    req.status = DriverStatus::NoSuchDevice;
-                                }
-                            }
+                            req.status = match pnp.minor_function {
+                                PnpMinorFunction::StartDevice => DriverStatus::Success,
+                                _ => DriverStatus::NotImplemented,
+                            };
                         } else {
-                            req.status = DriverStatus::NoSuchDevice;
+                            req.status = DriverStatus::NotImplemented;
                         }
+                        if !req.completed {
+                            self.complete_request(req);
+                        }
+                    }
+                }
+            }
+
+            RequestType::Read { offset: _, len: _ } => {
+                if let Some(h) = dev.dev_init.io_read {
+                    h(dev, req, req.data.len());
+                    if req.status == DriverStatus::Pending {
+                        let st = self.send_request_to_next_lower(dev, req);
+                        if st == DriverStatus::NoSuchDevice {
+                            req.status = DriverStatus::NoSuchDevice;
+                            if !req.completed {
+                                self.complete_request(req);
+                            }
+                        }
+                    } else if !req.completed {
+                        self.complete_request(req);
+                    }
+                } else {
+                    let st = self.send_request_to_next_lower(dev, req);
+                    if st == DriverStatus::NoSuchDevice && !req.completed {
+                        req.status = DriverStatus::NoSuchDevice;
                         self.complete_request(req);
                     }
                 }
             }
-            RequestType::Read { offset: _, len: _ } => {
-                if let Some(h) = dev.dev_init.io_read {
-                    h(dev, req, req.data.len());
-                }
-            }
+
             RequestType::Write { offset: _, len: _ } => {
                 if let Some(h) = dev.dev_init.io_write {
                     h(dev, req, req.data.len());
+                    if req.status == DriverStatus::Pending {
+                        let st = self.send_request_to_next_lower(dev, req);
+                        if st == DriverStatus::NoSuchDevice {
+                            req.status = DriverStatus::NoSuchDevice;
+                            if !req.completed {
+                                self.complete_request(req);
+                            }
+                        }
+                    } else if !req.completed {
+                        self.complete_request(req);
+                    }
+                } else {
+                    let st = self.send_request_to_next_lower(dev, req);
+                    if st == DriverStatus::NoSuchDevice && !req.completed {
+                        req.status = DriverStatus::NoSuchDevice;
+                        self.complete_request(req);
+                    }
                 }
             }
+
             RequestType::DeviceControl(_) => {
                 if let Some(h) = dev.dev_init.io_device_control {
                     h(dev, req);
+                    if req.status == DriverStatus::Pending {
+                        let st = self.send_request_to_next_lower(dev, req);
+                        if st == DriverStatus::NoSuchDevice {
+                            req.status = DriverStatus::NoSuchDevice;
+                            if !req.completed {
+                                self.complete_request(req);
+                            }
+                        }
+                    } else if !req.completed {
+                        self.complete_request(req);
+                    }
+                } else {
+                    let st = self.send_request_to_next_lower(dev, req);
+                    if st == DriverStatus::NoSuchDevice && !req.completed {
+                        req.status = DriverStatus::NoSuchDevice;
+                        self.complete_request(req);
+                    }
                 }
             }
+
             RequestType::Dummy => {}
         }
     }
@@ -1344,6 +1426,7 @@ impl PnpManager {
             //TODO: handle this correctly
             // Drop for now
         }
+        req.completed = true;
     }
 
     #[inline]

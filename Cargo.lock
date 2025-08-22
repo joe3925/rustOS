@@ -383,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "acpi 5.2.0",
  "spin 0.10.0",
+ "strum",
  "x86_64 0.15.2",
 ]
 
