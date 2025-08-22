@@ -7,8 +7,6 @@ mod aml;
 mod dev_ext;
 mod msvc_shims;
 mod pdo;
-#[cfg(not(test))]
-use core::panic::PanicInfo;
 use core::{intrinsics::size_of, mem, ptr};
 
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
@@ -30,6 +28,8 @@ use spin::RwLock;
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
+#[cfg(not(test))]
+use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {

@@ -768,6 +768,96 @@ impl PnpManager {
         }))
     }
 
+    #[inline]
+    fn ensure_driver_entry(&self, drv: &Arc<DriverObject>) -> bool {
+        let rt = &drv.runtime;
+        if matches!(rt.get_state(), DriverState::Started | DriverState::Pending) {
+            return true;
+        }
+        let m = rt.module.read();
+        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
+            let entry: DriverEntryFn =
+                unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
+            let st = unsafe { entry(drv) };
+            if matches!(st, DriverStatus::Success | DriverStatus::Pending) {
+                rt.set_state(DriverState::Pending);
+                return true;
+            }
+        }
+        rt.set_state(DriverState::Failed);
+        false
+    }
+
+    #[inline]
+    fn attach_one_above(
+        &self,
+        dn: &Arc<DevNode>,
+        below: Option<Arc<DeviceObject>>,
+        drv: &Arc<DriverObject>,
+    ) -> Option<Arc<DeviceObject>> {
+        if !self.ensure_driver_entry(drv) {
+            return None;
+        }
+        if let Some(cb) = drv.evt_device_add {
+            let mut dev_init = DeviceInit::new();
+            let st = cb(drv, &mut dev_init);
+            if st == DriverStatus::Success {
+                if dev_init.evt_pnp.is_none() {
+                    dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
+                }
+                let devobj = DeviceObject::new(dev_init.dev_ext_size);
+                unsafe {
+                    let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
+                    me.dev_init = dev_init;
+                    me.dev_node = Arc::downgrade(dn);
+                }
+                DeviceObject::set_lower_upper(&devobj, below);
+                return Some(devobj);
+            }
+        }
+        None
+    }
+
+    fn ensure_function_attached(&self, dn: &Arc<DevNode>, stk: &mut DeviceStack) -> bool {
+        if stk
+            .function
+            .as_ref()
+            .and_then(|l| l.devobj.as_ref())
+            .is_some()
+        {
+            return true;
+        }
+        let class = match dn.class.as_deref() {
+            Some(c) => c,
+            None => return false,
+        };
+        let pkg = match self.resolve_class_driver(Some(class)).ok().flatten() {
+            Some(p) => p,
+            None => return false,
+        };
+        let drv = match self.ensure_loaded(&pkg) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        let mut below = dn.get_pdo();
+        for l in &stk.lower {
+            if let Some(d) = &l.devobj {
+                below = Some(d.clone());
+            }
+        }
+
+        if let Some(devobj) = self.attach_one_above(dn, below, &drv) {
+            stk.function = Some(StackLayer {
+                driver: drv,
+                devobj: Some(devobj),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
     fn start_stack(&self, dn: &Arc<DevNode>) {
         println!(
             "   -> Building device stack for '{:#?}'",
@@ -793,93 +883,30 @@ impl PnpManager {
                 }
 
                 let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
-
                 for layer_ptr in layers {
                     let layer = unsafe { &mut *layer_ptr };
                     let drv = &layer.driver;
-                    let runtime = &drv.runtime;
 
-                    if !matches!(
-                        runtime.get_state(),
-                        DriverState::Started | DriverState::Pending
-                    ) {
-                        let module = runtime.module.clone();
-                        let m = module.read();
-                        if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
-                            let entry: DriverEntryFn = unsafe {
-                                core::mem::transmute(
-                                    (m.image_base.as_u64() + *rva as u64) as *const (),
-                                )
-                            };
-                            let status = unsafe { entry(drv) };
-                            println!("      -> Driver {} DriverEntry -> {:?}", m.title, status);
-
-                            if !matches!(status, DriverStatus::Success | DriverStatus::Pending) {
-                                runtime.set_state(DriverState::Failed);
-                                continue;
-                            }
-                            runtime.set_state(DriverState::Pending);
-                        } else {
-                            println!(
-                                "      -> ERROR: Driver {} missing symbol: DriverEntry",
-                                m.title
-                            );
-                            runtime.set_state(DriverState::Failed);
-                            continue;
-                        }
-                    }
-
-                    if let Some(cb) = drv.evt_device_add {
-                        let mut dev_init = DeviceInit::new();
-
-                        let status = cb(drv, &mut dev_init);
-
-                        if status == DriverStatus::Success {
-                            if dev_init.evt_pnp.is_none() {
-                                dev_init.evt_pnp = Some(Self::default_pnp_dispatch);
-                            }
-                            let devobj = DeviceObject::new(dev_init.dev_ext_size);
-                            unsafe {
-                                let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
-                                me.dev_init = dev_init;
-                                me.dev_node = Arc::downgrade(dn);
-                            }
-                            DeviceObject::set_lower_upper(&devobj, prev_do.clone());
-                            layer.devobj = Some(devobj.clone());
-                            prev_do = Some(devobj);
-                        } else {
-                            println!(
-                                "      -> NOTE: Driver {} rejected device add: {:?}",
-                                drv.driver_name, status
-                            );
-                        }
+                    if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), drv) {
+                        layer.devobj = Some(devobj.clone());
+                        prev_do = Some(devobj);
+                    } else {
+                        println!("      -> NOTE: Driver {} did not attach.", drv.driver_name);
                     }
                 }
             }
 
-            let function_driver_failed = if let Some(func_layer) = &stk.function {
-                if func_layer.devobj.is_none() {
-                    println!(
-                        "   -> CRITICAL: Function driver '{}' failed to attach. Aborting start.",
-                        func_layer.driver.driver_name
-                    );
-                    true
-                } else {
-                    false
-                }
-            } else {
-                println!("   -> CRITICAL: No function driver was bound. Aborting start.");
-                true
-            };
+            let have_function = self.ensure_function_attached(dn, stk);
 
-            if function_driver_failed {
+            if !have_function {
+                println!("   -> CRITICAL: No usable function driver. Aborting start.");
                 stk.lower.clear();
                 stk.upper.clear();
                 stk.function = None;
                 None
             } else {
-                stk.lower.retain(|layer| layer.devobj.is_some());
-                stk.upper.retain(|layer| layer.devobj.is_some());
+                stk.lower.retain(|l| l.devobj.is_some());
+                stk.upper.retain(|l| l.devobj.is_some());
 
                 let mut current_bottom = dn.get_pdo();
                 let all_valid_layers = stk
@@ -926,7 +953,6 @@ impl PnpManager {
             dn.set_state(DevNodeState::Faulted);
         }
     }
-
     pub extern "win64" fn start_io(req: &mut Request, context: usize) {
         if context == 0 {
             return;
