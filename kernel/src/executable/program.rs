@@ -2,14 +2,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
-    string::String,
+    string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
-    instructions::{hlt, interrupts},
+    instructions::hlt,
     registers::control::Cr3,
     structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
     VirtAddr,
@@ -18,6 +18,7 @@ use x86_64::{
 use crate::{
     file_system::path::Path,
     memory::paging::paging::map_page,
+    object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
     scheduling::scheduler::{self, Scheduler, TaskHandle},
     util::{generate_guid, random_number},
 };
@@ -31,6 +32,52 @@ use crate::{
 };
 
 use super::pe_loadable::{self, LoadError};
+
+// ───────────────────────── helpers ─────────────────────────
+
+type ObjectRef = Arc<Object>;
+pub type ProgramHandle = Arc<RwLock<Program>>;
+pub type QueueHandle = Arc<RwLock<MessageQueue>>;
+pub type ModuleHandle = Arc<RwLock<Module>>;
+pub type UserHandle = u64;
+
+#[inline]
+fn obj_as_program(obj: &ObjectRef) -> Option<ProgramHandle> {
+    match &obj.payload {
+        ObjectPayload::Program(p) => Some(p.clone()),
+        _ => None,
+    }
+}
+#[inline]
+fn obj_as_queue(obj: &ObjectRef) -> Option<QueueHandle> {
+    match &obj.payload {
+        ObjectPayload::Queue(q) => Some(q.clone()),
+        _ => None,
+    }
+}
+#[inline]
+fn guid_to_string(g: &[u8; 16]) -> String {
+    let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+    let d2 = u16::from_le_bytes([g[4], g[5]]);
+    let d3 = u16::from_le_bytes([g[6], g[7]]);
+    alloc::format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        d1,
+        d2,
+        d3,
+        g[8],
+        g[9],
+        g[10],
+        g[11],
+        g[12],
+        g[13],
+        g[14],
+        g[15]
+    )
+}
+
+// ───────────────────────── runtime types ─────────────────────────
+
 #[derive(Clone, Debug)]
 pub struct Module {
     pub title: String,
@@ -40,24 +87,13 @@ pub struct Module {
     pub symbols: Vec<(String, usize)>,
 }
 
-pub type ProgramHandle = Arc<RwLock<Program>>;
-pub type QueueHandle = Arc<RwLock<MessageQueue>>;
-pub type ModuleHandle = Arc<RwLock<Module>>;
-
-pub type UserHandle = u64;
+#[derive(Debug)]
 pub struct MessageQueue {
     pub queue: VecDeque<Message>,
 }
-
-#[derive(Clone)]
-pub enum HandleTarget {
-    Program(ProgramHandle),
-    MessageQueue(u64, QueueHandle),
-    Thread(TaskHandle),
-    Module(ModuleHandle),
-}
+#[derive(Debug)]
 pub struct HandleTable {
-    pub handles: BTreeMap<UserHandle, HandleTarget>,
+    pub handles: BTreeMap<UserHandle, ObjectRef>,
 }
 impl HandleTable {
     pub fn new() -> Self {
@@ -65,24 +101,21 @@ impl HandleTable {
             handles: BTreeMap::new(),
         }
     }
-    pub fn resolve(&self, handle: UserHandle) -> Option<HandleTarget> {
+    pub fn resolve(&self, handle: UserHandle) -> Option<ObjectRef> {
         self.handles.get(&handle).cloned()
     }
     pub fn handle_to_program(&self, target_pid: u64) -> Option<UserHandle> {
-        self.handles
-            .iter()
-            .find_map(|(user_handle, target)| match target {
-                HandleTarget::Program(program_handle) => {
-                    if program_handle.read().pid == target_pid {
-                        Some(*user_handle)
-                    } else {
-                        None
-                    }
+        self.handles.iter().find_map(|(uh, obj)| {
+            if let Some(ph) = obj_as_program(obj) {
+                if ph.read().pid == target_pid {
+                    return Some(*uh);
                 }
-                _ => None,
-            })
+            }
+            None
+        })
     }
 }
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MessageId {
@@ -94,8 +127,9 @@ pub enum MessageId {
     TimerExpired = 0x0006,
     IoComplete = 0x0007,
     ProcessExit = 0x0008,
-    User(u32), // Must be >= 0x8000
+    User(u32),
 }
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub id: MessageId,
@@ -105,35 +139,24 @@ pub struct Message {
     pub timestamp: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum RoutingAction {
-    /// Drop the message (it never reaches any queue)
     Block,
-
-    /// Deliver to the program’s default queue (same as no rule)
     Allow,
-
-    /// Deliver to this queue instead of the default queue
     Reroute(QueueHandle),
-
-    /// Wake a specific thread when a message arrives
-    /// (thread will still have to pop the message itself)
     Callback(TaskHandle, Option<QueueHandle>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RoutingRule {
-    /// Which message ID the rule applies to
     pub msg_id: MessageId,
-
-    /// Optional sender-PID filter (`None` = any sender)
     pub from_pid: Option<u64>,
-
-    /// Action taken when the rule matches
     pub action: RoutingAction,
 }
 
 pub type RuleList = Vec<RoutingRule>;
+
+#[derive(Debug)]
 pub struct Program {
     pub title: String,
     pub image_path: String,
@@ -144,10 +167,13 @@ pub struct Program {
     pub modules: RwLock<Vec<ModuleHandle>>,
     pub cr3: PhysFrame,
     pub tracker: Arc<RangeTracker>,
+
     pub handle_table: RwLock<HandleTable>,
     pub working_dir: Path,
+
     pub default_queue: QueueHandle,
     pub extra_queues: Mutex<BTreeMap<u64, QueueHandle>>,
+
     pub routing_rules: Mutex<RuleList>,
 }
 impl Program {
@@ -177,6 +203,7 @@ impl Program {
             routing_rules: Mutex::new(Vec::new()),
         }
     }
+
     pub fn virtual_map_alloc(
         &self,
         virt_addr: VirtAddr,
@@ -217,7 +244,6 @@ impl Program {
         res
     }
 
-    /// Map an already-tracked range.  Caller must ensure the range was reserved.
     pub unsafe fn virtual_map(
         &self,
         virt_addr: VirtAddr,
@@ -253,6 +279,7 @@ impl Program {
         Cr3::write(old_cr3.0, old_cr3.1);
         result
     }
+
     pub fn load_module(&mut self, path: String) -> Result<ModuleHandle, LoadError> {
         if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
             let module = dll.dll_load(self)?;
@@ -260,6 +287,7 @@ impl Program {
         }
         Err(LoadError::NoFile)
     }
+
     pub fn kill(&mut self) -> Result<(), LoadError> {
         let main_tid = match &self.main_thread {
             Some(handle) => handle.read().id,
@@ -294,6 +322,7 @@ impl Program {
 
         Ok(())
     }
+
     pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Option<VirtAddr> {
         let modules = self.modules.read();
 
@@ -312,15 +341,45 @@ impl Program {
 
         None
     }
+
     pub fn has_module(&self, name_lc: &str) -> bool {
         self.modules
             .read()
             .iter()
             .any(|m| m.read().title.eq_ignore_ascii_case(name_lc))
     }
-    pub fn resolve_handle(&self, handle: UserHandle) -> Option<HandleTarget> {
-        let table = self.handle_table.read();
-        table.handles.get(&handle).cloned()
+
+    pub fn resolve_handle(&self, handle: UserHandle) -> Option<ObjectRef> {
+        // Prefer local cache. Fallback to global index.
+        self.handle_table
+            .read()
+            .resolve(handle)
+            .or_else(|| OBJECT_MANAGER.open_by_id(handle))
+    }
+
+    pub fn create_user_handle_for_object(&self, obj: ObjectRef) -> UserHandle {
+        let id = obj.id;
+        self.handle_table.write().handles.insert(id, obj);
+        id
+    }
+
+    pub fn new_mq(&self) -> ObjectRef {
+        let qh = Arc::new(RwLock::new(MessageQueue {
+            queue: VecDeque::new(),
+        }));
+        let base = alloc::format!("\\Proc\\{}\\Queues", self.pid);
+        let _ = OBJECT_MANAGER.mkdir_p("\\Proc".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Proc\\{}", self.pid));
+        let _ = OBJECT_MANAGER.mkdir_p(base.clone());
+
+        let name = guid_to_string(&generate_guid());
+        let q_obj = Object::with_name(ObjectTag::Queue, name.clone(), ObjectPayload::Queue(qh));
+        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", base, name), &q_obj);
+        q_obj
+    }
+
+    pub fn has_handle(&self, pid: u64) -> Option<UserHandle> {
+        self.handle_table.read().handle_to_program(pid)
     }
 
     pub fn add_routing_rule(&self, rule: RoutingRule) {
@@ -342,8 +401,8 @@ impl Program {
         let mut rules = self.routing_rules.lock();
         rules.retain(|r| !(r.msg_id == msg_id && r.from_pid == from_pid));
     }
-    pub fn receive_message(&self, mut msg: Message) {
-        // ── find first matching rule ────────────────────────────────────────────
+
+    pub fn receive_message(&self, msg: Message) {
         let rule_opt = {
             let rules = self.routing_rules.lock();
             rules
@@ -351,13 +410,13 @@ impl Program {
                 .find(|r| {
                     r.msg_id == msg.id
                         && r.from_pid
-                            .map_or(true, |pid| msg.sender.map(|_| pid).is_some())
+                            .map_or(true, |pid| msg.sender.is_some() && r.from_pid == Some(pid))
                 })
                 .cloned()
         };
 
         match rule_opt.map(|r| r.action) {
-            Some(RoutingAction::Block) => return,
+            Some(RoutingAction::Block) => {}
 
             Some(RoutingAction::Allow) | None => {
                 self.default_queue.write().queue.push_back(msg);
@@ -367,9 +426,9 @@ impl Program {
                 qh.write().queue.push_back(msg);
             }
 
-            Some(RoutingAction::Callback(th, qh)) => {
-                if let Some(q) = qh {
-                    q.write().queue.push_back(msg);
+            Some(RoutingAction::Callback(th, qh_opt)) => {
+                if let Some(qh) = qh_opt {
+                    qh.write().queue.push_back(msg);
                 } else {
                     self.default_queue.write().queue.push_back(msg);
                 }
@@ -384,35 +443,11 @@ impl Program {
             }
         }
     }
-    pub fn create_user_handle(&self, target: HandleTarget) -> UserHandle {
-        let mut table = self.handle_table.write();
-
-        loop {
-            let raw = random_number();
-
-            if raw != 0 && !table.handles.contains_key(&raw) {
-                table.handles.insert(raw, target.clone());
-                return raw;
-            }
-        }
-    }
-    pub fn new_mq(&self) -> HandleTarget {
-        let handle = {
-            let qh = Arc::new(RwLock::new(MessageQueue {
-                queue: VecDeque::new(),
-            }));
-            HandleTarget::MessageQueue(self.pid, qh)
-        };
-
-        handle
-    }
-    pub fn has_handle(&self, pid: u64) -> Option<UserHandle> {
-        self.handle_table.read().handle_to_program(pid)
-    }
 }
+
 pub struct ProgramManager {
     next_pid: AtomicU64,
-    programs: RwLock<BTreeMap<u64, ProgramHandle>>, // pid → Arc
+    programs: RwLock<BTreeMap<u64, ProgramHandle>>,
 }
 
 impl ProgramManager {
@@ -427,22 +462,41 @@ impl ProgramManager {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
-            interrupts::without_interrupts(move || {
+            x86_64::instructions::interrupts::without_interrupts(move || {
                 task.write().parent_pid = pid;
             });
         }
 
         let handle = Arc::new(RwLock::new(prog));
-        self.programs.write().insert(pid, handle);
+        self.programs.write().insert(pid, handle.clone());
+
+        let proc_dir = alloc::format!("\\Proc\\{}", pid);
+        let _ = OBJECT_MANAGER.mkdir_p("\\Proc".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p(proc_dir.clone());
+
+        let prog_obj = Object::with_name(
+            ObjectTag::Program,
+            "Program".to_string(),
+            ObjectPayload::Program(handle.clone()),
+        );
+        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\Program", proc_dir), &prog_obj);
+
+        let dq_obj = Object::with_name(
+            ObjectTag::Queue,
+            "DefaultQueue".to_string(),
+            ObjectPayload::Queue(handle.read().default_queue.clone()),
+        );
+        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\DefaultQueue", proc_dir), &dq_obj);
+
         pid
     }
 
     pub fn get(&self, pid: u64) -> Option<ProgramHandle> {
         self.programs.read().get(&pid).map(Arc::clone)
     }
+
     pub fn start_pid(&self, pid: u64, scheduler: &mut Scheduler) -> Option<TaskHandle> {
         let handle = self.get(pid)?;
-
         let task_arc = {
             let prog = handle.write();
             Arc::clone(prog.main_thread.as_ref()?)
@@ -458,10 +512,11 @@ impl ProgramManager {
             .write()
             .remove(&pid)
             .ok_or(LoadError::BadPID)?;
-
+        let _ = OBJECT_MANAGER.unlink(alloc::format!("\\Proc\\{}", pid));
         handle.write().kill()?;
         Ok(())
     }
+
     pub fn all(&self) -> Vec<ProgramHandle> {
         self.programs.read().values().cloned().collect()
     }

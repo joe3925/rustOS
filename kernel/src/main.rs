@@ -28,13 +28,13 @@ mod executable;
 mod exports;
 mod file_system;
 mod memory;
+mod object_manager;
 mod registry;
 mod scheduling;
 mod static_handlers;
 mod structs;
 mod syscalls;
 mod util;
-
 use crate::console::clear_screen;
 use crate::memory::paging::tables::kernel_cr3;
 use crate::util::KERNEL_INITIALIZED;

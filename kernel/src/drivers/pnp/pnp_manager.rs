@@ -395,8 +395,21 @@ impl PnpManager {
         }
 
         dev_node.set_pdo(pdo.clone());
+
+        let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+        let pdo_obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Device,
+            "PDO".to_string(),
+            crate::object_manager::ObjectPayload::Device(pdo.clone()),
+        );
+        let _ =
+            crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\PDO", base), &pdo_obj);
+
         (dev_node, pdo)
     }
+
     pub fn create_child_devnode_and_pdo_with_init(
         &self,
         parent: &Arc<DevNode>,
@@ -416,6 +429,18 @@ impl PnpManager {
         }
 
         dev_node.set_pdo(pdo.clone());
+
+        let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+        let pdo_obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Device,
+            "PDO".to_string(),
+            crate::object_manager::ObjectPayload::Device(pdo.clone()),
+        );
+        let _ =
+            crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\PDO", base), &pdo_obj);
+
         (dev_node, pdo)
     }
     extern "win64" fn pdo_pnp_dispatch(device: &Arc<DeviceObject>, request: &mut Request) {
@@ -811,6 +836,19 @@ impl PnpManager {
                     me.dev_node = Arc::downgrade(dn);
                 }
                 DeviceObject::set_lower_upper(&devobj, below);
+
+                let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
+                let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(stack_dir.clone());
+                let uniq = (Arc::as_ptr(&devobj) as usize) as u64;
+                let leaf = alloc::format!("{}-{:x}", drv.driver_name, uniq);
+                let obj = crate::object_manager::Object::with_name(
+                    crate::object_manager::ObjectTag::Device,
+                    leaf.clone(),
+                    crate::object_manager::ObjectPayload::Device(devobj.clone()),
+                );
+                let _ = crate::object_manager::OBJECT_MANAGER
+                    .link(alloc::format!("{}\\{}", stack_dir, leaf), &obj);
+
                 return Some(devobj);
             }
         }
@@ -925,6 +963,17 @@ impl PnpManager {
         };
 
         if let Some(top_device) = top_of_stack {
+            let base = alloc::format!("\\Device\\{}", dn.instance_path);
+            let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+            let _ = crate::object_manager::OBJECT_MANAGER.unlink(alloc::format!("{}\\Top", base));
+            let top_obj = crate::object_manager::Object::with_name(
+                crate::object_manager::ObjectTag::Device,
+                "Top".to_string(),
+                crate::object_manager::ObjectPayload::Device(top_device.clone()),
+            );
+            let _ = crate::object_manager::OBJECT_MANAGER
+                .link(alloc::format!("{}\\Top", base), &top_obj);
+
             let top_device_name = top_device.dev_node.upgrade().unwrap().name.clone();
             println!(
                 "   ->  Sending PnP StartDevice request to stack top '{}'",
@@ -952,6 +1001,7 @@ impl PnpManager {
             dn.set_state(DevNodeState::Faulted);
         }
     }
+
     pub extern "win64" fn start_io(req: &mut Request, context: usize) {
         if context == 0 {
             return;
@@ -1060,6 +1110,15 @@ impl PnpManager {
             prog.load_module(pkg.image_path.clone())?
         };
 
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Modules".to_string());
+        let mod_obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Module,
+            pkg.name.clone(),
+            crate::object_manager::ObjectPayload::Module(module.clone()),
+        );
+        let _ = crate::object_manager::OBJECT_MANAGER
+            .link(alloc::format!("\\Modules\\{}", pkg.name), &mod_obj);
+
         let rt = Arc::new(DriverRuntime {
             pkg: pkg.clone(),
             module,
@@ -1067,6 +1126,17 @@ impl PnpManager {
             refcnt: AtomicU32::new(0),
         });
         let drv_obj = DriverObject::allocate(rt, pkg.name.clone());
+
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Drivers".to_string());
+        let any: crate::object_manager::ObjRef = drv_obj.clone();
+        let drv_om = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Generic,
+            pkg.name.clone(),
+            crate::object_manager::ObjectPayload::Generic(any),
+        );
+        let _ = crate::object_manager::OBJECT_MANAGER
+            .link(alloc::format!("\\Drivers\\{}", pkg.name), &drv_om);
+
         self.drivers
             .write()
             .insert(pkg.name.clone(), drv_obj.clone());
@@ -1384,6 +1454,15 @@ impl PnpManager {
         }
     }
     pub fn get_device_target(&self, instance_path: &str) -> Option<IoTarget> {
+        let om_path = alloc::format!("\\Device\\{}\\Top", instance_path);
+        if let Ok(o) = crate::object_manager::OBJECT_MANAGER.open(om_path) {
+            if let crate::object_manager::ObjectPayload::Device(d) = &o.payload {
+                return Some(IoTarget {
+                    target_device: d.clone(),
+                });
+            }
+        }
+
         self.dev_root
             .find_child_by_path(instance_path)
             .and_then(|dn| {
@@ -1475,6 +1554,82 @@ impl PnpManager {
 
         let tgt = IoTarget { target_device: top };
         self.send_request(&tgt, &mut req)
+    }
+    pub fn create_symlink(
+        &self,
+        link_path: &str,
+        target_path: &str,
+    ) -> Result<(), crate::object_manager::OmError> {
+        crate::object_manager::OBJECT_MANAGER
+            .symlink(link_path.to_string(), target_path.to_string(), true)
+            .map(|_| ())
+    }
+
+    pub fn replace_symlink(
+        &self,
+        link_path: &str,
+        target_path: &str,
+    ) -> Result<(), crate::object_manager::OmError> {
+        let _ = crate::object_manager::OBJECT_MANAGER.unlink(link_path.to_string());
+        crate::object_manager::OBJECT_MANAGER
+            .symlink(link_path.to_string(), target_path.to_string(), true)
+            .map(|_| ())
+    }
+
+    pub fn create_device_symlink_top(
+        &self,
+        instance_path: &str,
+        link_path: &str,
+    ) -> Result<(), crate::object_manager::OmError> {
+        let target = alloc::format!("\\Device\\{}\\Top", instance_path);
+        crate::object_manager::OBJECT_MANAGER
+            .symlink(link_path.to_string(), target, true)
+            .map(|_| ())
+    }
+
+    pub fn remove_symlink(&self, link_path: &str) -> Result<(), crate::object_manager::OmError> {
+        crate::object_manager::OBJECT_MANAGER.unlink(link_path.to_string())
+    }
+    pub fn resolve_targetio_from_symlink(&self, link_path: &str) -> Option<IoTarget> {
+        let obj = crate::object_manager::OBJECT_MANAGER
+            .open(link_path.to_string())
+            .ok()?;
+        match &obj.payload {
+            crate::object_manager::ObjectPayload::Device(d) => Some(IoTarget {
+                target_device: d.clone(),
+            }),
+            crate::object_manager::ObjectPayload::Directory(_) => {
+                let top = alloc::format!("{}\\Top", link_path);
+                let o2 = crate::object_manager::OBJECT_MANAGER.open(top).ok()?;
+                match &o2.payload {
+                    crate::object_manager::ObjectPayload::Device(d) => Some(IoTarget {
+                        target_device: d.clone(),
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    pub fn send_request_via_symlink(&self, link_path: &str, req: &mut Request) -> DriverStatus {
+        match self.resolve_targetio_from_symlink(link_path) {
+            Some(tgt) => self.send_request(&tgt, req),
+            None => DriverStatus::NoSuchDevice,
+        }
+    }
+    pub fn ioctl_via_symlink(
+        &self,
+        link_path: &str,
+        control_code: u32,
+        data: Box<[u8]>,
+        completion: Option<CompletionRoutine>,
+        context: usize,
+    ) -> DriverStatus {
+        let mut req = Request::new(RequestType::DeviceControl(control_code), data);
+        if let Some(c) = completion {
+            req.set_completion(c, context);
+        }
+        self.send_request_via_symlink(link_path, &mut req)
     }
 }
 

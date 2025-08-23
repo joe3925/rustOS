@@ -27,8 +27,6 @@ use kernel_api::{
     x86_64::instructions::port::Port,
 };
 
-// =========================== Global ===========================
-
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
@@ -40,11 +38,9 @@ fn panic(_info: &PanicInfo) -> ! {
 
 #[repr(C)]
 pub struct IdeReadLba28 {
-    pub lba: u32,     // 28-bit effective
-    pub sectors: u16, // 1..=256 (256 => 0 on-wire)
+    pub lba: u32,
+    pub sectors: u16,
 }
-
-// =========================== ATA constants ===========================
 
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
@@ -56,7 +52,6 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
-// =========================== Driver entry ===========================
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -75,8 +70,6 @@ pub extern "win64" fn ide_device_add(
     dev_init_ptr.io_device_control = None;
     DriverStatus::Success
 }
-
-// =========================== PnP path (async Start → QueryResources) ===========================
 
 #[repr(C)]
 struct PrepareHardwareCtx {
@@ -146,7 +139,6 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
         return;
     }
 
-    // Parse port BARs from parent blob and program DevExt
     let pnp_payload = req.pnp.as_ref().expect("missing PnP payload");
     let bars = parse_ide_bars(&pnp_payload.blob_out);
 
@@ -154,8 +146,7 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
     let cb = bars.cmd;
-    let ctb = bars.ctl; // control-block base (e.g., 0x3F4); ALT-STATUS = base+2
-
+    let ctb = bars.ctl;
     dx.data_port = Port::new(cb + 0);
     dx.error_port = Port::new(cb + 1);
     dx.sector_count_port = Port::new(cb + 2);
@@ -165,8 +156,8 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
     dx.drive_head_port = Port::new(cb + 6);
     dx.command_port = Port::new(cb + 7);
 
-    dx.alternative_command_port = Port::new(ctb + 2); // ALT-STATUS (read)
-    dx.control_port = Port::new(ctb + 2); // DEVICE CONTROL (write)
+    dx.alternative_command_port = Port::new(ctb + 2);
+    dx.control_port = Port::new(ctb + 2);
 
     dx.present = true;
     dx.enumerated = false;
@@ -176,8 +167,9 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
         prep.start_req.status = DriverStatus::Success;
         unsafe { pnp_complete_request(&mut prep.start_req) };
     }
-
-    unsafe { InvalidateDeviceRelations(&device, DeviceRelationType::BusRelations) };
+    if dx.enumerated == true {
+        unsafe { InvalidateDeviceRelations(&device, DeviceRelationType::BusRelations) };
+    }
 }
 
 // =========================== Parent resource parsing ===========================
@@ -233,7 +225,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
                 }
                 4 | 2 => {
                     if bars.ctl == 0 {
-                        bars.ctl = base; // expect 0x3F4; ALT-STATUS at base+2
+                        bars.ctl = base;
                     }
                 }
                 0x10 | 0x08 if bars.bm == 0 => {
@@ -248,12 +240,10 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
         bars.cmd = 0x1F0;
     }
     if bars.ctl == 0 {
-        bars.ctl = 0x3F4; // ensure base+2 = 0x3F6
+        bars.ctl = 0x3F4;
     }
     bars
 }
-
-// =========================== Bus enumeration ===========================
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
     let dx: &mut DevExt =
@@ -264,7 +254,6 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
 
     let mut found = false;
 
-    // Probe primary master (DH 0xE0) and primary slave (DH 0xF0)
     if ata_probe_drive(dx, 0xE0) {
         create_child_pdo(parent, 0, 0);
         found = true;
@@ -276,9 +265,7 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
 
     dx.enumerated = true;
 
-    if !found {
-        // nothing found; do nothing else
-    }
+    if !found {}
 }
 fn id_string(words: &[u16]) -> String {
     let mut bytes: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(words.len() * 2);
@@ -404,7 +391,6 @@ fn ata_identify_words(dx: &mut DevExt, dh: u8) -> Option<[u16; 256]> {
 fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
     ata_identify_words(dx, dh).is_some()
 }
-// =========================== IOCTL path ===========================
 
 pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request, len: usize) {
     let dx: &mut DevExt =
@@ -415,7 +401,6 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
         return;
     }
 
-    // Expect RequestType::Read(offset)
     let offset_bytes: u64 = match request.kind {
         RequestType::Read {
             offset: off,
@@ -427,7 +412,6 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
         }
     };
 
-    // Require 512B alignment for now
     if (offset_bytes & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         request.status = DriverStatus::InvalidParameter;
         return;
@@ -441,7 +425,6 @@ pub extern "win64" fn ide_read(device: &Arc<DeviceObject>, request: &mut Request
     let lba: u32 = (offset_bytes >> 9) as u32; // /512
     let sectors_total: u32 = (len as u32) >> 9; // /512
 
-    // 28-bit LBA limit
     if (lba >> 28) != 0 {
         request.status = DriverStatus::InvalidParameter;
         return;
@@ -510,7 +493,6 @@ fn ata_pio_read(dx: &mut DevExt, mut lba: u32, mut sectors: u32, out: &mut [u8])
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
 
         unsafe {
-            // master for now; TODO: select by PDO (0xE0 master / 0xF0 slave)
             dx.drive_head_port.write(0xE0 | ((lba >> 24) as u8 & 0x0F));
         }
         io_wait_400ns(&mut dx.alternative_command_port);
@@ -527,7 +509,6 @@ fn ata_pio_read(dx: &mut DevExt, mut lba: u32, mut sectors: u32, out: &mut [u8])
             if !wait_drq_set(&mut dx.alternative_command_port) {
                 return false;
             }
-            // read one sector (256 words)
             for _ in 0..256 {
                 let w: u16 = unsafe { dx.data_port.read() };
                 out[off] = (w & 0xFF) as u8;
@@ -565,7 +546,6 @@ fn ata_pio_write(dx: &mut DevExt, mut lba: u32, mut sectors: u32, data: &[u8]) -
             if !wait_drq_set(&mut dx.alternative_command_port) {
                 return false;
             }
-            // write one sector (256 words)
             for _ in 0..256 {
                 let lo = data[off] as u16;
                 let hi = data[off + 1] as u16;
@@ -579,7 +559,6 @@ fn ata_pio_write(dx: &mut DevExt, mut lba: u32, mut sectors: u32, data: &[u8]) -
         sectors -= chunk;
     }
 
-    // best-effort cache flush
     unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
     wait_not_busy(&mut dx.alternative_command_port)
 }
