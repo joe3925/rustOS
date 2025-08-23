@@ -1,0 +1,7 @@
+image = "partmgr.dll"
+start = "demand"
+
+[filter]
+position = "upper"
+order = 100
+class = "disk"

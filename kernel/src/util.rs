@@ -48,7 +48,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub static BOOTSET: &[BootPkg] = boot_packages!["acpi", "pci", "ide", "disk"];
+pub static BOOTSET: &[BootPkg] = boot_packages!["acpi", "pci", "ide", "disk", "partmgr"];
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;

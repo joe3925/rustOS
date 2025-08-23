@@ -335,7 +335,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         )
     };
 
-    let class = Some("DiskDrive".to_string());
+    let class = Some("disk".to_string());
 
     let parent_dn = unsafe {
         (*(Arc::as_ptr(parent) as *const DeviceObject))

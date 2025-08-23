@@ -10,6 +10,7 @@ members = [
     "drivers/pci",
     "drivers/ide",
     "drivers/disk",
+    "drivers/partmgr",
     "kernel_api",
 ]
 exclude = ["rustos-api"]

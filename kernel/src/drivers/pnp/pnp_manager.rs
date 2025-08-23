@@ -633,13 +633,16 @@ impl PnpManager {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{}/{}", key, pos);
                 if let Some(children) = reg::list_keys(&base).ok() {
                     for svc_path in children {
-                        let service = svc_path
-                            .rsplit_once('/')
-                            .map(|(_, s)| s.to_string())
-                            .unwrap_or_default();
                         let order = match reg::get_value(&svc_path, "Order") {
                             Some(Data::U32(v)) => v,
                             _ => 100,
+                        };
+                        let service = match reg::get_value(&svc_path, "Service") {
+                            Some(Data::Str(s)) => s,
+                            _ => svc_path
+                                .rsplit_once('/')
+                                .map(|(_, s)| s.to_string())
+                                .unwrap_or_else(|| svc_path.clone()),
                         };
                         if *pos == "lower" {
                             lowers.push(Item { order, service });
@@ -651,20 +654,22 @@ impl PnpManager {
             }
         }
 
-        // Add from Filters/class/*
         if let Some(class) = class_opt {
             let key = escape_key(class);
             for pos in ["lower", "upper"].iter() {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{}/{}", key, pos);
                 if let Some(children) = reg::list_keys(&base).ok() {
                     for svc_path in children {
-                        let service = svc_path
-                            .rsplit_once('/')
-                            .map(|(_, s)| s.to_string())
-                            .unwrap_or_default();
                         let order = match reg::get_value(&svc_path, "Order") {
                             Some(Data::U32(v)) => v,
                             _ => 100,
+                        };
+                        let service = match reg::get_value(&svc_path, "Service") {
+                            Some(Data::Str(s)) => s,
+                            _ => svc_path
+                                .rsplit_once('/')
+                                .map(|(_, s)| s.to_string())
+                                .unwrap_or_else(|| svc_path.clone()),
                         };
                         if *pos == "lower" {
                             lowers.push(Item { order, service });
@@ -707,13 +712,16 @@ impl PnpManager {
             );
             if let Some(children) = reg::list_keys(&base).ok() {
                 for svc_path in children {
-                    let service = svc_path
-                        .rsplit_once('/')
-                        .map(|(_, s)| s.to_string())
-                        .unwrap_or_default();
                     let order = match reg::get_value(&svc_path, "Order") {
                         Some(Data::U32(v)) => v,
                         _ => 100,
+                    };
+                    let service = match reg::get_value(&svc_path, "Service") {
+                        Some(Data::Str(s)) => s,
+                        _ => svc_path
+                            .rsplit_once('/')
+                            .map(|(_, s)| s.to_string())
+                            .unwrap_or_else(|| svc_path.clone()),
                     };
                     if *pos == "lower" {
                         lowers.push(Item { order, service });
@@ -724,25 +732,34 @@ impl PnpManager {
             }
         }
 
-        fn to_unique_sorted(mut v: Vec<Item>) -> Vec<String> {
-            v.sort_by(|a, b| {
-                a.order
-                    .cmp(&b.order)
-                    .then_with(|| a.service.cmp(&b.service))
-            });
-            let mut seen = BTreeMap::<String, u32>::new();
-            let mut out = Vec::new();
-            for it in v.into_iter() {
-                if !seen.contains_key(&it.service) {
-                    seen.insert(it.service.clone(), it.order);
-                    out.push(it.service);
-                }
-            }
-            out
-        }
+        lowers.sort_by(|a, b| {
+            a.order
+                .cmp(&b.order)
+                .then_with(|| a.service.cmp(&b.service))
+        });
+        uppers.sort_by(|a, b| {
+            a.order
+                .cmp(&b.order)
+                .then_with(|| a.service.cmp(&b.service))
+        });
 
-        let lower_svcs = to_unique_sorted(lowers);
-        let upper_svcs = to_unique_sorted(uppers);
+        let mut seen_l = BTreeMap::<String, u32>::new();
+        let mut seen_u = BTreeMap::<String, u32>::new();
+        let mut lower_svcs = Vec::new();
+        let mut upper_svcs = Vec::new();
+
+        for it in lowers {
+            if !seen_l.contains_key(&it.service) {
+                seen_l.insert(it.service.clone(), it.order);
+                lower_svcs.push(it.service);
+            }
+        }
+        for it in uppers {
+            if !seen_u.contains_key(&it.service) {
+                seen_u.insert(it.service.clone(), it.order);
+                upper_svcs.push(it.service);
+            }
+        }
 
         let mut lower_rts = Vec::new();
         for svc in lower_svcs {

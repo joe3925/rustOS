@@ -12,25 +12,17 @@ use spin::{Once, RwLock};
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
 const CLASS_LIST: &[(&str, &str)] = &[
     ("disk", "Disk devices / block storage"),
-    ("volume", "Logical volumes / partitions"),
-    ("storage", "Storage stack infrastructure"),
     ("kbd", "Keyboards"),
     ("mouse", "Pointing devices (mouse, touch)"),
     ("hid", "Human Interface Devices"),
     ("display", "Display controller (generic)"),
     ("gpu", "3D accelerator / graphics adapter"),
     ("net", "Network adapters"),
-    ("audio", "Audio devices"),
-    ("media", "Multimedia controllers / codecs"),
     ("usb", "USB host controllers / hubs"),
     ("battery", "Battery / power sources"),
-    ("sensor", "Sensors (IMU, ambient, etc.)"),
-    ("bluetooth", "Bluetooth radios / controllers"),
     ("wifi", "Wireless LAN"),
     ("serial", "Serial ports / UART"),
     ("parallel", "Parallel ports"),
-    ("camera", "Cameras / imaging"),
-    ("printer", "Printers"),
 ];
 
 /* ---------- data layer -------------- */
