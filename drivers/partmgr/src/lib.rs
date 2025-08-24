@@ -1,22 +1,32 @@
+#![no_std]
+#![no_main]
+
 extern crate alloc;
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::{
-    mem,
-    sync::atomic::{AtomicBool, Ordering},
-};
-use kernel_api::KernelAllocator;
+
+use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
+use core::mem;
+use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_api::alloc_api::ffi::{pnp_complete_request, pnp_forward_request_to_next_lower};
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, Request, RequestType,
-    alloc_api::ffi::{
-        driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-        pnp_forward_request_to_next_lower,
-    },
+    alloc_api::ffi::{driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init},
     alloc_api::{DeviceIds, DeviceInit},
 };
+use kernel_api::{KernelAllocator, println};
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
+#[cfg(not(test))]
+use core::panic::PanicInfo;
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    use kernel_api::println;
 
+    println!("{}", info);
+    loop {}
+}
+mod msvc_shims;
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, partmgr_device_add) };
@@ -29,11 +39,8 @@ pub extern "win64" fn partmgr_device_add(
 ) -> DriverStatus {
     init.dev_ext_size = core::mem::size_of::<PartMgrExt>();
     init.evt_bus_enumerate_devices = Some(partmgr_enumerate_devices);
-
     DriverStatus::Success
 }
-
-// ---------- per-device extension for the filter DO ----------
 
 #[repr(C)]
 struct PartMgrExt {
@@ -52,6 +59,51 @@ struct PartDevExt {
     start_lba: u64,
     end_lba: u64,
 }
+
+// ------------ Generic async “send down” with parent completion ------------
+
+#[repr(C)]
+struct ChildCtxCopyback {
+    parent_req: *mut Request,
+}
+
+extern "win64" fn child_complete_copyback(child: &mut Request, ctx: usize) {
+    let boxed = unsafe { Box::from_raw(ctx as *mut ChildCtxCopyback) };
+    let parent = unsafe { &mut *boxed.parent_req };
+
+    parent.status = child.status;
+    if parent.status == DriverStatus::Success {
+        let n = core::cmp::min(parent.data.len(), child.data.len());
+        parent.data[..n].copy_from_slice(&child.data[..n]);
+    }
+
+    unsafe { pnp_complete_request(parent) };
+}
+
+fn send_down_async_copyback(
+    from: &Arc<DeviceObject>,
+    parent: &mut Request,
+    new_kind: RequestType,
+    buf: Box<[u8]>,
+) -> DriverStatus {
+    let mut child = Request::new(new_kind, buf);
+    let ctx = Box::into_raw(Box::new(ChildCtxCopyback {
+        parent_req: parent as *mut _,
+    })) as usize;
+
+    child.set_completion(child_complete_copyback, ctx);
+
+    parent.status = DriverStatus::Waiting;
+    let st = unsafe { pnp_forward_request_to_next_lower(from, &mut child) };
+    if st == DriverStatus::NoSuchDevice {
+        // Complete parent immediately with failure
+        parent.status = DriverStatus::NoSuchDevice;
+        unsafe { pnp_complete_request(parent) };
+    }
+    DriverStatus::Waiting
+}
+
+// ------------ Partition PDO read/write using async forwarding ------------
 
 pub extern "win64" fn partition_pdo_read(
     device: &Arc<DeviceObject>,
@@ -75,15 +127,19 @@ pub extern "win64" fn partition_pdo_read(
         request.status = DriverStatus::InvalidParameter;
         return;
     }
+
     let phys_off = off + ((dx.start_lba as u64) << 9);
-    request.kind = RequestType::Read {
-        offset: phys_off,
-        len,
-    };
-    let st = unsafe { pnp_forward_request_to_next_lower(device, request) };
-    if st == DriverStatus::NoSuchDevice {
-        request.status = DriverStatus::NoSuchDevice;
-    }
+    let buf = vec![0u8; len].into_boxed_slice();
+
+    let _ = send_down_async_copyback(
+        device,
+        request,
+        RequestType::Read {
+            offset: phys_off,
+            len,
+        },
+        buf,
+    );
 }
 
 pub extern "win64" fn partition_pdo_write(
@@ -108,15 +164,21 @@ pub extern "win64" fn partition_pdo_write(
         request.status = DriverStatus::InvalidParameter;
         return;
     }
+
     let phys_off = off + ((dx.start_lba as u64) << 9);
-    request.kind = RequestType::Write {
-        offset: phys_off,
-        len,
-    };
-    let st = unsafe { pnp_forward_request_to_next_lower(device, request) };
-    if st == DriverStatus::NoSuchDevice {
-        request.status = DriverStatus::NoSuchDevice;
-    }
+
+    // Move parent's buffer into child to avoid copy
+    let moved = mem::take(&mut request.data);
+
+    let _ = send_down_async_copyback(
+        device,
+        request,
+        RequestType::Write {
+            offset: phys_off,
+            len,
+        },
+        moved,
+    );
 }
 
 // ---------- GPT structures (read-only) ----------
@@ -161,8 +223,7 @@ fn gpt_header_from(bytes: &[u8]) -> Option<GptHeader> {
     if &hdr.signature != b"EFI PART" {
         return None;
     }
-    if hdr.header_size < mem::size_of::<GptHeader>() as u32 && hdr.header_size >= 92 {
-        // accept canonical 92-byte size
+    if hdr.header_size < core::mem::size_of::<GptHeader>() as u32 && hdr.header_size >= 92 {
         hdr.header_size = 92;
     }
     Some(hdr)
@@ -201,104 +262,204 @@ fn guid_to_string(g: &[u8; 16]) -> String {
     )
 }
 
-fn read_sync(
-    device: &Arc<DeviceObject>,
-    lba: u64,
-    bytes: usize,
-) -> Result<Box<[u8]>, DriverStatus> {
-    let aligned = (bytes + 511) & !511;
-    let mut req = Request::new(
-        RequestType::Read {
-            offset: lba << 9,
-            len: aligned,
-        },
-        vec![0u8; aligned].into_boxed_slice(),
-    );
-    let st = unsafe { pnp_forward_request_to_next_lower(device, &mut req) };
-    if st == DriverStatus::NoSuchDevice {
-        return Err(DriverStatus::NoSuchDevice);
-    }
-    if req.status != DriverStatus::Success {
-        return Err(req.status);
-    }
-    Ok(req.data)
+// ---------- Async GPT enumeration state machine ----------
+
+#[repr(u32)]
+enum PartEnumPhase {
+    ReadHdr = 0,
+    ReadEntries = 1,
 }
 
-pub extern "win64" fn partmgr_enumerate_devices(device: &Arc<DeviceObject>) -> DriverStatus {
-    let pmx = ext_mut::<PartMgrExt>(device);
-    if pmx.enumerated.swap(true, Ordering::AcqRel) {
-        return DriverStatus::Success;
+#[repr(C)]
+struct PartEnumCtx {
+    device: Arc<DeviceObject>,
+    parent: *mut Request,
+    phase: PartEnumPhase,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
+    entry_lba: u64,
+    num_entries: u32,
+    entry_size: u32,
+    disk_guid: [u8; 16],
+}
+
+extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
+    println!("enum complete {:#?}", child.status);
+    let ctx = unsafe { &mut *(ctx_usize as *mut PartEnumCtx) };
+
+    if child.status != DriverStatus::Success {
+        let parent = unsafe { &mut *ctx.parent };
+        parent.status = DriverStatus::Success;
+        unsafe { pnp_complete_request(parent) };
+        unsafe {
+            drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+        }
+        return;
     }
 
-    let hdr_buf = match read_sync(device, 1, 512) {
-        Ok(b) => b,
-        Err(_) => return DriverStatus::Success,
-    };
-    let hdr = match gpt_header_from(&hdr_buf) {
-        Some(h) => h,
-        None => return DriverStatus::Success,
-    };
+    match ctx.phase {
+        PartEnumPhase::ReadHdr => {
+            println!("reading data");
+            println!("{:#?}", child.data);
+            if let Some(h) = gpt_header_from(&child.data) {
+                ctx.first_usable_lba = h.first_usable_lba;
+                ctx.last_usable_lba = h.last_usable_lba;
+                ctx.entry_lba = h.partition_entry_lba;
+                ctx.num_entries = h.num_partition_entries;
+                ctx.entry_size = h.partition_entry_size;
+                ctx.disk_guid = h.disk_guid;
 
-    let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
-    if hdr.partition_entry_size != 128 || total_bytes == 0 {
-        return DriverStatus::Success;
-    }
-    let sectors = (total_bytes + 511) / 512;
-    let entries_buf = match read_sync(device, hdr.partition_entry_lba, sectors * 512) {
-        Ok(b) => b,
-        Err(_) => return DriverStatus::Success,
-    };
+                let total = (ctx.num_entries as usize) * (ctx.entry_size as usize);
+                if ctx.entry_size != 128 || total == 0 {
+                    let parent = unsafe { &mut *ctx.parent };
+                    parent.status = DriverStatus::Success;
+                    unsafe { pnp_complete_request(parent) };
+                    unsafe {
+                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+                    }
+                    return;
+                }
+                let bytes = ((total + 511) / 512) * 512;
 
-    let parent = match device.dev_node.upgrade() {
-        Some(dn) => dn,
-        None => return DriverStatus::Unsuccessful,
-    };
+                let mut next = Request::new(
+                    RequestType::Read {
+                        offset: ctx.entry_lba << 9,
+                        len: bytes,
+                    },
+                    vec![0u8; bytes].into_boxed_slice(),
+                );
+                ctx.phase = PartEnumPhase::ReadEntries;
+                next.set_completion(part_enum_complete, ctx_usize);
 
-    let disk_guid_s = guid_to_string(&hdr.disk_guid);
-    let mut idx: u32 = 0;
-    for ch in entries_buf.chunks_exact(128) {
-        if let Some(e) = gpt_entry_from(ch) {
-            idx += 1;
-            if e.first_lba < hdr.first_usable_lba
-                || e.last_lba > hdr.last_usable_lba
-                || e.first_lba > e.last_lba
-            {
-                continue;
+                let st = unsafe { pnp_forward_request_to_next_lower(&ctx.device, &mut next) };
+                if st == DriverStatus::NoSuchDevice {
+                    let parent = unsafe { &mut *ctx.parent };
+                    parent.status = DriverStatus::Success;
+                    unsafe { pnp_complete_request(parent) };
+                    unsafe {
+                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+                    }
+                }
+            } else {
+                let parent = unsafe { &mut *ctx.parent };
+                parent.status = DriverStatus::Success;
+                unsafe { pnp_complete_request(parent) };
+                unsafe {
+                    drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+                }
+            }
+        }
+
+        PartEnumPhase::ReadEntries => {
+            let parent = unsafe { &mut *ctx.parent };
+
+            let parent_dn = match ctx.device.dev_node.upgrade() {
+                Some(dn) => dn,
+                None => {
+                    parent.status = DriverStatus::Unsuccessful;
+                    unsafe { pnp_complete_request(parent) };
+                    unsafe {
+                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+                    }
+                    return;
+                }
+            };
+
+            let disk_guid_s = guid_to_string(&ctx.disk_guid);
+            let mut idx: u32 = 0;
+
+            for ch in child.data.chunks_exact(128) {
+                if let Some(e) = gpt_entry_from(ch) {
+                    idx += 1;
+                    if e.first_lba < ctx.first_usable_lba
+                        || e.last_lba > ctx.last_usable_lba
+                        || e.first_lba > e.last_lba
+                    {
+                        continue;
+                    }
+
+                    let mut init = DeviceInit {
+                        dev_ext_size: core::mem::size_of::<PartDevExt>(),
+                        io_read: Some(partition_pdo_read),
+                        io_write: Some(partition_pdo_write),
+                        io_device_control: None,
+                        evt_device_prepare_hardware: None,
+                        evt_bus_enumerate_devices: None,
+                        evt_pnp: None,
+                    };
+
+                    let name = alloc::format!("Partition{}", idx);
+                    let inst = alloc::format!("STOR\\PARTITION\\{}\\{:04}", disk_guid_s, idx);
+                    let ids = DeviceIds {
+                        hardware: vec!["STOR\\Partition".into(), "STOR\\Partition\\GPT".into()],
+                        compatible: vec!["STOR\\Partition".into()],
+                    };
+
+                    let (_dn_child, pdo) = unsafe {
+                        pnp_create_child_devnode_and_pdo_with_init(
+                            &parent_dn,
+                            name,
+                            inst,
+                            ids,
+                            Some("DiskPartition".into()),
+                            init,
+                        )
+                    };
+
+                    let pext = ext_mut::<PartDevExt>(&pdo);
+                    pext.start_lba = e.first_lba;
+                    pext.end_lba = e.last_lba;
+                }
             }
 
-            let mut init = DeviceInit {
-                dev_ext_size: core::mem::size_of::<PartDevExt>(),
-                io_read: Some(partition_pdo_read),
-                io_write: Some(partition_pdo_write),
-                io_device_control: None,
-                evt_device_prepare_hardware: None,
-                evt_bus_enumerate_devices: None,
-                evt_pnp: None,
-            };
-
-            let name = alloc::format!("Partition{}", idx);
-            let inst = alloc::format!("STOR\\PARTITION\\{}\\{:04}", disk_guid_s, idx);
-            let ids = DeviceIds {
-                hardware: vec!["STOR\\Partition".into(), "STOR\\Partition\\GPT".into()],
-                compatible: vec!["STOR\\Partition".into()],
-            };
-
-            let (_dn_child, pdo) = unsafe {
-                pnp_create_child_devnode_and_pdo_with_init(
-                    &parent,
-                    name,
-                    inst,
-                    ids,
-                    Some("DiskPartition".into()),
-                    init,
-                )
-            };
-
-            let pext = ext_mut::<PartDevExt>(&pdo);
-            pext.start_lba = e.first_lba;
-            pext.end_lba = e.last_lba;
+            parent.status = DriverStatus::Success;
+            unsafe { pnp_complete_request(parent) };
+            unsafe {
+                drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
+            }
         }
     }
+}
 
-    DriverStatus::Success
+pub extern "win64" fn partmgr_enumerate_devices(
+    device: &Arc<DeviceObject>,
+    request: &mut Request,
+) -> DriverStatus {
+    println!("enum");
+    let pmx = ext_mut::<PartMgrExt>(device);
+    if pmx.enumerated.swap(true, Ordering::AcqRel) {
+        request.status = DriverStatus::Success;
+        return DriverStatus::Success;
+    }
+
+    let ctx = Box::into_raw(Box::new(PartEnumCtx {
+        device: device.clone(),
+        parent: request as *mut _,
+        phase: PartEnumPhase::ReadHdr,
+        first_usable_lba: 0,
+        last_usable_lba: 0,
+        entry_lba: 0,
+        num_entries: 0,
+        entry_size: 0,
+        disk_guid: [0u8; 16],
+    })) as usize;
+
+    let mut child = Request::new(
+        RequestType::Read {
+            offset: 1u64 << 9,
+            len: 512,
+        },
+        vec![0u8; 512].into_boxed_slice(),
+    );
+    child.set_completion(part_enum_complete, ctx);
+
+    request.status = DriverStatus::Waiting;
+
+    let st = unsafe { pnp_forward_request_to_next_lower(device, &mut child) };
+    if st == DriverStatus::NoSuchDevice {
+        request.status = DriverStatus::Success;
+        return DriverStatus::Success;
+    }
+
+    DriverStatus::Waiting
 }

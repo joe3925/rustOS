@@ -14,7 +14,7 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator,
+    DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request,
     alloc_api::{
         DeviceInit,
         ffi::{driver_set_evt_device_add, get_acpi_tables, pnp_send_request},
@@ -109,7 +109,10 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(ptr, len) }
 }
 
-pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
+pub extern "win64" fn enumerate_bus(
+    device: &Arc<DeviceObject>,
+    _req: &mut Request,
+) -> DriverStatus {
     let dev_ext: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 

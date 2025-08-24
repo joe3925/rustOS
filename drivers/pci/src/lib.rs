@@ -89,7 +89,7 @@ pub extern "win64" fn bus_pnp_dispatch(device: &Arc<DeviceObject>, req: &mut Req
         }
         PnpMinorFunction::QueryDeviceRelations => {
             if pnp.relation == kernel_api::DeviceRelationType::BusRelations {
-                req.status = enumerate_bus(device);
+                req.status = enumerate_bus(device, req);
             }
             unsafe { pnp_forward_request_to_next_lower(device, req) };
         }
@@ -112,7 +112,10 @@ pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) ->
     DriverStatus::Success
 }
 
-pub extern "win64" fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
+pub extern "win64" fn enumerate_bus(
+    device: &Arc<DeviceObject>,
+    _req: &mut Request,
+) -> DriverStatus {
     let devnode = unsafe {
         (*(Arc::as_ptr(device) as *const DeviceObject))
             .dev_node

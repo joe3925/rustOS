@@ -28,7 +28,7 @@ pub enum Controller {
 impl Controller {
     fn enumerate_drives() {
         //AHCIController::enumerate_drives();
-        IdeController::enumerate_drives();
+        //IdeController::enumerate_drives();
     }
 }
 #[derive(Debug, Display)]
@@ -139,8 +139,8 @@ impl DriveCollection {
         self.drives.push(drive);
     }
     pub(crate) fn enumerate_drives(&mut self) {
-        let mut drives = Vec::new();
-        drives.extend(<IdeController as DriveController>::enumerate_drives());
+        let mut drives: Vec<Drive> = Vec::new();
+        //drives.extend(<IdeController as DriveController>::enumerate_drives());
         //drives.extend(<AHCIController as DriveController>::enumerate_drives());
         for mut drive in drives {
             if (drive.index == -1) {
