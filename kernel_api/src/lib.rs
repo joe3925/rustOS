@@ -241,7 +241,7 @@ pub enum ResourceKind {
     Port = 2,
     Interrupt = 3,
 }
-pub type DpcFn = fn(usize);
+pub type DpcFn = extern "win64" fn(usize);
 
 pub mod alloc_api {
     use core::ptr::NonNull;

@@ -34,7 +34,7 @@ pub struct IoTarget {
     target_device: Arc<DeviceObject>,
 }
 
-pub type DpcFn = fn(usize);
+pub type DpcFn = extern "win64" fn(usize);
 #[derive(Clone, Copy)]
 pub struct Dpc {
     pub func: DpcFn,

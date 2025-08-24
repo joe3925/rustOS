@@ -1,15 +1,10 @@
-#![no_std]
-#![no_main]
-
 extern crate alloc;
-use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-#[cfg(not(test))]
-use core::panic::PanicInfo;
 use core::{
     mem,
     sync::atomic::{AtomicBool, Ordering},
 };
+use kernel_api::KernelAllocator;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, Request, RequestType,
     alloc_api::ffi::{
@@ -18,22 +13,9 @@ use kernel_api::{
     },
     alloc_api::{DeviceIds, DeviceInit},
 };
-use kernel_api::{DeviceRelationType, alloc_api::ffi::InvalidateDeviceRelations};
-use kernel_api::{KernelAllocator, print};
-use kernel_api::{ffi::pnp_queue_dpc, println};
-mod msvc_shims;
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
-
-#[cfg(not(test))]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::println;
-
-    println!("{}", info);
-    loop {}
-}
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -45,9 +27,9 @@ pub extern "win64" fn partmgr_device_add(
     _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
 ) -> DriverStatus {
-    println!("filter add device");
     init.dev_ext_size = core::mem::size_of::<PartMgrExt>();
     init.evt_bus_enumerate_devices = Some(partmgr_enumerate_devices);
+
     DriverStatus::Success
 }
 
@@ -219,8 +201,6 @@ fn guid_to_string(g: &[u8; 16]) -> String {
     )
 }
 
-// ---------- sync down-call helper ----------
-
 fn read_sync(
     device: &Arc<DeviceObject>,
     lba: u64,
@@ -244,93 +224,41 @@ fn read_sync(
     Ok(req.data)
 }
 
-struct EnumCtx {
-    dev: Arc<DeviceObject>,
-}
-
-fn enum_kickoff(ctx_usize: usize) {
-    let dev = unsafe { (&*(ctx_usize as *const EnumCtx)).dev.clone() };
-
-    let mut req = Request::new(
-        RequestType::Read {
-            offset: 1 << 9,
-            len: 512,
-        },
-        alloc::vec![0u8; 512].into_boxed_slice(),
-    );
-    req.set_completion(partmgr_hdr_done, ctx_usize);
-
-    let _ = unsafe { pnp_forward_request_to_next_lower(&dev, &mut req) };
-}
-
-extern "win64" fn partmgr_hdr_done(req: &mut Request, ctx: usize) {
-    let mut state = unsafe { Box::from_raw(ctx as *mut EnumCtx) };
-    if req.status != DriverStatus::Success {
-        return;
+pub extern "win64" fn partmgr_enumerate_devices(device: &Arc<DeviceObject>) -> DriverStatus {
+    let pmx = ext_mut::<PartMgrExt>(device);
+    if pmx.enumerated.swap(true, Ordering::AcqRel) {
+        return DriverStatus::Success;
     }
 
-    let hdr = match gpt_header_from(&req.data) {
+    let hdr_buf = match read_sync(device, 1, 512) {
+        Ok(b) => b,
+        Err(_) => return DriverStatus::Success,
+    };
+    let hdr = match gpt_header_from(&hdr_buf) {
         Some(h) => h,
-        None => return,
+        None => return DriverStatus::Success,
     };
 
     let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
     if hdr.partition_entry_size != 128 || total_bytes == 0 {
-        return;
+        return DriverStatus::Success;
     }
     let sectors = (total_bytes + 511) / 512;
-
-    let mut ent_req = Request::new(
-        RequestType::Read {
-            offset: hdr.partition_entry_lba << 9,
-            len: sectors * 512,
-        },
-        alloc::vec![0u8; sectors * 512].into_boxed_slice(),
-    );
-    ent_req.set_completion(partmgr_entries_done, Box::into_raw(state) as usize);
-
-    let dev = unsafe { (&*(ctx as *const EnumCtx)).dev.clone() };
-    let _ = unsafe { pnp_forward_request_to_next_lower(&dev, &mut ent_req) };
-}
-
-extern "win64" fn partmgr_entries_done(req: &mut Request, ctx: usize) {
-    let state = unsafe { Box::from_raw(ctx as *mut EnumCtx) };
-    let dev = state.dev.clone();
-
-    if req.status != DriverStatus::Success {
-        return;
-    }
-
-    let hdr = match {
-        let mut hdr_req = Request::new(
-            RequestType::Read {
-                offset: 1 << 9,
-                len: 512,
-            },
-            alloc::vec![0u8; 512].into_boxed_slice(),
-        );
-        let _ = unsafe { pnp_forward_request_to_next_lower(&dev, &mut hdr_req) };
-        if hdr_req.status == DriverStatus::Success {
-            gpt_header_from(&hdr_req.data)
-        } else {
-            None
-        }
-    } {
-        Some(h) => h,
-        None => return,
+    let entries_buf = match read_sync(device, hdr.partition_entry_lba, sectors * 512) {
+        Ok(b) => b,
+        Err(_) => return DriverStatus::Success,
     };
 
-    let parent = match dev.dev_node.upgrade() {
+    let parent = match device.dev_node.upgrade() {
         Some(dn) => dn,
-        None => return,
+        None => return DriverStatus::Unsuccessful,
     };
 
     let disk_guid_s = guid_to_string(&hdr.disk_guid);
     let mut idx: u32 = 0;
-    let mut slot: u32 = 0;
-    for ch in req.data.chunks_exact(128) {
-        slot += 1;
+    for ch in entries_buf.chunks_exact(128) {
         if let Some(e) = gpt_entry_from(ch) {
+            idx += 1;
             if e.first_lba < hdr.first_usable_lba
                 || e.last_lba > hdr.last_usable_lba
                 || e.first_lba > e.last_lba
@@ -348,12 +276,11 @@ extern "win64" fn partmgr_entries_done(req: &mut Request, ctx: usize) {
                 evt_pnp: None,
             };
 
-            idx += 1;
             let name = alloc::format!("Partition{}", idx);
             let inst = alloc::format!("STOR\\PARTITION\\{}\\{:04}", disk_guid_s, idx);
             let ids = DeviceIds {
-                hardware: alloc::vec!["STOR\\Partition".into(), "STOR\\Partition\\GPT".into()],
-                compatible: alloc::vec!["STOR\\Partition".into()],
+                hardware: vec!["STOR\\Partition".into(), "STOR\\Partition\\GPT".into()],
+                compatible: vec!["STOR\\Partition".into()],
             };
 
             let (_dn_child, pdo) = unsafe {
@@ -366,25 +293,12 @@ extern "win64" fn partmgr_entries_done(req: &mut Request, ctx: usize) {
                     init,
                 )
             };
+
             let pext = ext_mut::<PartDevExt>(&pdo);
             pext.start_lba = e.first_lba;
             pext.end_lba = e.last_lba;
         }
     }
 
-    unsafe { InvalidateDeviceRelations(&dev, DeviceRelationType::BusRelations) };
-}
-
-pub extern "win64" fn partmgr_enumerate_devices(device: &Arc<DeviceObject>) -> DriverStatus {
-    let pmx = ext_mut::<PartMgrExt>(device);
-    if pmx.enumerated.swap(true, Ordering::AcqRel) {
-        return DriverStatus::Success;
-    }
-
-    let ctx = Box::new(EnumCtx {
-        dev: device.clone(),
-    });
-    unsafe { pnp_queue_dpc(enum_kickoff as _, Box::into_raw(ctx) as usize) };
-
-    DriverStatus::Pending
+    DriverStatus::Success
 }
