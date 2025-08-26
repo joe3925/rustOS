@@ -155,10 +155,8 @@ pub fn kernel_main() {
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
         symbols: EXPORTS.to_vec(),
     }))]);
-    let mut controller = IdeController::new(DriveType::Master as u32);
-    let mut buffer = vec![0u8; 512];
-    controller.read(1, &mut buffer);
     let pid = PROGRAM_MANAGER.add_program(program);
+
     boot_part_init(BOOTSET);
     if (is_first_boot()) {
         setup_file_layout().expect("Failed to create system volume layout");
@@ -168,24 +166,6 @@ pub fn kernel_main() {
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");
-    // let label = {
-    //     let mut volumes = VOLUMES.lock();
-    //     if let Some(system_volume) = volumes.find_partition_by_name("MAIN VOLUME") {
-    //         system_volume.label.clone()
-    //     } else {
-    //         panic!("System Volume unavailable or corrupted")
-    //     }
-    // };
-
-    // let base_path = "\\SYSTEM\\MOD";
-    // let mut path_buffer = String::new();
-
-    // let full_path = {
-    //     let mut s = String::with_capacity(label.len() + base_path.len());
-    //     s.push_str(&label);
-    //     s.push_str(base_path);
-    //     s
-    // };
 
     print_mem_report();
     println!("");

@@ -140,7 +140,7 @@ impl DriveCollection {
     }
     pub(crate) fn enumerate_drives(&mut self) {
         let mut drives: Vec<Drive> = Vec::new();
-        //drives.extend(<IdeController as DriveController>::enumerate_drives());
+        drives.extend(<IdeController as DriveController>::enumerate_drives());
         //drives.extend(<AHCIController as DriveController>::enumerate_drives());
         for mut drive in drives {
             if (drive.index == -1) {
