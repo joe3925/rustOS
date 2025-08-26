@@ -8,7 +8,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::alloc_api::PnpRequest;
 use kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower;
-use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, RequestType};
+use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, RequestType, ResourceKind};
 use kernel_api::{
     PageMapError,
     ffi::{map_mmio_region, unmap_range},
@@ -274,20 +274,17 @@ pub fn header_type(seg: &McfgSegment, bus: u8, dev: u8) -> Option<u8> {
 }
 
 pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
-    use kernel_api::ResourceKind;
-
     let mut items: alloc::vec::Vec<(u32, u32, u64, u64)> = alloc::vec::Vec::new();
 
-    for b in p.bars.iter() {
+    for (i, b) in p.bars.iter().enumerate() {
         match b.kind {
             BarKind::None => {}
-            BarKind::Io => items.push((ResourceKind::Port as u32, 0, b.base, b.size)),
+            BarKind::Io => {
+                // write BAR index in the second u32
+                items.push((ResourceKind::Port as u32, i as u32, b.base, b.size));
+            }
             BarKind::Mem32 | BarKind::Mem64 => {
-                let mut flags = 0u32;
-                if b.prefetch {
-                    flags |= 1;
-                }
-                items.push((ResourceKind::Memory as u32, flags, b.base, b.size));
+                items.push((ResourceKind::Memory as u32, i as u32, b.base, b.size));
             }
         }
     }
@@ -301,9 +298,9 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     out.extend_from_slice(b"RSRC");
     out.extend_from_slice(&1u32.to_le_bytes());
     out.extend_from_slice(&(items.len() as u32).to_le_bytes());
-    for (k, f, s, l) in items {
+    for (k, idx, s, l) in items {
         out.extend_from_slice(&k.to_le_bytes());
-        out.extend_from_slice(&f.to_le_bytes());
+        out.extend_from_slice(&idx.to_le_bytes());
         out.extend_from_slice(&s.to_le_bytes());
         out.extend_from_slice(&l.to_le_bytes());
     }

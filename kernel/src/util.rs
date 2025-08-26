@@ -1,7 +1,10 @@
 extern crate rand_xoshiro;
 
-use crate::drivers::drive::generic_drive::{boot_part_init, DRIVECOLLECTION};
+use crate::drivers::drive::generic_drive::{
+    boot_part_init, DriveController, DriveType, DRIVECOLLECTION,
+};
 use crate::drivers::drive::gpt::VOLUMES;
+use crate::drivers::drive::ide_disk_driver::IdeController;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     calibrate_tsc, get_current_logical_id, wait_millis, wait_millis_idle, wait_using_pit_50ms,
@@ -152,7 +155,9 @@ pub fn kernel_main() {
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
         symbols: EXPORTS.to_vec(),
     }))]);
-
+    let mut controller = IdeController::new(DriveType::Master as u32);
+    let mut buffer = vec![0u8; 512];
+    controller.read(1, &mut buffer);
     let pid = PROGRAM_MANAGER.add_program(program);
     boot_part_init(BOOTSET);
     if (is_first_boot()) {

@@ -284,7 +284,6 @@ struct PartEnumCtx {
 }
 
 extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
-    println!("enum complete {:#?}", child.status);
     let ctx = unsafe { &mut *(ctx_usize as *mut PartEnumCtx) };
 
     if child.status != DriverStatus::Success {
@@ -299,9 +298,8 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
 
     match ctx.phase {
         PartEnumPhase::ReadHdr => {
-            println!("reading data");
-            println!("{:#?}", child.data);
             if let Some(h) = gpt_header_from(&child.data) {
+                println!("has header");
                 ctx.first_usable_lba = h.first_usable_lba;
                 ctx.last_usable_lba = h.last_usable_lba;
                 ctx.entry_lba = h.partition_entry_lba;

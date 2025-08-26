@@ -251,11 +251,6 @@ extern "win64" fn disk_on_query_done(child: &mut Request, ctx: usize) {
         || child.data.len() < core::mem::size_of::<BlockQueryOut>()
     {
         let st = if child.status == DriverStatus::Success {
-            println!(
-                "data: {:#x}, query: {:#X}",
-                child.data.len(),
-                core::mem::size_of::<BlockQueryOut>()
-            );
             DriverStatus::Unsuccessful
         } else {
             child.status
