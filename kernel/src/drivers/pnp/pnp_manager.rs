@@ -471,7 +471,6 @@ impl PnpManager {
     fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         let mut func_pkg: Option<Arc<DriverPackage>> = None;
 
-        // ROOT\* direct binding for boot devices
         if let Some(hwid) = dn.ids.hardware.get(0) {
             if hwid.starts_with("ROOT\\") {
                 if let Some(driver_name) = hwid.split('\\').nth(1) {
@@ -482,7 +481,6 @@ impl PnpManager {
             }
         }
 
-        // Try HWIDs first
         if func_pkg.is_none() {
             let ids_slice: Vec<&str> = dn
                 .ids
@@ -498,7 +496,7 @@ impl PnpManager {
             }
         }
 
-        // Fallback to class default service as the FUNCTION driver (not a separate layer)
+        // Fallback to class default service as the FUNCTION driver
         if func_pkg.is_none() {
             if let Some(pkg) = self.resolve_class_driver(dn.class.as_deref())? {
                 func_pkg = Some(pkg);

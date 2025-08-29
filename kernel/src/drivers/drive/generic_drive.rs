@@ -172,7 +172,7 @@ impl DriveCollection {
             for (i, drive) in self.drives.iter().enumerate() {
                 println!("Drive {}:", i + 1);
                 println!("Index: {}", drive.index);
-                drive.info.print(); // Call the print method of DriveInfo
+                drive.info.print();
             }
         }
     }

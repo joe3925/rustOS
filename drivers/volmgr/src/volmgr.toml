@@ -1,0 +1,5 @@
+image = "volmgr.dll"
+start = "demand"
+role = "function"
+class = "DiskPartition"
+hwids = ["STOR\\Partition\\GPT", "STOR\\Partition"]

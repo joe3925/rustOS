@@ -12,21 +12,23 @@ use kernel_api::{
     alloc_api::ffi::{driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init},
     alloc_api::{DeviceIds, DeviceInit},
 };
-use kernel_api::{KernelAllocator, println};
+use kernel_api::{GptHeader, GptPartitionEntry, KernelAllocator, println};
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
+
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     use kernel_api::println;
-
     println!("{}", info);
     loop {}
 }
+
 mod msvc_shims;
+
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, partmgr_device_add) };
@@ -52,15 +54,45 @@ fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
     unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
 }
 
-// ---------- partition PDO devext and IO handlers ----------
-
 #[repr(C)]
 struct PartDevExt {
     start_lba: u64,
     end_lba: u64,
+    gpt_header: Option<GptHeader>,
+    gpt_entry: Option<GptPartitionEntry>,
 }
 
-// ------------ Generic async “send down” with parent completion ------------
+pub extern "win64" fn partition_pdo_pnp(device: &Arc<DeviceObject>, request: &mut Request) {
+    let Some(pnp) = request.pnp.as_mut() else {
+        request.status = DriverStatus::Pending;
+        return;
+    };
+    match pnp.minor_function {
+        kernel_api::PnpMinorFunction::QueryResources => {
+            let dx = ext_mut::<PartDevExt>(device);
+            match (&dx.gpt_header, &dx.gpt_entry) {
+                (Some(h), Some(e)) => {
+                    let hb =
+                        unsafe { core::slice::from_raw_parts(h as *const _ as *const u8, 512) };
+                    let eb =
+                        unsafe { core::slice::from_raw_parts(e as *const _ as *const u8, 128) };
+                    pnp.blob_out.clear();
+                    pnp.blob_out.extend_from_slice(hb);
+                    pnp.blob_out.extend_from_slice(eb);
+                    request.status = DriverStatus::Success;
+                    unsafe { pnp_complete_request(request) };
+                }
+                _ => {
+                    request.status = DriverStatus::NotImplemented;
+                    unsafe { pnp_complete_request(request) };
+                }
+            }
+        }
+        _ => {
+            request.status = DriverStatus::Pending;
+        }
+    }
+}
 
 #[repr(C)]
 struct ChildCtxCopyback {
@@ -96,14 +128,11 @@ fn send_down_async_copyback(
     parent.status = DriverStatus::Waiting;
     let st = unsafe { pnp_forward_request_to_next_lower(from, &mut child) };
     if st == DriverStatus::NoSuchDevice {
-        // Complete parent immediately with failure
         parent.status = DriverStatus::NoSuchDevice;
         unsafe { pnp_complete_request(parent) };
     }
     DriverStatus::Waiting
 }
-
-// ------------ Partition PDO read/write using async forwarding ------------
 
 pub extern "win64" fn partition_pdo_read(
     device: &Arc<DeviceObject>,
@@ -167,7 +196,6 @@ pub extern "win64" fn partition_pdo_write(
 
     let phys_off = off + ((dx.start_lba as u64) << 9);
 
-    // Move parent's buffer into child to avoid copy
     let moved = mem::take(&mut request.data);
 
     let _ = send_down_async_copyback(
@@ -179,39 +207,6 @@ pub extern "win64" fn partition_pdo_write(
         },
         moved,
     );
-}
-
-// ---------- GPT structures (read-only) ----------
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GptHeader {
-    signature: [u8; 8],
-    revision: u32,
-    header_size: u32,
-    header_crc32: u32,
-    _reserved: u32,
-    _current_lba: u64,
-    _backup_lba: u64,
-    first_usable_lba: u64,
-    last_usable_lba: u64,
-    disk_guid: [u8; 16],
-    partition_entry_lba: u64,
-    num_partition_entries: u32,
-    partition_entry_size: u32,
-    _partition_crc32: u32,
-    _reserved_block: [u8; 420],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct GptPartitionEntry {
-    partition_type_guid: [u8; 16],
-    unique_partition_guid: [u8; 16],
-    first_lba: u64,
-    last_lba: u64,
-    _attr: u64,
-    name_utf16: [u16; 36],
 }
 
 #[inline]
@@ -262,8 +257,6 @@ fn guid_to_string(g: &[u8; 16]) -> String {
     )
 }
 
-// ---------- Async GPT enumeration state machine ----------
-
 #[repr(u32)]
 enum PartEnumPhase {
     ReadHdr = 0,
@@ -281,6 +274,7 @@ struct PartEnumCtx {
     num_entries: u32,
     entry_size: u32,
     disk_guid: [u8; 16],
+    hdr_copy: GptHeader,
 }
 
 extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
@@ -290,31 +284,27 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
         let parent = unsafe { &mut *ctx.parent };
         parent.status = DriverStatus::Success;
         unsafe { pnp_complete_request(parent) };
-        unsafe {
-            drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-        }
+        unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
         return;
     }
 
     match ctx.phase {
         PartEnumPhase::ReadHdr => {
             if let Some(h) = gpt_header_from(&child.data) {
-                println!("has header");
                 ctx.first_usable_lba = h.first_usable_lba;
                 ctx.last_usable_lba = h.last_usable_lba;
                 ctx.entry_lba = h.partition_entry_lba;
                 ctx.num_entries = h.num_partition_entries;
                 ctx.entry_size = h.partition_entry_size;
                 ctx.disk_guid = h.disk_guid;
+                ctx.hdr_copy = h;
 
                 let total = (ctx.num_entries as usize) * (ctx.entry_size as usize);
                 if ctx.entry_size != 128 || total == 0 {
                     let parent = unsafe { &mut *ctx.parent };
                     parent.status = DriverStatus::Success;
                     unsafe { pnp_complete_request(parent) };
-                    unsafe {
-                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-                    }
+                    unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
                     return;
                 }
                 let bytes = ((total + 511) / 512) * 512;
@@ -334,17 +324,13 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
                     let parent = unsafe { &mut *ctx.parent };
                     parent.status = DriverStatus::Success;
                     unsafe { pnp_complete_request(parent) };
-                    unsafe {
-                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-                    }
+                    unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
                 }
             } else {
                 let parent = unsafe { &mut *ctx.parent };
                 parent.status = DriverStatus::Success;
                 unsafe { pnp_complete_request(parent) };
-                unsafe {
-                    drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-                }
+                unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
             }
         }
 
@@ -356,9 +342,7 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
                 None => {
                     parent.status = DriverStatus::Unsuccessful;
                     unsafe { pnp_complete_request(parent) };
-                    unsafe {
-                        drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-                    }
+                    unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
                     return;
                 }
             };
@@ -383,7 +367,7 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
                         io_device_control: None,
                         evt_device_prepare_hardware: None,
                         evt_bus_enumerate_devices: None,
-                        evt_pnp: None,
+                        evt_pnp: Some(partition_pdo_pnp),
                     };
 
                     let name = alloc::format!("Partition{}", idx);
@@ -407,14 +391,14 @@ extern "win64" fn part_enum_complete(child: &mut Request, ctx_usize: usize) {
                     let pext = ext_mut::<PartDevExt>(&pdo);
                     pext.start_lba = e.first_lba;
                     pext.end_lba = e.last_lba;
+                    pext.gpt_header = Some(ctx.hdr_copy);
+                    pext.gpt_entry = Some(e);
                 }
             }
 
             parent.status = DriverStatus::Success;
             unsafe { pnp_complete_request(parent) };
-            unsafe {
-                drop(Box::from_raw(ctx_usize as *mut PartEnumCtx));
-            }
+            unsafe { drop(Box::from_raw(ctx_usize as *mut PartEnumCtx)) };
         }
     }
 }
@@ -440,6 +424,7 @@ pub extern "win64" fn partmgr_enumerate_devices(
         num_entries: 0,
         entry_size: 0,
         disk_guid: [0u8; 16],
+        hdr_copy: unsafe { core::mem::zeroed() },
     })) as usize;
 
     let mut child = Request::new(

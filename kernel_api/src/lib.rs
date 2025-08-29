@@ -67,6 +67,36 @@ pub enum RequestType {
 
     Dummy,
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GptHeader {
+    pub signature: [u8; 8],
+    pub revision: u32,
+    pub header_size: u32,
+    pub header_crc32: u32,
+    pub _reserved: u32,
+    pub _current_lba: u64,
+    pub _backup_lba: u64,
+    pub first_usable_lba: u64,
+    pub last_usable_lba: u64,
+    pub disk_guid: [u8; 16],
+    pub partition_entry_lba: u64,
+    pub num_partition_entries: u32,
+    pub partition_entry_size: u32,
+    pub _partition_crc32: u32,
+    pub_reserved_block: [u8; 420],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GptPartitionEntry {
+    pub partition_type_guid: [u8; 16],
+    pub unique_partition_guid: [u8; 16],
+    pub first_lba: u64,
+    pub last_lba: u64,
+    pub _attr: u64,
+    pub name_utf16: [u16; 36],
+}
 
 #[derive(Debug)]
 #[repr(C)]
