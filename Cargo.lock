@@ -444,6 +444,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 
 [[package]]
+name = "mountmgr"
+version = "0.1.0"
+dependencies = [
+ "kernel_api",
+ "spin 0.10.0",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,6 +800,14 @@ name = "volatile"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "442887c63f2c839b346c192d047a7c87e73d0689c9157b00b53dcc27dd5ea793"
+
+[[package]]
+name = "volmgr"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.0",
+ "kernel_api",
+]
 
 [[package]]
 name = "wasi"

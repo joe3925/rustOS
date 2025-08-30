@@ -417,8 +417,6 @@ pub mod alloc_api {
                 pub fn reg_list_keys(base_path: &str) -> Result<Vec<String>, RegError>;
                 pub fn reg_list_values(base_path: &str) -> Result<Vec<String>, RegError>;
             }
-
-            // Small safe-ish wrappers for convenience (just forward to externs)
             #[inline]
             pub fn get_value(k: &str, n: &str) -> Option<Data> {
                 unsafe { reg_get_value(k, n) }
@@ -513,7 +511,7 @@ pub mod alloc_api {
                 callback: ClassAddCallback,
                 dev_obj: Arc<DeviceObject>,
             );
-
+            pub fn pnp_wait_for_request(req: &Request);
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,

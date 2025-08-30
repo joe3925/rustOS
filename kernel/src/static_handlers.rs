@@ -314,3 +314,10 @@ pub extern "win64" fn pnp_add_class_listener(
 ) {
     PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
 }
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_wait_for_request(req: &Request) {
+    while (!req.completed) {
+        PNP_MANAGER.run_once();
+        core::hint::spin_loop();
+    }
+}

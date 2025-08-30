@@ -61,6 +61,7 @@ export! {
     pnp_ioctl_via_symlink,
     pnp_load_service,
     pnp_add_class_listener,
+    pnp_wait_for_request,
     InvalidateDeviceRelations,
 
     driver_get_name,

@@ -22,14 +22,8 @@ use kernel_api::{
     alloc_api::{
         DeviceInit,
         ffi::{
-            // new listener binding
-            pnp_add_class_listener,
-            // existing helpers
-            pnp_create_device_symlink_top,
-            pnp_ioctl_via_symlink,
-            pnp_load_service,
-            pnp_remove_symlink,
-            reg,
+            pnp_add_class_listener, pnp_create_device_symlink_top, pnp_ioctl_via_symlink,
+            pnp_load_service, pnp_remove_symlink, reg,
         },
     },
     println,

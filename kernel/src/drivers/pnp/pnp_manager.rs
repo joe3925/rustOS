@@ -1242,7 +1242,13 @@ impl PnpManager {
 
         Ok(idx)
     }
-
+    #[inline]
+    pub fn run_once(&self) -> bool {
+        let mut did = false;
+        did |= self.run_one_dpc();
+        did |= self.run_one_device_request();
+        did
+    }
     pub fn dispatch_forever(&self) -> ! {
         loop {
             let mut did_work = false;
