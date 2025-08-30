@@ -141,7 +141,7 @@ struct VolFdoExt {
     inst_path: String,
     probe_link: String,
     public_link: String,
-    fs_attached: AtomicBool, // set true after FS claims and attaches
+    fs_attached: AtomicBool,
 }
 impl VolFdoExt {
     fn blank() -> Self {
@@ -189,7 +189,6 @@ extern "win64" fn fs_probe_complete(req: &mut Request, ctx: usize) {
         dx.fs_attached.store(true, Ordering::Release);
         println!("[volclass] claimed -> {}", dx.public_link);
     }
-    // Box drops here
 }
 
 #[unsafe(no_mangle)]
@@ -203,7 +202,7 @@ pub extern "win64" fn volclass_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init.dev_ext_size = size_of::<VolFdoExt>();
-    dev_init.evt_device_prepare_hardware = Some(volclass_start); // StartDevice
+    dev_init.evt_device_prepare_hardware = Some(volclass_start);
     dev_init.io_device_control = Some(volclass_ioctl);
     let _ = refresh_fs_registry_from_registry();
     DriverStatus::Success
