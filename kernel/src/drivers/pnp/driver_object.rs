@@ -110,6 +110,9 @@ impl DeviceObject {
 fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {
     unsafe { Arc::from_raw(Arc::as_ptr(&Arc::new_uninit().assume_init())) }
 }
+pub type ClassAddCallback =
+    extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
+
 pub type EvtDriverDeviceAdd =
     extern "win64" fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
 
@@ -180,7 +183,11 @@ pub enum RequestType {
 
     Dummy,
 }
-
+pub struct ClassListener {
+    pub class: String,
+    pub dev: Arc<DeviceObject>,
+    pub cb: ClassAddCallback,
+}
 #[derive(Debug)]
 #[repr(C)]
 pub struct Request {

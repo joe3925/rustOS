@@ -1,5 +1,7 @@
 use crate::alloc::vec;
-use crate::drivers::pnp::driver_object::{PnpRequest, QueryIdType};
+use crate::drivers::pnp::driver_object::{
+    ClassAddCallback, ClassListener, PnpRequest, QueryIdType,
+};
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::{
@@ -207,6 +209,7 @@ impl DeviceStack {
     }
 }
 #[derive(Debug)]
+#[repr(C)]
 pub struct DevNode {
     pub name: String,
     pub parent: RwLock<Option<alloc::sync::Weak<DevNode>>>,
@@ -295,6 +298,8 @@ pub struct PnpManager {
     drivers: RwLock<BTreeMap<String, Arc<DriverObject>>>,
     dev_root: Arc<DevNode>,
     waiting_requests: Mutex<BTreeMap<usize, Arc<Mutex<Request>>>>,
+    class_listeners: Mutex<BTreeMap<u64, ClassListener>>,
+    next_listener_id: core::sync::atomic::AtomicU64,
 }
 
 impl PnpManager {
@@ -304,6 +309,8 @@ impl PnpManager {
             drivers: RwLock::new(BTreeMap::new()),
             dev_root: DevNode::new_root(),
             waiting_requests: Mutex::new(BTreeMap::new()),
+            class_listeners: Mutex::new(BTreeMap::new()),
+            next_listener_id: core::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -398,7 +405,7 @@ impl PnpManager {
         );
         let _ =
             crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\PDO", base), &pdo_obj);
-
+        self.notify_class_listeners(&dev_node);
         (dev_node, pdo)
     }
 
@@ -432,6 +439,7 @@ impl PnpManager {
         );
         let _ =
             crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\PDO", base), &pdo_obj);
+        self.notify_class_listeners(&dev_node);
 
         (dev_node, pdo)
     }
@@ -1594,6 +1602,79 @@ impl PnpManager {
         mut req: &mut Request,
     ) -> DriverStatus {
         self.send_request_via_symlink(link_path, &mut req)
+    }
+    pub fn create_control_device_with_init(
+        &self,
+        name: String,
+        mut init: DeviceInit,
+    ) -> (Arc<DeviceObject>, String) {
+        init.evt_pnp = None;
+
+        let dev = DeviceObject::new(init.dev_ext_size);
+        unsafe {
+            let p = &mut *(Arc::as_ptr(&dev) as *mut DeviceObject);
+            p.dev_init = init;
+        }
+
+        let base = alloc::format!("\\Device\\Control\\{}", name);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Device\\Control".to_string());
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+
+        let obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Device,
+            "Device".to_string(),
+            crate::object_manager::ObjectPayload::Device(dev.clone()),
+        );
+        let dev_path = alloc::format!("{}\\Device", base);
+        let _ = crate::object_manager::OBJECT_MANAGER.link(dev_path.clone(), &obj);
+
+        (dev, dev_path)
+    }
+
+    pub fn create_control_device_and_link(
+        &self,
+        name: String,
+        init: DeviceInit,
+        link_path: String,
+    ) -> Arc<DeviceObject> {
+        let (dev, dev_path) = self.create_control_device_with_init(name, init);
+        let _ = crate::object_manager::OBJECT_MANAGER.symlink(link_path, dev_path, true);
+        dev
+    }
+    pub fn add_class_listener(
+        &self,
+        class: String,
+        listener_dev: Arc<DeviceObject>,
+        cb: ClassAddCallback,
+    ) -> u64 {
+        let id = self.next_listener_id.fetch_add(1, Ordering::AcqRel) + 1;
+        self.class_listeners.lock().insert(
+            id,
+            ClassListener {
+                class,
+                dev: listener_dev,
+                cb,
+            },
+        );
+        id
+    }
+
+    pub fn remove_class_listener(&self, id: u64) -> bool {
+        self.class_listeners.lock().remove(&id).is_some()
+    }
+
+    fn notify_class_listeners(&self, dn: &Arc<DevNode>) {
+        let Some(cls) = dn.class.as_ref() else { return };
+        let hits: Vec<(Arc<DeviceObject>, ClassAddCallback)> = {
+            let map = self.class_listeners.lock();
+            map.values()
+                .filter(|l| l.class.eq_ignore_ascii_case(cls))
+                .map(|l| (l.dev.clone(), l.cb))
+                .collect()
+        };
+        for (dev, cb) in hits {
+            cb(dn, &dev);
+        }
     }
 }
 

@@ -1,5 +1,4 @@
 image = "mountmgr.dll"
-start = "demand"
-role = "function"
-class = "volume"
+start = "boot"
+role = "base"
 hwids = []

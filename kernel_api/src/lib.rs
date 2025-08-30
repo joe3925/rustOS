@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use ffi::random_number;
 use spin::{Mutex, RwLock};
@@ -14,10 +15,12 @@ pub use x86_64;
 use x86_64::structures::paging::mapper::MapToError;
 
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicBool, AtomicU8};
 use strum::Display;
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
+
+use crate::alloc_api::DeviceIds;
 
 pub struct KernelAllocator;
 
@@ -44,13 +47,28 @@ pub struct DeviceObject {
     pub dispatch_scheduled: AtomicBool,
     pub dev_node: Weak<DevNode>,
 }
-
+#[derive(Debug)]
 #[repr(C)]
 pub struct DevNode {
-    _private: [u8; 0],
+    pub name: String,
+    pub parent: RwLock<Option<alloc::sync::Weak<DevNode>>>,
+    pub children: RwLock<Vec<Arc<DevNode>>>,
+    pub instance_path: String,
+    pub ids: DeviceIds,
+    pub class: Option<String>,
+    pub state: AtomicU8,
+
+    pub pdo: RwLock<Option<Arc<DeviceObject>>>,
+    pub stack: RwLock<Option<DeviceStack>>,
 }
 #[repr(C)]
 pub struct DriverObject {
+    _private: [u8; 0],
+}
+#[derive(Debug)]
+#[repr(C)]
+
+pub struct DeviceStack {
     _private: [u8; 0],
 }
 #[repr(C)]
@@ -377,7 +395,8 @@ pub mod alloc_api {
     pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices =
         extern "win64" fn(&Arc<DeviceObject>, &mut Request) -> DriverStatus;
-
+    pub type ClassAddCallback =
+        extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
     pub mod ffi {
         use super::*;
@@ -480,6 +499,21 @@ pub mod alloc_api {
                 request: &mut Request,
             ) -> DriverStatus;
             pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>>;
+            pub fn pnp_create_control_device_with_init(
+                name: alloc::string::String,
+                init: DeviceInit,
+            ) -> Arc<DeviceObject>;
+            pub fn pnp_create_control_device_and_link(
+                name: alloc::string::String,
+                init: DeviceInit,
+                link_path: alloc::string::String,
+            ) -> Arc<DeviceObject>;
+            pub fn pnp_add_class_listener(
+                class: String,
+                callback: ClassAddCallback,
+                dev_obj: Arc<DeviceObject>,
+            );
+
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,

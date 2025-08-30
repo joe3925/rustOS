@@ -15,8 +15,8 @@ use crate::{
         interrupt_index::wait_millis,
         pnp::{
             driver_object::{
-                DeviceInit, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
-                EvtDriverDeviceAdd, EvtDriverUnload, Request,
+                ClassAddCallback, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
+                DriverStatus, EvtDriverDeviceAdd, EvtDriverUnload, Request,
             },
             pnp_manager::{CompletionRoutine, DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
         },
@@ -31,25 +31,36 @@ use crate::{
     },
     util::boot_info,
 };
+#[unsafe(no_mangle)]
 
 pub extern "win64" fn create_kernel_task(entry: usize, name: String) -> u64 {
     let task = Task::new_kernel_mode(entry, KERNEL_STACK_SIZE, name, 0);
     SCHEDULER.lock().add_task(task)
 }
+#[unsafe(no_mangle)]
+
 pub extern "win64" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
     SCHEDULER.lock().delete_task(id)
 }
+#[unsafe(no_mangle)]
+
 pub extern "win64" fn kernel_alloc(layout: Layout) -> *mut u8 {
     unsafe { GlobalAlloc::alloc(&ALLOCATOR, layout) }
 }
+#[unsafe(no_mangle)]
+
 pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
     unsafe {
         GlobalAlloc::dealloc(&ALLOCATOR, ptr, layout);
     };
 }
+#[unsafe(no_mangle)]
+
 pub extern "win64" fn print(str: &[u8]) {
     CONSOLE.lock().print(str);
 }
+#[unsafe(no_mangle)]
+
 pub extern "win64" fn wait_ms(ms: u64) {
     wait_millis(ms);
 }
@@ -273,6 +284,33 @@ pub extern "win64" fn pnp_ioctl_via_symlink(
 ) -> DriverStatus {
     PNP_MANAGER.ioctl_via_symlink(link_path, control_code, req)
 }
+#[unsafe(no_mangle)]
 pub extern "win64" fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
     PNP_MANAGER.load_service(&name)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_control_device_with_init(
+    name: String,
+    init: DeviceInit,
+) -> Arc<DeviceObject> {
+    let (dev, _) = PNP_MANAGER.create_control_device_with_init(name, init);
+    dev
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_control_device_and_link(
+    name: String,
+    init: DeviceInit,
+    link_path: String,
+) -> Arc<DeviceObject> {
+    PNP_MANAGER.create_control_device_and_link(name, init, link_path)
+}
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_add_class_listener(
+    class: String,
+    callback: ClassAddCallback,
+    dev_obj: Arc<DeviceObject>,
+) {
+    PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
 }
