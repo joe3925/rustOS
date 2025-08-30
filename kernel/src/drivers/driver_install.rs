@@ -52,6 +52,11 @@ pub enum FilterTarget {
     Class(String),
     Driver(String),
 }
+#[derive(Debug, Clone)]
+pub struct RegWrite {
+    pub path: String,
+    pub values: Vec<(String, Data)>,
+}
 
 #[derive(Debug)]
 pub struct FilterSpec {
@@ -68,7 +73,9 @@ pub struct DriverToml {
     pub role: DriverRole,           // default Function
     pub class: Option<String>,      // optional for function drivers
     pub filter: Option<FilterSpec>, // present when role==Filter
+    pub reg_writes: Vec<RegWrite>,
 }
+
 #[derive(Debug)]
 pub enum DriverError {
     File(crate::file_system::file::FileStatus),
@@ -153,7 +160,7 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
         .is_some();
 
     let explicit_role = tbl.get("role").and_then(|v| inner(v).as_str());
-    let mut role = if has_filter_tbl {
+    let role = if has_filter_tbl {
         DriverRole::Filter
     } else {
         match explicit_role {
@@ -215,6 +222,44 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
         return Err(FileStatus::BadPath);
     }
 
+    let reg_writes: Vec<RegWrite> = tbl
+        .get("registry")
+        .and_then(|v| inner(v).as_array())
+        .map(|arr| {
+            let mut out = Vec::new();
+            for item in arr.iter() {
+                let it = match inner(item).as_table() {
+                    Some(t) => t,
+                    None => continue,
+                };
+
+                let path = match it.get("path").and_then(|v| inner(v).as_str()) {
+                    Some(p) if !p.is_empty() => p.to_string(),
+                    _ => continue,
+                };
+
+                let mut values: Vec<(String, Data)> = Vec::new();
+                if let Some(vtbl) = it.get("values").and_then(|v| inner(v).as_table()) {
+                    for (k, vv) in vtbl.iter() {
+                        if let Some(s) = inner(vv).as_str() {
+                            values.push((k.to_string(), Data::Str(s.to_string())));
+                        } else if let Some(di) = inner(vv).as_integer() {
+                            if let Some(u) = deint_to_u32(di) {
+                                values.push((k.to_string(), Data::U32(u)));
+                            } else {
+                            }
+                        }
+                    }
+                }
+
+                if !values.is_empty() {
+                    out.push(RegWrite { path, values });
+                }
+            }
+            out
+        })
+        .unwrap_or_default();
+
     Ok(DriverToml {
         image,
         start,
@@ -222,13 +267,12 @@ pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
         role,
         class,
         filter,
+        reg_writes,
     })
 }
 
 fn deint_to_u32(di: &DeInteger) -> Option<u32> {
-    // Parse with the literal's radix; reject negatives and out-of-range
     let s = di.as_str();
-    // For order we only accept non-negative
     let n = i128::from_str_radix(s, di.radix()).ok()?;
     u32::try_from(n).ok()
 }
@@ -335,12 +379,11 @@ fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
 fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
-
 pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
     let driver = parse_driver_toml(toml_path).map_err(|_| DriverError::TomlParse)?;
     let driver_name = service_name_from_image(&driver.image);
 
-    let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}", driver_name);
+    let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}/", driver_name);
 
     let toml_target_path = alloc::format!("C:\\SYSTEM\\TOML\\{}.toml", driver_name);
     let img_target_path = alloc::format!("C:\\SYSTEM\\MOD\\{}", driver.image);
@@ -398,7 +441,7 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
             }
 
             if !driver.hwids.is_empty() {
-                let hwk = alloc::format!("{}/Hwids", key_path);
+                let hwk = alloc::format!("{}/Hwids", key_path.trim_end_matches('/'));
                 reg::create_key(&hwk)?;
                 for (i, h) in driver.hwids.iter().enumerate() {
                     reg::set_value(&hwk, &alloc::format!("{}", i), Data::Str(h.clone()))?;
@@ -408,7 +451,7 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
 
         DriverRole::Filter => {
             let f = driver.filter.as_ref().ok_or(DriverError::TomlParse)?;
-            let flt_key = alloc::format!("{}/Filter", key_path);
+            let flt_key = alloc::format!("{}/Filter", key_path.trim_end_matches('/'));
             reg::create_key(&flt_key)?;
             let pos_s = match f.position {
                 FilterPosition::Upper => "upper",
@@ -438,6 +481,13 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         }
 
         DriverRole::Base => {}
+    }
+
+    for rw in driver.reg_writes.iter() {
+        reg::create_key(&rw.path)?;
+        for (name, val) in rw.values.iter() {
+            reg::set_value(&rw.path, name, val.clone())?;
+        }
     }
 
     PNP_MANAGER.rebuild_index();

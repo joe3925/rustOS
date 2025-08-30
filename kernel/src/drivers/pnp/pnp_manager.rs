@@ -325,10 +325,7 @@ impl PnpManager {
                 .collect()
         };
 
-        println!("PNP: Initializing boot-start drivers as root devices...");
         for pkg in boot_packages {
-            println!("  -> Processing boot-start driver: {}", pkg.name);
-
             if let Err(e) = self.ensure_loaded(&pkg) {
                 println!(
                     "  -> ERROR: Failed to load boot-start driver binary {}: {:?}",
@@ -342,9 +339,6 @@ impl PnpManager {
                 hardware: vec![alloc::format!("ROOT\\{}", pkg.name)],
                 compatible: Vec::new(),
             };
-
-            println!("     -> Creating root DevNode with path: {}", instance_path);
-
             let mut pdo_init = DeviceInit::new();
             pdo_init.dev_ext_size = 0;
             pdo_init.evt_pnp = Some(Self::pdo_pnp_dispatch);
@@ -357,8 +351,6 @@ impl PnpManager {
                 None,
                 pdo_init,
             );
-
-            println!("     -> Binding and starting device stack...");
             if let Err(e) = self.bind_and_start(&devnode) {
                 println!(
                     "     -> ERROR: bind/start failed for '{}': {:?}",
@@ -909,6 +901,30 @@ impl PnpManager {
             false
         }
     }
+    pub fn load_service(&self, svc: &str) -> Option<Arc<DriverObject>> {
+        if let Some(drv) = self.drivers.read().get(svc).cloned() {
+            let _ = self.ensure_driver_entry(&drv);
+            return Some(drv);
+        }
+
+        let pkg = if let Some(p) = self.hw.read().by_driver.get(svc) {
+            p.clone()
+        } else {
+            match self.pkg_by_service(svc) {
+                Some(p) => p,
+                None => return None,
+            }
+        };
+
+        let drv = match self.ensure_loaded(&pkg) {
+            Ok(d) => d,
+            Err(_) => return None,
+        };
+
+        let _ = self.ensure_driver_entry(&drv);
+
+        Some(drv)
+    }
 
     fn start_stack(&self, dn: &Arc<DevNode>) {
         println!(
@@ -990,10 +1006,6 @@ impl PnpManager {
                 .link(alloc::format!("{}\\Top", base), &top_obj);
 
             let top_device_name = top_device.dev_node.upgrade().unwrap().name.clone();
-            println!(
-                "   ->  Sending PnP StartDevice request to stack top '{}'",
-                top_device_name
-            );
 
             let pnp_payload = PnpRequest {
                 minor_function: PnpMinorFunction::StartDevice,
@@ -1024,10 +1036,6 @@ impl PnpManager {
         let dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
 
         if req.status == DriverStatus::Success {
-            println!(
-                "   -> SUCCESS: PnP StartDevice completed for '{}'. Device is now fully started.",
-                dev_node.name
-            );
             dev_node.set_state(DevNodeState::Started);
 
             let pnp_manager = &*PNP_MANAGER;
@@ -1094,14 +1102,6 @@ impl PnpManager {
             .filter(|child| child.get_state() == DevNodeState::Initialized)
             .cloned()
             .collect();
-
-        if children_to_start.is_empty() {
-            println!(
-                "   -> NOTE: Bus driver '{}' enumerated 0 new devices.",
-                parent_dev_node.name
-            );
-        }
-
         for child_dn in children_to_start {
             pnp_manager.bind_and_start(&child_dn);
         }
@@ -1291,11 +1291,6 @@ impl PnpManager {
 
         match pnp_request.minor_function {
             PnpMinorFunction::StartDevice => {
-                println!(
-                    "      -> PnP StartDevice request reached driver for: {}",
-                    device.dev_node.upgrade().unwrap().name
-                );
-
                 if let Some(prepare_cb) = device.dev_init.evt_device_prepare_hardware {
                     let status = prepare_cb(device);
                     if status != DriverStatus::Success {
@@ -1532,8 +1527,8 @@ impl PnpManager {
     }
     pub fn create_symlink(
         &self,
-        link_path: &str,
-        target_path: &str,
+        link_path: String,
+        target_path: String,
     ) -> Result<(), crate::object_manager::OmError> {
         crate::object_manager::OBJECT_MANAGER
             .symlink(link_path.to_string(), target_path.to_string(), true)
@@ -1542,8 +1537,8 @@ impl PnpManager {
 
     pub fn replace_symlink(
         &self,
-        link_path: &str,
-        target_path: &str,
+        link_path: String,
+        target_path: String,
     ) -> Result<(), crate::object_manager::OmError> {
         let _ = crate::object_manager::OBJECT_MANAGER.unlink(link_path.to_string());
         crate::object_manager::OBJECT_MANAGER
@@ -1553,8 +1548,8 @@ impl PnpManager {
 
     pub fn create_device_symlink_top(
         &self,
-        instance_path: &str,
-        link_path: &str,
+        instance_path: String,
+        link_path: String,
     ) -> Result<(), crate::object_manager::OmError> {
         let target = alloc::format!("\\Device\\{}\\Top", instance_path);
         crate::object_manager::OBJECT_MANAGER
@@ -1562,10 +1557,10 @@ impl PnpManager {
             .map(|_| ())
     }
 
-    pub fn remove_symlink(&self, link_path: &str) -> Result<(), crate::object_manager::OmError> {
+    pub fn remove_symlink(&self, link_path: String) -> Result<(), crate::object_manager::OmError> {
         crate::object_manager::OBJECT_MANAGER.unlink(link_path.to_string())
     }
-    pub fn resolve_targetio_from_symlink(&self, link_path: &str) -> Option<IoTarget> {
+    pub fn resolve_targetio_from_symlink(&self, link_path: String) -> Option<IoTarget> {
         let obj = crate::object_manager::OBJECT_MANAGER
             .open(link_path.to_string())
             .ok()?;
@@ -1586,7 +1581,7 @@ impl PnpManager {
             _ => None,
         }
     }
-    pub fn send_request_via_symlink(&self, link_path: &str, req: &mut Request) -> DriverStatus {
+    pub fn send_request_via_symlink(&self, link_path: String, req: &mut Request) -> DriverStatus {
         match self.resolve_targetio_from_symlink(link_path) {
             Some(tgt) => self.send_request(&tgt, req),
             None => DriverStatus::NoSuchDevice,
@@ -1594,16 +1589,10 @@ impl PnpManager {
     }
     pub fn ioctl_via_symlink(
         &self,
-        link_path: &str,
+        link_path: String,
         control_code: u32,
-        data: Box<[u8]>,
-        completion: Option<CompletionRoutine>,
-        context: usize,
+        mut req: &mut Request,
     ) -> DriverStatus {
-        let mut req = Request::new(RequestType::DeviceControl(control_code), data);
-        if let Some(c) = completion {
-            req.set_completion(c, context);
-        }
         self.send_request_via_symlink(link_path, &mut req)
     }
 }

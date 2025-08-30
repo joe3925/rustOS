@@ -194,7 +194,7 @@ pub extern "win64" fn vol_enumerate_devices(
             name,
             inst,
             ids,
-            Some("Volume".into()),
+            Some("volume".into()),
             init,
         )
     };

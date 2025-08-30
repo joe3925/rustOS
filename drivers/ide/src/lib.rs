@@ -350,7 +350,6 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: &mut 
                 req.status = DriverStatus::InvalidParameter;
                 return;
             }
-            println!("{:#?}", hdr.op);
             let ok = match hdr.op {
                 BLOCK_RW_READ => ata_pio_read(
                     dx,
@@ -374,7 +373,6 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: &mut 
             req.status = if ok {
                 DriverStatus::Success
             } else {
-                println!("IDK");
                 DriverStatus::Unsuccessful
             };
         }

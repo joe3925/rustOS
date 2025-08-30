@@ -2,6 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use acpi::{AcpiTable, AcpiTables};
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
@@ -17,12 +18,13 @@ use crate::{
                 DeviceInit, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
                 EvtDriverDeviceAdd, EvtDriverUnload, Request,
             },
-            pnp_manager::{DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
+            pnp_manager::{CompletionRoutine, DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
     },
     file_system::file::{File, FileStatus, OpenFlags},
     memory::{allocator::ALLOCATOR, paging::constants::KERNEL_STACK_SIZE},
+    registry::{reg, Data, RegError},
     scheduling::{
         scheduler::{TaskError, SCHEDULER},
         task::Task,
@@ -85,6 +87,44 @@ pub extern "win64" fn file_write(file: &mut File, data: &[u8]) -> Result<(), Fil
 pub extern "win64" fn file_delete(file: &mut File) -> Result<(), FileStatus> {
     file.delete()
 }
+#[no_mangle]
+pub extern "win64" fn reg_get_value(key_path: &str, name: &str) -> Option<Data> {
+    reg::get_value(key_path, name)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_set_value(
+    key_path: &str,
+    name: &str,
+    data: Data,
+) -> Result<(), RegError> {
+    reg::set_value(key_path, name, data)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_create_key(path: &str) -> Result<(), RegError> {
+    reg::create_key(path)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_delete_key(path: &str) -> Result<bool, RegError> {
+    reg::delete_key(path)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_delete_value(key_path: &str, name: &str) -> Result<bool, RegError> {
+    reg::delete_value(key_path, name)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
+    reg::list_keys(base_path)
+}
+
+#[no_mangle]
+pub extern "win64" fn reg_list_values(base_path: &str) -> Result<Vec<String>, RegError> {
+    reg::list_values(base_path)
+}
 pub extern "win64" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
     return ACPI_TABLES.get_tables();
 }
@@ -97,7 +137,6 @@ pub extern "win64" fn pnp_create_pdo(
 ) -> (Arc<DevNode>, Arc<DeviceObject>) {
     PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
-
 pub extern "win64" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
     PNP_MANAGER.bind_and_start(dn)
 }
@@ -177,4 +216,63 @@ pub extern "win64" fn InvalidateDeviceRelations(
         return DriverStatus::NoSuchDevice;
     };
     mgr.invalidate_device_relations_for_node(&dn, relation)
+}
+#[inline]
+fn map_om_result(res: Result<(), crate::object_manager::OmError>) -> DriverStatus {
+    use crate::object_manager::OmError as OE;
+    match res {
+        Ok(()) => DriverStatus::Success,
+        Err(OE::InvalidPath) => DriverStatus::InvalidParameter,
+        Err(OE::NotFound) => DriverStatus::NoSuchDevice,
+        Err(OE::AlreadyExists) => DriverStatus::Unsuccessful,
+        Err(
+            OE::NotDirectory | OE::IsDirectory | OE::IsSymlink | OE::Unsupported | OE::LoopDetected,
+        ) => DriverStatus::Unsuccessful,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus {
+    map_om_result(PNP_MANAGER.create_symlink(link_path, target_path))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus {
+    map_om_result(PNP_MANAGER.replace_symlink(link_path, target_path))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_device_symlink_top(
+    instance_path: String,
+    link_path: String,
+) -> DriverStatus {
+    map_om_result(PNP_MANAGER.create_device_symlink_top(instance_path, link_path))
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
+    match PNP_MANAGER.remove_symlink(link_path) {
+        Ok(()) => DriverStatus::Success,
+        Err(_) => DriverStatus::NoSuchDevice,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_send_request_via_symlink(
+    link_path: String,
+    req: &mut Request,
+) -> DriverStatus {
+    PNP_MANAGER.send_request_via_symlink(link_path, req)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_ioctl_via_symlink(
+    link_path: String,
+    control_code: u32,
+    req: &mut Request,
+) -> DriverStatus {
+    PNP_MANAGER.ioctl_via_symlink(link_path, control_code, req)
+}
+pub extern "win64" fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
+    PNP_MANAGER.load_service(&name)
 }

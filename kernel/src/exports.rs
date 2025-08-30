@@ -53,6 +53,13 @@ export! {
     pnp_queue_dpc,
     pnp_send_request,
     pnp_create_child_devnode_and_pdo_with_init,
+    pnp_create_symlink,
+    pnp_replace_symlink,
+    pnp_create_device_symlink_top,
+    pnp_remove_symlink,
+    pnp_send_request_via_symlink,
+    pnp_ioctl_via_symlink,
+    pnp_load_service,
     InvalidateDeviceRelations,
 
     driver_get_name,
@@ -60,4 +67,12 @@ export! {
     driver_set_evt_device_add,
     driver_set_evt_driver_unload,
     random_number,
+
+    reg_get_value,
+    reg_set_value,
+    reg_create_key,
+    reg_delete_key,
+    reg_delete_value,
+    reg_list_keys,
+    reg_list_values,
 }

@@ -5,6 +5,7 @@ pub extern crate alloc;
 pub use acpi;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
+use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use ffi::random_number;
@@ -265,6 +266,25 @@ pub enum OpenFlags {
     CreateNew,
     Open,
 }
+#[derive(Debug, Clone)]
+pub enum Data {
+    U32(u32),
+    U64(u64),
+    I32(i32),
+    I64(i64),
+    Bool(bool),
+    Str(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum RegError {
+    File(FileStatus),
+    KeyAlreadyExists,
+    KeyNotFound,
+    ValueNotFound,
+    PersistenceFailed,
+    EncodingFailed,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ResourceKind {
@@ -362,6 +382,53 @@ pub mod alloc_api {
     pub mod ffi {
         use super::*;
         #[link(name = "KRNL")]
+        pub mod reg {
+            use super::*;
+
+            extern "win64" {
+                pub fn reg_get_value(key_path: &str, name: &str) -> Option<Data>;
+                pub fn reg_set_value(
+                    key_path: &str,
+                    name: &str,
+                    data: Data,
+                ) -> Result<(), RegError>;
+                pub fn reg_create_key(path: &str) -> Result<(), RegError>;
+                pub fn reg_delete_key(path: &str) -> Result<bool, RegError>;
+                pub fn reg_delete_value(key_path: &str, name: &str) -> Result<bool, RegError>;
+                pub fn reg_list_keys(base_path: &str) -> Result<Vec<String>, RegError>;
+                pub fn reg_list_values(base_path: &str) -> Result<Vec<String>, RegError>;
+            }
+
+            // Small safe-ish wrappers for convenience (just forward to externs)
+            #[inline]
+            pub fn get_value(k: &str, n: &str) -> Option<Data> {
+                unsafe { reg_get_value(k, n) }
+            }
+            #[inline]
+            pub fn set_value(k: &str, n: &str, d: Data) -> Result<(), RegError> {
+                unsafe { reg_set_value(k, n, d) }
+            }
+            #[inline]
+            pub fn create_key(p: &str) -> Result<(), RegError> {
+                unsafe { reg_create_key(p) }
+            }
+            #[inline]
+            pub fn delete_key(p: &str) -> Result<bool, RegError> {
+                unsafe { reg_delete_key(p) }
+            }
+            #[inline]
+            pub fn delete_value(k: &str, n: &str) -> Result<bool, RegError> {
+                unsafe { reg_delete_value(k, n) }
+            }
+            #[inline]
+            pub fn list_keys(b: &str) -> Result<Vec<String>, RegError> {
+                unsafe { reg_list_keys(b) }
+            }
+            #[inline]
+            pub fn list_values(b: &str) -> Result<Vec<String>, RegError> {
+                unsafe { reg_list_values(b) }
+            }
+        }
         extern "win64" {
             pub fn create_kernel_task(entry: usize, name: String) -> u64;
             pub fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus>;
@@ -394,6 +461,25 @@ pub mod alloc_api {
             ) -> DriverStatus;
             pub fn pnp_send_request(target: &IoTarget, req: &mut Request) -> DriverStatus;
             pub fn pnp_complete_request(req: &mut Request);
+            pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
+            pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
+            pub fn pnp_create_device_symlink_top(
+                instance_path: String,
+                link_path: String,
+            ) -> DriverStatus;
+            pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
+
+            pub fn pnp_send_request_via_symlink(
+                link_path: String,
+                req: &mut Request,
+            ) -> DriverStatus;
+
+            pub fn pnp_ioctl_via_symlink(
+                link_path: String,
+                control_code: u32,
+                request: &mut Request,
+            ) -> DriverStatus;
+            pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>>;
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,

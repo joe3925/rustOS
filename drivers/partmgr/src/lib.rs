@@ -407,7 +407,6 @@ pub extern "win64" fn partmgr_enumerate_devices(
     device: &Arc<DeviceObject>,
     request: &mut Request,
 ) -> DriverStatus {
-    println!("enum");
     let pmx = ext_mut::<PartMgrExt>(device);
     if pmx.enumerated.swap(true, Ordering::AcqRel) {
         request.status = DriverStatus::Success;

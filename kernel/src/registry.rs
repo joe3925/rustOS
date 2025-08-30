@@ -12,6 +12,7 @@ use spin::{Once, RwLock};
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
 const CLASS_LIST: &[(&str, &str)] = &[
     ("disk", "Disk devices / block storage"),
+    ("volume", "Mountable partitions"),
     ("kbd", "Keyboards"),
     ("mouse", "Pointing devices (mouse, touch)"),
     ("hid", "Human Interface Devices"),
