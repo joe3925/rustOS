@@ -23,7 +23,7 @@ use kernel_api::{
     println,
     x86_64::PhysAddr,
 };
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -111,7 +111,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 
 pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
-    _req: &mut Request,
+    _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let dev_ext: &mut DevExt =
         unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };

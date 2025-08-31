@@ -5,9 +5,12 @@ extern crate alloc;
 
 use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::{GptHeader, GptPartitionEntry};
+use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
+use kernel_api::{GptHeader, GptPartitionEntry, IoTarget};
+use spin::RwLock;
 
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
@@ -45,6 +48,10 @@ struct VolExt {
 fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
     unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
 }
+#[repr(C)]
+struct VolPdoExt {
+    backing: Option<Arc<IoTarget>>,
+}
 
 #[inline]
 fn guid_to_string(g: &[u8; 16]) -> String {
@@ -80,8 +87,8 @@ pub extern "win64" fn vol_device_add(
     dev_init.dev_ext_size = size_of::<VolExt>();
     dev_init.evt_device_prepare_hardware = Some(vol_prepare_hardware);
     dev_init.evt_bus_enumerate_devices = Some(vol_enumerate_devices);
-    dev_init.io_read = Some(vol_pdo_read);
-    dev_init.io_write = Some(vol_pdo_write);
+    dev_init.io_read = None;
+    dev_init.io_write = None;
     DriverStatus::Success
 }
 
@@ -125,35 +132,39 @@ extern "win64" fn vol_prepare_hardware(dev: &Arc<DeviceObject>) -> DriverStatus 
     let ctx = Arc::into_raw(dev.clone()) as usize;
     req.set_completion(vol_queryres_complete, ctx);
 
-    let _ = unsafe { pnp_forward_request_to_next_lower(dev, &mut req) };
+    // Forward as Arc<RwLock<Request>> under the new design.
+    let st = unsafe { pnp_forward_request_to_next_lower(dev, Arc::new(RwLock::new(req))) };
+    if st == DriverStatus::NoSuchDevice {
+        // Nothing below; treat as success for prepare.
+        return DriverStatus::Success;
+    }
     DriverStatus::Success
 }
 
 pub extern "win64" fn vol_enumerate_devices(
     device: &Arc<DeviceObject>,
-    request: &mut Request,
+    request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let dx = ext_mut::<VolExt>(device);
 
     if !dx.have_entry {
-        request.status = DriverStatus::Success;
+        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
     if dx.enumerated.swap(true, Ordering::AcqRel) {
-        request.status = DriverStatus::Success;
+        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
     let parent_dn = match device.dev_node.upgrade() {
         Some(dn) => dn,
         None => {
-            request.status = DriverStatus::Unsuccessful;
+            request.write().status = DriverStatus::Unsuccessful;
             return DriverStatus::Unsuccessful;
         }
     };
 
     let zero = [0u8; 16];
-
     const EFI_SYSTEM: [u8; 16] = [
         0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9,
         0x3B,
@@ -165,10 +176,11 @@ pub extern "win64" fn vol_enumerate_devices(
 
     let ptype = dx.entry.partition_type_guid;
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
-        request.status = DriverStatus::Success;
+        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
+    // Create a child PDO for the volume
     let part_guid_s = guid_to_string(&dx.entry.unique_partition_guid);
     let name = alloc::format!("Volume{}", &part_guid_s[..8]);
     let inst = alloc::format!("STOR\\VOLUME\\{}\\0000", part_guid_s);
@@ -179,16 +191,16 @@ pub extern "win64" fn vol_enumerate_devices(
     };
 
     let mut init = DeviceInit {
-        dev_ext_size: 0,
-        io_read: None,
-        io_write: None,
+        dev_ext_size: size_of::<VolPdoExt>(),
+        io_read: Some(vol_pdo_read),
+        io_write: Some(vol_pdo_write),
         io_device_control: None,
         evt_device_prepare_hardware: None,
         evt_bus_enumerate_devices: None,
         evt_pnp: None,
     };
 
-    let (_dn_child, _pdo) = unsafe {
+    let (_dn, pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             &parent_dn,
             name,
@@ -199,18 +211,110 @@ pub extern "win64" fn vol_enumerate_devices(
         )
     };
 
-    request.status = DriverStatus::Success;
+    if let Some(tgt) = unsafe { pnp_get_device_target(&parent_dn.instance_path) } {
+        ext_mut::<VolPdoExt>(&pdo).backing = Some(Arc::new(tgt));
+    }
+
+    request.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
 
-pub extern "win64" fn vol_pdo_read(dev: &Arc<DeviceObject>, parent: &mut Request, _buf_len: usize) {
-    let _ = unsafe { pnp_forward_request_to_next_lower(dev, parent) };
+#[repr(C)]
+struct BridgeCtx {
+    parent: Arc<RwLock<Request>>,
+}
+
+extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) {
+    let boxed = unsafe { Box::from_raw(ctx as *mut BridgeCtx) };
+    let parent = boxed.parent;
+
+    let mut r = {
+        let mut g = parent.write();
+        core::mem::replace(&mut *g, Request::empty())
+    };
+    r.status = child.status;
+    if r.status == DriverStatus::Success {
+        let n = core::cmp::min(r.data.len(), child.data.len());
+        r.data[..n].copy_from_slice(&child.data[..n]);
+    }
+    unsafe { pnp_complete_request(&mut r) };
+    {
+        let mut g = parent.write();
+        *g = r;
+    }
+}
+
+pub extern "win64" fn vol_pdo_read(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) {
+    let (off, len) = {
+        let r = parent.read();
+        match r.kind {
+            RequestType::Read { offset, len } => (offset, len),
+            _ => {
+                drop(r);
+                parent.write().status = DriverStatus::InvalidParameter;
+                return;
+            }
+        }
+    };
+
+    let tgt = match &ext_mut::<VolPdoExt>(dev).backing {
+        Some(t) => t.clone(),
+        None => {
+            parent.write().status = DriverStatus::NoSuchDevice;
+            return;
+        }
+    };
+
+    let mut child = Request::new(
+        RequestType::Read { offset: off, len },
+        vec![0u8; len].into_boxed_slice(),
+    );
+    let ctx = Box::into_raw(Box::new(BridgeCtx {
+        parent: parent.clone(),
+    })) as usize;
+    child.set_completion(bridge_complete, ctx);
+
+    parent.write().status = DriverStatus::Waiting;
+    unsafe { pnp_send_request(&*tgt, Arc::new(RwLock::new(child))) };
 }
 
 pub extern "win64" fn vol_pdo_write(
     dev: &Arc<DeviceObject>,
-    parent: &mut Request,
+    parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) {
-    let _ = unsafe { pnp_forward_request_to_next_lower(dev, parent) };
+    let (off, len, moved) = {
+        let mut w = parent.write();
+        match w.kind {
+            RequestType::Write { offset, len } => {
+                let data = mem::take(&mut w.data);
+                (offset, len, data)
+            }
+            _ => {
+                w.status = DriverStatus::InvalidParameter;
+                return;
+            }
+        }
+    };
+
+    let tgt = match &ext_mut::<VolPdoExt>(dev).backing {
+        Some(t) => t.clone(),
+        None => {
+            parent.write().status = DriverStatus::NoSuchDevice;
+            return;
+        }
+    };
+
+    let mut child = Request::new(RequestType::Write { offset: off, len }, moved);
+    let ctx = Box::into_raw(Box::new(BridgeCtx {
+        parent: parent.clone(),
+    })) as usize;
+    child.set_completion(bridge_complete, ctx);
+
+    parent.write().status = DriverStatus::Waiting;
+    unsafe { pnp_send_request(&*tgt, Arc::new(RwLock::new(child))) };
 }

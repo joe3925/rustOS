@@ -5,6 +5,7 @@ extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{mem::size_of, panic::PanicInfo, ptr};
+use spin::RwLock;
 
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
@@ -26,7 +27,19 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-// ---------- Block Port ABI (bus-neutral, implemented by PDOs) ----------
+// ---------- helpers for Arc<RwLock<Request>> ----------
+#[inline]
+fn take_req(r: &Arc<RwLock<Request>>) -> Request {
+    let mut g = r.write();
+    core::mem::replace(&mut *g, Request::empty())
+}
+#[inline]
+fn put_req(r: &Arc<RwLock<Request>>, req: Request) {
+    let mut g = r.write();
+    *g = req;
+}
+
+// ---------- Block Port ABI ----------
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -38,28 +51,27 @@ bitflags::bitflags! {
     #[repr(transparent)]
     struct BlockFeat: u64 {
         const FLUSH   = 1 << 0;
-        const DISCARD = 1 << 1; // reserved for future
-        const FUA     = 1 << 2; // reserved for future
+        const DISCARD = 1 << 1;
+        const FUA     = 1 << 2;
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BlockQueryOut {
-    block_size: u32,     // e.g. 512, 4096
-    max_blocks: u32,     // max LBA units per transfer
-    alignment_mask: u32, // buffer alignment mask (power-of-two minus 1)
-    features: u64,       // BlockFeat bits
-                         // room for future fields
+    block_size: u32,
+    max_blocks: u32,
+    alignment_mask: u32,
+    features: u64,
 }
 
 #[repr(C)]
 struct BlockRwIn {
-    op: u32, // BLOCK_RW_READ / BLOCK_RW_WRITE
+    op: u32,
     _rsvd: u32,
-    lba: u64,     // starting LBA
-    blocks: u32,  // number of LBAs
-    buf_off: u32, // offset into Request::data where payload lives
+    lba: u64,
+    blocks: u32,
+    buf_off: u32,
 }
 
 // ---------- Disk class FDO private state ----------
@@ -72,11 +84,10 @@ struct DiskExt {
     props_ready: bool,
 }
 
-// state for chunked I/O
 #[repr(C)]
 struct RwChainCtx {
     dev: Arc<DeviceObject>,
-    parent_req: *mut Request,
+    parent_req: Arc<RwLock<Request>>,
     lba: u64,
     remaining_bytes: usize,
     parent_buf_off: usize,
@@ -101,16 +112,25 @@ pub extern "win64" fn disk_device_add(
     DriverStatus::Success
 }
 
-pub extern "win64" fn disk_read(dev: &Arc<DeviceObject>, parent: &mut Request, _buf_len: usize) {
-    let (off, total) = match parent.kind {
-        RequestType::Read { offset, len } => (offset, len),
-        _ => {
-            parent.status = DriverStatus::InvalidParameter;
-            return;
+// ---------- I/O paths (Arc<RwLock<Request>>) ----------
+pub extern "win64" fn disk_read(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) {
+    let (off, total) = {
+        let g = parent.read();
+        match g.kind {
+            RequestType::Read { offset, len } => (offset, len),
+            _ => {
+                drop(g);
+                parent.write().status = DriverStatus::InvalidParameter;
+                return;
+            }
         }
     };
     if total == 0 {
-        parent.status = DriverStatus::Success;
+        parent.write().status = DriverStatus::Success;
         return;
     }
 
@@ -120,23 +140,32 @@ pub extern "win64" fn disk_read(dev: &Arc<DeviceObject>, parent: &mut Request, _
         return;
     }
     if !rw_validate(dx, off, total) {
-        parent.status = DriverStatus::InvalidParameter;
+        parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
+    parent.write().status = DriverStatus::Waiting;
     start_chunked_rw(dev, parent, off, total, false);
 }
 
-pub extern "win64" fn disk_write(dev: &Arc<DeviceObject>, parent: &mut Request, _buf_len: usize) {
-    let (off, total) = match parent.kind {
-        RequestType::Write { offset, len } => (offset, len),
-        _ => {
-            parent.status = DriverStatus::InvalidParameter;
-            return;
+pub extern "win64" fn disk_write(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) {
+    let (off, total) = {
+        let g = parent.read();
+        match g.kind {
+            RequestType::Write { offset, len } => (offset, len),
+            _ => {
+                drop(g);
+                parent.write().status = DriverStatus::InvalidParameter;
+                return;
+            }
         }
     };
     if total == 0 {
-        parent.status = DriverStatus::Success;
+        parent.write().status = DriverStatus::Success;
         return;
     }
 
@@ -146,29 +175,43 @@ pub extern "win64" fn disk_write(dev: &Arc<DeviceObject>, parent: &mut Request, 
         return;
     }
     if !rw_validate(dx, off, total) {
-        parent.status = DriverStatus::InvalidParameter;
+        parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
+    parent.write().status = DriverStatus::Waiting;
     start_chunked_rw(dev, parent, off, total, true);
 }
 
-// optional: flush exposed to upper layers via IOCTL
-pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: &mut Request) {
-    match parent.kind {
-        RequestType::DeviceControl(code) if code == IOCTL_BLOCK_FLUSH => {
+// optional: flush
+pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Request>>) {
+    let code_opt = {
+        if let RequestType::DeviceControl(c) = parent.read().kind {
+            Some(c)
+        } else {
+            None
+        }
+    };
+    match code_opt {
+        Some(c) if c == IOCTL_BLOCK_FLUSH => {
             let mut child =
                 Request::new(RequestType::DeviceControl(IOCTL_BLOCK_FLUSH), Box::new([]));
-            child.set_completion(disk_on_flush_done, parent as *mut _ as usize);
-            parent.status = DriverStatus::Waiting;
-            let st = unsafe { pnp_forward_request_to_next_lower(dev, &mut child) };
+            // pass parent Arc in context
+            let ctx_ptr = Box::into_raw(Box::new(parent.clone())) as usize;
+            child.set_completion(disk_on_flush_done, ctx_ptr);
+            parent.write().status = DriverStatus::Waiting;
+
+            let st =
+                unsafe { pnp_forward_request_to_next_lower(dev, Arc::new(RwLock::new(child))) };
             if st == DriverStatus::NoSuchDevice {
-                parent.status = DriverStatus::NoSuchDevice;
-                unsafe { pnp_complete_request(parent) };
+                let mut r = take_req(&parent);
+                r.status = DriverStatus::NoSuchDevice;
+                unsafe { pnp_complete_request(&mut r) };
+                put_req(&parent, r);
             }
         }
         _ => {
-            parent.status = DriverStatus::NotImplemented;
+            parent.write().status = DriverStatus::NotImplemented;
         }
     }
 }
@@ -189,14 +232,12 @@ fn rw_validate(dx: &mut DiskExt, off: u64, total: usize) -> bool {
     if (total as u64 % bs) != 0 {
         return false;
     }
-    // alignment_mask handling would go here once you track buffer addresses/MDLs
     true
 }
 
-// query path then resume original op
 fn issue_query_and_resume(
     dev: &Arc<DeviceObject>,
-    parent: &mut Request,
+    parent: Arc<RwLock<Request>>,
     off: u64,
     total: usize,
     is_write: bool,
@@ -207,7 +248,7 @@ fn issue_query_and_resume(
 
     let ctx = Box::new(QueryResumeCtx {
         dev: Arc::clone(dev),
-        parent_req: parent as *mut _,
+        parent_req: parent.clone(),
         off,
         total,
         is_write,
@@ -215,22 +256,21 @@ fn issue_query_and_resume(
     let ctx_ptr = Box::into_raw(ctx) as usize;
     child.set_completion(disk_on_query_done, ctx_ptr);
 
-    parent.status = DriverStatus::Waiting;
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, &mut child) };
+    parent.write().status = DriverStatus::Waiting;
+    let st = unsafe { pnp_forward_request_to_next_lower(dev, Arc::new(RwLock::new(child))) };
     if st == DriverStatus::NoSuchDevice {
-        // free ctx and complete parent immediately
-        unsafe {
-            drop(Box::from_raw(ctx_ptr as *mut QueryResumeCtx));
-        }
-        parent.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(parent) };
+        unsafe { drop(Box::from_raw(ctx_ptr as *mut QueryResumeCtx)) };
+        let mut r = take_req(&parent);
+        r.status = DriverStatus::NoSuchDevice;
+        unsafe { pnp_complete_request(&mut r) };
+        put_req(&parent, r);
     }
 }
 
 #[repr(C)]
 struct QueryResumeCtx {
     dev: Arc<DeviceObject>,
-    parent_req: *mut Request,
+    parent_req: Arc<RwLock<Request>>,
     off: u64,
     total: usize,
     is_write: bool,
@@ -239,12 +279,14 @@ struct QueryResumeCtx {
 extern "win64" fn disk_on_query_done(child: &mut Request, ctx: usize) {
     let boxed = unsafe { Box::from_raw(ctx as *mut QueryResumeCtx) };
     let dev = boxed.dev;
-    let parent = unsafe { &mut *boxed.parent_req };
+    let parent = boxed.parent_req;
 
     #[inline]
-    fn finish(parent: &mut Request, st: DriverStatus) {
-        parent.status = st;
-        unsafe { pnp_complete_request(parent) };
+    fn finish(parent: &Arc<RwLock<Request>>, st: DriverStatus) {
+        let mut r = take_req(parent);
+        r.status = st;
+        unsafe { pnp_complete_request(&mut r) };
+        put_req(parent, r);
     }
 
     if child.status != DriverStatus::Success
@@ -255,7 +297,7 @@ extern "win64" fn disk_on_query_done(child: &mut Request, ctx: usize) {
         } else {
             child.status
         };
-        return finish(parent, st);
+        return finish(&parent, st);
     }
 
     let qo = unsafe { *(child.data.as_ptr() as *const BlockQueryOut) };
@@ -267,16 +309,16 @@ extern "win64" fn disk_on_query_done(child: &mut Request, ctx: usize) {
     dx.props_ready = true;
 
     if !rw_validate(dx, boxed.off, boxed.total) {
-        return finish(parent, DriverStatus::InvalidParameter);
+        return finish(&parent, DriverStatus::InvalidParameter);
     }
 
-    // Parent stays Waiting; subsequent child completions will complete it
+    parent.write().status = DriverStatus::Waiting;
     start_chunked_rw(&dev, parent, boxed.off, boxed.total, boxed.is_write);
 }
 
 fn start_chunked_rw(
     dev: &Arc<DeviceObject>,
-    parent: &mut Request,
+    parent: Arc<RwLock<Request>>,
     off: u64,
     total: usize,
     is_write: bool,
@@ -286,13 +328,12 @@ fn start_chunked_rw(
     let lba = off / bs;
     let ctx = Box::new(RwChainCtx {
         dev: Arc::clone(dev),
-        parent_req: parent as *mut _,
+        parent_req: parent,
         lba,
         remaining_bytes: total,
         parent_buf_off: 0,
         is_write,
     });
-    parent.status = DriverStatus::Waiting;
     submit_next_chunk(Box::into_raw(ctx));
 }
 
@@ -301,9 +342,11 @@ fn submit_next_chunk(ctx_ptr: *mut RwChainCtx) {
     let dx = disk_ext_mut(&ctx.dev);
 
     if ctx.remaining_bytes == 0 {
-        let parent = unsafe { &mut *ctx.parent_req };
-        parent.status = DriverStatus::Success;
-        unsafe { pnp_complete_request(parent) };
+        let parent = &ctx.parent_req;
+        let mut r = take_req(parent);
+        r.status = DriverStatus::Success;
+        unsafe { pnp_complete_request(&mut r) };
+        put_req(parent, r);
         unsafe {
             drop(Box::from_raw(ctx_ptr));
         }
@@ -330,24 +373,24 @@ fn submit_next_chunk(ctx_ptr: *mut RwChainCtx) {
         blocks: this_blocks,
         buf_off: hdr_len as u32,
     };
-    unsafe {
-        ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr);
-    }
+    unsafe { ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) };
 
     if ctx.is_write {
-        let parent = unsafe { &mut *ctx.parent_req };
-        let src = &parent.data[ctx.parent_buf_off..ctx.parent_buf_off + this_bytes];
+        let p = ctx.parent_req.read();
+        let src = &p.data[ctx.parent_buf_off..ctx.parent_buf_off + this_bytes];
         buf[hdr_len..hdr_len + this_bytes].copy_from_slice(src);
     }
 
     let mut child = Request::new(RequestType::DeviceControl(IOCTL_BLOCK_RW), buf);
     child.set_completion(disk_on_rw_chunk_done, ctx_ptr as usize);
 
-    let st = unsafe { pnp_forward_request_to_next_lower(&ctx.dev, &mut child) };
+    let st = unsafe { pnp_forward_request_to_next_lower(&ctx.dev, Arc::new(RwLock::new(child))) };
     if st == DriverStatus::NoSuchDevice {
-        let parent = unsafe { &mut *ctx.parent_req };
-        parent.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(parent) };
+        let parent = &ctx.parent_req;
+        let mut r = take_req(parent);
+        r.status = DriverStatus::NoSuchDevice;
+        unsafe { pnp_complete_request(&mut r) };
+        put_req(parent, r);
         unsafe {
             drop(Box::from_raw(ctx_ptr));
         }
@@ -355,14 +398,17 @@ fn submit_next_chunk(ctx_ptr: *mut RwChainCtx) {
 }
 
 extern "win64" fn disk_on_rw_chunk_done(child: &mut Request, ctx: usize) {
-    let ctx = unsafe { &mut *(ctx as *mut RwChainCtx) };
+    let ctx_ptr = ctx as *mut RwChainCtx;
+    let ctx = unsafe { &mut *ctx_ptr };
 
     if child.status != DriverStatus::Success {
-        let parent = unsafe { &mut *ctx.parent_req };
-        parent.status = child.status;
-        unsafe { pnp_complete_request(parent) };
+        let parent = &ctx.parent_req;
+        let mut r = take_req(parent);
+        r.status = child.status;
+        unsafe { pnp_complete_request(&mut r) };
+        put_req(parent, r);
         unsafe {
-            drop(Box::from_raw(ctx as *mut _));
+            drop(Box::from_raw(ctx_ptr));
         }
         return;
     }
@@ -371,24 +417,26 @@ extern "win64" fn disk_on_rw_chunk_done(child: &mut Request, ctx: usize) {
     let moved = child.data.len().saturating_sub(hdr_len);
 
     if !ctx.is_write {
-        let parent = unsafe { &mut *ctx.parent_req };
-        let dst = &mut parent.data[ctx.parent_buf_off..ctx.parent_buf_off + moved];
+        let mut p = ctx.parent_req.write();
+        let dst = &mut p.data[ctx.parent_buf_off..ctx.parent_buf_off + moved];
         let src = &child.data[hdr_len..hdr_len + moved];
         dst.copy_from_slice(src);
     }
 
-    // advance
     let dx = disk_ext_mut(&ctx.dev);
     let bs = dx.block_size as usize;
     ctx.remaining_bytes -= moved;
     ctx.parent_buf_off += moved;
     ctx.lba += (moved / bs) as u64;
 
-    submit_next_chunk(ctx as *mut _);
+    submit_next_chunk(ctx_ptr);
 }
 
 extern "win64" fn disk_on_flush_done(child: &mut Request, ctx: usize) {
-    let parent = unsafe { &mut *(ctx as *mut Request) };
-    parent.status = child.status;
-    unsafe { pnp_complete_request(parent) };
+    let parent_arc: Arc<RwLock<Request>> =
+        *unsafe { Box::from_raw(ctx as *mut Arc<RwLock<Request>>) };
+    let mut r = take_req(&parent_arc);
+    r.status = child.status;
+    unsafe { pnp_complete_request(&mut r) };
+    put_req(&parent_arc, r);
 }

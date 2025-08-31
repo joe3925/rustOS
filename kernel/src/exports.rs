@@ -62,6 +62,8 @@ export! {
     pnp_load_service,
     pnp_add_class_listener,
     pnp_wait_for_request,
+    pnp_create_control_device_with_init,
+    pnp_create_control_device_and_link,
     InvalidateDeviceRelations,
 
     driver_get_name,

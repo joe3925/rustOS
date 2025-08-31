@@ -7,15 +7,17 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::alloc_api::PnpRequest;
-use kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower;
-use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, RequestType, ResourceKind};
+use kernel_api::alloc_api::ffi::{pnp_forward_request_to_next_lower, pnp_wait_for_request};
+use kernel_api::{
+    DeviceObject, DriverStatus, PnpMinorFunction, Request, RequestType, ResourceKind,
+};
 use kernel_api::{
     PageMapError,
     ffi::{map_mmio_region, unmap_range},
     println,
     x86_64::{PhysAddr, VirtAddr},
 };
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 
 const PCI_CFG1_ADDR: u16 = 0xCF8;
 const PCI_CFG1_DATA: u16 = 0xCFC;
@@ -89,7 +91,7 @@ pub struct PciPdoExt {
 #[repr(C)]
 pub struct PrepareHardwareCtx {
     pub(crate) original_device: Arc<DeviceObject>,
-    pub(crate) original_request: Box<kernel_api::Request>,
+    pub(crate) original_request: Arc<RwLock<Request>>,
 }
 
 #[inline]
@@ -422,7 +424,7 @@ fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
     req.completion_routine = Some(on_complete);
     req.completion_context = ctx;
 
-    let _ = unsafe { pnp_forward_request_to_next_lower(device, &mut req) };
+    let _ = unsafe { pnp_forward_request_to_next_lower(device, Arc::new(RwLock::new(req))) };
 
     let w = unsafe { &*(ctx as *const WaitCtx) };
     while !w.done.load(Ordering::Acquire) {
@@ -439,12 +441,13 @@ fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
 pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request, ctx: usize) {
     let prep_ctx = unsafe { Box::from_raw(ctx as *mut PrepareHardwareCtx) };
     let device = prep_ctx.original_device;
-    let mut original_start_request = prep_ctx.original_request;
+    let mut original_start_request = prep_ctx.original_request.clone();
 
     if req.status != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");
-        original_start_request.status = req.status;
-        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&mut original_start_request) };
+        let mut request = original_start_request.write();
+        request.status = req.status;
+        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&mut request) };
         return;
     }
 
@@ -463,17 +466,18 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
     let status = unsafe {
         kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower(
             &device,
-            &mut original_start_request,
+            original_start_request.clone(),
         )
     };
 
     if status == DriverStatus::NoSuchDevice {
-        original_start_request.status = DriverStatus::Success;
-        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&mut original_start_request) };
+        let original = &mut original_start_request.write();
+        original.status = DriverStatus::Success;
+        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(original) };
     }
 }
 
-fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
+pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
     let mut segs = Vec::new();
     let mut i = 0usize;
     while i + 8 <= blob.len() {
@@ -514,18 +518,54 @@ fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
 }
 
 pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> DevExt {
-    let blob = match query_parent_resources_blob(device) {
-        Some(b) => b,
-        None => {
-            println!("[PCI] parent QueryResources failed; no ECAM");
-            return DevExt {
-                segments: Vec::new(),
-            };
-        }
+    let pnp = kernel_api::alloc_api::PnpRequest {
+        minor_function: kernel_api::PnpMinorFunction::QueryResources,
+        relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
+        id_type: kernel_api::QueryIdType::CompatibleIds,
+        ids_out: alloc::vec::Vec::new(),
+        blob_out: alloc::vec::Vec::new(),
     };
+
+    let req = kernel_api::Request {
+        id: 0,
+        kind: kernel_api::RequestType::Pnp,
+        data: alloc::boxed::Box::new([]),
+        completed: false,
+        status: kernel_api::DriverStatus::Pending,
+        pnp: Some(pnp),
+        completion_routine: None,
+        completion_context: 0,
+    };
+
+    let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
+    let down = unsafe { pnp_forward_request_to_next_lower(device, req_arc.clone()) };
+    if down == kernel_api::DriverStatus::NoSuchDevice {
+        println!("[PCI] parent QueryResources failed; no ECAM");
+        return DevExt {
+            segments: alloc::vec::Vec::new(),
+        };
+    }
+
+    unsafe { pnp_wait_for_request(&req_arc) };
+    let st = { req_arc.read().status };
+    if st != kernel_api::DriverStatus::Success {
+        println!("[PCI] parent QueryResources failed; no ECAM");
+        return DevExt {
+            segments: alloc::vec::Vec::new(),
+        };
+    }
+
+    let blob = {
+        let g = req_arc.read();
+        g.pnp
+            .as_ref()
+            .map(|p| p.blob_out.clone())
+            .unwrap_or_default()
+    };
+
     let segs = parse_ecam_segments_from_blob(&blob);
     if segs.is_empty() {
-        println!("[PCI] no ECAM block found in parent resources");
+        kernel_api::println!("[PCI] no ECAM block found in parent resources");
     }
     DevExt { segments: segs }
 }

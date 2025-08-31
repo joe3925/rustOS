@@ -13,6 +13,7 @@ members = [
     "drivers/partmgr",
     "drivers/volmgr",
     "drivers/mountmgr",
+    "drivers/fat32",
     "kernel_api",
 ]
 exclude = ["rustos-api"]

@@ -1,0 +1,11 @@
+image = "fat32.dll"
+start = "demand"
+role = "function"
+hwids = []
+
+[[registry]]
+path = "SYSTEM/CurrentControlSet/MountMgr/Filesystems/fat32"
+[registry.values]
+Service = "fat32"
+ControlLink = "\\FileSystems\\fat32"
+Order = 100

@@ -7,6 +7,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use spin::{Mutex, RwLock};
 
 use crate::{
     console::CONSOLE,
@@ -158,12 +159,15 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 
 pub extern "win64" fn pnp_forward_request_to_next_lower(
     from: &Arc<DeviceObject>,
-    req: &mut Request,
+    req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     PNP_MANAGER.send_request_to_next_lower(from, req)
 }
 
-pub extern "win64" fn pnp_send_request(target: &IoTarget, req: &mut Request) -> DriverStatus {
+pub extern "win64" fn pnp_send_request(
+    target: &IoTarget,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     PNP_MANAGER.send_request(target, req)
 }
 
@@ -271,7 +275,7 @@ pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_send_request_via_symlink(
     link_path: String,
-    req: &mut Request,
+    req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     PNP_MANAGER.send_request_via_symlink(link_path, req)
 }
@@ -280,7 +284,7 @@ pub extern "win64" fn pnp_send_request_via_symlink(
 pub extern "win64" fn pnp_ioctl_via_symlink(
     link_path: String,
     control_code: u32,
-    req: &mut Request,
+    req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     PNP_MANAGER.ioctl_via_symlink(link_path, control_code, req)
 }
@@ -315,8 +319,13 @@ pub extern "win64" fn pnp_add_class_listener(
     PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_wait_for_request(req: &Request) {
-    while (!req.completed) {
+pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
+    loop {
+        if let Some(request) = (req.try_read()) {
+            if (request.completed) {
+                break;
+            }
+        }
         PNP_MANAGER.run_once();
         core::hint::spin_loop();
     }

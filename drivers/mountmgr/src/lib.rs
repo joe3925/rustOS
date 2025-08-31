@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use crate::alloc::vec;
 use alloc::{
     boxed::Box,
     string::{String, ToString},
@@ -13,18 +14,21 @@ use alloc::{
 use core::{
     mem::size_of,
     panic::PanicInfo,
+    ptr, slice,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use spin::RwLock;
 
 use kernel_api::{
-    Data, DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
+    Data, DeviceObject, DriverObject, DriverStatus, FsIdentify, IoTarget, KernelAllocator, Request,
+    RequestType,
     alloc_api::{
         DeviceInit,
         ffi::{
-            driver_set_evt_device_add, pnp_create_device_symlink_top,
-            pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink, pnp_load_service,
-            pnp_remove_symlink, reg,
+            driver_set_evt_device_add, pnp_create_control_device_and_link,
+            pnp_create_device_symlink_top, pnp_forward_request_to_next_lower,
+            pnp_get_device_target, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
+            pnp_wait_for_request, reg,
         },
     },
     println,
@@ -42,42 +46,30 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-// FS → VolClass: register control link
 const IOCTL_MOUNTMGR_REGISTER_FS: u32 = 0x4D4D_0001;
-// VolClass → FS: probe mount for provided link
-const IOCTL_FS_TRY_MOUNT: u32 = 0x4653_0001;
-// FS → VolClass: unmount/relinquish link
 const IOCTL_MOUNTMGR_UNMOUNT: u32 = 0x4D4D_0002;
-// Any → VolClass: query last status
 const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
-// Any → VolClass: rescan FS registry
 const IOCTL_MOUNTMGR_RESYNC: u32 = 0x4D4D_0004;
-// Any → VolClass: list registered FS control links
 const IOCTL_MOUNTMGR_LIST_FS: u32 = 0x4D4D_0005;
-
-// FSCTL routing: any code in 0x9000_0000..=0x9FFF_FFFF is sent upward to the FS device.
-const IOCTL_FSCTL_BASE: u32 = 0x9000_0000;
-const IOCTL_FSCTL_MASK: u32 = 0xF000_0000;
+const IOCTL_FS_IDENTIFY: u32 = 0x4653_0002;
 
 const VOLUME_LINK_BASE: &str = "\\Volumes";
-const PROBE_LINK_BASE: &str = "\\MountMgr\\Probe";
+const CTRL_LINK: &str = "\\MountMgr";
+const CTRL_NAME: &str = "\\Device\\volclass.ctrl";
 
 #[inline]
 fn make_volume_link_name(id: u32) -> String {
     alloc::format!("{}\\{:04}", VOLUME_LINK_BASE, id)
 }
-#[inline]
-fn make_probe_link_name(id: u32) -> String {
-    alloc::format!("{}\\{:04}", PROBE_LINK_BASE, id)
-}
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FsReg {
     svc: String,
     tag: String,
     ord: u32,
 }
 static mut FS_REGISTRY: RwLock<Vec<FsReg>> = RwLock::new(Vec::new());
+static mut FS_REGISTERED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 fn refresh_fs_registry_from_registry() -> usize {
     const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
@@ -139,20 +131,23 @@ fn list_fs_blob() -> Box<[u8]> {
 #[repr(C)]
 struct VolFdoExt {
     inst_path: String,
-    probe_link: String,
     public_link: String,
     fs_attached: AtomicBool,
+    fs_ctrl: Option<Arc<DeviceObject>>,
 }
 impl VolFdoExt {
     fn blank() -> Self {
         Self {
             inst_path: String::new(),
-            probe_link: String::new(),
             public_link: String::new(),
             fs_attached: AtomicBool::new(false),
+            fs_ctrl: None,
         }
     }
 }
+
+#[repr(C)]
+struct CtrlDevExt;
 
 #[inline]
 fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
@@ -161,39 +156,24 @@ fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
 
 static NEXT_VOL_ID: AtomicU32 = AtomicU32::new(1);
 
-struct VolumeCtx {
-    fdo: Arc<DeviceObject>,
-    inst_path: String,
-    probe_link: String,
-    public_link: String,
-}
-impl VolumeCtx {
-    fn new(fdo: Arc<DeviceObject>, inst_path: String, vid: u32) -> Self {
-        Self {
-            fdo,
-            inst_path,
-            probe_link: make_probe_link_name(vid),
-            public_link: make_volume_link_name(vid),
-        }
-    }
-}
-
-extern "win64" fn fs_probe_complete(req: &mut Request, ctx: usize) {
-    let mut bx = unsafe { Box::from_raw(ctx as *mut VolumeCtx) };
-    if req.status == DriverStatus::Success {
-        let _ =
-            unsafe { pnp_create_device_symlink_top(bx.inst_path.clone(), bx.public_link.clone()) };
-        let _ = unsafe { pnp_remove_symlink(bx.probe_link.clone()) };
-        let dx = ext_mut::<VolFdoExt>(&bx.fdo);
-        dx.public_link = bx.public_link.clone();
-        dx.fs_attached.store(true, Ordering::Release);
-        println!("[volclass] claimed -> {}", dx.public_link);
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, volclass_device_add) };
+
+    let mut init = DeviceInit {
+        dev_ext_size: size_of::<CtrlDevExt>(),
+        io_read: None,
+        io_write: None,
+        io_device_control: Some(volclass_ctrl_ioctl),
+        evt_device_prepare_hardware: None,
+        evt_bus_enumerate_devices: None,
+        evt_pnp: None,
+    };
+    let _ctrl = unsafe {
+        pnp_create_control_device_and_link(CTRL_NAME.to_string(), init, CTRL_LINK.to_string())
+    };
+
+    let _ = refresh_fs_registry_from_registry();
     DriverStatus::Success
 }
 
@@ -204,46 +184,93 @@ pub extern "win64" fn volclass_device_add(
     dev_init.dev_ext_size = size_of::<VolFdoExt>();
     dev_init.evt_device_prepare_hardware = Some(volclass_start);
     dev_init.io_device_control = Some(volclass_ioctl);
-    let _ = refresh_fs_registry_from_registry();
+    dev_init.io_read = Some(vol_pdo_read);
+    dev_init.io_write = Some(vol_pdo_write);
     DriverStatus::Success
 }
 
 extern "win64" fn volclass_start(dev: &Arc<DeviceObject>) -> DriverStatus {
     let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
+    let io_target = IoTarget {
+        target_device: dev.clone(),
+    };
     let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
-
     {
         let dx = ext_mut::<VolFdoExt>(dev);
         *dx = VolFdoExt::blank();
         dx.inst_path = inst.clone();
-        dx.probe_link = make_probe_link_name(vid);
         dx.public_link = make_volume_link_name(vid);
     }
 
-    let _ = unsafe {
-        pnp_create_device_symlink_top(inst.clone(), ext_mut::<VolFdoExt>(dev).probe_link.clone())
-    };
+    let _ = refresh_fs_registry_from_registry();
+    let vol = Arc::new(io_target);
 
-    let regs: Vec<FsReg> = unsafe { FS_REGISTRY.read().clone() };
-    if regs.is_empty() {
-        let _ = refresh_fs_registry_from_registry();
-    }
+    for tag in unsafe { FS_REGISTERED.read().clone() } {
+        // Build FsIdentify payload in-place inside Request::data
+        let payload = Box::new(FsIdentify {
+            volume_fdo: vol.clone(),
+            mount_device: None,
+            can_mount: false,
+        });
+        let len = core::mem::size_of::<FsIdentify>();
+        let ptr = Box::into_raw(payload) as *mut u8;
+        let data: Box<[u8]> = unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) };
 
-    let payload = ext_mut::<VolFdoExt>(dev)
-        .probe_link
-        .clone()
-        .into_bytes()
-        .into_boxed_slice();
-    let raw_ctx = Box::into_raw(Box::new(VolumeCtx::new(dev.clone(), inst, vid))) as usize;
+        let req_arc = Arc::new(RwLock::new(Request::new(
+            RequestType::DeviceControl(IOCTL_FS_IDENTIFY),
+            data,
+        )));
 
-    for fs in unsafe { FS_REGISTRY.read().iter().cloned().collect::<Vec<_>>() } {
-        let _ = unsafe { pnp_load_service(fs.svc.clone()) };
-        let mut req = Request::new(
-            RequestType::DeviceControl(IOCTL_FS_TRY_MOUNT),
-            payload.clone(),
-        );
-        req.set_completion(fs_probe_complete, raw_ctx);
-        let _ = unsafe { pnp_ioctl_via_symlink(fs.tag.clone(), IOCTL_FS_TRY_MOUNT, &mut req) };
+        unsafe {
+            let _ = pnp_ioctl_via_symlink(tag.clone(), IOCTL_FS_IDENTIFY, req_arc.clone());
+            pnp_wait_for_request(&req_arc.clone());
+        }
+
+        // Examine and act on the result
+        let mut guard = req_arc.write();
+
+        if guard.status != DriverStatus::Success {
+            let raw = core::mem::replace(&mut guard.data, Box::<[u8]>::from([]));
+            drop(guard);
+            let _owned: Box<FsIdentify> =
+                unsafe { Box::from_raw(Box::into_raw(raw) as *mut u8 as *mut FsIdentify) };
+            continue;
+        }
+
+        let id_ref: &FsIdentify = unsafe { &*(guard.data.as_ptr() as *const FsIdentify) };
+
+        if !id_ref.can_mount {
+            let raw = core::mem::replace(&mut guard.data, Box::<[u8]>::from([]));
+            drop(guard);
+            let _owned: Box<FsIdentify> =
+                unsafe { Box::from_raw(Box::into_raw(raw) as *mut u8 as *mut FsIdentify) };
+            continue;
+        }
+
+        if let Some(ctrl) = &id_ref.mount_device {
+            {
+                let dx = ext_mut::<VolFdoExt>(dev);
+                dx.fs_ctrl = Some(ctrl.clone());
+                dx.fs_attached.store(true, Ordering::Release);
+            }
+            let _ = unsafe {
+                pnp_create_device_symlink_top(
+                    inst.clone(),
+                    ext_mut::<VolFdoExt>(dev).public_link.clone(),
+                )
+            };
+
+            let raw = core::mem::replace(&mut guard.data, Box::<[u8]>::from([]));
+            drop(guard);
+            let _owned: Box<FsIdentify> =
+                unsafe { Box::from_raw(Box::into_raw(raw) as *mut u8 as *mut FsIdentify) };
+            break;
+        }
+
+        let raw = core::mem::replace(&mut guard.data, Box::<[u8]>::from([]));
+        drop(guard);
+        let _owned: Box<FsIdentify> =
+            unsafe { Box::from_raw(Box::into_raw(raw) as *mut u8 as *mut FsIdentify) };
     }
 
     DriverStatus::Success
@@ -256,12 +283,7 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
     } else {
         0
     };
-    let s = alloc::format!(
-        "claimed={};probe={};public={}",
-        claimed,
-        dx.probe_link,
-        dx.public_link
-    );
+    let s = alloc::format!("claimed={};public={}", claimed, dx.public_link);
     s.into_bytes().into_boxed_slice()
 }
 
@@ -271,93 +293,107 @@ fn string_from_req(req: &Request) -> Option<String> {
         .map(|s| s.trim_matches(char::from(0)).to_string())
 }
 
-#[inline]
-fn is_fsctl(code: u32) -> bool {
-    (code & IOCTL_FSCTL_MASK) == IOCTL_FSCTL_BASE
-}
-
-pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: &mut Request) {
-    let RequestType::DeviceControl(code) = req.kind else {
-        // pass non-IOCTL down
-        unsafe { pnp_forward_request_to_next_lower(dev, req) };
-        return;
+// FDO IOCTL
+pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+    let code = {
+        let r = req.read();
+        match r.kind {
+            RequestType::DeviceControl(c) => c,
+            _ => {
+                drop(r);
+                let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
+                return;
+            }
+        }
     };
 
-    // Up-route FSCTLs
-    if is_fsctl(code) {
-        let dx = ext_mut::<VolFdoExt>(dev);
-        if !dx.fs_attached.load(Ordering::Acquire) {
-            req.status = DriverStatus::DeviceNotReady;
-            return;
-        }
-        let mut shadow = Request::new(RequestType::DeviceControl(code), req.data.clone());
-        let r = unsafe { pnp_ioctl_via_symlink(dx.public_link.clone(), code, &mut shadow) };
-        if r == DriverStatus::Success {
-            req.data = shadow.data;
-            req.status = DriverStatus::Success;
-        } else {
-            req.status = DriverStatus::Unsuccessful;
-        }
-        return;
-    }
-
     match code {
-        IOCTL_MOUNTMGR_REGISTER_FS => {
-            let tag = match string_from_req(req) {
-                Some(t) if !t.is_empty() => t,
-                _ => {
-                    req.status = DriverStatus::InvalidParameter;
-                    return;
-                }
-            };
-            unsafe {
-                let mut wr = FS_REGISTRY.write();
-                if !wr.iter().any(|r| r.tag == tag) {
-                    let svc_guess = tag
-                        .rsplit(&['\\', '/'][..])
-                        .next()
-                        .unwrap_or("fs")
-                        .to_string();
-                    wr.push(FsReg {
-                        svc: svc_guess,
-                        tag,
-                        ord: 100,
-                    });
-                }
-            }
-            let _ = refresh_fs_registry_from_registry();
-            req.status = DriverStatus::Success;
-        }
-
         IOCTL_MOUNTMGR_UNMOUNT => {
-            let target = string_from_req(req).unwrap_or_default();
+            let target = {
+                let r = req.read();
+                string_from_req(&r).unwrap_or_default()
+            };
             if !target.is_empty() {
                 let _ = unsafe { pnp_remove_symlink(target) };
             }
-            ext_mut::<VolFdoExt>(dev)
-                .fs_attached
-                .store(false, Ordering::Release);
-            req.status = DriverStatus::Success;
+            {
+                ext_mut::<VolFdoExt>(dev)
+                    .fs_attached
+                    .store(false, Ordering::Release);
+                ext_mut::<VolFdoExt>(dev).fs_ctrl = None;
+            }
+            req.write().status = DriverStatus::Success;
         }
-
         IOCTL_MOUNTMGR_QUERY => {
-            req.data = build_status_blob(dev);
-            req.status = DriverStatus::Success;
+            let mut w = req.write();
+            w.data = build_status_blob(dev);
+            w.status = DriverStatus::Success;
         }
-
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry();
-            req.status = DriverStatus::Success;
+            req.write().status = DriverStatus::Success;
         }
-
         IOCTL_MOUNTMGR_LIST_FS => {
-            req.data = list_fs_blob();
-            req.status = DriverStatus::Success;
+            let mut w = req.write();
+            w.data = list_fs_blob();
+            w.status = DriverStatus::Success;
         }
-
         _ => {
-            // pass unknown IOCTLs down the storage stack
-            unsafe { pnp_forward_request_to_next_lower(dev, req) };
+            let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
         }
     }
+}
+
+// Control device IOCTL (MountMgr root)
+pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+    let code = {
+        let r = req.read();
+        match r.kind {
+            RequestType::DeviceControl(c) => c,
+            _ => {
+                drop(r);
+                req.write().status = DriverStatus::InvalidParameter;
+                return;
+            }
+        }
+    };
+
+    match code {
+        IOCTL_MOUNTMGR_REGISTER_FS => {
+            let tag = {
+                let r = req.read();
+                string_from_req(&r)
+            };
+            match tag {
+                Some(t) if !t.is_empty() => unsafe {
+                    let mut wr = FS_REGISTERED.write();
+                    if !wr.iter().any(|s| s == &t) {
+                        wr.push(t);
+                    }
+                    req.write().status = DriverStatus::Success;
+                },
+                _ => {
+                    req.write().status = DriverStatus::InvalidParameter;
+                }
+            }
+        }
+        _ => {
+            req.write().status = DriverStatus::NotImplemented;
+        }
+    }
+}
+pub extern "win64" fn vol_pdo_read(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) {
+    parent.write().status = DriverStatus::Pending;
+}
+
+pub extern "win64" fn vol_pdo_write(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) {
+    parent.write().status = DriverStatus::Pending;
 }

@@ -52,7 +52,7 @@ pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub static BOOTSET: &[BootPkg] =
-    boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr"];
+    boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32"];
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;

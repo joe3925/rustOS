@@ -5,6 +5,7 @@ pub extern crate alloc;
 pub use acpi;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
+use alloc::slice;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -72,9 +73,11 @@ pub struct DeviceStack {
     _private: [u8; 0],
 }
 #[repr(C)]
+#[derive(Clone)]
 pub struct IoTarget {
-    _private: [u8; 0],
+    pub target_device: Arc<DeviceObject>,
 }
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum RequestType {
@@ -105,7 +108,18 @@ pub struct GptHeader {
     pub _partition_crc32: u32,
     pub_reserved_block: [u8; 420],
 }
-
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BlkRead {
+    pub lba: u64,
+    pub sectors: u32,
+}
+#[repr(C)]
+pub struct FsIdentify {
+    pub volume_fdo: Arc<IoTarget>,
+    pub mount_device: Option<Arc<DeviceObject>>,
+    pub can_mount: bool,
+}
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GptPartitionEntry {
@@ -117,6 +131,17 @@ pub struct GptPartitionEntry {
     pub name_utf16: [u16; 36],
 }
 
+fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
+    let len = size_of::<T>();
+    let ptr = Box::into_raw(b) as *mut u8;
+    unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len)) }
+}
+
+unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
+    assert_eq!(b.len(), size_of::<T>());
+    let ptr = Box::into_raw(b) as *mut u8 as *mut T;
+    Box::from_raw(ptr)
+}
 #[derive(Debug)]
 #[repr(C)]
 pub struct Request {
@@ -339,7 +364,7 @@ pub mod alloc_api {
 
         pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
         pub evt_bus_enumerate_devices: Option<EvtDeviceEnumerateDevices>,
-        pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, &mut Request)>,
+        pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>)>,
     }
 
     #[repr(C)]
@@ -389,12 +414,12 @@ pub mod alloc_api {
 
     pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>);
 
-    pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
-    pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
-    pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request);
+    pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
+    pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
+    pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
     pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices =
-        extern "win64" fn(&Arc<DeviceObject>, &mut Request) -> DriverStatus;
+        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
     pub type ClassAddCallback =
         extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
@@ -474,9 +499,9 @@ pub mod alloc_api {
             pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
             pub fn pnp_forward_request_to_next_lower(
                 from: &Arc<DeviceObject>,
-                req: &mut Request,
+                req: Arc<RwLock<Request>>,
             ) -> DriverStatus;
-            pub fn pnp_send_request(target: &IoTarget, req: &mut Request) -> DriverStatus;
+            pub fn pnp_send_request(target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus;
             pub fn pnp_complete_request(req: &mut Request);
             pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
             pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
@@ -488,13 +513,13 @@ pub mod alloc_api {
 
             pub fn pnp_send_request_via_symlink(
                 link_path: String,
-                req: &mut Request,
+                req: Arc<RwLock<Request>>,
             ) -> DriverStatus;
 
             pub fn pnp_ioctl_via_symlink(
                 link_path: String,
                 control_code: u32,
-                request: &mut Request,
+                request: Arc<RwLock<Request>>,
             ) -> DriverStatus;
             pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>>;
             pub fn pnp_create_control_device_with_init(
@@ -511,7 +536,7 @@ pub mod alloc_api {
                 callback: ClassAddCallback,
                 dev_obj: Arc<DeviceObject>,
             );
-            pub fn pnp_wait_for_request(req: &Request);
+            pub fn pnp_wait_for_request(req: &Arc<RwLock<Request>>);
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,

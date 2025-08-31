@@ -6,6 +6,7 @@ extern crate alloc;
 mod dev_ext;
 mod msvc_shims;
 
+use alloc::vec;
 use alloc::{
     boxed::Box,
     string::{String, ToString},
@@ -13,8 +14,8 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem::size_of, panic::PanicInfo};
+use spin::RwLock;
 
-use crate::alloc::vec;
 use dev_ext::DevExt;
 use kernel_api::{
     DeviceObject, DeviceRelationType, DriverObject, DriverStatus, KernelAllocator, Request,
@@ -41,7 +42,6 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-// -------- Bus-neutral Block Port ABI (must match disk class driver) --------
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -53,23 +53,22 @@ const FEAT_FLUSH: u64 = 1 << 0;
 
 #[repr(C)]
 pub struct BlockQueryOut {
-    pub block_size: u32,     // e.g. 512
-    pub max_blocks: u32,     // max LBAs per transfer
-    pub alignment_mask: u32, // buffer alignment mask (0 => none)
-    pub features: u64,       // FEAT_*
+    pub block_size: u32,
+    pub max_blocks: u32,
+    pub alignment_mask: u32,
+    pub features: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BlockRwIn {
-    pub op: u32, // BLOCK_RW_*
+    pub op: u32,
     pub _rsvd: u32,
     pub lba: u64,
     pub blocks: u32,
-    pub buf_off: u32, // payload starts here
+    pub buf_off: u32,
 }
 
-// -------- ATA defs --------
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
 const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
@@ -81,10 +80,11 @@ const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 1000;
+
 #[repr(C)]
 struct ChildExt {
     parent_dx: *mut DevExt,
-    dh: u8, // 0xE0 master, 0xF0 slave
+    dh: u8,
     present: bool,
 }
 
@@ -106,42 +106,51 @@ pub extern "win64" fn ide_device_add(
     DriverStatus::Success
 }
 
-pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Request) {
-    let Some(pnp) = req.pnp.as_mut() else {
-        req.status = DriverStatus::InvalidParameter;
-        return;
+pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+    let (minor, relation) = {
+        let g = req.read();
+        let Some(p) = g.pnp.as_ref() else {
+            drop(g);
+            req.write().status = DriverStatus::InvalidParameter;
+            return;
+        };
+        (p.minor_function, p.relation)
     };
 
     use kernel_api::PnpMinorFunction::*;
-    match pnp.minor_function {
+    match minor {
         StartDevice => {
+            {
+                req.write().status = DriverStatus::Waiting;
+            }
+
             let ctx = Box::into_raw(Box::new(PrepareHardwareCtx {
                 device: Arc::clone(dev),
-                start_req: Box::new(unsafe { core::ptr::read(req) }),
+                parent: req.clone(),
             })) as usize;
 
-            let mut q = Request {
-                id: 0,
-                kind: RequestType::Pnp,
-                data: Box::new([]),
-                completed: false,
-                status: DriverStatus::Pending,
-                pnp: Some(PnpRequest {
-                    minor_function: kernel_api::PnpMinorFunction::QueryResources,
-                    relation: DeviceRelationType::TargetDeviceRelation,
-                    id_type: kernel_api::QueryIdType::CompatibleIds,
-                    ids_out: Vec::new(),
-                    blob_out: Vec::new(),
-                }),
-                completion_routine: Some(ide_on_query_resources_complete),
-                completion_context: ctx,
-            };
-            let _ = unsafe { pnp_forward_request_to_next_lower(dev, &mut q) };
+            let mut child = Request::new(RequestType::Pnp, Box::new([]));
+            child.pnp = Some(PnpRequest {
+                minor_function: kernel_api::PnpMinorFunction::QueryResources,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: kernel_api::QueryIdType::CompatibleIds,
+                ids_out: Vec::new(),
+                blob_out: Vec::new(),
+            });
+            child.set_completion(ide_on_query_resources_complete, ctx);
+
+            let q = Arc::new(RwLock::new(child));
+            let st = unsafe { pnp_forward_request_to_next_lower(dev, q) };
+            if st == DriverStatus::NoSuchDevice {
+                let mut pg = req.write();
+                pg.status = DriverStatus::Success;
+                unsafe { pnp_complete_request(&mut pg) };
+            }
         }
         QueryDeviceRelations => {
-            if pnp.relation == DeviceRelationType::BusRelations {
+            if relation == DeviceRelationType::BusRelations {
                 ide_enumerate_bus(dev);
-                req.status = DriverStatus::Success;
+                req.write().status = DriverStatus::Success;
             } else {
                 let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
             }
@@ -155,20 +164,23 @@ pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: &mut Reques
 #[repr(C)]
 struct PrepareHardwareCtx {
     device: Arc<DeviceObject>,
-    start_req: Box<Request>,
+    parent: Arc<RwLock<Request>>,
 }
 
-extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize) {
-    let mut prep = unsafe { Box::from_raw(ctx as *mut PrepareHardwareCtx) };
+extern "win64" fn ide_on_query_resources_complete(child: &mut Request, ctx: usize) {
+    let prep = unsafe { Box::from_raw(ctx as *mut PrepareHardwareCtx) };
     let device = prep.device.clone();
+    let parent = prep.parent.clone();
 
-    if req.status != DriverStatus::Success {
-        prep.start_req.status = req.status;
-        unsafe { pnp_complete_request(&mut prep.start_req) };
+    if child.status != DriverStatus::Success {
+        let mut pg = parent.write();
+        pg.status = child.status;
+        let ptr: *mut Request = &mut *pg;
+        unsafe { pnp_complete_request(&mut *ptr) };
         return;
     }
 
-    let pnp_payload = req.pnp.as_ref().expect("missing PnP payload");
+    let pnp_payload = child.pnp.as_ref().expect("missing PnP payload");
     let bars = parse_ide_bars(&pnp_payload.blob_out);
 
     let dx: &mut DevExt =
@@ -186,20 +198,24 @@ extern "win64" fn ide_on_query_resources_complete(req: &mut Request, ctx: usize)
     dx.lba_hi_port = Port::new(cb + 5);
     dx.drive_head_port = Port::new(cb + 6);
     dx.command_port = Port::new(cb + 7);
-    dx.alternative_command_port = Port::new(alt); // AltStatus read
-    dx.control_port = Port::new(alt); // nIEN/SRST write
+    dx.alternative_command_port = Port::new(alt);
+    dx.control_port = Port::new(alt);
 
     unsafe { dx.control_port.write(0u8) };
 
     dx.present = true;
+    let was_enumerated = dx.enumerated;
     dx.enumerated = false;
-
-    let status = unsafe { pnp_forward_request_to_next_lower(&device, &mut prep.start_req) };
-    if status == DriverStatus::NoSuchDevice {
-        prep.start_req.status = DriverStatus::Success;
-        unsafe { pnp_complete_request(&mut prep.start_req) };
+    parent.write().status = DriverStatus::Pending;
+    let st = unsafe { pnp_forward_request_to_next_lower(&device, parent.clone()) };
+    if st == DriverStatus::NoSuchDevice {
+        let mut pg = parent.write();
+        pg.status = DriverStatus::Success;
+        let ptr: *mut Request = &mut *pg;
+        unsafe { pnp_complete_request(&mut *ptr) };
     }
-    if dx.enumerated {
+
+    if was_enumerated {
         unsafe { InvalidateDeviceRelations(&device, DeviceRelationType::BusRelations) };
     }
 }
@@ -294,107 +310,120 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     cdx.present = true;
 }
 
-pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: &mut Request) {
-    let code = match req.kind {
-        RequestType::DeviceControl(c) => c,
-        _ => {
-            req.status = DriverStatus::InvalidParameter;
-            return;
-        }
-    };
-
+pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+    // Validate child state
     let cdx: &mut ChildExt =
         unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *const ChildExt as *mut ChildExt) };
     if !cdx.present || cdx.parent_dx.is_null() {
-        req.status = DriverStatus::NoSuchDevice;
+        req.write().status = DriverStatus::NoSuchDevice;
         return;
     }
     let dx: &mut DevExt = unsafe { &mut *cdx.parent_dx };
 
-    match code {
-        IOCTL_BLOCK_QUERY => {
-            if req.data.len() < size_of::<BlockQueryOut>() {
-                req.status = DriverStatus::InsufficientResources;
+    // Pull IOCTL code
+    let code = {
+        let mut w = req.write();
+        match w.kind {
+            RequestType::DeviceControl(c) => c,
+            _ => {
+                w.status = DriverStatus::InvalidParameter;
                 return;
             }
-            let out = unsafe { &mut *(req.data.as_mut_ptr() as *mut BlockQueryOut) };
+        }
+    };
+
+    match code {
+        IOCTL_BLOCK_QUERY => {
+            let mut w = req.write();
+            if w.data.len() < size_of::<BlockQueryOut>() {
+                w.status = DriverStatus::InsufficientResources;
+                return;
+            }
+            let out = unsafe { &mut *(w.data.as_mut_ptr() as *mut BlockQueryOut) };
             out.block_size = 512;
             out.max_blocks = 256;
             out.alignment_mask = 0;
             out.features = FEAT_FLUSH;
-            req.status = DriverStatus::Success;
+            w.status = DriverStatus::Success;
         }
-        IOCTL_BLOCK_RW => {
-            if req.data.len() < size_of::<BlockRwIn>() {
-                req.status = DriverStatus::InvalidParameter;
-                return;
-            }
-            let hdr = unsafe { *(req.data.as_ptr() as *const BlockRwIn) };
-            if hdr.blocks == 0 {
-                req.status = DriverStatus::InvalidParameter;
-                return;
-            }
-            let need = (hdr.blocks as usize) * 512;
-            let off = hdr.buf_off as usize;
-            if off
-                .checked_add(need)
-                .map(|e| e <= req.data.len())
-                .unwrap_or(false)
-                == false
-            {
-                req.status = DriverStatus::InvalidParameter;
-                return;
-            }
 
-            if (hdr.lba >> 28) != 0 {
-                req.status = DriverStatus::InvalidParameter;
-                return;
-            }
+        IOCTL_BLOCK_RW => {
+            // Read header first
+            let (hdr, need, off) = {
+                let w = req.read();
+                if w.data.len() < size_of::<BlockRwIn>() {
+                    drop(w);
+                    req.write().status = DriverStatus::InvalidParameter;
+                    return;
+                }
+                let hdr = unsafe { *(w.data.as_ptr() as *const BlockRwIn) };
+                let need = (hdr.blocks as usize) * 512;
+                let off = hdr.buf_off as usize;
+                if hdr.blocks == 0
+                    || off
+                        .checked_add(need)
+                        .map(|e| e <= w.data.len())
+                        .unwrap_or(false)
+                        == false
+                    || (hdr.lba >> 28) != 0
+                {
+                    drop(w);
+                    req.write().status = DriverStatus::InvalidParameter;
+                    return;
+                }
+                (hdr, need, off)
+            };
+
+            // Perform I/O and set status
+            let mut w = req.write();
             let ok = match hdr.op {
                 BLOCK_RW_READ => ata_pio_read(
                     dx,
                     cdx.dh,
                     hdr.lba as u32,
                     hdr.blocks as u32,
-                    &mut req.data[off..off + need],
+                    &mut w.data[off..off + need],
                 ),
                 BLOCK_RW_WRITE => ata_pio_write(
                     dx,
                     cdx.dh,
                     hdr.lba as u32,
                     hdr.blocks as u32,
-                    &req.data[off..off + need],
+                    &w.data[off..off + need],
                 ),
                 _ => {
-                    req.status = DriverStatus::InvalidParameter;
+                    w.status = DriverStatus::InvalidParameter;
                     return;
                 }
             };
-            req.status = if ok {
+            w.status = if ok {
                 DriverStatus::Success
             } else {
                 DriverStatus::Unsuccessful
             };
         }
+
         IOCTL_BLOCK_FLUSH => {
             unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
-            req.status = if wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS) {
+            let mut w = req.write();
+            w.status = if wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS) {
                 DriverStatus::Success
             } else {
                 DriverStatus::Unsuccessful
             };
         }
+
         _ => {
-            req.status = DriverStatus::NotImplemented;
+            req.write().status = DriverStatus::NotImplemented;
         }
     }
 }
 
 #[derive(Default, Clone, Copy)]
 struct IdeBars {
-    cmd: u16, // BAR0 (primary command block)
-    ctl: u16, // BAR1 (primary control block base, alt = ctl + 2)
-    bm: u16,  // BAR4 (bus-master IDE)
+    cmd: u16,
+    ctl: u16,
+    bm: u16,
 }
 
 fn parse_ide_bars(blob: &[u8]) -> IdeBars {
@@ -438,9 +467,9 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
         }
 
         match index {
-            0 => bars.cmd = start as u16, // BAR0
-            1 => bars.ctl = start as u16, // BAR1 (ALT = ctl + 2)
-            4 => bars.bm = start as u16,  // BAR4 bus-master IDE
+            0 => bars.cmd = start as u16,
+            1 => bars.ctl = start as u16,
+            4 => bars.bm = start as u16,
             _ => {
                 let l = len as u16;
                 if bars.cmd == 0 && (l == 8 || l == 16) {
@@ -455,18 +484,19 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
     }
 
     if bars.cmd == 0 {
-        bars.cmd = 0x1F0; // legacy primary
+        bars.cmd = 0x1F0;
     }
     if bars.ctl == 0 {
         bars.ctl = match bars.cmd {
-            0x1F0 => 0x3F4,         // legacy primary
-            0x170 => 0x374,         // legacy secondary
-            v => v.wrapping_add(2), // native mapping when BAR1 missing
+            0x1F0 => 0x3F4,
+            0x170 => 0x374,
+            v => v.wrapping_add(2),
         };
     }
 
     bars
 }
+
 fn id_string(words: &[u16]) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(words.len() * 2);
     for &w in words {

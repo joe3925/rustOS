@@ -38,7 +38,7 @@ pub struct DeviceObject {
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
     pub dev_ext: Box<[u8]>,
     pub dev_init: DeviceInit,
-    pub queue: Mutex<VecDeque<Arc<spin::Mutex<Request>>>>,
+    pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
 
     pub dispatch_scheduled: AtomicBool,
     pub dev_node: Weak<DevNode>,
@@ -118,12 +118,12 @@ pub type EvtDriverDeviceAdd =
 
 pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>);
 
-pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
-pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, &mut Request, usize);
-pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, &mut Request);
+pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
+pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
+pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
 pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 pub type EvtDeviceEnumerateDevices =
-    extern "win64" fn(&Arc<DeviceObject>, &mut Request) -> DriverStatus;
+    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -249,7 +249,7 @@ pub struct DeviceInit {
 
     pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
     pub evt_bus_enumerate_devices: Option<EvtDeviceEnumerateDevices>,
-    pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, &mut Request)>,
+    pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>)>,
 }
 
 impl DeviceInit {
