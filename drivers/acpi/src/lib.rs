@@ -14,9 +14,9 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request,
+    DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
     alloc_api::{
-        DeviceInit,
+        DeviceInit, PnpVtable,
         ffi::{driver_set_evt_device_add, get_acpi_tables, pnp_send_request},
     },
     ffi::{self},
@@ -46,14 +46,20 @@ pub extern "win64" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
+    let mut pnp_vtable = PnpVtable::new();
+    pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
+    pnp_vtable.set(PnpMinorFunction::QueryDeviceRelations, enumerate_bus);
+
     dev_init_ptr.dev_ext_size = size_of::<DevExt>();
-    dev_init_ptr.evt_device_prepare_hardware = Some(bus_driver_prepare_hardware);
-    dev_init_ptr.evt_bus_enumerate_devices = Some(enumerate_bus);
+    dev_init_ptr.pnp_vtable = Some(pnp_vtable);
 
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) -> DriverStatus {
+pub extern "win64" fn bus_driver_prepare_hardware(
+    device: &Arc<DeviceObject>,
+    _req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let acpi_tables = unsafe { get_acpi_tables() };
     let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
 

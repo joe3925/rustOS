@@ -23,7 +23,7 @@ use kernel_api::{
     Data, DeviceObject, DriverObject, DriverStatus, FsIdentify, IoTarget, KernelAllocator, Request,
     RequestType,
     alloc_api::{
-        DeviceInit,
+        DeviceInit, EvtDevicePrepareHardware, PnpVtable,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_device_symlink_top, pnp_forward_request_to_next_lower,
@@ -164,10 +164,8 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         dev_ext_size: size_of::<CtrlDevExt>(),
         io_read: None,
         io_write: None,
+        pnp_vtable: None,
         io_device_control: Some(volclass_ctrl_ioctl),
-        evt_device_prepare_hardware: None,
-        evt_bus_enumerate_devices: None,
-        evt_pnp: None,
     };
     let _ctrl = unsafe {
         pnp_create_control_device_and_link(CTRL_NAME.to_string(), init, CTRL_LINK.to_string())
@@ -181,15 +179,22 @@ pub extern "win64" fn volclass_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
+    let mut pnp_vtable = PnpVtable::new();
+    pnp_vtable.set(kernel_api::PnpMinorFunction::StartDevice, volclass_start);
+
     dev_init.dev_ext_size = size_of::<VolFdoExt>();
-    dev_init.evt_device_prepare_hardware = Some(volclass_start);
     dev_init.io_device_control = Some(volclass_ioctl);
     dev_init.io_read = Some(vol_pdo_read);
     dev_init.io_write = Some(vol_pdo_write);
+    dev_init.pnp_vtable = Some(pnp_vtable);
+
     DriverStatus::Success
 }
 
-extern "win64" fn volclass_start(dev: &Arc<DeviceObject>) -> DriverStatus {
+extern "win64" fn volclass_start(
+    dev: &Arc<DeviceObject>,
+    _request: Arc<RwLock<kernel_api::Request>>,
+) -> DriverStatus {
     let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
     let io_target = IoTarget {
         target_device: dev.clone(),
@@ -206,7 +211,6 @@ extern "win64" fn volclass_start(dev: &Arc<DeviceObject>) -> DriverStatus {
     let vol = Arc::new(io_target);
 
     for tag in unsafe { FS_REGISTERED.read().clone() } {
-        // Build FsIdentify payload in-place inside Request::data
         let payload = Box::new(FsIdentify {
             volume_fdo: vol.clone(),
             mount_device: None,
@@ -226,7 +230,6 @@ extern "win64" fn volclass_start(dev: &Arc<DeviceObject>) -> DriverStatus {
             pnp_wait_for_request(&req_arc.clone());
         }
 
-        // Examine and act on the result
         let mut guard = req_arc.write();
 
         if guard.status != DriverStatus::Success {
@@ -344,7 +347,6 @@ pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
     }
 }
 
-// Control device IOCTL (MountMgr root)
 pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let code = {
         let r = req.read();

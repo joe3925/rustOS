@@ -8,8 +8,9 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::alloc_api::PnpVtable;
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
-use kernel_api::{GptHeader, GptPartitionEntry, IoTarget};
+use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
 use spin::RwLock;
 
 use kernel_api::{
@@ -84,11 +85,17 @@ pub extern "win64" fn vol_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
+    let mut pnp_vtable = PnpVtable::new();
+    pnp_vtable.set(PnpMinorFunction::StartDevice, vol_prepare_hardware);
+    pnp_vtable.set(
+        PnpMinorFunction::QueryDeviceRelations,
+        vol_enumerate_devices,
+    );
+
     dev_init.dev_ext_size = size_of::<VolExt>();
-    dev_init.evt_device_prepare_hardware = Some(vol_prepare_hardware);
-    dev_init.evt_bus_enumerate_devices = Some(vol_enumerate_devices);
     dev_init.io_read = None;
     dev_init.io_write = None;
+    dev_init.pnp_vtable = Some(pnp_vtable);
     DriverStatus::Success
 }
 
@@ -119,7 +126,10 @@ extern "win64" fn vol_queryres_complete(child: &mut Request, ctx: usize) {
     }
 }
 
-extern "win64" fn vol_prepare_hardware(dev: &Arc<DeviceObject>) -> DriverStatus {
+extern "win64" fn vol_prepare_hardware(
+    dev: &Arc<DeviceObject>,
+    _req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let mut req = Request::new(RequestType::Pnp, Box::new([]));
     req.pnp = Some(PnpRequest {
         minor_function: kernel_api::PnpMinorFunction::QueryResources,
@@ -195,9 +205,7 @@ pub extern "win64" fn vol_enumerate_devices(
         io_read: Some(vol_pdo_read),
         io_write: Some(vol_pdo_write),
         io_device_control: None,
-        evt_device_prepare_hardware: None,
-        evt_bus_enumerate_devices: None,
-        evt_pnp: None,
+        pnp_vtable: None,
     };
 
     let (_dn, pdo) = unsafe {

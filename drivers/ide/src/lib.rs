@@ -14,6 +14,8 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::alloc_api::PnpVtable;
+use kernel_api::{PnpMinorFunction, QueryIdType};
 use spin::RwLock;
 
 use dev_ext::DevExt;
@@ -99,66 +101,93 @@ pub extern "win64" fn ide_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init.dev_ext_size = core::mem::size_of::<DevExt>();
-    dev_init.evt_pnp = Some(ide_pnp_dispatch);
     dev_init.io_read = None;
     dev_init.io_write = None;
     dev_init.io_device_control = None;
+
+    let mut vt = PnpVtable::new();
+    vt.set(PnpMinorFunction::StartDevice, ide_pnp_start);
+    vt.set(
+        PnpMinorFunction::QueryDeviceRelations,
+        ide_pnp_query_devrels,
+    );
+    dev_init.pnp_vtable = Some(vt);
     DriverStatus::Success
 }
 
-pub extern "win64" fn ide_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
-    let (minor, relation) = {
-        let g = req.read();
-        let Some(p) = g.pnp.as_ref() else {
-            drop(g);
-            req.write().status = DriverStatus::InvalidParameter;
-            return;
+extern "win64" fn ide_pnp_start(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    // sync QueryResources to parent/lower
+    let mut child = Request::new(RequestType::Pnp, Box::new([]));
+    child.pnp = Some(PnpRequest {
+        minor_function: PnpMinorFunction::QueryResources,
+        relation: DeviceRelationType::TargetDeviceRelation,
+        id_type: QueryIdType::CompatibleIds,
+        ids_out: Vec::new(),
+        blob_out: Vec::new(),
+    });
+    let child = Arc::new(RwLock::new(child));
+    let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
+    if st != DriverStatus::NoSuchDevice {
+        unsafe { kernel_api::alloc_api::ffi::pnp_wait_for_request(&child) };
+        let qst = { child.read().status };
+        if qst != DriverStatus::Success {
+            let mut pg = req.write();
+            pg.status = qst;
+            unsafe { pnp_complete_request(&mut *pg) };
+            return DriverStatus::Success;
+        }
+        let bars = {
+            let g = child.read();
+            parse_ide_bars(&g.pnp.as_ref().unwrap().blob_out)
         };
-        (p.minor_function, p.relation)
-    };
 
-    use kernel_api::PnpMinorFunction::*;
-    match minor {
-        StartDevice => {
-            {
-                req.write().status = DriverStatus::Waiting;
-            }
+        let dx: &mut DevExt =
+            unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
 
-            let ctx = Box::into_raw(Box::new(PrepareHardwareCtx {
-                device: Arc::clone(dev),
-                parent: req.clone(),
-            })) as usize;
+        let cb = bars.cmd as u16;
+        let ctl = bars.ctl as u16;
+        let alt = ctl.wrapping_add(2);
 
-            let mut child = Request::new(RequestType::Pnp, Box::new([]));
-            child.pnp = Some(PnpRequest {
-                minor_function: kernel_api::PnpMinorFunction::QueryResources,
-                relation: DeviceRelationType::TargetDeviceRelation,
-                id_type: kernel_api::QueryIdType::CompatibleIds,
-                ids_out: Vec::new(),
-                blob_out: Vec::new(),
-            });
-            child.set_completion(ide_on_query_resources_complete, ctx);
+        dx.data_port = Port::new(cb + 0);
+        dx.error_port = Port::new(cb + 1);
+        dx.sector_count_port = Port::new(cb + 2);
+        dx.lba_lo_port = Port::new(cb + 3);
+        dx.lba_mid_port = Port::new(cb + 4);
+        dx.lba_hi_port = Port::new(cb + 5);
+        dx.drive_head_port = Port::new(cb + 6);
+        dx.command_port = Port::new(cb + 7);
+        dx.alternative_command_port = Port::new(alt);
+        dx.control_port = Port::new(alt);
 
-            let q = Arc::new(RwLock::new(child));
-            let st = unsafe { pnp_forward_request_to_next_lower(dev, q) };
-            if st == DriverStatus::NoSuchDevice {
-                let mut pg = req.write();
-                pg.status = DriverStatus::Success;
-                unsafe { pnp_complete_request(&mut pg) };
-            }
-        }
-        QueryDeviceRelations => {
-            if relation == DeviceRelationType::BusRelations {
-                ide_enumerate_bus(dev);
-                req.write().status = DriverStatus::Success;
-            } else {
-                let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
-            }
-        }
-        _ => {
-            let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
-        }
+        unsafe { dx.control_port.write(0u8) };
+
+        dx.present = true;
+        dx.enumerated = false;
+    } else {
+        let dx: &mut DevExt =
+            unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+        dx.present = true;
+        dx.enumerated = false;
     }
+
+    req.write().status = DriverStatus::Pending;
+    DriverStatus::Pending
+}
+
+extern "win64" fn ide_pnp_query_devrels(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    let relation = { req.read().pnp.as_ref().unwrap().relation };
+    if relation == DeviceRelationType::BusRelations {
+        ide_enumerate_bus(dev);
+        req.write().status = DriverStatus::Success;
+        return DriverStatus::Success;
+    }
+    DriverStatus::Pending
 }
 
 #[repr(C)]
@@ -253,19 +282,11 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         } else if !model.is_empty() {
             hw.push(alloc::format!("IDE\\Disk{model}"));
         }
-        hw.push(alloc::format!(
-            "IDE\\Disk&CH_{:02}&DRV_{:02}",
-            channel,
-            drive
-        ));
+        hw.push(alloc::format!("IDE\\Disk&DRV_{:02}", drive));
         (hw, vec!["IDE\\Disk".into(), "GenDisk".into()])
     } else {
         (
-            vec![alloc::format!(
-                "IDE\\Disk&CH_{:02}&DRV_{:02}",
-                channel,
-                drive
-            )],
+            vec![alloc::format!("IDE\\Disk&DRV_{:02}", drive)],
             vec!["IDE\\Disk".into(), "GenDisk".into()],
         )
     };
@@ -284,18 +305,21 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         compatible,
     };
 
-    let child_init = DeviceInit {
+    let mut child_init = DeviceInit {
         dev_ext_size: size_of::<ChildExt>(),
         io_read: None,
         io_write: None,
         io_device_control: Some(ide_pdo_internal_ioctl),
-        evt_device_prepare_hardware: None,
-        evt_bus_enumerate_devices: None,
-        evt_pnp: None,
+        pnp_vtable: None,
     };
+    let mut pvt = PnpVtable::new();
+    pvt.set(PnpMinorFunction::QueryId, ide_pdo_query_id);
+    pvt.set(PnpMinorFunction::QueryResources, ide_pdo_query_resources);
+    pvt.set(PnpMinorFunction::StartDevice, ide_pdo_start);
+    child_init.pnp_vtable = Some(pvt);
 
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
-    let instance = alloc::format!("IDE\\CH_{:02}&DRV_{:02}", channel, drive);
+    let instance = alloc::format!("IDE\\DRV_{:02}", drive);
 
     let (_dn, pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
@@ -309,7 +333,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     cdx.dh = if drive == 0 { 0xE0 } else { 0xF0 };
     cdx.present = true;
 }
-
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     // Validate child state
     let cdx: &mut ChildExt =
@@ -690,4 +713,50 @@ fn wait_drq_set(st: &mut Port<u8>, timeout_ms: u64) -> bool {
         unsafe { wait_ms(1) };
     }
     false
+}
+extern "win64" fn ide_pdo_query_id(
+    pdo: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    use QueryIdType::*;
+    let ty = { req.read().pnp.as_ref().unwrap().id_type };
+    let mut w = req.write();
+    let p = w.pnp.as_mut().unwrap();
+    match ty {
+        HardwareIds => {
+            p.ids_out.push("IDE\\Disk".into());
+            p.ids_out.push("GenDisk".into());
+        }
+        CompatibleIds => {
+            p.ids_out.push("IDE\\Disk".into());
+            p.ids_out.push("GenDisk".into());
+        }
+        DeviceId => {
+            p.ids_out.push("IDE\\Disk".into());
+        }
+        InstanceId => {
+            p.ids_out
+                .push(pdo.dev_node.upgrade().unwrap().instance_path.clone());
+        }
+    }
+    w.status = DriverStatus::Success;
+    DriverStatus::Success
+}
+
+extern "win64" fn ide_pdo_query_resources(
+    _pdo: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    req.write().status = DriverStatus::Success; // none for child PDO
+    DriverStatus::Success
+}
+
+extern "win64" fn ide_pdo_start(
+    _pdo: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    if req.read().status == DriverStatus::Pending {
+        req.write().status = DriverStatus::Success;
+    }
+    DriverStatus::Success
 }

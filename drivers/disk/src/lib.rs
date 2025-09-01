@@ -27,7 +27,6 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-// ---------- helpers for Arc<RwLock<Request>> ----------
 #[inline]
 fn take_req(r: &Arc<RwLock<Request>>) -> Request {
     let mut g = r.write();
@@ -39,7 +38,6 @@ fn put_req(r: &Arc<RwLock<Request>>, req: Request) {
     *g = req;
 }
 
-// ---------- Block Port ABI ----------
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -74,7 +72,6 @@ struct BlockRwIn {
     buf_off: u32,
 }
 
-// ---------- Disk class FDO private state ----------
 #[repr(C)]
 struct DiskExt {
     block_size: u32,
@@ -94,7 +91,6 @@ struct RwChainCtx {
     is_write: bool,
 }
 
-// ---------- Driver entry / add ----------
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, disk_device_add) };
@@ -112,7 +108,6 @@ pub extern "win64" fn disk_device_add(
     DriverStatus::Success
 }
 
-// ---------- I/O paths (Arc<RwLock<Request>>) ----------
 pub extern "win64" fn disk_read(
     dev: &Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
@@ -183,7 +178,6 @@ pub extern "win64" fn disk_write(
     start_chunked_rw(dev, parent, off, total, true);
 }
 
-// optional: flush
 pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Request>>) {
     let code_opt = {
         if let RequestType::DeviceControl(c) = parent.read().kind {
@@ -196,7 +190,6 @@ pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Req
         Some(c) if c == IOCTL_BLOCK_FLUSH => {
             let mut child =
                 Request::new(RequestType::DeviceControl(IOCTL_BLOCK_FLUSH), Box::new([]));
-            // pass parent Arc in context
             let ctx_ptr = Box::into_raw(Box::new(parent.clone())) as usize;
             child.set_completion(disk_on_flush_done, ctx_ptr);
             parent.write().status = DriverStatus::Waiting;

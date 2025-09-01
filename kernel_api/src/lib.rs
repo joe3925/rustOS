@@ -1,7 +1,9 @@
 #![no_std]
 #![allow(improper_ctypes, improper_ctypes_definitions)]
+#![feature(variant_count)]
 pub extern crate alloc;
 
+use crate::alloc::vec;
 pub use acpi;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
@@ -10,15 +12,14 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
-use ffi::random_number;
-use spin::{Mutex, RwLock};
-pub use x86_64;
-use x86_64::structures::paging::mapper::MapToError;
-
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU8};
+use ffi::random_number;
+use spin::{Mutex, RwLock};
 use strum::Display;
+pub use x86_64;
 use x86_64::addr::{PhysAddr, VirtAddr};
+use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::alloc_api::DeviceIds;
@@ -355,6 +356,39 @@ pub mod alloc_api {
 
     #[repr(C)]
     #[derive(Debug)]
+    pub struct PnpVtable {
+        pub handlers: Vec<Option<PnpMinorCallback>>,
+    }
+
+    impl PnpVtable {
+        #[inline]
+        pub fn new() -> Self {
+            let n = core::mem::variant_count::<PnpMinorFunction>();
+            Self {
+                handlers: alloc::vec![None; n],
+            }
+        }
+
+        #[inline]
+        pub fn set(&mut self, m: PnpMinorFunction, cb: PnpMinorCallback) {
+            let i = m as usize;
+            if i < self.handlers.len() {
+                self.handlers[i] = Some(cb);
+            }
+        }
+
+        #[inline]
+        pub fn get(&self, m: PnpMinorFunction) -> Option<PnpMinorCallback> {
+            let i = m as usize;
+            if i < self.handlers.len() {
+                self.handlers[i]
+            } else {
+                None
+            }
+        }
+    }
+    #[repr(C)]
+    #[derive(Debug)]
     pub struct DeviceInit {
         pub dev_ext_size: usize,
 
@@ -362,9 +396,7 @@ pub mod alloc_api {
         pub io_write: Option<EvtIoWrite>,
         pub io_device_control: Option<EvtIoDeviceControl>,
 
-        pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
-        pub evt_bus_enumerate_devices: Option<EvtDeviceEnumerateDevices>,
-        pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>)>,
+        pub pnp_vtable: Option<PnpVtable>,
     }
 
     #[repr(C)]
@@ -423,6 +455,9 @@ pub mod alloc_api {
     pub type ClassAddCallback =
         extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
+    pub type PnpMinorCallback =
+        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+
     pub mod ffi {
         use super::*;
         #[link(name = "KRNL")]

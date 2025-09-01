@@ -6,10 +6,11 @@ use core::panic::PanicInfo;
 
 use alloc::sync::Arc;
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator,
-    alloc_api::{DeviceInit, ffi::driver_set_evt_device_add},
+    DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
+    alloc_api::{DeviceInit, PnpVtable, ffi::driver_set_evt_device_add},
     println,
 };
+use spin::RwLock;
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -31,11 +32,16 @@ pub extern "win64" fn bus_driver_device_add(
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init_ptr.dev_ext_size = 0;
-    dev_init_ptr.evt_device_prepare_hardware = Some(bus_driver_prepare_hardware);
+    let mut pnp_vtable = PnpVtable::new();
+    pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
+    dev_init_ptr.pnp_vtable = Some(pnp_vtable);
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_prepare_hardware(device: &Arc<DeviceObject>) -> DriverStatus {
+pub extern "win64" fn bus_driver_prepare_hardware(
+    device: &Arc<DeviceObject>,
+    _request: Arc<RwLock<Request>>,
+) -> DriverStatus {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     DriverStatus::Success
 }

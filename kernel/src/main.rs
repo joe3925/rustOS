@@ -14,7 +14,7 @@
 #![feature(let_chains)]
 #![feature(naked_functions)]
 #![feature(slice_as_array)]
-
+#![feature(variant_count)]
 extern crate alloc;
 
 pub mod gdt;

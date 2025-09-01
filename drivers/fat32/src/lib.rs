@@ -70,7 +70,6 @@ fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
     unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
 }
 
-// Root FS control device
 pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let code = {
         let r = req.read();
@@ -101,9 +100,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         io_read: None,
                         io_write: None,
                         io_device_control: Some(fs_volume_ioctl),
-                        evt_device_prepare_hardware: None,
-                        evt_bus_enumerate_devices: None,
-                        evt_pnp: None,
+                        pnp_vtable: None,
                     };
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
@@ -129,7 +126,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
     }
 }
 
-// Per-volume control device IOCTL handler (stub)
 pub extern "win64" fn fs_volume_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let mut r = req.write();
     match r.kind {
@@ -146,15 +142,12 @@ pub extern "win64" fn fs_volume_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
 
-    // Root control device + public link
     let mut init = DeviceInit {
         dev_ext_size: size_of::<CtrlDevExt>(),
         io_read: None,
         io_write: None,
         io_device_control: Some(fs_root_ioctl),
-        evt_device_prepare_hardware: None,
-        evt_bus_enumerate_devices: None,
-        evt_pnp: None,
+        pnp_vtable: None,
     };
 
     let ctrl_link = "\\FileSystems\\fat32".to_string();
@@ -162,7 +155,6 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl =
         unsafe { pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone()) };
 
-    // Register with MountMgr
     let reg = Arc::new(RwLock::new(Request::new(
         RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
         ctrl_link.clone().into_bytes().into_boxed_slice(),

@@ -6,10 +6,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{
-    mem,
-    sync::atomic::{AtomicBool, AtomicU32},
-};
+use core::{mem, sync::atomic::AtomicBool};
 use spin::{Mutex, RwLock};
 use strum::Display;
 
@@ -171,7 +168,42 @@ pub struct PnpRequest {
     pub ids_out: Vec<String>,
     pub blob_out: Vec<u8>,
 }
+pub type PnpMinorCallback =
+    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct PnpVtable {
+    pub handlers: Vec<Option<PnpMinorCallback>>,
+}
+
+impl PnpVtable {
+    #[inline]
+    pub fn new() -> Self {
+        let n = core::mem::variant_count::<PnpMinorFunction>();
+        Self {
+            handlers: alloc::vec![None; n],
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, m: PnpMinorFunction, cb: PnpMinorCallback) {
+        let i = m as usize;
+        if i < self.handlers.len() {
+            self.handlers[i] = Some(cb);
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, m: PnpMinorFunction) -> Option<PnpMinorCallback> {
+        let i = m as usize;
+        if i < self.handlers.len() {
+            self.handlers[i]
+        } else {
+            None
+        }
+    }
+}
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum RequestType {
@@ -247,9 +279,7 @@ pub struct DeviceInit {
     pub io_write: Option<EvtIoWrite>,
     pub io_device_control: Option<EvtIoDeviceControl>,
 
-    pub evt_device_prepare_hardware: Option<EvtDevicePrepareHardware>,
-    pub evt_bus_enumerate_devices: Option<EvtDeviceEnumerateDevices>,
-    pub evt_pnp: Option<extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>)>,
+    pub pnp_vtable: Option<PnpVtable>,
 }
 
 impl DeviceInit {
@@ -259,9 +289,7 @@ impl DeviceInit {
             io_read: None,
             io_write: None,
             io_device_control: None,
-            evt_pnp: None,
-            evt_device_prepare_hardware: None,
-            evt_bus_enumerate_devices: None,
+            pnp_vtable: None,
         }
     }
 }

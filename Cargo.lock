@@ -72,6 +72,7 @@ name = "base_driver"
 version = "0.1.0"
 dependencies = [
  "kernel_api",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -202,6 +203,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.9.0",
  "kernel_api",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -254,6 +256,15 @@ name = "fastrand"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
+
+[[package]]
+name = "fat32"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.0",
+ "kernel_api",
+ "spin 0.10.0",
+]
 
 [[package]]
 name = "fatfs"
@@ -344,6 +355,7 @@ name = "ide"
 version = "0.1.0"
 dependencies = [
  "kernel_api",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -471,6 +483,7 @@ name = "partmgr"
 version = "0.1.0"
 dependencies = [
  "kernel_api",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -807,6 +820,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.9.0",
  "kernel_api",
+ "spin 0.10.0",
 ]
 
 [[package]]

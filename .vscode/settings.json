@@ -122,6 +122,7 @@
         "usermode",
         "vhdx",
         "Virt",
+        "vtable",
         "wrmsr",
         "xoshiro",
         "Xoshiro"

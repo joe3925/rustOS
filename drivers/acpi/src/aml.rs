@@ -2,32 +2,28 @@ use crate::alloc::format;
 use crate::alloc::vec;
 use crate::map_aml;
 use crate::pdo::AcpiPdoExt;
-use crate::pdo::acpi_pdo_pnp_dispatch;
 use alloc::{
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
-use aml::Handler;
-use aml::resource::AddressSpaceDescriptor;
+use aml::resource::{AddressSpaceDescriptor, Resource as AmlResource, Resource};
 use aml::value::Args;
-use kernel_api::acpi::mcfg::Mcfg;
-use kernel_api::alloc_api::ffi::get_acpi_tables;
-
-use crate::aml::acpi::address::AddressSpace as AmlAddressSpace;
-use aml::resource::{Resource as AmlResource, Resource};
-use aml::{AmlContext, AmlName, AmlValue};
+use aml::{AmlContext, AmlName, AmlValue, Handler};
 use core::ptr::{read_volatile, write_volatile};
-use kernel_api::ResourceKind;
+use kernel_api::acpi::mcfg::Mcfg;
+use kernel_api::alloc_api::PnpVtable;
+use kernel_api::alloc_api::ffi::get_acpi_tables;
 use kernel_api::{
-    DevNode, DeviceObject, acpi, ffi, println,
+    DevNode, DeviceObject, PnpMinorFunction, QueryIdType, ResourceKind, acpi, ffi, println,
     x86_64::{PhysAddr, VirtAddr, instructions::port::Port},
 };
-use spin::Mutex;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
+
 pub const PAGE_SIZE: usize = 4096;
 
 pub struct KernelAmlHandler;
+
 #[repr(C)]
 pub struct McfgSeg {
     pub base: u64,
@@ -35,6 +31,7 @@ pub struct McfgSeg {
     pub sb: u8,
     pub eb: u8,
 }
+
 #[inline]
 fn round_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
@@ -330,7 +327,6 @@ pub fn create_pnp_bus_from_acpi(
 
     let mut hardware_ids = alloc::vec::Vec::new();
     hardware_ids.push(hid.clone());
-    hardware_ids.push(alloc::format!("ACPI\\{}", hid));
 
     for cid in cids.iter_mut() {
         *cid = cid.to_ascii_uppercase();
@@ -354,14 +350,19 @@ pub fn create_pnp_bus_from_acpi(
     } else {
         dev_name.as_string()
     };
+
+    // Build PnP vtable for the ACPI PDO
+    let mut vt = PnpVtable::new();
+    vt.set(PnpMinorFunction::QueryResources, acpi_pdo_query_resources);
+    vt.set(PnpMinorFunction::QueryId, acpi_pdo_query_id);
+    vt.set(PnpMinorFunction::StartDevice, acpi_pdo_start);
+
     let init = kernel_api::alloc_api::DeviceInit {
         dev_ext_size: core::mem::size_of::<AcpiPdoExt>(),
         io_read: None,
         io_write: None,
         io_device_control: None,
-        evt_device_prepare_hardware: None,
-        evt_bus_enumerate_devices: None,
-        evt_pnp: Some(acpi_pdo_pnp_dispatch),
+        pnp_vtable: Some(vt),
     };
 
     let (_dn, pdo) = unsafe {
@@ -374,6 +375,7 @@ pub fn create_pnp_bus_from_acpi(
             init,
         )
     };
+
     let seg = read_int_method(&mut ctx, &dev_name, "_SEG").unwrap_or(0) as u16;
     let bbn = read_int_method(&mut ctx, &dev_name, "_BBN").unwrap_or(0) as u8;
     let (sb, eb) = bus_range_from_crs(&mut ctx, &dev_name).unwrap_or((bbn, 0xFF));
@@ -427,6 +429,7 @@ pub fn pnp_id_from_u32(id: u32) -> String {
     }
     s
 }
+
 #[inline]
 fn le32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -453,6 +456,7 @@ fn ser_irq(vector: u32, level: bool, sharable: bool) -> [u8; 12] {
     buf[8..12].copy_from_slice(&(sharable as u32).to_le_bytes());
     buf
 }
+
 #[inline]
 fn read_int_method(ctx: &mut AmlContext, dev: &AmlName, suffix: &str) -> Option<u64> {
     let p = AmlName::from_str(&(dev.as_string() + "." + suffix)).ok()?;
@@ -475,6 +479,7 @@ fn append_ecam(out: &mut Vec<u8>, base: u64, seg: u16, sb: u8, eb: u8) {
     out.push(sb);
     out.push(eb);
 }
+
 fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
     use aml::value::Args;
     let crs = AmlName::from_str(&(dev.as_string() + "._CRS")).ok()?;
@@ -756,4 +761,104 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
     }
 
     Some(out)
+}
+
+/* --------------------------- PnP minor callbacks --------------------------- */
+extern "win64" fn acpi_pdo_query_resources(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<kernel_api::Request>>,
+) -> kernel_api::DriverStatus {
+    let pext: &mut AcpiPdoExt = unsafe { &mut *((&*dev.dev_ext).as_ptr() as *mut AcpiPdoExt) };
+
+    let ctx_lock = match unsafe { pext.ctx.as_ref() } {
+        Some(r) => r,
+        None => {
+            let mut w = req.write();
+            w.status = kernel_api::DriverStatus::NoSuchDevice;
+            return kernel_api::DriverStatus::NoSuchDevice;
+        }
+    };
+
+    let mut guard = ctx_lock.write();
+    let mut blob = build_query_resources_blob(&mut *guard, &pext.acpi_path).unwrap_or_default();
+    drop(guard);
+
+    if !pext.ecam.is_empty() {
+        append_ecam_list(&mut blob, &pext.ecam);
+    }
+
+    let mut w = req.write();
+    if let Some(p) = w.pnp.as_mut() {
+        p.blob_out = blob;
+    }
+    w.status = kernel_api::DriverStatus::Success;
+    kernel_api::DriverStatus::Success
+}
+
+extern "win64" fn acpi_pdo_query_id(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<kernel_api::Request>>,
+) -> kernel_api::DriverStatus {
+    let pext: &mut AcpiPdoExt = unsafe { &mut *((&*dev.dev_ext).as_ptr() as *mut AcpiPdoExt) };
+
+    let ty = { req.read().pnp.as_ref().unwrap().id_type };
+
+    let ctx_lock = match unsafe { pext.ctx.as_ref() } {
+        Some(r) => r,
+        None => {
+            let mut w = req.write();
+            w.status = kernel_api::DriverStatus::NoSuchDevice;
+            return kernel_api::DriverStatus::NoSuchDevice;
+        }
+    };
+
+    let mut guard = ctx_lock.write();
+    let (hid_opt, mut cids) = read_ids(&mut *guard, &pext.acpi_path);
+    drop(guard);
+
+    let mut w = req.write();
+    let p = w.pnp.as_mut().unwrap();
+
+    match ty {
+        QueryIdType::HardwareIds => {
+            if let Some(h) = hid_opt {
+                p.ids_out.push(h);
+            }
+        }
+        QueryIdType::CompatibleIds => {
+            p.ids_out.append(&mut cids);
+        }
+        QueryIdType::DeviceId => {
+            if let Some(h) = hid_opt {
+                p.ids_out.push(h);
+            } else {
+                w.status = kernel_api::DriverStatus::NoSuchDevice;
+                return kernel_api::DriverStatus::NoSuchDevice;
+            }
+        }
+        QueryIdType::InstanceId => {
+            if let Some(dn) = dev.dev_node.upgrade() {
+                p.ids_out.push(dn.instance_path.clone());
+            } else {
+                w.status = kernel_api::DriverStatus::NoSuchDevice;
+                return kernel_api::DriverStatus::NoSuchDevice;
+            }
+        }
+    }
+
+    w.status = kernel_api::DriverStatus::Success;
+    kernel_api::DriverStatus::Success
+}
+
+extern "win64" fn acpi_pdo_start(
+    _dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<kernel_api::Request>>,
+) -> kernel_api::DriverStatus {
+    let mut w = req.write();
+    if w.status == kernel_api::DriverStatus::Pending {
+        w.status = kernel_api::DriverStatus::Success;
+    } else {
+        w.status = kernel_api::DriverStatus::Success;
+    }
+    kernel_api::DriverStatus::Success
 }
