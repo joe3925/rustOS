@@ -34,6 +34,7 @@ pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
 pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
+pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
 
 pub const TIMER_FREQ: u64 = 300;
 
@@ -141,19 +142,7 @@ pub fn wait_using_pit_50ms() {
     }
 }
 
-#[inline(never)]
-pub fn send_eoi(irq: u8) {
-    unsafe {
-        if let Some(apic) = APIC.lock().as_mut() {
-            apic.end_interrupt();
-        } else {
-            PICS.force_unlock();
-            PICS.lock().notify_end_of_interrupt(irq);
-        }
-    }
-}
 #[derive(Debug, Clone, Copy)]
-
 pub enum ApicErrors {
     NotAvailable,
     NoCPUID,
@@ -339,6 +328,7 @@ impl ApicImpl {
             if first_time {
                 apic.ioapic.init_keyboard();
             }
+            LAPIC_BASE_VA.store(apic.lapic.base_addr.as_u64(), Ordering::Release);
             APIC.lock().replace(apic);
             USE_APIC.store(true, Ordering::SeqCst);
         }
@@ -537,4 +527,22 @@ pub enum APICOffset {
 pub enum IpiKind {
     Init,
     Startup { vector_phys_addr: PhysAddr },
+}
+#[inline(always)]
+pub fn send_eoi(vector: u8) {
+    if USE_APIC.load(Ordering::Relaxed) {
+        let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
+        if base != 0 {
+            unsafe {
+                ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
+            }
+            return;
+        }
+    }
+    unsafe {
+        if vector >= PIC_1_OFFSET + 8 {
+            Port::new(0xA0u16).write(0x20u8);
+        }
+        Port::new(0x20u16).write(0x20u8);
+    }
 }

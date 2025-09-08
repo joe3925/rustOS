@@ -19,18 +19,15 @@ const STATE_BYTES: usize = 15 * 8;
 
 extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     unsafe {
-        if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
-            send_eoi(InterruptIndex::Timer.as_u8());
-            return;
-        }
-
         let (mut scheduler, timer_time) = match (SCHEDULER.try_lock(), TIMER_TIME.try_lock()) {
             (Some(s), Some(t)) => (s, t),
             _ => {
-                send_eoi(InterruptIndex::Timer.as_u8());
                 return;
             }
         };
+        if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+            return;
+        }
 
         let stopwatch = Stopwatch::start();
         let cpu_id = get_current_logical_id();
@@ -69,37 +66,40 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
             .unwrap()
             .fetch_add(stopwatch.elapsed_millis() as usize, Ordering::SeqCst);
 
-        send_eoi(InterruptIndex::Timer.as_u8());
-
         (*ctx_ptr).restore(state);
     }
 }
+#[no_mangle]
+extern "C" fn timer_eoi() {
+    send_eoi(InterruptIndex::Timer.as_u8());
+}
+// TODO: send eoi in assembly
 #[unsafe(naked)]
 pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
-    unsafe {
-        naked_asm!(
-            "cli",
-            /* save GPRs … */                          /* as you already had */
-            "push r15","push r14","push r13","push r12",
-            "push r11","push r10","push r9","push r8",
-            "push rdi","push rsi","push rbp","push rbx",
-            "push rdx","push rcx","push rax",
+    naked_asm!(
+        "cli",
+        "push r15","push r14","push r13","push r12",
+        "push r11","push r10","push r9","push r8",
+        "push rdi","push rsi","push rbp","push rbx",
+        "push rdx","push rcx","push rax",
 
-            /* prepare arguments */
-            "mov  rdi, rsp",        // &State
-            "cld",                  // DF = 0
-            "sub  rsp, 8",          // align stack
-            "call {handler}",
-            "add  rsp, 8",
+        "mov  rdi, rsp",
+        "cld",
+        "sub  rsp, 8",
+        "call {handler}",
+        "add  rsp, 8",
 
-            /* restore GPRs … */
-            "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-            "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-            "pop  r9","pop  r10","pop  r11","pop  r12",
-            "pop  r13","pop  r14","pop  r15",
-            "sti",
-            "iretq",
-            handler = sym timer_interrupt_handler_c,
-        );
-    }
+        "sub  rsp, 8",
+        "call {eoi}",
+        "add  rsp, 8",
+
+        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
+        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
+        "pop  r9","pop  r10","pop  r11","pop  r12",
+        "pop  r13","pop  r14","pop  r15",
+        "sti",
+        "iretq",
+        handler = sym timer_interrupt_handler_c,
+        eoi     = sym timer_eoi,
+    );
 }
