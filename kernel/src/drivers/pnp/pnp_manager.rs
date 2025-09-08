@@ -1273,7 +1273,6 @@ impl PnpManager {
         dev.dispatch_scheduled.store(false, Ordering::Release);
         false
     }
-    // replace the whole function with this version
     extern "win64" fn pnp_minor_dispatch(
         device: &Arc<DeviceObject>,
         request: Arc<RwLock<Request>>,

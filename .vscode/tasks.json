@@ -4,7 +4,7 @@
         {
             "label": "dbg build",
             "type": "shell",
-            "command": "Set-Location 'C:\\Users\\Boden\\Documents\\rustOS\\drivers'; .\\build_drivers; if (-not $?) { exit 1 }; Set-Location 'C:\\Users\\Boden\\Documents\\rustOS\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "command": "Set-Location '${workspaceFolder}\\drivers'; .\\build_drivers; if (-not $?) { exit 1 }; Set-Location '${workspaceFolder}\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "problemMatcher": []
         },
         {
