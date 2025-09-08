@@ -215,6 +215,72 @@ pub enum RequestType {
 
     Dummy,
 }
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub enum IoType {
+    Read(EvtIoRead),
+    Write(EvtIoWrite),
+    DeviceControl(EvtIoDeviceControl),
+}
+impl IoType {
+    #[inline]
+    pub fn slot(&self) -> usize {
+        match self {
+            IoType::Read(_) => 0,
+            IoType::Write(_) => 1,
+            IoType::DeviceControl(_) => 2,
+        }
+    }
+    #[inline]
+    pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+        match *self {
+            IoType::Read(h) | IoType::Write(h) => {
+                let len = req.read().data.len();
+                h(dev, req, len);
+            }
+            IoType::DeviceControl(h) => h(dev, req),
+        }
+    }
+
+    #[inline]
+    pub fn slot_for_request(r: &RequestType) -> Option<usize> {
+        match r {
+            RequestType::Read { .. } => Some(0),
+            RequestType::Write { .. } => Some(1),
+            RequestType::DeviceControl(_) => Some(2),
+            _ => None,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct IoVtable {
+    pub handlers: Vec<Option<IoType>>,
+}
+
+impl IoVtable {
+    #[inline]
+    pub fn new() -> Self {
+        let n = core::mem::variant_count::<IoType>();
+        Self {
+            handlers: alloc::vec![None; n],
+        }
+    }
+
+    #[inline]
+    pub fn set(&mut self, cb: IoType) {
+        let i = cb.slot();
+        if i < self.handlers.len() {
+            self.handlers[i] = Some(cb);
+        }
+    }
+
+    #[inline]
+    pub fn get_for(&self, r: &RequestType) -> Option<IoType> {
+        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).copied().flatten())
+    }
+}
 pub struct ClassListener {
     pub class: String,
     pub dev: Arc<DeviceObject>,
@@ -274,11 +340,7 @@ impl Request {
 #[derive(Debug)]
 pub struct DeviceInit {
     pub dev_ext_size: usize,
-
-    pub io_read: Option<EvtIoRead>,
-    pub io_write: Option<EvtIoWrite>,
-    pub io_device_control: Option<EvtIoDeviceControl>,
-
+    pub io_vtable: IoVtable,
     pub pnp_vtable: Option<PnpVtable>,
 }
 
@@ -286,9 +348,7 @@ impl DeviceInit {
     pub fn new() -> Self {
         Self {
             dev_ext_size: 0,
-            io_read: None,
-            io_write: None,
-            io_device_control: None,
+            io_vtable: IoVtable::new(),
             pnp_vtable: None,
         }
     }

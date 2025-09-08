@@ -10,7 +10,7 @@ use spin::RwLock;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
     alloc_api::{
-        DeviceInit,
+        DeviceInit, IoType,
         ffi::{driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower},
     },
     println,
@@ -101,10 +101,10 @@ pub extern "win64" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
+    dev_init.io_vtable.set(IoType::Read(disk_read));
+    dev_init.io_vtable.set(IoType::Write(disk_write));
+    dev_init.io_vtable.set(IoType::DeviceControl(disk_ioctl));
     dev_init.dev_ext_size = size_of::<DiskExt>();
-    dev_init.io_read = Some(disk_read);
-    dev_init.io_write = Some(disk_write);
-    dev_init.io_device_control = Some(disk_ioctl);
     DriverStatus::Success
 }
 

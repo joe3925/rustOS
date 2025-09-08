@@ -15,7 +15,7 @@ use spin::RwLock;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, IoTarget, KernelAllocator, Request, RequestType,
     alloc_api::{
-        DeviceInit,
+        DeviceInit, IoType, IoVtable,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_wait_for_request,
@@ -95,11 +95,15 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             match Fat32::mount(&id.volume_fdo) {
                 Ok(fs) => {
+                    println!(
+                        "Fat32 is mounted for {}",
+                        id.volume_fdo.target_device.dev_node.upgrade().unwrap().name
+                    );
+                    let mut io_vtable = IoVtable::new();
+                    io_vtable.set(IoType::DeviceControl(fs_volume_ioctl));
                     let mut init = DeviceInit {
                         dev_ext_size: size_of::<VolCtrlDevExt>(),
-                        io_read: None,
-                        io_write: None,
-                        io_device_control: Some(fs_volume_ioctl),
+                        io_vtable,
                         pnp_vtable: None,
                     };
 
@@ -141,12 +145,11 @@ pub extern "win64" fn fs_volume_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
-
+    let mut io_vtable = IoVtable::new();
+    io_vtable.set(IoType::DeviceControl(fs_root_ioctl));
     let mut init = DeviceInit {
         dev_ext_size: size_of::<CtrlDevExt>(),
-        io_read: None,
-        io_write: None,
-        io_device_control: Some(fs_root_ioctl),
+        io_vtable,
         pnp_vtable: None,
     };
 

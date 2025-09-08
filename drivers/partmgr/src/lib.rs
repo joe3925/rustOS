@@ -6,6 +6,7 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_api::alloc_api::{IoType, IoVtable};
 use spin::RwLock;
 
 use kernel_api::alloc_api::ffi::{
@@ -45,9 +46,6 @@ pub extern "win64" fn partmgr_device_add(
     init: &mut DeviceInit,
 ) -> DriverStatus {
     init.dev_ext_size = core::mem::size_of::<PartMgrExt>();
-    init.io_read = None;
-    init.io_write = None;
-    init.io_device_control = None;
 
     // PnP vtable: handle BusRelations enumeration here.
     let mut vt = PnpVtable::new();
@@ -387,12 +385,12 @@ extern "win64" fn partmgr_pnp_query_devrels(
             {
                 continue;
             }
-
+            let mut io_vtable = IoVtable::new();
+            io_vtable.set(IoType::Read(partition_pdo_read));
+            io_vtable.set(IoType::Write(partition_pdo_write));
             let mut child_init = DeviceInit {
                 dev_ext_size: core::mem::size_of::<PartDevExt>(),
-                io_read: Some(partition_pdo_read),
-                io_write: Some(partition_pdo_write),
-                io_device_control: None,
+                io_vtable,
                 pnp_vtable: None,
             };
             let mut vt = PnpVtable::new();

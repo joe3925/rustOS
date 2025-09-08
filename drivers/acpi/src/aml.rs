@@ -12,6 +12,7 @@ use aml::value::Args;
 use aml::{AmlContext, AmlName, AmlValue, Handler};
 use core::ptr::{read_volatile, write_volatile};
 use kernel_api::acpi::mcfg::Mcfg;
+use kernel_api::alloc_api::IoVtable;
 use kernel_api::alloc_api::PnpVtable;
 use kernel_api::alloc_api::ffi::get_acpi_tables;
 use kernel_api::{
@@ -359,10 +360,8 @@ pub fn create_pnp_bus_from_acpi(
 
     let init = kernel_api::alloc_api::DeviceInit {
         dev_ext_size: core::mem::size_of::<AcpiPdoExt>(),
-        io_read: None,
-        io_write: None,
-        io_device_control: None,
         pnp_vtable: Some(vt),
+        io_vtable: IoVtable::new(),
     };
 
     let (_dn, pdo) = unsafe {

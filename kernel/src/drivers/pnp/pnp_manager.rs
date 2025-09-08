@@ -1363,52 +1363,20 @@ impl PnpManager {
 
     #[inline]
     fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
-        let status_after = {
-            let kind = { req_arc.read().kind };
-            match kind {
-                RequestType::Pnp => {
-                    Self::pnp_minor_dispatch(dev, req_arc.clone());
-                    {
-                        req_arc.read().status
-                    }
-                }
-                RequestType::Read { .. } => {
-                    if let Some(h) = dev.dev_init.io_read {
-                        let len = { req_arc.read().data.len() };
-                        h(dev, req_arc.clone(), len);
-                    } else {
-                        req_arc.write().status = DriverStatus::Pending;
-                    }
-                    {
-                        req_arc.read().status
-                    }
-                }
-                RequestType::Write { .. } => {
-                    if let Some(h) = dev.dev_init.io_write {
-                        let len = { req_arc.read().data.len() };
-                        h(dev, req_arc.clone(), len);
-                    } else {
-                        req_arc.write().status = DriverStatus::Pending;
-                    }
-                    {
-                        req_arc.read().status
-                    }
-                }
-                RequestType::DeviceControl(_) => {
-                    if let Some(h) = dev.dev_init.io_device_control {
-                        h(dev, req_arc.clone());
-                    } else {
-                        req_arc.write().status = DriverStatus::Pending;
-                    }
-                    {
-                        req_arc.read().status
-                    }
-                }
-                RequestType::Dummy => {
-                    return;
-                }
-            }
-        };
+        let kind = { req_arc.read().kind };
+        if matches!(kind, RequestType::Dummy) {
+            return;
+        }
+
+        if matches!(kind, RequestType::Pnp) {
+            Self::pnp_minor_dispatch(dev, req_arc.clone());
+        } else if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
+            h.invoke(dev, req_arc.clone());
+        } else {
+            req_arc.write().status = DriverStatus::Pending;
+        }
+
+        let status_after = { req_arc.read().status };
 
         if status_after == DriverStatus::Waiting {
             let key = {
@@ -1440,13 +1408,11 @@ impl PnpManager {
             return;
         }
 
-        {
-            let mut r = take_req(&req_arc);
-            if !r.completed {
-                self.complete_request(&mut r);
-            }
-            put_req(&req_arc, r);
+        let mut r = take_req(&req_arc);
+        if !r.completed {
+            self.complete_request(&mut r);
         }
+        put_req(&req_arc, r);
     }
 
     pub fn get_device_target(&self, instance_path: &str) -> Option<IoTarget> {

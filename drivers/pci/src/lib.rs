@@ -22,7 +22,7 @@ use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
     RequestType,
     alloc_api::{
-        DeviceIds, DeviceInit, PnpVtable,
+        DeviceIds, DeviceInit, IoVtable, PnpVtable,
         ffi::{
             driver_set_evt_device_add, pnp_complete_request,
             pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
@@ -69,8 +69,6 @@ pub extern "win64" fn bus_driver_device_add(
     DriverStatus::Success
 }
 
-/* ---------------- PCI BUS: PnP minor callbacks ---------------- */
-
 extern "win64" fn pci_bus_pnp_start(
     device: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -91,7 +89,7 @@ extern "win64" fn pci_bus_pnp_start(
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
             req.write().status = qst;
-            return DriverStatus::Success; // manager will complete
+            return DriverStatus::Success;
         }
         let blob = {
             let g = child.read();
@@ -118,7 +116,7 @@ extern "win64" fn pci_bus_pnp_start(
         if r.status == DriverStatus::Pending {
             r.status = DriverStatus::Success;
         }
-        return DriverStatus::Success; // manager completes
+        return DriverStatus::Success;
     }
 
     req.write().status = DriverStatus::Pending;
@@ -201,10 +199,6 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
         compatible,
     };
 
-    let mut child_init: DeviceInit = unsafe { zeroed() };
-    child_init.dev_ext_size = core::mem::size_of::<PciPdoExt>();
-
-    // PDO PnP vtable: split per-minor
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::QueryId, pci_pdo_query_id);
     vt.set(PnpMinorFunction::QueryResources, pci_pdo_query_resources);
@@ -213,7 +207,12 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
         PnpMinorFunction::QueryDeviceRelations,
         pci_pdo_query_devrels,
     );
-    child_init.pnp_vtable = Some(vt);
+
+    let child_init: DeviceInit = DeviceInit {
+        dev_ext_size: core::mem::size_of::<PciPdoExt>(),
+        pnp_vtable: Some(vt),
+        io_vtable: IoVtable::new(),
+    };
 
     let name = name_for(p);
     let instance_path = instance_path_for(p);
@@ -234,8 +233,6 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
         ptr::write(ptr_ext, *p);
     }
 }
-
-/* ---------------- PCI PDO: per-minor callbacks ---------------- */
 
 extern "win64" fn pci_pdo_query_id(
     dev: &Arc<DeviceObject>,

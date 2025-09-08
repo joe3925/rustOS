@@ -14,7 +14,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::PnpVtable;
+use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable};
 use kernel_api::{PnpMinorFunction, QueryIdType};
 use spin::RwLock;
 
@@ -101,9 +101,6 @@ pub extern "win64" fn ide_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init.dev_ext_size = core::mem::size_of::<DevExt>();
-    dev_init.io_read = None;
-    dev_init.io_write = None;
-    dev_init.io_device_control = None;
 
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::StartDevice, ide_pnp_start);
@@ -304,12 +301,11 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         hardware,
         compatible,
     };
-
+    let mut io_vtable = IoVtable::new();
+    io_vtable.set(IoType::DeviceControl(ide_pdo_internal_ioctl));
     let mut child_init = DeviceInit {
         dev_ext_size: size_of::<ChildExt>(),
-        io_read: None,
-        io_write: None,
-        io_device_control: Some(ide_pdo_internal_ioctl),
+        io_vtable,
         pnp_vtable: None,
     };
     let mut pvt = PnpVtable::new();

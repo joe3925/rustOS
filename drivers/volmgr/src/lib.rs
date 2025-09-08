@@ -8,8 +8,8 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::PnpVtable;
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
+use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable};
 use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
 use spin::RwLock;
 
@@ -93,8 +93,6 @@ pub extern "win64" fn vol_device_add(
     );
 
     dev_init.dev_ext_size = size_of::<VolExt>();
-    dev_init.io_read = None;
-    dev_init.io_write = None;
     dev_init.pnp_vtable = Some(pnp_vtable);
     DriverStatus::Success
 }
@@ -142,10 +140,8 @@ extern "win64" fn vol_prepare_hardware(
     let ctx = Arc::into_raw(dev.clone()) as usize;
     req.set_completion(vol_queryres_complete, ctx);
 
-    // Forward as Arc<RwLock<Request>> under the new design.
     let st = unsafe { pnp_forward_request_to_next_lower(dev, Arc::new(RwLock::new(req))) };
     if st == DriverStatus::NoSuchDevice {
-        // Nothing below; treat as success for prepare.
         return DriverStatus::Success;
     }
     DriverStatus::Success
@@ -199,12 +195,12 @@ pub extern "win64" fn vol_enumerate_devices(
         hardware: vec!["STOR\\Volume".into(), "STOR\\Volume\\GPT".into()],
         compatible: vec!["STOR\\Volume".into()],
     };
-
-    let mut init = DeviceInit {
+    let mut io_table = IoVtable::new();
+    io_table.set(IoType::Read(vol_pdo_read));
+    io_table.set(IoType::Write(vol_pdo_write));
+    let init = DeviceInit {
         dev_ext_size: size_of::<VolPdoExt>(),
-        io_read: Some(vol_pdo_read),
-        io_write: Some(vol_pdo_write),
-        io_device_control: None,
+        io_vtable: io_table,
         pnp_vtable: None,
     };
 
