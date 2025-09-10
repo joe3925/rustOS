@@ -15,7 +15,7 @@ use spin::RwLock;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, IoTarget, KernelAllocator, Request, RequestType,
     alloc_api::{
-        DeviceInit, IoType, IoVtable,
+        DeviceInit, IoType, IoVtable, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_wait_for_request,
@@ -100,7 +100,11 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         id.volume_fdo.target_device.dev_node.upgrade().unwrap().name
                     );
                     let mut io_vtable = IoVtable::new();
-                    io_vtable.set(IoType::DeviceControl(fs_volume_ioctl));
+                    io_vtable.set(
+                        IoType::DeviceControl(fs_volume_ioctl),
+                        Synchronization::Sync,
+                        0,
+                    );
                     let mut init = DeviceInit {
                         dev_ext_size: size_of::<VolCtrlDevExt>(),
                         io_vtable,
@@ -146,7 +150,11 @@ pub extern "win64" fn fs_volume_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(IoType::DeviceControl(fs_root_ioctl));
+    io_vtable.set(
+        IoType::DeviceControl(fs_root_ioctl),
+        Synchronization::Sync,
+        0,
+    );
     let mut init = DeviceInit {
         dev_ext_size: size_of::<CtrlDevExt>(),
         io_vtable,

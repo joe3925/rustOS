@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_api::alloc_api::{IoType, IoVtable};
+use kernel_api::alloc_api::{IoType, IoVtable, Synchronization};
 use spin::RwLock;
 
 use kernel_api::alloc_api::ffi::{
@@ -386,8 +386,8 @@ extern "win64" fn partmgr_pnp_query_devrels(
                 continue;
             }
             let mut io_vtable = IoVtable::new();
-            io_vtable.set(IoType::Read(partition_pdo_read));
-            io_vtable.set(IoType::Write(partition_pdo_write));
+            io_vtable.set(IoType::Read(partition_pdo_read), Synchronization::Sync, 0);
+            io_vtable.set(IoType::Write(partition_pdo_write), Synchronization::Sync, 0);
             let mut child_init = DeviceInit {
                 dev_ext_size: core::mem::size_of::<PartDevExt>(),
                 io_vtable,

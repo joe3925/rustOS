@@ -1371,7 +1371,7 @@ impl PnpManager {
         if matches!(kind, RequestType::Pnp) {
             Self::pnp_minor_dispatch(dev, req_arc.clone());
         } else if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-            h.invoke(dev, req_arc.clone());
+            h.handler.invoke(dev, req_arc.clone());
         } else {
             req_arc.write().status = DriverStatus::Pending;
         }

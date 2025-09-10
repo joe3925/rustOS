@@ -23,7 +23,7 @@ use kernel_api::{
     Data, DeviceObject, DriverObject, DriverStatus, FsIdentify, IoTarget, KernelAllocator, Request,
     RequestType,
     alloc_api::{
-        DeviceInit, EvtDevicePrepareHardware, IoType, IoVtable, PnpVtable,
+        DeviceInit, EvtDevicePrepareHardware, IoType, IoVtable, PnpVtable, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_device_symlink_top, pnp_forward_request_to_next_lower,
@@ -160,7 +160,11 @@ static NEXT_VOL_ID: AtomicU32 = AtomicU32::new(1);
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, volclass_device_add) };
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(IoType::DeviceControl(volclass_ctrl_ioctl));
+    io_vtable.set(
+        IoType::DeviceControl(volclass_ctrl_ioctl),
+        Synchronization::Sync,
+        0,
+    );
     let mut init = DeviceInit {
         dev_ext_size: size_of::<CtrlDevExt>(),
         pnp_vtable: None,
@@ -181,11 +185,17 @@ pub extern "win64" fn volclass_device_add(
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(kernel_api::PnpMinorFunction::StartDevice, volclass_start);
 
-    dev_init.io_vtable.set(IoType::Read(vol_pdo_read));
-    dev_init.io_vtable.set(IoType::Write(vol_pdo_write));
     dev_init
         .io_vtable
-        .set(IoType::DeviceControl(volclass_ioctl));
+        .set(IoType::Read(vol_pdo_read), Synchronization::Sync, 0);
+    dev_init
+        .io_vtable
+        .set(IoType::Write(vol_pdo_write), Synchronization::Sync, 0);
+    dev_init.io_vtable.set(
+        IoType::DeviceControl(volclass_ioctl),
+        Synchronization::Sync,
+        0,
+    );
 
     dev_init.dev_ext_size = size_of::<VolFdoExt>();
 

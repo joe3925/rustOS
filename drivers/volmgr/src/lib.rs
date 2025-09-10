@@ -9,7 +9,7 @@ use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable};
+use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
 use spin::RwLock;
 
@@ -196,8 +196,8 @@ pub extern "win64" fn vol_enumerate_devices(
         compatible: vec!["STOR\\Volume".into()],
     };
     let mut io_table = IoVtable::new();
-    io_table.set(IoType::Read(vol_pdo_read));
-    io_table.set(IoType::Write(vol_pdo_write));
+    io_table.set(IoType::Read(vol_pdo_read), Synchronization::Sync, 0);
+    io_table.set(IoType::Write(vol_pdo_write), Synchronization::Sync, 0);
     let init = DeviceInit {
         dev_ext_size: size_of::<VolPdoExt>(),
         io_vtable: io_table,

@@ -14,7 +14,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable};
+use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{PnpMinorFunction, QueryIdType};
 use spin::RwLock;
 
@@ -302,7 +302,11 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         compatible,
     };
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(IoType::DeviceControl(ide_pdo_internal_ioctl));
+    io_vtable.set(
+        IoType::DeviceControl(ide_pdo_internal_ioctl),
+        Synchronization::Sync,
+        0,
+    );
     let mut child_init = DeviceInit {
         dev_ext_size: size_of::<ChildExt>(),
         io_vtable,

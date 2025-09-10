@@ -416,9 +416,23 @@ pub mod alloc_api {
     }
 
     #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub enum Synchronization {
+        Sync,
+        Async,
+        FireAndForget,
+    }
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    pub struct IoHandler {
+        pub handler: IoType,
+        pub synchronization: Synchronization,
+        pub depth: usize,
+    }
+    #[repr(C)]
     #[derive(Debug)]
     pub struct IoVtable {
-        pub handlers: Vec<Option<IoType>>,
+        pub handlers: Vec<Option<IoHandler>>,
     }
 
     impl IoVtable {
@@ -431,15 +445,19 @@ pub mod alloc_api {
         }
 
         #[inline]
-        pub fn set(&mut self, cb: IoType) {
+        pub fn set(&mut self, cb: IoType, synchronization: Synchronization, depth: usize) {
             let i = cb.slot();
             if i < self.handlers.len() {
-                self.handlers[i] = Some(cb);
+                self.handlers[i] = Some(IoHandler {
+                    handler: cb,
+                    synchronization,
+                    depth,
+                });
             }
         }
 
         #[inline]
-        pub fn get_for(&self, r: &RequestType) -> Option<IoType> {
+        pub fn get_for(&self, r: &RequestType) -> Option<IoHandler> {
             IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).copied().flatten())
         }
     }
