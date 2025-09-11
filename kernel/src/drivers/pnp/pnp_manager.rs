@@ -1,9 +1,12 @@
 use crate::alloc::vec;
 use crate::drivers::pnp::driver_object::{
-    ClassAddCallback, ClassListener, PnpRequest, QueryIdType,
+    ClassAddCallback, ClassListener, PnpRequest, QueryIdType, Synchronization,
 };
+use crate::util::{generate_guid, random_number};
+use acpi::handler;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
+use alloc::format;
 use alloc::{
     collections::btree_map::BTreeMap,
     string::{String, ToString},
@@ -47,7 +50,7 @@ lazy_static! {
         spin::Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: spin::Mutex<VecDeque<Dpc>> = spin::Mutex::new(VecDeque::new());
 }
-
+pub const START_THREADS: usize = 3;
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub type DriverEntryFn = unsafe extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
@@ -1371,7 +1374,28 @@ impl PnpManager {
         if matches!(kind, RequestType::Pnp) {
             Self::pnp_minor_dispatch(dev, req_arc.clone());
         } else if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-            h.handler.invoke(dev, req_arc.clone());
+            let running_request = h.running_request.load(Ordering::SeqCst);
+            match h.synchronization {
+                Synchronization::Sync => {
+                    if running_request == 0 {
+                        h.running_request.fetch_add(1, Ordering::Release);
+                        h.handler.invoke(dev, req_arc.clone());
+                    } else {
+                        dev.queue.lock().push_back(req_arc);
+                        return;
+                    }
+                }
+                Synchronization::Async => {
+                    if running_request < h.depth as u64 {
+                        h.running_request.fetch_add(1, Ordering::Release);
+                        h.handler.invoke(dev, req_arc.clone());
+                    } else {
+                        dev.queue.lock().push_back(req_arc);
+                        return;
+                    }
+                }
+                Synchronization::FireAndForget => todo!(),
+            }
         } else {
             req_arc.write().status = DriverStatus::Pending;
         }
@@ -1481,7 +1505,12 @@ impl PnpManager {
     }
     pub fn init_io_dispatcher(&self) {
         if !DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
-            create_kernel_task(io_dispatcher_trampoline as usize, "io-dispatch".to_string());
+            for i in 0..START_THREADS {
+                create_kernel_task(
+                    io_dispatcher_trampoline as usize,
+                    format!("io-dispatch{:#X}", random_number()),
+                );
+            }
         }
     }
     pub fn invalidate_device_relations_for_node(

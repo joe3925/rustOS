@@ -6,7 +6,10 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::{mem, sync::atomic::AtomicBool};
+use core::{
+    mem,
+    sync::atomic::{AtomicBool, AtomicU64},
+};
 use spin::{Mutex, RwLock};
 use strum::Display;
 
@@ -260,11 +263,12 @@ pub enum Synchronization {
     FireAndForget,
 }
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IoHandler {
     pub handler: IoType,
     pub synchronization: Synchronization,
     pub depth: usize,
+    pub running_request: Arc<AtomicU64>,
 }
 #[repr(C)]
 #[derive(Debug)]
@@ -289,13 +293,14 @@ impl IoVtable {
                 handler: cb,
                 synchronization,
                 depth,
+                running_request: Arc::new(AtomicU64::new(0)),
             });
         }
     }
 
     #[inline]
     pub fn get_for(&self, r: &RequestType) -> Option<IoHandler> {
-        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).copied().flatten())
+        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).cloned().flatten())
     }
 }
 pub struct ClassListener {

@@ -340,6 +340,7 @@ pub type DpcFn = extern "win64" fn(usize);
 
 pub mod alloc_api {
     use core::ptr::NonNull;
+    use core::sync::atomic::AtomicU64;
 
     use super::*;
     use acpi::PhysicalMapping;
@@ -423,11 +424,12 @@ pub mod alloc_api {
         FireAndForget,
     }
     #[repr(C)]
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     pub struct IoHandler {
         pub handler: IoType,
         pub synchronization: Synchronization,
         pub depth: usize,
+        pub running_request: Arc<AtomicU64>,
     }
     #[repr(C)]
     #[derive(Debug)]
@@ -452,13 +454,14 @@ pub mod alloc_api {
                     handler: cb,
                     synchronization,
                     depth,
+                    running_request: Arc::new(AtomicU64::new(0)),
                 });
             }
         }
 
         #[inline]
         pub fn get_for(&self, r: &RequestType) -> Option<IoHandler> {
-            IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).copied().flatten())
+            IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).cloned().flatten())
         }
     }
     #[repr(C)]
