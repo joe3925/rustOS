@@ -8,7 +8,7 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
+use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
 use spin::RwLock;
@@ -281,9 +281,9 @@ pub extern "win64" fn vol_pdo_read(
         parent: parent.clone(),
     })) as usize;
     child.set_completion(bridge_complete, ctx);
-
-    parent.write().status = DriverStatus::Waiting;
-    unsafe { pnp_send_request(&*tgt, Arc::new(RwLock::new(child))) };
+    let req = Arc::new(RwLock::new(child));
+    unsafe { pnp_send_request(&*tgt, req.clone()) };
+    unsafe { pnp_wait_for_request(&req) };
 }
 
 pub extern "win64" fn vol_pdo_write(
@@ -319,6 +319,7 @@ pub extern "win64" fn vol_pdo_write(
     })) as usize;
     child.set_completion(bridge_complete, ctx);
 
-    parent.write().status = DriverStatus::Waiting;
-    unsafe { pnp_send_request(&*tgt, Arc::new(RwLock::new(child))) };
+    let req = Arc::new(RwLock::new(child));
+    unsafe { pnp_send_request(&*tgt, req.clone()) };
+    unsafe { pnp_wait_for_request(&req) };
 }

@@ -4,21 +4,23 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::mem;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_api::alloc_api::{IoType, IoVtable, Synchronization};
+use core::{mem, ptr};
 use spin::RwLock;
 
-use kernel_api::alloc_api::ffi::{
-    pnp_complete_request, pnp_forward_request_to_next_lower, pnp_get_device_target,
-    pnp_send_request, pnp_wait_for_request,
-};
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, PnpMinorFunction, Request, RequestType,
-    alloc_api::ffi::{driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init},
-    alloc_api::{DeviceIds, DeviceInit, PnpVtable},
+    DeviceObject, DriverObject, DriverStatus, GptHeader, GptPartitionEntry, IoTarget,
+    KernelAllocator, PnpMinorFunction, Request, RequestType,
+    alloc_api::{
+        DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
+        ffi::{
+            driver_set_evt_device_add, pnp_complete_request,
+            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
+            pnp_get_device_target, pnp_send_request, pnp_wait_for_request,
+        },
+    },
+    print, println,
 };
-use kernel_api::{GptHeader, GptPartitionEntry, KernelAllocator};
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -28,7 +30,6 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::println;
     println!("{}", info);
     loop {}
 }
@@ -36,8 +37,9 @@ fn panic(info: &PanicInfo) -> ! {
 mod msvc_shims;
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
+pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, partmgr_device_add) };
+    println!("partmgr: DriverEntry");
     DriverStatus::Success
 }
 
@@ -47,13 +49,12 @@ pub extern "win64" fn partmgr_device_add(
 ) -> DriverStatus {
     init.dev_ext_size = core::mem::size_of::<PartMgrExt>();
 
-    // PnP vtable: handle BusRelations enumeration here.
-    let mut vt = PnpVtable::new();
-    vt.set(
+    let mut pnp = PnpVtable::new();
+    pnp.set(
         PnpMinorFunction::QueryDeviceRelations,
         partmgr_pnp_query_devrels,
     );
-    init.pnp_vtable = Some(vt);
+    init.pnp_vtable = Some(pnp);
 
     DriverStatus::Success
 }
@@ -103,65 +104,34 @@ extern "win64" fn partition_pdo_query_resources(
     DriverStatus::Success
 }
 
-#[repr(C)]
-struct ChildCtxCopyback {
-    parent_req: *mut Request,
-}
-
-extern "win64" fn child_complete_copyback(child: &mut Request, ctx: usize) {
-    let boxed = unsafe { Box::from_raw(ctx as *mut ChildCtxCopyback) };
-    let parent = unsafe { &mut *boxed.parent_req };
-    parent.status = child.status;
-    if parent.status == DriverStatus::Success {
-        let n = core::cmp::min(parent.data.len(), child.data.len());
-        parent.data[..n].copy_from_slice(&child.data[..n]);
-    }
-    unsafe { pnp_complete_request(parent) };
-}
-
-fn send_down_async_copyback(
-    from: &Arc<DeviceObject>,
-    parent: &mut Request,
-    new_kind: RequestType,
-    buf: Box<[u8]>,
-) -> DriverStatus {
-    let parent_inst = match from
+fn parent_target_of(from: &Arc<DeviceObject>) -> Result<IoTarget, DriverStatus> {
+    let parent_inst = from
         .dev_node
         .upgrade()
         .and_then(|dn| dn.parent.read().as_ref().and_then(|w| w.upgrade()))
-    {
-        Some(p) => p.instance_path.clone(),
-        None => {
-            parent.status = DriverStatus::NoSuchDevice;
-            unsafe { pnp_complete_request(parent) };
-            return DriverStatus::Waiting;
-        }
-    };
+        .map(|p| p.instance_path.clone())
+        .ok_or(DriverStatus::NoSuchDevice)?;
 
-    let target = match unsafe { pnp_get_device_target(&parent_inst) } {
-        Some(t) => Arc::new(t),
-        None => {
-            parent.status = DriverStatus::NoSuchDevice;
-            unsafe { pnp_complete_request(parent) };
-            return DriverStatus::Waiting;
-        }
-    };
+    unsafe { pnp_get_device_target(&parent_inst) }.ok_or(DriverStatus::NoSuchDevice)
+}
 
-    let mut child = Request::new(new_kind, buf);
-    let ctx = Box::into_raw(Box::new(ChildCtxCopyback {
-        parent_req: parent as *mut _,
-    })) as usize;
-    child.set_completion(child_complete_copyback, ctx);
+fn send_child_sync(tgt: &IoTarget, mut req: Request) -> Result<Box<[u8]>, DriverStatus> {
+    let child = Arc::new(RwLock::new(req));
+    unsafe { pnp_send_request(tgt, child.clone()) };
+    unsafe { pnp_wait_for_request(&child) };
 
-    parent.status = DriverStatus::Waiting;
-    unsafe { pnp_send_request(&*target, Arc::new(RwLock::new(child))) };
-    DriverStatus::Waiting
+    let g = child.read();
+    if g.status == DriverStatus::Success {
+        Ok(g.data.clone())
+    } else {
+        Err(g.status)
+    }
 }
 
 pub extern "win64" fn partition_pdo_read(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
-    len: usize,
+    buf_len: usize,
 ) {
     let dx = ext_mut::<PartDevExt>(device);
 
@@ -177,35 +147,53 @@ pub extern "win64" fn partition_pdo_read(
         }
     };
 
-    if len != want || (off & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+    if buf_len != want || (off & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
     let part_bytes = ((dx.end_lba - dx.start_lba + 1) << 9) as u64;
-    if off as u64 + len as u64 > part_bytes {
+    if (off as u64) + (buf_len as u64) > part_bytes {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
     let phys_off = off + ((dx.start_lba as u64) << 9);
-    let buf = vec![0u8; len].into_boxed_slice();
 
-    let mut w = request.write();
-    let _ = send_down_async_copyback(
-        device,
-        &mut *w,
+    let tgt = match parent_target_of(device) {
+        Ok(t) => t,
+        Err(st) => {
+            request.write().status = st;
+            return;
+        }
+    };
+
+    let child_req = Request::new(
         RequestType::Read {
             offset: phys_off,
-            len,
+            len: buf_len,
         },
-        buf,
+        vec![0u8; buf_len].into_boxed_slice(),
     );
+
+    match send_child_sync(&tgt, child_req) {
+        Ok(data) => {
+            let mut w = request.write();
+            let n = core::cmp::min(w.data.len(), data.len());
+            if n != 0 {
+                w.data[..n].copy_from_slice(&data[..n]);
+            }
+            w.status = DriverStatus::Success;
+        }
+        Err(st) => {
+            request.write().status = st;
+        }
+    }
 }
 
 pub extern "win64" fn partition_pdo_write(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
-    len: usize,
+    buf_len: usize,
 ) {
     let dx = ext_mut::<PartDevExt>(device);
 
@@ -221,12 +209,12 @@ pub extern "win64" fn partition_pdo_write(
         }
     };
 
-    if len != want || (off & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+    if buf_len != want || (off & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
     let part_bytes = ((dx.end_lba - dx.start_lba + 1) << 9) as u64;
-    if off as u64 + len as u64 > part_bytes {
+    if (off as u64) + (buf_len as u64) > part_bytes {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
@@ -238,16 +226,30 @@ pub extern "win64" fn partition_pdo_write(
         mem::take(&mut w.data)
     };
 
-    let mut w = request.write();
-    let _ = send_down_async_copyback(
-        device,
-        &mut *w,
+    let tgt = match parent_target_of(device) {
+        Ok(t) => t,
+        Err(st) => {
+            request.write().status = st;
+            return;
+        }
+    };
+
+    let child_req = Request::new(
         RequestType::Write {
             offset: phys_off,
-            len,
+            len: buf_len,
         },
         moved,
     );
+
+    match send_child_sync(&tgt, child_req) {
+        Ok(_ignored) => {
+            request.write().status = DriverStatus::Success;
+        }
+        Err(st) => {
+            request.write().status = st;
+        }
+    }
 }
 
 #[inline]
@@ -302,9 +304,10 @@ extern "win64" fn partmgr_pnp_query_devrels(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
+    println!("partmgr: QueryDeviceRelations(BusRelations)");
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != kernel_api::DeviceRelationType::BusRelations {
-        request.write().status = DriverStatus::Pending; // manager will forward to next lower
+        request.write().status = DriverStatus::Pending;
         return DriverStatus::Pending;
     }
 
@@ -385,12 +388,14 @@ extern "win64" fn partmgr_pnp_query_devrels(
             {
                 continue;
             }
-            let mut io_vtable = IoVtable::new();
-            io_vtable.set(IoType::Read(partition_pdo_read), Synchronization::Sync, 0);
-            io_vtable.set(IoType::Write(partition_pdo_write), Synchronization::Sync, 0);
+
+            let mut io_vt = IoVtable::new();
+            io_vt.set(IoType::Read(partition_pdo_read), Synchronization::Sync, 0);
+            io_vt.set(IoType::Write(partition_pdo_write), Synchronization::Sync, 0);
+
             let mut child_init = DeviceInit {
                 dev_ext_size: core::mem::size_of::<PartDevExt>(),
-                io_vtable,
+                io_vtable: io_vt,
                 pnp_vtable: None,
             };
             let mut vt = PnpVtable::new();

@@ -20,7 +20,6 @@ use super::pnp_manager::{CompletionRoutine, DevNode, DriverRuntime};
 pub enum DriverStatus {
     Success = 0x0000_0000,
     Pending = 0x0000_0103,
-    Waiting = 0x0000_0104,
     NotImplemented = 0xC000_0002u32 as i32,
     InvalidParameter = 0xC000_000Du32 as i32,
     InsufficientResources = 0xC000_009Au32 as i32,

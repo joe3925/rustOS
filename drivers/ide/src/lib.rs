@@ -247,6 +247,7 @@ extern "win64" fn ide_on_query_resources_complete(child: &mut Request, ctx: usiz
 }
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
+    println!("enum bus");
     let dx: &mut DevExt =
         unsafe { &mut *((&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
     if dx.enumerated || !dx.present {

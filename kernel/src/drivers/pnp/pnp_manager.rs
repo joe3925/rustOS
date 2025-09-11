@@ -50,7 +50,7 @@ lazy_static! {
         spin::Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: spin::Mutex<VecDeque<Dpc>> = spin::Mutex::new(VecDeque::new());
 }
-pub const START_THREADS: usize = 3;
+pub const START_THREADS: usize = 1;
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 
 pub type DriverEntryFn = unsafe extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
@@ -301,7 +301,6 @@ pub struct PnpManager {
     hw: RwLock<Arc<HwIndex>>,
     drivers: RwLock<BTreeMap<String, Arc<DriverObject>>>,
     dev_root: Arc<DevNode>,
-    waiting_requests: Mutex<BTreeMap<usize, Arc<RwLock<Request>>>>,
     class_listeners: Mutex<BTreeMap<u64, ClassListener>>,
     next_listener_id: core::sync::atomic::AtomicU64,
 }
@@ -312,7 +311,6 @@ impl PnpManager {
             hw: RwLock::new(Arc::new(HwIndex::new())),
             drivers: RwLock::new(BTreeMap::new()),
             dev_root: DevNode::new_root(),
-            waiting_requests: Mutex::new(BTreeMap::new()),
             class_listeners: Mutex::new(BTreeMap::new()),
             next_listener_id: core::sync::atomic::AtomicU64::new(0),
         }
@@ -1089,7 +1087,7 @@ impl PnpManager {
             .cloned()
             .collect();
         for child_dn in children_to_start {
-            pnp_manager.bind_and_start(&child_dn);
+            pnp_manager.bind_and_start(&child_dn).expect("idk");
         }
     }
     fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
@@ -1310,22 +1308,18 @@ impl PnpManager {
                     pnp_manager.complete_request(&mut r);
                     put_req(&request, r);
                 }
-                DriverStatus::Waiting => {
-                    request.write().status = DriverStatus::Waiting;
-                }
                 DriverStatus::Pending => {
+                    request.write().status = DriverStatus::Pending;
                     let st = pnp_manager.send_request_to_next_lower(device, request.clone());
                     if st == DriverStatus::NoSuchDevice {
                         let mut r = take_req(&request);
                         r.status = match minor {
-                            PnpMinorFunction::StartDevice => DriverStatus::Success,
-                            PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
+                            PnpMinorFunction::StartDevice
+                            | PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
                             _ => DriverStatus::NotImplemented,
                         };
                         pnp_manager.complete_request(&mut r);
                         put_req(&request, r);
-                    } else {
-                        request.write().status = DriverStatus::Pending;
                     }
                 }
                 other => {
@@ -1363,7 +1357,6 @@ impl PnpManager {
             }
         }
     }
-
     #[inline]
     fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let kind = { req_arc.read().kind };
@@ -1373,52 +1366,57 @@ impl PnpManager {
 
         if matches!(kind, RequestType::Pnp) {
             Self::pnp_minor_dispatch(dev, req_arc.clone());
-        } else if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-            let running_request = h.running_request.load(Ordering::SeqCst);
+            return;
+        }
+
+        if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
             match h.synchronization {
-                Synchronization::Sync => {
-                    if running_request == 0 {
-                        h.running_request.fetch_add(1, Ordering::Release);
-                        h.handler.invoke(dev, req_arc.clone());
+                Synchronization::FireAndForget => {
+                    h.handler.invoke(dev, req_arc.clone());
+                }
+                Synchronization::Sync | Synchronization::Async => {
+                    let depth = if matches!(h.synchronization, Synchronization::Sync) {
+                        1u64
                     } else {
+                        h.depth as u64
+                    };
+
+                    let admit = h.running_request.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                        |cur| {
+                            if depth == 0 || cur < depth {
+                                Some(cur + 1)
+                            } else {
+                                None
+                            }
+                        },
+                    );
+
+                    if admit.is_err() {
                         dev.queue.lock().push_back(req_arc);
                         return;
                     }
+
+                    h.handler.invoke(dev, req_arc.clone());
+                    h.running_request.fetch_sub(1, Ordering::Release);
                 }
-                Synchronization::Async => {
-                    if running_request < h.depth as u64 || h.depth == 0 {
-                        h.running_request.fetch_add(1, Ordering::Release);
-                        h.handler.invoke(dev, req_arc.clone());
-                    } else {
-                        dev.queue.lock().push_back(req_arc);
-                        return;
-                    }
-                }
-                Synchronization::FireAndForget => todo!(),
             }
         } else {
             req_arc.write().status = DriverStatus::Pending;
         }
 
-        let status_after = { req_arc.read().status };
+        let st = { req_arc.read().status };
 
-        if status_after == DriverStatus::Waiting {
-            let key = {
-                let req = req_arc.read();
-                (&*req as *const Request) as usize
-            };
-            self.waiting_requests.lock().insert(key, req_arc);
-            return;
-        }
-
-        if status_after == DriverStatus::Pending {
-            let st = self.send_request_to_next_lower(dev, req_arc.clone());
-            if st == DriverStatus::NoSuchDevice {
+        if st == DriverStatus::Pending {
+            let fwd = self.send_request_to_next_lower(dev, req_arc.clone());
+            if fwd == DriverStatus::NoSuchDevice {
                 let mut r = take_req(&req_arc);
                 if let Some(pnp) = r.pnp.as_ref() {
                     r.status = match pnp.minor_function {
-                        PnpMinorFunction::StartDevice => DriverStatus::Success,
-                        PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
+                        PnpMinorFunction::StartDevice | PnpMinorFunction::QueryDeviceRelations => {
+                            DriverStatus::Success
+                        }
                         _ => DriverStatus::NotImplemented,
                     };
                 } else {
