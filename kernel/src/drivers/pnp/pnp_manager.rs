@@ -1386,7 +1386,7 @@ impl PnpManager {
                     }
                 }
                 Synchronization::Async => {
-                    if running_request < h.depth as u64 {
+                    if running_request < h.depth as u64 || h.depth == 0 {
                         h.running_request.fetch_add(1, Ordering::Release);
                         h.handler.invoke(dev, req_arc.clone());
                     } else {
