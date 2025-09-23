@@ -39,7 +39,6 @@ mod msvc_shims;
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, partmgr_device_add) };
-    println!("partmgr: DriverEntry");
     DriverStatus::Success
 }
 
@@ -73,8 +72,8 @@ fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
 struct PartDevExt {
     start_lba: u64,
     end_lba: u64,
-    gpt_header: Option<GptHeader>,
-    gpt_entry: Option<GptPartitionEntry>,
+    gpt_header_bytes: Option<[u8; 512]>,
+    gpt_entry_bytes: Option<[u8; 128]>,
 }
 
 extern "win64" fn partition_pdo_query_resources(
@@ -88,10 +87,8 @@ extern "win64" fn partition_pdo_query_resources(
     };
 
     let dx = ext_mut::<PartDevExt>(device);
-    match (&dx.gpt_header, &dx.gpt_entry) {
-        (Some(h), Some(e)) => {
-            let hb = unsafe { core::slice::from_raw_parts(h as *const _ as *const u8, 512) };
-            let eb = unsafe { core::slice::from_raw_parts(e as *const _ as *const u8, 128) };
+    match (&dx.gpt_header_bytes, &dx.gpt_entry_bytes) {
+        (Some(hb), Some(eb)) => {
             pnp.blob_out.clear();
             pnp.blob_out.extend_from_slice(hb);
             pnp.blob_out.extend_from_slice(eb);
@@ -304,7 +301,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    println!("partmgr: QueryDeviceRelations(BusRelations)");
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != kernel_api::DeviceRelationType::BusRelations {
         request.write().status = DriverStatus::Pending;
@@ -426,8 +422,8 @@ extern "win64" fn partmgr_pnp_query_devrels(
             let pext = ext_mut::<PartDevExt>(&pdo);
             pext.start_lba = e.first_lba;
             pext.end_lba = e.last_lba;
-            pext.gpt_header = Some(h);
-            pext.gpt_entry = Some(e);
+            pext.gpt_header_bytes = Some(hdr_bytes.as_ref().try_into().unwrap());
+            pext.gpt_entry_bytes = Some(ch.try_into().unwrap());
         }
     }
 

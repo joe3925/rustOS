@@ -13,7 +13,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, AtomicU8};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
 use spin::{Mutex, RwLock};
 use strum::Display;
@@ -46,7 +46,7 @@ pub struct DeviceObject {
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<spin::Mutex<Request>>>>,
 
-    pub dispatch_scheduled: AtomicBool,
+    pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
 }
 #[derive(Debug)]

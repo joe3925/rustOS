@@ -145,6 +145,13 @@ impl Task {
             self.id, self.context.rip, self.context.rsp
         );
     }
+    pub fn sleep(&mut self) {
+        self.is_sleeping = true;
+    }
+
+    pub fn wake(&mut self) {
+        self.is_sleeping = false;
+    }
 }
 
 //Idle task to prevent return

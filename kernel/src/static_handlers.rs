@@ -321,12 +321,12 @@ pub extern "win64" fn pnp_add_class_listener(
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
     loop {
-        if let Some(request) = (req.try_read()) {
-            if (request.completed) {
-                break;
+        if let Some(r) = req.try_read() {
+            if r.completed {
+                return;
             }
         }
-        PNP_MANAGER.run_once();
+        let _ = PNP_MANAGER.run_once();
         core::hint::spin_loop();
     }
 }

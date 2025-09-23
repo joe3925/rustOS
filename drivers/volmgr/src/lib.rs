@@ -6,13 +6,13 @@ extern crate alloc;
 use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
+use core::sync::atomic::Ordering::Acquire;
+use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
-use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
-use spin::RwLock;
-
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
     alloc_api::{
@@ -24,7 +24,8 @@ use kernel_api::{
     },
     println,
 };
-
+use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
+use spin::RwLock;
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 mod msvc_shims;
@@ -38,8 +39,8 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[repr(C)]
 struct VolExt {
-    have_gpt: bool,
-    have_entry: bool,
+    have_gpt: AtomicBool,
+    have_entry: AtomicBool,
     hdr: GptHeader,
     entry: GptPartitionEntry,
     enumerated: AtomicBool,
@@ -99,31 +100,36 @@ pub extern "win64" fn vol_device_add(
 
 extern "win64" fn vol_queryres_complete(child: &mut Request, ctx: usize) {
     let dev = unsafe { Arc::from_raw(ctx as *const DeviceObject) };
+    if child.status != DriverStatus::Success {
+        return;
+    }
 
-    if child.status == DriverStatus::Success {
-        let dx = ext_mut::<VolExt>(&dev);
-        let blob = &child.pnp.as_ref().unwrap().blob_out;
+    let dx = ext_mut::<VolExt>(&dev);
+    dx.have_gpt.store(false, Relaxed);
+    dx.have_entry.store(false, Relaxed);
 
-        dx.have_gpt = false;
-        dx.have_entry = false;
+    let blob = &child.pnp.as_ref().unwrap().blob_out;
 
-        if blob.len() == 512 {
-            let hdr: GptHeader = unsafe { core::ptr::read(blob.as_ptr() as *const _) };
-            dx.hdr = hdr;
-            dx.have_gpt = true;
-        } else if blob.len() == 512 + 128 {
-            let hdr: GptHeader = unsafe { core::ptr::read(blob.as_ptr() as *const _) };
-            let ent_off = 512;
-            let ent: GptPartitionEntry =
-                unsafe { core::ptr::read(blob.as_ptr().add(ent_off) as *const _) };
-            dx.hdr = hdr;
-            dx.entry = ent;
-            dx.have_gpt = true;
-            dx.have_entry = true;
-        }
+    if blob.len() == 512 {
+        let hdr: GptHeader =
+            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
+        dx.hdr = hdr;
+        dx.have_gpt.store(true, Release);
+        return;
+    }
+
+    if blob.len() == 512 + 128 {
+        let hdr: GptHeader =
+            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
+        let ent: GptPartitionEntry = unsafe {
+            core::ptr::read_unaligned(blob.as_ptr().add(512) as *const GptPartitionEntry)
+        };
+        dx.hdr = hdr;
+        dx.entry = ent;
+        dx.have_gpt.store(true, Release);
+        dx.have_entry.store(true, Release); // publish entry last
     }
 }
-
 extern "win64" fn vol_prepare_hardware(
     dev: &Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
@@ -137,23 +143,56 @@ extern "win64" fn vol_prepare_hardware(
         blob_out: Vec::new(),
     });
 
-    let ctx = Arc::into_raw(dev.clone()) as usize;
-    req.set_completion(vol_queryres_complete, ctx);
-
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, Arc::new(RwLock::new(req))) };
+    let req_lock = Arc::new(RwLock::new(req));
+    let st = unsafe { pnp_forward_request_to_next_lower(dev, req_lock.clone()) };
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
+
+    unsafe { pnp_wait_for_request(&req_lock) };
+
+    let g = req_lock.read();
+    let dx = ext_mut::<VolExt>(dev);
+
+    dx.have_gpt.store(false, Relaxed);
+    dx.have_entry.store(false, Relaxed);
+
+    if g.status != DriverStatus::Success {
+        dx.have_gpt.store(false, Release);
+        dx.have_entry.store(false, Release);
+        return DriverStatus::Success;
+    }
+
+    let blob = &g.pnp.as_ref().unwrap().blob_out;
+    if blob.len() >= 512 {
+        let hdr: GptHeader =
+            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
+        dx.hdr = hdr;
+
+        if blob.len() >= 512 + 128 {
+            let ent: GptPartitionEntry = unsafe {
+                core::ptr::read_unaligned(blob.as_ptr().add(512) as *const GptPartitionEntry)
+            };
+            dx.entry = ent;
+            dx.have_gpt.store(true, Relaxed);
+            dx.have_entry.store(true, Release);
+        } else {
+            dx.have_gpt.store(true, Release);
+        }
+    } else {
+        dx.have_gpt.store(false, Release);
+        dx.have_entry.store(false, Release);
+    }
+
     DriverStatus::Success
 }
-
 pub extern "win64" fn vol_enumerate_devices(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let dx = ext_mut::<VolExt>(device);
 
-    if !dx.have_entry {
+    if !dx.have_entry.load(Acquire) {
         request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
@@ -186,7 +225,6 @@ pub extern "win64" fn vol_enumerate_devices(
         return DriverStatus::Success;
     }
 
-    // Create a child PDO for the volume
     let part_guid_s = guid_to_string(&dx.entry.unique_partition_guid);
     let name = alloc::format!("Volume{}", &part_guid_s[..8]);
     let inst = alloc::format!("STOR\\VOLUME\\{}\\0000", part_guid_s);

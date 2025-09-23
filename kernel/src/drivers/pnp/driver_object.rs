@@ -8,7 +8,7 @@ use alloc::{
 };
 use core::{
     mem,
-    sync::atomic::{AtomicBool, AtomicU64},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
 use spin::{Mutex, RwLock};
 use strum::Display;
@@ -28,6 +28,11 @@ pub enum DriverStatus {
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
 }
+#[repr(C)]
+pub struct ReqJob {
+    pub(crate) dev: Arc<DeviceObject>,
+    pub(crate) req: Arc<RwLock<Request>>,
+}
 
 #[derive(Debug)]
 #[repr(C)]
@@ -39,7 +44,7 @@ pub struct DeviceObject {
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
 
-    pub dispatch_scheduled: AtomicBool,
+    pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
 }
 
@@ -52,7 +57,7 @@ impl DeviceObject {
             dev_ext,
             dev_init: DeviceInit::new(),
             queue: Mutex::new(VecDeque::new()),
-            dispatch_scheduled: AtomicBool::new(false),
+            dispatch_tickets: AtomicU32::new(0),
             dev_node: Weak::new(),
         })
     }

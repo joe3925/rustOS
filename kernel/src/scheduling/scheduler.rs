@@ -193,38 +193,31 @@ impl Scheduler {
         }
     }
 
-    /// Look up a task by name and return a handle.
     pub(crate) fn get_task_by_name(&self, name: &str) -> Option<TaskHandle> {
         self.tasks.iter().find(|h| h.read().name == name).cloned()
     }
     fn reap_task(&mut self) {
         let core_id = get_current_logical_id() as u16;
 
-        // Iterate from back to front so `remove(i)` is O(1) per removal.
         for i in (0..self.tasks.len()).rev() {
-            // First, read-lock just long enough to check the flags.
             let should_reap = {
                 let t = self.tasks[i].read();
                 t.terminated && t.executer_id == Some(core_id)
             };
 
             if should_reap {
-                // Clear per-core bookkeeping.
                 self.current_task.set(core_id as usize, 0);
 
-                // Destroy and drop the task under a write-lock.
                 {
                     let mut t = self.tasks[i].write();
                     t.destroy();
                 }
 
-                // Remove the handle from the queue.
                 self.tasks.remove(i);
             }
         }
     }
 
-    /// Debug helper: print every task in the queue.
     fn print_task(&self) {
         for handle in &self.tasks {
             handle.read().print();

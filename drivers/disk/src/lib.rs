@@ -96,7 +96,6 @@ struct RwChainCtx {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    println!("disk class start");
     unsafe { driver_set_evt_device_add(driver, disk_device_add) };
     DriverStatus::Success
 }
@@ -141,12 +140,9 @@ pub extern "win64" fn disk_read(
 
     let dx = disk_ext_mut(dev);
     if !dx.props_ready {
-        match query_props_sync(dev) {
-            Ok(_) => {}
-            Err(st) => {
-                parent.write().status = st;
-                return;
-            }
+        if let Err(st) = query_props_sync(dev) {
+            parent.write().status = st;
+            return;
         }
     }
     if !rw_validate(dx, off, total) {
@@ -164,7 +160,7 @@ pub extern "win64" fn disk_read(
         let this_bytes = core::cmp::min(remaining, max_bytes);
         let this_blocks = (this_bytes / bs) as u32;
 
-        let hdr_len = size_of::<BlockRwIn>();
+        let hdr_len = core::mem::size_of::<BlockRwIn>();
         let mut buf = vec![0u8; hdr_len + this_bytes].into_boxed_slice();
 
         let hdr = BlockRwIn {
@@ -174,7 +170,7 @@ pub extern "win64" fn disk_read(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) };
+        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) };
 
         let child = Arc::new(RwLock::new(Request::new(
             RequestType::DeviceControl(IOCTL_BLOCK_RW),
@@ -192,11 +188,23 @@ pub extern "win64" fn disk_read(
             parent.write().status = c.status;
             return;
         }
-        let moved = c.data.len().saturating_sub(hdr_len);
+
+        let data = &c.data;
+        if data.len() < hdr_len {
+            parent.write().status = DriverStatus::Unsuccessful;
+            return;
+        }
+        let payload = &data[hdr_len..];
+        if payload.is_empty() {
+            parent.write().status = DriverStatus::Unsuccessful;
+            return;
+        }
+
+        let moved = core::cmp::min(payload.len(), remaining);
         {
             let mut p = parent.write();
             let dst = &mut p.data[parent_off..parent_off + moved];
-            let src = &c.data[hdr_len..hdr_len + moved];
+            let src = &payload[..moved];
             dst.copy_from_slice(src);
         }
 

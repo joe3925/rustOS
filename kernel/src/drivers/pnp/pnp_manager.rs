@@ -50,9 +50,8 @@ lazy_static! {
         spin::Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: spin::Mutex<VecDeque<Dpc>> = spin::Mutex::new(VecDeque::new());
 }
-pub const START_THREADS: usize = 1;
+pub const START_THREADS: usize = 3;
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
-
 pub type DriverEntryFn = unsafe extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1249,31 +1248,37 @@ impl PnpManager {
 
     #[inline]
     fn run_one_device_request(&self) -> bool {
-        let dev_opt = DISPATCH_DEVQ.lock().pop_front();
-        let Some(dev) = dev_opt else {
-            return false;
+        let dev = match { DISPATCH_DEVQ.lock().pop_front() } {
+            Some(d) => d,
+            None => return false,
         };
 
-        let req_arc_opt = { dev.queue.lock().pop_front() };
-        if let Some(req_arc) = req_arc_opt {
-            // if (req_arc.read().completed) {
-            //     dev.dispatch_scheduled.store(false, Ordering::Release);
-            //     return false;
-            // }
-            self.call_device_handler(&dev, req_arc);
+        let _ = dev
+            .dispatch_tickets
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(1))
+            });
 
-            let has_more = { !dev.queue.lock().is_empty() };
-            if has_more {
-                self.schedule_device_dispatch(&dev);
-            } else {
-                dev.dispatch_scheduled.store(false, Ordering::Release);
+        loop {
+            let req_opt = { dev.queue.lock().pop_front() };
+            if let Some(req) = req_opt {
+                self.call_device_handler(&dev, req);
+                continue;
             }
 
+            let more = dev.dispatch_tickets.load(Ordering::Acquire);
+            let needs = more > 0 || { !dev.queue.lock().is_empty() };
+            if needs {
+                let mut dq = DISPATCH_DEVQ.lock();
+                let already = dq.iter().any(|d| Arc::ptr_eq(d, &dev));
+                if !already {
+                    dq.push_back(dev.clone());
+                }
+            }
             return true;
         }
-        dev.dispatch_scheduled.store(false, Ordering::Release);
-        false
     }
+
     extern "win64" fn pnp_minor_dispatch(
         device: &Arc<DeviceObject>,
         request: Arc<RwLock<Request>>,
@@ -1357,18 +1362,17 @@ impl PnpManager {
             }
         }
     }
+
     #[inline]
     fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let kind = { req_arc.read().kind };
         if matches!(kind, RequestType::Dummy) {
             return;
         }
-
         if matches!(kind, RequestType::Pnp) {
             Self::pnp_minor_dispatch(dev, req_arc.clone());
             return;
         }
-
         if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
             match h.synchronization {
                 Synchronization::FireAndForget => {
@@ -1380,7 +1384,6 @@ impl PnpManager {
                     } else {
                         h.depth as u64
                     };
-
                     let admit = h.running_request.fetch_update(
                         Ordering::AcqRel,
                         Ordering::Relaxed,
@@ -1392,12 +1395,10 @@ impl PnpManager {
                             }
                         },
                     );
-
                     if admit.is_err() {
                         dev.queue.lock().push_back(req_arc);
                         return;
                     }
-
                     h.handler.invoke(dev, req_arc.clone());
                     h.running_request.fetch_sub(1, Ordering::Release);
                 }
@@ -1405,9 +1406,7 @@ impl PnpManager {
         } else {
             req_arc.write().status = DriverStatus::Pending;
         }
-
         let st = { req_arc.read().status };
-
         if st == DriverStatus::Pending {
             let fwd = self.send_request_to_next_lower(dev, req_arc.clone());
             if fwd == DriverStatus::NoSuchDevice {
@@ -1429,14 +1428,12 @@ impl PnpManager {
             }
             return;
         }
-
         let mut r = take_req(&req_arc);
         if !r.completed {
             self.complete_request(&mut r);
         }
         put_req(&req_arc, r);
     }
-
     pub fn get_device_target(&self, instance_path: &str) -> Option<IoTarget> {
         let om_path = alloc::format!("\\Device\\{}\\Top", instance_path);
         if let Ok(o) = crate::object_manager::OBJECT_MANAGER.open(om_path) {
@@ -1493,9 +1490,12 @@ impl PnpManager {
 
     #[inline]
     fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
-        //if !dev.dispatch_scheduled.swap(true, Ordering::AcqRel) {
-        DISPATCH_DEVQ.lock().push_back(dev.clone());
-        //}
+        let mut dq = DISPATCH_DEVQ.lock();
+        if dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel) == 0 {
+            if !dq.iter().any(|d| Arc::ptr_eq(d, dev)) {
+                dq.push_back(dev.clone());
+            }
+        }
     }
 
     pub fn queue_dpc(&self, func: DpcFn, arg: usize) {
