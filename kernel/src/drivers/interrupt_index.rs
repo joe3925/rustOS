@@ -546,3 +546,14 @@ pub fn send_eoi(vector: u8) {
         Port::new(0x20u16).write(0x20u8);
     }
 }
+/// A faster send eoi for the timer interrupt
+#[inline(always)]
+pub extern "C" fn send_eoi_timer() {
+    let base = LAPIC_BASE_VA.load(Ordering::Relaxed);
+    if base != 0 {
+        unsafe {
+            ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
+        }
+        return;
+    }
+}

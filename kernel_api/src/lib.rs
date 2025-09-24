@@ -195,7 +195,41 @@ impl Request {
 pub struct File {
     _private: [u8; 0],
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 
+pub enum FileAttribute {
+    ReadOnly = 0x01,
+    Hidden = 0x02,
+    System = 0x04,
+    VolumeLabel = 0x08,
+    LFN = 0x0F,
+    Directory = 0x10,
+    Archive = 0x20,
+    Unknown = 0xFF,
+}
+impl From<FileAttribute> for u8 {
+    fn from(attribute: FileAttribute) -> Self {
+        attribute as u8
+    }
+}
+
+impl TryFrom<u8> for FileAttribute {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0x01 => Ok(FileAttribute::ReadOnly),
+            0x02 => Ok(FileAttribute::Hidden),
+            0x04 => Ok(FileAttribute::System),
+            0x08 => Ok(FileAttribute::VolumeLabel),
+            0x0F => Ok(FileAttribute::LFN),
+            0x10 => Ok(FileAttribute::Directory),
+            0x20 => Ok(FileAttribute::Archive),
+            _ => Ok(FileAttribute::Unknown),
+        }
+    }
+}
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStatus {

@@ -50,7 +50,7 @@ lazy_static! {
         spin::Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: spin::Mutex<VecDeque<Dpc>> = spin::Mutex::new(VecDeque::new());
 }
-pub const START_THREADS: usize = 3;
+pub const START_THREADS: usize = 1;
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 pub type DriverEntryFn = unsafe extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
 

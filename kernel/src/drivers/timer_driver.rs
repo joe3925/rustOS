@@ -1,4 +1,6 @@
-use crate::drivers::interrupt_index::{get_current_logical_id, send_eoi, InterruptIndex};
+use crate::drivers::interrupt_index::{
+    get_current_logical_id, send_eoi, send_eoi_timer, InterruptIndex,
+};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::structs::per_core_storage::PCS;
@@ -69,10 +71,6 @@ extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         (*ctx_ptr).restore(state);
     }
 }
-#[no_mangle]
-extern "C" fn timer_eoi() {
-    send_eoi(InterruptIndex::Timer.as_u8());
-}
 // TODO: send eoi in assembly
 #[unsafe(naked)]
 pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
@@ -100,6 +98,6 @@ pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
         "sti",
         "iretq",
         handler = sym timer_interrupt_handler_c,
-        eoi     = sym timer_eoi,
+        eoi     = sym send_eoi_timer,
     );
 }
