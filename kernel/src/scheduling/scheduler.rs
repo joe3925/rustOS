@@ -40,7 +40,6 @@ impl Scheduler {
     #[inline]
     pub fn add_task(&mut self, task: TaskHandle) -> u64 {
         {
-            // mutate via write-lock
             let mut t = task.write();
             t.id = self.id;
         }
