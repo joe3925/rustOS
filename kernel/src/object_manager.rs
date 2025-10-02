@@ -267,8 +267,6 @@ impl ObjectManager {
         Ok(names)
     }
 
-    // ---- helpers ----
-
     fn split_path(path: String) -> Result<Vec<String>, OmError> {
         if path.is_empty() {
             return Err(OmError::InvalidPath);

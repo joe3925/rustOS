@@ -374,7 +374,7 @@ impl PnpManager {
         *self.hw.write() = Arc::new(idx);
         Ok(())
     }
-
+    /// These should only be called during the enumeration
     pub fn create_child_devnode_and_pdo(
         &self,
         parent: &Arc<DevNode>,
@@ -406,7 +406,7 @@ impl PnpManager {
         self.notify_class_listeners(&dev_node);
         (dev_node, pdo)
     }
-
+    /// These should only be called during the enumeration
     pub fn create_child_devnode_and_pdo_with_init(
         &self,
         parent: &Arc<DevNode>,
@@ -440,7 +440,152 @@ impl PnpManager {
 
         (dev_node, pdo)
     }
+    pub fn create_devnode_over_fdo_with_function(
+        &self,
+        parent_fdo: Arc<DeviceObject>,
+        instance_path: String,
+        ids: DeviceIds,
+        class: Option<String>,
+        function_service: &str,
+        function_fdo: Arc<DeviceObject>,
+    ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError> {
+        let parent_dn = parent_fdo.dev_node.upgrade().ok_or(DriverError::NoParent)?;
+        let name = instance_path
+            .rsplit('\\')
+            .next()
+            .unwrap_or("NODE")
+            .to_string();
 
+        let dn = DevNode::new_child(
+            name,
+            instance_path.clone(),
+            ids.clone(),
+            class.clone(),
+            &parent_dn,
+        );
+        *dn.stack.write() = Some(DeviceStack::new());
+        *dn.pdo.write() = Some(parent_fdo.clone());
+
+        let func_pkg = self
+            .pkg_by_service(function_service)
+            .ok_or(DriverError::NoParent)?;
+        let func_drv = self.ensure_loaded(&func_pkg)?;
+
+        let id_strs: Vec<&str> = ids
+            .hardware
+            .iter()
+            .map(|s| s.as_str())
+            .chain(ids.compatible.iter().map(|s| s.as_str()))
+            .collect();
+        let (lower_pkgs, upper_pkgs) =
+            self.resolve_filters(&id_strs, class.as_deref(), function_service)?;
+
+        let lower_layers: Vec<StackLayer> = lower_pkgs
+            .into_iter()
+            .map(|p| {
+                Ok(StackLayer {
+                    driver: self.ensure_loaded(&p)?,
+                    devobj: None,
+                })
+            })
+            .collect::<Result<_, DriverError>>()?;
+        let upper_layers: Vec<StackLayer> = upper_pkgs
+            .into_iter()
+            .map(|p| {
+                Ok(StackLayer {
+                    driver: self.ensure_loaded(&p)?,
+                    devobj: None,
+                })
+            })
+            .collect::<Result<_, DriverError>>()?;
+
+        {
+            let mut g = dn.stack.write();
+            let stk = g.as_mut().unwrap();
+            stk.lower = lower_layers;
+            stk.function = Some(StackLayer {
+                driver: func_drv.clone(),
+                devobj: None,
+            });
+            stk.upper = upper_layers;
+        }
+
+        let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(stack_dir.clone());
+
+        let mut prev = dn.get_pdo().unwrap();
+
+        {
+            let mut g = dn.stack.write();
+            let stk = g.as_mut().unwrap();
+
+            for layer in stk.lower.iter_mut() {
+                if let Some(dobj) = self.attach_one_above(&dn, Some(prev.clone()), &layer.driver) {
+                    layer.devobj = Some(dobj.clone());
+                    prev = dobj;
+                }
+            }
+
+            unsafe {
+                let me = &mut *(Arc::as_ptr(&function_fdo) as *mut DeviceObject);
+                me.dev_node = Arc::downgrade(&dn);
+            }
+            DeviceObject::set_lower_upper(&function_fdo, Some(prev.clone()));
+            let uniq = (Arc::as_ptr(&function_fdo) as usize) as u64;
+            let leaf = alloc::format!("{}-{:x}", func_drv.driver_name, uniq);
+            let obj = crate::object_manager::Object::with_name(
+                crate::object_manager::ObjectTag::Device,
+                leaf.clone(),
+                crate::object_manager::ObjectPayload::Device(function_fdo.clone()),
+            );
+            let _ = crate::object_manager::OBJECT_MANAGER
+                .link(alloc::format!("{}\\{}", stack_dir, leaf), &obj);
+
+            if let Some(f) = stk.function.as_mut() {
+                f.devobj = Some(function_fdo.clone());
+            }
+            prev = function_fdo.clone();
+
+            for layer in stk.upper.iter_mut() {
+                if let Some(dobj) = self.attach_one_above(&dn, Some(prev.clone()), &layer.driver) {
+                    layer.devobj = Some(dobj.clone());
+                    prev = dobj;
+                }
+            }
+        }
+
+        let top = prev.clone();
+
+        let base = alloc::format!("\\Device\\{}", dn.instance_path);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+        let _ = crate::object_manager::OBJECT_MANAGER.unlink(alloc::format!("{}\\Top", base));
+        let top_obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Device,
+            "Top".to_string(),
+            crate::object_manager::ObjectPayload::Device(top.clone()),
+        );
+        let _ =
+            crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\Top", base), &top_obj);
+
+        let pnp_payload = PnpRequest {
+            minor_function: PnpMinorFunction::StartDevice,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::CompatibleIds,
+            ids_out: Vec::new(),
+            blob_out: Vec::new(),
+        };
+        let mut start_request = Request::new(RequestType::Pnp, Box::new([]));
+        start_request.pnp = Some(pnp_payload);
+        let ctx = Arc::into_raw(dn.clone()) as usize;
+        start_request.set_completion(Self::start_io, ctx);
+
+        let tgt = IoTarget {
+            target_device: top.clone(),
+        };
+        let _ = self.send_request(&tgt, Arc::new(RwLock::new(start_request)));
+
+        Ok((dn, top))
+    }
     pub fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         self.bind_device(dn)?;
         self.start_stack(dn);

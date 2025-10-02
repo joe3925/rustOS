@@ -24,6 +24,18 @@ use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
 use crate::alloc_api::DeviceIds;
 
+pub const IOCTL_MOUNTMGR_REGISTER_FS: u32 = 0x4D4D_0001;
+pub const IOCTL_FS_IDENTIFY: u32 = 0x4653_0002;
+
+pub const IOCTL_MOUNTMGR_UNMOUNT: u32 = 0x4D4D_0002;
+pub const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
+pub const IOCTL_MOUNTMGR_RESYNC: u32 = 0x4D4D_0004;
+pub const IOCTL_MOUNTMGR_LIST_FS: u32 = 0x4D4D_0005;
+pub const IOCTL_FS_CREATE_FUNCTION_FDO: u32 = 0x4653_3001;
+
+pub const VOLUME_LINK_BASE: &str = "\\Volumes";
+pub const CTRL_LINK: &str = "\\MountMgr";
+pub const CTRL_NAME: &str = "\\Device\\volclass.ctrl";
 pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
@@ -110,17 +122,19 @@ pub struct GptHeader {
     pub_reserved_block: [u8; 420],
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BlkRead {
-    pub lba: u64,
-    pub sectors: u32,
-}
-#[repr(C)]
 pub struct FsIdentify {
     pub volume_fdo: Arc<IoTarget>,
     pub mount_device: Option<Arc<DeviceObject>>,
     pub can_mount: bool,
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BlkRead {
+    pub lba: u64,
+    pub sectors: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GptPartitionEntry {
@@ -677,6 +691,14 @@ pub mod alloc_api {
                 callback: ClassAddCallback,
                 dev_obj: Arc<DeviceObject>,
             );
+            pub fn pnp_create_devnode_over_fdo_with_function(
+                parent_fdo: &Arc<DeviceObject>,
+                instance_path: String,
+                ids: DeviceIds,
+                class: Option<String>,
+                function_service: &str,
+                function_fdo: &Arc<DeviceObject>,
+            ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>;
             pub fn pnp_wait_for_request(req: &Arc<RwLock<Request>>);
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,

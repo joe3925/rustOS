@@ -13,7 +13,8 @@ use core::{mem::size_of, panic::PanicInfo, ptr, slice};
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, IoTarget, KernelAllocator, Request, RequestType,
+    DeviceObject, DriverObject, DriverStatus, FsIdentify, IOCTL_FS_IDENTIFY,
+    IOCTL_MOUNTMGR_REGISTER_FS, IoTarget, KernelAllocator, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, IoVtable, Synchronization,
         ffi::{
@@ -40,18 +41,6 @@ fn panic(info: &PanicInfo) -> ! {
 mod fat32;
 mod msvc_shims;
 mod structs;
-
-// mountmgr control
-const IOCTL_MOUNTMGR_REGISTER_FS: u32 = 0x4D4D_0001;
-// fs control
-const IOCTL_FS_IDENTIFY: u32 = 0x4653_0002;
-
-#[repr(C)]
-pub struct FsIdentify {
-    pub volume_fdo: Arc<IoTarget>,
-    pub mount_device: Option<Arc<DeviceObject>>,
-    pub can_mount: bool,
-}
 
 #[repr(C)]
 struct CtrlDevExt;

@@ -330,3 +330,21 @@ pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
         core::hint::spin_loop();
     }
 }
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_devnode_over_fdo_with_function(
+    parent_fdo: &Arc<DeviceObject>,
+    instance_path: String,
+    ids: DeviceIds,
+    class: Option<String>,
+    function_service: &str,
+    function_fdo: &Arc<DeviceObject>,
+) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError> {
+    PNP_MANAGER.create_devnode_over_fdo_with_function(
+        parent_fdo.clone(),
+        instance_path,
+        ids,
+        class,
+        function_service,
+        function_fdo.clone(),
+    )
+}

@@ -82,6 +82,7 @@ pub enum DriverError {
     InvalidUtf8,
     TomlParse,
     DriverAlreadyInstalled,
+    NoParent,
     Registry(crate::registry::RegError),
     LoadErr(LoadError),
 }
