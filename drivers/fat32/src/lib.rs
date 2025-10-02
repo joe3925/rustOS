@@ -150,7 +150,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         pnp_vtable: None,
     };
 
-    let ctrl_link = "\\FileSystems\\fat32".to_string();
+    let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();
     let _ctrl =
         unsafe { pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone()) };
@@ -161,7 +161,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     )));
     unsafe {
         let _ = pnp_ioctl_via_symlink(
-            "\\MountMgr".to_string(),
+            "\\GLOBAL\\MountMgr".to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
         );

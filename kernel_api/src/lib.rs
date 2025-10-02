@@ -33,9 +33,10 @@ pub const IOCTL_MOUNTMGR_RESYNC: u32 = 0x4D4D_0004;
 pub const IOCTL_MOUNTMGR_LIST_FS: u32 = 0x4D4D_0005;
 pub const IOCTL_FS_CREATE_FUNCTION_FDO: u32 = 0x4653_3001;
 
-pub const VOLUME_LINK_BASE: &str = "\\Volumes";
-pub const CTRL_LINK: &str = "\\MountMgr";
-pub const CTRL_NAME: &str = "\\Device\\volclass.ctrl";
+pub const GLOBAL_NS: &str = "\\GLOBAL";
+pub const GLOBAL_CTRL_LINK: &str = "\\GLOBAL\\MountMgr";
+pub const GLOBAL_VOLUMES_BASE: &str = "\\GLOBAL\\Volumes";
+pub const GLOBAL_LABELS_BASE: &str = "\\GLOBAL\\Mounts";
 pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
