@@ -1,49 +1,45 @@
+// util.rs
 extern crate rand_xoshiro;
 
-use crate::drivers::drive::generic_drive::{
-    boot_part_init, DriveController, DriveType, DRIVECOLLECTION,
-};
-use crate::drivers::drive::gpt::VOLUMES;
-use crate::drivers::drive::ide_disk_driver::IdeController;
-use crate::drivers::driver_install::install_prepacked_drivers;
+use crate::alloc::format;
+use crate::boot_packages;
 use crate::drivers::interrupt_index::{
-    calibrate_tsc, get_current_logical_id, wait_millis, wait_millis_idle, wait_using_pit_50ms,
-    ApicImpl,
+    calibrate_tsc, get_current_logical_id, wait_millis_idle, wait_using_pit_50ms, ApicImpl,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::pnp_manager::PNP_MANAGER;
 use crate::drivers::timer_driver::TIMER_TIME;
-use crate::executable::pe_loadable;
-use crate::executable::program::{HandleTable, Module, Program, PROGRAM_MANAGER};
+use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file::{File, FileStatus, OpenFlags};
-use crate::format;
+use crate::file_system::file_provider::install_file_provider;
+use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
+use crate::idt::load_idt;
 use crate::memory::allocator::ALLOCATOR;
+use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::registry::{is_first_boot, reg};
+use crate::registry::is_first_boot;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
+use crate::{cpu, println, BOOT_INFO};
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use spin::{Mutex, Once, RwLock};
-use x86_64::instructions::interrupts;
-
-use crate::boot_packages;
-use crate::drivers::drive::gpt::GptPartitionType::MicrosoftBasicData;
-use crate::idt::load_idt;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::{cpu, println, BOOT_INFO};
 use alloc::{vec, vec::Vec};
 use bootloader_api::BootInfo;
 use core::arch::asm;
+use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
+use spin::{Mutex, Once, RwLock};
+use x86_64::instructions::interrupts;
 use x86_64::VirtAddr;
+
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -51,14 +47,16 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 
 static TOTAL_TIME: Once<Stopwatch> = Once::new();
+
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32"];
+
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
     {
-        let init_lock = INIT_LOCK.lock();
+        let _init_lock = INIT_LOCK.lock();
         init_heap();
         test_full_heap();
 
@@ -70,6 +68,7 @@ pub unsafe fn init() {
         load_idt();
         println!("PIC loaded");
         syscall_init();
+
         // TSC calibration
         let tsc_start = cpu::get_cycles();
         wait_using_pit_50ms();
@@ -79,7 +78,6 @@ pub unsafe fn init() {
         match ApicImpl::init_apic_full() {
             Ok(_) => {
                 println!("APIC transition successful!");
-
                 x86_64::instructions::interrupts::disable();
                 APIC.lock().as_ref().unwrap().start_aps();
                 x86_64::instructions::interrupts::enable();
@@ -89,46 +87,9 @@ pub unsafe fn init() {
             }
         }
 
-        // {
-        //     let mut drives = DRIVECOLLECTION.lock();
-        //     drives.enumerate_drives();
-
-        //     match drives.drives[1].format_gpt() {
-        //         Ok(_) => {
-        //             println!("Drive init successful");
-        //             drives.drives[1]
-        //                 .add_partition(
-        //                     1024 * 1024 * 1024 * 9,
-        //                     MicrosoftBasicData.to_u8_16(),
-        //                     "MAIN VOLUME".to_string(),
-        //                 )
-        //                 .expect("TODO: panic message");
-        //         }
-        //         Err(err) => {
-        //             println!(
-        //                 "Error init drive {} {}",
-        //                 (drives.drives)[1].info.model,
-        //                 err.to_str()
-        //             )
-        //         }
-        //     }
-        // }
-        // {
-        //     let mut partitions = VOLUMES.lock();
-        //     partitions.enumerate_parts();
-        //     match partitions
-        //         .find_partition_by_name("MAIN VOLUME")
-        //         .unwrap()
-        //         .format()
-        //     {
-        //         Ok(_) => println!("Formatted"),
-        //         Err(e) => println!("{:#?}", e),
-        //     }
-        //     partitions.print_parts();
-        // }
         println!("Init Done");
     }
-    while (CORE_LOCK.load(Ordering::SeqCst) != 0) {
+    while CORE_LOCK.load(Ordering::SeqCst) != 0 {
         asm!("hlt");
     }
     TOTAL_TIME.call_once(Stopwatch::start);
@@ -139,6 +100,8 @@ pub unsafe fn init() {
 }
 
 pub fn kernel_main() {
+    install_file_provider(Box::new(BootstrapProvider::new(BOOTSET)));
+
     let mut program = Program::new(
         "KRNL".to_string(),
         "".to_string(),
@@ -156,14 +119,15 @@ pub fn kernel_main() {
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
         symbols: EXPORTS.to_vec(),
     }))]);
-    let pid = PROGRAM_MANAGER.add_program(program);
+    let _pid = PROGRAM_MANAGER.add_program(program);
 
-    boot_part_init(BOOTSET);
-    if (is_first_boot()) {
+    if is_first_boot() {
         setup_file_layout().expect("Failed to create system volume layout");
-
-        install_prepacked_drivers().expect("Failed to install pre packed drivers");
+        // Prepacked driver install reads from C:\INSTALL\DRIVERS\*\*.{toml,dll} (served by bootstrap FS)
+        crate::drivers::driver_install::install_prepacked_drivers()
+            .expect("Failed to install pre packed drivers");
     }
+
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");
@@ -178,7 +142,7 @@ pub fn kernel_main() {
             .unwrap()
             .load(Ordering::SeqCst);
         let total_ms = TOTAL_TIME.wait().elapsed_millis();
-        let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0‑1000
+        let percent_x10 = (timer_ms as u128 * 100_000) / total_ms as u128; // 0-1000
         let int_part = percent_x10 / 1000;
         let frac_part = percent_x10 % 1000;
 
@@ -193,10 +157,12 @@ pub fn kernel_main() {
         println!("\n");
     }
 }
+
 pub fn used_memory() -> usize {
     let allocator = unsafe { ALLOCATOR.lock() };
     HEAP_SIZE - allocator.free_memory()
 }
+
 pub fn print_mem_report() {
     let heap_used = interrupts::without_interrupts(move || used_memory());
     let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst);
@@ -227,44 +193,30 @@ pub fn print_mem_report() {
         heap_used_kb, heap_total_kb, heap_int_part, heap_frac_part
     );
 }
-pub fn setup_file_layout() -> Result<(), FileStatus> {
-    let drive_label = {
-        let mut binding = VOLUMES.lock();
-        let system_volume = binding
-            .find_partition_by_name("MAIN VOLUME")
-            .expect("System volume not found");
 
-        let dl = system_volume.label.clone();
-        dl
-    };
+pub fn setup_file_layout() -> Result<(), FileStatus> {
+    // During bootstrap we force the system layout under C:\
+    let drive_label = "C:".to_string();
     let mod_path = format!("{}\\SYSTEM\\MOD", drive_label);
     let inf_path = format!("{}\\SYSTEM\\TOML", drive_label);
 
     match File::make_dir(mod_path.clone()) {
-        Ok(_) => {}
-        Err(FileStatus::FileAlreadyExist) => {}
-        e => {
-            return e;
-        }
+        Ok(_) | Err(FileStatus::FileAlreadyExist) => {}
+        e => return e,
     }
 
     match File::make_dir(inf_path.clone()) {
-        Ok(_) => {
-            return Ok(());
-        }
-        Err(FileStatus::FileAlreadyExist) => {
-            return Ok(());
-        }
-        e => {
-            return e;
-        }
+        Ok(_) | Err(FileStatus::FileAlreadyExist) => Ok(()),
+        e => e,
     }
 }
+
 #[no_mangle]
 #[allow(unconditional_recursion)]
 pub extern "C" fn trigger_stack_overflow() {
     trigger_stack_overflow();
 }
+
 pub fn trigger_breakpoint() {
     unsafe {
         asm!("int 3");
@@ -275,13 +227,11 @@ pub fn test_full_heap() {
     let element_count = (HEAP_SIZE / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
-
     for i in 0..element_count {
         vec.push(i as u64);
     }
-    // Verify the data
     for i in 0..element_count {
-        if (i != vec[i] as usize) {
+        if i != vec[i] as usize {
             println!("Heap data verification failed at index {}", i);
         }
     }
@@ -291,6 +241,7 @@ pub fn test_full_heap() {
         element_count
     );
 }
+
 pub extern "win64" fn random_number() -> u64 {
     let mut rng = Random::new(cpu::get_cycles());
     rng.next_u64()
@@ -308,10 +259,9 @@ pub fn generate_guid() -> [u8; 16] {
     guid[..8].copy_from_slice(&start);
     guid[8..].copy_from_slice(&end);
 
-    // Set UUID version (v4: bits 12-15 should be `0100`)
+    // Set UUID version (v4)
     guid[6] = (guid[6] & 0x0F) | 0x40;
-
-    // Set UUID variant (RFC 4122: bits 6-7 should be `10`)
+    // Set UUID variant (RFC 4122)
     guid[8] = (guid[8] & 0x3F) | 0x80;
 
     guid
@@ -335,16 +285,15 @@ impl Random {
         (self.rng.next_u64() & 0xFFFF_FFFF) as u32
     }
 }
-pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
-    let mut buffer = [0x0000; 36]; // Fill with null terminators
-    let utf16_iter = name.encode_utf16();
 
-    for (i, c) in utf16_iter.take(36).enumerate() {
+pub fn name_to_utf16_fixed(name: &str) -> [u16; 36] {
+    let mut buffer = [0x0000; 36];
+    for (i, c) in name.encode_utf16().take(36).enumerate() {
         buffer[i] = c;
     }
-
     buffer
 }
+
 #[derive(Clone, Copy)]
 pub struct BootPkg {
     pub name: &'static str,

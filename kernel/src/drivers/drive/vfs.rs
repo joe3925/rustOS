@@ -7,7 +7,7 @@ use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::RwLock;
+use spin::{Lazy, RwLock};
 
 use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
 use crate::file_system::file_structs::FsReadParams;
@@ -606,3 +606,4 @@ impl Vfs {
         }
     }
 }
+pub static VFS: Lazy<Vfs> = Lazy::new(|| Vfs::new());

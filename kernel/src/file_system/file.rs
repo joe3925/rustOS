@@ -1,14 +1,19 @@
-use crate::drivers::drive::gpt::VOLUMES;
-use crate::file_system::fat::FileSystem;
-use crate::file_system::file::FileStatus::DriveNotFound;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
+#![no_std]
+
+extern crate alloc;
+
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 use core::cmp::PartialEq;
+
+use crate::file_system::file_provider::{self, FileProvider}; // shared flags + provider access
+use crate::file_system::file_structs::{FileError, FsSeekWhence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-
-pub(crate) enum FileAttribute {
+pub enum FileAttribute {
     ReadOnly = 0x01,
     Hidden = 0x02,
     System = 0x04,
@@ -23,39 +28,45 @@ impl From<FileAttribute> for u8 {
         attribute as u8
     }
 }
-
 impl TryFrom<u8> for FileAttribute {
     type Error = ();
-
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0x01 => Ok(FileAttribute::ReadOnly),
-            0x02 => Ok(FileAttribute::Hidden),
-            0x04 => Ok(FileAttribute::System),
-            0x08 => Ok(FileAttribute::VolumeLabel),
-            0x0F => Ok(FileAttribute::LFN),
-            0x10 => Ok(FileAttribute::Directory),
-            0x20 => Ok(FileAttribute::Archive),
-            _ => Ok(FileAttribute::Unknown),
-        }
+        Ok(match value {
+            0x01 => FileAttribute::ReadOnly,
+            0x02 => FileAttribute::Hidden,
+            0x04 => FileAttribute::System,
+            0x08 => FileAttribute::VolumeLabel,
+            0x0F => FileAttribute::LFN,
+            0x10 => FileAttribute::Directory,
+            0x20 => FileAttribute::Archive,
+            _ => FileAttribute::Unknown,
+        })
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenFlags {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+    Create,    // create if missing, otherwise open
+    CreateNew, // create only if missing, error if exists
+    Open,      // open only if exists
+}
+
 #[derive(Debug)]
 #[repr(u32)]
-
-pub(crate) enum FileStatus {
+pub enum FileStatus {
     Success = 0x00,
     FileAlreadyExist = 0x01,
     PathNotFound = 0x02,
     UnknownFail = 0x03,
-    NotFat = 0x04,
-    DriveNotFound,
+    NotFat = 0x04, // Kept for compatibility; maps to generic "Unsupported" in provider world
+    DriveNotFound, // Kept for compatibility; label resolution handled by provider
     IncompatibleFlags,
     CorruptFat,
     InternalError,
     BadPath,
 }
-
 impl FileStatus {
     pub fn to_str(&self) -> &'static str {
         match self {
@@ -66,175 +77,30 @@ impl FileStatus {
             FileStatus::NotFat => "The partition is unformatted or not supported",
             FileStatus::DriveNotFound => "The drive specified doesn't exist",
             FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFat => "The File Allocation Table is corrupt this drive should be reformated and backed up if still possible",
-            FileStatus::InternalError => "An unknown Error has happened likely due to a code logic error",
-            FileStatus::BadPath => "File name must be no more then 8 chars file Extension must be no more then 3 chars and every letter must be capital"
+            FileStatus::CorruptFat => "The File Allocation Table is corrupt",
+            FileStatus::InternalError => "Internal error",
+            FileStatus::BadPath => "Invalid path",
         }
     }
 }
-
-#[derive(Debug)]
-pub(crate) struct File {
-    pub name: String,
-    pub extension: String,
-    pub size: u64,
-    pub starting_cluster: u32,
-    pub drive_label: String,
-    pub path: String,
-    pub deleted: bool,
-    pub mount: FileSystem,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpenFlags {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-
-    /// Creates the file if it doesn't exist opens it if it does
-    Create,
-    /// Creates the file only if it doesn't already exist (fails if it exists)
-    CreateNew,
-    /// Opens the file only if it exists fails if it doesn't (this is default behavior if you have no create flags)
-    Open,
-}
-
 impl PartialEq for FileStatus {
     fn eq(&self, other: &FileStatus) -> bool {
-        if (self.to_str() == other.to_str()) {
-            return true;
-        }
-        false
+        self.to_str() == other.to_str()
     }
+}
+
+/// Public façade: now a VFS-style handle that delegates to the active FileProvider.
+/// Same function names as before.
+#[derive(Debug)]
+pub struct File {
+    fs_file_id: u64,
+    path: String,
+    size: u64,
+    is_dir: bool,
 }
 
 impl File {
-    /// Opens a file from the given `path` using the specified set of `OpenFlags`.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - A string slice representing the full path to the file, including the drive letter.
-    /// * `flags` - A slice of `OpenFlags` specifying the intended access and behavior.
-    ///
-    /// # Behavior
-    ///
-    /// The behavior of this function depends on the combination of `OpenFlags` provided:
-    ///
-    /// - `OpenFlags::ReadOnly`, `WriteOnly`, `ReadWrite`: These specify the intended access mode.
-    ///   (Note: Access mode is currently unused but reserved for future access control enforcement.)
-    ///
-    /// - `OpenFlags::Create`: If the file does not exist, it will be created. If it exists, it will be opened.
-    ///
-    /// - `OpenFlags::CreateNew`: The file will be created only if it doesn't already exist. If it exists, an error is returned.
-    ///
-    /// - `OpenFlags::Open`: The file must already exist. This is the default behavior if neither `Create` nor `CreateNew` are provided.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(File)` - On success, returns an instance of `File` pointing to the opened or newly created file.
-    /// * `Err(FileStatus)` - If the operation fails, returns a `FileStatus` indicating the error:
-    ///   - `FileStatus::DriveNotFound` if the drive letter is invalid or not mounted.
-    ///   - `FileStatus::PathNotFound` if the file doesn't exist and creation flags aren't set.
-    ///   - `FileStatus::FileAlreadyExist` if `CreateNew` is used and the file exists.
-    ///   - `FileStatus::IncompatibleFlags` if both `Create` and `CreateNew` are used together.
-    ///   - `FileStatus::UnknownFail` if file creation appears successful but lookup fails.
-    ///
-    /// # Panics
-    ///
-    /// This function does not panic, but will return errors via the `Result` type if path or drive validation fails.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// let file = File::open("C:/docs/readme.txt", &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    /// ```
-    ///
-    /// # Notes
-    ///
-    /// - File creation implicitly creates any missing directories in the path.
-    /// - Conflicting flags (`Create` + `CreateNew`) are rejected early.
-    /// - This function assumes that the caller has already mounted or prepared the drive structure (`VOLUMES`).
-    pub extern "win64" fn open(
-        path: &str,
-        flags: &[OpenFlags], // Accept flags as a slice
-    ) -> Result<Self, FileStatus> {
-        Self::check_path(path)?;
-        if let Some(drive_letter) = File::get_drive_letter(path.as_bytes()) {
-            let path = Self::remove_drive_from_path(path);
-            if (flags.contains(&OpenFlags::Create) && flags.contains(&OpenFlags::CreateNew)) {
-                return Err(FileStatus::IncompatibleFlags);
-            }
-            if let Some(part) = VOLUMES.lock().find_volume(drive_letter.clone()) {
-                // Check if the file exists
-                let file_system = FileSystem::mount(part)?;
-                let file_entry = file_system.find_file(part, path);
-                let name = FileSystem::file_parser(path);
-                let file_name = FileSystem::get_text_before_last_dot(name[name.len() - 1]);
-                let file_extension = FileSystem::get_text_after_last_dot(name[name.len() - 1]);
-                match file_entry {
-                    Ok(file_entry) => {
-                        if (!flags.contains(&OpenFlags::CreateNew)) {
-                            Ok(File {
-                                name: file_name.to_string(),
-                                extension: file_extension.to_string(),
-                                size: file_entry.file_size as u64,
-                                starting_cluster: file_entry.get_cluster(),
-                                drive_label: drive_letter.clone(),
-                                path: path.to_string(),
-                                deleted: false,
-                                mount: file_system,
-                            })
-                        } else {
-                            Err(FileStatus::FileAlreadyExist)
-                        }
-                    }
-                    Err(FileStatus::PathNotFound) => {
-                        // If file doesn't exist, check flags for creation
-                        if flags.contains(&OpenFlags::Create)
-                            || flags.contains(&OpenFlags::CreateNew)
-                        {
-                            match file_system.create_dir(part, File::remove_file_from_path(path)) {
-                                Ok(_) => {}
-                                Err(FileStatus::FileAlreadyExist) => {}
-                                Err(e) => return Err(e),
-                            };
-
-                            match file_system.create_file(
-                                part,
-                                &file_name,
-                                &file_extension,
-                                File::remove_file_from_path(path),
-                            ) {
-                                Ok(_) => {
-                                    let file_entry = file_system.find_file(part, path);
-                                    match file_entry {
-                                        Ok(file_entry) => Ok(File {
-                                            name: (file_name).to_string(),
-                                            extension: (file_extension).to_string(),
-                                            size: file_entry.file_size as u64,
-                                            starting_cluster: file_entry.get_cluster(),
-                                            drive_label: drive_letter.clone(),
-                                            path: path.to_string(),
-                                            deleted: false,
-                                            mount: file_system,
-                                        }),
-                                        Err(e) => Err(FileStatus::UnknownFail),
-                                    }
-                                }
-                                Err(status) => Err(status),
-                            }
-                        } else {
-                            Err(FileStatus::PathNotFound)
-                        }
-                    }
-                    Err(e) => Err(e),
-                }
-            } else {
-                Err(FileStatus::DriveNotFound)
-            }
-        } else {
-            Err(FileStatus::DriveNotFound)
-        }
-    }
+    // --------- helpers (unchanged signatures/semantics) ---------
 
     pub extern "win64" fn remove_drive_from_path(path: &str) -> &str {
         let b = path.as_bytes();
@@ -246,158 +112,149 @@ impl File {
     }
     pub extern "win64" fn remove_file_from_path(path: &str) -> &str {
         let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
-
-        if parent.is_empty() {
-            "\\"
-        } else if parent == "\\\\" {
+        if parent.is_empty() || parent == "\\\\" {
             "\\"
         } else {
             parent
         }
     }
-    pub extern "win64" fn list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
-        let label = File::get_drive_letter(path.as_bytes()).ok_or(FileStatus::DriveNotFound)?;
-        if let Some(part) = VOLUMES.lock().find_volume(label) {
-            if !part.is_fat {
-                return Err(FileStatus::NotFat); // Drive is not FAT
-            }
-            let path = Self::remove_drive_from_path(path);
-            let fs = FileSystem::mount(part)?;
-            return fs.list_dir(part, path);
-        } else {
-            Err(FileStatus::DriveNotFound)
-        }
-    }
-
-    /// Read data from the file.
-    pub extern "win64" fn read(&self) -> Result<Vec<u8>, FileStatus> {
-        if let Some(part) = VOLUMES.lock().find_volume(self.drive_label.clone()) {
-            if !part.is_fat {
-                return Err(FileStatus::NotFat); // Drive is not FAT
-            }
-            self.mount.read_file(part, self.path.as_str())
-        } else {
-            Err(DriveNotFound)
-        }
-    }
-    /// Write data to the file (overwrites).
-    pub extern "win64" fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
-        if let Some(part) = VOLUMES.lock().find_volume(self.drive_label.clone()) {
-            if !part.is_fat {
-                return Err(FileStatus::NotFat); // Drive is not FAT
-            }
-            self.mount.write_file(part, data, self.path.as_str())
-        } else {
-            Err(DriveNotFound)
-        }
-    }
-    pub extern "win64" fn delete(&mut self) -> Result<(), FileStatus> {
-        if let Some(part) = VOLUMES.lock().find_volume(self.drive_label.clone()) {
-            if !part.is_fat {
-                return Err(FileStatus::NotFat); // Drive is not FAT
-            }
-            let status = self.mount.delete_file(part, self.path.as_str());
-            match status {
-                Ok(_) => {
-                    self.deleted = true;
-                    Ok(())
-                }
-                Err(_) => status,
-            }
-        } else {
-            Err(DriveNotFound)
-        }
-    }
-    pub extern "win64" fn remove_dir(path: String) -> Result<(), FileStatus> {
-        Self::check_path(path.as_str())?;
-        if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
-            if let Some(part) = VOLUMES.lock().find_volume(label) {
-                if !part.is_fat {
-                    return Err(FileStatus::NotFat); // Drive is not FAT
-                }
-                let fs = FileSystem::mount(part)?;
-                fs.remove_dir(
-                    part,
-                    Self::remove_drive_from_path(path.as_str()).to_string(),
-                )?;
-            }
-        }
-        Err(FileStatus::DriveNotFound)
-    }
-    pub extern "win64" fn make_dir(path: String) -> Result<(), FileStatus> {
-        Self::check_path(path.as_str())?;
-        if let Some(label) = Self::get_drive_letter(path.as_bytes()) {
-            if let Some(part) = VOLUMES.lock().find_volume(label) {
-                let path = Self::remove_drive_from_path(&path);
-                if !part.is_fat {
-                    return Err(FileStatus::NotFat); // Drive is not FAT
-                }
-                let fs = FileSystem::mount(part)?;
-                fs.create_dir(part, path)?;
-                match fs.find_dir(part, path) {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(e),
-                }
-            } else {
-                Err(DriveNotFound)
-            }
-        } else {
-            Err(DriveNotFound)
-        }
-    }
     pub extern "win64" fn get_drive_letter(path: &[u8]) -> Option<String> {
-        // Ensure the path has at least 3 bytes: the letter, the colon, and the backslash.
-        if path.len() >= 3 {
-            if (path[0] as char).is_ascii_alphabetic() && path[1] == b':' && path[2] == b'\\' {
-                return Some(String::from_utf8_lossy(&path[0..2]).to_string());
-            }
-        }
-        None
-    }
-    pub extern "win64" fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
-        let dst_drive = File::get_drive_letter(dst.as_bytes()).ok_or(FileStatus::DriveNotFound)?;
-        if dst_drive != self.drive_label {
-            return Err(FileStatus::DriveNotFound);
-        }
-        let dst_rel = File::remove_drive_from_path(dst);
-        let parent = File::remove_file_from_path(dst_rel);
-
-        if let Some(part) = VOLUMES.lock().find_volume(self.drive_label.clone()) {
-            if !part.is_fat {
-                return Err(FileStatus::NotFat);
-            }
-            let _ = self.mount.create_dir(part, parent);
-            self.mount
-                .move_file_nocopy(part, self.path.as_str(), dst_rel)
+        if path.len() >= 3
+            && (path[0] as char).is_ascii_alphabetic()
+            && path[1] == b':'
+            && path[2] == b'\\'
+        {
+            Some(String::from_utf8_lossy(&path[0..2]).to_string())
         } else {
-            Err(FileStatus::DriveNotFound)
+            None
         }
     }
+
     pub extern "win64" fn check_path(path: &str) -> Result<(), FileStatus> {
-        let sanitized_path = File::remove_drive_from_path(path);
-        let components = FileSystem::file_parser(sanitized_path);
-
-        for component in components {
-            if component.is_empty() || component == "." || component == ".." {
+        // Basic validation kept for callers that relied on it
+        let sanitized = Self::remove_drive_from_path(path);
+        let parts = sanitized.trim_matches('\\').split('\\');
+        for comp in parts {
+            if comp.is_empty() || comp == "." || comp == ".." {
                 return Err(FileStatus::BadPath);
             }
-
-            if component.chars().count() > 255 {
+            if comp.chars().count() > 255 {
                 return Err(FileStatus::BadPath);
             }
-
-            if component.ends_with(' ') || component.ends_with('.') {
+            if comp.ends_with(' ') || comp.ends_with('.') {
                 return Err(FileStatus::BadPath);
             }
-
             let invalid = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
-            for ch in component.chars() {
+            for ch in comp.chars() {
                 if ch < '\u{20}' || invalid.contains(&ch) {
                     return Err(FileStatus::BadPath);
                 }
             }
         }
-
         Ok(())
+    }
+
+    // --------- open/close ---------
+
+    pub extern "win64" fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
+        // Provider resolves labels/mounts; we just forward
+        let (res, st) = file_provider::provider().open_path(path, flags);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = res.error {
+            return Err(file_provider::map_file_error(e));
+        }
+        Ok(Self {
+            fs_file_id: res.fs_file_id,
+            path: path.to_string(),
+            size: res.size,
+            is_dir: res.is_dir,
+        })
+    }
+
+    pub extern "win64" fn delete(&mut self) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().delete_path(&self.path);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match r.error {
+            None => Ok(()),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
+        let (r, st) = file_provider::provider().list_dir_path(path);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match r.error {
+            None => Ok(r.names),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn remove_dir(path: String) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().remove_dir_path(&path);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match r.error {
+            None => Ok(()),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn make_dir(path: String) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().make_dir_path(&path);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match r.error {
+            None => Ok(()),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn read(&self) -> Result<Vec<u8>, FileStatus> {
+        let (gi, st1) = file_provider::provider().get_info(self.fs_file_id);
+        if st1 != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = gi.error {
+            return Err(file_provider::map_file_error(e));
+        }
+        let size = gi.size as usize;
+        let (rr, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
+        if st2 != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match rr.error {
+            None => Ok(rr.data),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
+        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, data);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match wr.error {
+            None => Ok(()),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
+    }
+
+    pub extern "win64" fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().rename_path(&self.path, dst);
+        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match r.error {
+            None => Ok(()),
+            Some(e) => Err(file_provider::map_file_error(e)),
+        }
     }
 }

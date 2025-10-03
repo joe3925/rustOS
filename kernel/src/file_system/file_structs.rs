@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::file_system::file::OpenFlags;
+use crate::file_system::{self, file::OpenFlags};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
