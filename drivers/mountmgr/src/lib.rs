@@ -4,6 +4,7 @@
 
 extern crate alloc;
 mod msvc_shims;
+
 use crate::alloc::vec;
 use alloc::{
     boxed::Box,
@@ -21,7 +22,7 @@ use spin::RwLock;
 
 use kernel_api::{
     Data, DeviceObject, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
-    GLOBAL_LABELS_BASE, GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType,
+    GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType,
     alloc_api::{
         DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
         ffi::{
@@ -35,19 +36,9 @@ use kernel_api::{
     println,
 };
 
-#[repr(C)]
-struct FsCreateFdoResp {
-    function_fdo: Option<Arc<DeviceObject>>,
-}
-
 #[inline]
 fn make_volume_link_name(id: u32) -> String {
     alloc::format!("{}\\{:04}", GLOBAL_VOLUMES_BASE, id)
-}
-
-#[inline]
-fn make_label_link_name(id: u32) -> String {
-    alloc::format!("{}\\VOL{:04}", GLOBAL_LABELS_BASE, id)
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +111,6 @@ fn list_fs_blob() -> Box<[u8]> {
 struct VolFdoExt {
     inst_path: String,
     public_link: String,
-    label_link: String,
     fs_attached: AtomicBool,
 }
 impl VolFdoExt {
@@ -128,7 +118,6 @@ impl VolFdoExt {
         Self {
             inst_path: String::new(),
             public_link: String::new(),
-            label_link: String::new(),
             fs_attached: AtomicBool::new(false),
         }
     }
@@ -217,11 +206,7 @@ fn svc_for_tag(tag: &str) -> Option<String> {
     }
 }
 
-fn try_bind_filesystems_for_parent_fdo(
-    parent_fdo: &Arc<DeviceObject>,
-    public_link: &str,
-    label_link: &str,
-) -> bool {
+fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_link: &str) -> bool {
     let _ = refresh_fs_registry_from_registry();
 
     let vid = NEXT_VOL_ID.load(Ordering::Acquire);
@@ -291,9 +276,6 @@ fn try_bind_filesystems_for_parent_fdo(
                 let _ = unsafe {
                     pnp_create_device_symlink_top(instance_path.clone(), public_link.to_string())
                 };
-                let _ = unsafe {
-                    pnp_create_device_symlink_top(instance_path.clone(), label_link.to_string())
-                };
                 return true;
             }
             Err(_) => continue,
@@ -314,12 +296,11 @@ extern "win64" fn volclass_start(
         *dx = VolFdoExt::blank();
         dx.inst_path = inst.clone();
         dx.public_link = make_volume_link_name(vid);
-        dx.label_link = make_label_link_name(vid);
     }
 
     let linked = {
         let dx = ext_mut::<VolFdoExt>(dev);
-        try_bind_filesystems_for_parent_fdo(dev, &dx.public_link, &dx.label_link)
+        try_bind_filesystems_for_parent_fdo(dev, &dx.public_link)
     };
 
     if linked {
@@ -338,12 +319,7 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
     } else {
         0
     };
-    let s = alloc::format!(
-        "claimed={};public={};label={}",
-        claimed,
-        dx.public_link,
-        dx.label_link
-    );
+    let s = alloc::format!("claimed={};public={}", claimed, dx.public_link);
     s.into_bytes().into_boxed_slice()
 }
 
@@ -380,9 +356,6 @@ pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 let dx = ext_mut::<VolFdoExt>(dev);
                 if !dx.public_link.is_empty() {
                     let _ = unsafe { pnp_remove_symlink(dx.public_link.clone()) };
-                }
-                if !dx.label_link.is_empty() {
-                    let _ = unsafe { pnp_remove_symlink(dx.label_link.clone()) };
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }

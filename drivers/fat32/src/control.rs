@@ -64,7 +64,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(
                         IoType::DeviceControl(fs_volume_dispatch),
-                        Synchronization::Sync,
+                        Synchronization::Async,
                         0,
                     );
 
