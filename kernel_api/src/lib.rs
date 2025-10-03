@@ -98,10 +98,38 @@ pub enum RequestType {
     Read { offset: u64, len: usize },
     Write { offset: u64, len: usize },
     DeviceControl(u32),
-
+    Fs(FsOp),
     Pnp,
 
     Dummy,
+}
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub enum FsOp {
+    /// data = UTF-8 path bytes; flags in Request.flags (bitfield), length may carry mode/perm
+    Create,
+    /// data = UTF-8 path bytes; flags in Request.flags (bitfield)
+    Open,
+    /// uses Request.handle
+    Close,
+    /// uses Request.handle + Request.offset/length; returns bytes in Request.data
+    Read,
+    /// uses Request.handle + Request.offset; bytes to write in Request.data
+    Write,
+    /// uses Request.handle; ensure durable
+    Flush,
+    /// uses Request.handle + Request.offset (absolute)
+    Seek,
+    /// uses Request.handle; returns serialized dir entries in Request.data
+    ReadDir,
+    /// uses Request.handle; returns serialized stat/attributes in Request.data
+    GetInfo,
+    /// uses Request.handle; takes serialized attrs in Request.data
+    SetInfo,
+    /// data = UTF-8 path bytes (or uses Request.handle if nonzero)
+    Delete,
+    /// data = "old\0new" UTF-8 bytes
+    Rename,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
