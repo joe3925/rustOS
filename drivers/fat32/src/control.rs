@@ -56,11 +56,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             match Fat32::mount(&id.volume_fdo) {
                 Ok(fs) => {
-                    println!(
-                        "Fat32 mounted for {}",
-                        id.volume_fdo.target_device.dev_node.upgrade().unwrap().name
-                    );
-
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(
                         IoType::DeviceControl(fs_volume_dispatch),
