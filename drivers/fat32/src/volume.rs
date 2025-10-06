@@ -12,7 +12,7 @@ use kernel_api::{
     FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,
     FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult,
     FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams,
-    FsWriteResult, Request, RequestType,
+    FsWriteResult, Request, RequestType, println,
 };
 
 use crate::fat32::Fat32;
@@ -73,6 +73,7 @@ pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLoc
 
             match op {
                 FsOp::Open => {
+                    println!("fs open");
                     let params: FsOpenParams = unsafe {
                         match r.data.len() {
                             n if n == size_of::<FsOpenParams>() => *bytes_to_box::<FsOpenParams>(
@@ -122,6 +123,7 @@ pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLoc
                         error: None,
                     };
                     r.data = box_to_bytes(Box::new(res));
+                    println!("fs open");
                     r.status = DriverStatus::Success;
                 }
 

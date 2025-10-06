@@ -29,10 +29,10 @@ use kernel_api::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_device_symlink_top, pnp_create_devnode_over_fdo_with_function,
             pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink, pnp_load_service,
-            pnp_remove_symlink, pnp_send_request, pnp_send_request_via_symlink,
-            pnp_wait_for_request, reg,
+            pnp_remove_symlink, pnp_send_request, pnp_send_request_via_symlink, reg,
         },
     },
+    ffi::switch_to_vfs,
     println,
 };
 
@@ -49,6 +49,9 @@ struct FsReg {
 }
 static mut FS_REGISTRY: RwLock<Vec<FsReg>> = RwLock::new(Vec::new());
 static mut FS_REGISTERED: RwLock<Vec<String>> = RwLock::new(Vec::new());
+static VFS_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static mut VOLUMES: RwLock<Vec<alloc::sync::Weak<DeviceObject>>> = RwLock::new(Vec::new());
+const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
 
 fn refresh_fs_registry_from_registry() -> usize {
     const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
@@ -241,7 +244,8 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
 
         unsafe {
             let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone());
-            pnp_wait_for_request(&req);
+            // identify completion may target another stack; using wait here is acceptable
+            kernel_api::alloc_api::ffi::pnp_wait_for_request(&req);
         }
 
         let mut w = req.write();
@@ -288,27 +292,8 @@ extern "win64" fn volclass_start(
     dev: &Arc<DeviceObject>,
     _request: Arc<RwLock<kernel_api::Request>>,
 ) -> DriverStatus {
-    let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
-    let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
-
-    {
-        let dx = ext_mut::<VolFdoExt>(dev);
-        *dx = VolFdoExt::blank();
-        dx.inst_path = inst.clone();
-        dx.public_link = make_volume_link_name(vid);
-    }
-
-    let linked = {
-        let dx = ext_mut::<VolFdoExt>(dev);
-        try_bind_filesystems_for_parent_fdo(dev, &dx.public_link)
-    };
-
-    if linked {
-        ext_mut::<VolFdoExt>(dev)
-            .fs_attached
-            .store(true, Ordering::Release);
-    }
-
+    init_volume_dx(dev);
+    mount_if_unmounted(dev);
     DriverStatus::Success
 }
 
@@ -329,7 +314,6 @@ fn string_from_req(req: &Request) -> Option<String> {
         .map(|s| s.trim_matches(char::from(0)).to_string())
 }
 
-// FDO IOCTL
 pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let code = {
         let r = req.read();
@@ -369,6 +353,7 @@ pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
         }
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry();
+            rescan_all_volumes();
             req.write().status = DriverStatus::Success;
         }
         IOCTL_MOUNTMGR_LIST_FS => {
@@ -407,6 +392,8 @@ pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwL
                     if !wr.iter().any(|s| s == &t) {
                         wr.push(t);
                     }
+                    drop(wr);
+                    rescan_all_volumes();
                     req.write().status = DriverStatus::Success;
                 },
                 _ => {
@@ -434,4 +421,205 @@ pub extern "win64" fn vol_fdo_write(
     _buf_len: usize,
 ) {
     unsafe { pnp_forward_request_to_next_lower(_dev, parent) };
+}
+
+fn dos_name_for(label: u8) -> String {
+    let c = (label as char).to_ascii_uppercase();
+    alloc::format!("DosDevices\\{}:", c)
+}
+
+fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::RegError> {
+    let _ = reg::create_key(MP_ROOT);
+    if let Ok(vals) = reg::list_values(MP_ROOT) {
+        for name in vals {
+            if let Some(kernel_api::Data::Str(s)) = reg::get_value(MP_ROOT, &name) {
+                if s == public_link {
+                    let _ = reg::delete_value(MP_ROOT, &name);
+                }
+            }
+        }
+    }
+    let _ = reg::delete_value(MP_ROOT, &dos_name_for(label));
+    reg::set_value(
+        MP_ROOT,
+        &dos_name_for(label),
+        kernel_api::Data::Str(public_link.to_string()),
+    )
+}
+
+fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
+    let len = core::mem::size_of::<T>();
+    let p = Box::into_raw(b) as *mut u8;
+    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(p, len)) }
+}
+unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
+    assert_eq!(b.len(), core::mem::size_of::<T>());
+    let p = Box::into_raw(b) as *mut u8 as *mut T;
+    Box::from_raw(p)
+}
+
+#[repr(C)]
+struct BootProbe {
+    link: String,
+    need: AtomicU32,
+    mod_ok: AtomicBool,
+    inf_ok: AtomicBool,
+    hive_ok: AtomicBool,
+}
+
+#[repr(C)]
+struct BootReqCtx {
+    probe: *mut BootProbe,
+    which: u8,
+}
+
+extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) {
+    let reqctx: Box<BootReqCtx> = unsafe { Box::from_raw(ctx as *mut BootReqCtx) };
+    let ok = if r.status == DriverStatus::Success
+        && r.data.len() == core::mem::size_of::<kernel_api::FsOpenResult>()
+    {
+        let res: kernel_api::FsOpenResult =
+            unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
+        res.error.is_none()
+    } else {
+        false
+    };
+
+    let probe = unsafe { &*reqctx.probe };
+    match reqctx.which {
+        0 => {
+            if ok {
+                probe.mod_ok.store(true, Ordering::Release);
+            }
+        }
+        1 => {
+            if ok {
+                probe.inf_ok.store(true, Ordering::Release);
+            }
+        }
+        _ => {
+            if ok {
+                probe.hive_ok.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    if probe.need.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let all = probe.mod_ok.load(Ordering::Acquire)
+            && probe.inf_ok.load(Ordering::Acquire)
+            && probe.hive_ok.load(Ordering::Acquire);
+        if all {
+            let _ = attempt_boot_bind(&probe.link);
+        }
+        unsafe {
+            drop(Box::from_raw(reqctx.probe));
+        }
+    }
+}
+
+fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut BootProbe) {
+    let params = kernel_api::FsOpenParams {
+        flags: kernel_api::OpenFlags::Open,
+        path: path.to_string(),
+    };
+    let mut req = Request::new(
+        RequestType::Fs(kernel_api::FsOp::Open),
+        box_to_bytes(Box::new(params)),
+    );
+    let ctx = Box::into_raw(Box::new(BootReqCtx {
+        probe: probe_ptr,
+        which,
+    })) as usize;
+    req.set_completion(fs_open_boot_check_complete, ctx);
+    let req = Arc::new(RwLock::new(req));
+    println!("Sending request {:#x?}", req.read().id);
+    unsafe {
+        let e = kernel_api::alloc_api::ffi::pnp_send_request_via_symlink(
+            public_link.to_string(),
+            req.clone(),
+        );
+        println!("send via symlink: {:#?}", e);
+    }
+}
+
+fn start_boot_probe_async(public_link: &str) {
+    let probe = Box::new(BootProbe {
+        link: public_link.to_string(),
+        need: AtomicU32::new(3),
+        mod_ok: AtomicBool::new(false),
+        inf_ok: AtomicBool::new(false),
+        hive_ok: AtomicBool::new(false),
+    });
+    let probe_ptr = Box::into_raw(probe);
+    println!("start probe");
+    send_fs_open_async(public_link, "\\SYSTEM\\MOD", 0, probe_ptr);
+    send_fs_open_async(public_link, "\\SYSTEM\\TOML", 1, probe_ptr);
+    send_fs_open_async(public_link, "\\SYSTEM\\REGISTRY.BIN", 2, probe_ptr);
+}
+
+fn assign_c_for(dev_link: &str) {
+    let _ = set_label_for_link(dev_link, b'C');
+    let _ = unsafe {
+        kernel_api::alloc_api::ffi::pnp_replace_symlink(
+            alloc::format!("\\GLOBAL\\DosDevices\\C:"),
+            dev_link.to_string(),
+        )
+    };
+}
+fn attempt_boot_bind(public_link: &str) -> DriverStatus {
+    if VFS_ACTIVE.load(Ordering::Acquire) {
+        return DriverStatus::Success;
+    }
+    match unsafe { switch_to_vfs() } {
+        Ok(()) => {
+            VFS_ACTIVE.store(true, Ordering::Release);
+            assign_c_for(public_link);
+            DriverStatus::Success
+        }
+        Err(_) => DriverStatus::Unsuccessful,
+    }
+}
+
+fn rescan_all_volumes() {
+    let vols = unsafe { VOLUMES.read().clone() };
+    for w in vols {
+        if let Some(dev) = w.upgrade() {
+            let dx = ext_mut::<VolFdoExt>(&dev);
+            if dx.fs_attached.load(Ordering::Acquire) {
+                continue;
+            }
+            if dx.public_link.is_empty() {
+                continue;
+            }
+
+            if try_bind_filesystems_for_parent_fdo(&dev, &dx.public_link) {
+                dx.fs_attached.store(true, Ordering::Release);
+                start_boot_probe_async(&dx.public_link);
+            }
+        }
+    }
+}
+
+fn init_volume_dx(dev: &Arc<DeviceObject>) {
+    let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
+    let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
+
+    let dx = ext_mut::<VolFdoExt>(dev);
+    *dx = VolFdoExt::blank();
+    dx.inst_path = inst;
+    dx.public_link = make_volume_link_name(vid);
+
+    unsafe { VOLUMES.write().push(Arc::downgrade(dev)) };
+}
+
+fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
+    let dx = ext_mut::<VolFdoExt>(dev);
+    if dx.fs_attached.load(Ordering::Acquire) || dx.public_link.is_empty() {
+        return;
+    }
+    if try_bind_filesystems_for_parent_fdo(dev, &dx.public_link) {
+        dx.fs_attached.store(true, Ordering::Release);
+        start_boot_probe_async(&dx.public_link);
+        println!("mounted");
+    }
 }

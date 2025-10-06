@@ -1,5 +1,6 @@
 use crate::alloc::string::ToString;
 use crate::export;
+use crate::file_system::file::switch_to_vfs;
 use crate::file_system::file::File;
 use crate::function;
 use crate::get_rva;
@@ -22,6 +23,7 @@ export! {
     wait_ms,
     create_kernel_task,
     kill_kernel_task_by_id,
+    switch_to_vfs,
 
     get_rsdp,
     get_acpi_tables,

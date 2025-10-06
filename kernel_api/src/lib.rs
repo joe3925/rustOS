@@ -929,6 +929,7 @@ pub mod ffi {
         pub fn print(s: &str);
         pub fn wait_ms(ms: u64);
         pub fn random_number() -> u64;
+        pub fn switch_to_vfs() -> Result<(), RegError>;
     }
 }
 

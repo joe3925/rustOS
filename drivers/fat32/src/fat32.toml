@@ -7,5 +7,5 @@ hwids = []
 path = "SYSTEM/CurrentControlSet/MountMgr/Filesystems/fat32"
 [registry.values]
 Service = "fat32"
-ControlLink = "\\FileSystems\\fat32"
+ControlLink = "\\GLOBAL\\FileSystems\\fat32"
 Order = 100

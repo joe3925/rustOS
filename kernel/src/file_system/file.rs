@@ -3,13 +3,21 @@
 extern crate alloc;
 
 use alloc::{
+    boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
 use core::cmp::PartialEq;
 
-use crate::file_system::file_provider::{self, FileProvider}; // shared flags + provider access
-use crate::file_system::file_structs::{FileError, FsSeekWhence};
+use crate::file_system::{
+    file_provider::provider,
+    file_structs::{FileError, FsSeekWhence},
+};
+use crate::{
+    drivers::drive::vfs::Vfs,
+    file_system::file_provider::{self, install_file_provider, FileProvider},
+    registry::{reg::rebind_and_persist_after_provider_switch, RegError},
+}; // shared flags + provider access
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -257,4 +265,81 @@ impl File {
             Some(e) => Err(file_provider::map_file_error(e)),
         }
     }
+}
+fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
+    let (res, _) = provider().list_dir_path(dir);
+    if res.error.is_none() {
+        res.names
+    } else {
+        alloc::vec::Vec::new()
+    }
+}
+
+fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]) {
+        Ok(mut f) => f.read().ok(),
+        Err(_) => None,
+    }
+}
+
+fn ensure_dir(path: &str) {
+    let _ = provider().make_dir_path(path);
+}
+
+fn file_exists(path: &str) -> bool {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+pub fn switch_to_vfs() -> Result<(), RegError> {
+    // TODO: avoid this double copy
+    let ram_mod = "C:\\SYSTEM\\MOD";
+    let ram_toml = "C:\\SYSTEM\\TOML";
+
+    let mut mod_blobs: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> =
+        alloc::vec::Vec::new();
+    for name in list(ram_mod) {
+        let p = alloc::format!("{}\\{}", ram_mod, name);
+        if let Some(bytes) = read_all(&p) {
+            mod_blobs.push((name, bytes));
+        }
+    }
+    let mut toml_blobs: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> =
+        alloc::vec::Vec::new();
+    for name in list(ram_toml) {
+        let p = alloc::format!("{}\\{}", ram_toml, name);
+        if let Some(bytes) = read_all(&p) {
+            toml_blobs.push((name, bytes));
+        }
+    }
+
+    install_file_provider(Box::new(Vfs::new()));
+
+    rebind_and_persist_after_provider_switch()?;
+
+    let vfs_mod = "C:\\SYSTEM\\MOD";
+    let vfs_toml = "C:\\SYSTEM\\TOML";
+    ensure_dir(vfs_mod);
+    ensure_dir(vfs_toml);
+
+    for (name, bytes) in mod_blobs {
+        let dst = alloc::format!("{}\\{}", vfs_mod, name);
+        if !file_exists(&dst) {
+            if let Ok(mut f) = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite]) {
+                let _ = f.write(&bytes);
+            }
+        }
+    }
+    for (name, bytes) in toml_blobs {
+        let dst = alloc::format!("{}\\{}", vfs_toml, name);
+        if !file_exists(&dst) {
+            if let Ok(mut f) = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite]) {
+                let _ = f.write(&bytes);
+            }
+        }
+    }
+
+    Ok(())
 }

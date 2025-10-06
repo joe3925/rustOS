@@ -1540,10 +1540,10 @@ impl PnpManager {
                             }
                         },
                     );
-                    if admit.is_err() {
-                        dev.queue.lock().push_back(req_arc);
-                        return;
-                    }
+                    // if admit.is_err() {
+                    //     dev.queue.lock().push_back(req_arc);
+                    //     return;
+                    // }
                     h.handler.invoke(dev, req_arc.clone());
                     h.running_request.fetch_sub(1, Ordering::Release);
                 }
@@ -1625,8 +1625,10 @@ impl PnpManager {
 
     pub fn complete_request(&self, req: &mut Request) {
         if let Some(completion) = req.completion_routine.take() {
+            println!("Completing request: {:#x?}", req.id);
             completion(req, req.completion_context);
         } else {
+            println!("Dropping request: {:#x?}", req.id)
             //TODO: handle this correctly
             // Drop for now
         }
@@ -1636,10 +1638,12 @@ impl PnpManager {
     #[inline]
     fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
         let mut dq = DISPATCH_DEVQ.lock();
-        if dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel) == 0 {
-            if !dq.iter().any(|d| Arc::ptr_eq(d, dev)) {
-                dq.push_back(dev.clone());
-            }
+        // TODO: Tickets currently do not work correctly so this slow scan is used for now
+        let mut prev = dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel);
+        prev = 0;
+        let not_listed = !dq.iter().any(|d| Arc::ptr_eq(d, dev));
+        if prev == 0 || not_listed {
+            dq.push_back(dev.clone());
         }
     }
 

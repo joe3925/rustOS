@@ -12,6 +12,7 @@ use spin::{Mutex, RwLock};
 use crate::{
     console::CONSOLE,
     drivers::{
+        drive::vfs::Vfs,
         driver_install::DriverError,
         interrupt_index::wait_millis,
         pnp::{
@@ -23,9 +24,15 @@ use crate::{
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
     },
-    file_system::file::{File, FileStatus, OpenFlags},
+    file_system::{
+        file::{File, FileStatus, OpenFlags},
+        file_provider::install_file_provider,
+    },
     memory::{allocator::ALLOCATOR, paging::constants::KERNEL_STACK_SIZE},
-    registry::{reg, Data, RegError},
+    registry::{
+        reg::{self, rebind_and_persist_after_provider_switch},
+        Data, RegDelta, RegError,
+    },
     scheduling::{
         scheduler::{TaskError, SCHEDULER},
         task::Task,

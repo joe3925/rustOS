@@ -46,6 +46,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
     match code {
         IOCTL_FS_IDENTIFY => {
+            println!("identify fat32");
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
                 r.status = DriverStatus::InvalidParameter;
@@ -56,10 +57,11 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             match Fat32::mount(&id.volume_fdo) {
                 Ok(fs) => {
+                    println!("ok");
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(
                         IoType::DeviceControl(fs_volume_dispatch),
-                        Synchronization::Async,
+                        Synchronization::Sync,
                         0,
                     );
 
@@ -80,6 +82,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     r.status = DriverStatus::Success;
                 }
                 Err(_) => {
+                    println!("no");
                     id.mount_device = None;
                     id.can_mount = false;
                     r.status = DriverStatus::Success;

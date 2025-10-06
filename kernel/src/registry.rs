@@ -53,9 +53,7 @@ impl From<crate::file_system::file::FileStatus> for RegError {
 }
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Key {
-    /// name → Data
     pub values: BTreeMap<String, Data>,
-    /// sub-key name → Key
     pub sub_keys: BTreeMap<String, Key>,
 }
 
@@ -66,6 +64,24 @@ impl Key {
             sub_keys: BTreeMap::new(),
         }
     }
+}
+#[derive(Debug, Clone)]
+pub enum RegDelta {
+    CreateKey {
+        path: String,
+    },
+    DeleteKey {
+        path: String,
+    },
+    SetValue {
+        key_path: String,
+        name: String,
+        data: Data,
+    },
+    DeleteValue {
+        key_path: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
@@ -370,6 +386,90 @@ pub mod reg {
             out.push(join(base_norm, val_name));
         }
         Ok(out)
+    }
+    fn load_from_disk() -> Option<super::Registry> {
+        use bincode::config::standard;
+        if let Ok(mut f) = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]) {
+            if let Ok(buf) = f.read() {
+                if let Ok((r, _)) =
+                    bincode::decode_from_slice::<super::Registry, _>(&buf, standard())
+                {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
+    fn diff_maps(base_path: &str, from: &super::Key, to: &super::Key, out: &mut Vec<RegDelta>) {
+        for (k, v_to) in &to.values {
+            match from.values.get(k) {
+                Some(v_from) if v_from == v_to => {}
+                _ => out.push(RegDelta::SetValue {
+                    key_path: base_path.to_string(),
+                    name: k.clone(),
+                    data: v_to.clone(),
+                }),
+            }
+        }
+        for k in from.values.keys() {
+            if !to.values.contains_key(k) {
+                out.push(RegDelta::DeleteValue {
+                    key_path: base_path.to_string(),
+                    name: k.clone(),
+                });
+            }
+        }
+
+        // subkeys
+        for (name, sub_to) in &to.sub_keys {
+            let child_path = if base_path.is_empty() {
+                name.clone()
+            } else {
+                alloc::format!("{}/{}", base_path, name)
+            };
+
+            if let Some(sub_from) = from.sub_keys.get(name) {
+                diff_maps(&child_path, sub_from, sub_to, out);
+            } else {
+                out.push(RegDelta::CreateKey {
+                    path: child_path.clone(),
+                });
+                diff_maps(&child_path, &super::Key::empty(), sub_to, out);
+            }
+        }
+        for (name, _) in &from.sub_keys {
+            if !to.sub_keys.contains_key(name) {
+                let child_path = if base_path.is_empty() {
+                    name.clone()
+                } else {
+                    alloc::format!("{}/{}", base_path, name)
+                };
+                out.push(RegDelta::DeleteKey { path: child_path });
+            }
+        }
+    }
+
+    pub fn diff_registry(from: &super::Registry, to: &super::Registry) -> Vec<RegDelta> {
+        let mut root_from = super::Key::empty();
+        root_from.sub_keys = from.root.clone();
+        let mut root_to = super::Key::empty();
+        root_to.sub_keys = to.root.clone();
+
+        let mut out = Vec::new();
+        diff_maps("", &root_from, &root_to, &mut out);
+        out
+    }
+
+    pub fn rebind_and_persist_after_provider_switch() -> Result<(), super::RegError> {
+        ensure_loaded();
+        let current = (**REGISTRY.read()).clone();
+
+        let on_disk = load_from_disk().unwrap_or_else(super::Registry::empty);
+        let deltas = diff_registry(&on_disk, &current);
+
+        persist(&current)?;
+        Ok(())
     }
 }
 pub fn is_first_boot() -> bool {

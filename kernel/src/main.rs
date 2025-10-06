@@ -164,7 +164,7 @@ pub fn test_runner(tests: &[&dyn Fn()]) {
     }
 }
 const fn get_rva(addr: usize) -> usize {
-    let base = 0xFFFF_8500_0000_0000usize; // your known kernel base
+    let base = 0xFFFF_8500_0000_0000usize;
     addr - base
 }
 #[macro_export]

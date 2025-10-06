@@ -10,6 +10,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::{Lazy, RwLock};
 
 use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
+use crate::file_system::file::OpenFlags;
+use crate::file_system::file_provider::FileProvider;
 use crate::file_system::file_structs::FsReadParams;
 use crate::file_system::file_structs::{
     FileError, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
@@ -18,6 +20,8 @@ use crate::file_system::file_structs::{
     FsSeekResult, FsWriteParams, FsWriteResult,
 };
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
+use lazy_static::lazy_static;
+
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
     pub label: String,
@@ -606,4 +610,85 @@ impl Vfs {
         }
     }
 }
-pub static VFS: Lazy<Vfs> = Lazy::new(|| Vfs::new());
+impl FileProvider for Vfs {
+    fn open_path(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
+        let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
+        self.open(FsOpenParams {
+            flags: f,
+            path: path.to_string(),
+        })
+    }
+
+    fn close_handle(&self, file_id: u64) -> (FsCloseResult, DriverStatus) {
+        self.close(FsCloseParams {
+            fs_file_id: file_id,
+        })
+    }
+
+    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus) {
+        self.read(FsReadParams {
+            fs_file_id: file_id,
+            offset,
+            len: len as usize,
+        })
+    }
+
+    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus) {
+        self.write(FsWriteParams {
+            fs_file_id: file_id,
+            offset,
+            data: data.to_vec(),
+        })
+    }
+
+    fn flush_handle(&self, file_id: u64) -> (FsFlushResult, DriverStatus) {
+        self.flush(FsFlushParams {
+            fs_file_id: file_id,
+        })
+    }
+
+    fn get_info(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
+        self.get_info(FsGetInfoParams {
+            fs_file_id: file_id,
+        })
+    }
+
+    fn list_dir_path(&self, path: &str) -> (FsListDirResult, DriverStatus) {
+        self.list_dir(FsListDirParams {
+            path: path.to_string(),
+        })
+    }
+
+    fn make_dir_path(&self, path: &str) -> (FsCreateResult, DriverStatus) {
+        self.create(FsCreateParams {
+            path: path.to_string(),
+            dir: true,
+            flags: OpenFlags::Create,
+        })
+    }
+
+    fn remove_dir_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
+        (
+            FsCreateResult {
+                error: Some(FileError::Unsupported),
+            },
+            DriverStatus::Success,
+        )
+    }
+
+    fn rename_path(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus) {
+        self.rename(FsRenameParams {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        })
+    }
+
+    fn delete_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
+        (
+            FsCreateResult {
+                error: Some(FileError::Unsupported),
+            },
+            DriverStatus::Success,
+        )
+    }
+}

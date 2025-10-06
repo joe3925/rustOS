@@ -66,7 +66,6 @@ pub unsafe fn init() {
         PICS.lock().initialize();
 
         load_idt();
-        println!("PIC loaded");
         syscall_init();
 
         // TSC calibration
