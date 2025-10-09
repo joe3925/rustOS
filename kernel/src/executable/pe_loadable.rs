@@ -1,8 +1,7 @@
 use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
-use crate::file_system::fat::FileSystem;
-use crate::file_system::file::{File, OpenFlags};
+use crate::file_system::file::{file_parser, File, OpenFlags};
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
@@ -160,10 +159,7 @@ impl PELoader {
                 self.resolve_imports(program);
                 self.patch_imports(program);
                 let module = Module {
-                    title: FileSystem::file_parser(&self.path)
-                        .last()
-                        .unwrap()
-                        .to_string(),
+                    title: file_parser(&self.path).last().unwrap().to_string(),
                     image_path: self.path.clone(),
                     parent_pid: program.pid,
                     image_base: self.current_base,
@@ -187,10 +183,7 @@ impl PELoader {
             self.resolve_imports(program);
             self.patch_imports(program);
             let module = Module {
-                title: FileSystem::file_parser(&self.path)
-                    .last()
-                    .unwrap()
-                    .to_string(),
+                title: file_parser(&self.path).last().unwrap().to_string(),
                 image_path: self.path.clone(),
                 parent_pid: program.pid,
                 image_base: self.current_base,
@@ -261,10 +254,7 @@ impl PELoader {
         let heap_size = opt_hdr.windows_fields.size_of_heap_reserve;
         let heap_addr = self.current_base + image_size + 0x1000 + stack_size + 0x10;
 
-        let title = FileSystem::file_parser(&self.path)
-            .last()
-            .unwrap()
-            .to_string();
+        let title = file_parser(&self.path).last().unwrap().to_string();
 
         let mut program = Program::new(
             title,

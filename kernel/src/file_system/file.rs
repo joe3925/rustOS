@@ -290,7 +290,6 @@ fn file_exists(path: &str) -> bool {
 }
 
 pub fn switch_to_vfs() -> Result<(), RegError> {
-    PNP_MANAGER.print_device_tree();
     // TODO: avoid this double copy
     let ram_mod = "C:\\SYSTEM\\MOD";
     let ram_toml = "C:\\SYSTEM\\TOML";
@@ -339,4 +338,7 @@ pub fn switch_to_vfs() -> Result<(), RegError> {
     }
 
     Ok(())
+}
+pub(crate) fn file_parser(path: &str) -> Vec<&str> {
+    path.trim_start_matches('\\').split('\\').collect()
 }

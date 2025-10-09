@@ -1,7 +1,4 @@
 use crate::drivers;
-use crate::drivers::drive::ide_disk_driver::{
-    primary_drive_irq_handler, secondary_drive_irq_handler,
-};
 use crate::drivers::kbd_driver::keyboard_interrupt_handler;
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
@@ -36,8 +33,6 @@ lazy_static! {
         //hardware interrupts
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_addr(VirtAddr::new(timer_interrupt_entry as u64)).set_stack_index(TIMER_IST_INDEX);
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
-        idt[drivers::interrupt_index::InterruptIndex::PrimaryDrive.as_u8()].set_handler_fn(primary_drive_irq_handler);
-        idt[drivers::interrupt_index::InterruptIndex::SecondaryDrive.as_u8()].set_handler_fn(secondary_drive_irq_handler);
 
 
         idt
