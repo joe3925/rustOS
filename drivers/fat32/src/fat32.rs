@@ -397,6 +397,7 @@ impl Fat32 {
         out: &mut [u8],
     ) -> Result<(), FileStatus> {
         if first_cluster < 2 || cluster_count == 0 {
+            println!("Corrupt fat read");
             return Err(FileStatus::CorruptFat);
         }
         let sectors = (self.params.spc as usize)
@@ -418,6 +419,10 @@ impl Fat32 {
         data: &[u8],
     ) -> Result<(), FileStatus> {
         if first_cluster < 2 || cluster_count == 0 {
+            println!(
+                "Corrupt fat write cluster count: {}, first cluster: {},",
+                first_cluster, cluster_count
+            );
             return Err(FileStatus::CorruptFat);
         }
         let sectors = (self.params.spc as usize)
@@ -1281,6 +1286,7 @@ impl Fat32 {
                 break;
             }
             if next == 0x0FFF_FFF7 {
+                println!("Corrupt fat table");
                 return Err(FileStatus::CorruptFat);
             }
             if next < 2 {

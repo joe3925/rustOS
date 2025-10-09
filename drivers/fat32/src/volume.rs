@@ -62,9 +62,8 @@ fn fe_from_fs(s: FileStatus) -> FileError {
     }
 }
 
-pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let kind = { req.read().kind };
-
     match kind {
         RequestType::Fs(op) => {
             let mut r = req.write();
@@ -73,7 +72,6 @@ pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLoc
 
             match op {
                 FsOp::Open => {
-                    println!("fs open");
                     let params: FsOpenParams = unsafe {
                         match r.data.len() {
                             n if n == size_of::<FsOpenParams>() => *bytes_to_box::<FsOpenParams>(
@@ -110,7 +108,7 @@ pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLoc
                     vdx.table.write().insert(
                         id,
                         FileCtx {
-                            path: params.path,
+                            path: params.path.clone(),
                             is_dir,
                             pos: 0,
                         },
@@ -123,7 +121,6 @@ pub extern "win64" fn fs_volume_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLoc
                         error: None,
                     };
                     r.data = box_to_bytes(Box::new(res));
-                    println!("fs open");
                     r.status = DriverStatus::Success;
                 }
 

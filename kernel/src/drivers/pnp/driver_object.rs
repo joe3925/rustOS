@@ -128,6 +128,7 @@ pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<R
 pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
 pub type EvtDeviceEnumerateDevices =
     extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -250,12 +251,14 @@ pub enum FsOp {
     /// data = "old\0new" UTF-8 bytes
     Rename,
 }
+
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub enum IoType {
     Read(EvtIoRead),
     Write(EvtIoWrite),
     DeviceControl(EvtIoDeviceControl),
+    Fs(EvtIoFs),
 }
 impl IoType {
     #[inline]
@@ -264,8 +267,10 @@ impl IoType {
             IoType::Read(_) => 0,
             IoType::Write(_) => 1,
             IoType::DeviceControl(_) => 2,
+            IoType::Fs(_) => 3,
         }
     }
+
     #[inline]
     pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
         match *self {
@@ -274,6 +279,7 @@ impl IoType {
                 h(dev, req, len);
             }
             IoType::DeviceControl(h) => h(dev, req),
+            IoType::Fs(h) => h(dev, req),
         }
     }
 
@@ -283,6 +289,7 @@ impl IoType {
             RequestType::Read { .. } => Some(0),
             RequestType::Write { .. } => Some(1),
             RequestType::DeviceControl(_) => Some(2),
+            RequestType::Fs(_) => Some(3),
             _ => None,
         }
     }

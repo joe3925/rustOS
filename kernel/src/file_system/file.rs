@@ -9,15 +9,18 @@ use alloc::{
 };
 use core::cmp::PartialEq;
 
-use crate::file_system::{
-    file_provider::provider,
-    file_structs::{FileError, FsSeekWhence},
-};
 use crate::{
     drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
     registry::{reg::rebind_and_persist_after_provider_switch, RegError},
-}; // shared flags + provider access
+};
+use crate::{
+    drivers::pnp::pnp_manager::PNP_MANAGER,
+    file_system::{
+        file_provider::provider,
+        file_structs::{FileError, FsSeekWhence},
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -61,15 +64,15 @@ pub enum OpenFlags {
     Open,      // open only if exists
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum FileStatus {
     Success = 0x00,
     FileAlreadyExist = 0x01,
     PathNotFound = 0x02,
     UnknownFail = 0x03,
-    NotFat = 0x04, // Kept for compatibility; maps to generic "Unsupported" in provider world
-    DriveNotFound, // Kept for compatibility; label resolution handled by provider
+    NotFat = 0x04,
+    DriveNotFound,
     IncompatibleFlags,
     CorruptFat,
     InternalError,
@@ -97,8 +100,6 @@ impl PartialEq for FileStatus {
     }
 }
 
-/// Public façade: now a VFS-style handle that delegates to the active FileProvider.
-/// Same function names as before.
 #[derive(Debug)]
 pub struct File {
     fs_file_id: u64,
@@ -108,8 +109,6 @@ pub struct File {
 }
 
 impl File {
-    // --------- helpers (unchanged signatures/semantics) ---------
-
     pub extern "win64" fn remove_drive_from_path(path: &str) -> &str {
         let b = path.as_bytes();
         if b.len() >= 2 && b[1] == b':' {
@@ -162,10 +161,7 @@ impl File {
         Ok(())
     }
 
-    // --------- open/close ---------
-
     pub extern "win64" fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
-        // Provider resolves labels/mounts; we just forward
         let (res, st) = file_provider::provider().open_path(path, flags);
         if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -294,6 +290,7 @@ fn file_exists(path: &str) -> bool {
 }
 
 pub fn switch_to_vfs() -> Result<(), RegError> {
+    PNP_MANAGER.print_device_tree();
     // TODO: avoid this double copy
     let ram_mod = "C:\\SYSTEM\\MOD";
     let ram_toml = "C:\\SYSTEM\\TOML";

@@ -27,9 +27,10 @@ use kernel_api::{
         DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
-            pnp_create_device_symlink_top, pnp_create_devnode_over_fdo_with_function,
-            pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink, pnp_load_service,
-            pnp_remove_symlink, pnp_send_request, pnp_send_request_via_symlink, reg,
+            pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
+            pnp_create_symlink, pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink,
+            pnp_load_service, pnp_remove_symlink, pnp_send_request, pnp_send_request_via_symlink,
+            reg,
         },
     },
     ffi::switch_to_vfs,
@@ -54,45 +55,63 @@ static mut VOLUMES: RwLock<Vec<alloc::sync::Weak<DeviceObject>>> = RwLock::new(V
 const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
 
 fn refresh_fs_registry_from_registry() -> usize {
-    const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
-    let mut add: Vec<FsReg> = Vec::new();
+    use alloc::collections::{BTreeMap, BTreeSet};
 
+    const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
+
+    let (old_regs, old_svcs): (Vec<FsReg>, BTreeSet<String>) = unsafe {
+        let rd = FS_REGISTRY.read();
+        let svcs = rd.iter().map(|r| r.svc.clone()).collect();
+        (rd.clone(), svcs)
+    };
+
+    let mut by_tag: BTreeMap<String, FsReg> = BTreeMap::new();
     if let Ok(keys) = reg::list_keys(ROOT) {
         for sub in keys {
             let svc = match reg::get_value(&sub, "Service") {
                 Some(Data::Str(s)) if !s.is_empty() => s,
                 _ => continue,
             };
-            let link = match reg::get_value(&sub, "ControlLink") {
+            let tag = match reg::get_value(&sub, "ControlLink") {
                 Some(Data::Str(s)) if !s.is_empty() => s,
                 _ => continue,
             };
-            let order = match reg::get_value(&sub, "Order") {
+            let ord = match reg::get_value(&sub, "Order") {
                 Some(Data::U32(v)) => v,
                 _ => 100,
             };
-            let _ = unsafe { pnp_load_service(svc.clone()) };
-            add.push(FsReg {
-                svc,
-                tag: link,
-                ord: order,
-            });
+            by_tag.entry(tag.clone()).or_insert(FsReg { svc, tag, ord });
         }
     }
+    let mut fresh: Vec<FsReg> = by_tag.into_values().collect();
+    fresh.sort_by(|a, b| a.ord.cmp(&b.ord).then_with(|| a.tag.cmp(&b.tag)));
 
-    add.sort_by(|a, b| a.ord.cmp(&b.ord).then_with(|| a.tag.cmp(&b.tag)));
-
-    let mut added = 0usize;
-    unsafe {
-        let mut wr = FS_REGISTRY.write();
-        for r in add {
-            if !wr.iter().any(|e| e.tag == r.tag) {
-                wr.push(r);
-                added += 1;
+    let new_svcs: Vec<String> = {
+        let mut v = Vec::new();
+        for r in &fresh {
+            if !old_svcs.contains(&r.svc) {
+                v.push(r.svc.clone());
             }
         }
+        v
+    };
+
+    unsafe {
+        *FS_REGISTRY.write() = fresh;
     }
-    added
+
+    for s in new_svcs {
+        let _ = unsafe { pnp_load_service(s) };
+    }
+
+    let old_tags: BTreeSet<&str> = old_regs.iter().map(|r| r.tag.as_str()).collect();
+    unsafe {
+        FS_REGISTRY
+            .read()
+            .iter()
+            .filter(|r| !old_tags.contains(r.tag.as_str()))
+            .count()
+    }
 }
 
 fn list_fs_blob() -> Box<[u8]> {
@@ -114,6 +133,7 @@ fn list_fs_blob() -> Box<[u8]> {
 struct VolFdoExt {
     inst_path: String,
     public_link: String,
+    fs_link: String,
     fs_attached: AtomicBool,
 }
 impl VolFdoExt {
@@ -121,6 +141,7 @@ impl VolFdoExt {
         Self {
             inst_path: String::new(),
             public_link: String::new(),
+            fs_link: String::new(),
             fs_attached: AtomicBool::new(false),
         }
     }
@@ -209,13 +230,18 @@ fn svc_for_tag(tag: &str) -> Option<String> {
     }
 }
 
-fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_link: &str) -> bool {
+fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, _unused: &str) -> bool {
     let _ = refresh_fs_registry_from_registry();
 
     let vid = NEXT_VOL_ID.load(Ordering::Acquire);
     let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
-    let parent_inst = parent_fdo.dev_node.upgrade().unwrap().instance_path.clone();
-    let instance_path = alloc::format!("{}\\{}", parent_inst, inst_suffix);
+    let parent_dn = match parent_fdo.dev_node.upgrade() {
+        Some(x) => x,
+        None => return false,
+    };
+    let parent_inst = parent_dn.instance_path.clone();
+    let fs_inst = alloc::format!("{}\\{}", parent_inst, inst_suffix);
+
     let ids = DeviceIds {
         hardware: vec![alloc::format!("VIRT\\FSINST#{}", inst_suffix)],
         compatible: Vec::new(),
@@ -241,10 +267,8 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
             RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
             data,
         )));
-
         unsafe {
             let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone());
-            // identify completion may target another stack; using wait here is acceptable
             kernel_api::alloc_api::ffi::pnp_wait_for_request(&req);
         }
 
@@ -266,20 +290,38 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
             None => continue,
         };
 
-        match unsafe {
-            pnp_create_devnode_over_fdo_with_function(
-                &parent_fdo.clone(),
-                instance_path.clone(),
+        let created = unsafe {
+            pnp_create_devnode_over_pdo_with_function(
+                &parent_dn,
+                fs_inst.clone(),
                 ids.clone(),
                 class.clone(),
                 &svc,
                 &function_fdo.clone(),
+                DeviceInit {
+                    dev_ext_size: 0,
+                    io_vtable: IoVtable::new(),
+                    pnp_vtable: None,
+                },
             )
-        } {
-            Ok((_dn, _top)) => {
+        };
+
+        match created {
+            Ok((dn, _top)) => {
+                let primary_link = make_volume_link_name(vid);
+
+                let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
+
                 let _ = unsafe {
-                    pnp_create_device_symlink_top(instance_path.clone(), public_link.to_string())
+                    pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone())
                 };
+                let _ = unsafe {
+                    pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone())
+                };
+
+                let dx = ext_mut::<VolFdoExt>(parent_fdo);
+                dx.fs_link = primary_link;
+
                 return true;
             }
             Err(_) => continue,
@@ -304,7 +346,12 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
     } else {
         0
     };
-    let s = alloc::format!("claimed={};public={}", claimed, dx.public_link);
+    let link = if !dx.fs_link.is_empty() {
+        &dx.fs_link
+    } else {
+        &dx.public_link
+    };
+    let s = alloc::format!("claimed={};public={}", claimed, link);
     s.into_bytes().into_boxed_slice()
 }
 
@@ -423,9 +470,9 @@ pub extern "win64" fn vol_fdo_write(
     unsafe { pnp_forward_request_to_next_lower(_dev, parent) };
 }
 
-fn dos_name_for(label: u8) -> String {
+fn dev_name_for(label: u8) -> String {
     let c = (label as char).to_ascii_uppercase();
-    alloc::format!("DosDevices\\{}:", c)
+    alloc::format!("StorageDevices\\{}:", c)
 }
 
 fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::RegError> {
@@ -439,10 +486,10 @@ fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::Re
             }
         }
     }
-    let _ = reg::delete_value(MP_ROOT, &dos_name_for(label));
+    let _ = reg::delete_value(MP_ROOT, &dev_name_for(label));
     reg::set_value(
         MP_ROOT,
-        &dos_name_for(label),
+        &dev_name_for(label),
         kernel_api::Data::Str(public_link.to_string()),
     )
 }
@@ -465,8 +512,9 @@ struct BootProbe {
     mod_ok: AtomicBool,
     inf_ok: AtomicBool,
     hive_ok: AtomicBool,
-}
 
+    inst_path: String,
+}
 #[repr(C)]
 struct BootReqCtx {
     probe: *mut BootProbe,
@@ -503,13 +551,12 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) {
             }
         }
     }
-
     if probe.need.fetch_sub(1, Ordering::AcqRel) == 1 {
         let all = probe.mod_ok.load(Ordering::Acquire)
             && probe.inf_ok.load(Ordering::Acquire)
             && probe.hive_ok.load(Ordering::Acquire);
         if all {
-            let _ = attempt_boot_bind(&probe.link);
+            let _ = attempt_boot_bind(&probe.inst_path, &probe.link);
         }
         unsafe {
             drop(Box::from_raw(reqctx.probe));
@@ -532,51 +579,57 @@ fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut 
     })) as usize;
     req.set_completion(fs_open_boot_check_complete, ctx);
     let req = Arc::new(RwLock::new(req));
-    println!("Sending request {:#x?}", req.read().id);
     unsafe {
         let e = kernel_api::alloc_api::ffi::pnp_send_request_via_symlink(
             public_link.to_string(),
             req.clone(),
         );
-        println!("send via symlink: {:#?}", e);
     }
 }
 
-fn start_boot_probe_async(public_link: &str) {
+fn start_boot_probe_async(public_link: &str, inst_path: &str) {
     let probe = Box::new(BootProbe {
         link: public_link.to_string(),
         need: AtomicU32::new(3),
         mod_ok: AtomicBool::new(false),
         inf_ok: AtomicBool::new(false),
         hive_ok: AtomicBool::new(false),
+        inst_path: inst_path.to_string(),
     });
     let probe_ptr = Box::into_raw(probe);
-    println!("start probe");
     send_fs_open_async(public_link, "\\SYSTEM\\MOD", 0, probe_ptr);
     send_fs_open_async(public_link, "\\SYSTEM\\TOML", 1, probe_ptr);
     send_fs_open_async(public_link, "\\SYSTEM\\REGISTRY.BIN", 2, probe_ptr);
 }
+fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
+    let ch = (letter as char).to_ascii_uppercase();
+    if ch < 'A' || ch > 'Z' {
+        return;
+    }
 
-fn assign_c_for(dev_link: &str) {
-    let _ = set_label_for_link(dev_link, b'C');
-    let _ = unsafe {
-        kernel_api::alloc_api::ffi::pnp_replace_symlink(
-            alloc::format!("\\GLOBAL\\DosDevices\\C:"),
-            dev_link.to_string(),
-        )
-    };
+    let _ = set_label_for_link(fs_mount_link, ch as u8);
+
+    let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
+    let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
+
+    let _ = unsafe { pnp_remove_symlink(link_nocolon.clone()) };
+    let _ = unsafe { pnp_remove_symlink(link_colon.clone()) };
+
+    let _ = unsafe { pnp_create_symlink(link_nocolon, fs_mount_link.to_string()) };
+    let _ = unsafe { pnp_create_symlink(link_colon, fs_mount_link.to_string()) };
 }
-fn attempt_boot_bind(public_link: &str) -> DriverStatus {
+fn attempt_boot_bind(dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus {
     if VFS_ACTIVE.load(Ordering::Acquire) {
         return DriverStatus::Success;
     }
+    assign_drive_letter(b'C', fs_mount_link);
     match unsafe { switch_to_vfs() } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
-            assign_c_for(public_link);
+            println!("System volume found!");
             DriverStatus::Success
         }
-        Err(_) => DriverStatus::Unsuccessful,
+        Err(e) => panic!("VFS transition failed with err {:#?}", e),
     }
 }
 
@@ -594,12 +647,17 @@ fn rescan_all_volumes() {
 
             if try_bind_filesystems_for_parent_fdo(&dev, &dx.public_link) {
                 dx.fs_attached.store(true, Ordering::Release);
-                start_boot_probe_async(&dx.public_link);
+                let link = if !dx.fs_link.is_empty() {
+                    dx.fs_link.clone()
+                } else {
+                    dx.public_link.clone()
+                };
+                let inst = dx.inst_path.clone();
+                start_boot_probe_async(&link, &inst);
             }
         }
     }
 }
-
 fn init_volume_dx(dev: &Arc<DeviceObject>) {
     let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
     let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
@@ -608,10 +666,19 @@ fn init_volume_dx(dev: &Arc<DeviceObject>) {
     *dx = VolFdoExt::blank();
     dx.inst_path = inst;
     dx.public_link = make_volume_link_name(vid);
+    dx.fs_link.clear();
 
-    unsafe { VOLUMES.write().push(Arc::downgrade(dev)) };
+    unsafe {
+        let mut v = VOLUMES.write();
+        v.retain(|w| w.strong_count() > 0);
+        if !v
+            .iter()
+            .any(|w| w.upgrade().map_or(false, |d| Arc::ptr_eq(&d, dev)))
+        {
+            v.push(Arc::downgrade(dev));
+        }
+    }
 }
-
 fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
     let dx = ext_mut::<VolFdoExt>(dev);
     if dx.fs_attached.load(Ordering::Acquire) || dx.public_link.is_empty() {
@@ -619,7 +686,12 @@ fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
     }
     if try_bind_filesystems_for_parent_fdo(dev, &dx.public_link) {
         dx.fs_attached.store(true, Ordering::Release);
-        start_boot_probe_async(&dx.public_link);
-        println!("mounted");
+        let link = if !dx.fs_link.is_empty() {
+            dx.fs_link.clone()
+        } else {
+            dx.public_link.clone()
+        };
+        let inst = dx.inst_path.clone();
+        start_boot_probe_async(&link, &inst);
     }
 }

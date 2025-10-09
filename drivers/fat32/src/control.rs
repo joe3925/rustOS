@@ -9,9 +9,9 @@ use spin::RwLock;
 
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, FsIdentify, IOCTL_FS_IDENTIFY,
-    IOCTL_MOUNTMGR_REGISTER_FS, Request, RequestType,
+    IOCTL_MOUNTMGR_REGISTER_FS, PnpMinorFunction, Request, RequestType,
     alloc_api::{
-        DeviceInit, IoType, IoVtable, Synchronization,
+        DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_wait_for_request,
@@ -21,7 +21,7 @@ use kernel_api::{
 };
 
 use crate::volume::VolCtrlDevExt;
-use crate::{fat32::Fat32, volume::fs_volume_dispatch};
+use crate::{fat32::Fat32, volume::fs_op_dispatch};
 
 #[repr(C)]
 struct CtrlDevExt;
@@ -46,7 +46,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
     match code {
         IOCTL_FS_IDENTIFY => {
-            println!("identify fat32");
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
                 r.status = DriverStatus::InvalidParameter;
@@ -57,14 +56,9 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             match Fat32::mount(&id.volume_fdo) {
                 Ok(fs) => {
-                    println!("ok");
                     let mut io_vtable = IoVtable::new();
-                    io_vtable.set(
-                        IoType::DeviceControl(fs_volume_dispatch),
-                        Synchronization::Sync,
-                        0,
-                    );
 
+                    io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
                     let mut init = DeviceInit {
                         dev_ext_size: size_of::<VolCtrlDevExt>(),
                         io_vtable,
@@ -82,7 +76,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     r.status = DriverStatus::Success;
                 }
                 Err(_) => {
-                    println!("no");
                     id.mount_device = None;
                     id.can_mount = false;
                     r.status = DriverStatus::Success;
@@ -94,7 +87,13 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
         }
     }
 }
-
+#[unsafe(no_mangle)]
+pub extern "win64" fn fat_start(
+    dev: &Arc<DeviceObject>,
+    _req: Arc<spin::rwlock::RwLock<Request>>,
+) -> DriverStatus {
+    DriverStatus::Success
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };

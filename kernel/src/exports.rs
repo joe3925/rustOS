@@ -66,7 +66,7 @@ export! {
     pnp_wait_for_request,
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
-    pnp_create_devnode_over_fdo_with_function,
+    pnp_create_devnode_over_pdo_with_function,
     InvalidateDeviceRelations,
 
     driver_get_name,

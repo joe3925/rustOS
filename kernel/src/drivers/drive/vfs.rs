@@ -19,6 +19,7 @@ use crate::file_system::file_structs::{
     FsOpenParams, FsOpenResult, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams,
     FsSeekResult, FsWriteParams, FsWriteResult,
 };
+use crate::println;
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
 use lazy_static::lazy_static;
 
@@ -29,15 +30,13 @@ pub struct MountedVolume {
     pub object_name: String,
 }
 
-/// Internal handle tracked by VFS (maps VFS handle -> underlying FS handle + symlink)
 #[derive(Clone)]
 struct VfsHandle {
     pub volume_symlink: String,
-    pub inner_id: u64, // FS-specific handle id returned by the filesystem driver
+    pub inner_id: u64,
     pub is_dir: bool,
 }
 
-/// The Virtual File System front-end.
 /// - Resolves labels to mount symlinks
 /// - Forwards FsOps to the appropriate filesystem driver device via its symlink
 /// - Maintains per-process (or system-wide) handle table mapping VFS handles to FS handles
@@ -175,9 +174,13 @@ impl Vfs {
             return None;
         }
         if let Some((_, leaf)) = label_link.rsplit_once('\\') {
-            if !leaf.is_empty() {
-                return Some(alloc::format!("{}:", leaf));
+            if leaf.is_empty() {
+                return None;
             }
+            if leaf.chars().all(|c| c.is_ascii_digit()) {
+                return Some(alloc::format!("VOL{:0>4}:", leaf));
+            }
+            return Some(alloc::format!("{}:", leaf));
         }
         None
     }
@@ -193,7 +196,7 @@ impl Vfs {
         alloc::format!("VOL{}:", map.len() + 1)
     }
 
-    // TODO: Ask the volume for a persistent friendly label (e.g., FAT volume label).
+    // TODO: Ask the volume for a persistent friendly label
     fn query_persistent_label(&self, _mount_symlink: &str) -> Option<String> {
         None
     }
@@ -217,28 +220,24 @@ impl Vfs {
             return Err(FileError::BadPath);
         }
 
-        // Case 1: raw symlink path prefix
-        const GLOBAL_PREFIX: &str = "\\GLOBAL\\Mounts\\";
-        if user_path.starts_with(GLOBAL_PREFIX) {
-            // Split first component as the symlink path base
-            // e.g. "\GLOBAL\Mounts\VOL0001\foo\bar"
-            let mut parts = user_path.splitn(4, '\\'); // ["", "GLOBAL", "Mounts", "VOL0001\foo\bar"]
-            let _ = parts.next(); // ""
+        const VOL_PREFIX: &str = "\\GLOBAL\\Volumes\\";
+        if user_path.starts_with(VOL_PREFIX) {
+            let mut parts = user_path.splitn(4, '\\');
+            let _ = parts.next();
             let g = parts.next().unwrap_or("");
-            let m = parts.next().unwrap_or("");
-            let rest = parts.next().unwrap_or(""); // "VOL0001\foo\bar" (or "")
-
-            if g != "GLOBAL" || m != "Mounts" {
+            let v = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("");
+            if g != "GLOBAL" || v != "Volumes" {
                 return Err(FileError::BadPath);
             }
             let (mount, tail) = match rest.split_once('\\') {
                 Some((a, b)) => (a, b),
-                None => (rest, ""), // root of the mount
+                None => (rest, ""),
             };
             if mount.is_empty() {
                 return Err(FileError::BadPath);
             }
-            let symlink = alloc::format!("{}{}", GLOBAL_PREFIX, mount);
+            let symlink = alloc::format!("{}{}", VOL_PREFIX, mount);
             let fs_path = if tail.is_empty() {
                 "\\".to_string()
             } else {
@@ -248,10 +247,8 @@ impl Vfs {
         }
 
         if let Some(colon_pos) = user_path.find(':') {
-            let (label, tail0) = user_path.split_at(colon_pos + 1); // includes ':'
-                                                                    // Normalize fs path: must start with '\'
+            let (label, tail0) = user_path.split_at(colon_pos + 1);
             let mut fs_path = if tail0.len() > 1 {
-                // tail0 starts with ":\something" because split_at included ':'
                 let after_colon = &tail0[1..];
                 if after_colon.starts_with('\\') {
                     after_colon.to_string()
@@ -262,12 +259,11 @@ impl Vfs {
                 "\\".to_string()
             };
 
-            // Resolve label -> symlink
             let symlink = match self.label_map.read().get(label) {
                 Some(s) => s.clone(),
                 None => {
                     let base = label.trim_end_matches(':');
-                    alloc::format!("\\GLOBAL\\Mounts\\{}", base)
+                    alloc::format!("\\GLOBAL\\StorageDevices\\{}", base)
                 }
             };
 
@@ -280,7 +276,6 @@ impl Vfs {
         Err(FileError::BadPath)
     }
 
-    // ---- Transport helpers (Box<T> <-> Box<[u8]>) ----
     fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
         let len = size_of::<T>();
         let ptr = Box::into_raw(b) as *mut u8;
@@ -292,7 +287,6 @@ impl Vfs {
         Box::from_raw(ptr)
     }
 
-    // ---- Core forwarding primitive ----
     fn call_fs<TParam, TResult>(
         &self,
         volume_symlink: &str,
@@ -307,6 +301,7 @@ impl Vfs {
             RequestType::Fs(op),
             Vfs::box_to_bytes(Box::new(param)),
         )));
+        println!("sending to symlink {}", volume_symlink);
         unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
         unsafe { pnp_wait_for_request(&req) };
 
@@ -314,13 +309,10 @@ impl Vfs {
         if w.status != DriverStatus::Success {
             return Err(w.status);
         }
-        // take out the result
         let raw = core::mem::replace(&mut w.data, Box::new([]));
         let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };
         Ok(*out)
     }
-
-    // ========================= VFS API =========================
 
     pub fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {

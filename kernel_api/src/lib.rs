@@ -512,7 +512,7 @@ pub enum PnpMinorFunction {
     QueryId,
     QueryResources,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum FileStatus {
     Success = 0x00,
@@ -525,6 +525,27 @@ pub enum FileStatus {
     CorruptFat,
     InternalError,
     BadPath,
+}
+impl FileStatus {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            FileStatus::Success => "Success",
+            FileStatus::FileAlreadyExist => "File already exists",
+            FileStatus::PathNotFound => "Path not found",
+            FileStatus::UnknownFail => "The operation failed for an unknown reason",
+            FileStatus::NotFat => "The partition is unformatted or not supported",
+            FileStatus::DriveNotFound => "The drive specified doesn't exist",
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
+            FileStatus::CorruptFat => "The File Allocation Table is corrupt",
+            FileStatus::InternalError => "Internal error",
+            FileStatus::BadPath => "Invalid path",
+        }
+    }
+}
+impl PartialEq for FileStatus {
+    fn eq(&self, other: &FileStatus) -> bool {
+        self.to_str() == other.to_str()
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -621,6 +642,7 @@ pub mod alloc_api {
         Read(EvtIoRead),
         Write(EvtIoWrite),
         DeviceControl(EvtIoDeviceControl),
+        Fs(EvtIoFs),
     }
     impl IoType {
         #[inline]
@@ -629,6 +651,19 @@ pub mod alloc_api {
                 IoType::Read(_) => 0,
                 IoType::Write(_) => 1,
                 IoType::DeviceControl(_) => 2,
+                IoType::Fs(_) => 3,
+            }
+        }
+
+        #[inline]
+        pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+            match *self {
+                IoType::Read(h) | IoType::Write(h) => {
+                    let len = req.read().data.len();
+                    h(dev, req, len);
+                }
+                IoType::DeviceControl(h) => h(dev, req),
+                IoType::Fs(h) => h(dev, req),
             }
         }
 
@@ -638,6 +673,7 @@ pub mod alloc_api {
                 RequestType::Read { .. } => Some(0),
                 RequestType::Write { .. } => Some(1),
                 RequestType::DeviceControl(_) => Some(2),
+                RequestType::Fs(_) => Some(3),
                 _ => None,
             }
         }
@@ -752,6 +788,7 @@ pub mod alloc_api {
     pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices =
         extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+    pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
     pub type ClassAddCallback =
         extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
@@ -871,13 +908,14 @@ pub mod alloc_api {
                 callback: ClassAddCallback,
                 dev_obj: Arc<DeviceObject>,
             );
-            pub fn pnp_create_devnode_over_fdo_with_function(
-                parent_fdo: &Arc<DeviceObject>,
+            pub fn pnp_create_devnode_over_pdo_with_function(
+                parent_dn: &Arc<DevNode>,
                 instance_path: String,
                 ids: DeviceIds,
                 class: Option<String>,
                 function_service: &str,
                 function_fdo: &Arc<DeviceObject>,
+                init_pdo: DeviceInit,
             ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>;
             pub fn pnp_wait_for_request(req: &Arc<RwLock<Request>>);
             pub fn InvalidateDeviceRelations(

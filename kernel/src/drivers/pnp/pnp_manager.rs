@@ -440,16 +440,17 @@ impl PnpManager {
 
         (dev_node, pdo)
     }
-    pub fn create_devnode_over_fdo_with_function(
+
+    pub fn create_devnode_over_pdo_with_function(
         &self,
-        parent_fdo: Arc<DeviceObject>,
+        parent_dn: Arc<DevNode>,
         instance_path: String,
         ids: DeviceIds,
         class: Option<String>,
         function_service: &str,
         function_fdo: Arc<DeviceObject>,
+        init_pdo: DeviceInit,
     ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError> {
-        let parent_dn = parent_fdo.dev_node.upgrade().ok_or(DriverError::NoParent)?;
         let name = instance_path
             .rsplit('\\')
             .next()
@@ -464,7 +465,25 @@ impl PnpManager {
             &parent_dn,
         );
         *dn.stack.write() = Some(DeviceStack::new());
-        *dn.pdo.write() = Some(parent_fdo.clone());
+
+        let pdo = DeviceObject::new(init_pdo.dev_ext_size);
+        unsafe {
+            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
+            p.dev_node = Arc::downgrade(&dn);
+            p.dev_init = init_pdo;
+        }
+        dn.set_pdo(pdo.clone());
+
+        let base = alloc::format!("\\Device\\{}", dn.instance_path);
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
+        let pdo_obj = crate::object_manager::Object::with_name(
+            crate::object_manager::ObjectTag::Device,
+            "PDO".to_string(),
+            crate::object_manager::ObjectPayload::Device(pdo.clone()),
+        );
+        let _ =
+            crate::object_manager::OBJECT_MANAGER.link(alloc::format!("{}\\PDO", base), &pdo_obj);
 
         let func_pkg = self
             .pkg_by_service(function_service)
@@ -513,7 +532,7 @@ impl PnpManager {
         let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
         let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(stack_dir.clone());
 
-        let mut prev = dn.get_pdo().unwrap();
+        let mut prev = pdo.clone();
 
         {
             let mut g = dn.stack.write();
@@ -556,8 +575,6 @@ impl PnpManager {
 
         let top = prev.clone();
 
-        let base = alloc::format!("\\Device\\{}", dn.instance_path);
-        let _ = crate::object_manager::OBJECT_MANAGER.mkdir_p(base.clone());
         let _ = crate::object_manager::OBJECT_MANAGER.unlink(alloc::format!("{}\\Top", base));
         let top_obj = crate::object_manager::Object::with_name(
             crate::object_manager::ObjectTag::Device,
@@ -583,9 +600,10 @@ impl PnpManager {
             target_device: top.clone(),
         };
         let _ = self.send_request(&tgt, Arc::new(RwLock::new(start_request)));
-
+        dn.set_state(DevNodeState::Started);
         Ok((dn, top))
     }
+
     pub fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         self.bind_device(dn)?;
         self.start_stack(dn);
@@ -934,21 +952,30 @@ impl PnpManager {
     #[inline]
     fn ensure_driver_entry(&self, drv: &Arc<DriverObject>) -> bool {
         let rt = &drv.runtime;
-        if matches!(rt.get_state(), DriverState::Started | DriverState::Pending) {
-            return true;
+
+        match rt.get_state() {
+            DriverState::Started | DriverState::Pending => return true,
+            DriverState::Failed => return false,
+            _ => {}
         }
+
         let m = rt.module.read();
         if let Some((_, rva)) = m.symbols.iter().find(|(s, _)| s == "DriverEntry") {
+            rt.set_state(DriverState::Pending);
             let entry: DriverEntryFn =
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
             let st = unsafe { entry(drv) };
-            if matches!(st, DriverStatus::Success | DriverStatus::Pending) {
-                rt.set_state(DriverState::Pending);
-                return true;
+            match st {
+                DriverStatus::Success | DriverStatus::Pending => true,
+                _ => {
+                    rt.set_state(DriverState::Failed);
+                    false
+                }
             }
+        } else {
+            rt.set_state(DriverState::Failed);
+            false
         }
-        rt.set_state(DriverState::Failed);
-        false
     }
     #[inline]
     fn attach_one_above(
@@ -1540,6 +1567,7 @@ impl PnpManager {
                             }
                         },
                     );
+                    // TODO: fix this
                     // if admit.is_err() {
                     //     dev.queue.lock().push_back(req_arc);
                     //     return;
@@ -1625,10 +1653,8 @@ impl PnpManager {
 
     pub fn complete_request(&self, req: &mut Request) {
         if let Some(completion) = req.completion_routine.take() {
-            println!("Completing request: {:#x?}", req.id);
             completion(req, req.completion_context);
         } else {
-            println!("Dropping request: {:#x?}", req.id)
             //TODO: handle this correctly
             // Drop for now
         }
@@ -1727,26 +1753,27 @@ impl PnpManager {
     pub fn remove_symlink(&self, link_path: String) -> Result<(), crate::object_manager::OmError> {
         crate::object_manager::OBJECT_MANAGER.unlink(link_path.to_string())
     }
-    pub fn resolve_targetio_from_symlink(&self, link_path: String) -> Option<IoTarget> {
-        let obj = crate::object_manager::OBJECT_MANAGER
-            .open(link_path.to_string())
-            .ok()?;
-        match &obj.payload {
-            crate::object_manager::ObjectPayload::Device(d) => Some(IoTarget {
-                target_device: d.clone(),
-            }),
-            crate::object_manager::ObjectPayload::Directory(_) => {
-                let top = alloc::format!("{}\\Top", link_path);
-                let o2 = crate::object_manager::OBJECT_MANAGER.open(top).ok()?;
-                match &o2.payload {
-                    crate::object_manager::ObjectPayload::Device(d) => Some(IoTarget {
+    pub fn resolve_targetio_from_symlink(&self, mut p: String) -> Option<IoTarget> {
+        for _ in 0..32 {
+            let o = crate::object_manager::OBJECT_MANAGER.open(p.clone()).ok()?;
+            match &o.payload {
+                crate::object_manager::ObjectPayload::Device(d) => {
+                    return Some(IoTarget {
                         target_device: d.clone(),
-                    }),
-                    _ => None,
+                    })
                 }
+                crate::object_manager::ObjectPayload::Directory(_) => {
+                    p = alloc::format!("{}\\Top", p);
+                    continue;
+                }
+                crate::object_manager::ObjectPayload::Symlink(target) => {
+                    p = target.clone().target;
+                    continue;
+                }
+                _ => return None,
             }
-            _ => None,
         }
+        None
     }
     pub fn send_request_via_symlink(
         &self,
@@ -1839,6 +1866,98 @@ impl PnpManager {
         for (dev, cb) in hits {
             cb(dn, &dev);
         }
+    }
+    #[inline]
+    fn state_str(s: DevNodeState) -> &'static str {
+        match s {
+            DevNodeState::Empty => "Empty",
+            DevNodeState::Initialized => "Initialized",
+            DevNodeState::DriversBound => "DriversBound",
+            DevNodeState::Started => "Started",
+            DevNodeState::Stopped => "Stopped",
+            DevNodeState::SurpriseRemoved => "SurpriseRemoved",
+            DevNodeState::Deleted => "Deleted",
+            DevNodeState::Faulted => "Faulted",
+        }
+    }
+
+    #[inline]
+    fn make_indent(depth: usize) -> alloc::string::String {
+        let mut s = alloc::string::String::new();
+        for _ in 0..depth {
+            s.push_str("  ");
+        }
+        s
+    }
+
+    fn print_node_line(dn: &Arc<DevNode>, depth: usize) {
+        let indent = Self::make_indent(depth);
+        let state = dn.get_state();
+        let class = dn.class.as_deref().unwrap_or("-");
+        let hwid = dn.ids.hardware.get(0).map(|s| s.as_str()).unwrap_or("-");
+        println!(
+            "{}{}  [{}]  class={}  inst={}  hwid={}",
+            indent,
+            dn.name,
+            Self::state_str(state),
+            class,
+            dn.instance_path,
+            hwid
+        );
+
+        if let Some(stk) = dn.stack.read().as_ref() {
+            let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+            if !stk.lower.is_empty() {
+                parts.push("lower");
+            }
+            if stk.function.is_some() {
+                parts.push("func");
+            }
+            if !stk.upper.is_empty() {
+                parts.push("upper");
+            }
+            if !parts.is_empty() {
+                let sub = Self::make_indent(depth + 1);
+                println!("{}stack: {}", sub, parts.join("/"));
+            }
+        }
+    }
+
+    #[inline]
+    fn state_rank(s: DevNodeState) -> u8 {
+        match s {
+            DevNodeState::Started => 7,
+            DevNodeState::DriversBound => 6,
+            DevNodeState::Initialized => 5,
+            DevNodeState::Stopped => 4,
+            DevNodeState::Faulted => 3,
+            DevNodeState::SurpriseRemoved => 2,
+            DevNodeState::Deleted => 1,
+            DevNodeState::Empty => 0,
+        }
+    }
+
+    fn print_subtree(&self, dn: &Arc<DevNode>, depth: usize) {
+        Self::print_node_line(dn, depth);
+
+        let mut kids = {
+            let g = dn.children.read();
+            g.iter().cloned().collect::<alloc::vec::Vec<_>>()
+        };
+        kids.sort_by(|a, b| {
+            let ra = Self::state_rank(a.get_state());
+            let rb = Self::state_rank(b.get_state());
+            ra.cmp(&rb).then_with(|| a.name.cmp(&b.name))
+        });
+
+        for ch in kids {
+            self.print_subtree(&ch, depth + 1);
+        }
+    }
+
+    pub fn print_device_tree(&self) {
+        let root = self.root();
+        self.print_subtree(&root, 0);
     }
 }
 #[inline]
