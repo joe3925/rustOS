@@ -1202,10 +1202,11 @@ impl Fat32 {
                 Some((n, e)) => (n.to_string(), e.to_string()),
                 None => (ln.clone(), String::new()),
             };
-
             let mut entries = FileEntry::new_long_name(&name_part, &ext_part, entry.get_cluster());
-            *entries.last_mut().unwrap() = *entry;
-
+            if let Some(sfn_entry) = entries.last_mut() {
+                sfn_entry.attributes = entry.attributes;
+                sfn_entry.file_size = entry.file_size;
+            }
             for e in &entries {
                 self.write_file_to_dir(e, start_cluster_of_dir, None)?;
             }
@@ -1214,17 +1215,14 @@ impl Fat32 {
         let mut dir_buf = vec![0u8; (self.params.spc as usize * self.params.bps as usize) as usize];
         let clusters = self.get_all_clusters(start_cluster_of_dir)?;
         self.read_cluster_sync(clusters[clusters.len() - 1], &mut dir_buf)?;
-
         let entry_size = 32;
         let mut entry_offset = None;
-
         for i in (0..dir_buf.len()).step_by(entry_size) {
             if dir_buf[i] == 0x00 || dir_buf[i] == 0xE5 {
                 entry_offset = Some(i);
                 break;
             }
         }
-
         if entry_offset.is_none() {
             let free_cluster = self.find_free_cluster(0);
             if free_cluster != 0xFFFFFFFF {
@@ -1233,14 +1231,12 @@ impl Fat32 {
                 return self.write_file_to_dir(entry, start_cluster_of_dir, long_name);
             }
         }
-
         if let Some(offset) = entry_offset {
             entry.write_to_buffer(&mut dir_buf, offset);
             self.write_cluster_sync(clusters[clusters.len() - 1], &dir_buf)?;
         } else {
             println!("No free directory entry found!");
         }
-
         Ok(())
     }
 

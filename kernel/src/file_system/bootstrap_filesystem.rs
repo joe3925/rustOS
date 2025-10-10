@@ -133,18 +133,19 @@ impl<'a> BootstrapProvider<'a> {
         n.get_mut(&norm_upcase("C:\\SYSTEM"))
             .unwrap()
             .children
-            .insert("REGISTRY.BIN".into(), reg_key);
+            .insert("registry.bin".into(), reg_key);
 
         for bp in boot {
             let ddir = norm_upcase(&alloc::format!("{}\\{}", DRIVER_ROOT, bp.name));
             n.entry(ddir.clone()).or_insert_with(Node::dir);
+
             n.get_mut(&norm_upcase(DRIVER_ROOT))
                 .unwrap()
                 .children
-                .insert(bp.name.to_uppercase(), ddir.clone());
+                .insert(bp.name.clone().to_string(), ddir.clone());
 
-            let toml_name = alloc::format!("{}.TOML", bp.name.to_ascii_uppercase());
-            let dll_name = alloc::format!("{}.DLL", bp.name.to_ascii_uppercase());
+            let toml_name = alloc::format!("{}.toml", bp.name);
+            let dll_name = alloc::format!("{}.dll", bp.name);
 
             let toml_src = norm_upcase(&alloc::format!("{}\\{}", ddir, toml_name));
             let dll_src = norm_upcase(&alloc::format!("{}\\{}", ddir, dll_name));
@@ -171,6 +172,7 @@ impl<'a> BootstrapProvider<'a> {
                 .unwrap()
                 .children
                 .insert(toml_name, toml_target);
+
             n.get_mut(&norm_upcase("C:\\SYSTEM\\MOD"))
                 .unwrap()
                 .children
