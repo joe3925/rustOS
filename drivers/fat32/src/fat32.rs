@@ -458,18 +458,17 @@ impl Fat32 {
 
         let mut write_copy = |fat_idx: u32, buf: &mut [u8]| {
             let lba = self.params.fat_start_lba + fat_idx * self.params.fatsz + sector_in_fat;
-            read_sectors_sync(&self.volume, lba as u64, 1, 512, buf);
 
-            let mut cur = u32::from_le_bytes([
+            read_sectors_sync(&self.volume, lba as u64, 1, self.params.bps as usize, buf);
+            let cur = u32::from_le_bytes([
                 buf[entry_off],
                 buf[entry_off + 1],
                 buf[entry_off + 2],
                 buf[entry_off + 3],
             ]);
-
             let new_val = (cur & 0xF000_0000) | (next_cluster & 0x0FFF_FFFF);
             buf[entry_off..entry_off + 4].copy_from_slice(&new_val.to_le_bytes());
-            write_sectors_sync(&self.volume, lba as u64, 1, 512, buf);
+            write_sectors_sync(&self.volume, lba as u64, 1, self.params.bps as usize, buf);
         };
 
         let mut secbuf = vec![0u8; self.params.bps as usize];
@@ -855,55 +854,79 @@ impl Fat32 {
         (self.params.bps as usize * self.params.spc as usize)
     }
     pub fn write_file(&self, file_data: &[u8], path: &str) -> Result<(), FileStatus> {
-        let mut file_entry = self.find_file(path)?;
-        let cluster_size = self.calc_cluster_size();
-        let new_clusters_needed = (file_data.len() + cluster_size - 1) / cluster_size;
-        let old_clusters = self.get_all_clusters(file_entry.get_cluster())?;
-        let old_clusters_needed = old_clusters.len();
+        let mut fe = self.find_file(path)?;
+        let cluster_sz = self.calc_cluster_size();
 
-        let mut buffer = vec![0u8; cluster_size];
-        let mut current_cluster = file_entry.get_cluster();
+        if file_data.is_empty() {
+            fe.file_size = 0;
+            self.update_dir_entry(path, fe, fe.get_cluster(), None).ok();
+            return Ok(());
+        }
 
-        for i in 0..new_clusters_needed {
-            let data_offset = i * cluster_size;
-            let bytes_to_copy = core::cmp::min(cluster_size, file_data.len() - data_offset);
+        let mut cur = fe.get_cluster();
+        if cur < 2 {
+            let new = self.find_free_cluster(0);
+            if new == 0xFFFF_FFFF {
+                return Err(FileStatus::UnknownFail);
+            }
+            self.update_fat(new, 0xFFFF_FFFF);
 
-            buffer[..bytes_to_copy]
-                .copy_from_slice(&file_data[data_offset..data_offset + bytes_to_copy]);
+            let zero = vec![0u8; cluster_sz];
+            self.write_cluster_sync(new, &zero)?;
 
-            self.write_cluster_sync(current_cluster, &buffer)?;
+            fe.first_cluster_low = (new & 0xFFFF) as u16;
+            fe.first_cluster_high = ((new >> 16) & 0xFFFF) as u16;
 
-            if i < new_clusters_needed - 1 {
-                if i < old_clusters_needed - 1 {
-                    current_cluster = old_clusters[i + 1];
+            // starting_cluster==0 matches the pre-allocation entry
+            self.update_dir_entry(path, fe, 0, None)?;
+            cur = new;
+        }
+
+        let old_chain = self.get_all_clusters(cur)?;
+        let old_len = old_chain.len();
+        let need = (file_data.len() + cluster_sz - 1) / cluster_sz;
+
+        let mut buf = vec![0u8; cluster_sz];
+        let mut wcur = cur;
+
+        for i in 0..need {
+            let off = i * cluster_sz;
+            let n = core::cmp::min(cluster_sz, file_data.len() - off);
+
+            for b in &mut buf {
+                *b = 0;
+            }
+            buf[..n].copy_from_slice(&file_data[off..off + n]);
+
+            self.write_cluster_sync(wcur, &buf)?;
+
+            if i < need - 1 {
+                if i < old_len - 1 {
+                    wcur = old_chain[i + 1];
                 } else {
-                    let next_cluster = self.find_free_cluster(current_cluster);
-                    if next_cluster == 0xFFFFFFFF {
+                    let next = self.find_free_cluster(wcur);
+                    if next == 0xFFFF_FFFF {
                         return Err(FileStatus::UnknownFail);
                     }
-                    self.update_fat(current_cluster, next_cluster);
-                    current_cluster = next_cluster;
+                    self.update_fat(wcur, next);
+                    wcur = next;
+
+                    let zero = vec![0u8; cluster_sz];
+                    self.write_cluster_sync(wcur, &zero)?;
                 }
             } else {
-                self.update_fat(current_cluster, 0xFFFFFFFF);
+                self.update_fat(wcur, 0xFFFF_FFFF);
             }
         }
 
-        if old_clusters_needed > new_clusters_needed {
-            for cluster in &old_clusters[new_clusters_needed..] {
-                self.update_fat(*cluster, 0x00000000);
+        if old_len > need {
+            for cl in &old_chain[need..] {
+                self.update_fat(*cl, 0x0000_0000);
             }
         }
 
-        file_entry.file_size = file_data.len() as u32;
-        let starting_cluster = file_entry.get_cluster();
-
-        if self
-            .update_dir_entry(path, file_entry, starting_cluster, None)
-            .is_err()
-        {
-            return Err(FileStatus::UnknownFail);
-        }
+        fe.file_size = file_data.len() as u32;
+        self.update_dir_entry(path, fe, fe.get_cluster(), None).ok();
         Ok(())
     }
     pub fn list_dir(&self, path: &str) -> Result<Vec<String>, FileStatus> {
@@ -1255,18 +1278,12 @@ impl Fat32 {
 
     fn fat_entry(&self, cl: u32) -> Result<u32, FileStatus> {
         let bps = self.params.bps as usize;
-
         let sector = self.sector_for_cluster(cl);
         let off = self.cluster_in_sector(cl);
-
         let mut sec = vec![0u8; bps];
-        read_sectors_sync(&self.volume, sector as u64, 1, 512, &mut sec);
-
-        let raw =
-            u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF;
-        Ok(raw)
+        read_sectors_sync(&self.volume, sector as u64, 1, bps, &mut sec)?;
+        Ok(u32::from_le_bytes([sec[off], sec[off + 1], sec[off + 2], sec[off + 3]]) & 0x0FFF_FFFF)
     }
-
     fn is_eoc(v: u32) -> bool {
         v >= 0x0FFF_FFF8 && v <= 0x0FFF_FFFF
     }

@@ -134,7 +134,7 @@ pub fn kernel_main() {
     print_mem_report();
     println!("");
     wait_millis_idle(10000);
-    PNP_MANAGER.print_device_tree();
+    //PNP_MANAGER.print_device_tree();
     loop {
         wait_millis_idle(300000);
         let timer_ms = TIMER_TIME

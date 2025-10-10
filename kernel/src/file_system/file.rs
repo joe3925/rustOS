@@ -322,19 +322,30 @@ pub fn switch_to_vfs() -> Result<(), RegError> {
 
     for (name, bytes) in mod_blobs {
         let dst = alloc::format!("{}\\{}", vfs_mod, name);
-        if !file_exists(&dst) {
-            if let Ok(mut f) = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite]) {
-                let _ = f.write(&bytes);
-            }
+        if file_exists(&dst) {
+            continue;
         }
+
+        let mut f = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite])
+            .unwrap_or_else(|e| panic!("mod install failed: open {}: {:?}", dst, e));
+
+        let n = f
+            .write(&bytes)
+            .unwrap_or_else(|e| panic!("mod install failed: write {}: {:?}", dst, e));
     }
+
     for (name, bytes) in toml_blobs {
         let dst = alloc::format!("{}\\{}", vfs_toml, name);
-        if !file_exists(&dst) {
-            if let Ok(mut f) = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite]) {
-                let _ = f.write(&bytes);
-            }
+        if file_exists(&dst) {
+            continue;
         }
+
+        let mut f = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite])
+            .unwrap_or_else(|e| panic!("toml install failed: open {}: {:?}", dst, e));
+
+        let n = f
+            .write(&bytes)
+            .unwrap_or_else(|e| panic!("toml install failed: write {}: {:?}", dst, e));
     }
 
     Ok(())
