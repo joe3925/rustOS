@@ -29,8 +29,8 @@ use kernel_api::{
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
-            pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink, pnp_load_service,
-            pnp_remove_symlink, pnp_send_request_via_symlink, reg,
+            pnp_create_symlink, pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink,
+            pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink, reg,
         },
     },
     ffi::switch_to_vfs,
@@ -53,6 +53,7 @@ static FS_REGISTRY: RwLock<Vec<FsReg>> = RwLock::new(Vec::new());
 static FS_REGISTERED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 static VFS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOLUMES: RwLock<Vec<Arc<DeviceObject>>> = RwLock::new(Vec::new());
+const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
 #[repr(C)]
 struct VolFdoExt {
     inst_path: String,
@@ -628,6 +629,7 @@ fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus 
     if VFS_ACTIVE.load(Ordering::Acquire) {
         return DriverStatus::Success;
     }
+    assign_drive_letter(b'C', fs_mount_link);
     match unsafe { switch_to_vfs() } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
@@ -637,9 +639,48 @@ fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus 
         Err(e) => panic!("VFS transition failed {:#?}", e),
     }
 }
+fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
+    let ch = (letter as char).to_ascii_uppercase();
+    if ch < 'A' || ch > 'Z' {
+        return;
+    }
+
+    let _ = set_label_for_link(fs_mount_link, ch as u8);
+
+    let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
+    let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
+
+    let _ = unsafe { pnp_remove_symlink(link_nocolon.clone()) };
+    let _ = unsafe { pnp_remove_symlink(link_colon.clone()) };
+
+    let _ = unsafe { pnp_create_symlink(link_nocolon, fs_mount_link.to_string()) };
+    let _ = unsafe { pnp_create_symlink(link_colon, fs_mount_link.to_string()) };
+}
 fn rescan_all_volumes() {
     let vols = unsafe { VOLUMES.read() };
     for dev in vols.clone() {
         mount_if_unmounted(&dev);
     }
+}
+fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::RegError> {
+    let _ = reg::create_key(MP_ROOT);
+    if let Ok(vals) = reg::list_values(MP_ROOT) {
+        for name in vals {
+            if let Some(kernel_api::Data::Str(s)) = reg::get_value(MP_ROOT, &name) {
+                if s == public_link {
+                    let _ = reg::delete_value(MP_ROOT, &name);
+                }
+            }
+        }
+    }
+    let _ = reg::delete_value(MP_ROOT, &dev_name_for(label));
+    reg::set_value(
+        MP_ROOT,
+        &dev_name_for(label),
+        kernel_api::Data::Str(public_link.to_string()),
+    )
+}
+fn dev_name_for(label: u8) -> String {
+    let c = (label as char).to_ascii_uppercase();
+    alloc::format!("StorageDevices\\{}:", c)
 }

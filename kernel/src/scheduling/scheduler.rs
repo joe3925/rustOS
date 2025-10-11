@@ -1,13 +1,17 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
+use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER, TIMER_TIME};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::scheduling::state::State;
 use crate::scheduling::task::{idle_task, Task};
 use crate::structs::per_core_storage::PCS;
-use crate::util::kernel_main;
+use crate::structs::stopwatch::Stopwatch;
+use crate::util::{kernel_main, KERNEL_INITIALIZED};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::registers::control::Cr3;
@@ -96,64 +100,108 @@ impl Scheduler {
 
     // round-robin
     #[inline]
-    pub fn schedule_next(&mut self) {
+    pub fn schedule_next(&mut self) -> Option<TaskHandle> {
         let logical_id = get_current_logical_id() as usize;
 
         self.reap_task();
 
         if self.tasks.is_empty() {
-            let kernel_task =
+            let k =
                 Task::new_kernel_mode(kernel_main as usize, KERNEL_STACK_SIZE, "kernel".into(), 0);
-            self.add_task(kernel_task);
+            self.add_task(k);
         }
-
         if self.runnable_task() == 0 && !self.has_core_init() {
-            let idle_task =
-                Task::new_kernel_mode(idle_task as usize, KERNEL_STACK_SIZE, "".into(), 0);
-            self.add_task(idle_task);
+            let i = Task::new_kernel_mode(idle_task as usize, KERNEL_STACK_SIZE, "".into(), 0);
+            self.add_task(i);
+        }
+        if self.tasks.is_empty() {
+            return None;
         }
 
-        if !self.tasks.is_empty() {
-            if self.has_core_init() {
-                let id = *self
-                    .current_task
-                    .get(logical_id)
-                    .expect("no current task for core");
-
-                if let Some(handle) = self.get_task_by_id(id) {
-                    handle.write().executer_id = None;
-                }
-                self.reset_task_by_id(id).expect("reset failed");
+        if self.has_core_init() {
+            let id = *self
+                .current_task
+                .get(logical_id)
+                .expect("no current task for core");
+            if let Some(h) = self.get_task_by_id(id) {
+                h.write().executer_id = None;
             }
+            let _ = self.reset_task_by_id(id);
+        }
 
-            let next_task_id = if self.should_idle() {
-                self.tasks
-                    .iter()
-                    .find(|h| {
-                        let t = h.read();
-                        t.name.is_empty() && t.executer_id.is_none() && !t.is_sleeping
-                    })
-                    .map(|h| h.read().id)
-            } else {
-                self.tasks
-                    .iter()
-                    .find(|h| {
-                        let t = h.read();
-                        !t.name.is_empty() && t.executer_id.is_none() && !t.is_sleeping
-                    })
-                    .map(|h| h.read().id)
+        let next = if self.should_idle() {
+            self.tasks
+                .iter()
+                .find(|h| {
+                    let t = h.read();
+                    t.name.is_empty() && t.executer_id.is_none() && !t.is_sleeping
+                })
+                .cloned()
+        } else {
+            self.tasks
+                .iter()
+                .find(|h| {
+                    let t = h.read();
+                    !t.name.is_empty() && t.executer_id.is_none() && !t.is_sleeping
+                })
+                .cloned()
+        };
+
+        if let Some(h) = next.clone() {
+            let id = h.read().id;
+            self.current_task.set(logical_id, id);
+            h.write().executer_id = Some(logical_id as u16);
+        }
+        next
+    }
+    #[inline(always)]
+    pub fn on_timer_tick(&mut self, state: *mut State, cpu: usize) {
+        if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(mut timer_time) = TIMER_TIME.try_lock() else {
+            return;
+        };
+        let Some(mut pc_switches) = PER_CORE_SWITCHES.try_lock() else {
+            return;
+        };
+        let sw = Stopwatch::start();
+        let core_inited = self.has_core_init();
+
+        if !core_inited {
+            timer_time.set(cpu, AtomicUsize::new(0));
+            pc_switches.set(cpu, AtomicUsize::new(0));
+        }
+
+        if !self.is_empty() && core_inited {
+            unsafe {
+                self.get_current_task()
+                    .write()
+                    .update_from_context(&mut *state)
+            };
+        }
+
+        if let Some(task) = self.schedule_next() {
+            let (needs_restore, ctx_ptr) = {
+                let t = task.read();
+                (t.parent_pid != 0, &t.context as *const _ as *mut State)
             };
 
-            if let Some(id) = next_task_id {
-                self.current_task.set(logical_id, id);
-
-                if let Some(handle) = self.get_task_by_id(id) {
-                    handle.write().executer_id = Some(logical_id as u16);
-                }
+            if needs_restore {
+                self.restore_page_table();
             }
+
+            timer_time
+                .get(cpu)
+                .unwrap()
+                .fetch_add(sw.elapsed_millis() as usize, Ordering::SeqCst);
+            pc_switches.get(cpu).unwrap().fetch_add(1, Ordering::SeqCst);
+
+            return unsafe { (*ctx_ptr).restore(state) };
+        } else {
+            panic!("No valid task in scheduler")
         }
     }
-
     pub fn get_current_task(&self) -> TaskHandle {
         let logical_id = get_current_logical_id() as usize;
         let id = *self

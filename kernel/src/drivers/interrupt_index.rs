@@ -2,6 +2,7 @@ use crate::cpu::{self, get_cpu_info};
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
+use crate::drivers::timer_driver::{set_num_cores, NUM_CORES};
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
@@ -35,6 +36,8 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
+
+pub static APIC_TICKS_PER_NS_FP32: AtomicU64 = AtomicU64::new(0);
 
 pub const TIMER_FREQ: u64 = 300;
 
@@ -140,6 +143,70 @@ pub fn wait_using_pit_50ms() {
             }
         }
     }
+}
+
+#[inline]
+fn lapic() -> *mut u32 {
+    LAPIC_BASE_VA.load(Ordering::SeqCst) as *mut u32
+}
+#[inline]
+fn rd(off: APICOffset) -> u32 {
+    unsafe { lapic().add(off as usize / 4).read_volatile() }
+}
+#[inline]
+fn wr(off: APICOffset, v: u32) {
+    unsafe { lapic().add(off as usize / 4).write_volatile(v) }
+}
+
+pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
+    assert!(window_ms > 0);
+    let saved_lvt = rd(APICOffset::LvtT);
+    let saved_ticr = rd(APICOffset::Ticr);
+
+    wr(APICOffset::LvtT, saved_lvt | (1 << 16));
+    wr(APICOffset::Ticr, u32::MAX);
+
+    wait_millis(window_ms);
+
+    let cur = rd(APICOffset::Tccr) as u64;
+    let dec = (u32::MAX as u64).saturating_sub(cur);
+
+    let elapsed_ns = (window_ms as u128) * 1_000_000u128;
+    let q32 = if dec == 0 {
+        0
+    } else {
+        (((dec as u128) << 32) / elapsed_ns) as u64
+    };
+
+    APIC_TICKS_PER_NS_FP32.store(q32, Ordering::SeqCst);
+
+    wr(APICOffset::Ticr, saved_ticr);
+    wr(APICOffset::LvtT, saved_lvt);
+
+    q32
+}
+
+#[inline]
+pub fn apic_ticr_for_ns(ns: u64) -> u32 {
+    let fp = APIC_TICKS_PER_NS_FP32.load(Ordering::SeqCst);
+    if fp == 0 || ns == 0 {
+        return 0;
+    }
+    let prod = ((ns as u128) * (fp as u128) + ((1u128 << 32) - 1)) >> 32; // ceil
+    core::cmp::min(prod as u64, u32::MAX as u64) as u32
+}
+
+pub fn apic_program_period_ns(ns: u64) {
+    let lvt = rd(APICOffset::LvtT);
+    wr(APICOffset::Ticr, apic_ticr_for_ns(ns));
+    wr(APICOffset::LvtT, lvt & !(1 << 16));
+}
+pub fn apic_program_period_ms(ms: u64) {
+    if ms == 0 {
+        return;
+    }
+    let ns = ms.saturating_mul(1_000_000);
+    apic_program_period_ns(ns);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -370,7 +437,7 @@ impl ApicImpl {
             .processor_info
             .expect("bad interrupt model")
             .application_processors;
-
+        set_num_cores(apics.iter().count());
         for (idx, apic) in apics.iter().enumerate() {
             let tramp_phys = PhysAddr::new(TRAMPOLINE_BASE);
             unsafe {

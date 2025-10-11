@@ -15,6 +15,7 @@
 #![feature(naked_functions)]
 #![feature(slice_as_array)]
 #![feature(variant_count)]
+#![allow(improper_ctypes_definitions)]
 extern crate alloc;
 
 pub mod gdt;
