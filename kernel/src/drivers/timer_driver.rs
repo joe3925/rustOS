@@ -35,7 +35,6 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let n = NUM_CORES.load(Ordering::Relaxed).max(1);
     let cpu = get_current_logical_id() as usize % n;
 
-    // Atomically claim the slot; only the winning core increments.
     let claimed = ROT_TICKET
         .0
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
