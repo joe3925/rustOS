@@ -9,17 +9,14 @@ use alloc::{
 };
 use core::cmp::PartialEq;
 
+use crate::file_system::{
+    file_provider::provider,
+    file_structs::{FileError, FsSeekWhence},
+};
 use crate::{
     drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
     registry::{reg::rebind_and_persist_after_provider_switch, RegError},
-};
-use crate::{
-    drivers::pnp::pnp_manager::PNP_MANAGER,
-    file_system::{
-        file_provider::provider,
-        file_structs::{FileError, FsSeekWhence},
-    },
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

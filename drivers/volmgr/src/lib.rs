@@ -270,20 +270,13 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) {
     let boxed = unsafe { Box::from_raw(ctx as *mut BridgeCtx) };
     let parent = boxed.parent;
 
-    let mut r = {
-        let mut g = parent.write();
-        core::mem::replace(&mut *g, Request::empty())
-    };
-    r.status = child.status;
-    if r.status == DriverStatus::Success {
-        let n = core::cmp::min(r.data.len(), child.data.len());
-        r.data[..n].copy_from_slice(&child.data[..n]);
+    let mut g = parent.write();
+    g.status = child.status;
+    if g.status == DriverStatus::Success {
+        let n = core::cmp::min(g.data.len(), child.data.len());
+        g.data[..n].copy_from_slice(&child.data[..n]);
     }
-    unsafe { pnp_complete_request(&mut r) };
-    {
-        let mut g = parent.write();
-        *g = r;
-    }
+    unsafe { pnp_complete_request(&mut *g) };
 }
 
 pub extern "win64" fn vol_pdo_read(

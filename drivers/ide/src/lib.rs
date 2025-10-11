@@ -16,7 +16,7 @@ use alloc::{
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{PnpMinorFunction, QueryIdType};
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use dev_ext::DevExt;
 use kernel_api::{
@@ -82,7 +82,7 @@ const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 1000;
-
+pub static LOCK: Mutex<u64> = Mutex::new(0);
 #[repr(C)]
 struct ChildExt {
     parent_dx: *mut DevExt,
@@ -116,6 +116,7 @@ extern "win64" fn ide_pnp_start(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
+    let guard = LOCK.lock();
     // sync QueryResources to parent/lower
     let mut child = Request::new(RequestType::Pnp, Box::new([]));
     child.pnp = Some(PnpRequest {
@@ -185,65 +186,6 @@ extern "win64" fn ide_pnp_query_devrels(
         return DriverStatus::Success;
     }
     DriverStatus::Pending
-}
-
-#[repr(C)]
-struct PrepareHardwareCtx {
-    device: Arc<DeviceObject>,
-    parent: Arc<RwLock<Request>>,
-}
-
-extern "win64" fn ide_on_query_resources_complete(child: &mut Request, ctx: usize) {
-    let prep = unsafe { Box::from_raw(ctx as *mut PrepareHardwareCtx) };
-    let device = prep.device.clone();
-    let parent = prep.parent.clone();
-
-    if child.status != DriverStatus::Success {
-        let mut pg = parent.write();
-        pg.status = child.status;
-        let ptr: *mut Request = &mut *pg;
-        unsafe { pnp_complete_request(&mut *ptr) };
-        return;
-    }
-
-    let pnp_payload = child.pnp.as_ref().expect("missing PnP payload");
-    let bars = parse_ide_bars(&pnp_payload.blob_out);
-
-    let dx: &mut DevExt =
-        unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
-
-    let cb = bars.cmd as u16;
-    let ctl = bars.ctl as u16;
-    let alt = ctl.wrapping_add(2);
-
-    dx.data_port = Port::new(cb + 0);
-    dx.error_port = Port::new(cb + 1);
-    dx.sector_count_port = Port::new(cb + 2);
-    dx.lba_lo_port = Port::new(cb + 3);
-    dx.lba_mid_port = Port::new(cb + 4);
-    dx.lba_hi_port = Port::new(cb + 5);
-    dx.drive_head_port = Port::new(cb + 6);
-    dx.command_port = Port::new(cb + 7);
-    dx.alternative_command_port = Port::new(alt);
-    dx.control_port = Port::new(alt);
-
-    unsafe { dx.control_port.write(0u8) };
-
-    dx.present = true;
-    let was_enumerated = dx.enumerated;
-    dx.enumerated = false;
-    parent.write().status = DriverStatus::Pending;
-    let st = unsafe { pnp_forward_request_to_next_lower(&device, parent.clone()) };
-    if st == DriverStatus::NoSuchDevice {
-        let mut pg = parent.write();
-        pg.status = DriverStatus::Success;
-        let ptr: *mut Request = &mut *pg;
-        unsafe { pnp_complete_request(&mut *ptr) };
-    }
-
-    if was_enumerated {
-        unsafe { InvalidateDeviceRelations(&device, DeviceRelationType::BusRelations) };
-    }
 }
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
@@ -334,6 +276,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     cdx.present = true;
 }
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+    let guard = LOCK.lock();
     // Validate child state
     let cdx: &mut ChildExt =
         unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *const ChildExt as *mut ChildExt) };
@@ -552,6 +495,7 @@ fn id_string(words: &[u16]) -> String {
 }
 
 fn ata_identify_words(dx: &mut DevExt, dh: u8) -> Option<[u16; 256]> {
+    let guard = LOCK.lock();
     unsafe {
         dx.drive_head_port.write(dh);
     }

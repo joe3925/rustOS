@@ -16,11 +16,13 @@ use crate::{
         driver_install::DriverError,
         interrupt_index::wait_millis,
         pnp::{
+            device::{DevNode, DeviceIds},
             driver_object::{
                 ClassAddCallback, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
                 DriverStatus, EvtDriverDeviceAdd, EvtDriverUnload, Request,
             },
-            pnp_manager::{CompletionRoutine, DevNode, DeviceIds, DpcFn, IoTarget, PNP_MANAGER},
+            manager::PNP_MANAGER,
+            request::{DpcFn, IoTarget},
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
     },

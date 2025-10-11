@@ -1,3 +1,4 @@
+use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::pe_loadable::LoadError;
 use crate::registry::RegError;
 use crate::{format, println};
@@ -10,8 +11,6 @@ use crate::{
     file_system::file::{File, FileStatus, OpenFlags},
     registry::{reg, Data},
 };
-
-use super::pnp::pnp_manager::PNP_MANAGER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverRole {

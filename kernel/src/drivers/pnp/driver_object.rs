@@ -1,4 +1,8 @@
-use crate::{alloc::vec, util::random_number};
+use crate::{
+    alloc::vec,
+    drivers::pnp::{device::DevNode, driver_index::DriverRuntime, request::CompletionRoutine},
+    util::random_number,
+};
 use alloc::{
     boxed::Box,
     collections::vec_deque::VecDeque,
@@ -12,8 +16,6 @@ use core::{
 };
 use spin::{Mutex, RwLock};
 use strum::Display;
-
-use super::pnp_manager::{CompletionRoutine, DevNode, DriverRuntime};
 
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,7 @@ pub struct DeviceObject {
 
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
+    pub in_queue: AtomicBool,
 }
 
 impl DeviceObject {
@@ -59,6 +62,7 @@ impl DeviceObject {
             queue: Mutex::new(VecDeque::new()),
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Weak::new(),
+            in_queue: AtomicBool::new(false),
         })
     }
 
@@ -396,7 +400,6 @@ impl Request {
         self.completion_context = context;
     }
 }
-//TODO: do something better
 #[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {

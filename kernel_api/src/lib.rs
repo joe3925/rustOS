@@ -56,11 +56,13 @@ pub struct DeviceObject {
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
     pub dev_ext: Box<[u8]>,
     pub dev_init: DeviceInit,
-    pub queue: Mutex<VecDeque<Arc<spin::Mutex<Request>>>>,
+    pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
 
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
+    pub in_queue: AtomicBool,
 }
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct DevNode {

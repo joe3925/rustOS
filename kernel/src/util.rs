@@ -7,7 +7,7 @@ use crate::drivers::interrupt_index::{
     calibrate_tsc, get_current_logical_id, wait_millis_idle, wait_using_pit_50ms, ApicImpl,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
-use crate::drivers::pnp::pnp_manager::PNP_MANAGER;
+use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::TIMER_TIME;
 use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
