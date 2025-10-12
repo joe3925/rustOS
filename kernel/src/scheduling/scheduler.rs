@@ -1,5 +1,5 @@
-use crate::drivers::interrupt_index::get_current_logical_id;
-use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER, TIMER_TIME};
+use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id};
+use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::state::State;
@@ -71,7 +71,7 @@ impl Scheduler {
         }
     }
     pub fn has_core_init(&self) -> bool {
-        if let Some(task) = self.current_task.get(get_current_logical_id() as usize) {
+        if let Some(task) = self.current_task.get(current_cpu_id() as usize) {
             if *task == 0 {
                 return false;
             }
@@ -101,7 +101,7 @@ impl Scheduler {
     // round-robin
     #[inline]
     pub fn schedule_next(&mut self) -> Option<TaskHandle> {
-        let logical_id = get_current_logical_id() as usize;
+        let logical_id = current_cpu_id() as usize;
 
         self.reap_task();
 
@@ -156,29 +156,19 @@ impl Scheduler {
     }
     #[inline(always)]
     pub fn on_timer_tick(&mut self, state: *mut State, cpu: usize) {
-        if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
-        let Some(mut timer_time) = TIMER_TIME.try_lock() else {
-            return;
-        };
-        let Some(mut pc_switches) = PER_CORE_SWITCHES.try_lock() else {
-            return;
-        };
-        let sw = Stopwatch::start();
+
         let core_inited = self.has_core_init();
-
         if !core_inited {
-            timer_time.set(cpu, AtomicUsize::new(0));
-            pc_switches.set(cpu, AtomicUsize::new(0));
-        }
-
-        if !self.is_empty() && core_inited {
+            PER_CORE_SWITCHES.set(cpu, AtomicUsize::new(0));
+        } else if !self.is_empty() {
             unsafe {
                 self.get_current_task()
                     .write()
-                    .update_from_context(&mut *state)
-            };
+                    .update_from_context(&mut *state);
+            }
         }
 
         if let Some(task) = self.schedule_next() {
@@ -186,24 +176,19 @@ impl Scheduler {
                 let t = task.read();
                 (t.parent_pid != 0, &t.context as *const _ as *mut State)
             };
-
             if needs_restore {
                 self.restore_page_table();
             }
-
-            timer_time
-                .get(cpu)
-                .unwrap()
-                .fetch_add(sw.elapsed_millis() as usize, Ordering::SeqCst);
-            pc_switches.get(cpu).unwrap().fetch_add(1, Ordering::SeqCst);
-
-            return unsafe { (*ctx_ptr).restore(state) };
+            if let Some(a) = PER_CORE_SWITCHES.get(cpu) {
+                a.fetch_add(1, Ordering::SeqCst);
+            }
+            unsafe { (*ctx_ptr).restore(state) };
         } else {
-            panic!("No valid task in scheduler")
+            panic!("No valid task in scheduler");
         }
     }
     pub fn get_current_task(&self) -> TaskHandle {
-        let logical_id = get_current_logical_id() as usize;
+        let logical_id = current_cpu_id() as usize;
         let id = *self
             .current_task
             .get(logical_id)
@@ -244,7 +229,7 @@ impl Scheduler {
         self.tasks.iter().find(|h| h.read().name == name).cloned()
     }
     fn reap_task(&mut self) {
-        let core_id = get_current_logical_id() as u16;
+        let core_id = current_cpu_id() as u16;
 
         for i in (0..self.tasks.len()).rev() {
             let should_reap = {

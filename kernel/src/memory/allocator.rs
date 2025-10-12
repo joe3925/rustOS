@@ -163,35 +163,39 @@ static mut INIT: bool = false;
 unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // perform layout adjustments
-        let (size, align) = Allocator::size_align(layout);
-        let mut allocator = self.lock();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let (size, align) = Allocator::size_align(layout);
+            let mut allocator = self.lock();
 
-        if (INIT == false) {
-            let heap_start = VirtAddr::new(HEAP_START as u64);
-            let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
+            if (INIT == false) {
+                let heap_start = VirtAddr::new(HEAP_START as u64);
+                let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
 
-            allocator.free_list.head.next = heap_node_ptr.as_mut();
-            INIT = true;
-        }
-        if let Some((region, alloc_start)) = allocator.find_region(size, align) {
-            let alloc_end = alloc_start.checked_add(size).expect("overflow");
-            let excess_size = region.end_addr() - alloc_end;
-            if excess_size > 0 {
-                allocator.add_free_region(alloc_end, excess_size);
+                allocator.free_list.head.next = heap_node_ptr.as_mut();
+                INIT = true;
             }
-            allocator.allocations_made += 1;
-            alloc_start as *mut u8
-        } else {
-            ptr::null_mut()
-        }
+            if let Some((region, alloc_start)) = allocator.find_region(size, align) {
+                let alloc_end = alloc_start.checked_add(size).expect("overflow");
+                let excess_size = region.end_addr() - alloc_end;
+                if excess_size > 0 {
+                    allocator.add_free_region(alloc_end, excess_size);
+                }
+                allocator.allocations_made += 1;
+                alloc_start as *mut u8
+            } else {
+                ptr::null_mut()
+            }
+        })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // perform layout adjustments
-        let mut allocator = self.lock();
-        let (size, _) = Allocator::size_align(layout);
-        allocator.allocations_made -= 1;
-        allocator.add_free_region(ptr as usize, size);
-        allocator.merge_free_list();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut allocator = self.lock();
+            let (size, _) = Allocator::size_align(layout);
+            allocator.allocations_made -= 1;
+            allocator.add_free_region(ptr as usize, size);
+            allocator.merge_free_list();
+        });
     }
 }

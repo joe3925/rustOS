@@ -16,7 +16,8 @@ pub fn wait_cycle_idle(cycles: u128) {
     let start = get_cycles() as u128;
     loop {
         unsafe { asm!("hlt") };
-        if (get_cycles() as u128 >= cycles + start) {
+        let current = get_cycles();
+        if (current as u128 >= cycles + start) {
             return;
         }
     }

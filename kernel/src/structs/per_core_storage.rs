@@ -1,9 +1,9 @@
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use spin::{Mutex, MutexGuard};
+use spin::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct PCS<T> {
-    data: Mutex<PCSInner<T>>,
+    data: RwLock<PCSInner<T>>,
 }
 
 struct PCSInner<T> {
@@ -12,24 +12,34 @@ struct PCSInner<T> {
 }
 
 pub struct PCSGuard<'a, T> {
-    _lock: MutexGuard<'a, PCSInner<T>>,
-    value: *mut T,
+    _lock: RwLockReadGuard<'a, PCSInner<T>>,
+    value: *const T,
 }
-
 impl<'a, T> core::ops::Deref for PCSGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
         unsafe { &*self.value }
     }
 }
-impl<'a, T> core::ops::DerefMut for PCSGuard<'a, T> {
+
+pub struct PCSWriteGuard<'a, T> {
+    _lock: RwLockWriteGuard<'a, PCSInner<T>>,
+    value: *mut T,
+}
+impl<'a, T> core::ops::Deref for PCSWriteGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.value }
+    }
+}
+impl<'a, T> core::ops::DerefMut for PCSWriteGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
         unsafe { &mut *self.value }
     }
 }
 
 pub struct PCSIter<'a, T> {
-    _lock: MutexGuard<'a, PCSInner<T>>,
+    _lock: RwLockReadGuard<'a, PCSInner<T>>,
     ptr: *const T,
     len: usize,
     idx: usize,
@@ -47,7 +57,7 @@ impl<'a, T> Iterator for PCSIter<'a, T> {
 }
 
 pub struct PCSIterMut<'a, T> {
-    _lock: MutexGuard<'a, PCSInner<T>>,
+    _lock: RwLockWriteGuard<'a, PCSInner<T>>,
     ptr: *mut T,
     len: usize,
     idx: usize,
@@ -67,7 +77,7 @@ impl<'a, T> Iterator for PCSIterMut<'a, T> {
 impl<T> PCS<T> {
     pub fn new() -> Self {
         Self {
-            data: Mutex::new(PCSInner {
+            data: RwLock::new(PCSInner {
                 items: Vec::new(),
                 logical_id_map: HashMap::new(),
             }),
@@ -75,17 +85,27 @@ impl<T> PCS<T> {
     }
 
     pub fn get(&self, logical_id: usize) -> Option<PCSGuard<'_, T>> {
-        let lock = self.data.lock();
+        let lock = self.data.read();
         let index = lock.logical_id_map.get(&logical_id).copied()?;
-        let ptr = &lock.items[index] as *const T as *mut T;
+        let ptr = &lock.items[index] as *const T;
         Some(PCSGuard {
             _lock: lock,
             value: ptr,
         })
     }
 
-    pub fn set(&self, logical_id: usize, value: T) -> PCSGuard<'_, T> {
-        let mut lock = self.data.lock();
+    pub fn get_mut(&self, logical_id: usize) -> Option<PCSWriteGuard<'_, T>> {
+        let mut lock = self.data.write();
+        let index = lock.logical_id_map.get(&logical_id).copied()?;
+        let ptr = &mut lock.items[index] as *mut T;
+        Some(PCSWriteGuard {
+            _lock: lock,
+            value: ptr,
+        })
+    }
+
+    pub fn set(&self, logical_id: usize, value: T) -> PCSWriteGuard<'_, T> {
+        let mut lock = self.data.write();
         let index = match lock.logical_id_map.get(&logical_id) {
             Some(&idx) => {
                 lock.items[idx] = value;
@@ -99,14 +119,14 @@ impl<T> PCS<T> {
             }
         };
         let ptr = &mut lock.items[index] as *mut T;
-        PCSGuard {
+        PCSWriteGuard {
             _lock: lock,
             value: ptr,
         }
     }
 
     pub fn iter(&self) -> PCSIter<'_, T> {
-        let lock = self.data.lock();
+        let lock = self.data.read();
         let ptr = lock.items.as_ptr();
         let len = lock.items.len();
         PCSIter {
@@ -118,8 +138,8 @@ impl<T> PCS<T> {
     }
 
     pub fn iter_mut(&self) -> PCSIterMut<'_, T> {
-        let lock = self.data.lock();
-        let ptr = lock.items.as_ptr() as *mut T;
+        let mut lock = self.data.write();
+        let ptr = lock.items.as_mut_ptr();
         let len = lock.items.len();
         PCSIterMut {
             _lock: lock,

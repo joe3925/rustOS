@@ -11,10 +11,13 @@ use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::allocate_kernel_stack;
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{AP_STARTUP_CODE, CORE_LOCK, INIT_LOCK};
-use crate::KERNEL_INITIALIZED;
+use crate::util::{AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{mem, ptr};
 use pic8259::ChainedPics;
@@ -88,6 +91,79 @@ pub fn get_current_logical_id() -> u8 {
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
+static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
+
+pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
+    let idx = lapic_id as usize;
+    let mut v = PERCPU_SLOTS.lock();
+    if v.len() <= idx {
+        v.resize_with(idx + 1, || None);
+    }
+    if let Some(p) = v[idx] {
+        return p;
+    }
+    let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
+        cpu_id: lapic_id as u64,
+    }));
+    v[idx] = Some(p);
+    p
+}
+#[repr(C, align(64))]
+pub struct PerCpu {
+    pub cpu_id: u64,
+}
+
+pub const PERCPU_CPU_ID_OFF: u64 = 0;
+
+const IA32_GS_BASE: u32 = 0xC000_0101;
+const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+#[inline(always)]
+fn wrmsr(msr: u32, val: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") (val as u32),
+            in("edx") (val >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+pub fn set_gs_bases(percpu: *const PerCpu) {
+    let p = percpu as u64;
+    wrmsr(IA32_GS_BASE, p);
+    wrmsr(IA32_KERNEL_GS_BASE, p);
+}
+
+#[inline(always)]
+pub fn set_current_cpu_id(id: u32) {
+    unsafe {
+        asm!(
+            "mov dword ptr gs:[{off}], {id:e}",
+            off = const PERCPU_CPU_ID_OFF,
+            id  = in(reg) id,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+pub fn current_cpu_id() -> u32 {
+    let id: u32;
+    unsafe {
+        asm!(
+            "mov {out:e}, dword ptr gs:[{off}]",
+            out = out(reg) id,
+            off = const PERCPU_CPU_ID_OFF,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    id
+}
+
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
@@ -437,7 +513,7 @@ impl ApicImpl {
             .processor_info
             .expect("bad interrupt model")
             .application_processors;
-        set_num_cores(apics.iter().count());
+        set_num_cores(apics.iter().count() + 1);
         for (idx, apic) in apics.iter().enumerate() {
             let tramp_phys = PhysAddr::new(TRAMPOLINE_BASE);
             unsafe {
@@ -496,28 +572,45 @@ impl ApicImpl {
     }
 }
 
+#[inline(always)]
+pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
+    let p: &'static PerCpu = alloc_or_get_percpu_for(lapic_id);
+    let ptr = p as *const PerCpu;
+    unsafe {
+        (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
+    }
+    set_gs_bases(ptr);
+    p
+}
+
 extern "C" fn ap_startup() -> ! {
-    CORE_LOCK.fetch_add(1, Ordering::SeqCst);
-    INIT_LOCK.lock();
     {
+        CORE_LOCK.fetch_add(1, Ordering::SeqCst);
+        let _g = INIT_LOCK.lock();
+
         unsafe { PER_CPU_GDT.lock().init_gdt() };
         IDT.load();
+
+        let lapic_id = get_current_logical_id() as u32;
+        init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+
         unsafe {
             let mut guard = APIC.lock();
             if let Some(apic) = guard.as_mut() {
-                apic.lapic.init(get_current_logical_id());
+                apic.lapic.init(lapic_id as u8);
                 apic.lapic.init_timer();
             }
         }
+
         syscall_init();
-        x86_64::instructions::interrupts::enable();
+
+        CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
-    CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
-    while (!KERNEL_INITIALIZED.load(Ordering::SeqCst)) {}
 
+    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {}
+    x86_64::instructions::interrupts::enable();
     loop {
-
-        //TODO: Set to same gdt, idt, and scheduler as the BSP
+        x86_64::instructions::hlt();
     }
 }
 

@@ -1,5 +1,6 @@
+use crate::cpu;
 use crate::drivers::interrupt_index::{
-    get_current_logical_id, send_eoi, send_eoi_timer, InterruptIndex,
+    current_cpu_id, get_current_logical_id, send_eoi, send_eoi_timer, InterruptIndex,
 };
 use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::state::State;
@@ -13,18 +14,85 @@ use spin::Mutex;
 
 pub static TIMER: AtomicUsize = AtomicUsize::new(0);
 
-lazy_static! {
-    pub static ref TIMER_TIME: Mutex<PCS<AtomicUsize>> = Mutex::new(PCS::new());
-    pub static ref PER_CORE_SWITCHES: Mutex<PCS<AtomicUsize>> = Mutex::new(PCS::new());
-}
-
 const STATE_BYTES: usize = 15 * 8;
-// A little more fair bad average time
+
 #[repr(align(64))]
-struct Al64<T>(T);
+pub struct Al64<T>(pub T);
 
 pub static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
-static ROT_TICKET: Al64<AtomicUsize> = Al64(AtomicUsize::new(0));
+pub static ROT_TICKET: Al64<AtomicUsize> = Al64(AtomicUsize::new(0));
+
+lazy_static! {
+    pub static ref TIMER_TIME_FAST: PCS<AtomicUsize> = PCS::new();
+    pub static ref TIMER_TIME_SCHED: PCS<AtomicUsize> = PCS::new();
+    pub static ref PER_CORE_SWITCHES: PCS<AtomicUsize> = PCS::new();
+}
+
+#[inline(always)]
+fn add_time(pcs: &PCS<AtomicUsize>, cpu: usize, v: usize) {
+    match pcs.get(cpu) {
+        Some(a) => {
+            a.fetch_add(v, Ordering::Relaxed);
+        }
+        None => {
+            let a = pcs.set(cpu, AtomicUsize::new(0));
+            a.fetch_add(v, Ordering::Relaxed);
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct TimerDebug {
+    pub cpu: usize,
+    pub claimed: bool,
+    pub did_sched: bool,
+}
+#[inline(always)]
+fn timer_wrapper(state: *mut State, cpu_idx: usize, n: usize) -> TimerDebug {
+    let mut claimed = false;
+    let mut did_sched = false;
+
+    let t = ROT_TICKET.0.load(core::sync::atomic::Ordering::Acquire);
+    if (t as usize % n) != cpu_idx {
+        return TimerDebug {
+            cpu: cpu_idx,
+            claimed,
+            did_sched,
+        };
+    }
+
+    let guard = if let Some(g) = SCHEDULER.try_lock() {
+        g
+    } else {
+        return TimerDebug {
+            cpu: cpu_idx,
+            claimed,
+            did_sched,
+        };
+    };
+
+    if ROT_TICKET
+        .0
+        .compare_exchange(
+            t,
+            t + 1,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        claimed = true;
+        let mut sched = guard;
+        sched.on_timer_tick(state, cpu_idx);
+        did_sched = true;
+    }
+
+    TimerDebug {
+        cpu: cpu_idx,
+        claimed,
+        did_sched,
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
@@ -33,30 +101,20 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     let n = NUM_CORES.load(Ordering::Relaxed).max(1);
-    let cpu = get_current_logical_id() as usize % n;
+    TIMER.fetch_add(1, Ordering::Relaxed);
 
-    let claimed = ROT_TICKET
-        .0
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
-            if t % n == cpu {
-                Some(t.wrapping_add(1))
-            } else {
-                None
-            }
-        })
-        .is_ok();
+    let cpu_idx = current_cpu_id() as usize; // dense index
+    let sw = Stopwatch::start();
+    let dbg = timer_wrapper(state, cpu_idx, n);
+    let dt = sw.elapsed_nanos() as usize;
 
-    if !claimed {
-        return;
+    if dbg.did_sched {
+        add_time(&TIMER_TIME_SCHED, cpu_idx, dt);
+    } else {
+        add_time(&TIMER_TIME_FAST, cpu_idx, dt);
     }
-
-    // Only the claimer reaches here.
-    let mut sched = SCHEDULER.lock();
-    sched.on_timer_tick(state, cpu);
 }
-
 // Decent Average time, a little less fair
-
 // static ROT_STATE: AtomicU64 = AtomicU64::new(0);
 // static ALLOW_MASK: AtomicUsize = AtomicUsize::new(1);
 
@@ -70,27 +128,32 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
 //     m
 // }
 
-// #[no_mangle]
-// pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
-//     if !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
-//         return;
+// #[derive(Copy, Clone)]
+// pub struct TimerDebug {
+//     pub cpu: usize,
+//     pub allowed: bool,
+//     pub did_sched: bool,
+// }
+
+// #[inline(always)]
+// fn timer_wrapper_mask(state: *mut State, cpu: usize, n: usize) -> TimerDebug {
+//     if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+//         return TimerDebug { cpu, allowed: false, did_sched: false };
 //     }
 
-//     let n = NUM_CORES.load(Ordering::Relaxed).max(1);
-//     let cpu = get_current_logical_id() as usize;
-
-//     let mask = ALLOW_MASK.load(Ordering::Relaxed);
-//     if ((mask >> cpu) & 1) == 0 {
-//         return;
+//     let allowed = ((ALLOW_MASK.load(Ordering::Relaxed) >> cpu) & 1) != 0;
+//     if !allowed {
+//         return TimerDebug { cpu, allowed, did_sched: false };
 //     }
 
-//     let mut sched = SCHEDULER.lock();
-//     sched.on_timer_tick(state, cpu);
-//     drop(sched);
+//     {
+//         let mut sched = SCHEDULER.lock();
+//         sched.on_timer_tick(state, cpu);
+//     }
 
 //     loop {
-//         let s = ROT_STATE.load(Ordering::Relaxed);
-//         let h = (s >> 32) as usize;
+//         let s  = ROT_STATE.load(Ordering::Relaxed);
+//         let h  = (s >> 32) as usize;
 //         let w0 = (s & 0xFFFF_FFFF) as usize;
 
 //         let w2 = (w0 % n) + 1;
@@ -105,6 +168,21 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
 //             break;
 //         }
 //     }
+
+//     TimerDebug { cpu, allowed: true, did_sched: true }
+// }
+
+// #[no_mangle]
+// pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
+//     let n   = NUM_CORES.load(Ordering::Relaxed).max(1);
+//     let cpu = (get_current_logical_id() as usize) % n;
+
+//     let sw  = Stopwatch::start();
+//     let dbg = timer_wrapper_mask(state, cpu, n);
+//     let dt  = sw.elapsed_millis() as usize;
+
+//     if dbg.did_sched { add_time(&TIMER_TIME_SCHED, cpu, dt); }
+//     else             { add_time(&TIMER_TIME_FAST,  cpu, dt); }
 // }
 
 // pub fn set_num_cores(n: usize) {
@@ -118,6 +196,12 @@ pub fn set_num_cores(n: usize) {
     let n = n.max(1);
     NUM_CORES.store(n, Ordering::Relaxed);
     ROT_TICKET.0.store(0, Ordering::Relaxed);
+
+    for id in 0..n {
+        let _ = TIMER_TIME_FAST.set(id, AtomicUsize::new(0));
+        let _ = TIMER_TIME_SCHED.set(id, AtomicUsize::new(0));
+        let _ = PER_CORE_SWITCHES.set(id, AtomicUsize::new(0));
+    }
 }
 #[unsafe(naked)]
 pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {

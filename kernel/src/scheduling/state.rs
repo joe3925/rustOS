@@ -28,7 +28,6 @@ pub struct State {
 }
 impl State {
     #[inline(always)]
-    //rustc is protesting inlining this function so rax must be saved before call
     pub fn new(rax: u64) -> Self {
         let mut state = State {
             rax: 0,
