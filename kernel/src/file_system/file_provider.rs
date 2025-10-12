@@ -2,10 +2,10 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
-use crate::drivers::pnp::driver_object::DriverStatus;
+use crate::drivers::pnp::driver_object::{DriverStatus, Request};
 use crate::file_system::file::OpenFlags;
 use crate::file_system::file_structs::{
     FileError, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
@@ -27,6 +27,25 @@ pub trait FileProvider: Send + Sync {
     fn remove_dir_path(&self, path: &str) -> (FsCreateResult, DriverStatus);
     fn rename_path(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus);
     fn delete_path(&self, path: &str) -> (FsCreateResult, DriverStatus);
+
+    // Async variants: return the in-flight Request handle without waiting.
+    fn open_path_async(
+        &self,
+        path: &str,
+        flags: &[OpenFlags],
+    ) -> Result<Arc<RwLock<Request>>, FileError>;
+    fn read_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Arc<RwLock<Request>>, FileError>;
+    fn write_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Arc<RwLock<Request>>, FileError>;
 }
 
 static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);

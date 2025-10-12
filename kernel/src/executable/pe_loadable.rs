@@ -294,8 +294,7 @@ impl PELoader {
 
         let pid = PROGRAM_MANAGER.add_program(program);
         {
-            let mut scheduler = SCHEDULER.lock();
-            PROGRAM_MANAGER.start_pid(pid, &mut scheduler);
+            PROGRAM_MANAGER.start_pid(pid);
         }
         if were_enabled {
             interrupts::enable();

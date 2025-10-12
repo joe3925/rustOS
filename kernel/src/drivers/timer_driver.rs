@@ -47,72 +47,20 @@ pub struct TimerDebug {
     pub claimed: bool,
     pub did_sched: bool,
 }
-#[inline(always)]
-fn timer_wrapper(state: *mut State, cpu_idx: usize, n: usize) -> TimerDebug {
-    let mut claimed = false;
-    let mut did_sched = false;
-
-    let t = ROT_TICKET.0.load(core::sync::atomic::Ordering::Acquire);
-    if (t as usize % n) != cpu_idx {
-        return TimerDebug {
-            cpu: cpu_idx,
-            claimed,
-            did_sched,
-        };
-    }
-
-    let guard = if let Some(g) = SCHEDULER.try_lock() {
-        g
-    } else {
-        return TimerDebug {
-            cpu: cpu_idx,
-            claimed,
-            did_sched,
-        };
-    };
-
-    if ROT_TICKET
-        .0
-        .compare_exchange(
-            t,
-            t + 1,
-            core::sync::atomic::Ordering::AcqRel,
-            core::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
-    {
-        claimed = true;
-        let mut sched = guard;
-        sched.on_timer_tick(state, cpu_idx);
-        did_sched = true;
-    }
-
-    TimerDebug {
-        cpu: cpu_idx,
-        claimed,
-        did_sched,
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
 
-    let n = NUM_CORES.load(Ordering::Relaxed).max(1);
     TIMER.fetch_add(1, Ordering::Relaxed);
-
-    let cpu_idx = current_cpu_id() as usize; // dense index
+    let cpu_id = current_cpu_id() as usize;
     let sw = Stopwatch::start();
-    let dbg = timer_wrapper(state, cpu_idx, n);
-    let dt = sw.elapsed_nanos() as usize;
 
-    if dbg.did_sched {
-        add_time(&TIMER_TIME_SCHED, cpu_idx, dt);
-    } else {
-        add_time(&TIMER_TIME_FAST, cpu_idx, dt);
-    }
+    SCHEDULER.on_timer_tick(state, cpu_id);
+
+    let dt = sw.elapsed_nanos() as usize;
+    add_time(&TIMER_TIME_SCHED, cpu_id, dt);
 }
 // Decent Average time, a little less fair
 // static ROT_STATE: AtomicU64 = AtomicU64::new(0);

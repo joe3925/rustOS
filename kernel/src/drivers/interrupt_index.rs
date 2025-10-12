@@ -11,7 +11,7 @@ use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::allocate_kernel_stack;
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
@@ -151,7 +151,7 @@ pub fn set_current_cpu_id(id: u32) {
 }
 
 #[inline(always)]
-pub fn current_cpu_id() -> u32 {
+pub fn current_cpu_id() -> usize {
     let id: u32;
     unsafe {
         asm!(
@@ -161,7 +161,7 @@ pub fn current_cpu_id() -> u32 {
             options(nomem, nostack, preserves_flags)
         );
     }
-    id
+    id as usize
 }
 
 impl InterruptIndex {
@@ -603,7 +603,8 @@ extern "C" fn ap_startup() -> ! {
         }
 
         syscall_init();
-
+        apic_calibrate_ticks_per_ns_via_wait(10);
+        apic_program_period_ns(APIC_START_PERIOD as u64);
         CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
 

@@ -45,12 +45,12 @@ use crate::{
 
 pub extern "win64" fn create_kernel_task(entry: usize, name: String) -> u64 {
     let task = Task::new_kernel_mode(entry, KERNEL_STACK_SIZE, name, 0);
-    SCHEDULER.lock().add_task(task)
+    SCHEDULER.add_task(task)
 }
 #[unsafe(no_mangle)]
 
 pub extern "win64" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
-    SCHEDULER.lock().delete_task(id)
+    SCHEDULER.delete_task(id)
 }
 #[unsafe(no_mangle)]
 

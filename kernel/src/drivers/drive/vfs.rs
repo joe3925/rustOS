@@ -6,8 +6,9 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::{Lazy, RwLock};
+use spin::RwLock;
 
 use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
 use crate::file_system::file::OpenFlags;
@@ -21,7 +22,6 @@ use crate::file_system::file_structs::{
 };
 use crate::println;
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
-use lazy_static::lazy_static;
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
@@ -37,9 +37,8 @@ struct VfsHandle {
     pub is_dir: bool,
 }
 
-/// - Resolves labels to mount symlinks
-/// - Forwards FsOps to the appropriate filesystem driver device via its symlink
-/// - Maintains per-process (or system-wide) handle table mapping VFS handles to FS handles
+/// Resolves labels to mount symlinks and forwards FsOps to FS drivers.
+/// Keeps a VFS-handle ⇄ FS-handle table.
 pub struct Vfs {
     label_map: RwLock<BTreeMap<String, String>>,
     next_vh: AtomicU64,
@@ -63,15 +62,8 @@ impl Vfs {
         self.label_map.write().remove(label);
     }
 
-    /// Enumerate mounted volumes, refresh the internal label map, and return UI-friendly info.
-    ///
-    /// Enumerate mount objects (TODO: real MountMgr enumerate).
-    ///
-    /// Query each for status (`IOCTL_MOUNTMGR_QUERY`) -> parse "public=...;label=...".
-    ///
-    /// If no persistent label (TODO), assign a free label (C:..Z:) and (TODO) SetLabel.
     pub fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
-        let mounts = self.enumerate_mount_symlinks(); // TODO: replace with real enumerate
+        let mounts = self.enumerate_mount_symlinks();
 
         let mut out: Vec<MountedVolume> = Vec::new();
         let mut labels = self.label_map.write();
@@ -79,12 +71,10 @@ impl Vfs {
         for m in mounts {
             let (public, label_link, object_name) = match self.query_volume_status(&m) {
                 Ok(t) => t,
-                Err(_) => continue, // skip volumes we can’t talk to
+                Err(_) => continue,
             };
 
             let mut label = self.try_label_from_link(&label_link);
-
-            // TODO: ask for a persistent friendly label provided by the volume/FS
             if label.is_none() {
                 if let Some(persist) = self.query_persistent_label(&m) {
                     label = Some(persist);
@@ -95,7 +85,6 @@ impl Vfs {
                 Some(l) => l,
                 None => {
                     let assigned = self.assign_free_drive_label(&labels);
-                    // TODO: push assigned label to the volume/MountMgr so it persists
                     let _ = self.send_set_label_ioctl(&m, &assigned);
                     assigned
                 }
@@ -118,7 +107,6 @@ impl Vfs {
         (out, DriverStatus::Success)
     }
 
-    // TODO: Enumerate mount object symlinks from MountMgr.
     fn enumerate_mount_symlinks(&self) -> Vec<String> {
         Vec::new()
     }
@@ -168,7 +156,6 @@ impl Vfs {
         Ok((public, label, object_name))
     }
 
-    /// Generate a default user-visible label from a label link like "\\GLOBAL\\Mounts\\VOL0001".
     fn try_label_from_link(&self, label_link: &str) -> Option<String> {
         if label_link.is_empty() {
             return None;
@@ -185,7 +172,6 @@ impl Vfs {
         None
     }
 
-    /// Assign a free drive letter "C:".. "Z:"; fall back to "VOLn:".
     fn assign_free_drive_label(&self, map: &BTreeMap<String, String>) -> String {
         for ch in b'C'..=b'Z' {
             let cand = alloc::format!("{}:", ch as char);
@@ -196,12 +182,10 @@ impl Vfs {
         alloc::format!("VOL{}:", map.len() + 1)
     }
 
-    // TODO: Ask the volume for a persistent friendly label
     fn query_persistent_label(&self, _mount_symlink: &str) -> Option<String> {
         None
     }
 
-    // TODO: Push an assigned label back to the volume or MountMgr to persist it.
     fn send_set_label_ioctl(&self, _mount_symlink: &str, _label: &str) -> Result<(), DriverStatus> {
         Ok(())
     }
@@ -215,6 +199,7 @@ impl Vfs {
             v
         }
     }
+
     fn resolve_path(&self, user_path: &str) -> Result<(String, String), FileError> {
         if user_path.is_empty() {
             return Err(FileError::BadPath);
@@ -313,6 +298,67 @@ impl Vfs {
         let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };
         Ok(*out)
     }
+
+    #[inline]
+    fn call_fs_async<TParam>(
+        &self,
+        volume_symlink: &str,
+        op: FsOp,
+        param: TParam,
+    ) -> Arc<RwLock<Request>>
+    where
+        TParam: 'static,
+    {
+        let req = Arc::new(RwLock::new(Request::new(
+            RequestType::Fs(op),
+            Vfs::box_to_bytes(Box::new(param)),
+        )));
+        unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
+        req
+    }
+
+    // ---------- ASYNC API: returns the sent Request; no waits ----------
+
+    pub fn open_async(&self, p: FsOpenParams) -> Result<Arc<RwLock<Request>>, FileError> {
+        let (symlink, fs_path) = self.resolve_path(&p.path)?;
+        let param = FsOpenParams {
+            flags: p.flags,
+            path: fs_path,
+        };
+        Ok(self.call_fs_async(&symlink, FsOp::Open, param))
+    }
+
+    pub fn read_async(&self, p: FsReadParams) -> Result<Arc<RwLock<Request>>, FileError> {
+        let h = self
+            .handles
+            .read()
+            .get(&p.fs_file_id)
+            .cloned()
+            .ok_or(FileError::NotFound)?;
+        let param = FsReadParams {
+            fs_file_id: h.inner_id,
+            offset: p.offset,
+            len: p.len,
+        };
+        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Read, param))
+    }
+
+    pub fn write_async(&self, p: FsWriteParams) -> Result<Arc<RwLock<Request>>, FileError> {
+        let h = self
+            .handles
+            .read()
+            .get(&p.fs_file_id)
+            .cloned()
+            .ok_or(FileError::NotFound)?;
+        let param = FsWriteParams {
+            fs_file_id: h.inner_id,
+            offset: p.offset,
+            data: p.data,
+        };
+        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Write, param))
+    }
+
+    // ---------- SYNC API (unchanged behavior) ----------
 
     pub fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {
@@ -528,7 +574,6 @@ impl Vfs {
             self.call_fs(&h.volume_symlink, FsOp::Close, inner);
         match res {
             Ok(mut r) => {
-                // even if FS returns error, the VFS mapping is gone
                 if r.error.is_none() {
                     r.error = None;
                 }
@@ -580,7 +625,6 @@ impl Vfs {
                 DriverStatus::Success,
             );
         };
-        // replace handle id with inner id; reuse caller buffers
         p.fs_file_id = h.inner_id;
         match self.call_fs::<FsWriteParams, FsWriteResult>(&h.volume_symlink, FsOp::Write, p) {
             Ok(r) => (r, DriverStatus::Success),
@@ -739,6 +783,7 @@ impl Vfs {
         }
     }
 }
+
 impl FileProvider for Vfs {
     fn open_path(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
         let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
@@ -819,5 +864,43 @@ impl FileProvider for Vfs {
             },
             DriverStatus::Success,
         )
+    }
+
+    fn open_path_async(
+        &self,
+        path: &str,
+        flags: &[OpenFlags],
+    ) -> Result<Arc<RwLock<Request>>, FileError> {
+        let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
+        self.open_async(FsOpenParams {
+            flags: f,
+            path: path.to_string(),
+        })
+    }
+
+    fn read_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Arc<RwLock<Request>>, FileError> {
+        self.read_async(FsReadParams {
+            fs_file_id: file_id,
+            offset,
+            len: len as usize,
+        })
+    }
+
+    fn write_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Arc<RwLock<Request>>, FileError> {
+        self.write_async(FsWriteParams {
+            fs_file_id: file_id,
+            offset,
+            data: data.to_vec(),
+        })
     }
 }

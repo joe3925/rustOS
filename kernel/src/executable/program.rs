@@ -299,14 +299,13 @@ impl Program {
         loop {
             hlt();
 
-            let scheduler = SCHEDULER.lock();
             let mut running = managed.len() + 1;
 
-            if scheduler.get_task_by_id(main_tid).is_none() {
+            if SCHEDULER.get_task_by_id(main_tid).is_none() {
                 running -= 1;
             }
             for tid in &*managed {
-                if scheduler.get_task_by_id(tid.read().id).is_none() {
+                if SCHEDULER.get_task_by_id(tid.read().id).is_none() {
                     running -= 1;
                 }
             }
@@ -495,15 +494,15 @@ impl ProgramManager {
         self.programs.read().get(&pid).map(Arc::clone)
     }
 
-    pub fn start_pid(&self, pid: u64, scheduler: &mut Scheduler) -> Option<TaskHandle> {
+    pub fn start_pid(&self, pid: u64) -> Option<TaskHandle> {
         let handle = self.get(pid)?;
         let task_arc = {
             let prog = handle.write();
             Arc::clone(prog.main_thread.as_ref()?)
         };
         let tid = task_arc.read().id;
-        scheduler.add_task(task_arc);
-        scheduler.get_task_by_id(tid)
+        SCHEDULER.add_task(task_arc);
+        SCHEDULER.get_task_by_id(tid)
     }
 
     pub fn kill_program(&self, pid: u64) -> Result<(), LoadError> {

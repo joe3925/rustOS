@@ -25,7 +25,7 @@ pub type DpcFn = extern "win64" fn(usize);
 pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
 
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
-const START_THREADS: usize = 2;
+const START_THREADS: usize = 5;
 
 lazy_static::lazy_static! {
     static ref DISPATCH_DEVQ: Mutex<VecDeque<Arc<DeviceObject>>> = Mutex::new(VecDeque::new());

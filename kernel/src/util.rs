@@ -5,13 +5,13 @@ use crate::alloc::format;
 use crate::boot_packages;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
-    calibrate_tsc, get_current_logical_id, init_percpu_gs, set_current_cpu_id, wait_millis_idle,
-    wait_using_pit_50ms, ApicImpl,
+    calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
+    wait_millis_idle, wait_using_pit_50ms, ApicImpl,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{
-    PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_FAST, TIMER_TIME_SCHED,
+    NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_FAST, TIMER_TIME_SCHED,
 };
 use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
@@ -51,7 +51,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_TIME: Once<Stopwatch> = Once::new();
-
+pub const APIC_START_PERIOD: u64 = 560_000;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32"];
 
@@ -83,8 +83,8 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
                 x86_64::instructions::interrupts::disable();
                 APIC.lock().as_ref().unwrap().start_aps();
-                apic_calibrate_ticks_per_ns_via_wait(1);
-                apic_program_period_ns(336484);
+                apic_calibrate_ticks_per_ns_via_wait(10);
+                apic_program_period_ns(APIC_START_PERIOD);
             }
             Err(err) => {
                 println!("APIC transition failed {}!", err.to_str());
@@ -96,6 +96,7 @@ pub unsafe fn init() {
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
     TOTAL_TIME.call_once(Stopwatch::start);
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+    SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
     x86_64::instructions::interrupts::enable();
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     loop {
@@ -114,7 +115,7 @@ pub fn kernel_main() {
         KERNEL_RANGE_TRACKER.clone(),
     );
 
-    program.main_thread = Some(SCHEDULER.lock().get_current_task());
+    program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
         title: "KRNL.DLL".into(),
@@ -141,54 +142,29 @@ pub fn kernel_main() {
     PNP_MANAGER.print_device_tree();
     run_stats_loop();
 }
+
 fn read_all_core_timer_ms() -> Vec<u128> {
-    let fast: Vec<u128> = TIMER_TIME_FAST
+    TIMER_TIME_SCHED
         .iter()
-        .map(|a| a.load(Ordering::SeqCst) as u128)
-        .collect();
-    let sched: Vec<u128> = TIMER_TIME_SCHED
-        .iter()
-        .map(|a| a.load(Ordering::SeqCst) as u128)
-        .collect();
-
-    let n = fast.len().max(sched.len());
-    let mut v = Vec::with_capacity(n);
-    for i in 0..n {
-        let ns = fast
-            .get(i)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(sched.get(i).copied().unwrap_or(0));
-        v.push((ns + 500_000) / 1_000_000); // ns -> ms, rounded
-    }
-    v
-}
-
-fn read_all_core_fast_ns() -> Vec<u128> {
-    let pcs = &TIMER_TIME_FAST;
-    let mut v = Vec::with_capacity(pcs.iter().count());
-    for a in pcs.iter() {
-        v.push(a.load(Ordering::SeqCst) as u128);
-    }
-    v
+        .map(|a| {
+            let ns = a.load(Ordering::SeqCst) as u128;
+            (ns + 500_000) / 1_000_000
+        })
+        .collect()
 }
 
 fn read_all_core_sched_ns() -> Vec<u128> {
-    let pcs = &TIMER_TIME_SCHED;
-    let mut v = Vec::with_capacity(pcs.iter().count());
-    for a in pcs.iter() {
-        v.push(a.load(Ordering::SeqCst) as u128);
-    }
-    v
+    TIMER_TIME_SCHED
+        .iter()
+        .map(|a| a.load(Ordering::SeqCst) as u128)
+        .collect()
 }
 
 fn read_all_core_switches() -> Vec<u64> {
-    let pcs = &PER_CORE_SWITCHES;
-    let mut v = Vec::with_capacity(pcs.iter().count());
-    for a in pcs.iter() {
-        v.push(a.load(Ordering::SeqCst) as u64);
-    }
-    v
+    PER_CORE_SWITCHES
+        .iter()
+        .map(|a| a.load(Ordering::SeqCst) as u64)
+        .collect()
 }
 
 fn avg_ms_per_core(core_ms: &[u128]) -> u128 {
@@ -366,21 +342,10 @@ pub fn run_stats_loop() {
     let mut prev_total_ms: u128 = 0;
     let mut prev_core_ms: Vec<u128> = read_all_core_timer_ms();
     let mut prev_core_sw: Vec<u64> = read_all_core_switches();
-    let mut prev_fast_ns: Vec<u128> = read_all_core_fast_ns();
     let mut prev_sched_ns: Vec<u128> = read_all_core_sched_ns();
-
-    let mut prev_timer: u64 = TIMER.load(Ordering::SeqCst) as u64;
-    let mut prev_rot: u64 = ROT_TICKET.0.load(Ordering::SeqCst) as u64;
 
     loop {
         wait_millis_idle(60000);
-
-        let timer_now = TIMER.load(Ordering::SeqCst) as u64;
-        let rot_now = ROT_TICKET.0.load(Ordering::SeqCst) as u64;
-
-        let delta_ticks = timer_now.saturating_sub(prev_timer);
-        let delta_hits = rot_now.saturating_sub(prev_rot);
-        let delta_misses = delta_ticks.saturating_sub(delta_hits);
 
         let core_ms_now = read_all_core_timer_ms();
         let total_ms_now = TOTAL_TIME.wait().elapsed_millis() as u128;
@@ -405,24 +370,12 @@ pub fn run_stats_loop() {
             delta_core_sw.push(d);
         }
 
-        let fast_ns_now = read_all_core_fast_ns();
         let sched_ns_now = read_all_core_sched_ns();
-        let mut delta_fast_ns = Vec::new();
         let mut delta_sched_ns = Vec::new();
-        let mut total_fast_ns: u128 = 0;
         let mut total_sched_ns: u128 = 0;
 
-        let cores = core_ms_now
-            .len()
-            .max(fast_ns_now.len())
-            .max(sched_ns_now.len());
+        let cores = core_ms_now.len().max(sched_ns_now.len());
         for i in 0..cores {
-            let nf = *fast_ns_now.get(i).unwrap_or(&0);
-            let pf = *prev_fast_ns.get(i).unwrap_or(&0);
-            let ns_fast = nf.saturating_sub(pf);
-            total_fast_ns += ns_fast;
-            delta_fast_ns.push(ns_fast);
-
             let ns = *sched_ns_now.get(i).unwrap_or(&0);
             let ps = *prev_sched_ns.get(i).unwrap_or(&0);
             let ns_sched = ns.saturating_sub(ps);
@@ -444,31 +397,15 @@ pub fn run_stats_loop() {
         let avg_ns_per_switch = if total_delta_sw == 0 {
             0
         } else {
-            (total_fast_ns + total_sched_ns) / total_delta_sw
+            total_sched_ns / total_delta_sw
         };
 
-        let total_timer_ns = total_fast_ns.saturating_add(total_sched_ns);
+        let total_timer_ns = total_sched_ns;
         let total_cpu_ns_window = delta_total_ms * ncores * 1_000_000;
         let timer_overhead_x100000 = if total_cpu_ns_window == 0 {
             0
         } else {
             (total_timer_ns * 100_000) / total_cpu_ns_window
-        };
-
-        let fast_share_x1000 = if total_timer_ns == 0 {
-            0
-        } else {
-            (total_fast_ns * 1000) / total_timer_ns
-        };
-        let avg_fast_ns_per_switch = if total_delta_sw == 0 {
-            0
-        } else {
-            total_fast_ns / total_delta_sw
-        };
-        let avg_sched_ns_per_switch = if total_delta_sw == 0 {
-            0
-        } else {
-            total_sched_ns / total_delta_sw
         };
 
         let (min_core_idx, max_core_idx, max_gap) = max_gap_x1000(&percs);
@@ -477,54 +414,47 @@ pub fn run_stats_loop() {
         let median = median_x1000(percs.clone());
         let mad = mad_percent_x1000(&percs);
 
-        let hits_per_sec = ((delta_hits as u128) * 1000 / delta_total_ms) as u64;
-        let misses_per_sec = ((delta_misses as u128) * 1000 / delta_total_ms) as u64;
-        let hit_rate_x1000: u64 = {
-            let tot = delta_hits.saturating_add(delta_misses);
-            if tot == 0 {
-                0
-            } else {
-                ((delta_hits as u128) * 1000 / (tot as u128)) as u64
-            }
-        };
-
         println!(
             "\n{:=^120}",
             format!("[ System Summary | Window: {}ms ]", delta_total_ms)
         );
         println!(
-            "Avg Util: {:>3}.{:01}% | Total Ctx/s: {:<7} | Avg Ctx/s/Core: {:<5} | Avg Ctx Latency: {:>4} ns",
-            avg_util_x100000 / 1000, (avg_util_x100000 % 1000) / 100,
-            total_ctx_per_sec, avg_ctx_per_sec_per_core, avg_ns_per_switch
+            "Avg Util: {:>3}.{:01}% | Total Ctx/s: {:<7} | Avg Ctx/s/Core: {:<5} | Avg Sched Latency: {:>4} ns",
+            avg_util_x100000 / 1000,
+            (avg_util_x100000 % 1000) / 100,
+            total_ctx_per_sec,
+            avg_ctx_per_sec_per_core,
+            avg_ns_per_switch
         );
         println!(
-            "Timer Ovh: {:>2}.{:02}% | Total Cost: {:>5} us | Fast/Sched Split: {:>2}.{:01}% / {:>2}.{:01}% ({:>3}ns / {:>3}ns per ctx)",
-            timer_overhead_x100000 / 1000, (timer_overhead_x100000 % 1000) / 10,
+            "Timer Ovh: {:>2}.{:02}% | Total Scheduler Cost: {:>5} us",
+            timer_overhead_x100000 / 1000,
+            (timer_overhead_x100000 % 1000) / 10,
             total_timer_ns / 1000,
-            fast_share_x1000 / 10, fast_share_x1000 % 10,
-            (1000 - fast_share_x1000) / 10, (1000 - fast_share_x1000) % 10,
-            avg_fast_ns_per_switch, avg_sched_ns_per_switch
-        );
-        println!(
-            "Timer Hits/Misses: {:>10} / {:>10} | HitRate: {:>3}.{:01}% | Hits/s: {:>6} | Misses/s: {:>6}",
-            delta_hits, delta_misses,
-            hit_rate_x1000 / 10, hit_rate_x1000 % 10,
-            hits_per_sec, misses_per_sec
         );
 
         println!("{:-^120}", "[ Per-Core Utilization ]");
-        const NUM_COLUMNS: usize = 3;
+        const NUM_COLUMNS: usize = 4;
         let num_cores = percs.len();
         let num_rows = (num_cores + NUM_COLUMNS - 1) / NUM_COLUMNS;
 
         let header = format!(
             "{:<4} | {:>5} | {:>5} | {:>9} | {:>6}",
-            "Core", "Util%", "Ctx/s", "F/S ns", "Ovh%"
+            "Core", "Util%", "Ctx/s", "Sched ns", "Ovh%"
         );
         let separator = "-".repeat(header.len());
 
-        println!("| {} |", vec![header.as_str(); NUM_COLUMNS].join(" | "));
-        println!("| {} |", vec![separator.as_str(); NUM_COLUMNS].join(" | "));
+        let mut headers = Vec::new();
+        for _ in 0..NUM_COLUMNS {
+            headers.push(header.as_str());
+        }
+        println!("| {} |", headers.join(" | "));
+
+        let mut separators = Vec::new();
+        for _ in 0..NUM_COLUMNS {
+            separators.push(separator.as_str());
+        }
+        println!("| {} |", separators.join(" | "));
 
         for row in 0..num_rows {
             let mut row_segments = Vec::with_capacity(NUM_COLUMNS);
@@ -535,13 +465,11 @@ pub fn run_stats_loop() {
                     let cps = (delta_core_sw.get(core_idx).copied().unwrap_or(0) as u128 * 1000)
                         / delta_total_ms;
                     let sw = delta_core_sw.get(core_idx).copied().unwrap_or(0) as u128;
-                    let fns = delta_fast_ns.get(core_idx).copied().unwrap_or(0);
                     let sns = delta_sched_ns.get(core_idx).copied().unwrap_or(0);
-                    let fast_avg = if sw == 0 { 0 } else { fns / sw };
                     let sched_avg = if sw == 0 { 0 } else { sns / sw };
 
                     let core_cpu_ns = delta_total_ms * 1_000_000;
-                    let tns = fns + sns;
+                    let tns = sns;
                     let overhead_x10000 = if core_cpu_ns == 0 {
                         0
                     } else {
@@ -549,12 +477,11 @@ pub fn run_stats_loop() {
                     };
 
                     row_segments.push(format!(
-                        "C{:<3} | {:>3}.{:01}% | {:>5} | {:>4}/{:<4} | {:>2}.{:02}%",
+                        "C{:<3} | {:>3}.{:01}% | {:>5} | {:>9} | {:>2}.{:02}%",
                         core_idx,
                         p / 1000,
                         (p % 1000) / 100,
                         cps,
-                        fast_avg,
                         sched_avg,
                         overhead_x10000 / 100,
                         overhead_x10000 % 100
@@ -584,10 +511,7 @@ pub fn run_stats_loop() {
         prev_core_ms = core_ms_now;
         prev_total_ms = total_ms_now;
         prev_core_sw = core_sw_now;
-        prev_fast_ns = fast_ns_now;
         prev_sched_ns = sched_ns_now;
-        prev_timer = timer_now;
-        prev_rot = rot_now;
     }
 }
 

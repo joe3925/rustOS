@@ -624,4 +624,30 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             DriverStatus::Success,
         )
     }
+
+    fn open_path_async(
+        &self,
+        path: &str,
+        flags: &[OpenFlags],
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+        todo!()
+    }
+
+    fn read_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+        todo!()
+    }
+
+    fn write_at_async(
+        &self,
+        file_id: u64,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+        todo!()
+    }
 }

@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::scheduling::task::Task;
@@ -38,7 +39,7 @@ impl ThreadPool {
         for _ in 0..n {
             let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
             t.write().context.rdi = Arc::as_ptr(self) as u64;
-            SCHEDULER.lock().add_task(t);
+            SCHEDULER.add_task(t);
         }
     }
 
@@ -53,7 +54,7 @@ impl ThreadPool {
 
 extern "C" fn worker(pool_ptr: usize) {
     let pool: &ThreadPool = unsafe { &*(pool_ptr as *const ThreadPool) };
-    let me = SCHEDULER.lock().get_current_task();
+    let me = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
 
     loop {
         let job = {

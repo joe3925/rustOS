@@ -1,3 +1,4 @@
+use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
@@ -236,7 +237,11 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
 }
 
 pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
 
     let obj = match OBJECT_MANAGER.open_by_id(task_handle) {
         Some(o) => o,
@@ -260,14 +265,18 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
     };
     if th.read().parent_pid != caller_pid {}
     let tid = th.read().id;
-    match SCHEDULER.lock().delete_task(tid) {
+    match SCHEDULER.delete_task(tid) {
         Ok(_) => 0,
         Err(_) => make_err(ErrClass::TaskClass, TaskErr::NotFound as u16, tid as u32),
     }
 }
 
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -300,7 +309,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         stack,
         caller_pid,
     );
-    SCHEDULER.lock().add_task(task.clone());
+    SCHEDULER.add_task(task.clone());
 
     let obj = ensure_thread_object(caller_pid, &task);
     obj.id
@@ -320,7 +329,11 @@ pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
     };
     let len = core::cmp::min(data.len(), max_len);
 
-    let pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let handle = match PROGRAM_MANAGER.get(pid) {
         Some(h) => h,
         None => return make_err(ErrClass::Program, ProgErr::NotFound as u16, pid as u32),
@@ -368,7 +381,11 @@ pub(crate) fn list_dir(path: *const u8) -> u64 {
         return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
     }
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -433,7 +450,11 @@ pub(crate) fn sys_file_open(
         return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
     }
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -467,7 +488,7 @@ pub(crate) fn sys_file_delete(file: *mut File) -> u64 {
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
-    let task = SCHEDULER.lock().get_current_task();
+    let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
     let caller_pid = task.read().parent_pid;
     let obj = ensure_thread_object(caller_pid, &task);
     obj.id
@@ -479,7 +500,11 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
     }
     let msg = unsafe { &mut *message_ptr };
 
-    let sender_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let sender_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let sender_prog = match PROGRAM_MANAGER.get(sender_pid) {
         Some(p) => p,
         None => {
@@ -517,7 +542,11 @@ pub(crate) fn sys_rule_add(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -619,7 +648,11 @@ pub(crate) fn sys_rule_clear(rule_ptr: *const UserRoutingRule) -> u64 {
     }
     let rule_u = unsafe { &*rule_ptr };
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -647,7 +680,11 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let prog = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -687,7 +724,11 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
 
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let prog = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -727,7 +768,11 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
 }
 
 pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let prog = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => return 0,
@@ -737,7 +782,11 @@ pub(crate) fn sys_get_default_mq_handle() -> UserHandle {
 }
 
 pub(crate) fn sys_create_mq() -> UserHandle {
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let prog = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => return 0,
@@ -761,7 +810,11 @@ pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
     if path.is_null() || !user_ptr(path) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
@@ -790,7 +843,11 @@ pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
 }
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
-    let caller_pid = SCHEDULER.lock().get_current_task().read().parent_pid;
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .read()
+        .parent_pid;
     let caller = match PROGRAM_MANAGER.get(caller_pid) {
         Some(p) => p,
         None => {
