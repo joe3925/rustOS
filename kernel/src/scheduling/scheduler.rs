@@ -4,7 +4,7 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::state::State;
 use crate::scheduling::task::{idle_task, Task};
-use crate::util::{kernel_main, KERNEL_INITIALIZED};
+use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -114,10 +114,15 @@ impl Scheduler {
         }
 
         if let Some(cur) = self.get_current_task(cpu_id) {
-            unsafe { cur.write().update_from_context(&mut *state) };
+            cur.write().update_from_context(state);
         }
+        // TODO: move to balancing routine when added to timer
+        //self.reap_tasks(cpu_id);
 
-        self.reap_tasks(cpu_id);
+        if ((TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0) {
+            self.reap_tasks(cpu_id);
+            self.balance();
+        }
         let next = self.schedule_next(cpu_id);
 
         let (needs_restore, ctx_ptr) = {
@@ -139,27 +144,27 @@ impl Scheduler {
     fn schedule_next(&self, cpu_id: usize) -> TaskHandle {
         let core = &self.cores[cpu_id];
 
-        if let Some(prev) = core.current.write().take() {
-            if !Arc::ptr_eq(&prev, &core.idle_task) {
-                core.run_queue.lock().push_back(prev);
+        if let Some(previous_task) = core.current.write().take() {
+            if !Arc::ptr_eq(&previous_task, &core.idle_task) {
+                core.run_queue.lock().push_back(previous_task);
             }
         }
 
-        let next = {
-            let mut q = core.run_queue.lock();
-            let n = q.len();
-            for _ in 0..n {
-                if let Some(h) = q.pop_front() {
-                    let runnable = {
-                        let r = h.read();
-                        !r.is_sleeping && !r.terminated
+        let next_task = {
+            let mut run_queue_guard = core.run_queue.lock();
+            let queue_len = run_queue_guard.len();
+            for _ in 0..queue_len {
+                if let Some(task_handle) = run_queue_guard.pop_front() {
+                    let is_runnable = {
+                        let task = task_handle.read();
+                        !task.is_sleeping && !task.terminated
                     };
-                    if runnable {
-                        drop(q);
-                        *core.current.write() = Some(h.clone());
-                        return h;
+                    if is_runnable {
+                        drop(run_queue_guard);
+                        *core.current.write() = Some(task_handle.clone());
+                        return task_handle;
                     } else {
-                        q.push_back(h);
+                        run_queue_guard.push_back(task_handle);
                     }
                 } else {
                     break;
@@ -168,8 +173,8 @@ impl Scheduler {
             core.idle_task.clone()
         };
 
-        *core.current.write() = Some(next.clone());
-        next
+        *core.current.write() = Some(next_task.clone());
+        next_task
     }
 
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {

@@ -126,8 +126,8 @@ impl Task {
             is_sleeping: false,
         }))
     }
-    pub fn update_from_context(&mut self, context: &State) {
-        self.context = *context;
+    pub fn update_from_context(&mut self, context: *mut State) {
+        self.context = unsafe { *context };
     }
     pub fn destroy(&mut self) {
         if (self.is_user_mode) {

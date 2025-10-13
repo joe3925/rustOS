@@ -50,8 +50,8 @@ pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 560_000;
+pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
+pub const APIC_START_PERIOD: u64 = 156_800;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32"];
 
