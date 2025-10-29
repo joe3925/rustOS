@@ -5,6 +5,7 @@ use crate::drivers::pnp::driver_object::{
 use crate::drivers::pnp::manager::{PnpManager, PNP_MANAGER};
 use crate::drivers::pnp::request;
 use crate::static_handlers::create_kernel_task;
+use crate::structs::thread_pool::ThreadPool;
 use alloc::{boxed::Box, collections::vec_deque::VecDeque, string::String, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
@@ -25,9 +26,10 @@ pub type DpcFn = extern "win64" fn(usize);
 pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
 
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
-const START_THREADS: usize = 5;
+const START_THREADS: usize = 12;
 
 lazy_static::lazy_static! {
+    static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
     static ref DISPATCH_DEVQ: Mutex<VecDeque<Arc<DeviceObject>>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
@@ -39,18 +41,18 @@ impl PnpManager {
 
     pub fn init_io_dispatcher(&self) {
         if !DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
-            for _ in 0..START_THREADS {
-                create_kernel_task(
-                    io_dispatcher_trampoline as usize,
-                    alloc::format!("io-dispatch{:x}", crate::util::random_number()),
-                );
-            }
+            THREADS.start(START_THREADS);
+            create_kernel_task(
+                io_dispatcher_trampoline as usize,
+                alloc::format!("io-dispatch{:x}", crate::util::random_number()),
+            );
         }
     }
 
     pub fn run_once(&self) -> bool {
         self.run_one_dpc() | self.run_one_device_request()
     }
+
     pub fn dispatch_forever(&self) -> ! {
         loop {
             if !self.run_once() {
@@ -60,54 +62,87 @@ impl PnpManager {
     }
 
     fn run_one_dpc(&self) -> bool {
-        if let Some(dpc) = GLOBAL_DPCQ.lock().pop_front() {
-            (dpc.func)(dpc.arg);
-            true
-        } else {
-            false
+        let dpc_opt = { GLOBAL_DPCQ.lock().pop_front() };
+        let Some(dpc) = dpc_opt else {
+            return false;
+        };
+
+        let pair = Box::new((dpc.func, dpc.arg));
+        let ptr = Box::into_raw(pair) as usize;
+
+        if !THREADS.submit_if_runnable(job_run_dpc, ptr) {
+            let _ = unsafe { Box::from_raw(ptr as *mut (extern "win64" fn(usize), usize)) };
+            GLOBAL_DPCQ.lock().push_front(dpc);
+            return false;
         }
+        true
     }
 
-    fn run_one_device_request(&self) -> bool {
-        let dev = match DISPATCH_DEVQ.lock().pop_front() {
-            Some(d) => d,
-            None => return false,
+    pub fn pump_queue_once(&self) -> bool {
+        let dev_opt = { DISPATCH_DEVQ.lock().pop_front() };
+        let Some(dev) = dev_opt else {
+            return false;
         };
-        dev.in_queue.store(false, Ordering::Release);
 
+        dev.in_queue.store(false, Ordering::Release);
         let _ = dev
             .dispatch_tickets
             .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
                 Some(cur.saturating_sub(1))
             });
 
+        self.drain_device(&dev);
+        true
+    }
+
+    fn run_one_device_request(&self) -> bool {
+        let dev_opt = { DISPATCH_DEVQ.lock().pop_front() };
+        let Some(dev) = dev_opt else {
+            return false;
+        };
+
+        dev.in_queue.store(false, Ordering::Release);
+        let _ = dev
+            .dispatch_tickets
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(1))
+            });
+
+        let arg = Box::new(DrainJobArg { dev: dev.clone() });
+        let ptr = Box::into_raw(arg) as usize;
+
+        if !THREADS.submit_if_runnable(job_drain_device, ptr) {
+            let _ = unsafe { Box::from_raw(ptr as *mut DrainJobArg) };
+            dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel);
+            if !dev.in_queue.swap(true, Ordering::AcqRel) {
+                DISPATCH_DEVQ.lock().push_front(dev);
+            }
+            return false;
+        }
+        true
+    }
+
+    fn drain_device(&self, dev: &Arc<DeviceObject>) {
         loop {
-            let req_opt = {
-                let mut q = dev.queue.lock();
-                q.pop_front()
-            };
+            let req_opt = { dev.queue.lock().pop_front() };
 
             if let Some(req) = req_opt {
-                self.call_device_handler(&dev, req);
+                self.call_device_handler(dev, req);
                 continue;
             }
 
             let needs_requeue = {
                 let more = dev.dispatch_tickets.load(Ordering::Acquire);
-                let has_items = {
-                    let q = dev.queue.lock();
-                    !q.is_empty()
-                };
+                let has_items = { !dev.queue.lock().is_empty() };
                 more > 0 || has_items
             };
 
             if needs_requeue && !dev.in_queue.swap(true, Ordering::AcqRel) {
                 DISPATCH_DEVQ.lock().push_back(dev.clone());
             }
-            return true;
+            return;
         }
     }
-
     pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
         target.target_device.queue.lock().push_back(req);
         self.schedule_device_dispatch(&target.target_device);
@@ -297,4 +332,19 @@ fn with_req_mut<F: FnOnce(&mut Request)>(r: &Arc<RwLock<Request>>, f: F) {
 
 extern "C" fn io_dispatcher_trampoline() {
     PNP_MANAGER.dispatch_forever();
+}
+
+struct DrainJobArg {
+    dev: Arc<DeviceObject>,
+}
+
+extern "win64" fn job_run_dpc(arg: usize) {
+    let p = unsafe { &*(arg as *const (extern "win64" fn(usize), usize)) };
+    (p.0)(p.1);
+    let _ = unsafe { Box::from_raw(arg as *mut (extern "win64" fn(usize), usize)) };
+}
+
+extern "win64" fn job_drain_device(arg: usize) {
+    let b: Box<DrainJobArg> = unsafe { Box::from_raw(arg as *mut DrainJobArg) };
+    PNP_MANAGER.drain_device(&b.dev);
 }

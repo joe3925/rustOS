@@ -101,7 +101,7 @@ impl PartialEq for FileStatus {
 pub struct File {
     fs_file_id: u64,
     path: String,
-    size: u64,
+    pub(crate) size: u64,
     is_dir: bool,
 }
 
@@ -287,26 +287,13 @@ fn file_exists(path: &str) -> bool {
 }
 
 pub fn switch_to_vfs() -> Result<(), RegError> {
-    // TODO: avoid this double copy
-    let ram_mod = "C:\\SYSTEM\\MOD";
-    let ram_toml = "C:\\SYSTEM\\TOML";
+    // TODO: At some point I need to figure out what to do with the boot strap drivers, DriverObject images not resolving.
+    // Options:
+    // 1. OM resolution, add memory backed files resolved from the OM
 
-    let mut mod_blobs: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> =
-        alloc::vec::Vec::new();
-    for name in list(ram_mod) {
-        let p = alloc::format!("{}\\{}", ram_mod, name);
-        if let Some(bytes) = read_all(&p) {
-            mod_blobs.push((name, bytes));
-        }
-    }
-    let mut toml_blobs: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> =
-        alloc::vec::Vec::new();
-    for name in list(ram_toml) {
-        let p = alloc::format!("{}\\{}", ram_toml, name);
-        if let Some(bytes) = read_all(&p) {
-            toml_blobs.push((name, bytes));
-        }
-    }
+    // 2. create a ramfs driver that registers with the vfs, get rid of the file provider stuff
+
+    // 3. add memory backed files that file system drivers must support.
 
     install_file_provider(Box::new(Vfs::new()));
 
@@ -316,34 +303,6 @@ pub fn switch_to_vfs() -> Result<(), RegError> {
     let vfs_toml = "C:\\SYSTEM\\TOML";
     ensure_dir(vfs_mod);
     ensure_dir(vfs_toml);
-
-    for (name, bytes) in mod_blobs {
-        let dst = alloc::format!("{}\\{}", vfs_mod, name);
-        if file_exists(&dst) {
-            continue;
-        }
-
-        let mut f = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite])
-            .unwrap_or_else(|e| panic!("mod install failed: open {}: {:?}", dst, e));
-
-        let n = f
-            .write(&bytes)
-            .unwrap_or_else(|e| panic!("mod install failed: write {}: {:?}", dst, e));
-    }
-
-    for (name, bytes) in toml_blobs {
-        let dst = alloc::format!("{}\\{}", vfs_toml, name);
-        if file_exists(&dst) {
-            continue;
-        }
-
-        let mut f = File::open(&dst, &[OpenFlags::CreateNew, OpenFlags::ReadWrite])
-            .unwrap_or_else(|e| panic!("toml install failed: open {}: {:?}", dst, e));
-
-        let n = f
-            .write(&bytes)
-            .unwrap_or_else(|e| panic!("toml install failed: write {}: {:?}", dst, e));
-    }
 
     Ok(())
 }

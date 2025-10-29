@@ -15,6 +15,7 @@ use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
+use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 
 #[derive(Debug)]
@@ -116,8 +117,6 @@ impl Scheduler {
         if let Some(cur) = self.get_current_task(cpu_id) {
             cur.write().update_from_context(state);
         }
-        // TODO: move to balancing routine when added to timer
-        //self.reap_tasks(cpu_id);
 
         if ((TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0) {
             self.reap_tasks(cpu_id);
@@ -254,21 +253,14 @@ pub fn kernel_task_yield() {
 }
 
 pub fn kernel_task_end() -> ! {
-    let syscall_number: u64 = 2;
-    let arg1: u64 = {
-        let cpu_id = current_cpu_id() as usize;
-        SCHEDULER.get_current_task(cpu_id).unwrap().read().id
-    };
-    unsafe {
-        asm!(
-            "mov rax, {0}",
-            "mov r8,  {1}",
-            "int 0x80",
-            "2:",
-            "jmp 2b",
-            in(reg) syscall_number,
-            in(reg) arg1,
-            options(noreturn)
-        );
-    }
+    // TODO: need a better pattern then this
+    interrupts::without_interrupts(|| {
+        let id = SCHEDULER
+            .get_current_task(current_cpu_id() as usize)
+            .unwrap()
+            .read()
+            .id;
+        SCHEDULER.delete_task(id);
+    });
+    loop {}
 }

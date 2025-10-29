@@ -21,6 +21,7 @@ extern crate alloc;
 pub mod gdt;
 mod idt;
 
+mod benchmarking;
 mod console;
 mod cpu;
 mod drivers;

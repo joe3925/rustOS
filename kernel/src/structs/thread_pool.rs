@@ -1,6 +1,8 @@
+use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::drivers::interrupt_index::current_cpu_id;
@@ -50,6 +52,49 @@ impl ThreadPool {
             t.write().wake();
         }
     }
+
+    pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
+        let started = Arc::new(AtomicBool::new(false));
+
+        let mut g = self.inner.lock();
+        let sleeper = match g.sleepers.pop() {
+            Some(t) => t,
+            None => return false,
+        };
+
+        let payload = Box::new(TrampPayload {
+            f,
+            a,
+            started: started.clone(),
+        });
+
+        g.q.push_front(Job {
+            f: job_start_trampoline,
+            a: Box::into_raw(payload) as usize,
+        });
+
+        sleeper.write().wake();
+        drop(g);
+
+        while !started.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        true
+    }
+}
+
+struct TrampPayload {
+    f: JobFn,
+    a: usize,
+    started: Arc<AtomicBool>,
+}
+
+extern "win64" fn job_start_trampoline(p: usize) {
+    let b: Box<TrampPayload> = unsafe { Box::from_raw(p as *mut TrampPayload) };
+    b.started.store(true, Ordering::Release);
+    let f = b.f;
+    let a = b.a;
+    (f)(a);
 }
 
 extern "C" fn worker(pool_ptr: usize) {

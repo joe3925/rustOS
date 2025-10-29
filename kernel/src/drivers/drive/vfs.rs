@@ -1,4 +1,3 @@
-// vfs.rs
 #![no_std]
 
 extern crate alloc;
@@ -38,7 +37,7 @@ struct VfsHandle {
 }
 
 /// Resolves labels to mount symlinks and forwards FsOps to FS drivers.
-/// Keeps a VFS-handle ⇄ FS-handle table.
+/// Keeps a VFS-handle -> FS-handle table.
 pub struct Vfs {
     label_map: RwLock<BTreeMap<String, String>>,
     next_vh: AtomicU64,
@@ -286,7 +285,6 @@ impl Vfs {
             RequestType::Fs(op),
             Vfs::box_to_bytes(Box::new(param)),
         )));
-        println!("sending to symlink {}", volume_symlink);
         unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
         unsafe { pnp_wait_for_request(&req) };
 

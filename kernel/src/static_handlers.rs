@@ -335,7 +335,7 @@ pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
                 return;
             }
         }
-        let _ = PNP_MANAGER.run_once();
+        let _ = PNP_MANAGER.pump_queue_once();
         core::hint::spin_loop();
     }
 }
