@@ -132,9 +132,8 @@ extern "win64" fn ide_pnp_start(
         unsafe { kernel_api::alloc_api::ffi::pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
-            let mut pg = req.write();
-            pg.status = qst;
-            unsafe { pnp_complete_request(&mut *pg) };
+            req.write().status = qst;
+            unsafe { pnp_complete_request(&req) };
             return DriverStatus::Success;
         }
         let bars = {

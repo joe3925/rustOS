@@ -143,6 +143,7 @@ impl PnpManager {
             return;
         }
     }
+
     pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
         target.target_device.queue.lock().push_back(req);
         self.schedule_device_dispatch(&target.target_device);
@@ -164,11 +165,19 @@ impl PnpManager {
         }
     }
 
-    pub fn complete_request(&self, req: &mut Request) {
-        if let Some(completion) = req.completion_routine.take() {
-            completion(req, req.completion_context);
+    pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
+        let (func_addr, ctx, req_ptr) = {
+            let mut g = req_arc.write();
+            let f = g.completion_routine.take().map(|fp| fp as usize);
+            let ctx = g.completion_context;
+            g.completed = true;
+            let p = (&mut *g) as *mut Request;
+            (f, ctx, p)
+        };
+        if let Some(addr) = func_addr {
+            let f: CompletionRoutine = unsafe { core::mem::transmute(addr) };
+            unsafe { f(&mut *req_ptr, ctx) };
         }
-        req.completed = true;
     }
 
     fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
@@ -224,28 +233,33 @@ impl PnpManager {
         if st == DriverStatus::Pending {
             let fwd = self.send_request_to_next_lower(dev, req_arc.clone());
             if fwd == DriverStatus::NoSuchDevice {
-                with_req_mut(&req_arc, |r| {
-                    if let Some(pnp) = r.pnp.as_ref() {
-                        r.status = match pnp.minor_function {
+                let mut should_complete = false;
+                {
+                    let mut g = req_arc.write();
+                    if let Some(pnp) = g.pnp.as_ref() {
+                        g.status = match pnp.minor_function {
                             PnpMinorFunction::StartDevice
                             | PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
                             _ => DriverStatus::NotImplemented,
                         };
                     } else {
-                        r.status = DriverStatus::NotImplemented;
+                        g.status = DriverStatus::NotImplemented;
                     }
-                    if !r.completed {
-                        self.complete_request(r);
+                    if !g.completed {
+                        should_complete = true;
                     }
-                });
+                }
+                if should_complete {
+                    self.complete_request(&req_arc);
+                }
             }
             return;
         }
-        with_req_mut(&req_arc, |r| {
-            if !r.completed {
-                self.complete_request(r);
-            }
-        });
+
+        let do_complete = { !req_arc.read().completed };
+        if do_complete {
+            self.complete_request(&req_arc);
+        }
     }
 
     fn pnp_minor_dispatch(device: &Arc<DeviceObject>, request: Arc<RwLock<Request>>) {
@@ -255,9 +269,11 @@ impl PnpManager {
         let Some(minor) = minor_opt else {
             let st = me.send_request_to_next_lower(device, request.clone());
             if st == DriverStatus::NoSuchDevice {
-                let mut g = request.write();
-                g.status = DriverStatus::NotImplemented;
-                me.complete_request(&mut *g);
+                {
+                    let mut g = request.write();
+                    g.status = DriverStatus::NotImplemented;
+                }
+                me.complete_request(&request);
             } else {
                 request.write().status = DriverStatus::Pending;
             }
@@ -273,27 +289,33 @@ impl PnpManager {
         if let Some(cb) = cb_opt {
             match cb(device, request.clone()) {
                 DriverStatus::Success => {
-                    let mut g = request.write();
-                    g.status = DriverStatus::Success;
-                    me.complete_request(&mut *g);
+                    {
+                        let mut g = request.write();
+                        g.status = DriverStatus::Success;
+                    }
+                    me.complete_request(&request);
                 }
                 DriverStatus::Pending => {
                     request.write().status = DriverStatus::Pending;
                     let st = me.send_request_to_next_lower(device, request.clone());
                     if st == DriverStatus::NoSuchDevice {
-                        let mut g = request.write();
-                        g.status = match minor {
-                            PnpMinorFunction::StartDevice
-                            | PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
-                            _ => DriverStatus::NotImplemented,
-                        };
-                        me.complete_request(&mut *g);
+                        {
+                            let mut g = request.write();
+                            g.status = match minor {
+                                PnpMinorFunction::StartDevice
+                                | PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
+                                _ => DriverStatus::NotImplemented,
+                            };
+                        }
+                        me.complete_request(&request);
                     }
                 }
                 other => {
-                    let mut g = request.write();
-                    g.status = other;
-                    me.complete_request(&mut *g);
+                    {
+                        let mut g = request.write();
+                        g.status = other;
+                    }
+                    me.complete_request(&request);
                 }
             }
             return;
@@ -303,9 +325,11 @@ impl PnpManager {
             PnpMinorFunction::StartDevice | PnpMinorFunction::QueryDeviceRelations => {
                 let st = me.send_request_to_next_lower(device, request.clone());
                 if st == DriverStatus::NoSuchDevice {
-                    let mut g = request.write();
-                    g.status = DriverStatus::Success;
-                    me.complete_request(&mut *g);
+                    {
+                        let mut g = request.write();
+                        g.status = DriverStatus::Success;
+                    }
+                    me.complete_request(&request);
                 } else {
                     request.write().status = DriverStatus::Pending;
                 }
@@ -313,9 +337,11 @@ impl PnpManager {
             _ => {
                 let st = me.send_request_to_next_lower(device, request.clone());
                 if st == DriverStatus::NoSuchDevice {
-                    let mut g = request.write();
-                    g.status = DriverStatus::NoSuchDevice;
-                    me.complete_request(&mut *g);
+                    {
+                        let mut g = request.write();
+                        g.status = DriverStatus::NoSuchDevice;
+                    }
+                    me.complete_request(&request);
                 } else {
                     request.write().status = DriverStatus::Pending;
                 }

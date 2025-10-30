@@ -445,9 +445,11 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
 
     if req.status != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");
-        let mut request = original_start_request.write();
-        request.status = req.status;
-        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&mut request) };
+        {
+            let mut request = original_start_request.write();
+            request.status = req.status;
+        }
+        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&original_start_request) };
         return;
     }
 
@@ -471,9 +473,8 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
     };
 
     if status == DriverStatus::NoSuchDevice {
-        let original = &mut original_start_request.write();
-        original.status = DriverStatus::Success;
-        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(original) };
+        original_start_request.write().status = DriverStatus::Success;
+        unsafe { kernel_api::alloc_api::ffi::pnp_complete_request(&original_start_request) };
     }
 }
 

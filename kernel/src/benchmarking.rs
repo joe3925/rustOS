@@ -388,7 +388,7 @@ fn build_window_log(
 
 fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
     provider().make_dir_path(path);
-    let file_path = path.to_string() + "benchmark.txt";
+    let file_path = path.to_string() + "\\benchmark.txt";
     let (res, _) = provider().open_path(file_path.as_str(), &[OpenFlags::Create]);
     let handle: u64 = if res.error.is_none() {
         res.fs_file_id

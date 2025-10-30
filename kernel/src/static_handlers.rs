@@ -180,7 +180,7 @@ pub extern "win64" fn pnp_send_request(
     PNP_MANAGER.send_request(target, req)
 }
 
-pub extern "win64" fn pnp_complete_request(req: &mut Request) {
+pub extern "win64" fn pnp_complete_request(req: &Arc<RwLock<Request>>) {
     PNP_MANAGER.complete_request(req);
 }
 

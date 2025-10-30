@@ -3,7 +3,10 @@ use alloc::{
     sync::Arc,
 };
 use aml::{AmlContext, AmlName, AmlValue, value::Args};
-use kernel_api::{DeviceObject, DriverStatus, PnpMinorFunction, QueryIdType, Request, println};
+use kernel_api::{
+    DeviceObject, DriverStatus, PnpMinorFunction, QueryIdType, Request,
+    alloc_api::ffi::pnp_complete_request,
+};
 use spin::RwLock;
 
 use crate::aml::{McfgSeg, append_ecam_list, build_query_resources_blob, read_ids};
@@ -17,19 +20,12 @@ pub struct AcpiPdoExt {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
-    use kernel_api::alloc_api::ffi::pnp_complete_request;
-
-    // No PnP payload → complete as NoSuchDevice.
     if req.read().pnp.is_none() {
-        let mut r = {
-            let mut g = req.write();
-            core::mem::replace(&mut *g, Request::empty())
-        };
-        r.status = DriverStatus::NoSuchDevice;
-        unsafe { pnp_complete_request(&mut r) };
         {
-            *req.write() = r;
+            let mut g = req.write();
+            g.status = DriverStatus::NoSuchDevice;
         }
+        unsafe { pnp_complete_request(&req) };
         return;
     }
 
@@ -64,48 +60,31 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
                     }
                 }
                 QueryIdType::DeviceId => {
-                    let st = {
-                        if let (Some(hid), _) = read_ids(&mut ctx, &ext.acpi_path) {
-                            let mut g = req.write();
-                            g.pnp
-                                .as_mut()
-                                .unwrap()
-                                .ids_out
-                                .push(alloc::format!("ACPI\\{}", hid));
-                            g.status = DriverStatus::Success;
-                            DriverStatus::Success
-                        } else {
-                            req.write().status = DriverStatus::NoSuchDevice;
-                            DriverStatus::NoSuchDevice
-                        }
-                    };
-                    let _ = st;
+                    if let (Some(hid), _) = read_ids(&mut ctx, &ext.acpi_path) {
+                        let mut g = req.write();
+                        g.pnp
+                            .as_mut()
+                            .unwrap()
+                            .ids_out
+                            .push(alloc::format!("ACPI\\{}", hid));
+                        g.status = DriverStatus::Success;
+                    } else {
+                        req.write().status = DriverStatus::NoSuchDevice;
+                    }
                 }
                 QueryIdType::InstanceId => {
-                    let st = {
-                        if let Some(uid) = read_uid(&mut ctx, &ext.acpi_path) {
-                            let mut g = req.write();
-                            g.pnp.as_mut().unwrap().ids_out.push(uid);
-                            g.status = DriverStatus::Success;
-                            DriverStatus::Success
-                        } else {
-                            req.write().status = DriverStatus::NoSuchDevice;
-                            DriverStatus::NoSuchDevice
-                        }
-                    };
-                    let _ = st;
+                    if let Some(uid) = read_uid(&mut ctx, &ext.acpi_path) {
+                        let mut g = req.write();
+                        g.pnp.as_mut().unwrap().ids_out.push(uid);
+                        g.status = DriverStatus::Success;
+                    } else {
+                        req.write().status = DriverStatus::NoSuchDevice;
+                    }
                 }
             }
 
             drop(ctx);
-            let mut r = {
-                let mut g = req.write();
-                core::mem::replace(&mut *g, Request::empty())
-            };
-            unsafe { pnp_complete_request(&mut r) };
-            {
-                *req.write() = r;
-            }
+            unsafe { pnp_complete_request(&req) };
         }
 
         PnpMinorFunction::QueryResources => {
@@ -122,62 +101,38 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
                 req.write().status = DriverStatus::NoSuchDevice;
             } else {
                 let mut g = req.write();
-
                 g.pnp.as_mut().unwrap().blob_out = blob;
                 g.status = DriverStatus::Success;
             }
 
             drop(ctx);
-            let mut r = {
-                let mut g = req.write();
-                core::mem::replace(&mut *g, Request::empty())
-            };
-            unsafe { pnp_complete_request(&mut r) };
-            {
-                *req.write() = r;
-            }
+            unsafe { pnp_complete_request(&req) };
         }
 
         PnpMinorFunction::StartDevice => {
-            req.write().status = DriverStatus::Success;
-            let mut r = {
-                let mut g = req.write();
-                core::mem::replace(&mut *g, Request::empty())
-            };
-            unsafe { pnp_complete_request(&mut r) };
             {
-                *req.write() = r;
+                let mut g = req.write();
+                g.status = DriverStatus::Success;
             }
+            unsafe { pnp_complete_request(&req) };
         }
 
         PnpMinorFunction::QueryDeviceRelations => {
-            let mut r = {
-                let mut g = req.write();
-                core::mem::replace(&mut *g, Request::empty())
-            };
-            unsafe { pnp_complete_request(&mut r) };
-            {
-                *req.write() = r;
-            }
+            unsafe { pnp_complete_request(&req) };
         }
 
         _ => {
-            req.write().status = DriverStatus::NotImplemented;
-            let mut r = {
-                let mut g = req.write();
-                core::mem::replace(&mut *g, Request::empty())
-            };
-            unsafe { pnp_complete_request(&mut r) };
             {
-                *req.write() = r;
+                let mut g = req.write();
+                g.status = DriverStatus::NotImplemented;
             }
+            unsafe { pnp_complete_request(&req) };
         }
     }
 }
 
 pub fn read_uid(ctx: &mut AmlContext, dev: &AmlName) -> Option<String> {
     let uid_path = AmlName::from_str(&(dev.as_string() + "._UID")).ok()?;
-
     if let Ok(val) = ctx.invoke_method(&uid_path, Args::EMPTY) {
         return uid_to_string(val);
     }

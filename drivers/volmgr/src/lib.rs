@@ -269,14 +269,15 @@ struct BridgeCtx {
 extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) {
     let boxed = unsafe { Box::from_raw(ctx as *mut BridgeCtx) };
     let parent = boxed.parent;
-
-    let mut g = parent.write();
-    g.status = child.status;
-    if g.status == DriverStatus::Success {
-        let n = core::cmp::min(g.data.len(), child.data.len());
-        g.data[..n].copy_from_slice(&child.data[..n]);
+    {
+        let mut g = parent.write();
+        g.status = child.status;
+        if g.status == DriverStatus::Success {
+            let n = core::cmp::min(g.data.len(), child.data.len());
+            g.data[..n].copy_from_slice(&child.data[..n]);
+        }
     }
-    unsafe { pnp_complete_request(&mut *g) };
+    unsafe { pnp_complete_request(&parent) };
 }
 
 pub extern "win64" fn vol_pdo_read(

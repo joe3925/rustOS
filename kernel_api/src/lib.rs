@@ -876,7 +876,7 @@ pub mod alloc_api {
                 req: Arc<RwLock<Request>>,
             ) -> DriverStatus;
             pub fn pnp_send_request(target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus;
-            pub fn pnp_complete_request(req: &mut Request);
+            pub fn pnp_complete_request(req: &Arc<RwLock<Request>>);
             pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
             pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
             pub fn pnp_create_device_symlink_top(
