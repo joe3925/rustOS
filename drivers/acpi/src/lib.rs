@@ -10,14 +10,18 @@ mod pdo;
 use core::{intrinsics::size_of, mem, ptr};
 
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
+    acpi::fadt::{self, Fadt},
     alloc_api::{
-        DeviceInit, PnpVtable,
-        ffi::{driver_set_evt_device_add, get_acpi_tables, pnp_send_request},
+        DeviceIds, DeviceInit, IoVtable, PnpVtable,
+        ffi::{
+            driver_set_evt_device_add, get_acpi_tables, pnp_create_child_devnode_and_pdo_with_init,
+            pnp_send_request,
+        },
     },
     ffi::{self},
     println,
@@ -83,11 +87,11 @@ pub extern "win64" fn bus_driver_prepare_hardware(
         device.dev_ext.len() >= mem::size_of::<DevExt>(),
         "Device extension buffer is too small for DevExt"
     );
-
     let dev_ext_ptr = device.dev_ext.as_ptr() as *const DevExt as *mut DevExt;
 
     let new_ext = DevExt {
         ctx: RwLock::new(aml_ctx),
+        i8042_hint: fadt_has_i8042_hint(),
     };
 
     unsafe {
@@ -95,6 +99,15 @@ pub extern "win64" fn bus_driver_prepare_hardware(
     }
 
     DriverStatus::Success
+}
+fn fadt_has_i8042_hint() -> bool {
+    let acpi = unsafe { get_acpi_tables() };
+    if let Ok(sdt) = acpi.find_table::<Fadt>() {
+        let flags = sdt.iapc_boot_arch;
+        return flags.motherboard_implements_8042();
+    } else {
+        return false;
+    }
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -150,6 +163,28 @@ pub extern "win64" fn enumerate_bus(
     for dev_name in devices_to_report {
         create_pnp_bus_from_acpi(&dev_ext.ctx, &parent_dev_node, dev_name);
     }
+    if dev_ext.i8042_hint {
+        create_synthetic_i8042_pdo(&parent_dev_node);
+    }
 
     DriverStatus::Success
+}
+fn create_synthetic_i8042_pdo(parent: &Arc<kernel_api::DevNode>) {
+    let ids = DeviceIds {
+        hardware: alloc::vec!["ACPI\\I8042".to_string()],
+        compatible: alloc::vec![],
+    };
+
+    let child_init = DeviceInit {
+        dev_ext_size: 0,
+        pnp_vtable: Some(PnpVtable::new()),
+        io_vtable: IoVtable::new(),
+    };
+
+    let name = "\\Device\\ACPI_I8042".to_string();
+    let instance = "ACPI\\I8042\\0".to_string();
+
+    let _ = unsafe {
+        pnp_create_child_devnode_and_pdo_with_init(parent, name, instance, ids, None, child_init)
+    };
 }

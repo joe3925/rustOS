@@ -374,6 +374,7 @@ pub fn create_pnp_bus_from_acpi(
             init,
         )
     };
+    println!("ACPI: {:#?}", _dn.ids.hardware);
 
     let seg = read_int_method(&mut ctx, &dev_name, "_SEG").unwrap_or(0) as u16;
     let bbn = read_int_method(&mut ctx, &dev_name, "_BBN").unwrap_or(0) as u8;
