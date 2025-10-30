@@ -90,7 +90,63 @@ impl PnpManager {
         *self.hw.write() = Arc::new(idx::build_hw_index()?);
         Ok(())
     }
+    pub fn recheck_all_devices(&self) {
+        self.rebuild_index();
+        let root = self.root();
+        self.rebind_tree(&root);
+        self.rescan_buses_started(&root);
+    }
 
+    pub fn rebind_faulted_and_unbound(&self) {
+        if self.hw.read().by_driver.is_empty() {
+            let _ = self.rebuild_index();
+        }
+        let root = self.root();
+        self.rebind_tree(&root);
+    }
+
+    fn rebind_tree(&self, dn: &Arc<DevNode>) {
+        let state = dn.get_state();
+        let needs_function = {
+            let g = dn.stack.read();
+            match g.as_ref() {
+                None => true,
+                Some(stk) => stk
+                    .function
+                    .as_ref()
+                    .and_then(|l| l.devobj.as_ref())
+                    .is_none(),
+            }
+        };
+        if needs_function
+            && matches!(
+                state,
+                DevNodeState::Initialized | DevNodeState::Faulted | DevNodeState::Stopped
+            )
+        {
+            let _ = self.bind_and_start(dn);
+        }
+        let kids: Vec<Arc<DevNode>> = {
+            let g = dn.children.read();
+            g.iter().cloned().collect()
+        };
+        for ch in kids {
+            self.rebind_tree(&ch);
+        }
+    }
+
+    fn rescan_buses_started(&self, dn: &Arc<DevNode>) {
+        if dn.get_state() == DevNodeState::Started {
+            let _ = self.invalidate_device_relations_for_node(dn, DeviceRelationType::BusRelations);
+        }
+        let kids: Vec<Arc<DevNode>> = {
+            let g = dn.children.read();
+            g.iter().cloned().collect()
+        };
+        for ch in kids {
+            self.rescan_buses_started(&ch);
+        }
+    }
     pub fn create_child_devnode_and_pdo(
         &self,
         parent: &Arc<DevNode>,

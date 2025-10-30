@@ -57,7 +57,7 @@ pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 156_800;
 pub static BOOTSET: &[BootPkg] =
-    boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32"];
+    boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 
 pub unsafe fn init() {
     init_kernel_cr3();
@@ -129,12 +129,8 @@ pub fn kernel_main() {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
-
-    if is_first_boot() {
-        //setup_file_layout().expect("Failed to create system volume layout");
-        crate::drivers::driver_install::install_prepacked_drivers()
-            .expect("Failed to install pre packed drivers");
-    }
+    crate::drivers::driver_install::install_prepacked_drivers()
+        .expect("Failed to install pre packed drivers");
 
     PNP_MANAGER
         .init_from_registry()
@@ -148,23 +144,6 @@ pub fn kernel_main() {
         0,
     );
     SCHEDULER.add_task(task);
-}
-
-pub fn setup_file_layout() -> Result<(), FileStatus> {
-    // During bootstrap we force the system layout under C:\
-    let drive_label = "C:".to_string();
-    let mod_path = format!("{}\\SYSTEM\\MOD", drive_label);
-    let inf_path = format!("{}\\SYSTEM\\TOML", drive_label);
-
-    match File::make_dir(mod_path.clone()) {
-        Ok(_) | Err(FileStatus::FileAlreadyExist) => {}
-        e => return e,
-    }
-
-    match File::make_dir(inf_path.clone()) {
-        Ok(_) | Err(FileStatus::FileAlreadyExist) => Ok(()),
-        e => e,
-    }
 }
 
 #[no_mangle]

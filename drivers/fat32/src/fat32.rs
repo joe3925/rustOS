@@ -300,7 +300,7 @@ impl Fat32 {
             let ext_flags = u16::from_le_bytes([sector[40], sector[41]]);
             let fs_ver = u16::from_le_bytes([sector[42], sector[43]]);
             let root_clus = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
-            let root_clus = 2;
+
             let fsinfo_sec = u16::from_le_bytes([sector[48], sector[49]]);
             let bkboot_sec = u16::from_le_bytes([sector[50], sector[51]]);
 
@@ -389,7 +389,12 @@ impl Fat32 {
         let idx = cluster.saturating_sub(2) as u64;
         (idx * self.params.spc as u64 + self.data_start_lba() as u64) as u32
     }
-
+    #[inline]
+    fn cluster_from_dirent_bytes(ent: &[u8]) -> u32 {
+        let lo = u16::from_le_bytes([ent[26], ent[27]]) as u32;
+        let hi = u16::from_le_bytes([ent[20], ent[21]]) as u32;
+        ((hi << 16) | lo) & 0x0FFF_FFFF
+    }
     pub fn read_clusters_sync(
         &self,
         first_cluster: u32,
@@ -594,7 +599,7 @@ impl Fat32 {
             for i in (0..dir_buffer.len()).step_by(entry_size) {
                 let cl_lo = u16::from_le_bytes([dir_buffer[i + 26], dir_buffer[i + 27]]) as u32;
                 let cl_hi = u16::from_le_bytes([dir_buffer[i + 20], dir_buffer[i + 21]]) as u32;
-                let entry_cluster = ((cl_hi << 16) | cl_lo) & 0x0FFF_FFFF;
+                let entry_cluster = Self::cluster_from_dirent_bytes(&dir_buffer[i..i + 32]);
 
                 if entry_cluster == start_cluster {
                     dir_buffer[i] = 0xE5;
@@ -615,6 +620,7 @@ impl Fat32 {
 
         Err(FileStatus::PathNotFound)
     }
+
     fn initialize_directory(
         &self,
 
@@ -945,75 +951,125 @@ impl Fat32 {
 
         Ok(names)
     }
+    #[inline]
+    fn is_dir_attr(attr: u8) -> bool {
+        (attr & 0x10) != 0
+    }
+    #[inline]
+    fn is_lfn_attr(attr: u8) -> bool {
+        attr == 0x0F
+    }
+
     pub fn assemble_entries(files: &[FileEntry]) -> Vec<(String, FileAttribute, usize)> {
-        let mut out: Vec<(String, FileAttribute, usize)> = Vec::new();
-        let mut pending_lfn: Vec<FileEntry> = Vec::new();
+        let mut out = Vec::new();
+        let mut lfn_buf: Vec<[u8; 32]> = Vec::new();
 
-        for (i, entry) in files.iter().enumerate() {
-            let attr = FileAttribute::try_from(entry.attributes).unwrap();
+        for (i, e) in files.iter().enumerate() {
+            let attr = e.attributes;
 
-            if attr == FileAttribute::LFN {
-                pending_lfn.push(*entry);
+            if Self::is_lfn_attr(attr) {
+                let mut raw = [0u8; 32];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (e as *const FileEntry) as *const u8,
+                        raw.as_mut_ptr(),
+                        32,
+                    );
+                }
+                lfn_buf.push(raw);
                 continue;
             }
 
-            if entry.name.get(0).copied() == Some(0x00) || entry.name.get(0).copied() == Some(0xE5)
-            {
-                pending_lfn.clear();
+            let first = e.name[0];
+            if first == 0x00 || first == 0xE5 {
+                lfn_buf.clear();
                 continue;
             }
 
-            let name = if !pending_lfn.is_empty() {
-                pending_lfn.reverse();
-                let mut utf16: Vec<u16> = Vec::new();
+            let name = if !lfn_buf.is_empty() {
+                let mut sfn = [0x20u8; 11];
+                sfn[..8].copy_from_slice(&e.name);
+                sfn[8..].copy_from_slice(&e.extension);
+                let chk = FileEntry::lfn_checksum(&sfn);
 
-                for lfn in &pending_lfn {
-                    let raw: [u8; 32] =
-                        unsafe { core::mem::transmute::<FileEntry, [u8; 32]>(*lfn) };
+                lfn_buf.reverse();
 
-                    for k in (1..11).step_by(2) {
-                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                let valid = lfn_buf.iter().all(|raw| raw[13] == chk);
+                let mut utf16 = Vec::<u16>::new();
+                if valid {
+                    for raw in &lfn_buf {
+                        // Name1
+                        for k in (1..11).step_by(2) {
+                            utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                        }
+                        // Name2
+                        for k in (14..26).step_by(2) {
+                            utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                        }
+                        // Name3
+                        for k in (28..32).step_by(2) {
+                            utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                        }
                     }
-                    for k in (14..26).step_by(2) {
-                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                    if let Some(pos) = utf16.iter().position(|&w| w == 0x0000) {
+                        utf16.truncate(pos);
                     }
-                    for k in (28..32).step_by(2) {
-                        utf16.push(u16::from_le_bytes([raw[k], raw[k + 1]]));
+                    utf16.retain(|&w| w != 0xFFFF);
+                    lfn_buf.clear();
+                    String::from_utf16_lossy(&utf16)
+                } else {
+                    lfn_buf.clear();
+                    let mut s = {
+                        let base = e
+                            .name
+                            .iter()
+                            .take_while(|&&c| c != 0 && c != b' ')
+                            .copied()
+                            .collect::<Vec<u8>>();
+                        String::from_utf8_lossy(&base).to_string()
+                    };
+                    let ext = e
+                        .extension
+                        .iter()
+                        .take_while(|&&c| c != 0 && c != b' ')
+                        .copied()
+                        .collect::<Vec<u8>>();
+                    if !ext.is_empty() {
+                        s.push('.');
+                        s.push_str(&String::from_utf8_lossy(&ext));
                     }
+                    s
                 }
-
-                if let Some(pos) = utf16.iter().position(|&w| w == 0x0000) {
-                    utf16.truncate(pos);
-                }
-                utf16.retain(|&w| w != 0xFFFF);
-
-                pending_lfn.clear();
-                String::from_utf16_lossy(&utf16)
             } else {
-                let base_raw = entry
-                    .name
-                    .iter()
-                    .take_while(|&&c| c != 0 && c != b' ')
-                    .copied()
-                    .collect::<Vec<u8>>();
-                let ext_raw = entry
+                let mut s = {
+                    let base = e
+                        .name
+                        .iter()
+                        .take_while(|&&c| c != 0 && c != b' ')
+                        .copied()
+                        .collect::<Vec<u8>>();
+                    String::from_utf8_lossy(&base).to_string()
+                };
+                let ext = e
                     .extension
                     .iter()
                     .take_while(|&&c| c != 0 && c != b' ')
                     .copied()
                     .collect::<Vec<u8>>();
-
-                let mut s = String::from_utf8_lossy(&base_raw).to_string();
-                if !ext_raw.is_empty() {
+                if !ext.is_empty() {
                     s.push('.');
-                    s.push_str(&String::from_utf8_lossy(&ext_raw));
+                    s.push_str(&String::from_utf8_lossy(&ext));
                 }
                 s
             };
 
-            out.push((name, attr, i));
+            let fa = if Self::is_dir_attr(attr) {
+                FileAttribute::Directory
+            } else {
+                FileAttribute::Archive
+            };
+            out.push((name, fa, i));
         }
-
         out
     }
 
@@ -1191,53 +1247,104 @@ impl Fat32 {
         Err(FileStatus::PathNotFound)
     }
 
+    fn find_free_dir_run(&self, dir_clusters: &[u32], need_slots: usize) -> Option<(u32, usize)> {
+        let esz = 32;
+        let bpc = self.params.bps as usize * self.params.spc as usize;
+        let mut buf = vec![0u8; bpc];
+
+        for &cl in dir_clusters {
+            self.read_cluster_sync(cl, &mut buf).ok()?;
+            let mut run = 0usize;
+            let mut start = 0usize;
+            for i in (0..bpc).step_by(esz) {
+                let b = buf[i];
+                if b == 0x00 || b == 0xE5 {
+                    if run == 0 {
+                        start = i;
+                    }
+                    run += 1;
+                    if run >= need_slots {
+                        return Some((cl, start));
+                    }
+                } else {
+                    run = 0;
+                }
+            }
+        }
+        None
+    }
+
+    fn write_dir_run(
+        &self,
+        cluster: u32,
+        offset: usize,
+        entries: &[[u8; 32]],
+    ) -> Result<(), FileStatus> {
+        let bpc = self.params.bps as usize * self.params.spc as usize;
+        let mut buf = vec![0u8; bpc];
+        self.read_cluster_sync(cluster, &mut buf)?;
+        for (k, e) in entries.iter().enumerate() {
+            let off = offset + k * 32;
+            buf[off..off + 32].copy_from_slice(e);
+        }
+        self.write_cluster_sync(cluster, &buf)
+    }
+
     fn write_file_to_dir(
         &self,
         entry: &FileEntry,
         start_cluster_of_dir: u32,
         long_name: Option<String>,
     ) -> Result<(), FileStatus> {
-        if let Some(ln) = long_name {
-            let (name_part, ext_part) = match ln.rsplit_once('.') {
-                Some((n, e)) => (n.to_string(), e.to_string()),
-                None => (ln.clone(), String::new()),
-            };
-            let mut entries = FileEntry::new_long_name(&name_part, &ext_part, entry.get_cluster());
-            if let Some(sfn_entry) = entries.last_mut() {
-                sfn_entry.attributes = entry.attributes;
-                sfn_entry.file_size = entry.file_size;
-            }
+        let (records, total) = if let Some(ref ln) = long_name {
+            let (name_part, ext_part) = ln
+                .rsplit_once('.')
+                .map(|(n, e)| (n, e))
+                .unwrap_or((ln.as_str(), ""));
+            let entries = FileEntry::new_long_name(name_part, ext_part, entry.get_cluster());
+
+            let mut recs: Vec<[u8; 32]> = Vec::with_capacity(entries.len());
             for e in &entries {
-                self.write_file_to_dir(e, start_cluster_of_dir, None)?;
+                let mut b = [0u8; 32];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        (e as *const FileEntry) as *const u8,
+                        b.as_mut_ptr(),
+                        32,
+                    );
+                }
+                recs.push(b);
             }
-            return Ok(());
-        }
-        let mut dir_buf = vec![0u8; (self.params.spc as usize * self.params.bps as usize) as usize];
-        let clusters = self.get_all_clusters(start_cluster_of_dir)?;
-        self.read_cluster_sync(clusters[clusters.len() - 1], &mut dir_buf)?;
-        let entry_size = 32;
-        let mut entry_offset = None;
-        for i in (0..dir_buf.len()).step_by(entry_size) {
-            if dir_buf[i] == 0x00 || dir_buf[i] == 0xE5 {
-                entry_offset = Some(i);
-                break;
+            if let Some(last) = recs.last_mut() {
+                last[11] = entry.attributes;
+                last[28..32].copy_from_slice(&entry.file_size.to_le_bytes());
+                last[20..22].copy_from_slice(&entry.first_cluster_high.to_le_bytes());
+                last[26..28].copy_from_slice(&entry.first_cluster_low.to_le_bytes());
             }
-        }
-        if entry_offset.is_none() {
-            let free_cluster = self.find_free_cluster(0);
-            if free_cluster != 0xFFFFFFFF {
-                self.update_fat(clusters[clusters.len() - 1], free_cluster);
-                self.update_fat(free_cluster, 0xFFFFFFFF);
-                return self.write_file_to_dir(entry, start_cluster_of_dir, long_name);
-            }
-        }
-        if let Some(offset) = entry_offset {
-            entry.write_to_buffer(&mut dir_buf, offset);
-            self.write_cluster_sync(clusters[clusters.len() - 1], &dir_buf)?;
+            (recs, entries.len())
         } else {
-            println!("No free directory entry found!");
+            let mut b = [0u8; 32];
+            let mut tmp = [0u8; 32];
+            entry.write_to_buffer(&mut tmp, 0);
+            b.copy_from_slice(&tmp);
+            (vec![b], 1)
+        };
+
+        let dir_clusters = self.get_all_clusters(start_cluster_of_dir)?;
+        if let Some((cl, off)) = self.find_free_dir_run(&dir_clusters, total) {
+            return self.write_dir_run(cl, off, &records);
         }
-        Ok(())
+
+        let free = self.find_free_cluster(0);
+        if free == 0xFFFF_FFFF {
+            return Err(FileStatus::UnknownFail);
+        }
+        let last = *dir_clusters.last().ok_or(FileStatus::UnknownFail)?;
+        self.update_fat(last, free);
+        self.update_fat(free, 0xFFFF_FFFF);
+        let zero = vec![0u8; self.calc_cluster_size()];
+        self.write_cluster_sync(free, &zero)?;
+        self.write_file_to_dir(entry, start_cluster_of_dir, long_name)
     }
 
     #[inline]

@@ -1,7 +1,5 @@
-use alloc::{
-    string::{String, ToString},
-    sync::Arc,
-};
+use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use aml::{AmlContext, AmlName, AmlValue, value::Args};
 use kernel_api::{
     DeviceObject, DriverStatus, PnpMinorFunction, QueryIdType, Request,
@@ -15,15 +13,14 @@ use crate::aml::{McfgSeg, append_ecam_list, build_query_resources_blob, read_ids
 pub struct AcpiPdoExt {
     pub acpi_path: aml::AmlName,
     pub ctx: *const spin::RwLock<aml::AmlContext>,
-    pub ecam: alloc::vec::Vec<McfgSeg>,
+    pub ecam: alloc::vec::Vec<McfgSeg>, // only non-empty for PCIe root bridges
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     if req.read().pnp.is_none() {
         {
-            let mut g = req.write();
-            g.status = DriverStatus::NoSuchDevice;
+            req.write().status = DriverStatus::NoSuchDevice;
         }
         unsafe { pnp_complete_request(&req) };
         return;
@@ -37,27 +34,21 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
             let ctx_lock = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
 
-            let id_type = { req.read().pnp.as_ref().unwrap().id_type };
-
-            match id_type {
+            match { req.read().pnp.as_ref().unwrap().id_type } {
                 QueryIdType::HardwareIds => {
                     let (hid_opt, mut cids) = read_ids(&mut ctx, &ext.acpi_path);
-                    {
-                        let mut g = req.write();
-                        if let Some(hid) = hid_opt {
-                            g.pnp.as_mut().unwrap().ids_out.push(hid);
-                        }
-                        g.pnp.as_mut().unwrap().ids_out.append(&mut cids);
-                        g.status = DriverStatus::Success;
+                    let mut g = req.write();
+                    if let Some(hid) = hid_opt {
+                        g.pnp.as_mut().unwrap().ids_out.push(hid);
                     }
+                    g.pnp.as_mut().unwrap().ids_out.append(&mut cids);
+                    g.status = DriverStatus::Success;
                 }
                 QueryIdType::CompatibleIds => {
                     let (_hid, mut cids) = read_ids(&mut ctx, &ext.acpi_path);
-                    {
-                        let mut g = req.write();
-                        g.pnp.as_mut().unwrap().ids_out.append(&mut cids);
-                        g.status = DriverStatus::Success;
-                    }
+                    let mut g = req.write();
+                    g.pnp.as_mut().unwrap().ids_out.append(&mut cids);
+                    g.status = DriverStatus::Success;
                 }
                 QueryIdType::DeviceId => {
                     if let (Some(hid), _) = read_ids(&mut ctx, &ext.acpi_path) {
@@ -77,6 +68,14 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
                         let mut g = req.write();
                         g.pnp.as_mut().unwrap().ids_out.push(uid);
                         g.status = DriverStatus::Success;
+                    } else if let Some(adr) = read_adr(&mut ctx, &ext.acpi_path) {
+                        let mut g = req.write();
+                        g.pnp
+                            .as_mut()
+                            .unwrap()
+                            .ids_out
+                            .push(alloc::format!("ADR_{:08X}", adr));
+                        g.status = DriverStatus::Success;
                     } else {
                         req.write().status = DriverStatus::NoSuchDevice;
                     }
@@ -89,19 +88,19 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
 
         PnpMinorFunction::QueryResources => {
             let ext: &AcpiPdoExt = unsafe { &*((&*dev.dev_ext).as_ptr() as *const AcpiPdoExt) };
-            let ctx_lock: &spin::RwLock<aml::AmlContext> = unsafe { &*ext.ctx };
+            let ctx_lock: &spin::RwLock<AmlContext> = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
 
             let mut blob = build_query_resources_blob(&mut ctx, &ext.acpi_path).unwrap_or_default();
-            if !ext.ecam.is_empty() {
+
+            // Only append ECAM for PCI/PCIe root bridges.
+            if is_pci_root(&mut ctx, &ext.acpi_path) && !ext.ecam.is_empty() {
                 append_ecam_list(&mut blob, &ext.ecam);
             }
 
-            if blob.is_empty() {
-                req.write().status = DriverStatus::NoSuchDevice;
-            } else {
+            {
                 let mut g = req.write();
-                g.pnp.as_mut().unwrap().blob_out = blob;
+                g.pnp.as_mut().unwrap().blob_out = blob; // may be empty; that’s valid
                 g.status = DriverStatus::Success;
             }
 
@@ -111,20 +110,19 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
 
         PnpMinorFunction::StartDevice => {
             {
-                let mut g = req.write();
-                g.status = DriverStatus::Success;
+                req.write().status = DriverStatus::Success;
             }
             unsafe { pnp_complete_request(&req) };
         }
 
         PnpMinorFunction::QueryDeviceRelations => {
+            // Leaf PDO: nothing to enumerate.
             unsafe { pnp_complete_request(&req) };
         }
 
         _ => {
             {
-                let mut g = req.write();
-                g.status = DriverStatus::NotImplemented;
+                req.write().status = DriverStatus::NotImplemented;
             }
             unsafe { pnp_complete_request(&req) };
         }
@@ -139,6 +137,14 @@ pub fn read_uid(ctx: &mut AmlContext, dev: &AmlName) -> Option<String> {
     None
 }
 
+fn read_adr(ctx: &mut AmlContext, dev: &AmlName) -> Option<u32> {
+    let adr_path = AmlName::from_str(&(dev.as_string() + "._ADR")).ok()?;
+    if let Ok(AmlValue::Integer(n)) = ctx.invoke_method(&adr_path, Args::EMPTY) {
+        return Some(n as u32);
+    }
+    None
+}
+
 #[inline]
 fn uid_to_string(v: AmlValue) -> Option<String> {
     match v {
@@ -149,4 +155,12 @@ fn uid_to_string(v: AmlValue) -> Option<String> {
             .map(|s| s.trim_end_matches('\0').to_string()),
         _ => None,
     }
+}
+
+fn is_pci_root(ctx: &mut AmlContext, dev: &AmlName) -> bool {
+    let (hid_opt, cids) = read_ids(ctx, dev);
+    let hid = hid_opt.unwrap_or_default();
+    let is_pci_hid = hid == "PNP0A03" || hid == "PNP0A08";
+    let is_pci_cid = cids.iter().any(|c| c == "PNP0A03" || c == "PNP0A08");
+    is_pci_hid || is_pci_cid
 }

@@ -46,9 +46,10 @@ impl ThreadPool {
     }
 
     pub fn submit(&self, f: JobFn, a: usize) {
-        let mut g = self.inner.lock();
+        let mut g = { self.inner.lock() };
         g.q.push_back(Job { f, a });
         if let Some(t) = g.sleepers.pop() {
+            drop(g);
             t.write().wake();
         }
     }
@@ -56,7 +57,7 @@ impl ThreadPool {
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
         let started = Arc::new(AtomicBool::new(false));
 
-        let mut g = self.inner.lock();
+        let mut g = { self.inner.lock() };
         let sleeper = match g.sleepers.pop() {
             Some(t) => t,
             None => return false,
@@ -103,11 +104,12 @@ extern "C" fn worker(pool_ptr: usize) {
 
     loop {
         let job = {
-            let mut g = pool.inner.lock();
+            let mut g = { pool.inner.lock() };
             if let Some(j) = g.q.pop_front() {
                 Some(j)
             } else {
                 g.sleepers.push(me.clone());
+                drop(g);
                 me.write().sleep();
                 None
             }

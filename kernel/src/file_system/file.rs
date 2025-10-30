@@ -9,14 +9,18 @@ use alloc::{
 };
 use core::cmp::PartialEq;
 
-use crate::file_system::{
-    file_provider::provider,
-    file_structs::{FileError, FsSeekWhence},
-};
 use crate::{
     drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
     registry::{reg::rebind_and_persist_after_provider_switch, RegError},
+};
+use crate::{
+    drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
+    file_system::{
+        file_provider::provider,
+        file_structs::{FileError, FsSeekWhence},
+    },
+    registry::is_first_boot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,7 +307,9 @@ pub fn switch_to_vfs() -> Result<(), RegError> {
     let vfs_toml = "C:\\SYSTEM\\TOML";
     ensure_dir(vfs_mod);
     ensure_dir(vfs_toml);
-
+    if (is_first_boot()) {
+        install_prepacked_drivers();
+    }
     Ok(())
 }
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {

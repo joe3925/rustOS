@@ -1,0 +1,29 @@
+
+[package]
+name = "i8042"
+version = "0.1.0"
+edition = "2024"
+autotests = false
+
+[lib]
+name = "i8042"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+test = false
+
+[profile.dev]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+
+[dependencies]
+kernel_api = { path = "../../kernel_api" }
+bitflags = "2.6.0"
+spin = { version = "0.10", default-features = false, features = ["mutex"] }

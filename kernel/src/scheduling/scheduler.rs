@@ -15,7 +15,7 @@ use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
-use x86_64::instructions::interrupts;
+use x86_64::instructions::interrupts::{self, without_interrupts};
 use x86_64::registers::control::Cr3;
 
 #[derive(Debug)]
@@ -83,22 +83,24 @@ impl Scheduler {
     }
 
     pub fn add_task(&self, task: TaskHandle) -> u64 {
-        let n = self.num_cores.load(Ordering::Relaxed);
-        let mut best = 0usize;
-        let mut best_len = usize::MAX;
-        for i in 0..n {
-            let len = self.cores[i].run_queue.lock().len();
-            if len < best_len {
-                best_len = len;
-                best = i;
+        without_interrupts(|| {
+            let n = self.num_cores.load(Ordering::Relaxed);
+            let mut best = 0usize;
+            let mut best_len = usize::MAX;
+            for i in 0..n {
+                let len = self.cores[i].run_queue.lock().len();
+                if len < best_len {
+                    best_len = len;
+                    best = i;
+                }
             }
-        }
-        let id = self.add_task_internal(task.clone());
-        {
-            task.write().id = id;
-            self.cores[best].run_queue.lock().push_back(task);
-        }
-        id
+            let id = self.add_task_internal(task.clone());
+            {
+                task.write().id = id;
+                self.cores[best].run_queue.lock().push_back(task);
+            }
+            id
+        })
     }
 
     fn add_task_internal(&self, task: TaskHandle) -> u64 {

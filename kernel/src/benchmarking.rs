@@ -1,5 +1,6 @@
 use crate::alloc::format;
 use crate::alloc::vec;
+use crate::drivers::pnp::manager::PNP_MANAGER;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -192,10 +193,9 @@ pub fn run_stats_loop() {
     let mut acc_total_sw: u128 = 0;
     let mut acc_sched_ns: Vec<u128> = vec![0; prev_sched_ns.len()];
     let mut acc_total_sched_ns: u128 = 0;
-
     loop {
         wait_millis_idle(60000);
-
+        PNP_MANAGER.print_device_tree();
         let core_ms_now = read_all_core_timer_ms();
         let total_ms_now = TOTAL_TIME.wait().elapsed_millis() as u128;
         let delta_total_ms = total_ms_now.saturating_sub(prev_total_ms);

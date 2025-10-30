@@ -490,7 +490,7 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         }
     }
 
-    PNP_MANAGER.rebuild_index();
+    PNP_MANAGER.recheck_all_devices();
     Ok(())
 }
 
