@@ -1,28 +1,33 @@
+#![no_std]
+
 use alloc::{
     boxed::Box,
     string::{String, ToString},
     sync::Arc,
-    vec,
+    vec::Vec,
 };
-use core::{mem::size_of, ptr, slice};
+use core::mem::size_of;
+use fatfs::FsOptions;
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, FsIdentify, IOCTL_FS_IDENTIFY,
-    IOCTL_MOUNTMGR_REGISTER_FS, PnpMinorFunction, Request, RequestType,
+    DeviceObject, DeviceRelationType, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
+    IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo, PnpMinorFunction, QueryIdType,
+    Request, RequestType,
     alloc_api::{
-        DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
+        DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
-            pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_wait_for_request,
+            pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
+            pnp_wait_for_request,
         },
     },
-    println,
+    bytes_to_box, println,
 };
 
-use crate::volume::VolCtrlDevExt;
-use crate::{fat32::Fat32, volume::fs_op_dispatch};
-
+use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
+use crate::{block_dev::BlockDev, fat32::Fat32}; // assumed to expose `mount(&Arc<DeviceObject>) -> FileSystem<BlockDev>`
+const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 #[repr(C)]
 struct CtrlDevExt;
 
@@ -46,6 +51,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
     match code {
         IOCTL_FS_IDENTIFY => {
+            println!("Identify");
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
                 r.status = DriverStatus::InvalidParameter;
@@ -54,12 +60,59 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             let id: &mut FsIdentify = unsafe { &mut *(r.data.as_mut_ptr() as *mut FsIdentify) };
 
-            match Fat32::mount(&id.volume_fdo) {
+            let mut q = Request::new(RequestType::Pnp, Box::new([]));
+            q.pnp = Some(PnpRequest {
+                minor_function: PnpMinorFunction::QueryResources,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: QueryIdType::DeviceId,
+                ids_out: Vec::new(),
+                blob_out: Vec::new(),
+            });
+            let q = Arc::new(RwLock::new(q));
+
+            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) };
+            unsafe { pnp_wait_for_request(&q) };
+
+            let mut sector_size: u16 = 512;
+            let mut total_sectors: u64 = 10_000;
+
+            {
+                let mut w = q.write();
+                if w.status == DriverStatus::Success {
+                    if let Some(pnp) = w.pnp.as_mut() {
+                        let buf = core::mem::take(&mut pnp.blob_out);
+                        if buf.len() == core::mem::size_of::<PartitionInfo>() {
+                            let boxed: Box<[u8]> = buf.into_boxed_slice();
+                            let pi: Box<PartitionInfo> = unsafe { bytes_to_box(boxed) };
+                            sector_size = if pi.disk.logical_block_size != 0 {
+                                pi.disk.logical_block_size as u16
+                            } else {
+                                512
+                            };
+
+                            total_sectors = if let Some(ent) = pi.gpt_entry {
+                                ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
+                            } else {
+                                id.mount_device = None;
+                                id.can_mount = false;
+                                r.status = DriverStatus::Success;
+                                return;
+                            };
+                        }
+                    }
+                }
+            }
+
+            let options = FsOptions::new();
+            match fatfs::FileSystem::new(
+                BlockDev::new(id.volume_fdo.clone(), sector_size, total_sectors),
+                options,
+            ) {
                 Ok(fs) => {
                     let mut io_vtable = IoVtable::new();
-
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
-                    let mut init = DeviceInit {
+
+                    let init = DeviceInit {
                         dev_ext_size: size_of::<VolCtrlDevExt>(),
                         io_vtable,
                         pnp_vtable: None,
@@ -67,12 +120,17 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl = unsafe { pnp_create_control_device_with_init(vol_name, init) };
-
+                    println!("1");
                     let vdx = ext_mut::<VolCtrlDevExt>(&vol_ctrl);
-                    unsafe { ptr::write(&mut vdx.fs as *mut Fat32, fs) };
-
+                    println!("addr = {:p}", &vdx.fs as *const _);
+                    println!("fs addr = {:p}", &fs as *const _);
+                    vdx.fs = fs;
+                    println!("3");
                     id.mount_device = Some(vol_ctrl);
+                    println!("4");
                     id.can_mount = true;
+                    println!("5");
+                    println!("idk");
                     r.status = DriverStatus::Success;
                 }
                 Err(_) => {
@@ -87,13 +145,15 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
         }
     }
 }
+
 #[unsafe(no_mangle)]
 pub extern "win64" fn fat_start(
-    dev: &Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     _req: Arc<spin::rwlock::RwLock<Request>>,
 ) -> DriverStatus {
     DriverStatus::Success
 }
+
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
@@ -105,7 +165,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         0,
     );
 
-    let mut init = DeviceInit {
+    let init = DeviceInit {
         dev_ext_size: core::mem::size_of::<CtrlDevExt>(),
         io_vtable,
         pnp_vtable: None,
@@ -122,7 +182,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     )));
     unsafe {
         let _ = pnp_ioctl_via_symlink(
-            "\\GLOBAL\\MountMgr".to_string(),
+            GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
         );

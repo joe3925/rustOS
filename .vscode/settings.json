@@ -68,6 +68,7 @@
         "ecam",
         "EFER",
         "endstruc",
+        "fatfs",
         "fninit",
         "gdtr",
         "greyscale",

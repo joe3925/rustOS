@@ -133,7 +133,7 @@ checksum = "718ebb60a92a2e37f9c6c6ab26f0adfd117aa6f1a8cd08d07bbd5a7762ff0812"
 dependencies = [
  "anyhow",
  "bootloader-boot-config",
- "fatfs",
+ "fatfs 0.3.6",
  "gpt",
  "llvm-tools",
  "serde_json",
@@ -262,6 +262,7 @@ name = "fat32"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.9.0",
+ "fatfs 0.4.0",
  "kernel_api",
  "spin 0.10.0",
 ]
@@ -274,6 +275,15 @@ checksum = "05669f8e7e2d7badc545c513710f0eba09c2fbef683eb859fd79c46c355048e0"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
+ "log",
+]
+
+[[package]]
+name = "fatfs"
+version = "0.4.0"
+source = "git+https://github.com/rafalh/rust-fatfs#4eccb50d011146fbed20e133d33b22f3c27292e7"
+dependencies = [
+ "bitflags 2.9.0",
  "log",
 ]
 
@@ -349,6 +359,15 @@ name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95505c38b4572b2d910cecb0281560f54b440a19336cbbcb27bf6ce6adc6f5a8"
+
+[[package]]
+name = "i8042"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.9.0",
+ "kernel_api",
+ "spin 0.10.0",
+]
 
 [[package]]
 name = "ide"

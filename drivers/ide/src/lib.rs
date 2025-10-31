@@ -15,7 +15,7 @@ use alloc::{
 };
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
-use kernel_api::{PnpMinorFunction, QueryIdType};
+use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType};
 use spin::{Mutex, RwLock};
 
 use dev_ext::DevExt;
@@ -88,6 +88,8 @@ struct ChildExt {
     parent_dx: *mut DevExt,
     dh: u8,
     present: bool,
+    disk_info: DiskInfo,
+    have_disk_info: bool,
 }
 
 #[unsafe(no_mangle)]
@@ -242,12 +244,14 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         hardware,
         compatible,
     };
+
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
         IoType::DeviceControl(ide_pdo_internal_ioctl),
         Synchronization::Sync,
         0,
     );
+
     let mut child_init = DeviceInit {
         dev_ext_size: size_of::<ChildExt>(),
         io_vtable,
@@ -271,8 +275,22 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     let cdx: &mut ChildExt =
         unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *const ChildExt as *mut ChildExt) };
     cdx.parent_dx = unsafe { (&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt };
-    cdx.dh = if drive == 0 { 0xE0 } else { 0xF0 };
+    cdx.dh = dh;
     cdx.present = true;
+
+    if let Some(words) = id_words_opt {
+        cdx.disk_info = disk_info_from_identify(&words);
+        cdx.have_disk_info = true;
+    } else {
+        cdx.disk_info = DiskInfo {
+            logical_block_size: 512,
+            physical_block_size: 0,
+            total_logical_blocks: 0,
+            total_bytes_low: 0,
+            total_bytes_high: 0,
+        };
+        cdx.have_disk_info = false;
+    }
 }
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let guard = LOCK.lock();
@@ -608,7 +626,24 @@ fn ata_pio_write(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: 
     unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
     wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS)
 }
+fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {
+    let lba48: u64 = ((words[103] as u64) << 48)
+        | ((words[102] as u64) << 32)
+        | ((words[101] as u64) << 16)
+        | (words[100] as u64);
+    let lba28: u64 = ((words[61] as u64) << 16) | (words[60] as u64);
+    let total_lbas = if lba48 != 0 { lba48 } else { lba28 };
+    let logical = 512u32;
+    let total_bytes = total_lbas.saturating_mul(logical as u64);
 
+    DiskInfo {
+        logical_block_size: logical,
+        physical_block_size: 0,
+        total_logical_blocks: total_lbas,
+        total_bytes_low: total_bytes,
+        total_bytes_high: 0,
+    }
+}
 fn io_wait_400ns(alt: &mut Port<u8>) {
     unsafe {
         let _ = alt.read();
@@ -687,11 +722,23 @@ extern "win64" fn ide_pdo_query_id(
 }
 
 extern "win64" fn ide_pdo_query_resources(
-    _pdo: &Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    req.write().status = DriverStatus::Success; // none for child PDO
-    DriverStatus::Success
+    let cdx: &ChildExt = unsafe { &*((&*pdo.dev_ext).as_ptr() as *const ChildExt) };
+
+    let mut w = req.write();
+    if let Some(p) = w.pnp.as_mut() {
+        let di = &cdx.disk_info as *const DiskInfo as *const u8;
+        let n = core::mem::size_of::<DiskInfo>();
+        let bytes = unsafe { core::slice::from_raw_parts(di, n) };
+        p.blob_out = bytes.to_vec();
+        w.status = DriverStatus::Success;
+        return DriverStatus::Success;
+    }
+
+    w.status = DriverStatus::InvalidParameter;
+    DriverStatus::InvalidParameter
 }
 
 extern "win64" fn ide_pdo_start(

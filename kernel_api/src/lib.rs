@@ -285,7 +285,7 @@ pub struct FsGetInfoResult {
     pub error: Option<FileError>,
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct GptHeader {
     pub signature: [u8; 8],
     pub revision: u32,
@@ -304,6 +304,23 @@ pub struct GptHeader {
     pub_reserved_block: [u8; 420],
 }
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DiskInfo {
+    pub logical_block_size: u32,
+    pub physical_block_size: u32,
+    pub total_logical_blocks: u64,
+    pub total_bytes_low: u64,
+    pub total_bytes_high: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct PartitionInfo {
+    pub disk: DiskInfo,
+    pub gpt_header: Option<GptHeader>,
+    pub gpt_entry: Option<GptPartitionEntry>,
+}
+#[repr(C)]
 pub struct FsIdentify {
     pub volume_fdo: Arc<IoTarget>,
     pub mount_device: Option<Arc<DeviceObject>>,
@@ -318,7 +335,7 @@ pub struct BlkRead {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct GptPartitionEntry {
     pub partition_type_guid: [u8; 16],
     pub unique_partition_guid: [u8; 16],
@@ -328,13 +345,13 @@ pub struct GptPartitionEntry {
     pub name_utf16: [u16; 36],
 }
 
-fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
+pub fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let len = size_of::<T>();
     let ptr = Box::into_raw(b) as *mut u8;
     unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len)) }
 }
 
-unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
+pub unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     assert_eq!(b.len(), size_of::<T>());
     let ptr = Box::into_raw(b) as *mut u8 as *mut T;
     Box::from_raw(ptr)

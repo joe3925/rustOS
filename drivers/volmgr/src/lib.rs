@@ -6,13 +6,16 @@ extern crate alloc;
 use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
+use core::mem::take;
 use core::sync::atomic::Ordering::Acquire;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::PartitionInfo;
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
+use kernel_api::bytes_to_box;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
     alloc_api::{
@@ -39,10 +42,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[repr(C)]
 struct VolExt {
-    have_gpt: AtomicBool,
-    have_entry: AtomicBool,
-    hdr: GptHeader,
-    entry: GptPartitionEntry,
+    part: Option<PartitionInfo>,
     enumerated: AtomicBool,
 }
 
@@ -53,6 +53,7 @@ fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
 #[repr(C)]
 struct VolPdoExt {
     backing: Option<Arc<IoTarget>>,
+    part: Option<PartitionInfo>,
 }
 
 #[inline]
@@ -98,38 +99,6 @@ pub extern "win64" fn vol_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn vol_queryres_complete(child: &mut Request, ctx: usize) {
-    let dev = unsafe { Arc::from_raw(ctx as *const DeviceObject) };
-    if child.status != DriverStatus::Success {
-        return;
-    }
-
-    let dx = ext_mut::<VolExt>(&dev);
-    dx.have_gpt.store(false, Relaxed);
-    dx.have_entry.store(false, Relaxed);
-
-    let blob = &child.pnp.as_ref().unwrap().blob_out;
-
-    if blob.len() == 512 {
-        let hdr: GptHeader =
-            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
-        dx.hdr = hdr;
-        dx.have_gpt.store(true, Release);
-        return;
-    }
-
-    if blob.len() == 512 + 128 {
-        let hdr: GptHeader =
-            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
-        let ent: GptPartitionEntry = unsafe {
-            core::ptr::read_unaligned(blob.as_ptr().add(512) as *const GptPartitionEntry)
-        };
-        dx.hdr = hdr;
-        dx.entry = ent;
-        dx.have_gpt.store(true, Release);
-        dx.have_entry.store(true, Release); // publish entry last
-    }
-}
 extern "win64" fn vol_prepare_hardware(
     dev: &Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
@@ -151,38 +120,25 @@ extern "win64" fn vol_prepare_hardware(
 
     unsafe { pnp_wait_for_request(&req_lock) };
 
-    let g = req_lock.read();
+    let mut g = req_lock.write();
     let dx = ext_mut::<VolExt>(dev);
 
-    dx.have_gpt.store(false, Relaxed);
-    dx.have_entry.store(false, Relaxed);
-
     if g.status != DriverStatus::Success {
-        dx.have_gpt.store(false, Release);
-        dx.have_entry.store(false, Release);
         return DriverStatus::Success;
     }
 
-    let blob = &g.pnp.as_ref().unwrap().blob_out;
-    if blob.len() >= 512 {
-        let hdr: GptHeader =
-            unsafe { core::ptr::read_unaligned(blob.as_ptr() as *const GptHeader) };
-        dx.hdr = hdr;
-
-        if blob.len() >= 512 + 128 {
-            let ent: GptPartitionEntry = unsafe {
-                core::ptr::read_unaligned(blob.as_ptr().add(512) as *const GptPartitionEntry)
-            };
-            dx.entry = ent;
-            dx.have_gpt.store(true, Relaxed);
-            dx.have_entry.store(true, Release);
+    let pi_opt: Option<PartitionInfo> = {
+        let pnp = g.pnp.as_mut().unwrap();
+        let buf = take(&mut pnp.blob_out);
+        if buf.len() == core::mem::size_of::<PartitionInfo>() {
+            let boxed_bytes: Box<[u8]> = buf.into_boxed_slice();
+            let boxed_pi: Box<PartitionInfo> = unsafe { bytes_to_box(boxed_bytes) };
+            Some(*boxed_pi)
         } else {
-            dx.have_gpt.store(true, Release);
+            None
         }
-    } else {
-        dx.have_gpt.store(false, Release);
-        dx.have_entry.store(false, Release);
-    }
+    };
+    dx.part = pi_opt;
 
     DriverStatus::Success
 }
@@ -192,21 +148,34 @@ pub extern "win64" fn vol_enumerate_devices(
 ) -> DriverStatus {
     let dx = ext_mut::<VolExt>(device);
 
-    if !dx.have_entry.load(Acquire) {
+    let pi = if let Some(ref pi) = dx.part {
+        pi
+    } else {
         request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
-    }
-    if dx.enumerated.swap(true, Ordering::AcqRel) {
+    };
+
+    let binding = (pi.gpt_header, pi.gpt_entry);
+    let (_hdr, ent) = if let (Some(ref hdr), Some(ref ent)) = binding {
+        (hdr, ent)
+    } else {
+        request.write().status = DriverStatus::Success;
+        return DriverStatus::Success;
+    };
+
+    if dx
+        .enumerated
+        .swap(true, core::sync::atomic::Ordering::AcqRel)
+    {
         request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
-    let parent_dn = match device.dev_node.upgrade() {
-        Some(dn) => dn,
-        None => {
-            request.write().status = DriverStatus::Unsuccessful;
-            return DriverStatus::Unsuccessful;
-        }
+    let parent_dn = if let Some(dn) = device.dev_node.upgrade() {
+        dn
+    } else {
+        request.write().status = DriverStatus::Unsuccessful;
+        return DriverStatus::Unsuccessful;
     };
 
     let zero = [0u8; 16];
@@ -219,13 +188,13 @@ pub extern "win64" fn vol_enumerate_devices(
         0x49,
     ];
 
-    let ptype = dx.entry.partition_type_guid;
+    let ptype = ent.partition_type_guid;
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
         request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
-    let part_guid_s = guid_to_string(&dx.entry.unique_partition_guid);
+    let part_guid_s = guid_to_string(&ent.unique_partition_guid);
     let name = alloc::format!("Volume{}", &part_guid_s[..8]);
     let inst = alloc::format!("STOR\\VOLUME\\{}\\0000", part_guid_s);
 
@@ -233,13 +202,17 @@ pub extern "win64" fn vol_enumerate_devices(
         hardware: vec!["STOR\\Volume".into(), "STOR\\Volume\\GPT".into()],
         compatible: vec!["STOR\\Volume".into()],
     };
+
     let mut io_table = IoVtable::new();
     io_table.set(IoType::Read(vol_pdo_read), Synchronization::Sync, 0);
     io_table.set(IoType::Write(vol_pdo_write), Synchronization::Sync, 0);
+
+    let mut pnp_vtable = PnpVtable::new();
+    pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
     let init = DeviceInit {
-        dev_ext_size: size_of::<VolPdoExt>(),
+        dev_ext_size: core::mem::size_of::<VolPdoExt>(),
         io_vtable: io_table,
-        pnp_vtable: None,
+        pnp_vtable: Some(pnp_vtable),
     };
 
     let (_dn, pdo) = unsafe {
@@ -255,12 +228,12 @@ pub extern "win64" fn vol_enumerate_devices(
 
     if let Some(tgt) = unsafe { pnp_get_device_target(&parent_dn.instance_path) } {
         ext_mut::<VolPdoExt>(&pdo).backing = Some(Arc::new(tgt));
+        ext_mut::<VolPdoExt>(&pdo).part = Some(dx.part.clone().unwrap());
     }
 
     request.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
-
 #[repr(C)]
 struct BridgeCtx {
     parent: Arc<RwLock<Request>>,
@@ -354,4 +327,34 @@ pub extern "win64" fn vol_pdo_write(
     let req = Arc::new(RwLock::new(child));
     unsafe { pnp_send_request(&*tgt, req.clone()) };
     unsafe { pnp_wait_for_request(&req) };
+}
+extern "win64" fn vol_pdo_query_resources(
+    pdo: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    let mut w = req.write();
+    let pnp = match w.pnp.as_mut() {
+        Some(p) => p,
+        None => {
+            w.status = DriverStatus::InvalidParameter;
+            return DriverStatus::InvalidParameter;
+        }
+    };
+
+    if let Some(pi) = ext_mut::<VolPdoExt>(pdo).part.as_ref() {
+        let mut out = vec![0u8; core::mem::size_of::<PartitionInfo>()];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (pi as *const PartitionInfo) as *const u8,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+        pnp.blob_out = out;
+    } else {
+        pnp.blob_out.clear();
+    }
+
+    w.status = DriverStatus::Success;
+    DriverStatus::Success
 }

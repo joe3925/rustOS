@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-
 extern crate alloc;
 
 use core::panic::PanicInfo;
@@ -24,4 +23,5 @@ mod structs;
 mod control;
 mod volume;
 
+mod block_dev;
 pub use control::DriverEntry;

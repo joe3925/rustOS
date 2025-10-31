@@ -8,7 +8,8 @@ use core::{mem::size_of, panic::PanicInfo, ptr};
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
+    DeviceObject, DeviceRelationType, DiskInfo, DriverObject, DriverStatus, KernelAllocator,
+    PnpMinorFunction, QueryIdType, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, Synchronization,
         ffi::{
@@ -44,6 +45,8 @@ fn put_req(r: &Arc<RwLock<Request>>, req: Request) {
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
+
+const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 const BLOCK_RW_READ: u32 = 0;
 const BLOCK_RW_WRITE: u32 = 1;
@@ -313,22 +316,43 @@ pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Req
             return;
         }
     };
+    match code {
+        IOCTL_DRIVE_IDENTIFY => {
+            let mut ch = Request::new(RequestType::Pnp, Box::new([]));
+            ch.pnp = Some(kernel_api::alloc_api::PnpRequest {
+                minor_function: PnpMinorFunction::QueryResources,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: QueryIdType::CompatibleIds,
+                ids_out: Vec::new(),
+                blob_out: Vec::new(),
+            });
+            let ch = Arc::new(RwLock::new(ch));
 
-    if code == IOCTL_BLOCK_FLUSH {
-        let child = Arc::new(RwLock::new(Request::new(
-            RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-            Box::new([]),
-        )));
-        let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-        if st == DriverStatus::NoSuchDevice {
-            parent.write().status = DriverStatus::NoSuchDevice;
-            return;
+            unsafe { pnp_forward_request_to_next_lower(dev, ch.clone()) };
+            unsafe { pnp_wait_for_request(&ch) };
+
+            let blob = { ch.read().pnp.as_ref().unwrap().blob_out.clone() };
+            {
+                let mut w = parent.write();
+                w.data = blob.into_boxed_slice();
+                w.status = DriverStatus::Success;
+            }
         }
-        unsafe { pnp_wait_for_request(&child) };
-        let c = child.read();
-        parent.write().status = c.status;
-    } else {
-        parent.write().status = DriverStatus::NotImplemented;
+        IOCTL_BLOCK_FLUSH => {
+            let child = Arc::new(RwLock::new(Request::new(
+                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
+                Box::new([]),
+            )));
+            let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
+            if st == DriverStatus::NoSuchDevice {
+                parent.write().status = DriverStatus::NoSuchDevice;
+                return;
+            }
+            unsafe { pnp_wait_for_request(&child) };
+            let c = child.read();
+            parent.write().status = c.status;
+        }
+        _ => parent.write().status = DriverStatus::NotImplemented,
     }
 }
 
