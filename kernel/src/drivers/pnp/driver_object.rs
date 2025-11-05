@@ -11,7 +11,10 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::{type_name, Any, TypeId},
+    marker::PhantomData,
     mem,
+    ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
 use spin::{Mutex, RwLock};
@@ -42,23 +45,25 @@ pub struct ReqJob {
 pub struct DeviceObject {
     pub lower_device: Option<Arc<DeviceObject>>,
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
-    pub dev_ext: Box<[u8]>,
+    dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
-
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
     pub in_queue: AtomicBool,
 }
-
 impl DeviceObject {
-    pub fn new(dev_ext_size: usize) -> Arc<Self> {
-        let dev_ext = vec![0u8; dev_ext_size].into_boxed_slice();
+    pub fn new(mut init: DeviceInit) -> Arc<Self> {
+        let dev_ext = match (init.dev_ext_type, init.dev_ext_factory) {
+            (Some(ty), Some(f)) => DevExtBox::from_factory(f, ty),
+            _ => DevExtBox::none(),
+        };
+
         Arc::new(Self {
             lower_device: None,
             upper_device: RwLock::new(None),
             dev_ext,
-            dev_init: DeviceInit::new(),
+            dev_init: init,
             queue: Mutex::new(VecDeque::new()),
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Weak::new(),
@@ -103,16 +108,40 @@ impl DeviceObject {
         }
     }
 
-    #[inline]
-    pub fn devext_mut<T>(&mut self) -> &mut T {
-        assert!(self.dev_ext.len() >= mem::size_of::<T>());
-        unsafe { &mut *(self.dev_ext.as_mut_ptr() as *mut T) }
+    pub fn try_devext<'a, T: 'static>(&'a self) -> Result<DevExtRef<'a, T>, DevExtError> {
+        if self.dev_ext.ty != TypeId::of::<T>() {
+            return Err(DevExtError::TypeMismatch {
+                expected: type_name::<T>(),
+            });
+        }
+        let r = self.dev_ext.inner.downcast_ref::<T>().unwrap();
+        Ok(DevExtRef {
+            inner: r,
+            _lt: PhantomData,
+        })
     }
 
-    #[inline]
-    pub fn devext_ref<T>(&self) -> &T {
-        assert!(self.dev_ext.len() >= mem::size_of::<T>());
-        unsafe { &*(self.dev_ext.as_ptr() as *const T) }
+    pub fn try_devext_mut<'a, T: 'static>(
+        &'a mut self,
+    ) -> Result<DevExtRefMut<'a, T>, DevExtError> {
+        if self.dev_ext.ty != TypeId::of::<T>() {
+            return Err(DevExtError::TypeMismatch {
+                expected: type_name::<T>(),
+            });
+        }
+        let r = self.dev_ext.inner.downcast_mut::<T>().unwrap();
+        Ok(DevExtRefMut {
+            inner: r,
+            _lt: PhantomData,
+        })
+    }
+
+    pub fn devext<'a, T: 'static>(&'a self) -> DevExtRef<'a, T> {
+        self.try_devext::<T>().ok().unwrap()
+    }
+
+    pub fn devext_mut<'a, T: 'static>(&'a mut self) -> DevExtRefMut<'a, T> {
+        self.try_devext_mut::<T>().ok().unwrap()
     }
 }
 fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {
@@ -400,12 +429,13 @@ impl Request {
         self.completion_context = context;
     }
 }
-#[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {
     pub dev_ext_size: usize,
     pub io_vtable: IoVtable,
     pub pnp_vtable: Option<PnpVtable>,
+    dev_ext_factory: Option<fn() -> Box<dyn Any + Send + Sync>>,
+    dev_ext_type: Option<TypeId>,
 }
 
 impl DeviceInit {
@@ -414,7 +444,18 @@ impl DeviceInit {
             dev_ext_size: 0,
             io_vtable: IoVtable::new(),
             pnp_vtable: None,
+            dev_ext_factory: None,
+            dev_ext_type: None,
         }
+    }
+
+    pub fn set_dev_ext_default<T>(&mut self)
+    where
+        T: Default + 'static + Send + Sync,
+    {
+        self.dev_ext_size = core::mem::size_of::<T>();
+        self.dev_ext_type = Some(TypeId::of::<T>());
+        self.dev_ext_factory = Some(|| Box::new(T::default()));
     }
 }
 
@@ -472,5 +513,63 @@ impl DriverConfig {
             (*(self.driver as *mut DriverObject)).evt_driver_unload = Some(cb);
         }
         self
+    }
+}
+
+pub enum DevExtError {
+    NotPresent,
+    TypeMismatch { expected: &'static str },
+}
+
+pub struct DevExtRef<'a, T: 'static> {
+    inner: &'a T,
+    _lt: PhantomData<&'a T>,
+}
+impl<'a, T: 'static> Deref for DevExtRef<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner
+    }
+}
+
+pub struct DevExtRefMut<'a, T: 'static> {
+    inner: &'a mut T,
+    _lt: PhantomData<&'a mut T>,
+}
+impl<'a, T: 'static> Deref for DevExtRefMut<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner
+    }
+}
+impl<'a, T: 'static> DerefMut for DevExtRefMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner
+    }
+}
+
+#[derive(Default)]
+struct NoDevExt;
+#[derive(Debug)]
+struct DevExtBox {
+    ty: TypeId,
+    inner: Box<dyn Any + Send + Sync>,
+    present: bool,
+}
+
+impl DevExtBox {
+    fn none() -> Self {
+        Self {
+            ty: TypeId::of::<NoDevExt>(),
+            inner: Box::new(NoDevExt::default()),
+            present: false,
+        }
+    }
+    fn from_factory(f: fn() -> Box<dyn Any + Send + Sync>, ty: TypeId) -> Self {
+        Self {
+            ty,
+            inner: f(),
+            present: true,
+        }
     }
 }

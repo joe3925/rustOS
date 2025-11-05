@@ -13,6 +13,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use core::alloc::{GlobalAlloc, Layout};
+use core::any::{type_name, Any, TypeId};
+use core::marker::PhantomData;
+use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
 use spin::{Mutex, RwLock};
@@ -54,15 +57,79 @@ unsafe impl GlobalAlloc for KernelAllocator {
 pub struct DeviceObject {
     pub lower_device: Option<Arc<DeviceObject>>,
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
-    pub dev_ext: Box<[u8]>,
+    dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
-
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Weak<DevNode>,
     pub in_queue: AtomicBool,
 }
 
+impl DeviceObject {
+    pub fn new(mut init: DeviceInit) -> Arc<Self> {
+        let dev_ext = match (init.dev_ext_type, init.dev_ext_factory) {
+            (Some(ty), Some(f)) => DevExtBox::from_factory(f, ty),
+            _ => DevExtBox::none(),
+        };
+
+        Arc::new(Self {
+            lower_device: None,
+            upper_device: RwLock::new(None),
+            dev_ext,
+            dev_init: init,
+            queue: Mutex::new(VecDeque::new()),
+            dispatch_tickets: AtomicU32::new(0),
+            dev_node: Weak::new(),
+            in_queue: AtomicBool::new(false),
+        })
+    }
+
+    pub fn has_devext(&self) -> bool {
+        self.dev_ext.present
+    }
+
+    pub fn try_devext<'a, T: 'static>(&'a self) -> Result<DevExtRef<'a, T>, DevExtError> {
+        if !self.dev_ext.present {
+            return Err(DevExtError::NotPresent);
+        }
+        if self.dev_ext.ty != TypeId::of::<T>() {
+            return Err(DevExtError::TypeMismatch {
+                expected: type_name::<T>(),
+            });
+        }
+        let r = self.dev_ext.inner.downcast_ref::<T>().unwrap();
+        Ok(DevExtRef {
+            inner: r,
+            _lt: PhantomData,
+        })
+    }
+
+    pub fn try_devext_mut<'a, T: 'static>(
+        &'a mut self,
+    ) -> Result<DevExtRefMut<'a, T>, DevExtError> {
+        if !self.dev_ext.present {
+            return Err(DevExtError::NotPresent);
+        }
+        if self.dev_ext.ty != TypeId::of::<T>() {
+            return Err(DevExtError::TypeMismatch {
+                expected: type_name::<T>(),
+            });
+        }
+        let r = self.dev_ext.inner.downcast_mut::<T>().unwrap();
+        Ok(DevExtRefMut {
+            inner: r,
+            _lt: PhantomData,
+        })
+    }
+
+    // optional fast-fail helpers if you want them:
+    pub fn devext<'a, T: 'static>(&'a self) -> DevExtRef<'a, T> {
+        self.try_devext::<T>().ok().unwrap()
+    }
+    pub fn devext_mut<'a, T: 'static>(&'a mut self) -> DevExtRefMut<'a, T> {
+        self.try_devext_mut::<T>().ok().unwrap()
+    }
+}
 #[derive(Debug)]
 #[repr(C)]
 pub struct DevNode {
@@ -76,6 +143,63 @@ pub struct DevNode {
 
     pub pdo: RwLock<Option<Arc<DeviceObject>>>,
     pub stack: RwLock<Option<DeviceStack>>,
+}
+pub enum DevExtError {
+    NotPresent,
+    TypeMismatch { expected: &'static str },
+}
+
+pub struct DevExtRef<'a, T: 'static> {
+    pub(crate) inner: &'a T,
+    pub(crate) _lt: PhantomData<&'a T>,
+}
+impl<'a, T: 'static> Deref for DevExtRef<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner
+    }
+}
+
+pub struct DevExtRefMut<'a, T: 'static> {
+    pub(crate) inner: &'a mut T,
+    pub(crate) _lt: PhantomData<&'a mut T>,
+}
+impl<'a, T: 'static> Deref for DevExtRefMut<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.inner
+    }
+}
+impl<'a, T: 'static> DerefMut for DevExtRefMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner
+    }
+}
+
+#[derive(Default)]
+struct NoDevExt;
+#[derive(Debug)]
+struct DevExtBox {
+    ty: TypeId,
+    inner: Box<dyn Any + Send + Sync>,
+    present: bool,
+}
+
+impl DevExtBox {
+    fn none() -> Self {
+        Self {
+            ty: TypeId::of::<NoDevExt>(),
+            inner: Box::new(NoDevExt::default()),
+            present: false,
+        }
+    }
+    fn from_factory(f: fn() -> Box<dyn Any + Send + Sync>, ty: TypeId) -> Self {
+        Self {
+            ty,
+            inner: f(),
+            present: true,
+        }
+    }
 }
 #[repr(C)]
 pub struct DriverObject {
@@ -606,6 +730,9 @@ pub enum ResourceKind {
 pub type DpcFn = extern "win64" fn(usize);
 
 pub mod alloc_api {
+    use core::any::{Any, TypeId};
+    use core::marker::PhantomData;
+    use core::ops::{Deref, DerefMut};
     use core::ptr::NonNull;
     use core::sync::atomic::AtomicU64;
 
@@ -752,8 +879,20 @@ pub mod alloc_api {
         pub dev_ext_size: usize,
         pub io_vtable: IoVtable,
         pub pnp_vtable: Option<PnpVtable>,
+        pub(crate) dev_ext_factory: Option<fn() -> Box<dyn Any + Send + Sync>>,
+        pub(crate) dev_ext_type: Option<TypeId>,
     }
 
+    impl DeviceInit {
+        pub fn set_dev_ext_default<T>(&mut self)
+        where
+            T: Default + 'static + Send + Sync,
+        {
+            self.dev_ext_size = core::mem::size_of::<T>();
+            self.dev_ext_type = Some(TypeId::of::<T>());
+            self.dev_ext_factory = Some(|| Box::new(T::default()));
+        }
+    }
     #[repr(C)]
     #[derive(Debug, Clone)]
     pub struct PnpRequest {
@@ -764,6 +903,7 @@ pub mod alloc_api {
         pub ids_out: Vec<String>,
         pub blob_out: Vec<u8>,
     }
+
     #[derive(Debug, Clone)]
     pub struct KernelAcpiHandler;
 

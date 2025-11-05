@@ -156,7 +156,7 @@ impl PnpManager {
         class: Option<String>,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
-        let pdo = DeviceObject::new(0);
+        let pdo = DeviceObject::new(DeviceInit::new());
         unsafe {
             let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
             p.dev_node = Arc::downgrade(&dev_node);
@@ -186,11 +186,10 @@ impl PnpManager {
         mut init: DeviceInit,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
-        let pdo = DeviceObject::new(init.dev_ext_size);
+        let pdo = DeviceObject::new(init);
         unsafe {
             let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
             p.dev_node = Arc::downgrade(&dev_node);
-            p.dev_init = init;
         }
         dev_node.set_pdo(pdo.clone());
 
@@ -573,10 +572,9 @@ impl PnpManager {
             let mut dev_init = DeviceInit::new();
             let st = cb(drv, &mut dev_init);
             if st == DriverStatus::Success {
-                let devobj = DeviceObject::new(dev_init.dev_ext_size);
+                let devobj = DeviceObject::new(dev_init);
                 unsafe {
                     let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
-                    me.dev_init = dev_init;
                     me.dev_node = Arc::downgrade(dn);
                 }
                 DeviceObject::set_lower_upper(&devobj, below);
@@ -1092,11 +1090,10 @@ impl PnpManager {
         );
         *dn.stack.write() = Some(DeviceStack::new());
 
-        let pdo = DeviceObject::new(init_pdo.dev_ext_size);
+        let pdo = DeviceObject::new(init_pdo);
         unsafe {
             let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
             p.dev_node = Arc::downgrade(&dn);
-            p.dev_init = init_pdo;
         }
         dn.set_pdo(pdo.clone());
 
@@ -1236,10 +1233,9 @@ impl PnpManager {
     ) -> (Arc<DeviceObject>, String) {
         init.pnp_vtable = None;
 
-        let dev = DeviceObject::new(init.dev_ext_size);
+        let dev = DeviceObject::new(init);
         unsafe {
             let p = &mut *(Arc::as_ptr(&dev) as *mut DeviceObject);
-            p.dev_init = init;
         }
 
         let base = alloc::format!("\\Device\\Control\\{}", name);
