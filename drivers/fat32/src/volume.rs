@@ -18,14 +18,15 @@ use fatfs::{
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DriverStatus, FileError, FsCloseParams, FsCloseResult, FsCreateParams,
-    FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,
+    DevExtRefMut, DeviceObject, DriverStatus, FileError, FsCloseParams, FsCloseResult,
+    FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,
     FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult,
     FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams,
     FsWriteResult, Request, RequestType,
 };
 
 use crate::block_dev::BlockDev;
+use crate::control::ext_mut;
 
 // ---- Explicit fatfs type aliases (old fatfs requires TP/OCC generics) ----
 type FatDev = BlockDev;
@@ -40,12 +41,12 @@ type FsError = FatError<<FatDev as IoBase>::Error>; // = fatfs::Error<()>
 #[repr(C)]
 pub struct VolCtrlDevExt {
     pub fs: Fs,
-    next_id: AtomicU64,
-    table: RwLock<BTreeMap<u64, FileCtx>>,
+    pub(crate) next_id: AtomicU64,
+    pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
 }
 
 #[derive(Clone)]
-struct FileCtx {
+pub struct FileCtx {
     path: String,
     is_dir: bool,
     pos: u64,
@@ -60,11 +61,6 @@ fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
 unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     let p = Box::into_raw(b) as *mut u8 as *mut T;
     Box::from_raw(p)
-}
-
-#[inline]
-fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
 }
 
 // ---- map fatfs::Error<()> -> your FileError ----

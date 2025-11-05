@@ -8,8 +8,8 @@ use core::{mem::size_of, panic::PanicInfo, ptr};
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DeviceRelationType, DiskInfo, DriverObject, DriverStatus, KernelAllocator,
-    PnpMinorFunction, QueryIdType, Request, RequestType,
+    DevExtRefMut, DeviceObject, DeviceRelationType, DiskInfo, DriverObject, DriverStatus,
+    KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, Synchronization,
         ffi::{
@@ -79,6 +79,7 @@ struct BlockRwIn {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct DiskExt {
     block_size: u32,
     max_blocks: u32,
@@ -116,7 +117,7 @@ pub extern "win64" fn disk_device_add(
     dev_init
         .io_vtable
         .set(IoType::DeviceControl(disk_ioctl), Synchronization::Sync, 0);
-    dev_init.dev_ext_size = size_of::<DiskExt>();
+    dev_init.set_dev_ext_default::<DiskExt>();
     DriverStatus::Success
 }
 
@@ -141,14 +142,14 @@ pub extern "win64" fn disk_read(
         return;
     }
 
-    let dx = disk_ext_mut(dev);
+    let mut dx = disk_ext_mut(dev);
     if !dx.props_ready {
         if let Err(st) = query_props_sync(dev) {
             parent.write().status = st;
             return;
         }
     }
-    if !rw_validate(dx, off, total) {
+    if !rw_validate(&mut dx, off, total) {
         parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
@@ -240,7 +241,7 @@ pub extern "win64" fn disk_write(
         return;
     }
 
-    let dx = disk_ext_mut(dev);
+    let mut dx = disk_ext_mut(dev);
     if !dx.props_ready {
         match query_props_sync(dev) {
             Ok(_) => {}
@@ -250,7 +251,7 @@ pub extern "win64" fn disk_write(
             }
         }
     }
-    if !rw_validate(dx, off, total) {
+    if !rw_validate(&mut dx, off, total) {
         parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
@@ -356,9 +357,9 @@ pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Req
     }
 }
 
-// ---------- Helpers ----------
-fn disk_ext_mut(dev: &Arc<DeviceObject>) -> &mut DiskExt {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const DiskExt as *mut DiskExt) }
+pub fn disk_ext_mut<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, DiskExt> {
+    dev.try_devext_mut::<DiskExt>()
+        .expect("Failed to get disk dev ext")
 }
 
 fn rw_validate(dx: &mut DiskExt, off: u64, total: usize) -> bool {
@@ -398,7 +399,7 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     }
 
     let qo = unsafe { *(c.data.as_ptr() as *const BlockQueryOut) };
-    let dx = disk_ext_mut(dev);
+    let dx: &mut DiskExt = &mut disk_ext_mut(dev);
     dx.block_size = qo.block_size.max(1);
     dx.max_blocks = qo.max_blocks.max(1);
     dx.alignment_mask = qo.alignment_mask;

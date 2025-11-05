@@ -12,6 +12,7 @@ use aml::value::Args;
 use aml::{AmlContext, AmlName, AmlValue, Handler};
 use core::ptr::{read_volatile, write_volatile};
 use kernel_api::acpi::mcfg::Mcfg;
+use kernel_api::alloc_api::DeviceInit;
 use kernel_api::alloc_api::IoVtable;
 use kernel_api::alloc_api::PnpVtable;
 use kernel_api::alloc_api::ffi::get_acpi_tables;
@@ -323,7 +324,6 @@ pub fn create_pnp_bus_from_acpi(
     let Some(hid_raw) = hid_opt else {
         return false;
     };
-
     let hid = hid_raw.to_ascii_uppercase();
 
     let mut hardware_ids = alloc::vec::Vec::new();
@@ -352,37 +352,27 @@ pub fn create_pnp_bus_from_acpi(
         dev_name.as_string()
     };
 
-    // Build PnP vtable for the ACPI PDO
+    // PnP vtable
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::QueryResources, acpi_pdo_query_resources);
     vt.set(PnpMinorFunction::QueryId, acpi_pdo_query_id);
     vt.set(PnpMinorFunction::StartDevice, acpi_pdo_start);
 
-    let init = kernel_api::alloc_api::DeviceInit {
-        dev_ext_size: core::mem::size_of::<AcpiPdoExt>(),
-        pnp_vtable: Some(vt),
-        io_vtable: IoVtable::new(),
+    // Init: set PnP vtable and dev-ext from a prebuilt value (no Default)
+    let mut init = DeviceInit::new(IoVtable::new(), Some(vt));
+    let mut ext = AcpiPdoExt {
+        acpi_path: dev_name.clone(),
+        ctx: ctx_lock,
+        ecam: alloc::vec::Vec::new(),
     };
 
-    let (_dn, pdo) = unsafe {
-        kernel_api::alloc_api::ffi::pnp_create_child_devnode_and_pdo_with_init(
-            parent_dev_node,
-            short_name,
-            instance_path,
-            device_ids,
-            None,
-            init,
-        )
-    };
-    println!("ACPI: {:#?}", _dn.ids.hardware);
-
+    // Compute ECAM coverage, then write into the dev-ext
     let seg = read_int_method(&mut ctx, &dev_name, "_SEG").unwrap_or(0) as u16;
     let bbn = read_int_method(&mut ctx, &dev_name, "_BBN").unwrap_or(0) as u8;
     let (sb, eb) = bus_range_from_crs(&mut ctx, &dev_name).unwrap_or((bbn, 0xFF));
 
     let tables = unsafe { get_acpi_tables() };
     let mut ecam = alloc::vec::Vec::new();
-
     if let Ok(map) = tables.find_table::<Mcfg>() {
         let raw = unsafe {
             core::slice::from_raw_parts(
@@ -403,12 +393,20 @@ pub fn create_pnp_bus_from_acpi(
             }
         }
     }
+    ext.ecam = ecam;
+    init.set_dev_ext_from(ext);
 
-    let pext: &mut AcpiPdoExt = unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *mut AcpiPdoExt) };
-    pext.acpi_path = dev_name;
+    let (_dn, mut pdo) = unsafe {
+        kernel_api::alloc_api::ffi::pnp_create_child_devnode_and_pdo_with_init(
+            parent_dev_node,
+            short_name,
+            instance_path,
+            device_ids,
+            None,
+            init,
+        )
+    };
     drop(ctx);
-    pext.ctx = ctx_lock;
-    pext.ecam = ecam;
     true
 }
 
@@ -768,7 +766,7 @@ extern "win64" fn acpi_pdo_query_resources(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
-    let pext: &mut AcpiPdoExt = unsafe { &mut *((&*dev.dev_ext).as_ptr() as *mut AcpiPdoExt) };
+    let pext: &mut AcpiPdoExt = &mut dev.try_devext_mut().expect("Failed to get devext");
 
     let ctx_lock = match unsafe { pext.ctx.as_ref() } {
         Some(r) => r,
@@ -799,7 +797,7 @@ extern "win64" fn acpi_pdo_query_id(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
-    let pext: &mut AcpiPdoExt = unsafe { &mut *((&*dev.dev_ext).as_ptr() as *mut AcpiPdoExt) };
+    let pext: &mut AcpiPdoExt = &mut dev.try_devext_mut().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
 

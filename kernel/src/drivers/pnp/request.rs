@@ -33,7 +33,6 @@ lazy_static::lazy_static! {
     static ref DISPATCH_DEVQ: Mutex<VecDeque<Arc<DeviceObject>>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
-
 impl PnpManager {
     pub fn queue_dpc(&self, func: extern "win64" fn(usize), arg: usize) {
         GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });

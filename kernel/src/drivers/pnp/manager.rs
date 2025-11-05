@@ -67,7 +67,6 @@ impl PnpManager {
                 compatible: Vec::new(),
             };
             let mut pdo_init = DeviceInit::new();
-            pdo_init.dev_ext_size = 0;
 
             let (devnode, _pdo) = self.create_child_devnode_and_pdo_with_init(
                 &root_node,

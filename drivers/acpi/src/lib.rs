@@ -54,7 +54,7 @@ pub extern "win64" fn bus_driver_device_add(
     pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
     pnp_vtable.set(PnpMinorFunction::QueryDeviceRelations, enumerate_bus);
 
-    dev_init_ptr.dev_ext_size = size_of::<DevExt>();
+    dev_init_ptr.set_dev_ext_default::<DevExt>();
     dev_init_ptr.pnp_vtable = Some(pnp_vtable);
 
     DriverStatus::Success
@@ -83,20 +83,10 @@ pub extern "win64" fn bus_driver_prepare_hardware(
         println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
         return DriverStatus::Success;
     }
-    assert!(
-        device.dev_ext.len() >= mem::size_of::<DevExt>(),
-        "Device extension buffer is too small for DevExt"
-    );
-    let dev_ext_ptr = device.dev_ext.as_ptr() as *const DevExt as *mut DevExt;
+    let dev_ext: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get dev ext ACPI");
 
-    let new_ext = DevExt {
-        ctx: RwLock::new(aml_ctx),
-        i8042_hint: fadt_has_i8042_hint(),
-    };
-
-    unsafe {
-        ptr::write(dev_ext_ptr, new_ext);
-    }
+    dev_ext.ctx = Some(RwLock::new(aml_ctx));
+    dev_ext.i8042_hint = fadt_has_i8042_hint();
 
     DriverStatus::Success
 }
@@ -132,8 +122,7 @@ pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dev_ext: &mut DevExt =
-        unsafe { &mut *((&*device.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+    let dev_ext: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = unsafe {
         (*(Arc::as_ptr(device) as *const DeviceObject))
@@ -143,25 +132,31 @@ pub extern "win64" fn enumerate_bus(
     };
     let devices_to_report: Vec<AmlName> = {
         let mut v = Vec::new();
-        let _ = dev_ext.ctx.write().namespace.traverse(|name, level| {
-            if matches!(level.typ, LevelType::Device) {
-                let s = name.as_string();
-                let is_sb_child = s.starts_with("\\_SB_.") || s.starts_with("_SB_.");
-                if is_sb_child {
-                    let path_after_prefix =
-                        s.trim_start_matches("\\_SB_.").trim_start_matches("_SB_.");
-                    if !path_after_prefix.contains('.') {
-                        v.push(name.clone());
+        let _ = dev_ext
+            .ctx
+            .as_ref()
+            .unwrap()
+            .write()
+            .namespace
+            .traverse(|name, level| {
+                if matches!(level.typ, LevelType::Device) {
+                    let s = name.as_string();
+                    let is_sb_child = s.starts_with("\\_SB_.") || s.starts_with("_SB_.");
+                    if is_sb_child {
+                        let path_after_prefix =
+                            s.trim_start_matches("\\_SB_.").trim_start_matches("_SB_.");
+                        if !path_after_prefix.contains('.') {
+                            v.push(name.clone());
+                        }
                     }
                 }
-            }
-            Ok(true)
-        });
+                Ok(true)
+            });
         v
     };
 
     for dev_name in devices_to_report {
-        create_pnp_bus_from_acpi(&dev_ext.ctx, &parent_dev_node, dev_name);
+        create_pnp_bus_from_acpi(&dev_ext.ctx.as_ref().unwrap(), &parent_dev_node, dev_name);
     }
     if dev_ext.i8042_hint {
         create_synthetic_i8042_pdo(&parent_dev_node);
@@ -175,11 +170,7 @@ fn create_synthetic_i8042_pdo(parent: &Arc<kernel_api::DevNode>) {
         compatible: alloc::vec![],
     };
 
-    let child_init = DeviceInit {
-        dev_ext_size: 0,
-        pnp_vtable: Some(PnpVtable::new()),
-        io_vtable: IoVtable::new(),
-    };
+    let child_init = DeviceInit::new(IoVtable::new(), Some(PnpVtable::new()));
 
     let name = "\\Device\\ACPI_I8042".to_string();
     let instance = "ACPI\\I8042\\0".to_string();

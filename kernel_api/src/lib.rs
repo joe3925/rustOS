@@ -14,8 +14,10 @@ use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use core::alloc::{GlobalAlloc, Layout};
 use core::any::{type_name, Any, TypeId};
+use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
 use spin::{Mutex, RwLock};
@@ -67,11 +69,7 @@ pub struct DeviceObject {
 
 impl DeviceObject {
     pub fn new(mut init: DeviceInit) -> Arc<Self> {
-        let dev_ext = match (init.dev_ext_type, init.dev_ext_factory) {
-            (Some(ty), Some(f)) => DevExtBox::from_factory(f, ty),
-            _ => DevExtBox::none(),
-        };
-
+        let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
         Arc::new(Self {
             lower_device: None,
             upper_device: RwLock::new(None),
@@ -97,16 +95,15 @@ impl DeviceObject {
                 expected: type_name::<T>(),
             });
         }
-        let r = self.dev_ext.inner.downcast_ref::<T>().unwrap();
+        let p = NonNull::new(self.dev_ext.as_const_ptr::<T>() as *mut T).unwrap();
         Ok(DevExtRef {
-            inner: r,
+            ptr: p,
             _lt: PhantomData,
+            _nosend: PhantomData,
         })
     }
 
-    pub fn try_devext_mut<'a, T: 'static>(
-        &'a mut self,
-    ) -> Result<DevExtRefMut<'a, T>, DevExtError> {
+    pub fn try_devext_mut<'a, T: 'static>(&'a self) -> Result<DevExtRefMut<'a, T>, DevExtError> {
         if !self.dev_ext.present {
             return Err(DevExtError::NotPresent);
         }
@@ -115,21 +112,15 @@ impl DeviceObject {
                 expected: type_name::<T>(),
             });
         }
-        let r = self.dev_ext.inner.downcast_mut::<T>().unwrap();
+        let p = NonNull::new(self.dev_ext.as_mut_ptr::<T>()).unwrap();
         Ok(DevExtRefMut {
-            inner: r,
+            ptr: p,
             _lt: PhantomData,
+            _nosend: PhantomData,
         })
     }
-
-    // optional fast-fail helpers if you want them:
-    pub fn devext<'a, T: 'static>(&'a self) -> DevExtRef<'a, T> {
-        self.try_devext::<T>().ok().unwrap()
-    }
-    pub fn devext_mut<'a, T: 'static>(&'a mut self) -> DevExtRefMut<'a, T> {
-        self.try_devext_mut::<T>().ok().unwrap()
-    }
 }
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct DevNode {
@@ -144,63 +135,85 @@ pub struct DevNode {
     pub pdo: RwLock<Option<Arc<DeviceObject>>>,
     pub stack: RwLock<Option<DeviceStack>>,
 }
+#[derive(Debug)]
 pub enum DevExtError {
     NotPresent,
     TypeMismatch { expected: &'static str },
 }
-
+#[repr(C)]
 pub struct DevExtRef<'a, T: 'static> {
-    pub(crate) inner: &'a T,
-    pub(crate) _lt: PhantomData<&'a T>,
+    ptr: NonNull<T>,
+    _lt: PhantomData<&'a T>,
+    _nosend: PhantomData<*mut T>,
 }
 impl<'a, T: 'static> Deref for DevExtRef<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.inner
+        unsafe { self.ptr.as_ref() }
     }
 }
-
+#[repr(C)]
 pub struct DevExtRefMut<'a, T: 'static> {
-    pub(crate) inner: &'a mut T,
-    pub(crate) _lt: PhantomData<&'a mut T>,
+    ptr: NonNull<T>,
+    _lt: PhantomData<&'a mut T>,
+    _nosend: PhantomData<*mut T>,
 }
 impl<'a, T: 'static> Deref for DevExtRefMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        self.inner
+        unsafe { self.ptr.as_ref() }
     }
 }
 impl<'a, T: 'static> DerefMut for DevExtRefMut<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.inner
+        unsafe { self.ptr.as_mut() }
     }
 }
-
+#[repr(C)]
 #[derive(Default)]
 struct NoDevExt;
+#[repr(C)]
 #[derive(Debug)]
 struct DevExtBox {
+    ptr: UnsafeCell<*mut u8>,
     ty: TypeId,
-    inner: Box<dyn Any + Send + Sync>,
+    drop_fn: unsafe fn(*mut u8),
     present: bool,
 }
-
 impl DevExtBox {
     fn none() -> Self {
         Self {
+            ptr: UnsafeCell::new(core::ptr::null_mut()),
             ty: TypeId::of::<NoDevExt>(),
-            inner: Box::new(NoDevExt::default()),
+            drop_fn: |_| {},
             present: false,
         }
     }
-    fn from_factory(f: fn() -> Box<dyn Any + Send + Sync>, ty: TypeId) -> Self {
+    fn from_value<T: 'static>(v: T) -> Self {
+        let p = Box::into_raw(Box::new(v)) as *mut u8;
         Self {
-            ty,
-            inner: f(),
+            ptr: UnsafeCell::new(p),
+            ty: TypeId::of::<T>(),
+            drop_fn: |q| unsafe { drop(Box::from_raw(q as *mut T)) },
             present: true,
         }
     }
+    #[inline]
+    fn as_const_ptr<T>(&self) -> *const T {
+        unsafe { *self.ptr.get() as *const T }
+    }
+    #[inline]
+    fn as_mut_ptr<T>(&self) -> *mut T {
+        unsafe { *self.ptr.get() as *mut T }
+    }
 }
+impl Drop for DevExtBox {
+    fn drop(&mut self) {
+        unsafe { (self.drop_fn)(*self.ptr.get()) }
+    }
+}
+unsafe impl Send for DevExtBox {}
+unsafe impl Sync for DevExtBox {}
 #[repr(C)]
 pub struct DriverObject {
     _private: [u8; 0],
@@ -876,23 +889,35 @@ pub mod alloc_api {
     #[repr(C)]
     #[derive(Debug)]
     pub struct DeviceInit {
-        pub dev_ext_size: usize,
         pub io_vtable: IoVtable,
         pub pnp_vtable: Option<PnpVtable>,
-        pub(crate) dev_ext_factory: Option<fn() -> Box<dyn Any + Send + Sync>>,
         pub(crate) dev_ext_type: Option<TypeId>,
+        pub(crate) dev_ext_size: usize,
+        pub(crate) dev_ext_ready: Option<DevExtBox>,
     }
 
     impl DeviceInit {
-        pub fn set_dev_ext_default<T>(&mut self)
-        where
-            T: Default + 'static + Send + Sync,
-        {
+        pub fn new(io_vtable: IoVtable, pnp_vtable: Option<PnpVtable>) -> Self {
+            Self {
+                io_vtable,
+                pnp_vtable,
+                dev_ext_type: None,
+                dev_ext_size: 0,
+                dev_ext_ready: None,
+            }
+        }
+
+        pub fn set_dev_ext_from<T: 'static>(&mut self, value: T) {
             self.dev_ext_size = core::mem::size_of::<T>();
             self.dev_ext_type = Some(TypeId::of::<T>());
-            self.dev_ext_factory = Some(|| Box::new(T::default()));
+            self.dev_ext_ready = Some(DevExtBox::from_value(value));
+        }
+
+        pub fn set_dev_ext_default<T: Default + 'static>(&mut self) {
+            self.set_dev_ext_from::<T>(T::default());
         }
     }
+
     #[repr(C)]
     #[derive(Debug, Clone)]
     pub struct PnpRequest {
@@ -903,7 +928,7 @@ pub mod alloc_api {
         pub ids_out: Vec<String>,
         pub blob_out: Vec<u8>,
     }
-
+    #[repr(C)]
     #[derive(Debug, Clone)]
     pub struct KernelAcpiHandler;
 

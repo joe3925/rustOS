@@ -30,7 +30,7 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
 
     match minor {
         PnpMinorFunction::QueryId => {
-            let ext: &AcpiPdoExt = unsafe { &*((&*dev.dev_ext).as_ptr() as *const AcpiPdoExt) };
+            let ext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get dev ext");
             let ctx_lock = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
 
@@ -87,7 +87,9 @@ pub extern "win64" fn acpi_pdo_pnp_dispatch(dev: &Arc<DeviceObject>, req: Arc<Rw
         }
 
         PnpMinorFunction::QueryResources => {
-            let ext: &AcpiPdoExt = unsafe { &*((&*dev.dev_ext).as_ptr() as *const AcpiPdoExt) };
+            let ext: &AcpiPdoExt = &dev
+                .try_devext::<&AcpiPdoExt>()
+                .expect("ACPI enum failed AcpiPdoExt is not set ");
             let ctx_lock: &spin::RwLock<AmlContext> = unsafe { &*ext.ctx };
             let mut ctx = ctx_lock.write();
 

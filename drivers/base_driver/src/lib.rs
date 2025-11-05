@@ -31,7 +31,6 @@ pub extern "win64" fn bus_driver_device_add(
     driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
-    dev_init_ptr.dev_ext_size = 0;
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
     dev_init_ptr.pnp_vtable = Some(pnp_vtable);

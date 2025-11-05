@@ -2,18 +2,19 @@
 
 use alloc::{
     boxed::Box,
+    collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
-use core::mem::size_of;
+use core::{mem::size_of, sync::atomic::AtomicU64};
 use fatfs::FsOptions;
 use spin::RwLock;
 
 use kernel_api::{
-    DeviceObject, DeviceRelationType, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
-    IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo, PnpMinorFunction, QueryIdType,
-    Request, RequestType,
+    DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus, FsIdentify,
+    GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
+    PnpMinorFunction, QueryIdType, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
         ffi::{
@@ -28,12 +29,10 @@ use kernel_api::{
 use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
 use crate::{block_dev::BlockDev, fat32::Fat32}; // assumed to expose `mount(&Arc<DeviceObject>) -> FileSystem<BlockDev>`
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
-#[repr(C)]
-struct CtrlDevExt;
 
 #[inline]
-fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
+pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
+    dev.try_devext_mut().expect("Failed to get fat32 dev ext")
 }
 
 pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
@@ -112,25 +111,21 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
 
-                    let init = DeviceInit {
-                        dev_ext_size: size_of::<VolCtrlDevExt>(),
-                        io_vtable,
-                        pnp_vtable: None,
+                    // Build the dev-ext now
+                    let ext = VolCtrlDevExt {
+                        fs,
+                        next_id: AtomicU64::new(1),
+                        table: RwLock::new(BTreeMap::new()),
                     };
+
+                    let mut init = DeviceInit::new(io_vtable, None);
+                    init.set_dev_ext_from(ext);
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl = unsafe { pnp_create_control_device_with_init(vol_name, init) };
-                    println!("1");
-                    let vdx = ext_mut::<VolCtrlDevExt>(&vol_ctrl);
-                    println!("addr = {:p}", &vdx.fs as *const _);
-                    println!("fs addr = {:p}", &fs as *const _);
-                    vdx.fs = fs;
-                    println!("3");
+
                     id.mount_device = Some(vol_ctrl);
-                    println!("4");
                     id.can_mount = true;
-                    println!("5");
-                    println!("idk");
                     r.status = DriverStatus::Success;
                 }
                 Err(_) => {
@@ -164,13 +159,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         Synchronization::Sync,
         0,
     );
-
-    let init = DeviceInit {
-        dev_ext_size: core::mem::size_of::<CtrlDevExt>(),
-        io_vtable,
-        pnp_vtable: None,
-    };
-
+    let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();
     let _ctrl =
