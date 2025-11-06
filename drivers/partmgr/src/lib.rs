@@ -6,7 +6,7 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem, ptr};
-use kernel_api::{DiskInfo, PartitionInfo};
+use kernel_api::{DevExtRefMut, DiskInfo, PartitionInfo};
 use spin::RwLock;
 
 use kernel_api::{
@@ -49,7 +49,7 @@ pub extern "win64" fn partmgr_device_add(
     _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
 ) -> DriverStatus {
-    init.dev_ext_size = core::mem::size_of::<PartMgrExt>();
+    init.set_dev_ext_default::<PartMgrExt>();
 
     let mut pnp = PnpVtable::new();
     pnp.set(PnpMinorFunction::StartDevice, partmgr_start);
@@ -63,17 +63,19 @@ pub extern "win64" fn partmgr_device_add(
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct PartMgrExt {
     enumerated: AtomicBool,
     disk_info: Option<Vec<u8>>, // raw bytes of DiskInfo (size_of::<DiskInfo>())
 }
 
 #[inline]
-fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
+pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
+    dev.try_devext_mut().expect("Failed to get partmgr dev ext")
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct PartDevExt {
     start_lba: u64,
     end_lba: u64,
@@ -254,7 +256,7 @@ extern "win64" fn partmgr_start(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dx = ext_mut::<PartMgrExt>(dev);
+    let mut dx = ext_mut::<PartMgrExt>(dev);
     *dx = PartMgrExt {
         enumerated: AtomicBool::new(false),
         disk_info: None,
@@ -425,17 +427,15 @@ extern "win64" fn partmgr_pnp_query_devrels(
         io_vt.set(IoType::Read(partition_pdo_read), Synchronization::Sync, 0);
         io_vt.set(IoType::Write(partition_pdo_write), Synchronization::Sync, 0);
 
-        let mut child_init = DeviceInit {
-            dev_ext_size: core::mem::size_of::<PartDevExt>(),
-            io_vtable: io_vt,
-            pnp_vtable: None,
-        };
+        let mut child_init = DeviceInit::new(io_vt, None);
+
         let mut vt = PnpVtable::new();
         vt.set(
             PnpMinorFunction::QueryResources,
             partition_pdo_query_resources,
         );
         child_init.pnp_vtable = Some(vt);
+        child_init.set_dev_ext_default::<PartDevExt>();
 
         let name = alloc::format!("Partition{}", idx);
         let inst = alloc::format!("STOR\\PARTITION\\{}\\{:04}", disk_guid_s, idx);
@@ -455,7 +455,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
             )
         };
 
-        let pext = ext_mut::<PartDevExt>(&pdo);
+        let mut pext = ext_mut::<PartDevExt>(&pdo);
         pext.start_lba = e.first_lba;
         pext.end_lba = e.last_lba;
 

@@ -12,6 +12,7 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::DevExtRefMut;
 use kernel_api::PartitionInfo;
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
@@ -41,16 +42,18 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 #[repr(C)]
+#[derive(Default)]
 struct VolExt {
     part: Option<PartitionInfo>,
     enumerated: AtomicBool,
 }
 
 #[inline]
-fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
+pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
+    dev.try_devext_mut().expect("Failed to get partmgr dev ext")
 }
 #[repr(C)]
+#[derive(Default)]
 struct VolPdoExt {
     backing: Option<Arc<IoTarget>>,
     part: Option<PartitionInfo>,
@@ -94,7 +97,7 @@ pub extern "win64" fn vol_device_add(
         vol_enumerate_devices,
     );
 
-    dev_init.dev_ext_size = size_of::<VolExt>();
+    dev_init.set_dev_ext_default::<VolExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);
     DriverStatus::Success
 }
@@ -121,7 +124,7 @@ extern "win64" fn vol_prepare_hardware(
     unsafe { pnp_wait_for_request(&req_lock) };
 
     let mut g = req_lock.write();
-    let dx = ext_mut::<VolExt>(dev);
+    let mut dx = ext_mut::<VolExt>(dev);
 
     if g.status != DriverStatus::Success {
         return DriverStatus::Success;
@@ -209,12 +212,8 @@ pub extern "win64" fn vol_enumerate_devices(
 
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
-    let init = DeviceInit {
-        dev_ext_size: core::mem::size_of::<VolPdoExt>(),
-        io_vtable: io_table,
-        pnp_vtable: Some(pnp_vtable),
-    };
-
+    let mut init = DeviceInit::new(io_table, Some(pnp_vtable));
+    init.set_dev_ext_default::<VolPdoExt>();
     let (_dn, pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             &parent_dn,

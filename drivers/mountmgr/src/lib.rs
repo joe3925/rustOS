@@ -22,7 +22,7 @@ use core::{
 use spin::RwLock;
 
 use kernel_api::{
-    Data, DeviceObject, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
+    Data, DevExtRefMut, DeviceObject, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
     GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType,
     alloc_api::{
         DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
@@ -55,6 +55,7 @@ static VFS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOLUMES: RwLock<Vec<Arc<DeviceObject>>> = RwLock::new(Vec::new());
 const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
 #[repr(C)]
+#[derive(Default)]
 struct VolFdoExt {
     inst_path: String,
     public_link: String,
@@ -75,12 +76,10 @@ impl VolFdoExt {
     }
 }
 
-#[repr(C)]
-struct CtrlDevExt;
-
 #[inline]
-fn ext_mut<T>(dev: &Arc<DeviceObject>) -> &mut T {
-    unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const T as *mut T) }
+pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
+    dev.try_devext_mut()
+        .expect("Failed to get mountmgr dev ext")
 }
 
 static NEXT_VOL_ID: AtomicU32 = AtomicU32::new(1);
@@ -106,11 +105,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         0,
     );
 
-    let mut init = DeviceInit {
-        dev_ext_size: size_of::<CtrlDevExt>(),
-        pnp_vtable: None,
-        io_vtable,
-    };
+    let mut init = DeviceInit::new(io_vtable, None);
 
     let _ctrl = unsafe {
         pnp_create_control_device_and_link(
@@ -142,8 +137,8 @@ pub extern "win64" fn volclass_device_add(
         Synchronization::Sync,
         0,
     );
+    dev_init.set_dev_ext_default::<VolFdoExt>();
 
-    dev_init.dev_ext_size = size_of::<VolFdoExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);
 
     let _ = refresh_fs_registry_from_registry();
@@ -273,7 +268,7 @@ fn init_volume_dx(dev: &Arc<DeviceObject>) {
     let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
     let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
 
-    let dx = ext_mut::<VolFdoExt>(dev);
+    let mut dx = ext_mut::<VolFdoExt>(dev);
     *dx = VolFdoExt::blank();
     dx.inst_path = inst;
     dx.public_link = make_volume_link_name(vid);
@@ -384,11 +379,7 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
                 class.clone(),
                 &svc,
                 &function_fdo.clone(),
-                DeviceInit {
-                    dev_ext_size: 0,
-                    io_vtable: IoVtable::new(),
-                    pnp_vtable: None,
-                },
+                DeviceInit::new(IoVtable::new(), None),
             )
         };
 
@@ -403,7 +394,7 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
                 pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone())
             };
 
-            let dx = ext_mut::<VolFdoExt>(parent_fdo);
+            let mut dx = ext_mut::<VolFdoExt>(parent_fdo);
             dx.fs_link = primary_link;
             return true;
         }

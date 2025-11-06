@@ -460,10 +460,8 @@ pub extern "win64" fn on_query_resources_complete(req: &mut kernel_api::Request,
         println!("[PCI] no ECAM block found in parent resources");
     }
 
-    let ext_ptr = device.dev_ext.as_ptr() as *mut DevExt;
-    unsafe {
-        core::ptr::write(ext_ptr, DevExt { segments });
-    }
+    let ext_ptr: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get pci dev ext ");
+    ext_ptr.segments = segments;
 
     let status = unsafe {
         kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower(
