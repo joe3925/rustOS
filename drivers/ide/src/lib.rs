@@ -83,6 +83,7 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 1000;
 pub static LOCK: Mutex<u64> = Mutex::new(0);
+
 #[repr(C)]
 struct ChildExt {
     parent_dx: *mut DevExt,
@@ -102,15 +103,31 @@ pub extern "win64" fn ide_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
-    dev_init.dev_ext_size = core::mem::size_of::<DevExt>();
-
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::StartDevice, ide_pnp_start);
     vt.set(
         PnpMinorFunction::QueryDeviceRelations,
         ide_pnp_query_devrels,
     );
-    dev_init.pnp_vtable = Some(vt);
+
+    // Construct init with constructor and provide a zeroed DevExt to be filled on Start.
+    let init = DeviceInit::new(IoVtable::new(), Some(vt));
+    *dev_init = init;
+    dev_init.set_dev_ext_from(DevExt {
+        data_port: Port::new(0),
+        error_port: Port::new(0),
+        sector_count_port: Port::new(0),
+        lba_lo_port: Port::new(0),
+        lba_mid_port: Port::new(0),
+        lba_hi_port: Port::new(0),
+        drive_head_port: Port::new(0),
+        command_port: Port::new(0),
+        alternative_command_port: Port::new(0),
+        control_port: Port::new(0),
+        present: false,
+        enumerated: false,
+    });
+
     DriverStatus::Success
 }
 
@@ -118,8 +135,9 @@ extern "win64" fn ide_pnp_start(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let guard = LOCK.lock();
-    // sync QueryResources to parent/lower
+    let _guard = LOCK.lock();
+
+    // QueryResources to lower
     let mut child = Request::new(RequestType::Pnp, Box::new([]));
     child.pnp = Some(PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
@@ -138,13 +156,15 @@ extern "win64" fn ide_pnp_start(
             unsafe { pnp_complete_request(&req) };
             return DriverStatus::Success;
         }
+
         let bars = {
             let g = child.read();
             parse_ide_bars(&g.pnp.as_ref().unwrap().blob_out)
         };
 
-        let dx: &mut DevExt =
-            unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+        let mut dx = dev
+            .try_devext_mut::<DevExt>()
+            .expect("ide: FDO DevExt missing");
 
         let cb = bars.cmd as u16;
         let ctl = bars.ctl as u16;
@@ -166,8 +186,9 @@ extern "win64" fn ide_pnp_start(
         dx.present = true;
         dx.enumerated = false;
     } else {
-        let dx: &mut DevExt =
-            unsafe { &mut *((&*dev.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+        let mut dx = dev
+            .try_devext_mut::<DevExt>()
+            .expect("ide: FDO DevExt missing");
         dx.present = true;
         dx.enumerated = false;
     }
@@ -190,16 +211,17 @@ extern "win64" fn ide_pnp_query_devrels(
 }
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
-    let dx: &mut DevExt =
-        unsafe { &mut *((&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+    let mut dx = parent
+        .try_devext_mut::<DevExt>()
+        .expect("ide: FDO DevExt missing");
     if dx.enumerated || !dx.present {
         return;
     }
 
-    if ata_probe_drive(dx, 0xE0) {
+    if ata_probe_drive(&mut dx, 0xE0) {
         create_child_pdo(parent, 0, 0);
     }
-    if ata_probe_drive(dx, 0xF0) {
+    if ata_probe_drive(&mut dx, 0xF0) {
         create_child_pdo(parent, 0, 1);
     }
 
@@ -207,11 +229,12 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
 }
 
 fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
-    let dx: &mut DevExt =
-        unsafe { &mut *((&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt) };
+    let mut dx = parent
+        .try_devext_mut::<DevExt>()
+        .expect("ide: FDO DevExt missing");
 
     let dh = if drive == 0 { 0xE0 } else { 0xF0 };
-    let id_words_opt = ata_identify_words(dx, dh);
+    let id_words_opt = ata_identify_words(&mut dx, dh);
 
     let (hardware, compatible) = if let Some(words) = id_words_opt {
         let model = id_string(&words[27..=46]);
@@ -252,16 +275,29 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         0,
     );
 
-    let mut child_init = DeviceInit {
-        dev_ext_size: size_of::<ChildExt>(),
-        io_vtable,
-        pnp_vtable: None,
-    };
     let mut pvt = PnpVtable::new();
     pvt.set(PnpMinorFunction::QueryId, ide_pdo_query_id);
     pvt.set(PnpMinorFunction::QueryResources, ide_pdo_query_resources);
     pvt.set(PnpMinorFunction::StartDevice, ide_pdo_start);
-    child_init.pnp_vtable = Some(pvt);
+
+    let mut child_init = DeviceInit::new(io_vtable, Some(pvt));
+    child_init.set_dev_ext_from(ChildExt {
+        parent_dx: core::ptr::null_mut(),
+        dh,
+        present: true,
+        disk_info: if let Some(words) = id_words_opt {
+            disk_info_from_identify(&words)
+        } else {
+            DiskInfo {
+                logical_block_size: 512,
+                physical_block_size: 0,
+                total_logical_blocks: 0,
+                total_bytes_low: 0,
+                total_bytes_high: 0,
+            }
+        },
+        have_disk_info: id_words_opt.is_some(),
+    });
 
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
     let instance = alloc::format!("IDE\\DRV_{:02}", drive);
@@ -272,38 +308,27 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         )
     };
 
-    let cdx: &mut ChildExt =
-        unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *const ChildExt as *mut ChildExt) };
-    cdx.parent_dx = unsafe { (&*parent.dev_ext).as_ptr() as *const DevExt as *mut DevExt };
-    cdx.dh = dh;
-    cdx.present = true;
-
-    if let Some(words) = id_words_opt {
-        cdx.disk_info = disk_info_from_identify(&words);
-        cdx.have_disk_info = true;
-    } else {
-        cdx.disk_info = DiskInfo {
-            logical_block_size: 512,
-            physical_block_size: 0,
-            total_logical_blocks: 0,
-            total_bytes_low: 0,
-            total_bytes_high: 0,
-        };
-        cdx.have_disk_info = false;
-    }
+    // finish wiring parent pointer
+    let mut cdx = pdo
+        .try_devext_mut::<ChildExt>()
+        .expect("ide: PDO ChildExt missing");
+    cdx.parent_dx = &mut *(parent
+        .try_devext_mut::<DevExt>()
+        .expect("ide: FDO DevExt missing"));
 }
+
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
-    let guard = LOCK.lock();
-    // Validate child state
-    let cdx: &mut ChildExt =
-        unsafe { &mut *((&*pdo.dev_ext).as_ptr() as *const ChildExt as *mut ChildExt) };
+    let _guard = LOCK.lock();
+
+    let mut cdx = pdo
+        .try_devext_mut::<ChildExt>()
+        .expect("ide: PDO ChildExt missing");
     if !cdx.present || cdx.parent_dx.is_null() {
         req.write().status = DriverStatus::NoSuchDevice;
         return;
     }
     let dx: &mut DevExt = unsafe { &mut *cdx.parent_dx };
 
-    // Pull IOCTL code
     let code = {
         let mut w = req.write();
         match w.kind {
@@ -331,7 +356,6 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
         }
 
         IOCTL_BLOCK_RW => {
-            // Read header first
             let (hdr, need, off) = {
                 let w = req.read();
                 if w.data.len() < size_of::<BlockRwIn>() {
@@ -357,7 +381,6 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
                 (hdr, need, off)
             };
 
-            // Perform I/O and set status
             let mut w = req.write();
             let ok = match hdr.op {
                 BLOCK_RW_READ => ata_pio_read(
@@ -512,7 +535,7 @@ fn id_string(words: &[u16]) -> String {
 }
 
 fn ata_identify_words(dx: &mut DevExt, dh: u8) -> Option<[u16; 256]> {
-    let guard = LOCK.lock();
+    let _guard = LOCK.lock();
     unsafe {
         dx.drive_head_port.write(dh);
     }
@@ -626,6 +649,7 @@ fn ata_pio_write(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: 
     unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
     wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS)
 }
+
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {
     let lba48: u64 = ((words[103] as u64) << 48)
         | ((words[102] as u64) << 32)
@@ -644,6 +668,7 @@ fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {
         total_bytes_high: 0,
     }
 }
+
 fn io_wait_400ns(alt: &mut Port<u8>) {
     unsafe {
         let _ = alt.read();
@@ -692,6 +717,7 @@ fn wait_drq_set(st: &mut Port<u8>, timeout_ms: u64) -> bool {
     }
     false
 }
+
 extern "win64" fn ide_pdo_query_id(
     pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -725,11 +751,13 @@ extern "win64" fn ide_pdo_query_resources(
     pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let cdx: &ChildExt = unsafe { &*((&*pdo.dev_ext).as_ptr() as *const ChildExt) };
+    let cdx = pdo
+        .try_devext::<ChildExt>()
+        .expect("ide: PDO ChildExt missing");
 
     let mut w = req.write();
     if let Some(p) = w.pnp.as_mut() {
-        let di = &cdx.disk_info as *const DiskInfo as *const u8;
+        let di = (&cdx.disk_info as *const DiskInfo) as *const u8;
         let n = core::mem::size_of::<DiskInfo>();
         let bytes = unsafe { core::slice::from_raw_parts(di, n) };
         p.blob_out = bytes.to_vec();

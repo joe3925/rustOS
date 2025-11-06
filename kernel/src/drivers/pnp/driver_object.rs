@@ -400,26 +400,27 @@ impl Request {
 #[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {
-    dev_ext_size: usize,
     pub io_vtable: IoVtable,
     pub pnp_vtable: Option<PnpVtable>,
-    dev_ext_type: Option<core::any::TypeId>,
-    dev_ext_ready: Option<DevExtBox>,
+    pub(crate) dev_ext_type: Option<TypeId>,
+    pub(crate) dev_ext_size: usize,
+    pub(crate) dev_ext_ready: Option<DevExtBox>,
 }
+
 impl DeviceInit {
-    pub fn new() -> Self {
+    pub fn new(io_vtable: IoVtable, pnp_vtable: Option<PnpVtable>) -> Self {
         Self {
-            dev_ext_size: 0,
-            io_vtable: IoVtable::new(),
-            pnp_vtable: None,
+            io_vtable,
+            pnp_vtable,
             dev_ext_type: None,
+            dev_ext_size: 0,
             dev_ext_ready: None,
         }
     }
 
     pub fn set_dev_ext_from<T: 'static>(&mut self, value: T) {
         self.dev_ext_size = core::mem::size_of::<T>();
-        self.dev_ext_type = Some(core::any::TypeId::of::<T>());
+        self.dev_ext_type = Some(TypeId::of::<T>());
         self.dev_ext_ready = Some(DevExtBox::from_value(value));
     }
 

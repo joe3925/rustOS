@@ -4,13 +4,13 @@
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::{mem::size_of, panic::PanicInfo};
+use core::panic::PanicInfo;
 use kernel_api::{
-    alloc_api::{
-        ffi::pnp_create_child_devnode_and_pdo_with_init, DeviceIds, DeviceInit, IoVtable, PnpVtable,
-    },
     DevNode, DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction,
     QueryIdType, Request,
+    alloc_api::{
+        DeviceIds, DeviceInit, IoVtable, PnpVtable, ffi::pnp_create_child_devnode_and_pdo_with_init,
+    },
 };
 use spin::RwLock;
 
@@ -53,20 +53,25 @@ pub extern "win64" fn ps2_device_add(
     pnp.set(PnpMinorFunction::StartDevice, ps2_start);
     pnp.set(PnpMinorFunction::QueryDeviceRelations, ps2_query_devrels);
 
-    dev_init.dev_ext_size = size_of::<DevExt>();
     dev_init.pnp_vtable = Some(pnp);
+    dev_init.set_dev_ext_from(DevExt {
+        probed: false,
+        have_kbd: false,
+        have_mouse: false,
+    });
     DriverStatus::Success
 }
 
 extern "win64" fn ps2_start(dev: &Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
-    let ext: &mut DevExt = unsafe { &mut *(dev.dev_ext.as_ptr() as *mut DevExt) };
-    if !ext.probed {
-        let (have_kbd, have_mouse) = unsafe { probe_i8042() };
-        *ext = DevExt {
-            probed: true,
-            have_kbd,
-            have_mouse,
-        };
+    if let Ok(mut ext) = dev.try_devext_mut::<DevExt>() {
+        if !ext.probed {
+            let (have_kbd, have_mouse) = unsafe { probe_i8042() };
+            ext.probed = true;
+            ext.have_kbd = have_kbd;
+            ext.have_mouse = have_mouse;
+        }
+    } else {
+        return DriverStatus::NoSuchDevice;
     }
     DriverStatus::Success
 }
@@ -82,13 +87,21 @@ extern "win64" fn ps2_query_devrels(
         return DriverStatus::Pending;
     }
 
-    let devnode: Arc<DevNode> = unsafe {
-        (*(Arc::as_ptr(device) as *const DeviceObject))
-            .dev_node
-            .upgrade()
-            .expect("[i8042] PDO missing DevNode")
+    let devnode: Arc<DevNode> = match device.dev_node.upgrade() {
+        Some(dn) => dn,
+        None => {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
     };
-    let ext: &DevExt = unsafe { &*(device.dev_ext.as_ptr() as *const DevExt) };
+
+    let ext = match device.try_devext::<DevExt>() {
+        Ok(g) => g,
+        Err(_) => {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
+    };
 
     if ext.have_kbd {
         make_child_pdo(
@@ -142,13 +155,10 @@ fn make_child_pdo(
     vt.set(PnpMinorFunction::QueryId, ps2_child_query_id);
     vt.set(PnpMinorFunction::StartDevice, ps2_child_start);
 
-    let child_init = DeviceInit {
-        dev_ext_size: core::mem::size_of::<Ps2ChildExt>(),
-        pnp_vtable: Some(vt),
-        io_vtable: IoVtable::new(),
-    };
+    let mut child_init = DeviceInit::new(IoVtable::new(), Some(vt));
+    child_init.set_dev_ext_from(Ps2ChildExt { is_kbd });
 
-    let (_dn, pdo) = unsafe {
+    let (_dn, _pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             parent,
             name.into(),
@@ -158,16 +168,20 @@ fn make_child_pdo(
             child_init,
         )
     };
-
-    let ptr_ext = pdo.dev_ext.as_ptr() as *mut Ps2ChildExt;
-    unsafe { core::ptr::write(ptr_ext, Ps2ChildExt { is_kbd }) };
 }
 
 extern "win64" fn ps2_child_query_id(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let is_kbd = unsafe { (*(dev.dev_ext.as_ptr() as *const Ps2ChildExt)).is_kbd };
+    let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
+        Ok(ext) => ext.is_kbd,
+        Err(_) => {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
+    };
+
     let mut r = req.write();
     let p = r.pnp.as_mut().unwrap();
 
@@ -308,12 +322,10 @@ unsafe fn read_data() -> Option<u8> {
 }
 
 unsafe fn probe_i8042() -> (bool, bool) {
-    // Disable both ports (ignore failures)
     let _ = cmd(0xAD);
     let _ = cmd(0xA7);
     flush_ob(10000);
 
-    // Self-test
     if !cmd(0xAA) {
         return (false, false);
     }

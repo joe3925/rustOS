@@ -12,7 +12,7 @@ static ALLOCATOR: KernelAllocator = KernelAllocator;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
+    println!("Fat32: {}", info);
     loop {}
 }
 

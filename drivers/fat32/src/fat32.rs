@@ -28,7 +28,7 @@ pub struct FileEntry {
     first_cluster_low: u16,    // DIR_FstClusLO
     pub(crate) file_size: u32, // DIR_FileSize
 }
-
+// TODO: This panics sometimes in unsafe cell when writing to the file system
 impl FileEntry {
     /// Parses a 32-byte buffer into a `FileEntry`
     pub fn from_buffer(buffer: &[u8]) -> Self {

@@ -81,11 +81,6 @@ impl DeviceObject {
             in_queue: AtomicBool::new(false),
         })
     }
-
-    pub fn has_devext(&self) -> bool {
-        self.dev_ext.present
-    }
-
     pub fn try_devext<'a, T: 'static>(&'a self) -> Result<DevExtRef<'a, T>, DevExtError> {
         if !self.dev_ext.present {
             return Err(DevExtError::NotPresent);

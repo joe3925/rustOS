@@ -7,7 +7,8 @@ use crate::drivers::driver_install::{BootType, DriverError};
 use crate::drivers::pnp::device::{DevNode, DevNodeState, DeviceIds, DeviceStack, StackLayer};
 use crate::drivers::pnp::driver_object::{
     ClassAddCallback, ClassListener, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
-    DriverStatus, PnpMinorFunction, PnpRequest, QueryIdType, Request, RequestType, Synchronization,
+    DriverStatus, IoVtable, PnpMinorFunction, PnpRequest, QueryIdType, Request, RequestType,
+    Synchronization,
 };
 use crate::executable::program::{ModuleHandle, PROGRAM_MANAGER};
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
@@ -66,7 +67,7 @@ impl PnpManager {
                 hardware: vec![alloc::format!("ROOT\\{}", pkg.name)],
                 compatible: Vec::new(),
             };
-            let mut pdo_init = DeviceInit::new();
+            let mut pdo_init = DeviceInit::new(IoVtable::new(), None);
 
             let (devnode, _pdo) = self.create_child_devnode_and_pdo_with_init(
                 &root_node,
@@ -155,7 +156,7 @@ impl PnpManager {
         class: Option<String>,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
-        let pdo = DeviceObject::new(DeviceInit::new());
+        let pdo = DeviceObject::new(DeviceInit::new(IoVtable::new(), None));
         unsafe {
             let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
             p.dev_node = Arc::downgrade(&dev_node);
@@ -568,7 +569,7 @@ impl PnpManager {
             return None;
         }
         if let Some(cb) = drv.evt_device_add {
-            let mut dev_init = DeviceInit::new();
+            let mut dev_init = DeviceInit::new(IoVtable::new(), None);
             let st = cb(drv, &mut dev_init);
             if st == DriverStatus::Success {
                 let devobj = DeviceObject::new(dev_init);

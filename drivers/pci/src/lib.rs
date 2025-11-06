@@ -8,14 +8,10 @@ mod msvc_shims;
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use core::{
-    mem::{size_of, zeroed},
-    ptr,
-};
 
 use dev_ext::{
     DevExt, PciPdoExt, build_resources_blob, header_type, hwids_for, instance_path_for,
-    load_segments_from_parent, name_for, probe_function,
+    load_segments_from_parent, name_for, parse_ecam_segments_from_blob, probe_function,
 };
 
 use kernel_api::{
@@ -32,8 +28,6 @@ use kernel_api::{
     println,
 };
 use spin::RwLock;
-
-use crate::dev_ext::parse_ecam_segments_from_blob;
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -55,9 +49,6 @@ pub extern "win64" fn bus_driver_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
-    dev_init.dev_ext_size = size_of::<DevExt>();
-
-    // PnP vtable: split handlers per-minor
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::StartDevice, pci_bus_pnp_start);
     vt.set(
@@ -66,6 +57,10 @@ pub extern "win64" fn bus_driver_device_add(
     );
     dev_init.pnp_vtable = Some(vt);
 
+    dev_init.set_dev_ext_from(DevExt {
+        segments: Vec::new(),
+    });
+
     DriverStatus::Success
 }
 
@@ -73,6 +68,7 @@ extern "win64" fn pci_bus_pnp_start(
     device: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
+    // Ask parent for resources to discover ECAM segments
     let mut query = Request::new(RequestType::Pnp, Box::new([]));
     query.pnp = Some(kernel_api::alloc_api::PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
@@ -91,6 +87,7 @@ extern "win64" fn pci_bus_pnp_start(
             req.write().status = qst;
             return DriverStatus::Success;
         }
+
         let blob = {
             let g = child.read();
             g.pnp
@@ -99,15 +96,26 @@ extern "win64" fn pci_bus_pnp_start(
                 .unwrap_or_default()
         };
         let segs = parse_ecam_segments_from_blob(&blob);
+
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
         }
-        let ext_ptr = device.dev_ext.as_ptr() as *mut DevExt;
-        unsafe { core::ptr::write(ext_ptr, DevExt { segments: segs }) };
+
+        if let Ok(mut ext) = device.try_devext_mut::<DevExt>() {
+            ext.segments = segs;
+        } else {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
     } else {
-        let ext = load_segments_from_parent(device);
-        let ext_ptr = device.dev_ext.as_ptr() as *mut DevExt;
-        unsafe { core::ptr::write(ext_ptr, ext) };
+        // Fallback derive segments from parent using platform-specific probe
+        let ext_val = load_segments_from_parent(device);
+        if let Ok(mut ext) = device.try_devext_mut::<DevExt>() {
+            ext.segments = ext_val.segments;
+        } else {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
     }
 
     let down2 = unsafe { pnp_forward_request_to_next_lower(device, req.clone()) };
@@ -142,14 +150,21 @@ pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
     _req: &mut Request,
 ) -> DriverStatus {
-    let devnode = unsafe {
-        (*(Arc::as_ptr(device) as *const DeviceObject))
-            .dev_node
-            .upgrade()
-            .expect("[PCI] PDO missing DevNode")
+    let devnode = match device.dev_node.upgrade() {
+        Some(dn) => dn,
+        None => {
+            println!("[PCI] PDO missing DevNode");
+            return DriverStatus::NoSuchDevice;
+        }
     };
 
-    let ext: &DevExt = unsafe { &*(device.dev_ext.as_ptr() as *const DevExt) };
+    let ext = match device.try_devext::<DevExt>() {
+        Ok(g) => g,
+        Err(_) => {
+            println!("[PCI] missing DevExt");
+            return DriverStatus::NoSuchDevice;
+        }
+    };
 
     if ext.segments.is_empty() {
         println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
@@ -208,16 +223,13 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
         pci_pdo_query_devrels,
     );
 
-    let child_init: DeviceInit = DeviceInit {
-        dev_ext_size: core::mem::size_of::<PciPdoExt>(),
-        pnp_vtable: Some(vt),
-        io_vtable: IoVtable::new(),
-    };
+    let mut child_init = DeviceInit::new(IoVtable::new(), Some(vt));
+    child_init.set_dev_ext_from(*p);
 
     let name = name_for(p);
     let instance_path = instance_path_for(p);
 
-    let (_child_dn, child_pdo) = unsafe {
+    let (_child_dn, _child_pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             parent,
             name,
@@ -227,11 +239,6 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
             child_init,
         )
     };
-
-    let ptr_ext = child_pdo.dev_ext.as_ptr() as *mut PciPdoExt;
-    unsafe {
-        ptr::write(ptr_ext, *p);
-    }
 }
 
 extern "win64" fn pci_pdo_query_id(
@@ -240,22 +247,29 @@ extern "win64" fn pci_pdo_query_id(
 ) -> DriverStatus {
     use kernel_api::QueryIdType;
 
-    let ext: &PciPdoExt = unsafe { &*(dev.dev_ext.as_ptr() as *const PciPdoExt) };
+    let ext = match dev.try_devext::<PciPdoExt>() {
+        Ok(g) => g,
+        Err(_) => {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
+    };
+
     let mut r = req.write();
     let pnp = r.pnp.as_mut().unwrap();
     match pnp.id_type {
         QueryIdType::HardwareIds => {
-            let (hw, _cmp, _) = hwids_for(ext);
+            let (hw, _cmp, _) = hwids_for(&ext);
             pnp.ids_out.extend(hw);
             r.status = DriverStatus::Success;
         }
         QueryIdType::CompatibleIds => {
-            let (_hw, cmp, _) = hwids_for(ext);
+            let (_hw, cmp, _) = hwids_for(&ext);
             pnp.ids_out.extend(cmp);
             r.status = DriverStatus::Success;
         }
         QueryIdType::DeviceId => {
-            let (hw, _, _) = hwids_for(ext);
+            let (hw, _, _) = hwids_for(&ext);
             if let Some(primary) = hw.first() {
                 pnp.ids_out.push(primary.clone());
                 r.status = DriverStatus::Success;
@@ -264,7 +278,7 @@ extern "win64" fn pci_pdo_query_id(
             }
         }
         QueryIdType::InstanceId => {
-            pnp.ids_out.push(instance_path_for(ext));
+            pnp.ids_out.push(instance_path_for(&ext));
             r.status = DriverStatus::Success;
         }
     }
@@ -275,10 +289,17 @@ extern "win64" fn pci_pdo_query_resources(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let ext: &PciPdoExt = unsafe { &*(dev.dev_ext.as_ptr() as *const PciPdoExt) };
+    let ext = match dev.try_devext::<PciPdoExt>() {
+        Ok(g) => g,
+        Err(_) => {
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
+        }
+    };
+
     let mut r = req.write();
     let pnp = r.pnp.as_mut().unwrap();
-    pnp.blob_out = build_resources_blob(ext);
+    pnp.blob_out = build_resources_blob(&ext);
     r.status = DriverStatus::Success;
     DriverStatus::Success
 }
