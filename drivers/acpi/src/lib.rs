@@ -85,7 +85,7 @@ pub extern "win64" fn bus_driver_prepare_hardware(
     }
     let dev_ext: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get dev ext ACPI");
 
-    dev_ext.ctx = Some(RwLock::new(aml_ctx));
+    dev_ext.ctx = Some(Arc::new(RwLock::new(aml_ctx)));
     dev_ext.i8042_hint = fadt_has_i8042_hint();
 
     DriverStatus::Success
@@ -156,7 +156,7 @@ pub extern "win64" fn enumerate_bus(
     };
 
     for dev_name in devices_to_report {
-        create_pnp_bus_from_acpi(&dev_ext.ctx.as_ref().unwrap(), &parent_dev_node, dev_name);
+        create_pnp_bus_from_acpi(dev_ext.ctx.as_ref().unwrap(), &parent_dev_node, dev_name);
     }
     if dev_ext.i8042_hint {
         create_synthetic_i8042_pdo(&parent_dev_node);

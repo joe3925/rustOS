@@ -35,6 +35,17 @@ struct VfsHandle {
     pub inner_id: u64,
     pub is_dir: bool,
 }
+#[inline]
+fn normalize_rel(mut s: &str) -> String {
+    while s.starts_with('\\') || s.starts_with('/') {
+        s = &s[1..];
+    }
+    let mut t = s.replace('\\', "/");
+    while t.contains("//") {
+        t = t.replace("//", "/");
+    }
+    t
+}
 
 /// Resolves labels to mount symlinks and forwards FsOps to FS drivers.
 /// Keeps a VFS-handle -> FS-handle table.
@@ -206,8 +217,9 @@ impl Vfs {
 
         const VOL_PREFIX: &str = "\\GLOBAL\\Volumes\\";
         if user_path.starts_with(VOL_PREFIX) {
+            // \GLOBAL\Volumes\<mount>\<tail...>
             let mut parts = user_path.splitn(4, '\\');
-            let _ = parts.next();
+            let _ = parts.next(); // ""
             let g = parts.next().unwrap_or("");
             let v = parts.next().unwrap_or("");
             let rest = parts.next().unwrap_or("");
@@ -222,26 +234,14 @@ impl Vfs {
                 return Err(FileError::BadPath);
             }
             let symlink = alloc::format!("{}{}", VOL_PREFIX, mount);
-            let fs_path = if tail.is_empty() {
-                "\\".to_string()
-            } else {
-                alloc::format!("\\{}", tail)
-            };
+            let fs_path = normalize_rel(tail);
             return Ok((symlink, fs_path));
         }
 
         if let Some(colon_pos) = user_path.find(':') {
             let (label, tail0) = user_path.split_at(colon_pos + 1);
-            let mut fs_path = if tail0.len() > 1 {
-                let after_colon = &tail0[1..];
-                if after_colon.starts_with('\\') {
-                    after_colon.to_string()
-                } else {
-                    alloc::format!("\\{}", after_colon)
-                }
-            } else {
-                "\\".to_string()
-            };
+            let after_colon = if tail0.len() > 1 { &tail0[1..] } else { "" };
+            let fs_path = normalize_rel(after_colon);
 
             let symlink = match self.label_map.read().get(label) {
                 Some(s) => s.clone(),
@@ -250,10 +250,6 @@ impl Vfs {
                     alloc::format!("\\GLOBAL\\StorageDevices\\{}", base)
                 }
             };
-
-            if fs_path.is_empty() {
-                fs_path = "\\".to_string();
-            }
             return Ok((symlink, fs_path));
         }
 

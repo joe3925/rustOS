@@ -9,7 +9,7 @@ use alloc::{
 };
 use core::{mem::size_of, sync::atomic::AtomicU64};
 use fatfs::FsOptions;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use kernel_api::{
     DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus, FsIdentify,
@@ -26,8 +26,8 @@ use kernel_api::{
     bytes_to_box, println,
 };
 
+use crate::block_dev::BlockDev;
 use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
-use crate::{block_dev::BlockDev, fat32::Fat32}; // assumed to expose `mount(&Arc<DeviceObject>) -> FileSystem<BlockDev>`
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 #[inline]
@@ -50,7 +50,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
     match code {
         IOCTL_FS_IDENTIFY => {
-            println!("Identify");
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
                 r.status = DriverStatus::InvalidParameter;
@@ -113,7 +112,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     // Build the dev-ext now
                     let ext = VolCtrlDevExt {
-                        fs,
+                        fs: Mutex::new(fs),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
                     };
@@ -126,6 +125,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
+                    println!("Can mount");
                     r.status = DriverStatus::Success;
                 }
                 Err(_) => {

@@ -117,12 +117,16 @@ impl Scheduler {
         }
 
         if let Some(cur) = self.get_current_task(cpu_id) {
-            cur.write().update_from_context(state);
+            if let Some(mut guard) = cur.try_write() {
+                guard.update_from_context(state);
+            } else {
+                return;
+            }
         }
 
         if ((TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0) {
             self.reap_tasks(cpu_id);
-            self.balance();
+            //self.balance();
         }
         let next = self.schedule_next(cpu_id);
 

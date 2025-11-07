@@ -167,32 +167,35 @@ impl<'a, T: 'static> DerefMut for DevExtRefMut<'a, T> {
 #[repr(C)]
 #[derive(Default)]
 struct NoDevExt;
-#[repr(C)]
 #[derive(Debug)]
+#[repr(C)]
 struct DevExtBox {
-    ptr: UnsafeCell<*mut u8>,
-    ty: TypeId,
+    ptr: core::cell::UnsafeCell<*mut u8>,
+    ty: core::any::TypeId,
     drop_fn: unsafe fn(*mut u8),
     present: bool,
 }
+
 impl DevExtBox {
     fn none() -> Self {
         Self {
-            ptr: UnsafeCell::new(core::ptr::null_mut()),
-            ty: TypeId::of::<NoDevExt>(),
+            ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
+            ty: core::any::TypeId::of::<()>(),
             drop_fn: |_| {},
             present: false,
         }
     }
-    fn from_value<T: 'static>(v: T) -> Self {
-        let p = Box::into_raw(Box::new(v)) as *mut u8;
+
+    fn from_value<T: 'static + Send + Sync>(v: T) -> Self {
+        let p = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(v)) as *mut u8;
         Self {
-            ptr: UnsafeCell::new(p),
-            ty: TypeId::of::<T>(),
-            drop_fn: |q| unsafe { drop(Box::from_raw(q as *mut T)) },
+            ptr: core::cell::UnsafeCell::new(p),
+            ty: core::any::TypeId::of::<T>(),
+            drop_fn: |q| unsafe { drop(alloc::boxed::Box::from_raw(q as *mut T)) },
             present: true,
         }
     }
+
     #[inline]
     fn as_const_ptr<T>(&self) -> *const T {
         unsafe { *self.ptr.get() as *const T }
@@ -202,11 +205,13 @@ impl DevExtBox {
         unsafe { *self.ptr.get() as *mut T }
     }
 }
+
 impl Drop for DevExtBox {
     fn drop(&mut self) {
         unsafe { (self.drop_fn)(*self.ptr.get()) }
     }
 }
+
 unsafe impl Send for DevExtBox {}
 unsafe impl Sync for DevExtBox {}
 #[repr(C)]
@@ -886,7 +891,7 @@ pub mod alloc_api {
     pub struct DeviceInit {
         pub io_vtable: IoVtable,
         pub pnp_vtable: Option<PnpVtable>,
-        pub(crate) dev_ext_type: Option<TypeId>,
+        pub(crate) dev_ext_type: Option<core::any::TypeId>,
         pub(crate) dev_ext_size: usize,
         pub(crate) dev_ext_ready: Option<DevExtBox>,
     }
@@ -902,17 +907,16 @@ pub mod alloc_api {
             }
         }
 
-        pub fn set_dev_ext_from<T: 'static>(&mut self, value: T) {
+        pub fn set_dev_ext_from<T: 'static + Send + Sync>(&mut self, value: T) {
             self.dev_ext_size = core::mem::size_of::<T>();
-            self.dev_ext_type = Some(TypeId::of::<T>());
+            self.dev_ext_type = Some(core::any::TypeId::of::<T>());
             self.dev_ext_ready = Some(DevExtBox::from_value(value));
         }
 
-        pub fn set_dev_ext_default<T: Default + 'static>(&mut self) {
+        pub fn set_dev_ext_default<T: Default + 'static + Send + Sync>(&mut self) {
             self.set_dev_ext_from::<T>(T::default());
         }
     }
-
     #[repr(C)]
     #[derive(Debug, Clone)]
     pub struct PnpRequest {

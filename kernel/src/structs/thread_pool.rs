@@ -4,6 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
+use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
@@ -110,7 +111,9 @@ extern "C" fn worker(pool_ptr: usize) {
             } else {
                 g.sleepers.push(me.clone());
                 drop(g);
-                me.write().sleep();
+                without_interrupts(|| {
+                    me.write().sleep();
+                });
                 None
             }
         };

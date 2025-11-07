@@ -16,7 +16,6 @@ fn panic(info: &PanicInfo) -> ! {
     loop {}
 }
 
-mod fat32;
 mod msvc_shims;
 mod structs;
 

@@ -311,7 +311,7 @@ fn read_uid(ctx: &mut AmlContext, dev: &AmlName) -> Option<String> {
 }
 
 pub fn create_pnp_bus_from_acpi(
-    ctx_lock: &spin::RwLock<aml::AmlContext>,
+    ctx_lock: &Arc<spin::RwLock<aml::AmlContext>>,
     parent_dev_node: &Arc<DevNode>,
     dev_name: AmlName,
 ) -> bool {
@@ -362,7 +362,7 @@ pub fn create_pnp_bus_from_acpi(
     let mut init = DeviceInit::new(IoVtable::new(), Some(vt));
     let mut ext = AcpiPdoExt {
         acpi_path: dev_name.clone(),
-        ctx: ctx_lock,
+        ctx: ctx_lock.clone(),
         ecam: alloc::vec::Vec::new(),
     };
 
@@ -768,14 +768,7 @@ extern "win64" fn acpi_pdo_query_resources(
 ) -> kernel_api::DriverStatus {
     let pext: &mut AcpiPdoExt = &mut dev.try_devext_mut().expect("Failed to get devext");
 
-    let ctx_lock = match unsafe { pext.ctx.as_ref() } {
-        Some(r) => r,
-        None => {
-            let mut w = req.write();
-            w.status = kernel_api::DriverStatus::NoSuchDevice;
-            return kernel_api::DriverStatus::NoSuchDevice;
-        }
-    };
+    let ctx_lock = &pext.ctx;
 
     let mut guard = ctx_lock.write();
     let mut blob = build_query_resources_blob(&mut *guard, &pext.acpi_path).unwrap_or_default();
@@ -801,15 +794,7 @@ extern "win64" fn acpi_pdo_query_id(
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
 
-    let ctx_lock = match unsafe { pext.ctx.as_ref() } {
-        Some(r) => r,
-        None => {
-            let mut w = req.write();
-            w.status = kernel_api::DriverStatus::NoSuchDevice;
-            return kernel_api::DriverStatus::NoSuchDevice;
-        }
-    };
-
+    let ctx_lock = &pext.ctx;
     let mut guard = ctx_lock.write();
     let (hid_opt, mut cids) = read_ids(&mut *guard, &pext.acpi_path);
     drop(guard);

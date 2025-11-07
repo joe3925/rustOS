@@ -6,6 +6,7 @@ extern crate alloc;
 mod dev_ext;
 mod msvc_shims;
 
+use alloc::sync::Weak;
 use alloc::vec;
 use alloc::{
     boxed::Box,
@@ -13,10 +14,12 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::sync::atomic::{AtomicBool, AtomicU8};
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType};
-use spin::{Mutex, RwLock};
+use spin::Mutex;
+use spin::rwlock::RwLock;
 
 use dev_ext::DevExt;
 use kernel_api::{
@@ -85,12 +88,11 @@ const TIMEOUT_MS: u64 = 1000;
 pub static LOCK: Mutex<u64> = Mutex::new(0);
 
 #[repr(C)]
-struct ChildExt {
-    parent_dx: *mut DevExt,
-    dh: u8,
-    present: bool,
-    disk_info: DiskInfo,
-    have_disk_info: bool,
+pub struct ChildExt {
+    pub parent_device: Weak<DeviceObject>,
+    pub dh: AtomicU8,
+    pub present: AtomicBool,
+    pub disk_info: Option<Arc<DiskInfo>>,
 }
 
 #[unsafe(no_mangle)]
@@ -282,21 +284,20 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 
     let mut child_init = DeviceInit::new(io_vtable, Some(pvt));
     child_init.set_dev_ext_from(ChildExt {
-        parent_dx: core::ptr::null_mut(),
-        dh,
-        present: true,
+        parent_device: Arc::downgrade(parent),
+        dh: AtomicU8::new(dh),
+        present: AtomicBool::new(true),
         disk_info: if let Some(words) = id_words_opt {
-            disk_info_from_identify(&words)
+            Some(Arc::new(disk_info_from_identify(&words)))
         } else {
-            DiskInfo {
+            Some(Arc::new(DiskInfo {
                 logical_block_size: 512,
                 physical_block_size: 0,
                 total_logical_blocks: 0,
                 total_bytes_low: 0,
                 total_bytes_high: 0,
-            }
+            }))
         },
-        have_disk_info: id_words_opt.is_some(),
     });
 
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
@@ -312,9 +313,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     let mut cdx = pdo
         .try_devext_mut::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
-    cdx.parent_dx = &mut *(parent
-        .try_devext_mut::<DevExt>()
-        .expect("ide: FDO DevExt missing"));
 }
 
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
@@ -323,12 +321,15 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
     let mut cdx = pdo
         .try_devext_mut::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
-    if !cdx.present || cdx.parent_dx.is_null() {
+    if !cdx.present.load(core::sync::atomic::Ordering::Acquire) {
         req.write().status = DriverStatus::NoSuchDevice;
         return;
     }
-    let dx: &mut DevExt = unsafe { &mut *cdx.parent_dx };
+    let parent: Arc<DeviceObject> = cdx.parent_device.upgrade().expect("parent device gone");
 
+    let mut dx = parent
+        .try_devext_mut::<DevExt>()
+        .expect("No parent IDE dev ext");
     let code = {
         let mut w = req.write();
         match w.kind {
@@ -384,15 +385,15 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
             let mut w = req.write();
             let ok = match hdr.op {
                 BLOCK_RW_READ => ata_pio_read(
-                    dx,
-                    cdx.dh,
+                    &mut dx,
+                    cdx.dh.load(core::sync::atomic::Ordering::Acquire),
                     hdr.lba as u32,
                     hdr.blocks as u32,
                     &mut w.data[off..off + need],
                 ),
                 BLOCK_RW_WRITE => ata_pio_write(
-                    dx,
-                    cdx.dh,
+                    &mut dx,
+                    cdx.dh.load(core::sync::atomic::Ordering::Acquire),
                     hdr.lba as u32,
                     hdr.blocks as u32,
                     &w.data[off..off + need],
@@ -751,24 +752,34 @@ extern "win64" fn ide_pdo_query_resources(
     pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let cdx = pdo
-        .try_devext::<ChildExt>()
-        .expect("ide: PDO ChildExt missing");
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(x) => x,
+        Err(_) => {
+            let mut w = req.write();
+            w.status = DriverStatus::NoSuchDevice;
+            return DriverStatus::NoSuchDevice;
+        }
+    };
 
     let mut w = req.write();
-    if let Some(p) = w.pnp.as_mut() {
-        let di = (&cdx.disk_info as *const DiskInfo) as *const u8;
-        let n = core::mem::size_of::<DiskInfo>();
-        let bytes = unsafe { core::slice::from_raw_parts(di, n) };
-        p.blob_out = bytes.to_vec();
-        w.status = DriverStatus::Success;
-        return DriverStatus::Success;
-    }
+    let Some(p) = w.pnp.as_mut() else {
+        w.status = DriverStatus::InvalidParameter;
+        return DriverStatus::InvalidParameter;
+    };
 
-    w.status = DriverStatus::InvalidParameter;
-    DriverStatus::InvalidParameter
+    let Some(di) = cdx.disk_info.as_ref() else {
+        w.status = DriverStatus::DeviceNotReady;
+        return DriverStatus::Success; // request completed with DeviceNotReady
+    };
+
+    let di_ptr = di.as_ref() as *const DiskInfo as *const u8;
+    let n = core::mem::size_of::<DiskInfo>();
+    let bytes = unsafe { core::slice::from_raw_parts(di_ptr, n) };
+    p.blob_out = bytes.to_vec();
+
+    w.status = DriverStatus::Success;
+    DriverStatus::Success
 }
-
 extern "win64" fn ide_pdo_start(
     _pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
