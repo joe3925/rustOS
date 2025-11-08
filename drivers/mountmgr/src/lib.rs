@@ -612,7 +612,9 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
     });
     let probe_ptr = Box::into_raw(probe);
     send_fs_open_async(public_link, "SYSTEM/MOD", 0, probe_ptr);
+
     send_fs_open_async(public_link, "SYSTEM/TOML", 1, probe_ptr);
+
     send_fs_open_async(public_link, "SYSTEM/REGISTRY.BIN", 2, probe_ptr);
 }
 

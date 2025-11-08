@@ -8,6 +8,7 @@ use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::println;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::scheduling::task::Task;
 
@@ -41,45 +42,59 @@ impl ThreadPool {
     pub fn start(self: &Arc<Self>, n: usize) {
         for _ in 0..n {
             let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
-            t.write().context.rdi = Arc::as_ptr(self) as u64;
+            without_interrupts(|| {
+                t.write().context.rdi = Arc::as_ptr(self) as u64;
+            });
             SCHEDULER.add_task(t);
         }
     }
 
     pub fn submit(&self, f: JobFn, a: usize) {
-        let mut g = { self.inner.lock() };
-        g.q.push_back(Job { f, a });
-        if let Some(t) = g.sleepers.pop() {
-            drop(g);
-            t.write().wake();
+        let to_wake = {
+            let mut g = self.inner.lock();
+            g.q.push_back(Job { f, a });
+            g.sleepers.pop()
+        };
+        if let Some(t) = to_wake {
+            without_interrupts(|| {
+                t.write().wake();
+            });
         }
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
         let started = Arc::new(AtomicBool::new(false));
 
-        let mut g = { self.inner.lock() };
-        let sleeper = match g.sleepers.pop() {
-            Some(t) => t,
-            None => return false,
+        let sleeper = {
+            let mut g = self.inner.lock();
+            match g.sleepers.pop() {
+                Some(t) => {
+                    let payload = Box::new(TrampPayload {
+                        f,
+                        a,
+                        started: started.clone(),
+                    });
+                    g.q.push_front(Job {
+                        f: job_start_trampoline,
+                        a: Box::into_raw(payload) as usize,
+                    });
+                    t
+                }
+                None => return false,
+            }
         };
-
-        let payload = Box::new(TrampPayload {
-            f,
-            a,
-            started: started.clone(),
+        without_interrupts(|| {
+            sleeper.write().wake();
         });
 
-        g.q.push_front(Job {
-            f: job_start_trampoline,
-            a: Box::into_raw(payload) as usize,
-        });
-
-        sleeper.write().wake();
-        drop(g);
-
+        let mut spins = 0usize;
         while !started.load(Ordering::Acquire) {
             core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins > 1_000_000 {
+                println!("Timeout");
+                return false;
+            }
         }
         true
     }
@@ -94,9 +109,7 @@ struct TrampPayload {
 extern "win64" fn job_start_trampoline(p: usize) {
     let b: Box<TrampPayload> = unsafe { Box::from_raw(p as *mut TrampPayload) };
     b.started.store(true, Ordering::Release);
-    let f = b.f;
-    let a = b.a;
-    (f)(a);
+    (b.f)(b.a);
 }
 
 extern "C" fn worker(pool_ptr: usize) {
@@ -104,24 +117,35 @@ extern "C" fn worker(pool_ptr: usize) {
     let me = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
 
     loop {
-        let job = {
-            let mut g = { pool.inner.lock() };
-            if let Some(j) = g.q.pop_front() {
-                Some(j)
-            } else {
-                g.sleepers.push(me.clone());
-                drop(g);
-                without_interrupts(|| {
-                    me.write().sleep();
-                });
-                None
-            }
-        };
-
-        if let Some(j) = job {
+        // Fast path: try get a job.
+        if let Some(j) = {
+            let mut g = pool.inner.lock();
+            g.q.pop_front()
+        } {
             (j.f)(j.a);
             continue;
         }
+
+        without_interrupts(|| {
+            let should_sleep = {
+                let mut g = pool.inner.lock();
+
+                if let Some(j) = g.q.pop_front() {
+                    drop(g);
+
+                    (j.f)(j.a);
+                    false
+                } else {
+                    me.write().sleep();
+                    g.sleepers.push(me.clone());
+                    true
+                }
+            };
+
+            if should_sleep {
+                me.write().sleep();
+            }
+        });
 
         loop {
             if !me.read().is_sleeping {

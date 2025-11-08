@@ -153,20 +153,31 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
             let mut r = req.write();
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
 
+            // Pre-acquire everything in a fixed order
+            let mut tbl_opt = Some(vdx.table.write());
+            let mut fs_opt = Some(vdx.fs.lock());
+
             match op {
                 FsOp::Open => {
                     let params: FsOpenParams = unsafe {
                         if r.data.len() != size_of::<FsOpenParams>() {
                             r.status = DriverStatus::InvalidParameter;
-
                             return;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
-                    let is_dir = match is_dir(fs, &params.path) {
-                        Ok(b) => b,
+
+                    // use fs
+                    let (ok_dir, size_or_err) = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        match is_dir(&mut *fs, &params.path) {
+                            Ok(true) => (true, Ok(0)),
+                            Ok(false) => (false, file_len(&mut *fs, &params.path)),
+                            Err(e) => (false, Err(e)),
+                        }
+                    };
+
+                    match size_or_err {
                         Err(e) => {
                             let res = FsOpenResult {
                                 fs_file_id: 0,
@@ -176,37 +187,35 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             };
                             r.data = box_to_bytes(Box::new(res));
                             r.status = DriverStatus::Success;
-                            return;
                         }
-                    };
+                        Ok(size) => {
+                            let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
+                            let tbl = tbl_opt.as_mut().unwrap();
+                            tbl.insert(
+                                id,
+                                FileCtx {
+                                    path: params.path.clone(),
+                                    is_dir: ok_dir,
+                                    pos: 0,
+                                },
+                            );
 
-                    let size = if is_dir {
-                        0
-                    } else {
-                        file_len(fs, &params.path).unwrap_or(0)
-                    };
-
-                    let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
-                    vdx.table.write().insert(
-                        id,
-                        FileCtx {
-                            path: params.path.clone(),
-                            is_dir,
-                            pos: 0,
-                        },
-                    );
-
-                    let res = FsOpenResult {
-                        fs_file_id: id,
-                        is_dir,
-                        size,
-                        error: None,
-                    };
-                    r.data = box_to_bytes(Box::new(res));
-                    r.status = DriverStatus::Success;
+                            let res = FsOpenResult {
+                                fs_file_id: id,
+                                is_dir: ok_dir,
+                                size,
+                                error: None,
+                            };
+                            r.data = box_to_bytes(Box::new(res));
+                            r.status = DriverStatus::Success;
+                        }
+                    }
                 }
 
                 FsOp::Close => {
+                    // fs not needed here
+                    drop(fs_opt.take());
+
                     let params: FsCloseParams = unsafe {
                         if r.data.len() != size_of::<FsCloseParams>() {
                             r.status = DriverStatus::InvalidParameter;
@@ -215,7 +224,11 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let removed = vdx.table.write().remove(&params.fs_file_id).is_some();
+                    let removed = {
+                        let tbl = tbl_opt.as_mut().unwrap();
+                        tbl.remove(&params.fs_file_id).is_some()
+                    };
+
                     let res = FsCloseResult {
                         error: if removed {
                             None
@@ -236,17 +249,20 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let ctx = match vdx.table.read().get(&params.fs_file_id).cloned() {
-                        Some(c) => c,
-                        None => {
-                            r.data = box_to_bytes(Box::new(FsReadResult {
-                                data: Vec::new(),
-                                error: Some(FileError::NotFound),
-                            }));
-                            r.status = DriverStatus::Success;
-                            return;
-                        }
+                    // read ctx from table
+                    let ctx = {
+                        let tbl = tbl_opt.as_ref().unwrap();
+                        tbl.get(&params.fs_file_id).cloned()
                     };
+                    if ctx.is_none() {
+                        r.data = box_to_bytes(Box::new(FsReadResult {
+                            data: Vec::new(),
+                            error: Some(FileError::NotFound),
+                        }));
+                        r.status = DriverStatus::Success;
+                        return;
+                    }
+                    let ctx = ctx.unwrap();
                     if ctx.is_dir {
                         r.data = box_to_bytes(Box::new(FsReadResult {
                             data: Vec::new(),
@@ -256,22 +272,25 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         return;
                     }
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
+                    let data_or_err = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        read_slice(&mut *fs, &ctx.path, params.offset as u64, params.len)
+                    };
 
-                    let data = match read_slice(fs, &ctx.path, params.offset as u64, params.len) {
-                        Ok(v) => v,
+                    match data_or_err {
+                        Ok(v) => {
+                            r.data = box_to_bytes(Box::new(FsReadResult {
+                                data: v,
+                                error: None,
+                            }))
+                        }
                         Err(e) => {
                             r.data = box_to_bytes(Box::new(FsReadResult {
                                 data: Vec::new(),
                                 error: Some(map_fatfs_err(&e)),
-                            }));
-                            r.status = DriverStatus::Success;
-                            return;
+                            }))
                         }
-                    };
-
-                    r.data = box_to_bytes(Box::new(FsReadResult { data, error: None }));
+                    }
                     r.status = DriverStatus::Success;
                 }
 
@@ -284,17 +303,19 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let ctx = match vdx.table.read().get(&params.fs_file_id).cloned() {
-                        Some(c) => c,
-                        None => {
-                            r.data = box_to_bytes(Box::new(FsWriteResult {
-                                written: 0,
-                                error: Some(FileError::NotFound),
-                            }));
-                            r.status = DriverStatus::Success;
-                            return;
-                        }
+                    let ctx = {
+                        let tbl = tbl_opt.as_ref().unwrap();
+                        tbl.get(&params.fs_file_id).cloned()
                     };
+                    if ctx.is_none() {
+                        r.data = box_to_bytes(Box::new(FsWriteResult {
+                            written: 0,
+                            error: Some(FileError::NotFound),
+                        }));
+                        r.status = DriverStatus::Success;
+                        return;
+                    }
+                    let ctx = ctx.unwrap();
                     if ctx.is_dir {
                         r.data = box_to_bytes(Box::new(FsWriteResult {
                             written: 0,
@@ -304,21 +325,23 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         return;
                     }
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
+                    let write_res = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        write_slice(&mut *fs, &ctx.path, params.offset as u64, &params.data)
+                    };
 
-                    match write_slice(fs, &ctx.path, params.offset as u64, &params.data) {
+                    match write_res {
                         Ok(n) => {
                             r.data = box_to_bytes(Box::new(FsWriteResult {
                                 written: n,
                                 error: None,
-                            }));
+                            }))
                         }
                         Err(e) => {
                             r.data = box_to_bytes(Box::new(FsWriteResult {
                                 written: 0,
                                 error: Some(map_fatfs_err(&e)),
-                            }));
+                            }))
                         }
                     }
                     r.status = DriverStatus::Success;
@@ -333,32 +356,48 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let mut tbl = vdx.table.write();
-                    let Some(ctx) = tbl.get_mut(&params.fs_file_id) else {
+                    let snap = {
+                        let tbl = tbl_opt.as_ref().unwrap();
+                        tbl.get(&params.fs_file_id)
+                            .map(|c| (c.path.clone(), c.is_dir, c.pos))
+                    };
+                    if snap.is_none() {
                         r.data = box_to_bytes(Box::new(FsSeekResult {
                             pos: 0,
                             error: Some(FileError::NotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
-                    };
+                    }
+                    let (path, is_dir, cur_pos) = snap.unwrap();
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
-
-                    let size = if ctx.is_dir {
+                    let size = if is_dir {
                         0
                     } else {
-                        file_len(fs, &ctx.path).unwrap_or(0)
+                        let fs = fs_opt.as_mut().unwrap();
+                        file_len(&mut *fs, &path).unwrap_or(0)
                     };
 
-                    let newpos = match params.origin {
+                    let newpos_i = match params.origin {
                         FsSeekWhence::Set => params.offset as i128,
-                        FsSeekWhence::Cur => ctx.pos as i128 + params.offset as i128,
+                        FsSeekWhence::Cur => cur_pos as i128 + params.offset as i128,
                         FsSeekWhence::End => size as i128 + params.offset as i128,
                     };
-                    let clamped = if newpos < 0 { 0 } else { newpos as u64 };
-                    ctx.pos = clamped;
+                    let clamped = if newpos_i < 0 { 0 } else { newpos_i as u64 };
+
+                    {
+                        let tbl = tbl_opt.as_mut().unwrap();
+                        if let Some(c) = tbl.get_mut(&params.fs_file_id) {
+                            c.pos = clamped;
+                        } else {
+                            r.data = box_to_bytes(Box::new(FsSeekResult {
+                                pos: 0,
+                                error: Some(FileError::NotFound),
+                            }));
+                            r.status = DriverStatus::Success;
+                            return;
+                        }
+                    }
 
                     r.data = box_to_bytes(Box::new(FsSeekResult {
                         pos: clamped,
@@ -368,6 +407,11 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
 
                 FsOp::Flush => {
+                    // drop locks not needed
+                    drop(fs_opt.take());
+                    // table not used either
+                    drop(tbl_opt.take());
+
                     let _params: FsFlushParams = unsafe {
                         if r.data.len() != size_of::<FsFlushParams>() {
                             r.status = DriverStatus::InvalidParameter;
@@ -380,6 +424,9 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
 
                 FsOp::Create => {
+                    // table not needed
+                    drop(tbl_opt.take());
+
                     let params: FsCreateParams = unsafe {
                         if r.data.len() != size_of::<FsCreateParams>() {
                             r.status = DriverStatus::InvalidParameter;
@@ -388,12 +435,12 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
-
-                    let err = match create_entry(fs, &params.path, params.dir) {
-                        Ok(()) => None,
-                        Err(e) => Some(map_fatfs_err(&e)),
+                    let err = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        match create_entry(&mut *fs, &params.path, params.dir) {
+                            Ok(()) => None,
+                            Err(e) => Some(map_fatfs_err(&e)),
+                        }
                     };
 
                     r.data = box_to_bytes(Box::new(FsCreateResult { error: err }));
@@ -401,6 +448,9 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
 
                 FsOp::Rename => {
+                    // table not needed
+                    drop(tbl_opt.take());
+
                     let params: FsRenameParams = unsafe {
                         if r.data.len() != size_of::<FsRenameParams>() {
                             r.status = DriverStatus::InvalidParameter;
@@ -409,18 +459,22 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
-
-                    let err = match rename_entry(fs, &params.src, &params.dst) {
-                        Ok(()) => None,
-                        Err(e) => Some(map_fatfs_err(&e)),
+                    let err = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        match rename_entry(&mut *fs, &params.src, &params.dst) {
+                            Ok(()) => None,
+                            Err(e) => Some(map_fatfs_err(&e)),
+                        }
                     };
+
                     r.data = box_to_bytes(Box::new(FsRenameResult { error: err }));
                     r.status = DriverStatus::Success;
                 }
 
                 FsOp::ReadDir => {
+                    // table not needed
+                    drop(tbl_opt.take());
+
                     let params: FsListDirParams = unsafe {
                         if r.data.len() != size_of::<FsListDirParams>() {
                             r.status = DriverStatus::InvalidParameter;
@@ -429,18 +483,20 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
+                    let names_or_err = {
+                        let fs = fs_opt.as_mut().unwrap();
+                        list_names(&mut *fs, &params.path)
+                    };
 
-                    match list_names(fs, &params.path) {
+                    match names_or_err {
                         Ok(names) => {
-                            r.data = box_to_bytes(Box::new(FsListDirResult { names, error: None }));
+                            r.data = box_to_bytes(Box::new(FsListDirResult { names, error: None }))
                         }
                         Err(e) => {
                             r.data = box_to_bytes(Box::new(FsListDirResult {
                                 names: Vec::new(),
                                 error: Some(map_fatfs_err(&e)),
-                            }));
+                            }))
                         }
                     }
                     r.status = DriverStatus::Success;
@@ -455,28 +511,28 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let ctx = match vdx.table.read().get(&params.fs_file_id).cloned() {
-                        Some(c) => c,
-                        None => {
-                            r.data = box_to_bytes(Box::new(FsGetInfoResult {
-                                size: 0,
-                                is_dir: false,
-                                attrs: 0,
-                                error: Some(FileError::NotFound),
-                            }));
-                            r.status = DriverStatus::Success;
-                            return;
-                        }
+                    let ctx = {
+                        let tbl = tbl_opt.as_ref().unwrap();
+                        tbl.get(&params.fs_file_id).cloned()
                     };
-
-                    let mut guard = vdx.fs.lock();
-                    let fs = &mut *guard;
+                    if ctx.is_none() {
+                        r.data = box_to_bytes(Box::new(FsGetInfoResult {
+                            size: 0,
+                            is_dir: false,
+                            attrs: 0,
+                            error: Some(FileError::NotFound),
+                        }));
+                        r.status = DriverStatus::Success;
+                        return;
+                    }
+                    let ctx = ctx.unwrap();
 
                     let (size, attrs) = if ctx.is_dir {
                         (0u64, u8::from(kernel_api::FileAttribute::Directory))
                     } else {
+                        let fs = fs_opt.as_mut().unwrap();
                         (
-                            file_len(fs, &ctx.path).unwrap_or(0),
+                            file_len(&mut *fs, &ctx.path).unwrap_or(0),
                             u8::from(kernel_api::FileAttribute::Archive),
                         )
                     };
@@ -491,9 +547,14 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
 
                 FsOp::SetInfo => {
+                    // nothing uses fs/table; drop both
+                    drop(fs_opt.take());
+                    drop(tbl_opt.take());
                     r.status = DriverStatus::NotImplemented;
                 }
                 FsOp::Delete => {
+                    drop(fs_opt.take());
+                    drop(tbl_opt.take());
                     r.status = DriverStatus::NotImplemented;
                 }
             }
@@ -507,6 +568,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
         }
     }
 }
+
 pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String>, FileError> {
     let params = FsListDirParams {
         path: path.to_string(),
