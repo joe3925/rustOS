@@ -19,6 +19,7 @@ use core::any::{type_name, Any, TypeId};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{ControlFlow, Deref, DerefMut, FromResidual, Try};
+use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
@@ -124,6 +125,7 @@ pub struct DevNode {
     pub stack: RwLock<Option<DeviceStack>>,
 }
 #[derive(Debug)]
+#[repr(u32)]
 pub enum DevExtError {
     NotPresent,
     TypeMismatch { expected: &'static str },
@@ -160,53 +162,51 @@ impl<'a, T: 'static> DerefMut for DevExtRefMut<'a, T> {
 #[repr(C)]
 #[derive(Default)]
 struct NoDevExt;
-#[derive(Debug)]
+
 #[repr(C)]
+#[derive(Debug)]
 struct DevExtBox {
-    ptr: core::cell::UnsafeCell<*mut u8>,
-    ty: core::any::TypeId,
-    drop_fn: unsafe fn(*mut u8),
+    inner: Once<Box<dyn Any + Send + Sync>>,
+    ty: TypeId,
     present: bool,
 }
 
 impl DevExtBox {
+    #[inline]
     fn none() -> Self {
         Self {
-            ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
-            ty: core::any::TypeId::of::<()>(),
-            drop_fn: |_| {},
+            inner: Once::new(),
+            ty: TypeId::of::<()>(),
             present: false,
         }
     }
 
+    #[inline]
     fn from_value<T: 'static + Send + Sync>(v: T) -> Self {
-        let p = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(v)) as *mut u8;
-        Self {
-            ptr: core::cell::UnsafeCell::new(p),
-            ty: core::any::TypeId::of::<T>(),
-            drop_fn: |q| unsafe { drop(alloc::boxed::Box::from_raw(q as *mut T)) },
+        let mut b = Self {
+            inner: Once::new(),
+            ty: TypeId::of::<T>(),
             present: true,
+        };
+        b.inner
+            .call_once(|| Box::new(v) as Box<dyn Any + Send + Sync>);
+        b
+    }
+
+    #[inline]
+    fn as_const_ptr<T: 'static>(&self) -> *const T {
+        match self.inner.get() {
+            Some(b) => {
+                // &Box<dyn Any> -> &dyn Any -> &T (if types match)
+                let a: &dyn Any = &**b;
+                a.downcast_ref::<T>()
+                    .map(|r| r as *const T)
+                    .unwrap_or(ptr::null())
+            }
+            None => ptr::null(),
         }
     }
-
-    #[inline]
-    fn as_const_ptr<T>(&self) -> *const T {
-        unsafe { *self.ptr.get() as *const T }
-    }
-    #[inline]
-    fn as_mut_ptr<T>(&self) -> *mut T {
-        unsafe { *self.ptr.get() as *mut T }
-    }
 }
-
-impl Drop for DevExtBox {
-    fn drop(&mut self) {
-        unsafe { (self.drop_fn)(*self.ptr.get()) }
-    }
-}
-
-unsafe impl Send for DevExtBox {}
-unsafe impl Sync for DevExtBox {}
 #[repr(C)]
 pub struct DriverObject {
     _private: [u8; 0],
@@ -693,7 +693,7 @@ pub enum FileStatus {
     BadPath,
     AccessDenied,
     NoSpace,
-    DriverError(DriverStatus),
+    //DriverError(DriverStatus),
 }
 impl FileStatus {
     pub fn to_str(&self) -> String {
@@ -715,10 +715,9 @@ impl FileStatus {
             }
             FileStatus::NoSpace => {
                 "Insufficient space on drive to write the requested data".to_string()
-            }
-            FileStatus::DriverError(e) => {
-                format!("The file access failed with a driver error of {}", e)
-            }
+            } // FileStatus::DriverError(e) => {
+              //     format!("The file access failed with a driver error of {}", e)
+              // }
         }
     }
 }
@@ -739,6 +738,8 @@ pub enum OpenFlags {
     Open,
 }
 #[derive(Debug, Clone)]
+#[repr(u32)]
+
 pub enum Data {
     U32(u32),
     U64(u64),
@@ -749,6 +750,8 @@ pub enum Data {
 }
 
 #[derive(Debug)]
+#[repr(u32)]
+
 pub enum RegError {
     File(FileStatus),
     KeyAlreadyExists,

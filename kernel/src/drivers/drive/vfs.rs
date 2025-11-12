@@ -379,7 +379,7 @@ impl Vfs {
                         fs_file_id: 0,
                         is_dir: false,
                         size: 0,
-                        error: Some(FileStatus::DriverError(st)),
+                        error: Some(FileStatus::UnknownFail),
                     },
                     st,
                 ),
@@ -401,7 +401,7 @@ impl Vfs {
                                 fs_file_id: 0,
                                 is_dir: false,
                                 size: 0,
-                                error: Some(FileStatus::DriverError(st)),
+                                error: Some(FileStatus::UnknownFail),
                             },
                             st,
                         )
@@ -481,7 +481,7 @@ impl Vfs {
                                     fs_file_id: 0,
                                     is_dir: false,
                                     size: 0,
-                                    error: Some(FileStatus::DriverError(st)),
+                                    error: Some(FileStatus::UnknownFail),
                                 },
                                 st,
                             )
@@ -575,7 +575,7 @@ impl Vfs {
             }
             Err(st) => (
                 FsCloseResult {
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -602,7 +602,7 @@ impl Vfs {
             Err(st) => (
                 FsReadResult {
                     data: Vec::new(),
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -625,7 +625,7 @@ impl Vfs {
             Err(st) => (
                 FsWriteResult {
                     written: 0,
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -648,7 +648,7 @@ impl Vfs {
             Err(st) => (
                 FsSeekResult {
                     pos: 0,
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -669,7 +669,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsFlushResult {
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -697,7 +697,7 @@ impl Vfs {
                     size: 0,
                     is_dir: false,
                     attrs: 0,
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -714,7 +714,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsCreateResult {
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -744,7 +744,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsRenameResult {
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),
@@ -770,7 +770,7 @@ impl Vfs {
             Err(st) => (
                 FsListDirResult {
                     names: Vec::new(),
-                    error: Some(FileStatus::DriverError(st)),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 st,
             ),

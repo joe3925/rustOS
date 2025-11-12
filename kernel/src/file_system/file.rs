@@ -55,6 +55,7 @@ impl TryFrom<u8> for FileAttribute {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum OpenFlags {
     ReadOnly,
     WriteOnly,
@@ -79,7 +80,7 @@ pub enum FileStatus {
     BadPath,
     AccessDenied,
     NoSpace,
-    DriverError(DriverStatus),
+    // DriverError(DriverStatus),
 }
 impl FileStatus {
     pub fn to_str(&self) -> String {
@@ -101,10 +102,9 @@ impl FileStatus {
             }
             FileStatus::NoSpace => {
                 "Insufficient space on drive to write the requested data".to_string()
-            }
-            FileStatus::DriverError(e) => {
-                format!("The file access failed with a driver error of {}", e)
-            }
+            } // FileStatus::DriverError(e) => {
+              //     format!("The file access failed with a driver error of {}", e)
+              // }
         }
     }
 }

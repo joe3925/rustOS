@@ -115,7 +115,6 @@ extern "win64" fn pci_bus_pnp_start(
         // Fallback derive segments from parent using platform-specific probe
         let segs = load_segments_from_parent(device);
         if let Ok(ext) = device.try_devext::<DevExt>() {
-            println!("segs set");
             if !segs.is_empty() {
                 ext.segments.call_once(|| segs);
             }

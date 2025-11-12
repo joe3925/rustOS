@@ -28,6 +28,7 @@ const CLASS_LIST: &[(&str, &str)] = &[
 
 /* ---------- data layer -------------- */
 #[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
+#[repr(u32)]
 pub enum Data {
     U32(u32),
     U64(u64),
@@ -37,6 +38,7 @@ pub enum Data {
     Str(String),
 }
 #[derive(Debug)]
+#[repr(u32)]
 pub enum RegError {
     File(crate::file_system::file::FileStatus),
     KeyAlreadyExists,

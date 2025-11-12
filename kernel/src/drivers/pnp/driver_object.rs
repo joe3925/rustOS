@@ -10,6 +10,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::ptr;
 use core::{
     any::{type_name, Any, TypeId},
     cell::UnsafeCell,
@@ -433,13 +434,13 @@ impl DeviceInit {
         }
     }
 
-    pub fn set_dev_ext_from<T: 'static>(&mut self, value: T) {
+    pub fn set_dev_ext_from<T: 'static + Send + Sync>(&mut self, value: T) {
         self.dev_ext_size = core::mem::size_of::<T>();
         self.dev_ext_type = Some(TypeId::of::<T>());
         self.dev_ext_ready = Some(DevExtBox::from_value(value));
     }
 
-    pub fn set_dev_ext_default<T: Default + 'static>(&mut self) {
+    pub fn set_dev_ext_default<T: Default + 'static + Send + Sync>(&mut self) {
         self.set_dev_ext_from::<T>(T::default());
     }
 }
@@ -500,7 +501,7 @@ impl DriverConfig {
         self
     }
 }
-
+#[repr(u32)]
 pub enum DevExtError {
     NotPresent,
     TypeMismatch { expected: &'static str },
@@ -535,47 +536,50 @@ impl<'a, T: 'static> core::ops::DerefMut for DevExtRefMut<'a, T> {
     }
 }
 
+#[repr(C)]
 #[derive(Default)]
 struct NoDevExt;
+
 #[repr(C)]
 #[derive(Debug)]
 struct DevExtBox {
-    ptr: UnsafeCell<*mut u8>,
+    inner: Once<Box<dyn Any + Send + Sync>>,
     ty: TypeId,
-    drop_fn: unsafe fn(*mut u8),
     present: bool,
 }
+
 impl DevExtBox {
+    #[inline]
     fn none() -> Self {
         Self {
-            ptr: UnsafeCell::new(core::ptr::null_mut()),
-            ty: TypeId::of::<NoDevExt>(),
-            drop_fn: |_| {},
+            inner: Once::new(),
+            ty: TypeId::of::<()>(),
             present: false,
         }
     }
-    fn from_value<T: 'static>(v: T) -> Self {
-        let p = Box::into_raw(Box::new(v)) as *mut u8;
-        Self {
-            ptr: UnsafeCell::new(p),
+
+    #[inline]
+    fn from_value<T: 'static + Send + Sync>(v: T) -> Self {
+        let mut b = Self {
+            inner: Once::new(),
             ty: TypeId::of::<T>(),
-            drop_fn: |q| unsafe { drop(Box::from_raw(q as *mut T)) },
             present: true,
+        };
+        b.inner
+            .call_once(|| Box::new(v) as Box<dyn Any + Send + Sync>);
+        b
+    }
+
+    #[inline]
+    fn as_const_ptr<T: 'static>(&self) -> *const T {
+        match self.inner.get() {
+            Some(b) => {
+                let a: &dyn Any = &**b;
+                a.downcast_ref::<T>()
+                    .map(|r| r as *const T)
+                    .unwrap_or(ptr::null())
+            }
+            None => ptr::null(),
         }
     }
-    #[inline]
-    fn as_const_ptr<T>(&self) -> *const T {
-        unsafe { *self.ptr.get() as *const T }
-    }
-    #[inline]
-    fn as_mut_ptr<T>(&self) -> *mut T {
-        unsafe { *self.ptr.get() as *mut T }
-    }
 }
-impl Drop for DevExtBox {
-    fn drop(&mut self) {
-        unsafe { (self.drop_fn)(*self.ptr.get()) }
-    }
-}
-unsafe impl Send for DevExtBox {}
-unsafe impl Sync for DevExtBox {}

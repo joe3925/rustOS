@@ -66,8 +66,8 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
 }
 #[unsafe(no_mangle)]
 
-pub extern "win64" fn print(str: &[u8]) {
-    CONSOLE.lock().print(str);
+pub extern "win64" fn print(str: &str) {
+    CONSOLE.lock().print(str.as_bytes());
 }
 #[unsafe(no_mangle)]
 
