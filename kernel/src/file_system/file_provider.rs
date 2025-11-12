@@ -6,12 +6,12 @@ use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
 use crate::drivers::pnp::driver_object::{DriverStatus, Request};
-use crate::file_system::file::OpenFlags;
+use crate::file_system::file::{FileStatus, OpenFlags};
 use crate::file_system::file_structs::{
-    FileError, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
-    FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult,
-    FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
-    FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
+    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
+    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
+    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
+    FsSeekWhence, FsWriteParams, FsWriteResult,
 };
 
 pub trait FileProvider: Send + Sync {
@@ -33,19 +33,19 @@ pub trait FileProvider: Send + Sync {
         &self,
         path: &str,
         flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<Request>>, FileError>;
+    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
     fn read_at_async(
         &self,
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<Request>>, FileError>;
+    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
     fn write_at_async(
         &self,
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<Request>>, FileError>;
+    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
 }
 
 static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);
@@ -59,21 +59,4 @@ pub(crate) fn provider() -> &'static dyn FileProvider {
     let guard = CURRENT_PROVIDER.read();
     let p = guard.as_ref().expect("FileProvider not installed");
     unsafe { &*(&**p as *const dyn FileProvider) }
-}
-
-pub fn map_file_error(err: FileError) -> super::file::FileStatus {
-    use super::file::FileStatus;
-    match err {
-        FileError::AlreadyExists => FileStatus::FileAlreadyExist,
-        FileError::NotFound => FileStatus::PathNotFound,
-        FileError::BadPath => FileStatus::BadPath,
-        FileError::Unsupported => FileStatus::UnknownFail,
-        FileError::Corrupt => FileStatus::CorruptFat,
-        FileError::Unknown => FileStatus::UnknownFail,
-        FileError::NotADirectory => FileStatus::PathNotFound,
-        FileError::IsDirectory => FileStatus::BadPath,
-        FileError::AccessDenied => FileStatus::UnknownFail,
-        FileError::NoSpace => todo!(),
-        FileError::IoError => todo!(),
-    }
 }

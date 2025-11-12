@@ -12,6 +12,7 @@ use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::static_handlers::*;
+use crate::util::panic_common;
 use crate::util::random_number;
 use crate::vec;
 use alloc::string::String;
@@ -24,6 +25,7 @@ export! {
     create_kernel_task,
     kill_kernel_task_by_id,
     switch_to_vfs,
+    panic_common,
 
     get_rsdp,
     get_acpi_tables,

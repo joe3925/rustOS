@@ -6,7 +6,7 @@ use crate::boot_packages;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
     calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
-    wait_millis_idle, wait_using_pit_50ms, ApicImpl,
+    wait_millis_idle, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -40,12 +40,14 @@ use alloc::{vec, vec::Vec};
 use bootloader_api::BootInfo;
 use core::arch::asm;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
+use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
 
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
@@ -58,7 +60,8 @@ pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 156_800;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
-
+static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -144,6 +147,60 @@ pub fn kernel_main() {
         0,
     );
     SCHEDULER.add_task(task);
+}
+#[inline(always)]
+fn halt_loop() -> ! {
+    unsafe {
+        loop {
+            asm!("hlt;", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+#[no_mangle]
+pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+    if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
+        halt_loop()
+    }
+
+    x86_64::instructions::interrupts::disable();
+    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) }
+    crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
+
+    let me = get_current_logical_id() as u32;
+    let i_am_owner = match PANIC_OWNER.try_lock() {
+        Some(mut g) => {
+            if g.is_none() {
+                *g = Some(me);
+                true
+            } else {
+                g.as_ref() == Some(&me)
+            }
+        }
+        None => false,
+    };
+
+    if i_am_owner {
+        println!("\n=== KERNEL PANIC [{}] ===", mod_name);
+        if let Some(loc) = info.location() {
+            println!("at: \n {}:{}:{} \n", loc.file(), loc.line(), loc.column());
+        }
+        if let Some(s) = info.message().as_str() {
+            println!("msg:\n {}", s);
+        } else {
+            let s = info.message().to_string();
+            println!("msg: {}", s);
+        }
+
+        unsafe {
+            APIC.lock()
+                .as_ref()
+                .map(|a| a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi));
+        }
+
+        halt_loop()
+    } else {
+        halt_loop()
+    }
 }
 
 #[no_mangle]

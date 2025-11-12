@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
-
+#![feature(const_option_ops)]
+#![feature(const_trait_impl)]
 extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
@@ -24,11 +25,13 @@ use kernel_api::{
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 mod msvc_shims;
 
-#[cfg(not(test))]
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
+#[cfg(not(test))]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
-    loop {}
+    use kernel_api::alloc_api::ffi::panic_common;
+
+    unsafe { panic_common(MOD_NAME, info) }
 }
 
 #[inline]

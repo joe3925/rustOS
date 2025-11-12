@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
-
+#![feature(const_option_ops)]
+#![feature(const_trait_impl)]
 extern crate alloc;
 
 use crate::alloc::vec;
@@ -34,13 +35,15 @@ use spin::RwLock;
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 mod msvc_shims;
 
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
-    loop {}
-}
+    use kernel_api::alloc_api::ffi::panic_common;
 
+    unsafe { panic_common(MOD_NAME, info) }
+}
 #[repr(C)]
 #[derive(Default)]
 struct VolExt {

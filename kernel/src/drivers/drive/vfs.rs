@@ -10,14 +10,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
 use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
-use crate::file_system::file::OpenFlags;
+use crate::file_system::file::{FileStatus, OpenFlags};
 use crate::file_system::file_provider::FileProvider;
 use crate::file_system::file_structs::FsReadParams;
 use crate::file_system::file_structs::{
-    FileError, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
-    FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult,
-    FsOpenParams, FsOpenResult, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams,
-    FsSeekResult, FsWriteParams, FsWriteResult,
+    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
+    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
+    FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsWriteParams,
+    FsWriteResult,
 };
 use crate::println;
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
@@ -210,9 +210,9 @@ impl Vfs {
         }
     }
 
-    fn resolve_path(&self, user_path: &str) -> Result<(String, String), FileError> {
+    fn resolve_path(&self, user_path: &str) -> Result<(String, String), FileStatus> {
         if user_path.is_empty() {
-            return Err(FileError::BadPath);
+            return Err(FileStatus::BadPath);
         }
 
         const VOL_PREFIX: &str = "\\GLOBAL\\Volumes\\";
@@ -224,14 +224,14 @@ impl Vfs {
             let v = parts.next().unwrap_or("");
             let rest = parts.next().unwrap_or("");
             if g != "GLOBAL" || v != "Volumes" {
-                return Err(FileError::BadPath);
+                return Err(FileStatus::BadPath);
             }
             let (mount, tail) = match rest.split_once('\\') {
                 Some((a, b)) => (a, b),
                 None => (rest, ""),
             };
             if mount.is_empty() {
-                return Err(FileError::BadPath);
+                return Err(FileStatus::BadPath);
             }
             let symlink = alloc::format!("{}{}", VOL_PREFIX, mount);
             let fs_path = normalize_rel(tail);
@@ -253,7 +253,7 @@ impl Vfs {
             return Ok((symlink, fs_path));
         }
 
-        Err(FileError::BadPath)
+        Err(FileStatus::BadPath)
     }
 
     fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
@@ -281,7 +281,7 @@ impl Vfs {
             RequestType::Fs(op),
             Vfs::box_to_bytes(Box::new(param)),
         )));
-        unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
+        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
         unsafe { pnp_wait_for_request(&req) };
 
         let mut w = req.write();
@@ -313,7 +313,7 @@ impl Vfs {
 
     // ---------- ASYNC API: returns the sent Request; no waits ----------
 
-    pub fn open_async(&self, p: FsOpenParams) -> Result<Arc<RwLock<Request>>, FileError> {
+    pub fn open_async(&self, p: FsOpenParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
         let (symlink, fs_path) = self.resolve_path(&p.path)?;
         let param = FsOpenParams {
             flags: p.flags,
@@ -322,13 +322,13 @@ impl Vfs {
         Ok(self.call_fs_async(&symlink, FsOp::Open, param))
     }
 
-    pub fn read_async(&self, p: FsReadParams) -> Result<Arc<RwLock<Request>>, FileError> {
+    pub fn read_async(&self, p: FsReadParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
         let h = self
             .handles
             .read()
             .get(&p.fs_file_id)
             .cloned()
-            .ok_or(FileError::NotFound)?;
+            .ok_or(FileStatus::PathNotFound)?;
         let param = FsReadParams {
             fs_file_id: h.inner_id,
             offset: p.offset,
@@ -337,13 +337,13 @@ impl Vfs {
         Ok(self.call_fs_async(&h.volume_symlink, FsOp::Read, param))
     }
 
-    pub fn write_async(&self, p: FsWriteParams) -> Result<Arc<RwLock<Request>>, FileError> {
+    pub fn write_async(&self, p: FsWriteParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
         let h = self
             .handles
             .read()
             .get(&p.fs_file_id)
             .cloned()
-            .ok_or(FileError::NotFound)?;
+            .ok_or(FileStatus::PathNotFound)?;
         let param = FsWriteParams {
             fs_file_id: h.inner_id,
             offset: p.offset,
@@ -379,7 +379,7 @@ impl Vfs {
                         fs_file_id: 0,
                         is_dir: false,
                         size: 0,
-                        error: Some(FileError::Unknown),
+                        error: Some(FileStatus::DriverError(st)),
                     },
                     st,
                 ),
@@ -401,7 +401,7 @@ impl Vfs {
                                 fs_file_id: 0,
                                 is_dir: false,
                                 size: 0,
-                                error: Some(FileError::Unknown),
+                                error: Some(FileStatus::DriverError(st)),
                             },
                             st,
                         )
@@ -467,7 +467,7 @@ impl Vfs {
                         DriverStatus::Success,
                     );
                 }
-                if try_open.error == Some(FileError::NotFound) {
+                if try_open.error == Some(FileStatus::PathNotFound) {
                     let creq = FsCreateParams {
                         path: fs_path.clone(),
                         dir: false,
@@ -481,7 +481,7 @@ impl Vfs {
                                     fs_file_id: 0,
                                     is_dir: false,
                                     size: 0,
-                                    error: Some(FileError::Unknown),
+                                    error: Some(FileStatus::DriverError(st)),
                                 },
                                 st,
                             )
@@ -555,7 +555,7 @@ impl Vfs {
         let Some(h) = self.handles.write().remove(&p.fs_file_id) else {
             return (
                 FsCloseResult {
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -575,7 +575,7 @@ impl Vfs {
             }
             Err(st) => (
                 FsCloseResult {
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -587,7 +587,7 @@ impl Vfs {
             return (
                 FsReadResult {
                     data: Vec::new(),
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -602,7 +602,7 @@ impl Vfs {
             Err(st) => (
                 FsReadResult {
                     data: Vec::new(),
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -614,7 +614,7 @@ impl Vfs {
             return (
                 FsWriteResult {
                     written: 0,
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -625,7 +625,7 @@ impl Vfs {
             Err(st) => (
                 FsWriteResult {
                     written: 0,
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -637,7 +637,7 @@ impl Vfs {
             return (
                 FsSeekResult {
                     pos: 0,
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -648,7 +648,7 @@ impl Vfs {
             Err(st) => (
                 FsSeekResult {
                     pos: 0,
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -659,7 +659,7 @@ impl Vfs {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsFlushResult {
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -669,7 +669,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsFlushResult {
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -683,7 +683,7 @@ impl Vfs {
                     size: 0,
                     is_dir: false,
                     attrs: 0,
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -697,7 +697,7 @@ impl Vfs {
                     size: 0,
                     is_dir: false,
                     attrs: 0,
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -714,7 +714,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsCreateResult {
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -733,7 +733,7 @@ impl Vfs {
         if src_symlink != dst_symlink {
             return (
                 FsRenameResult {
-                    error: Some(FileError::Unsupported),
+                    error: Some(FileStatus::UnknownFail),
                 },
                 DriverStatus::Success,
             );
@@ -744,7 +744,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsRenameResult {
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -770,7 +770,7 @@ impl Vfs {
             Err(st) => (
                 FsListDirResult {
                     names: Vec::new(),
-                    error: Some(FileError::Unknown),
+                    error: Some(FileStatus::DriverError(st)),
                 },
                 st,
             ),
@@ -838,7 +838,7 @@ impl FileProvider for Vfs {
     fn remove_dir_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
         (
             FsCreateResult {
-                error: Some(FileError::Unsupported),
+                error: Some(FileStatus::UnknownFail),
             },
             DriverStatus::Success,
         )
@@ -854,7 +854,7 @@ impl FileProvider for Vfs {
     fn delete_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
         (
             FsCreateResult {
-                error: Some(FileError::Unsupported),
+                error: Some(FileStatus::UnknownFail),
             },
             DriverStatus::Success,
         )
@@ -864,7 +864,7 @@ impl FileProvider for Vfs {
         &self,
         path: &str,
         flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<Request>>, FileError> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
         self.open_async(FsOpenParams {
             flags: f,
@@ -877,7 +877,7 @@ impl FileProvider for Vfs {
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<Request>>, FileError> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         self.read_async(FsReadParams {
             fs_file_id: file_id,
             offset,
@@ -890,7 +890,7 @@ impl FileProvider for Vfs {
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<Request>>, FileError> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         self.write_async(FsWriteParams {
             fs_file_id: file_id,
             offset,

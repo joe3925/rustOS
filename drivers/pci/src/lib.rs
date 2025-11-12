@@ -1,5 +1,7 @@
 #![no_std]
 #![no_main]
+#![feature(const_option_ops)]
+#![feature(const_trait_impl)]
 extern crate alloc;
 
 mod dev_ext;
@@ -32,13 +34,15 @@ use spin::RwLock;
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
 
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("[PCI] {}", info);
-    loop {}
-}
+    use kernel_api::alloc_api::ffi::panic_common;
 
+    unsafe { panic_common(MOD_NAME, info) }
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };

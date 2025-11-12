@@ -11,11 +11,12 @@
 #![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
-#![feature(let_chains)]
-#![feature(naked_functions)]
 #![feature(slice_as_array)]
 #![feature(variant_count)]
 #![allow(improper_ctypes_definitions)]
+#![feature(try_trait_v2)]
+#![feature(const_trait_impl)]
+#![feature(const_option_ops)]
 extern crate alloc;
 
 pub mod gdt;
@@ -39,7 +40,7 @@ mod syscalls;
 mod util;
 use crate::console::clear_screen;
 use crate::memory::paging::tables::kernel_cr3;
-use crate::util::KERNEL_INITIALIZED;
+use crate::util::{panic_common, KERNEL_INITIALIZED};
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -53,13 +54,11 @@ use lazy_static::lazy_static;
 use x86_64::registers::control::Cr3;
 
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    x86_64::instructions::interrupts::disable();
-    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
-    KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
-    println!("{}", info);
-    loop {}
+    panic_common(MOD_NAME, info)
 }
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();

@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
-
+#![feature(const_option_ops)]
+#![feature(const_trait_impl)]
 extern crate alloc;
 
 mod dev_ext;
@@ -36,6 +37,7 @@ use kernel_api::{
     println,
     x86_64::instructions::port::Port,
 };
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -43,10 +45,10 @@ static ALLOCATOR: KernelAllocator = KernelAllocator;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    println!("{}", info);
-    loop {}
-}
+    use kernel_api::alloc_api::ffi::panic_common;
 
+    unsafe { panic_common(MOD_NAME, info) }
+}
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;

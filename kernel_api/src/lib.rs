@@ -1,14 +1,16 @@
 #![no_std]
 #![allow(improper_ctypes, improper_ctypes_definitions)]
 #![feature(variant_count)]
+#![feature(try_trait_v2)]
 pub extern crate alloc;
 
+use crate::alloc::format;
 use crate::alloc::vec;
 pub use acpi;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::slice;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
@@ -16,7 +18,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::any::{type_name, Any, TypeId};
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
+use core::ops::{ControlFlow, Deref, DerefMut, FromResidual, Try};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
@@ -269,21 +271,6 @@ pub enum FsOp {
     /// data = "old\0new" UTF-8 bytes
     Rename,
 }
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileError {
-    NotFound,
-    AlreadyExists,
-    NotADirectory,
-    IsDirectory,
-    BadPath,
-    Corrupt,
-    Unsupported,
-    AccessDenied,
-    NoSpace,
-    IoError,
-    Unknown,
-}
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -297,7 +284,7 @@ pub struct FsOpenResult {
     pub fs_file_id: u64,
     pub is_dir: bool,
     pub size: u64,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -308,7 +295,7 @@ pub struct FsCloseParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsCloseResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -322,7 +309,7 @@ pub struct FsReadParams {
 #[derive(Debug, Clone)]
 pub struct FsReadResult {
     pub data: Vec<u8>,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -336,7 +323,7 @@ pub struct FsWriteParams {
 #[derive(Debug, Clone)]
 pub struct FsWriteResult {
     pub written: usize,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -357,7 +344,7 @@ pub struct FsSeekParams {
 #[derive(Debug, Clone)]
 pub struct FsSeekResult {
     pub pos: u64,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -368,7 +355,7 @@ pub struct FsFlushParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsFlushResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -381,7 +368,7 @@ pub struct FsCreateParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsCreateResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -393,7 +380,7 @@ pub struct FsRenameParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsRenameResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -405,7 +392,7 @@ pub struct FsListDirParams {
 #[derive(Debug, Clone)]
 pub struct FsListDirResult {
     pub names: Vec<String>,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -419,7 +406,7 @@ pub struct FsGetInfoResult {
     pub size: u64,
     pub is_dir: bool,
     pub attrs: u32,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -593,6 +580,38 @@ pub enum DriverStatus {
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
 }
+impl Try for DriverStatus {
+    type Output = ();
+    type Residual = DriverStatus;
+
+    #[inline]
+    fn from_output((): Self::Output) -> Self {
+        DriverStatus::Success
+    }
+
+    #[inline]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        if self == DriverStatus::Success {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(self)
+        }
+    }
+}
+
+impl<T> FromResidual<DriverStatus> for Result<T, DriverStatus> {
+    #[inline]
+    fn from_residual(r: DriverStatus) -> Self {
+        Err(r)
+    }
+}
+
+impl FromResidual<DriverStatus> for DriverStatus {
+    #[inline]
+    fn from_residual(r: DriverStatus) -> Self {
+        r
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DriverError {
@@ -678,23 +697,37 @@ pub enum FileStatus {
     NotFat = 0x04,
     DriveNotFound,
     IncompatibleFlags,
-    CorruptFat,
+    CorruptFilesystem,
     InternalError,
     BadPath,
+    AccessDenied,
+    NoSpace,
+    DriverError(DriverStatus),
 }
 impl FileStatus {
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(&self) -> String {
         match self {
-            FileStatus::Success => "Success",
-            FileStatus::FileAlreadyExist => "File already exists",
-            FileStatus::PathNotFound => "Path not found",
-            FileStatus::UnknownFail => "The operation failed for an unknown reason",
-            FileStatus::NotFat => "The partition is unformatted or not supported",
-            FileStatus::DriveNotFound => "The drive specified doesn't exist",
-            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFat => "The File Allocation Table is corrupt",
-            FileStatus::InternalError => "Internal error",
-            FileStatus::BadPath => "Invalid path",
+            FileStatus::Success => "Success".to_string(),
+            FileStatus::FileAlreadyExist => "File already exists".to_string(),
+            FileStatus::PathNotFound => "Path not found".to_string(),
+            FileStatus::UnknownFail => "The operation failed for an unknown reason".to_string(),
+            FileStatus::NotFat => "The partition is unformatted or not supported".to_string(),
+            FileStatus::DriveNotFound => "The drive specified doesn't exist".to_string(),
+            FileStatus::IncompatibleFlags => {
+                "The flags can contain CreateNew and Create".to_string()
+            }
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".to_string(),
+            FileStatus::InternalError => "Internal error".to_string(),
+            FileStatus::BadPath => "Invalid path".to_string(),
+            FileStatus::AccessDenied => {
+                "Insufficient permissions to access the current file".to_string()
+            }
+            FileStatus::NoSpace => {
+                "Insufficient space on drive to write the requested data".to_string()
+            }
+            FileStatus::DriverError(e) => {
+                format!("The file access failed with a driver error of {}", e)
+            }
         }
     }
 }
@@ -724,7 +757,7 @@ pub enum Data {
     Str(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum RegError {
     File(FileStatus),
     KeyAlreadyExists,
@@ -732,6 +765,13 @@ pub enum RegError {
     ValueNotFound,
     PersistenceFailed,
     EncodingFailed,
+    CorruptReg,
+}
+
+impl From<FileStatus> for RegError {
+    fn from(e: FileStatus) -> Self {
+        RegError::File(e)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -979,6 +1019,8 @@ pub mod alloc_api {
         extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
     pub mod ffi {
+        use core::panic::PanicInfo;
+
         use super::*;
         #[link(name = "KRNL")]
         pub mod reg {
@@ -1028,6 +1070,7 @@ pub mod alloc_api {
         }
         extern "win64" {
             pub fn create_kernel_task(entry: usize, name: String) -> u64;
+            pub fn panic_common(mod_name: &'static str, info: &PanicInfo) -> !;
             pub fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus>;
             pub fn fs_list_dir(path: &str) -> Result<Vec<String>, FileStatus>;
             pub fn fs_remove_dir(path: &str) -> Result<(), FileStatus>;

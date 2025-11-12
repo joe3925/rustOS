@@ -44,6 +44,7 @@ pub enum RegError {
     ValueNotFound,
     PersistenceFailed,
     EncodingFailed,
+    CorruptReg,
 }
 
 impl From<crate::file_system::file::FileStatus> for RegError {
@@ -387,18 +388,14 @@ pub mod reg {
         }
         Ok(out)
     }
-    fn load_from_disk() -> Option<super::Registry> {
+    fn load_from_disk() -> Result<super::Registry, RegError> {
         use bincode::config::standard;
-        if let Ok(mut f) = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]) {
-            if let Ok(buf) = f.read() {
-                if let Ok((r, _)) =
-                    bincode::decode_from_slice::<super::Registry, _>(&buf, standard())
-                {
-                    return Some(r);
-                }
-            }
-        }
-        None
+
+        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])?;
+        let buf = f.read()?;
+        let (r, _) = bincode::decode_from_slice::<super::Registry, _>(&buf, standard())
+            .map_err(|_| RegError::CorruptReg)?;
+        Ok(r)
     }
 
     fn diff_maps(base_path: &str, from: &super::Key, to: &super::Key, out: &mut Vec<RegDelta>) {
@@ -465,7 +462,7 @@ pub mod reg {
         ensure_loaded();
         let current = (**REGISTRY.read()).clone();
 
-        let on_disk = load_from_disk().unwrap_or_else(super::Registry::empty);
+        let on_disk = load_from_disk()?;
         let deltas = diff_registry(&on_disk, &current);
 
         persist(&current)?;

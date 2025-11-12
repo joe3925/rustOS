@@ -18,7 +18,7 @@ use fatfs::{
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    DevExtRefMut, DeviceObject, DriverStatus, FileError, FsCloseParams, FsCloseResult,
+    DevExtRefMut, DeviceObject, DriverStatus, FileStatus, FsCloseParams, FsCloseResult,
     FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult,
     FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult,
     FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams,
@@ -52,7 +52,6 @@ pub struct FileCtx {
     pos: u64,
 }
 
-// ---- bytes <-> box helpers for your kernel message ABI ----
 fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let len = size_of::<T>();
     let p = Box::into_raw(b) as *mut u8;
@@ -63,20 +62,17 @@ unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     Box::from_raw(p)
 }
 
-// ---- map fatfs::Error<()> -> your FileError ----
-fn map_fatfs_err(e: &FsError) -> FileError {
+fn map_fatfs_err(e: &FsError) -> FileStatus {
     use fatfs::Error::*;
     match e {
-        NotFound => FileError::NotFound,
-        AlreadyExists => FileError::AlreadyExists,
-        InvalidInput => FileError::BadPath,
-        NoSpace => FileError::IoError,
-        CorruptedFileSystem => FileError::Corrupt,
-        _ => FileError::Unknown,
+        NotFound => FileStatus::PathNotFound,
+        AlreadyExists => FileStatus::FileAlreadyExist,
+        InvalidInput => FileStatus::BadPath,
+        NoSpace => FileStatus::UnknownFail,
+        CorruptedFileSystem => FileStatus::CorruptFilesystem,
     }
 }
 
-// Helpers now take &mut Fs so the caller must hold the MutexGuard.
 fn is_dir(fs: &mut Fs, path: &str) -> Result<bool, FsError> {
     if fs.root_dir().open_dir(path).is_ok() {
         return Ok(true);
@@ -233,7 +229,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         error: if removed {
                             None
                         } else {
-                            Some(FileError::NotFound)
+                            Some(FileStatus::PathNotFound)
                         },
                     };
                     r.data = box_to_bytes(Box::new(res));
@@ -257,7 +253,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     if ctx.is_none() {
                         r.data = box_to_bytes(Box::new(FsReadResult {
                             data: Vec::new(),
-                            error: Some(FileError::NotFound),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -266,7 +262,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     if ctx.is_dir {
                         r.data = box_to_bytes(Box::new(FsReadResult {
                             data: Vec::new(),
-                            error: Some(FileError::IsDirectory),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -310,7 +306,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     if ctx.is_none() {
                         r.data = box_to_bytes(Box::new(FsWriteResult {
                             written: 0,
-                            error: Some(FileError::NotFound),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -319,7 +315,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     if ctx.is_dir {
                         r.data = box_to_bytes(Box::new(FsWriteResult {
                             written: 0,
-                            error: Some(FileError::IsDirectory),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -364,7 +360,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     if snap.is_none() {
                         r.data = box_to_bytes(Box::new(FsSeekResult {
                             pos: 0,
-                            error: Some(FileError::NotFound),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -392,7 +388,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         } else {
                             r.data = box_to_bytes(Box::new(FsSeekResult {
                                 pos: 0,
-                                error: Some(FileError::NotFound),
+                                error: Some(FileStatus::PathNotFound),
                             }));
                             r.status = DriverStatus::Success;
                             return;
@@ -520,7 +516,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             size: 0,
                             is_dir: false,
                             attrs: 0,
-                            error: Some(FileError::NotFound),
+                            error: Some(FileStatus::PathNotFound),
                         }));
                         r.status = DriverStatus::Success;
                         return;
@@ -569,7 +565,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
     }
 }
 
-pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String>, FileError> {
+pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String>, FileStatus> {
     let params = FsListDirParams {
         path: path.to_string(),
     };
@@ -583,12 +579,12 @@ pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String
 
     let mut guard = areq.write();
     if guard.status != DriverStatus::Success {
-        return Err(FileError::Unknown);
+        return Err(FileStatus::UnknownFail);
     }
 
     let result: FsListDirResult = unsafe {
         if guard.data.len() != core::mem::size_of::<FsListDirResult>() {
-            return Err(FileError::Corrupt);
+            return Err(FileStatus::CorruptFilesystem);
         }
         *bytes_to_box(core::mem::replace(&mut guard.data, Box::new([])))
     };

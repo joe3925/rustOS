@@ -13,13 +13,13 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::file_system::file_provider::FileProvider;
 use crate::file_system::file_structs::{
-    FileError, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
-    FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult,
-    FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
-    FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
+    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
+    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
+    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
+    FsSeekWhence, FsWriteParams, FsWriteResult,
 };
+use crate::file_system::{file::FileStatus, file_provider::FileProvider};
 use crate::util::BootPkg;
 use crate::{drivers::pnp::driver_object::DriverStatus, file_system::file::OpenFlags};
 
@@ -180,10 +180,10 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn must_c(&self, path: &str) -> Result<String, FileError> {
+    fn must_c(&self, path: &str) -> Result<String, FileStatus> {
         let p = norm_upcase(path);
         if !p.starts_with(C_PREFIX) {
-            return Err(FileError::NotFound);
+            return Err(FileStatus::PathNotFound);
         }
         Ok(p)
     }
@@ -206,15 +206,15 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileError> {
+    fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileStatus> {
         let mut cur = path.to_string();
 
         let data_vec = loop {
             let map = self.nodes.read();
-            let node = map.get(&cur).ok_or(FileError::NotFound)?;
+            let node = map.get(&cur).ok_or(FileStatus::PathNotFound)?;
 
             if node.is_dir {
-                return Err(FileError::BadPath);
+                return Err(FileStatus::BadPath);
             }
 
             match node.data.as_ref().unwrap() {
@@ -232,12 +232,12 @@ impl<'a> BootstrapProvider<'a> {
         Ok(data_vec[off..off + take].to_vec())
     }
 
-    fn write_slice(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, FileError> {
+    fn write_slice(&self, path: &str, offset: u64, data: &[u8]) -> Result<u32, FileStatus> {
         let mut map = self.nodes.write();
-        let node = map.get_mut(path).ok_or(FileError::NotFound)?;
+        let node = map.get_mut(path).ok_or(FileStatus::PathNotFound)?;
 
         if node.is_dir {
-            return Err(FileError::BadPath);
+            return Err(FileStatus::BadPath);
         }
 
         match node.data.as_mut().unwrap() {
@@ -249,18 +249,15 @@ impl<'a> BootstrapProvider<'a> {
                 v[offset as usize..offset as usize + data.len()].copy_from_slice(data);
                 Ok(data.len() as u32)
             }
-            DataRef::Static(_) => Err(FileError::Unknown),
-            DataRef::Alias(_t) => {
-                // Accept writes but store nowhere (no-copy bootstrap).
-                Ok(data.len() as u32)
-            }
+            DataRef::Static(_) => Err(FileStatus::UnknownFail),
+            DataRef::Alias(_t) => Ok(data.len() as u32),
         }
     }
 
-    fn ensure_dir(&self, p: &str) -> Result<(), FileError> {
+    fn ensure_dir(&self, p: &str) -> Result<(), FileStatus> {
         let p = norm_upcase(p);
         if !p.starts_with(C_PREFIX) {
-            return Err(FileError::NotFound);
+            return Err(FileStatus::PathNotFound);
         }
         let mut map = self.nodes.write();
         if map.contains_key(&p) {
@@ -268,11 +265,11 @@ impl<'a> BootstrapProvider<'a> {
             if is_dir {
                 return Ok(());
             }
-            return Err(FileError::BadPath);
+            return Err(FileStatus::BadPath);
         }
         let parent = parent_of(&p).to_string();
         if !map.contains_key(&parent) {
-            return Err(FileError::BadPath);
+            return Err(FileStatus::BadPath);
         }
         map.insert(p.clone(), Node::dir());
         map.get_mut(&parent)
@@ -313,7 +310,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                     fs_file_id: 0,
                     is_dir: false,
                     size: 0,
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -340,7 +337,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                 error: if removed {
                     None
                 } else {
-                    Some(FileError::NotFound)
+                    Some(FileStatus::PathNotFound)
                 },
             },
             DriverStatus::Success,
@@ -354,7 +351,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                 return (
                     FsReadResult {
                         data: Vec::new(),
-                        error: Some(FileError::NotFound),
+                        error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
                 )
@@ -385,7 +382,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                 return (
                     FsWriteResult {
                         written: 0,
-                        error: Some(FileError::NotFound),
+                        error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
                 )
@@ -422,7 +419,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                         size: 0,
                         is_dir: false,
                         attrs: 0,
-                        error: Some(FileError::NotFound),
+                        error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
                 )
@@ -441,7 +438,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
                     size: 0,
                     is_dir: false,
                     attrs: 0,
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -490,7 +487,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             return (
                 FsListDirResult {
                     names: Vec::new(),
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -499,7 +496,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             return (
                 FsListDirResult {
                     names: Vec::new(),
-                    error: Some(FileError::BadPath),
+                    error: Some(FileStatus::BadPath),
                 },
                 DriverStatus::Success,
             );
@@ -523,7 +520,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
     fn remove_dir_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
         (
             FsCreateResult {
-                error: Some(FileError::Unsupported),
+                error: Some(FileStatus::UnknownFail),
             },
             DriverStatus::Success,
         )
@@ -546,7 +543,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             Some(_) => {
                 return (
                     FsRenameResult {
-                        error: Some(FileError::BadPath),
+                        error: Some(FileStatus::BadPath),
                     },
                     DriverStatus::Success,
                 )
@@ -554,7 +551,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             None => {
                 return (
                     FsRenameResult {
-                        error: Some(FileError::NotFound),
+                        error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
                 )
@@ -564,7 +561,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         if !src_node_exists {
             return (
                 FsRenameResult {
-                    error: Some(FileError::NotFound),
+                    error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
@@ -577,7 +574,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             Some(_) => {
                 return (
                     FsRenameResult {
-                        error: Some(FileError::BadPath),
+                        error: Some(FileStatus::BadPath),
                     },
                     DriverStatus::Success,
                 )
@@ -585,7 +582,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
             None => {
                 return (
                     FsRenameResult {
-                        error: Some(FileError::BadPath),
+                        error: Some(FileStatus::BadPath),
                     },
                     DriverStatus::Success,
                 )
@@ -619,7 +616,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         }
         (
             FsCreateResult {
-                error: Some(FileError::Unsupported),
+                error: Some(FileStatus::UnknownFail),
             },
             DriverStatus::Success,
         )
@@ -629,7 +626,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         &self,
         path: &str,
         flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
         todo!()
     }
 
@@ -638,7 +635,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
         todo!()
     }
 
@@ -647,7 +644,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileError> {
+    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
         todo!()
     }
 }

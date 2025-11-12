@@ -10,18 +10,18 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
+use core::ops::FromResidual;
 use core::{
     any::{type_name, Any, TypeId},
     cell::UnsafeCell,
     marker::PhantomData,
     mem,
-    ops::{Deref, DerefMut},
+    ops::{ControlFlow, Deref, DerefMut, Try},
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
 use spin::{Mutex, RwLock};
 use strum::Display;
-
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStatus {
@@ -34,6 +34,39 @@ pub enum DriverStatus {
     NoSuchFile = 0xC000_000Fu32 as i32,
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
+}
+
+impl Try for DriverStatus {
+    type Output = ();
+    type Residual = DriverStatus;
+
+    #[inline]
+    fn from_output((): Self::Output) -> Self {
+        DriverStatus::Success
+    }
+
+    #[inline]
+    fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
+        if self == DriverStatus::Success {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(self)
+        }
+    }
+}
+
+impl<T> FromResidual<DriverStatus> for Result<T, DriverStatus> {
+    #[inline]
+    fn from_residual(r: DriverStatus) -> Self {
+        Err(r)
+    }
+}
+
+impl FromResidual<DriverStatus> for DriverStatus {
+    #[inline]
+    fn from_residual(r: DriverStatus) -> Self {
+        r
+    }
 }
 #[repr(C)]
 pub struct ReqJob {

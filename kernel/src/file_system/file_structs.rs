@@ -1,22 +1,9 @@
 use alloc::{string::String, vec::Vec};
 
-use crate::file_system::{self, file::OpenFlags};
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileError {
-    NotFound,
-    AlreadyExists,
-    NotADirectory,
-    IsDirectory,
-    BadPath,
-    Corrupt,
-    Unsupported,
-    AccessDenied,
-    NoSpace,
-    IoError,
-    Unknown,
-}
+use crate::file_system::{
+    self,
+    file::{FileStatus, OpenFlags},
+};
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -30,7 +17,7 @@ pub struct FsOpenResult {
     pub fs_file_id: u64,
     pub is_dir: bool,
     pub size: u64,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -41,7 +28,7 @@ pub struct FsCloseParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsCloseResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -55,7 +42,7 @@ pub struct FsReadParams {
 #[derive(Debug, Clone)]
 pub struct FsReadResult {
     pub data: Vec<u8>,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -69,7 +56,7 @@ pub struct FsWriteParams {
 #[derive(Debug, Clone)]
 pub struct FsWriteResult {
     pub written: usize,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -90,7 +77,7 @@ pub struct FsSeekParams {
 #[derive(Debug, Clone)]
 pub struct FsSeekResult {
     pub pos: u64,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -101,7 +88,7 @@ pub struct FsFlushParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsFlushResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -114,7 +101,7 @@ pub struct FsCreateParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsCreateResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -126,7 +113,7 @@ pub struct FsRenameParams {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsRenameResult {
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -138,7 +125,7 @@ pub struct FsListDirParams {
 #[derive(Debug, Clone)]
 pub struct FsListDirResult {
     pub names: Vec<String>,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
@@ -152,5 +139,5 @@ pub struct FsGetInfoResult {
     pub size: u64,
     pub is_dir: bool,
     pub attrs: u32,
-    pub error: Option<FileError>,
+    pub error: Option<FileStatus>,
 }

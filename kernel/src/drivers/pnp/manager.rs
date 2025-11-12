@@ -1091,6 +1091,7 @@ impl PnpManager {
         *dn.stack.write() = Some(DeviceStack::new());
 
         let pdo = DeviceObject::new(init_pdo);
+        // TODO: MAJOR remove this unsafe pattern
         unsafe {
             let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
             p.dev_node = Arc::downgrade(&dn);

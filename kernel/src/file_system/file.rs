@@ -3,23 +3,22 @@
 extern crate alloc;
 
 use alloc::{
+    borrow::Cow,
     boxed::Box,
+    format,
     string::{String, ToString},
     vec::Vec,
 };
 use core::cmp::PartialEq;
 
 use crate::{
-    drivers::drive::vfs::Vfs,
+    drivers::{drive::vfs::Vfs, pnp::driver_object::DriverStatus},
     file_system::file_provider::{self, install_file_provider, FileProvider},
     registry::{reg::rebind_and_persist_after_provider_switch, RegError},
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
-    file_system::{
-        file_provider::provider,
-        file_structs::{FileError, FsSeekWhence},
-    },
+    file_system::{file_provider::provider, file_structs::FsSeekWhence},
     registry::is_first_boot,
 };
 
@@ -75,23 +74,37 @@ pub enum FileStatus {
     NotFat = 0x04,
     DriveNotFound,
     IncompatibleFlags,
-    CorruptFat,
+    CorruptFilesystem,
     InternalError,
     BadPath,
+    AccessDenied,
+    NoSpace,
+    DriverError(DriverStatus),
 }
 impl FileStatus {
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(&self) -> String {
         match self {
-            FileStatus::Success => "Success",
-            FileStatus::FileAlreadyExist => "File already exists",
-            FileStatus::PathNotFound => "Path not found",
-            FileStatus::UnknownFail => "The operation failed for an unknown reason",
-            FileStatus::NotFat => "The partition is unformatted or not supported",
-            FileStatus::DriveNotFound => "The drive specified doesn't exist",
-            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFat => "The File Allocation Table is corrupt",
-            FileStatus::InternalError => "Internal error",
-            FileStatus::BadPath => "Invalid path",
+            FileStatus::Success => "Success".to_string(),
+            FileStatus::FileAlreadyExist => "File already exists".to_string(),
+            FileStatus::PathNotFound => "Path not found".to_string(),
+            FileStatus::UnknownFail => "The operation failed for an unknown reason".to_string(),
+            FileStatus::NotFat => "The partition is unformatted or not supported".to_string(),
+            FileStatus::DriveNotFound => "The drive specified doesn't exist".to_string(),
+            FileStatus::IncompatibleFlags => {
+                "The flags can contain CreateNew and Create".to_string()
+            }
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".to_string(),
+            FileStatus::InternalError => "Internal error".to_string(),
+            FileStatus::BadPath => "Invalid path".to_string(),
+            FileStatus::AccessDenied => {
+                "Insufficient permissions to access the current file".to_string()
+            }
+            FileStatus::NoSpace => {
+                "Insufficient space on drive to write the requested data".to_string()
+            }
+            FileStatus::DriverError(e) => {
+                format!("The file access failed with a driver error of {}", e)
+            }
         }
     }
 }
@@ -168,7 +181,7 @@ impl File {
             return Err(FileStatus::UnknownFail);
         }
         if let Some(e) = res.error {
-            return Err(file_provider::map_file_error(e));
+            return Err(e);
         }
         Ok(Self {
             fs_file_id: res.fs_file_id,
@@ -185,7 +198,7 @@ impl File {
         }
         match r.error {
             None => Ok(()),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -196,7 +209,7 @@ impl File {
         }
         match r.error {
             None => Ok(r.names),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -207,7 +220,7 @@ impl File {
         }
         match r.error {
             None => Ok(()),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -218,7 +231,7 @@ impl File {
         }
         match r.error {
             None => Ok(()),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -228,7 +241,7 @@ impl File {
             return Err(FileStatus::UnknownFail);
         }
         if let Some(e) = gi.error {
-            return Err(file_provider::map_file_error(e));
+            return Err(e);
         }
         let size = gi.size as usize;
         let (rr, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
@@ -237,7 +250,7 @@ impl File {
         }
         match rr.error {
             None => Ok(rr.data),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -248,7 +261,7 @@ impl File {
         }
         match wr.error {
             None => Ok(()),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 
@@ -259,7 +272,7 @@ impl File {
         }
         match r.error {
             None => Ok(()),
-            Some(e) => Err(file_provider::map_file_error(e)),
+            Some(e) => Err(e),
         }
     }
 }

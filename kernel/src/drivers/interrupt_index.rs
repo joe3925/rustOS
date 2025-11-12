@@ -309,7 +309,7 @@ pub trait LocalApic {
     unsafe fn init(&self, logical_id: u8);
     fn init_timer(&self);
     fn end_interrupt(&self);
-    unsafe fn send_ipi(&self, apic_id: u8, kind: IpiKind);
+    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind);
     unsafe fn write(&self, offset: usize, value: u32);
 }
 
@@ -366,27 +366,46 @@ impl LocalApic for Lapic {
                 .write_volatile(0);
         }
     }
+    unsafe fn send_ipi(&self, dest: IpiDest, kind: IpiKind) {
+        let base = self.ptr();
+        let icr1 = base.add(APICOffset::Icr1 as usize / 4);
+        let icr2 = base.add(APICOffset::Icr2 as usize / 4);
 
-    unsafe fn send_ipi(&self, apic_id: u8, kind: IpiKind) {
-        let icr_base = self.ptr();
+        while (icr1.read_volatile() & (1 << 12)) != 0 {}
 
-        let icr_low = icr_base.add(APICOffset::Icr1 as usize / 4);
-        let icr_high = icr_base.add(APICOffset::Icr2 as usize / 4);
-
-        icr_high.write_volatile((apic_id as u32) << 24);
-
-        let icr_value = match kind {
-            IpiKind::Init => {
-                0b0000_0101_0000_0000u32 // INIT IPI
+        let mut hi = 0u32;
+        let shorthand = match dest {
+            IpiDest::ApicId(id) => {
+                hi = (id as u32) << 24;
+                0u32
             }
-
-            IpiKind::Startup { vector_phys_addr } => {
-                let vector = (vector_phys_addr.as_u64() >> 12) as u8;
-                (vector as u32) | 0b0000_0110_0000_0000u32
-            }
+            IpiDest::SelfOnly => 0b01 << 18,
+            IpiDest::AllIncludingSelf => 0b10 << 18,
+            IpiDest::AllExcludingSelf => 0b11 << 18,
         };
 
-        icr_low.write_volatile(icr_value);
+        let mut lo = 0u32;
+        match kind {
+            IpiKind::Fixed { vector } => {
+                lo = (0b000 << 8) | (vector as u32);
+            }
+            IpiKind::Nmi => {
+                lo = 0b100 << 8;
+            }
+            IpiKind::InitAssert => {
+                lo = (0b101 << 8) | (1 << 14) | (1 << 15);
+            }
+            IpiKind::InitDeassert => {
+                lo = (0b101 << 8) | (0 << 14) | (1 << 15);
+            }
+            IpiKind::Startup { vector_phys_addr } => {
+                let v = ((vector_phys_addr.as_u64() >> 12) & 0xFF) as u32;
+                lo = (0b110 << 8) | v;
+            }
+        }
+
+        icr2.write_volatile(hi);
+        icr1.write_volatile(shorthand | lo);
     }
     unsafe fn write(&self, offset: usize, value: u32) {
         self.ptr().add(offset / 4).write_volatile(value);
@@ -554,11 +573,16 @@ impl ApicImpl {
             }
 
             unsafe {
-                self.lapic.send_ipi(apic.local_apic_id as u8, IpiKind::Init);
+                let dst = IpiDest::ApicId(apic.local_apic_id as u8);
+
+                self.lapic.send_ipi(dst, IpiKind::InitAssert);
+                wait_millis(10);
+
+                self.lapic.send_ipi(dst, IpiKind::InitDeassert);
                 wait_millis(10);
 
                 self.lapic.send_ipi(
-                    apic.local_apic_id as u8,
+                    dst,
                     IpiKind::Startup {
                         vector_phys_addr: tramp_phys,
                     },
@@ -685,10 +709,23 @@ pub enum APICOffset {
     Tdcr = 0x3E0,     // Divide Configuration Register (for Timer)
     R0x3F0 = 0x3F0,   // RESERVED = 0x3F0
 }
+#[derive(Clone, Copy)]
+pub enum IpiDest {
+    ApicId(u8),
+    SelfOnly,
+    AllIncludingSelf,
+    AllExcludingSelf,
+}
+
+#[derive(Clone, Copy)]
 pub enum IpiKind {
-    Init,
+    Fixed { vector: u8 },
+    Nmi,
+    InitAssert,
+    InitDeassert,
     Startup { vector_phys_addr: PhysAddr },
 }
+
 #[inline(always)]
 pub fn send_eoi(vector: u8) {
     if USE_APIC.load(Ordering::Relaxed) {
