@@ -8,11 +8,11 @@ mod aml;
 mod dev_ext;
 mod msvc_shims;
 mod pdo;
-use core::{intrinsics::size_of, mem, ptr};
-
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
+use core::sync::atomic::Ordering;
+use core::{intrinsics::size_of, mem, ptr};
 use dev_ext::DevExt;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
@@ -86,10 +86,12 @@ pub extern "win64" fn bus_driver_prepare_hardware(
         println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
         return DriverStatus::Success;
     }
-    let dev_ext: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get dev ext ACPI");
+    let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
-    dev_ext.ctx = Some(Arc::new(RwLock::new(aml_ctx)));
-    dev_ext.i8042_hint = fadt_has_i8042_hint();
+    dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
+    dev_ext
+        .i8042_hint
+        .store(fadt_has_i8042_hint(), Ordering::SeqCst);
 
     DriverStatus::Success
 }
@@ -125,7 +127,7 @@ pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dev_ext: &mut DevExt = &mut device.try_devext_mut().expect("Failed to get dev ext ACPI");
+    let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = unsafe {
         (*(Arc::as_ptr(device) as *const DeviceObject))
@@ -139,7 +141,7 @@ pub extern "win64" fn enumerate_bus(
         let mut v = Vec::new();
         let _ = dev_ext
             .ctx
-            .as_ref()
+            .get()
             .unwrap()
             .write()
             .namespace
@@ -161,9 +163,9 @@ pub extern "win64" fn enumerate_bus(
     };
 
     for dev_name in devices_to_report {
-        create_pnp_bus_from_acpi(dev_ext.ctx.as_ref().unwrap(), &parent_dev_node, dev_name);
+        create_pnp_bus_from_acpi(dev_ext.ctx.get().unwrap(), &parent_dev_node, dev_name);
     }
-    if dev_ext.i8042_hint {
+    if dev_ext.i8042_hint.load(Ordering::Acquire) {
         create_synthetic_i8042_pdo(&parent_dev_node);
     }
 

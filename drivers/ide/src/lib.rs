@@ -15,14 +15,14 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::sync::atomic::{AtomicBool, AtomicU8};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
 use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
-use dev_ext::DevExt;
+use dev_ext::{DevExt, Ports};
 use kernel_api::{
     DeviceObject, DeviceRelationType, DriverObject, DriverStatus, KernelAllocator, Request,
     RequestType, ResourceKind,
@@ -49,6 +49,7 @@ fn panic(info: &PanicInfo) -> ! {
 
     unsafe { panic_common(MOD_NAME, info) }
 }
+
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
 const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -114,23 +115,9 @@ pub extern "win64" fn ide_device_add(
         ide_pnp_query_devrels,
     );
 
-    // Construct init with constructor and provide a zeroed DevExt to be filled on Start.
     let init = DeviceInit::new(IoVtable::new(), Some(vt));
     *dev_init = init;
-    dev_init.set_dev_ext_from(DevExt {
-        data_port: Port::new(0),
-        error_port: Port::new(0),
-        sector_count_port: Port::new(0),
-        lba_lo_port: Port::new(0),
-        lba_mid_port: Port::new(0),
-        lba_hi_port: Port::new(0),
-        drive_head_port: Port::new(0),
-        command_port: Port::new(0),
-        alternative_command_port: Port::new(0),
-        control_port: Port::new(0),
-        present: false,
-        enumerated: false,
-    });
+    dev_init.set_dev_ext_from(DevExt::new(0x1F0, 0x3F4));
 
     DriverStatus::Success
 }
@@ -141,7 +128,6 @@ extern "win64" fn ide_pnp_start(
 ) -> DriverStatus {
     let _guard = LOCK.lock();
 
-    // QueryResources to lower
     let mut child = Request::new(RequestType::Pnp, Box::new([]));
     child.pnp = Some(PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
@@ -166,35 +152,24 @@ extern "win64" fn ide_pnp_start(
             parse_ide_bars(&g.pnp.as_ref().unwrap().blob_out)
         };
 
-        let mut dx = dev
-            .try_devext_mut::<DevExt>()
-            .expect("ide: FDO DevExt missing");
+        let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
 
         let cb = bars.cmd as u16;
         let ctl = bars.ctl as u16;
         let alt = ctl.wrapping_add(2);
 
-        dx.data_port = Port::new(cb + 0);
-        dx.error_port = Port::new(cb + 1);
-        dx.sector_count_port = Port::new(cb + 2);
-        dx.lba_lo_port = Port::new(cb + 3);
-        dx.lba_mid_port = Port::new(cb + 4);
-        dx.lba_hi_port = Port::new(cb + 5);
-        dx.drive_head_port = Port::new(cb + 6);
-        dx.command_port = Port::new(cb + 7);
-        dx.alternative_command_port = Port::new(alt);
-        dx.control_port = Port::new(alt);
+        {
+            let mut p = dx.ports.lock();
+            *p = Ports::new(cb, alt);
+            unsafe { p.control.write(0u8) };
+        }
 
-        unsafe { dx.control_port.write(0u8) };
-
-        dx.present = true;
-        dx.enumerated = false;
+        dx.present.store(true, Ordering::Release);
+        dx.enumerated.store(false, Ordering::Release);
     } else {
-        let mut dx = dev
-            .try_devext_mut::<DevExt>()
-            .expect("ide: FDO DevExt missing");
-        dx.present = true;
-        dx.enumerated = false;
+        let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
+        dx.present.store(true, Ordering::Release);
+        dx.enumerated.store(false, Ordering::Release);
     }
 
     req.write().status = DriverStatus::Pending;
@@ -215,30 +190,30 @@ extern "win64" fn ide_pnp_query_devrels(
 }
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
-    let mut dx = parent
-        .try_devext_mut::<DevExt>()
+    let dx = parent
+        .try_devext::<DevExt>()
         .expect("ide: FDO DevExt missing");
-    if dx.enumerated || !dx.present {
+    if dx.enumerated.load(Ordering::Acquire) || !dx.present.load(Ordering::Acquire) {
         return;
     }
 
-    if ata_probe_drive(&mut dx, 0xE0) {
+    if ata_probe_drive(&dx, 0xE0) {
         create_child_pdo(parent, 0, 0);
     }
-    if ata_probe_drive(&mut dx, 0xF0) {
+    if ata_probe_drive(&dx, 0xF0) {
         create_child_pdo(parent, 0, 1);
     }
 
-    dx.enumerated = true;
+    dx.enumerated.store(true, Ordering::Release);
 }
 
 fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
-    let mut dx = parent
-        .try_devext_mut::<DevExt>()
+    let dx = parent
+        .try_devext::<DevExt>()
         .expect("ide: FDO DevExt missing");
 
     let dh = if drive == 0 { 0xE0 } else { 0xF0 };
-    let id_words_opt = ata_identify_words(&mut dx, dh);
+    let id_words_opt = ata_identify_words(&dx, dh);
 
     let (hardware, compatible) = if let Some(words) = id_words_opt {
         let model = id_string(&words[27..=46]);
@@ -306,26 +281,25 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         )
     };
 
-    // finish wiring parent pointer
-    let mut cdx = pdo
-        .try_devext_mut::<ChildExt>()
+    let _cdx = pdo
+        .try_devext::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
 }
 
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
     let _guard = LOCK.lock();
 
-    let mut cdx = pdo
-        .try_devext_mut::<ChildExt>()
+    let cdx = pdo
+        .try_devext::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
-    if !cdx.present.load(core::sync::atomic::Ordering::Acquire) {
+    if !cdx.present.load(Ordering::Acquire) {
         req.write().status = DriverStatus::NoSuchDevice;
         return;
     }
     let parent: Arc<DeviceObject> = cdx.parent_device.upgrade().expect("parent device gone");
 
-    let mut dx = parent
-        .try_devext_mut::<DevExt>()
+    let dx = parent
+        .try_devext::<DevExt>()
         .expect("No parent IDE dev ext");
     let code = {
         let mut w = req.write();
@@ -382,15 +356,15 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
             let mut w = req.write();
             let ok = match hdr.op {
                 BLOCK_RW_READ => ata_pio_read(
-                    &mut dx,
-                    cdx.dh.load(core::sync::atomic::Ordering::Acquire),
+                    &dx,
+                    cdx.dh.load(Ordering::Acquire),
                     hdr.lba as u32,
                     hdr.blocks as u32,
                     &mut w.data[off..off + need],
                 ),
                 BLOCK_RW_WRITE => ata_pio_write(
-                    &mut dx,
-                    cdx.dh.load(core::sync::atomic::Ordering::Acquire),
+                    &dx,
+                    cdx.dh.load(Ordering::Acquire),
                     hdr.lba as u32,
                     hdr.blocks as u32,
                     &w.data[off..off + need],
@@ -408,9 +382,16 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
         }
 
         IOCTL_BLOCK_FLUSH => {
-            unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
+            {
+                let mut p = dx.ports.lock();
+                unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
+            }
             let mut w = req.write();
-            w.status = if wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS) {
+            let ok = {
+                let mut p = dx.ports.lock();
+                wait_not_busy(&mut p.control, TIMEOUT_MS)
+            };
+            w.status = if ok {
                 DriverStatus::Success
             } else {
                 DriverStatus::Unsuccessful
@@ -532,71 +513,70 @@ fn id_string(words: &[u16]) -> String {
     out
 }
 
-fn ata_identify_words(dx: &mut DevExt, dh: u8) -> Option<[u16; 256]> {
+fn ata_identify_words(dx: &DevExt, dh: u8) -> Option<[u16; 256]> {
     let _guard = LOCK.lock();
-    unsafe {
-        dx.drive_head_port.write(dh);
-    }
-    io_wait_400ns(&mut dx.alternative_command_port);
+    {
+        let mut p = dx.ports.lock();
+        unsafe { p.drive_head.write(dh) };
+        io_wait_400ns(&mut p.control);
+        unsafe { p.command.write(ATA_CMD_IDENTIFY) };
+        let st: u8 = unsafe { p.command.read() };
+        if st == 0 || (st & ATA_SR_ERR) != 0 {
+            return None;
+        }
 
-    unsafe { dx.command_port.write(ATA_CMD_IDENTIFY) };
-    let st: u8 = unsafe { dx.command_port.read() };
-    if st == 0 || (st & ATA_SR_ERR) != 0 {
-        return None;
+        let mut words = [0u16; 256];
+        for i in 0..256 {
+            words[i] = unsafe { p.data.read() };
+        }
+        return Some(words);
     }
-
-    let mut words = [0u16; 256];
-    for i in 0..256 {
-        words[i] = unsafe { dx.data_port.read() };
-    }
-    Some(words)
 }
 
-fn ata_probe_drive(dx: &mut DevExt, dh: u8) -> bool {
+fn ata_probe_drive(dx: &DevExt, dh: u8) -> bool {
     ata_identify_words(dx, dh).is_some()
 }
 
-fn ata_pio_read(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
+fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
     let mut off = 0usize;
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
 
-        if !wait_ready(&mut dx.command_port, TIMEOUT_MS) {
-            return false;
-        }
-
-        let devsel = 0xE0 | (dh & 0x10) | ((lba >> 24) as u8 & 0x0F);
-        unsafe { dx.drive_head_port.write(devsel) };
-        io_wait_400ns(&mut dx.alternative_command_port);
-
-        if !wait_ready(&mut dx.command_port, TIMEOUT_MS) {
-            return false;
-        }
-
-        unsafe {
-            dx.sector_count_port.write(sc);
-            dx.lba_lo_port.write((lba & 0xFF) as u8);
-            dx.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
-            dx.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            dx.command_port.write(ATA_CMD_READ_SECTORS);
-        }
-
-        for _ in 0..chunk {
-            if !wait_drq_set(&mut dx.command_port, TIMEOUT_MS) {
+        {
+            let mut p = dx.ports.lock();
+            if !wait_ready(&mut p.command, TIMEOUT_MS) {
                 return false;
             }
-            if off + 512 > out.len() {
+            let devsel = 0xE0 | (dh & 0x10) | ((lba >> 24) as u8 & 0x0F);
+            unsafe { p.drive_head.write(devsel) };
+            io_wait_400ns(&mut p.control);
+            if !wait_ready(&mut p.command, TIMEOUT_MS) {
                 return false;
             }
-
-            for _ in 0..256 {
-                let w: u16 = unsafe { dx.data_port.read() };
-                out[off] = (w & 0xFF) as u8;
-                out[off + 1] = (w >> 8) as u8;
-                off += 2;
+            unsafe {
+                p.sector_count.write(sc);
+                p.lba_lo.write((lba & 0xFF) as u8);
+                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+                p.command.write(ATA_CMD_READ_SECTORS);
             }
-            let _ = unsafe { dx.command_port.read() };
+
+            for _ in 0..chunk {
+                if !wait_drq_set(&mut p.command, TIMEOUT_MS) {
+                    return false;
+                }
+                if off + 512 > out.len() {
+                    return false;
+                }
+                for _ in 0..256 {
+                    let w: u16 = unsafe { p.data.read() };
+                    out[off] = (w & 0xFF) as u8;
+                    out[off + 1] = (w >> 8) as u8;
+                    off += 2;
+                }
+                let _ = unsafe { p.command.read() };
+            }
         }
 
         lba = lba.wrapping_add(chunk);
@@ -605,38 +585,38 @@ fn ata_pio_read(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &m
     true
 }
 
-fn ata_pio_write(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
+fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
     let mut off = 0usize;
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
 
-        unsafe {
-            dx.drive_head_port
-                .write((dh & 0xF0) | ((lba >> 24) as u8 & 0x0F))
-        };
-        io_wait_400ns(&mut dx.command_port);
-        if !wait_ready(&mut dx.command_port, TIMEOUT_MS) {
-            return false;
-        }
-
-        unsafe {
-            dx.sector_count_port.write(sc);
-            dx.lba_lo_port.write((lba & 0xFF) as u8);
-            dx.lba_mid_port.write(((lba >> 8) & 0xFF) as u8);
-            dx.lba_hi_port.write(((lba >> 16) & 0xFF) as u8);
-            dx.command_port.write(ATA_CMD_WRITE_SECTORS);
-        }
-
-        for _ in 0..chunk {
-            if !wait_drq_set(&mut dx.command_port, TIMEOUT_MS) {
+        {
+            let mut p = dx.ports.lock();
+            unsafe { p.drive_head.write((dh & 0xF0) | ((lba >> 24) as u8 & 0x0F)) };
+            io_wait_400ns(&mut p.command);
+            if !wait_ready(&mut p.command, TIMEOUT_MS) {
                 return false;
             }
-            for _ in 0..256 {
-                let lo = data[off] as u16;
-                let hi = data[off + 1] as u16;
-                unsafe { dx.data_port.write(lo | (hi << 8)) };
-                off += 2;
+
+            unsafe {
+                p.sector_count.write(sc);
+                p.lba_lo.write((lba & 0xFF) as u8);
+                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+                p.command.write(ATA_CMD_WRITE_SECTORS);
+            }
+
+            for _ in 0..chunk {
+                if !wait_drq_set(&mut p.command, TIMEOUT_MS) {
+                    return false;
+                }
+                for _ in 0..256 {
+                    let lo = data[off] as u16;
+                    let hi = data[off + 1] as u16;
+                    unsafe { p.data.write(lo | (hi << 8)) };
+                    off += 2;
+                }
             }
         }
 
@@ -644,8 +624,11 @@ fn ata_pio_write(dx: &mut DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: 
         sectors -= chunk;
     }
 
-    unsafe { dx.command_port.write(ATA_CMD_FLUSH_CACHE) };
-    wait_not_busy(&mut dx.alternative_command_port, TIMEOUT_MS)
+    {
+        let mut p = dx.ports.lock();
+        unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
+        wait_not_busy(&mut p.control, TIMEOUT_MS)
+    }
 }
 
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {
@@ -773,7 +756,7 @@ extern "win64" fn ide_pdo_query_resources(
 
     let Some(di) = cdx.disk_info.as_ref() else {
         w.status = DriverStatus::DeviceNotReady;
-        return DriverStatus::Success; // request completed with DeviceNotReady
+        return DriverStatus::Success;
     };
 
     let di_ptr = di.as_ref() as *const DiskInfo as *const u8;
@@ -784,6 +767,7 @@ extern "win64" fn ide_pdo_query_resources(
     w.status = DriverStatus::Success;
     DriverStatus::Success
 }
+
 extern "win64" fn ide_pdo_start(
     _pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,

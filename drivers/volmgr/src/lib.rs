@@ -13,6 +13,7 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::DevExtRef;
 use kernel_api::DevExtRefMut;
 use kernel_api::PartitionInfo;
 use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
@@ -30,6 +31,7 @@ use kernel_api::{
     println,
 };
 use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
+use spin::Once;
 use spin::RwLock;
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -47,19 +49,19 @@ fn panic(info: &PanicInfo) -> ! {
 #[repr(C)]
 #[derive(Default)]
 struct VolExt {
-    part: Option<PartitionInfo>,
+    part: Once<PartitionInfo>,
     enumerated: AtomicBool,
 }
 
 #[inline]
-pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
-    dev.try_devext_mut().expect("Failed to get partmgr dev ext")
+pub fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
+    dev.try_devext().expect("Failed to get partmgr dev ext")
 }
 #[repr(C)]
 #[derive(Default)]
 struct VolPdoExt {
-    backing: Option<Arc<IoTarget>>,
-    part: Option<PartitionInfo>,
+    backing: Once<Arc<IoTarget>>,
+    part: Once<PartitionInfo>,
 }
 
 #[inline]
@@ -127,7 +129,7 @@ extern "win64" fn vol_prepare_hardware(
     unsafe { pnp_wait_for_request(&req_lock) };
 
     let mut g = req_lock.write();
-    let mut dx = ext_mut::<VolExt>(dev);
+    let mut dx = ext::<VolExt>(dev);
 
     if g.status != DriverStatus::Success {
         return DriverStatus::Success;
@@ -136,6 +138,7 @@ extern "win64" fn vol_prepare_hardware(
     let pi_opt: Option<PartitionInfo> = {
         let pnp = g.pnp.as_mut().unwrap();
         let buf = take(&mut pnp.blob_out);
+
         if buf.len() == core::mem::size_of::<PartitionInfo>() {
             let boxed_bytes: Box<[u8]> = buf.into_boxed_slice();
             let boxed_pi: Box<PartitionInfo> = unsafe { bytes_to_box(boxed_bytes) };
@@ -144,7 +147,9 @@ extern "win64" fn vol_prepare_hardware(
             None
         }
     };
-    dx.part = pi_opt;
+    if let Some(pi) = pi_opt {
+        dx.part.call_once(|| pi);
+    }
 
     DriverStatus::Success
 }
@@ -152,12 +157,12 @@ pub extern "win64" fn vol_enumerate_devices(
     device: &Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dx = ext_mut::<VolExt>(device);
+    let dx = ext::<VolExt>(device);
 
-    let pi = if let Some(ref pi) = dx.part {
+    let binding = dx.part.get();
+    let pi = if let Some(ref pi) = binding {
         pi
     } else {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     };
 
@@ -165,7 +170,6 @@ pub extern "win64" fn vol_enumerate_devices(
     let (_hdr, ent) = if let (Some(ref hdr), Some(ref ent)) = binding {
         (hdr, ent)
     } else {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     };
 
@@ -173,14 +177,12 @@ pub extern "win64" fn vol_enumerate_devices(
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
     let parent_dn = if let Some(dn) = device.dev_node.get().unwrap().upgrade() {
         dn
     } else {
-        request.write().status = DriverStatus::Unsuccessful;
         return DriverStatus::Unsuccessful;
     };
 
@@ -196,7 +198,6 @@ pub extern "win64" fn vol_enumerate_devices(
 
     let ptype = ent.partition_type_guid;
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
@@ -229,11 +230,11 @@ pub extern "win64" fn vol_enumerate_devices(
     };
 
     if let Some(tgt) = unsafe { pnp_get_device_target(&parent_dn.instance_path) } {
-        ext_mut::<VolPdoExt>(&pdo).backing = Some(Arc::new(tgt));
-        ext_mut::<VolPdoExt>(&pdo).part = Some(dx.part.clone().unwrap());
+        ext::<VolPdoExt>(&pdo).backing.call_once(|| Arc::new(tgt));
+        ext::<VolPdoExt>(&pdo)
+            .part
+            .call_once(|| dx.part.get().unwrap().clone());
     }
-
-    request.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
 #[repr(C)]
@@ -272,7 +273,8 @@ pub extern "win64" fn vol_pdo_read(
         }
     };
 
-    let tgt = match &ext_mut::<VolPdoExt>(dev).backing {
+    let binding = ext::<VolPdoExt>(dev);
+    let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
             parent.write().status = DriverStatus::NoSuchDevice;
@@ -312,7 +314,8 @@ pub extern "win64" fn vol_pdo_write(
         }
     };
 
-    let tgt = match &ext_mut::<VolPdoExt>(dev).backing {
+    let binding = ext::<VolPdoExt>(dev);
+    let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
             parent.write().status = DriverStatus::NoSuchDevice;
@@ -343,7 +346,7 @@ extern "win64" fn vol_pdo_query_resources(
         }
     };
 
-    if let Some(pi) = ext_mut::<VolPdoExt>(pdo).part.as_ref() {
+    if let Some(pi) = ext::<VolPdoExt>(pdo).part.get() {
         let mut out = vec![0u8; core::mem::size_of::<PartitionInfo>()];
         unsafe {
             core::ptr::copy_nonoverlapping(

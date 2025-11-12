@@ -5,12 +5,17 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use core::{mem::size_of, panic::PanicInfo, ptr};
+use core::{
+    mem::size_of,
+    panic::PanicInfo,
+    ptr,
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
+};
 use spin::RwLock;
 
 use kernel_api::{
-    DevExtRefMut, DeviceObject, DeviceRelationType, DiskInfo, DriverObject, DriverStatus,
-    KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
+    DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DiskInfo, DriverObject,
+    DriverStatus, KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, Synchronization,
         ffi::{
@@ -84,11 +89,11 @@ struct BlockRwIn {
 #[repr(C)]
 #[derive(Default)]
 struct DiskExt {
-    block_size: u32,
-    max_blocks: u32,
-    alignment_mask: u32,
-    features: u64,
-    props_ready: bool,
+    block_size: AtomicU32,
+    max_blocks: AtomicU32,
+    alignment_mask: AtomicU32,
+    features: AtomicU64,
+    props_ready: AtomicBool,
 }
 
 #[repr(C)]
@@ -145,30 +150,35 @@ pub extern "win64" fn disk_read(
         return;
     }
 
-    let mut dx = disk_ext_mut(dev);
-    if !dx.props_ready {
+    let dx = disk_ext(dev);
+    if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
         if let Err(st) = query_props_sync(dev) {
             parent.write().status = st;
             return;
         }
     }
-    if !rw_validate(&mut dx, off, total) {
+    if !rw_validate(&dx, off, total) {
         parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
-    let bs = dx.block_size as usize;
+    let bs_u32 = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
+    let bs = bs_u32 as usize;
     let mut remaining = total;
-    let mut lba = (off / dx.block_size as u64) as u64;
+    let mut lba = (off / bs_u32 as u64) as u64;
     let mut parent_off = 0usize;
 
     while remaining > 0 {
-        let max_bytes = (dx.max_blocks as usize).saturating_mul(bs).max(bs);
+        let max_blocks = dx
+            .max_blocks
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(1);
+        let max_bytes = (max_blocks as usize).saturating_mul(bs).max(bs);
         let this_bytes = core::cmp::min(remaining, max_bytes);
         let this_blocks = (this_bytes / bs) as u32;
 
         let hdr_len = core::mem::size_of::<BlockRwIn>();
-        let mut buf = vec![0u8; hdr_len + this_bytes].into_boxed_slice();
+        let mut buf = alloc::vec![0u8; hdr_len + this_bytes].into_boxed_slice();
 
         let hdr = BlockRwIn {
             op: BLOCK_RW_READ,
@@ -177,7 +187,7 @@ pub extern "win64" fn disk_read(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) };
+        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         let child = Arc::new(RwLock::new(Request::new(
             RequestType::DeviceControl(IOCTL_BLOCK_RW),
@@ -195,7 +205,6 @@ pub extern "win64" fn disk_read(
             parent.write().status = c.status;
             return;
         }
-
         let data = &c.data;
         if data.len() < hdr_len {
             parent.write().status = DriverStatus::Unsuccessful;
@@ -244,33 +253,35 @@ pub extern "win64" fn disk_write(
         return;
     }
 
-    let mut dx = disk_ext_mut(dev);
-    if !dx.props_ready {
-        match query_props_sync(dev) {
-            Ok(_) => {}
-            Err(st) => {
-                parent.write().status = st;
-                return;
-            }
+    let dx = disk_ext(dev);
+    if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
+        if let Err(st) = query_props_sync(dev) {
+            parent.write().status = st;
+            return;
         }
     }
-    if !rw_validate(&mut dx, off, total) {
+    if !rw_validate(&dx, off, total) {
         parent.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
-    let bs = dx.block_size as usize;
+    let bs_u32 = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
+    let bs = bs_u32 as usize;
     let mut remaining = total;
-    let mut lba = (off / dx.block_size as u64) as u64;
+    let mut lba = (off / bs_u32 as u64) as u64;
     let mut parent_off = 0usize;
 
     while remaining > 0 {
-        let max_bytes = (dx.max_blocks as usize).saturating_mul(bs).max(bs);
+        let max_blocks = dx
+            .max_blocks
+            .load(core::sync::atomic::Ordering::Acquire)
+            .max(1);
+        let max_bytes = (max_blocks as usize).saturating_mul(bs).max(bs);
         let this_bytes = core::cmp::min(remaining, max_bytes);
         let this_blocks = (this_bytes / bs) as u32;
 
-        let hdr_len = size_of::<BlockRwIn>();
-        let mut buf = vec![0u8; hdr_len + this_bytes].into_boxed_slice();
+        let hdr_len = core::mem::size_of::<BlockRwIn>();
+        let mut buf = alloc::vec![0u8; hdr_len + this_bytes].into_boxed_slice();
 
         let hdr = BlockRwIn {
             op: BLOCK_RW_WRITE,
@@ -279,7 +290,7 @@ pub extern "win64" fn disk_write(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) };
+        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         {
             let p = parent.read();
@@ -327,20 +338,16 @@ pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Req
                 minor_function: PnpMinorFunction::QueryResources,
                 relation: DeviceRelationType::TargetDeviceRelation,
                 id_type: QueryIdType::CompatibleIds,
-                ids_out: Vec::new(),
-                blob_out: Vec::new(),
+                ids_out: alloc::vec::Vec::new(),
+                blob_out: alloc::vec::Vec::new(),
             });
             let ch = Arc::new(RwLock::new(ch));
-
             unsafe { pnp_forward_request_to_next_lower(dev, ch.clone()) };
             unsafe { pnp_wait_for_request(&ch) };
-
             let blob = { ch.read().pnp.as_ref().unwrap().blob_out.clone() };
-            {
-                let mut w = parent.write();
-                w.data = blob.into_boxed_slice();
-                w.status = DriverStatus::Success;
-            }
+            let mut w = parent.write();
+            w.data = blob.into_boxed_slice();
+            w.status = DriverStatus::Success;
         }
         IOCTL_BLOCK_FLUSH => {
             let child = Arc::new(RwLock::new(Request::new(
@@ -360,28 +367,28 @@ pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Req
     }
 }
 
-pub fn disk_ext_mut<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, DiskExt> {
-    dev.try_devext_mut::<DiskExt>()
-        .expect("Failed to get disk dev ext")
+#[inline]
+pub fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
+    dev.try_devext::<DiskExt>().expect("disk dev ext missing")
 }
 
-fn rw_validate(dx: &mut DiskExt, off: u64, total: usize) -> bool {
-    if dx.block_size == 0 {
+#[inline]
+fn rw_validate(dx: &DiskExt, off: u64, total: usize) -> bool {
+    let bs = dx.block_size.load(core::sync::atomic::Ordering::Acquire) as u64;
+    if bs == 0 {
         return false;
     }
-    let bs = dx.block_size as u64;
-    if (off % bs) != 0 {
+    if off % bs != 0 {
         return false;
     }
-    if (total as u64 % bs) != 0 {
+    if (total as u64) % bs != 0 {
         return false;
     }
     true
 }
-
 fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let out_len = size_of::<BlockQueryOut>();
-    let buf = vec![0u8; out_len].into_boxed_slice();
+    let out_len = core::mem::size_of::<BlockQueryOut>();
+    let buf = alloc::vec![0u8; out_len].into_boxed_slice();
     let child = Arc::new(RwLock::new(Request::new(
         RequestType::DeviceControl(IOCTL_BLOCK_QUERY),
         buf,
@@ -393,7 +400,7 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     unsafe { pnp_wait_for_request(&child) };
 
     let c = child.read();
-    if c.status != DriverStatus::Success || c.data.len() < size_of::<BlockQueryOut>() {
+    if c.status != DriverStatus::Success || c.data.len() < core::mem::size_of::<BlockQueryOut>() {
         return Err(if c.status == DriverStatus::Success {
             DriverStatus::Unsuccessful
         } else {
@@ -402,12 +409,17 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     }
 
     let qo = unsafe { *(c.data.as_ptr() as *const BlockQueryOut) };
-    let dx: &mut DiskExt = &mut disk_ext_mut(dev);
-    dx.block_size = qo.block_size.max(1);
-    dx.max_blocks = qo.max_blocks.max(1);
-    dx.alignment_mask = qo.alignment_mask;
-    dx.features = qo.features;
-    dx.props_ready = true;
+    let dx = disk_ext(dev);
+    dx.block_size
+        .store(qo.block_size.max(1), core::sync::atomic::Ordering::Release);
+    dx.max_blocks
+        .store(qo.max_blocks.max(1), core::sync::atomic::Ordering::Release);
+    dx.alignment_mask
+        .store(qo.alignment_mask, core::sync::atomic::Ordering::Release);
+    dx.features
+        .store(qo.features, core::sync::atomic::Ordering::Release);
+    dx.props_ready
+        .store(true, core::sync::atomic::Ordering::Release);
     Ok(())
 }
 

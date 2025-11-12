@@ -5,10 +5,10 @@
 extern crate alloc;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{mem, ptr};
-use kernel_api::{DevExtRefMut, DiskInfo, PartitionInfo};
-use spin::RwLock;
+use kernel_api::{DevExtRef, DevExtRefMut, DiskInfo, PartitionInfo};
+use spin::{Once, RwLock};
 
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, GptHeader, GptPartitionEntry, IoTarget,
@@ -69,20 +69,20 @@ pub extern "win64" fn partmgr_device_add(
 #[derive(Default)]
 struct PartMgrExt {
     enumerated: AtomicBool,
-    disk_info: Option<Vec<u8>>, // raw bytes of DiskInfo (size_of::<DiskInfo>())
+    disk_info: Once<Vec<u8>>, // raw bytes of DiskInfo (size_of::<DiskInfo>())
 }
 
 #[inline]
-pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
-    dev.try_devext_mut().expect("Failed to get partmgr dev ext")
+pub fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
+    dev.try_devext().expect("Failed to get partmgr dev ext")
 }
 
 #[repr(C)]
 #[derive(Default)]
 struct PartDevExt {
-    start_lba: u64,
-    end_lba: u64,
-    part: Option<PartitionInfo>,
+    start_lba: Once<u64>,
+    end_lba: Once<u64>,
+    part: Once<PartitionInfo>,
 }
 
 extern "win64" fn partition_pdo_query_resources(
@@ -91,17 +91,13 @@ extern "win64" fn partition_pdo_query_resources(
 ) -> DriverStatus {
     let mut w = request.write();
     let Some(pnp) = w.pnp.as_mut() else {
-        w.status = DriverStatus::NotImplemented;
         return DriverStatus::Success;
     };
 
-    let dx = ext_mut::<PartDevExt>(device);
-    if let Some(ref pi) = dx.part {
-        let bytes: Box<[u8]> = kernel_api::box_to_bytes(Box::new(pi.clone()));
+    let dx = ext::<PartDevExt>(device);
+    if let Some(pi) = dx.part.get() {
+        let bytes: Box<[u8]> = kernel_api::box_to_bytes(Box::new((*pi).clone()));
         pnp.blob_out = bytes.into_vec();
-        w.status = DriverStatus::Success;
-    } else {
-        w.status = DriverStatus::NotImplemented;
     }
 
     DriverStatus::Success
@@ -140,8 +136,9 @@ pub extern "win64" fn partition_pdo_read(
     request: Arc<RwLock<Request>>,
     buf_len: usize,
 ) {
-    let dx = ext_mut::<PartDevExt>(device);
-
+    let dx = ext::<PartDevExt>(device);
+    let start_lba = *dx.start_lba.get().unwrap();
+    let end_lba = *dx.end_lba.get().unwrap();
     let (off, want) = {
         let r = request.read();
         match r.kind {
@@ -158,13 +155,13 @@ pub extern "win64" fn partition_pdo_read(
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
-    let part_bytes = ((dx.end_lba - dx.start_lba + 1) << 9) as u64;
+    let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
     if (off as u64) + (buf_len as u64) > part_bytes {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
-    let phys_off = off + ((dx.start_lba as u64) << 9);
+    let phys_off = off + ((start_lba as u64) << 9);
 
     let tgt = match parent_target_of(device) {
         Ok(t) => t,
@@ -202,8 +199,9 @@ pub extern "win64" fn partition_pdo_write(
     request: Arc<RwLock<Request>>,
     buf_len: usize,
 ) {
-    let dx = ext_mut::<PartDevExt>(device);
-
+    let dx = ext::<PartDevExt>(device);
+    let start_lba = *dx.start_lba.get().unwrap();
+    let end_lba = *dx.end_lba.get().unwrap();
     let (off, want) = {
         let r = request.read();
         match r.kind {
@@ -220,13 +218,13 @@ pub extern "win64" fn partition_pdo_write(
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
-    let part_bytes = ((dx.end_lba - dx.start_lba + 1) << 9) as u64;
+    let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
     if (off as u64) + (buf_len as u64) > part_bytes {
         request.write().status = DriverStatus::InvalidParameter;
         return;
     }
 
-    let phys_off = off + ((dx.start_lba as u64) << 9);
+    let phys_off = off + ((start_lba as u64) << 9);
 
     let moved = {
         let mut w = request.write();
@@ -263,11 +261,7 @@ extern "win64" fn partmgr_start(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let mut dx = ext_mut::<PartMgrExt>(dev);
-    *dx = PartMgrExt {
-        enumerated: AtomicBool::new(false),
-        disk_info: None,
-    };
+    let mut dx = ext::<PartMgrExt>(dev);
 
     let parent = Arc::new(RwLock::new(Request::new(
         RequestType::DeviceControl(IOCTL_DRIVE_IDENTIFY),
@@ -281,9 +275,7 @@ extern "win64" fn partmgr_start(
         (g.status, g.data.clone())
     };
     if st == DriverStatus::Success && data.len() == core::mem::size_of::<DiskInfo>() {
-        dx.disk_info = Some(data.into_vec());
-    } else {
-        dx.disk_info = None;
+        dx.disk_info.call_once(|| data.into_vec());
     }
 
     if req.read().status == DriverStatus::Pending {
@@ -326,7 +318,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
         return DriverStatus::Pending;
     }
 
-    let pmx = ext_mut::<PartMgrExt>(device);
+    let pmx = ext::<PartMgrExt>(device);
     if pmx
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
@@ -335,7 +327,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
         return DriverStatus::Success;
     }
 
-    let di = if let Some(ref buf) = pmx.disk_info {
+    let di = if let Some(ref buf) = pmx.disk_info.get() {
         if buf.len() == core::mem::size_of::<DiskInfo>() {
             unsafe { ptr::read_unaligned(buf.as_ptr() as *const DiskInfo) }
         } else {
@@ -462,16 +454,16 @@ extern "win64" fn partmgr_pnp_query_devrels(
             )
         };
 
-        let mut pext = ext_mut::<PartDevExt>(&pdo);
-        pext.start_lba = e.first_lba;
-        pext.end_lba = e.last_lba;
+        let pext = ext::<PartDevExt>(&pdo);
+        pext.start_lba.call_once(|| e.first_lba);
+        pext.end_lba.call_once(|| e.last_lba);
 
         let part_pi = PartitionInfo {
             disk: di,
             gpt_header: Some(hdr),
             gpt_entry: Some(e),
         };
-        pext.part = Some(part_pi);
+        pext.part.call_once(|| part_pi);
     }
 
     request.write().status = DriverStatus::Success;

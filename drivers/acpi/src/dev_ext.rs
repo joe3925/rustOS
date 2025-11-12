@@ -1,12 +1,12 @@
-use core::mem::MaybeUninit;
+use core::{mem::MaybeUninit, sync::atomic::AtomicBool};
 
 use alloc::sync::Arc;
 use aml::AmlContext;
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 #[repr(C)]
 #[derive(Default)]
 pub struct DevExt {
-    pub ctx: Option<Arc<RwLock<AmlContext>>>,
-    pub i8042_hint: bool,
+    pub ctx: Once<Arc<RwLock<AmlContext>>>,
+    pub i8042_hint: AtomicBool,
 }

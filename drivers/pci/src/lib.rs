@@ -29,7 +29,7 @@ use kernel_api::{
     },
     println,
 };
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
@@ -62,7 +62,7 @@ pub extern "win64" fn bus_driver_device_add(
     dev_init.pnp_vtable = Some(vt);
 
     dev_init.set_dev_ext_from(DevExt {
-        segments: Vec::new(),
+        segments: Once::new(),
     });
 
     DriverStatus::Success
@@ -103,21 +103,23 @@ extern "win64" fn pci_bus_pnp_start(
 
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
+            return DriverStatus::Success;
         }
 
-        if let Ok(mut ext) = device.try_devext_mut::<DevExt>() {
-            ext.segments = segs;
+        if let Ok(ext) = device.try_devext::<DevExt>() {
+            ext.segments.call_once(|| segs);
         } else {
-            req.write().status = DriverStatus::NoSuchDevice;
             return DriverStatus::Success;
         }
     } else {
         // Fallback derive segments from parent using platform-specific probe
-        let ext_val = load_segments_from_parent(device);
-        if let Ok(mut ext) = device.try_devext_mut::<DevExt>() {
-            ext.segments = ext_val.segments;
+        let segs = load_segments_from_parent(device);
+        if let Ok(ext) = device.try_devext::<DevExt>() {
+            println!("segs set");
+            if !segs.is_empty() {
+                ext.segments.call_once(|| segs);
+            }
         } else {
-            req.write().status = DriverStatus::NoSuchDevice;
             return DriverStatus::Success;
         }
     }
@@ -170,7 +172,7 @@ pub extern "win64" fn enumerate_bus(
         }
     };
 
-    if ext.segments.is_empty() {
+    if ext.segments.get().is_none() {
         println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
         for bus in 0u8..=255 {
             for dev in 0u8..32 {
@@ -190,7 +192,7 @@ pub extern "win64" fn enumerate_bus(
         return DriverStatus::Success;
     }
 
-    for seg in &ext.segments {
+    for seg in ext.segments.get().unwrap() {
         for bus in seg.start_bus..=seg.end_bus {
             for dev in 0u8..32 {
                 let ht = match header_type(seg, bus, dev) {

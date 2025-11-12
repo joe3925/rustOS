@@ -766,7 +766,7 @@ extern "win64" fn acpi_pdo_query_resources(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
-    let pext: &mut AcpiPdoExt = &mut dev.try_devext_mut().expect("Failed to get devext");
+    let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ctx_lock = &pext.ctx;
 
@@ -790,7 +790,7 @@ extern "win64" fn acpi_pdo_query_id(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
-    let pext: &mut AcpiPdoExt = &mut dev.try_devext_mut().expect("Failed to get devext");
+    let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
 

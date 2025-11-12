@@ -118,22 +118,6 @@ impl DeviceObject {
         })
     }
 
-    pub fn try_devext_mut<'a, T: 'static>(&'a self) -> Result<DevExtRefMut<'a, T>, DevExtError> {
-        if !self.dev_ext.present {
-            return Err(DevExtError::NotPresent);
-        }
-        if self.dev_ext.ty != TypeId::of::<T>() {
-            return Err(DevExtError::TypeMismatch {
-                expected: type_name::<T>(),
-            });
-        }
-        let p = NonNull::new(self.dev_ext.as_mut_ptr::<T>()).unwrap();
-        Ok(DevExtRefMut {
-            ptr: p,
-            _lt: PhantomData,
-            _nosend: PhantomData,
-        })
-    }
     pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
         this.lower_device.call_once(|| lower.clone());
         *lower.upper_device.write() = Some(Arc::downgrade(this));

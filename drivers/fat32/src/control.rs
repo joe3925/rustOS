@@ -12,8 +12,8 @@ use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus, FsIdentify,
-    GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
+    DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
+    FsIdentify, GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
     PnpMinorFunction, QueryIdType, Request, RequestType,
     alloc_api::{
         DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
@@ -31,8 +31,8 @@ use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 #[inline]
-pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRefMut<'a, T> {
-    dev.try_devext_mut().expect("Failed to get fat32 dev ext")
+pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
+    dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
 pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {

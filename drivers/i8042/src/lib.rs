@@ -5,7 +5,10 @@
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
-use core::panic::PanicInfo;
+use core::{
+    panic::PanicInfo,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use kernel_api::{
     DevNode, DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction,
     QueryIdType, Request,
@@ -30,9 +33,9 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[repr(C)]
 pub struct DevExt {
-    probed: bool,
-    have_kbd: bool,
-    have_mouse: bool,
+    probed: AtomicBool,
+    have_kbd: AtomicBool,
+    have_mouse: AtomicBool,
 }
 
 #[repr(C)]
@@ -57,20 +60,19 @@ pub extern "win64" fn ps2_device_add(
 
     dev_init.pnp_vtable = Some(pnp);
     dev_init.set_dev_ext_from(DevExt {
-        probed: false,
-        have_kbd: false,
-        have_mouse: false,
+        probed: AtomicBool::new(false),
+        have_kbd: AtomicBool::new(false),
+        have_mouse: AtomicBool::new(false),
     });
     DriverStatus::Success
 }
 
 extern "win64" fn ps2_start(dev: &Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
-    if let Ok(mut ext) = dev.try_devext_mut::<DevExt>() {
-        if !ext.probed {
+    if let Ok(mut ext) = dev.try_devext::<DevExt>() {
+        if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
-            ext.probed = true;
-            ext.have_kbd = have_kbd;
-            ext.have_mouse = have_mouse;
+            ext.have_kbd.store(have_kbd, Ordering::Release);
+            ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
         return DriverStatus::NoSuchDevice;
@@ -105,7 +107,7 @@ extern "win64" fn ps2_query_devrels(
         }
     };
 
-    if ext.have_kbd {
+    if ext.have_kbd.load(Ordering::Acquire) {
         make_child_pdo(
             &devnode,
             true,
@@ -116,7 +118,7 @@ extern "win64" fn ps2_query_devrels(
             "\\Device\\Ps2Keyboard",
         );
     }
-    if ext.have_mouse {
+    if ext.have_mouse.load(Ordering::Acquire) {
         make_child_pdo(
             &devnode,
             false,
