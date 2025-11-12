@@ -130,6 +130,8 @@ pub extern "win64" fn enumerate_bus(
     let parent_dev_node = unsafe {
         (*(Arc::as_ptr(device) as *const DeviceObject))
             .dev_node
+            .get()
+            .unwrap()
             .upgrade()
             .expect("ACPI PDO has no DevNode")
     };

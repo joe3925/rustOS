@@ -157,10 +157,7 @@ impl PnpManager {
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
         let pdo = DeviceObject::new(DeviceInit::new(IoVtable::new(), None));
-        unsafe {
-            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
-            p.dev_node = Arc::downgrade(&dev_node);
-        }
+        pdo.attach_devnode(&dev_node);
         dev_node.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
@@ -187,10 +184,8 @@ impl PnpManager {
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
         let pdo = DeviceObject::new(init);
-        unsafe {
-            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
-            p.dev_node = Arc::downgrade(&dev_node);
-        }
+        pdo.attach_devnode(&dev_node);
+
         dev_node.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
@@ -573,11 +568,10 @@ impl PnpManager {
             let st = cb(drv, &mut dev_init);
             if st == DriverStatus::Success {
                 let devobj = DeviceObject::new(dev_init);
-                unsafe {
-                    let me = &mut *(Arc::as_ptr(&devobj) as *mut DeviceObject);
-                    me.dev_node = Arc::downgrade(dn);
+                devobj.attach_devnode(&dn);
+                if let Some(lower) = below {
+                    DeviceObject::set_lower_upper(&devobj, lower);
                 }
-                DeviceObject::set_lower_upper(&devobj, below);
 
                 let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
                 let _ = OBJECT_MANAGER.mkdir_p(stack_dir.clone());
@@ -639,25 +633,24 @@ impl PnpManager {
             let stk = guard.as_mut().unwrap();
 
             {
-                let mut layers: Vec<*mut StackLayer> = Vec::new();
-                for l in stk.lower.iter_mut() {
-                    layers.push(l as *mut _);
-                }
-                if let Some(f) = stk.function.as_mut() {
-                    layers.push(f as *mut _);
-                }
-                for u in stk.upper.iter_mut() {
-                    layers.push(u as *mut _);
-                }
-
                 let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
-                for layer_ptr in layers {
-                    let layer = unsafe { &mut *layer_ptr };
-                    let drv = &layer.driver;
-                    if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), drv) {
+
+                let mut attach = |layer: &mut StackLayer| {
+                    if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &layer.driver)
+                    {
                         layer.devobj = Some(devobj.clone());
                         prev_do = Some(devobj);
                     }
+                };
+
+                for layer in &mut stk.lower {
+                    attach(layer);
+                }
+                if let Some(layer) = stk.function.as_mut() {
+                    attach(layer);
+                }
+                for layer in &mut stk.upper {
+                    attach(layer);
                 }
             }
 
@@ -678,7 +671,9 @@ impl PnpManager {
                     .chain(stk.upper.iter());
                 for layer in all {
                     let current_do = layer.devobj.as_ref().unwrap();
-                    DeviceObject::set_lower_upper(current_do, current_bottom.clone());
+                    if let Some(bottom) = current_bottom {
+                        DeviceObject::set_lower_upper(current_do, bottom.clone());
+                    }
                     current_bottom = Some(current_do.clone());
                 }
                 current_bottom
@@ -1091,11 +1086,7 @@ impl PnpManager {
         *dn.stack.write() = Some(DeviceStack::new());
 
         let pdo = DeviceObject::new(init_pdo);
-        // TODO: MAJOR remove this unsafe pattern
-        unsafe {
-            let p = &mut *(Arc::as_ptr(&pdo) as *mut DeviceObject);
-            p.dev_node = Arc::downgrade(&dn);
-        }
+        pdo.attach_devnode(&dn);
         dn.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dn.instance_path);
@@ -1168,12 +1159,8 @@ impl PnpManager {
                     prev = dobj;
                 }
             }
-
-            unsafe {
-                let me = &mut *(Arc::as_ptr(&function_fdo) as *mut DeviceObject);
-                me.dev_node = Arc::downgrade(&dn);
-            }
-            DeviceObject::set_lower_upper(&function_fdo, Some(prev.clone()));
+            function_fdo.attach_devnode(&dn);
+            DeviceObject::set_lower_upper(&function_fdo, prev.clone());
             let uniq = (Arc::as_ptr(&function_fdo) as usize) as u64;
             let leaf = alloc::format!("{}-{:x}", func_drv.driver_name, uniq);
             let obj = Object::with_name(
@@ -1235,9 +1222,6 @@ impl PnpManager {
         init.pnp_vtable = None;
 
         let dev = DeviceObject::new(init);
-        unsafe {
-            let p = &mut *(Arc::as_ptr(&dev) as *mut DeviceObject);
-        }
 
         let base = alloc::format!("\\Device\\Control\\{}", name);
         let _ = OBJECT_MANAGER.mkdir_p("\\Device\\Control".to_string());

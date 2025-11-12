@@ -154,9 +154,9 @@ impl PnpManager {
         from: &Arc<DeviceObject>,
         req: Arc<RwLock<Request>>,
     ) -> DriverStatus {
-        if let Some(target_dev) = from.lower_device.clone() {
+        if let Some(target_dev) = from.lower_device.get() {
             let target = IoTarget {
-                target_device: target_dev,
+                target_device: target_dev.clone(),
             };
             self.send_request(&target, req)
         } else {

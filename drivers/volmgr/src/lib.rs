@@ -177,7 +177,7 @@ pub extern "win64" fn vol_enumerate_devices(
         return DriverStatus::Success;
     }
 
-    let parent_dn = if let Some(dn) = device.dev_node.upgrade() {
+    let parent_dn = if let Some(dn) = device.dev_node.get().unwrap().upgrade() {
         dn
     } else {
         request.write().status = DriverStatus::Unsuccessful;

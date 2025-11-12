@@ -269,7 +269,14 @@ pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwL
 
 fn init_volume_dx(dev: &Arc<DeviceObject>) {
     let vid = NEXT_VOL_ID.fetch_add(1, Ordering::AcqRel);
-    let inst = dev.dev_node.upgrade().unwrap().instance_path.clone();
+    let inst = dev
+        .dev_node
+        .get()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+        .instance_path
+        .clone();
 
     let mut dx = ext_mut::<VolFdoExt>(dev);
     *dx = VolFdoExt::blank();
@@ -317,7 +324,7 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
     let dx_vol = ext_mut::<VolFdoExt>(parent_fdo);
     let vid = dx_vol.vid;
     let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
-    let parent_dn = match parent_fdo.dev_node.upgrade() {
+    let parent_dn = match parent_fdo.dev_node.get().unwrap().upgrade() {
         Some(x) => x,
         None => {
             return false;

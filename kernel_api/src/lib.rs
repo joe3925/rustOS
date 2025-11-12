@@ -22,6 +22,7 @@ use core::ops::{ControlFlow, Deref, DerefMut, FromResidual, Try};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
 use ffi::random_number;
+use spin::Once;
 use spin::{Mutex, RwLock};
 use strum::Display;
 pub use x86_64;
@@ -59,13 +60,13 @@ unsafe impl GlobalAlloc for KernelAllocator {
 #[repr(C)]
 
 pub struct DeviceObject {
-    pub lower_device: Option<Arc<DeviceObject>>,
+    pub lower_device: Once<Arc<DeviceObject>>,
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
     dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
     pub dispatch_tickets: AtomicU32,
-    pub dev_node: Weak<DevNode>,
+    pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
 }
 
@@ -73,13 +74,13 @@ impl DeviceObject {
     pub fn new(mut init: DeviceInit) -> Arc<Self> {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
         Arc::new(Self {
-            lower_device: None,
+            lower_device: Once::new(),
             upper_device: RwLock::new(None),
             dev_ext,
             dev_init: init,
             queue: Mutex::new(VecDeque::new()),
             dispatch_tickets: AtomicU32::new(0),
-            dev_node: Weak::new(),
+            dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
         })
     }
@@ -115,6 +116,13 @@ impl DeviceObject {
             _lt: PhantomData,
             _nosend: PhantomData,
         })
+    }
+    pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
+        this.lower_device.call_once(|| lower.clone());
+        *lower.upper_device.write() = Some(Arc::downgrade(this));
+    }
+    pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
+        self.dev_node.call_once(|| Arc::downgrade(dn));
     }
 }
 

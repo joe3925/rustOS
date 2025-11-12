@@ -107,17 +107,21 @@ extern "win64" fn partition_pdo_query_resources(
     DriverStatus::Success
 }
 
-fn parent_target_of(from: &Arc<DeviceObject>) -> Result<IoTarget, DriverStatus> {
-    let parent_inst = from
-        .dev_node
-        .upgrade()
-        .and_then(|dn| dn.parent.read().as_ref().and_then(|w| w.upgrade()))
-        .map(|p| p.instance_path.clone())
-        .ok_or(DriverStatus::NoSuchDevice)?;
+pub fn parent_target_of(from: &Arc<DeviceObject>) -> Result<IoTarget, DriverStatus> {
+    let parent_inst = {
+        let dn = from
+            .dev_node
+            .get()
+            .and_then(|w| w.upgrade())
+            .ok_or(DriverStatus::NoSuchDevice)?;
+        let pw = { dn.parent.read().clone() };
+        pw.and_then(|w| w.upgrade())
+            .map(|p| p.instance_path.clone())
+            .ok_or(DriverStatus::NoSuchDevice)?
+    };
 
-    unsafe { pnp_get_device_target(&parent_inst) }.ok_or(DriverStatus::NoSuchDevice)
+    unsafe { pnp_get_device_target(&parent_inst).ok_or(DriverStatus::NoSuchDevice) }
 }
-
 fn send_child_sync(tgt: &IoTarget, req: Request) -> Result<Box<[u8]>, DriverStatus> {
     let child = Arc::new(RwLock::new(req));
     unsafe { pnp_send_request(tgt, child.clone()) };
@@ -386,7 +390,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
         }
     };
 
-    let parent_dn = match device.dev_node.upgrade() {
+    let parent_dn = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             request.write().status = DriverStatus::Unsuccessful;

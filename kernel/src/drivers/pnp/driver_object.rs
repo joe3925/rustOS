@@ -10,7 +10,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::ops::FromResidual;
 use core::{
     any::{type_name, Any, TypeId},
     cell::UnsafeCell,
@@ -20,7 +19,8 @@ use core::{
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
-use spin::{Mutex, RwLock};
+use core::{cell::OnceCell, ops::FromResidual};
+use spin::{Mutex, Once, RwLock};
 use strum::Display;
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,26 +78,26 @@ pub struct ReqJob {
 #[repr(C)]
 
 pub struct DeviceObject {
-    pub lower_device: Option<Arc<DeviceObject>>,
+    pub lower_device: Once<Arc<DeviceObject>>,
     pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
     dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
     pub dispatch_tickets: AtomicU32,
-    pub dev_node: Weak<DevNode>,
+    pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
 }
 impl DeviceObject {
     pub fn new(mut init: DeviceInit) -> Arc<Self> {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
         Arc::new(Self {
-            lower_device: None,
+            lower_device: Once::new(),
             upper_device: RwLock::new(None),
             dev_ext,
             dev_init: init,
             queue: Mutex::new(VecDeque::new()),
             dispatch_tickets: AtomicU32::new(0),
-            dev_node: Weak::new(),
+            dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
         })
     }
@@ -134,14 +134,12 @@ impl DeviceObject {
             _nosend: PhantomData,
         })
     }
-    pub fn set_lower_upper(this: &Arc<Self>, lower: Option<Arc<DeviceObject>>) {
-        unsafe {
-            let me = &mut *(Arc::as_ptr(this) as *mut DeviceObject);
-            me.lower_device = lower.clone();
-        }
-        if let Some(low) = lower {
-            *low.upper_device.write() = Some(Arc::downgrade(this));
-        }
+    pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
+        this.lower_device.call_once(|| lower.clone());
+        *lower.upper_device.write() = Some(Arc::downgrade(this));
+    }
+    pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
+        self.dev_node.call_once(|| Arc::downgrade(dn));
     }
 }
 fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {

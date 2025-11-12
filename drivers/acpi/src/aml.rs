@@ -820,7 +820,7 @@ extern "win64" fn acpi_pdo_query_id(
             }
         }
         QueryIdType::InstanceId => {
-            if let Some(dn) = dev.dev_node.upgrade() {
+            if let Some(dn) = dev.dev_node.get().unwrap().upgrade() {
                 p.ids_out.push(dn.instance_path.clone());
             } else {
                 w.status = kernel_api::DriverStatus::NoSuchDevice;

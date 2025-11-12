@@ -260,12 +260,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 
     let class = Some("disk".to_string());
 
-    let parent_dn = unsafe {
-        (*(Arc::as_ptr(parent) as *const DeviceObject))
-            .dev_node
-            .upgrade()
-            .expect("IDE FDO has no DevNode")
-    };
+    let parent_dn = parent.dev_node.get().unwrap().upgrade().unwrap();
 
     let ids = DeviceIds {
         hardware,
@@ -742,8 +737,15 @@ extern "win64" fn ide_pdo_query_id(
             p.ids_out.push("IDE\\Disk".into());
         }
         InstanceId => {
-            p.ids_out
-                .push(pdo.dev_node.upgrade().unwrap().instance_path.clone());
+            p.ids_out.push(
+                pdo.dev_node
+                    .get()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .instance_path
+                    .clone(),
+            );
         }
     }
     w.status = DriverStatus::Success;

@@ -154,7 +154,7 @@ pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
     _req: &mut Request,
 ) -> DriverStatus {
-    let devnode = match device.dev_node.upgrade() {
+    let devnode = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             println!("[PCI] PDO missing DevNode");

@@ -89,7 +89,7 @@ extern "win64" fn ps2_query_devrels(
         return DriverStatus::Pending;
     }
 
-    let devnode: Arc<DevNode> = match device.dev_node.upgrade() {
+    let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             req.write().status = DriverStatus::NoSuchDevice;

@@ -236,10 +236,10 @@ pub extern "win64" fn InvalidateDeviceRelations(
     relation: DeviceRelationType,
 ) -> DriverStatus {
     let mgr = &*PNP_MANAGER;
-    let Some(dn) = device.dev_node.upgrade() else {
+    let Some(dn) = device.dev_node.get() else {
         return DriverStatus::NoSuchDevice;
     };
-    mgr.invalidate_device_relations_for_node(&dn, relation)
+    mgr.invalidate_device_relations_for_node(&dn.upgrade().unwrap(), relation)
 }
 #[inline]
 fn map_om_result(res: Result<(), crate::object_manager::OmError>) -> DriverStatus {

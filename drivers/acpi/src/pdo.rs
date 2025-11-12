@@ -13,7 +13,7 @@ use crate::aml::{McfgSeg, append_ecam_list, build_query_resources_blob, read_ids
 pub struct AcpiPdoExt {
     pub acpi_path: aml::AmlName,
     pub ctx: Arc<spin::RwLock<aml::AmlContext>>,
-    pub ecam: alloc::vec::Vec<McfgSeg>, // only non-empty for PCIe root bridges
+    pub ecam: alloc::vec::Vec<McfgSeg>,
 }
 
 #[unsafe(no_mangle)]
