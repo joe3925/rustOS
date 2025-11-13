@@ -533,7 +533,7 @@ struct BootReqCtx {
     which: u8,
 }
 
-extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) {
+extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> DriverStatus {
     let reqctx: Box<BootReqCtx> = unsafe { Box::from_raw(ctx as *mut BootReqCtx) };
     let ok = if r.status == DriverStatus::Success
         && r.data.len() == core::mem::size_of::<kernel_api::FsOpenResult>()
@@ -574,6 +574,7 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) {
             drop(Box::from_raw(reqctx.probe));
         }
     }
+    return DriverStatus::Success;
 }
 
 fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut BootProbe) {
@@ -623,7 +624,10 @@ fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus 
             println!("System volume mounted at '{}'", fs_mount_link);
             DriverStatus::Success
         }
-        Err(e) => panic!("VFS transition failed {:#?}", e),
+        Err(e) => {
+            println!("Error: {:#?}", e);
+            panic!("VFS transition failed {:#?}", e);
+        }
     }
 }
 

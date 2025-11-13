@@ -751,22 +751,16 @@ pub enum Data {
 
 #[derive(Debug)]
 #[repr(u32)]
-
 pub enum RegError {
-    File(FileStatus),
     KeyAlreadyExists,
     KeyNotFound,
     ValueNotFound,
     PersistenceFailed,
     EncodingFailed,
     CorruptReg,
+    FileIO,
 }
 
-impl From<FileStatus> for RegError {
-    fn from(e: FileStatus) -> Self {
-        RegError::File(e)
-    }
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ResourceKind {
@@ -1008,7 +1002,8 @@ pub mod alloc_api {
     pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
     pub type ClassAddCallback =
         extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
-    pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
+    pub type CompletionRoutine =
+        extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
     pub type PnpMinorCallback =
         extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 

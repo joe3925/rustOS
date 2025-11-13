@@ -40,20 +40,15 @@ pub enum Data {
 #[derive(Debug)]
 #[repr(u32)]
 pub enum RegError {
-    File(crate::file_system::file::FileStatus),
     KeyAlreadyExists,
     KeyNotFound,
     ValueNotFound,
     PersistenceFailed,
     EncodingFailed,
     CorruptReg,
+    FileIO,
 }
 
-impl From<crate::file_system::file::FileStatus> for RegError {
-    fn from(e: crate::file_system::file::FileStatus) -> Self {
-        RegError::File(e)
-    }
-}
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Key {
     pub values: BTreeMap<String, Data>,
@@ -328,8 +323,12 @@ pub mod reg {
 
         *REGISTRY.write() = Arc::new(new_reg.clone());
 
-        let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])?;
-        file.write(&bytes).map_err(RegError::from)
+        let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])
+            .ok()
+            .ok_or(RegError::FileIO)?;
+
+        file.write(&bytes).ok().ok_or(RegError::FileIO)?;
+        Ok(())
     }
     pub fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
         fn join(base: &str, seg: &str) -> String {
@@ -393,8 +392,10 @@ pub mod reg {
     fn load_from_disk() -> Result<super::Registry, RegError> {
         use bincode::config::standard;
 
-        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])?;
-        let buf = f.read()?;
+        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])
+            .ok()
+            .ok_or(RegError::FileIO)?;
+        let buf = f.read().ok().ok_or(RegError::FileIO)?;
         let (r, _) = bincode::decode_from_slice::<super::Registry, _>(&buf, standard())
             .map_err(|_| RegError::CorruptReg)?;
         Ok(r)
@@ -464,8 +465,13 @@ pub mod reg {
         ensure_loaded();
         let current = (**REGISTRY.read()).clone();
 
-        let on_disk = load_from_disk()?;
-        let deltas = diff_registry(&on_disk, &current);
+        let on_disk = match load_from_disk() {
+            Ok(r) => r,
+            Err(RegError::FileIO) | Err(RegError::CorruptReg) => super::Registry::empty(),
+            Err(e) => return Err(e),
+        };
+
+        let _deltas = diff_registry(&on_disk, &current);
 
         persist(&current)?;
         Ok(())

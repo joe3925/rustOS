@@ -181,16 +181,7 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
 
     if i_am_owner {
         println!("\n=== KERNEL PANIC [{}] ===", mod_name);
-        if let Some(loc) = info.location() {
-            println!("at: \n {}:{}:{} \n", loc.file(), loc.line(), loc.column());
-        }
-        if let Some(s) = info.message().as_str() {
-            println!("msg:\n {}", s);
-        } else {
-            let s = info.message().to_string();
-            println!("msg: {}", s);
-        }
-
+        println!("\n{}", info);
         unsafe {
             APIC.lock()
                 .as_ref()

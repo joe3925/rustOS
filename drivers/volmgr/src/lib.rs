@@ -242,7 +242,7 @@ struct BridgeCtx {
     parent: Arc<RwLock<Request>>,
 }
 
-extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) {
+extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStatus {
     let boxed = unsafe { Box::from_raw(ctx as *mut BridgeCtx) };
     let parent = boxed.parent;
     {
@@ -254,6 +254,7 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) {
         }
     }
     unsafe { pnp_complete_request(&parent) };
+    return DriverStatus::Success;
 }
 
 pub extern "win64" fn vol_pdo_read(

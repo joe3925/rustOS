@@ -372,8 +372,13 @@ impl Vfs {
 
         let call_open = |this: &Self, link: &String, path: String, flags: OpenFlags| {
             let inner = FsOpenParams { flags, path };
-            match this.call_fs(link, FsOp::Open, inner) {
-                Ok(r) => (r, DriverStatus::Success),
+            match this.call_fs::<FsOpenParams, FsOpenResult>(link, FsOp::Open, inner) {
+                Ok(mut r) => {
+                    if matches!(r.error, Some(FileStatus::Success)) {
+                        r.error = None;
+                    }
+                    (r, DriverStatus::Success)
+                }
                 Err(st) => (
                     FsOpenResult {
                         fs_file_id: 0,
@@ -408,20 +413,24 @@ impl Vfs {
                     }
                 };
                 if let Some(e) = cres.error {
-                    return (
-                        FsOpenResult {
-                            fs_file_id: 0,
-                            is_dir: false,
-                            size: 0,
-                            error: Some(e),
-                        },
-                        DriverStatus::Success,
-                    );
+                    if e != FileStatus::Success {
+                        return (
+                            FsOpenResult {
+                                fs_file_id: 0,
+                                is_dir: false,
+                                size: 0,
+                                error: Some(e),
+                            },
+                            DriverStatus::Success,
+                        );
+                    }
                 }
+
                 let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open);
-                if inner_res.error.is_some() {
+                if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st);
                 }
+
                 let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
                 self.handles.write().insert(
                     vhid,
@@ -488,20 +497,24 @@ impl Vfs {
                         }
                     };
                     if let Some(e) = cres.error {
-                        return (
-                            FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(e),
-                            },
-                            DriverStatus::Success,
-                        );
+                        if e != FileStatus::Success {
+                            return (
+                                FsOpenResult {
+                                    fs_file_id: 0,
+                                    is_dir: false,
+                                    size: 0,
+                                    error: Some(e),
+                                },
+                                DriverStatus::Success,
+                            );
+                        }
                     }
+
                     let (inner_res, st2) = call_open(self, &symlink, fs_path, OpenFlags::Open);
-                    if inner_res.error.is_some() {
+                    if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                         return (inner_res, st2);
                     }
+
                     let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
                     self.handles.write().insert(
                         vhid,
@@ -526,7 +539,7 @@ impl Vfs {
 
             OpenFlags::Open | OpenFlags::ReadOnly | OpenFlags::WriteOnly | OpenFlags::ReadWrite => {
                 let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open);
-                if inner_res.error.is_some() {
+                if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st);
                 }
                 let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);

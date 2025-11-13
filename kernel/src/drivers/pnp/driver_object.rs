@@ -36,7 +36,6 @@ pub enum DriverStatus {
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
 }
-
 impl Try for DriverStatus {
     type Output = ();
     type Residual = DriverStatus;

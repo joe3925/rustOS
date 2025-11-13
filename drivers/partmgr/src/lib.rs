@@ -278,9 +278,6 @@ extern "win64" fn partmgr_start(
         dx.disk_info.call_once(|| data.into_vec());
     }
 
-    if req.read().status == DriverStatus::Pending {
-        req.write().status = DriverStatus::Success;
-    }
     DriverStatus::Success
 }
 
@@ -314,7 +311,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
 
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != DeviceRelationType::BusRelations {
-        request.write().status = DriverStatus::Pending;
         return DriverStatus::Pending;
     }
 
@@ -323,7 +319,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
@@ -331,16 +326,13 @@ extern "win64" fn partmgr_pnp_query_devrels(
         if buf.len() == core::mem::size_of::<DiskInfo>() {
             unsafe { ptr::read_unaligned(buf.as_ptr() as *const DiskInfo) }
         } else {
-            request.write().status = DriverStatus::Success;
             return DriverStatus::Success;
         }
     } else {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     };
     let sec_sz_u32 = di.logical_block_size;
     if sec_sz_u32 == 0 {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
     let sec_sz = sec_sz_u32 as usize;
@@ -354,7 +346,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
     };
 
     if hdr_bytes.len() < core::mem::size_of::<GptHeader>() {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
@@ -364,7 +355,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
         || hdr.partition_entry_size != 128
         || hdr.num_partition_entries == 0
     {
-        request.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
 
@@ -377,7 +367,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
     ) {
         Ok(b) => b,
         Err(_) => {
-            request.write().status = DriverStatus::Success;
             return DriverStatus::Success;
         }
     };
@@ -385,7 +374,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
     let parent_dn = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            request.write().status = DriverStatus::Unsuccessful;
             return DriverStatus::Success;
         }
     };
@@ -466,7 +454,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
         pext.part.call_once(|| part_pi);
     }
 
-    request.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
 

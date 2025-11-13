@@ -152,7 +152,6 @@ impl File {
     }
 
     pub extern "win64" fn check_path(path: &str) -> Result<(), FileStatus> {
-        // Basic validation kept for callers that relied on it
         let sanitized = Self::remove_drive_from_path(path);
         let parts = sanitized.trim_matches('\\').split('\\');
         for comp in parts {
@@ -321,7 +320,7 @@ pub fn switch_to_vfs() -> Result<(), RegError> {
     ensure_dir(vfs_mod);
     ensure_dir(vfs_toml);
     if (is_first_boot()) {
-        install_prepacked_drivers();
+        //install_prepacked_drivers();
     }
     Ok(())
 }

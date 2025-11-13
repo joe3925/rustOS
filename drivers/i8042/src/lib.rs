@@ -240,10 +240,6 @@ extern "win64" fn ps2_child_start(
     _dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let mut r = req.write();
-    if r.status == DriverStatus::Pending {
-        r.status = DriverStatus::Success;
-    }
     DriverStatus::Success
 }
 

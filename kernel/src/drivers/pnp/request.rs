@@ -23,7 +23,8 @@ pub struct IoTarget {
 }
 
 pub type DpcFn = extern "win64" fn(usize);
-pub type CompletionRoutine = extern "win64" fn(request: &mut Request, context: usize);
+pub type CompletionRoutine =
+    extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
 
 static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 const START_THREADS: usize = 12;
@@ -146,7 +147,7 @@ impl PnpManager {
     pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
         target.target_device.queue.lock().push_back(req);
         self.schedule_device_dispatch(&target.target_device);
-        DriverStatus::Pending
+        DriverStatus::Success
     }
 
     pub fn send_request_to_next_lower(
@@ -165,17 +166,23 @@ impl PnpManager {
     }
 
     pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
-        let (func_addr, ctx, req_ptr) = {
+        let (func_addr, ctx) = {
             let mut g = req_arc.write();
             let f = g.completion_routine.take().map(|fp| fp as usize);
             let ctx = g.completion_context;
             g.completed = true;
-            let p = (&mut *g) as *mut Request;
-            (f, ctx, p)
+            (f, ctx)
         };
+
         if let Some(addr) = func_addr {
             let f: CompletionRoutine = unsafe { core::mem::transmute(addr) };
-            unsafe { f(&mut *req_ptr, ctx) };
+            let ref_req = &mut req_arc.write();
+            ref_req.status = f(ref_req, ctx);
+        }
+        let mut req = req_arc.write();
+        // Drivers should never return pending in the completion routine
+        if req.status == DriverStatus::Pending {
+            req.status = DriverStatus::Success;
         }
     }
 
@@ -232,25 +239,7 @@ impl PnpManager {
         if st == DriverStatus::Pending {
             let fwd = self.send_request_to_next_lower(dev, req_arc.clone());
             if fwd == DriverStatus::NoSuchDevice {
-                let mut should_complete = false;
-                {
-                    let mut g = req_arc.write();
-                    if let Some(pnp) = g.pnp.as_ref() {
-                        g.status = match pnp.minor_function {
-                            PnpMinorFunction::StartDevice
-                            | PnpMinorFunction::QueryDeviceRelations => DriverStatus::Success,
-                            _ => DriverStatus::NotImplemented,
-                        };
-                    } else {
-                        g.status = DriverStatus::NotImplemented;
-                    }
-                    if !g.completed {
-                        should_complete = true;
-                    }
-                }
-                if should_complete {
-                    self.complete_request(&req_arc);
-                }
+                self.complete_request(&req_arc);
             }
             return;
         }

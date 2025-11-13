@@ -714,9 +714,9 @@ impl PnpManager {
         }
     }
 
-    pub extern "win64" fn start_io(req: &mut Request, context: usize) {
+    pub extern "win64" fn start_io(req: &mut Request, context: usize) -> DriverStatus {
         if context == 0 {
-            return;
+            return DriverStatus::InvalidParameter;
         }
         let dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
 
@@ -751,19 +751,23 @@ impl PnpManager {
         } else {
             dev_node.set_state(DevNodeState::Stopped);
         }
+        return DriverStatus::Success;
     }
 
-    pub extern "win64" fn process_enumerated_children(req: &mut Request, context: usize) {
+    pub extern "win64" fn process_enumerated_children(
+        req: &mut Request,
+        context: usize,
+    ) -> DriverStatus {
         if context == 0 {
-            return;
+            return DriverStatus::InvalidParameter;
         }
         let parent_dev_node = unsafe { Arc::from_raw(context as *const DevNode) };
 
         if req.status == DriverStatus::NotImplemented {
-            return;
+            return DriverStatus::NotImplemented;
         }
         if req.status != DriverStatus::Success {
-            return;
+            return req.status;
         }
 
         let pnp_manager = &*PNP_MANAGER;
@@ -778,6 +782,7 @@ impl PnpManager {
             let r = pnp_manager.bind_and_start(&child_dn);
             if let Err(e) = r {}
         }
+        return DriverStatus::Success;
     }
 
     fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {

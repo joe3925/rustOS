@@ -379,7 +379,7 @@ struct WaitCtx {
     blob: UnsafeCell<Vec<u8>>,
 }
 
-extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) {
+extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(p) = req.pnp.as_ref() {
@@ -392,6 +392,7 @@ extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) {
         *w.blob.get() = out;
     }
     w.done.store(true, Ordering::Release);
+    return DriverStatus::Success;
 }
 
 fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {

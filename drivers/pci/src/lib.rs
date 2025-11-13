@@ -125,14 +125,8 @@ extern "win64" fn pci_bus_pnp_start(
 
     let down2 = unsafe { pnp_forward_request_to_next_lower(device, req.clone()) };
     if down2 == DriverStatus::NoSuchDevice {
-        let mut r = req.write();
-        if r.status == DriverStatus::Pending {
-            r.status = DriverStatus::Success;
-        }
         return DriverStatus::Success;
     }
-
-    req.write().status = DriverStatus::Pending;
     DriverStatus::Pending
 }
 
@@ -143,11 +137,9 @@ extern "win64" fn pci_bus_pnp_query_devrels(
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation == kernel_api::DeviceRelationType::BusRelations {
         let st = enumerate_bus(device, &mut *req.write());
-        req.write().status = st;
-        return DriverStatus::Success;
+        return st;
     }
 
-    req.write().status = DriverStatus::Pending;
     DriverStatus::Pending
 }
 
@@ -314,9 +306,7 @@ extern "win64" fn pci_pdo_start(
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut r = req.write();
-    if r.status == DriverStatus::Pending {
-        r.status = DriverStatus::Success;
-    }
+
     DriverStatus::Success
 }
 

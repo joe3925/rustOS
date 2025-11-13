@@ -172,7 +172,6 @@ extern "win64" fn ide_pnp_start(
         dx.enumerated.store(false, Ordering::Release);
     }
 
-    req.write().status = DriverStatus::Pending;
     DriverStatus::Pending
 }
 
@@ -183,7 +182,6 @@ extern "win64" fn ide_pnp_query_devrels(
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(dev);
-        req.write().status = DriverStatus::Success;
         return DriverStatus::Success;
     }
     DriverStatus::Pending
@@ -772,8 +770,5 @@ extern "win64" fn ide_pdo_start(
     _pdo: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    if req.read().status == DriverStatus::Pending {
-        req.write().status = DriverStatus::Success;
-    }
     DriverStatus::Success
 }

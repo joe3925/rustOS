@@ -72,8 +72,16 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         CorruptedFileSystem => FileStatus::CorruptFilesystem,
     }
 }
-
-fn is_dir(fs: &mut Fs, path: &str) -> Result<bool, FsError> {
+fn is_file(fs: &Fs, path: &str) -> Result<bool, FsError> {
+    if fs.root_dir().open_file(path).is_ok() {
+        return Ok(true);
+    }
+    if fs.root_dir().open_dir(path).is_ok() {
+        return Ok(false);
+    }
+    Err(FatError::NotFound)
+}
+fn is_dir(fs: &Fs, path: &str) -> Result<bool, FsError> {
     if fs.root_dir().open_dir(path).is_ok() {
         return Ok(true);
     }
@@ -89,7 +97,7 @@ fn file_len(fs: &mut Fs, path: &str) -> Result<u64, FsError> {
     Ok(end)
 }
 
-fn read_slice(fs: &mut Fs, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
+fn read_slice(fs: &Fs, path: &str, offset: u64, len: usize) -> Result<Vec<u8>, FsError> {
     let mut f = fs.root_dir().open_file(path)?;
     let _ = f.seek(SeekFrom::Start(offset))?;
     let mut buf = vec![0u8; len];
@@ -149,7 +157,6 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
             let mut r = req.write();
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
 
-            // Pre-acquire everything in a fixed order
             let mut tbl_opt = Some(vdx.table.write());
             let mut fs_opt = Some(vdx.fs.lock());
 
@@ -164,15 +171,16 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     };
 
                     // use fs
+                    println!("opening");
                     let (ok_dir, size_or_err) = {
                         let fs = fs_opt.as_mut().unwrap();
-                        match is_dir(&mut *fs, &params.path) {
-                            Ok(true) => (true, Ok(0)),
-                            Ok(false) => (false, file_len(&mut *fs, &params.path)),
+                        match is_file(&mut *fs, &params.path) {
+                            Ok(false) => (true, Ok(0)),
+                            Ok(true) => (false, file_len(&mut *fs, &params.path)),
                             Err(e) => (false, Err(e)),
                         }
                     };
-
+                    println!("opened");
                     match size_or_err {
                         Err(e) => {
                             let res = FsOpenResult {

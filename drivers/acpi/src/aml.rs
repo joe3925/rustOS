@@ -837,11 +837,5 @@ extern "win64" fn acpi_pdo_start(
     _dev: &Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
-    let mut w = req.write();
-    if w.status == kernel_api::DriverStatus::Pending {
-        w.status = kernel_api::DriverStatus::Success;
-    } else {
-        w.status = kernel_api::DriverStatus::Success;
-    }
     kernel_api::DriverStatus::Success
 }
