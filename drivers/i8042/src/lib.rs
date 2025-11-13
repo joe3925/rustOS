@@ -15,6 +15,7 @@ use kernel_api::{
     alloc_api::{
         DeviceIds, DeviceInit, IoVtable, PnpVtable, ffi::pnp_create_child_devnode_and_pdo_with_init,
     },
+    print, println,
 };
 use spin::RwLock;
 
@@ -111,7 +112,7 @@ extern "win64" fn ps2_query_devrels(
         make_child_pdo(
             &devnode,
             true,
-            "ACPI\\PNP0303",
+            "I8042\\PNP0303",
             &["PS2\\Keyboard"],
             &["INPUT\\Keyboard", "INPUT\\GenericKbd"],
             "\\I8042\\Kbd0",
@@ -122,7 +123,7 @@ extern "win64" fn ps2_query_devrels(
         make_child_pdo(
             &devnode,
             false,
-            "ACPI\\PNP0F13",
+            "I8042\\PNP0F13",
             &["PS2\\Mouse"],
             &["INPUT\\Pointer", "INPUT\\GenericMouse"],
             "\\I8042\\Mouse0",

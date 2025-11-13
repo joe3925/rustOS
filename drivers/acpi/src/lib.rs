@@ -14,6 +14,7 @@ use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use core::sync::atomic::Ordering;
 use core::{intrinsics::size_of, mem, ptr};
 use dev_ext::DevExt;
+use kernel_api::x86_64::instructions::port::Port;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
     acpi::fadt::{self, Fadt},
@@ -89,20 +90,8 @@ pub extern "win64" fn bus_driver_prepare_hardware(
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
-    dev_ext
-        .i8042_hint
-        .store(fadt_has_i8042_hint(), Ordering::SeqCst);
 
     DriverStatus::Success
-}
-fn fadt_has_i8042_hint() -> bool {
-    let acpi = unsafe { get_acpi_tables() };
-    if let Ok(sdt) = acpi.find_table::<Fadt>() {
-        let flags = sdt.iapc_boot_arch;
-        return flags.motherboard_implements_8042();
-    } else {
-        return false;
-    }
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -165,9 +154,7 @@ pub extern "win64" fn enumerate_bus(
     for dev_name in devices_to_report {
         create_pnp_bus_from_acpi(dev_ext.ctx.get().unwrap(), &parent_dev_node, dev_name);
     }
-    if dev_ext.i8042_hint.load(Ordering::Acquire) {
-        create_synthetic_i8042_pdo(&parent_dev_node);
-    }
+    create_synthetic_i8042_pdo(&parent_dev_node);
 
     DriverStatus::Success
 }

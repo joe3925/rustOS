@@ -8,5 +8,4 @@ use spin::{Once, RwLock};
 #[derive(Default)]
 pub struct DevExt {
     pub ctx: Once<Arc<RwLock<AmlContext>>>,
-    pub i8042_hint: AtomicBool,
 }
