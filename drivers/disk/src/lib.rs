@@ -187,7 +187,7 @@ pub extern "win64" fn disk_read(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         let child = Arc::new(RwLock::new(Request::new(
             RequestType::DeviceControl(IOCTL_BLOCK_RW),
@@ -290,7 +290,7 @@ pub extern "win64" fn disk_write(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         {
             let p = parent.read();
@@ -421,11 +421,4 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     dx.props_ready
         .store(true, core::sync::atomic::Ordering::Release);
     Ok(())
-}
-
-extern "win64" fn disk_on_flush_done(child: &mut Request, ctx: usize) {
-    let parent_arc: Arc<RwLock<Request>> =
-        *unsafe { Box::from_raw(ctx as *mut Arc<RwLock<Request>>) };
-    parent_arc.write().status = child.status;
-    unsafe { pnp_complete_request(&parent_arc) };
 }

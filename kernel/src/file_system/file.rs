@@ -237,27 +237,32 @@ impl File {
     pub extern "win64" fn read(&self) -> Result<Vec<u8>, FileStatus> {
         let (gi, st1) = file_provider::provider().get_info(self.fs_file_id);
         if st1 != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::InternalError);
         }
         if let Some(e) = gi.error {
             return Err(e);
         }
+
         let size = gi.size as usize;
-        let (rr, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
+        let (buf_opt, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
         if st2 != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::InternalError);
         }
-        match rr.error {
-            None => Ok(rr.data),
-            Some(e) => Err(e),
+
+        match buf_opt {
+            Some(buf) => Ok(buf.into_vec()),
+            None => Err(FileStatus::InternalError),
         }
     }
 
     pub extern "win64" fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
-        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, data);
+        let boxed = data.to_vec().into_boxed_slice();
+
+        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, boxed);
         if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+            return Err(FileStatus::InternalError);
         }
+
         match wr.error {
             None => Ok(()),
             Some(e) => Err(e),

@@ -4,6 +4,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -12,12 +13,12 @@ use spin::RwLock;
 use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
 use crate::file_system::file::{FileStatus, OpenFlags};
 use crate::file_system::file_provider::FileProvider;
-use crate::file_system::file_structs::FsReadParams;
 use crate::file_system::file_structs::{
-    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
-    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsWriteParams,
-    FsWriteResult,
+    make_read_request, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
+    FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult,
+    FsOpenParams, FsOpenResult, FsReadHeader, FsReadResultHeader, FsRenameParams, FsRenameResult,
+    FsSeekParams, FsSeekResult, FsWriteHeader, FsWriteResultHeader, ReadView, FS_READ_HDR_AREA,
+    FS_WRITE_HDR_AREA,
 };
 use crate::println;
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
@@ -310,7 +311,6 @@ impl Vfs {
         unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
         req
     }
-
     // ---------- ASYNC API: returns the sent Request; no waits ----------
 
     pub fn open_async(&self, p: FsOpenParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
@@ -321,35 +321,97 @@ impl Vfs {
         };
         Ok(self.call_fs_async(&symlink, FsOp::Open, param))
     }
+    fn call_fs_rw_read(
+        &self,
+        volume_symlink: &str,
+        params: FsReadHeader,
+        caller_buf: &mut Vec<u8>,
+    ) -> Result<(), DriverStatus> {
+        let hdr_area = FS_READ_HDR_AREA;
+        let needed = hdr_area + params.len;
 
-    pub fn read_async(&self, p: FsReadParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        let h = self
-            .handles
-            .read()
-            .get(&p.fs_file_id)
-            .cloned()
-            .ok_or(FileStatus::PathNotFound)?;
-        let param = FsReadParams {
-            fs_file_id: h.inner_id,
-            offset: p.offset,
-            len: p.len,
-        };
-        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Read, param))
+        if caller_buf.len() < needed {
+            caller_buf.resize(needed, 0);
+        }
+
+        let total = caller_buf.len();
+        if total < hdr_area {
+            return Err(DriverStatus::InvalidParameter);
+        }
+        let data_len = total - hdr_area;
+
+        unsafe {
+            let hdr_ptr = caller_buf.as_mut_ptr().add(data_len) as *mut FsReadHeader;
+            core::ptr::write_unaligned(hdr_ptr, params);
+        }
+
+        let vec_for_req = core::mem::take(caller_buf);
+        let request_data: Box<[u8]> = vec_for_req.into_boxed_slice();
+
+        let req = Arc::new(RwLock::new(Request::new(
+            RequestType::Fs(FsOp::Read),
+            request_data,
+        )));
+
+        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
+        unsafe { pnp_wait_for_request(&req) };
+
+        let mut w = req.write();
+        if w.status != DriverStatus::Success {
+            return Err(w.status);
+        }
+
+        let boxed = core::mem::replace(&mut w.data, Box::new([]));
+        *caller_buf = boxed.into_vec();
+
+        Ok(())
     }
 
-    pub fn write_async(&self, p: FsWriteParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        let h = self
-            .handles
-            .read()
-            .get(&p.fs_file_id)
-            .cloned()
-            .ok_or(FileStatus::PathNotFound)?;
-        let param = FsWriteParams {
-            fs_file_id: h.inner_id,
-            offset: p.offset,
-            data: p.data,
-        };
-        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Write, param))
+    fn call_fs_rw_write(
+        &self,
+        volume_symlink: &str,
+        mut params: FsWriteHeader,
+        payload: &mut Vec<u8>,
+    ) -> Result<FsWriteResultHeader, DriverStatus> {
+        let hdr_size = core::mem::size_of::<FsWriteHeader>();
+        let orig_len = payload.len();
+
+        params.len = orig_len;
+
+        // safe grow + unaligned write of header at the end
+        payload.resize(orig_len + hdr_size, 0);
+        let hdr_ptr = unsafe { payload.as_mut_ptr().add(orig_len) as *mut FsWriteHeader };
+        unsafe {
+            core::ptr::write_unaligned(hdr_ptr, params);
+        }
+
+        let vec_for_req = core::mem::take(payload);
+        let request_data: Box<[u8]> = vec_for_req.into_boxed_slice();
+
+        let req = Arc::new(RwLock::new(Request::new(
+            RequestType::Fs(FsOp::Write),
+            request_data,
+        )));
+
+        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
+        unsafe { pnp_wait_for_request(&req) };
+
+        let mut w = req.write();
+        if w.status != DriverStatus::Success {
+            return Err(w.status);
+        }
+
+        let boxed = core::mem::replace(&mut w.data, Box::new([]));
+        let v = boxed.into_vec();
+
+        let res_hdr_size = core::mem::size_of::<FsWriteResultHeader>();
+        if v.len() < res_hdr_size {
+            return Err(DriverStatus::Unsuccessful);
+        }
+
+        let hdr = unsafe { core::ptr::read_unaligned(v.as_ptr() as *const FsWriteResultHeader) };
+
+        Ok(hdr)
     }
 
     // ---------- SYNC API (unchanged behavior) ----------
@@ -595,48 +657,54 @@ impl Vfs {
         }
     }
 
-    pub fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
+    pub fn read(&self, p: FsReadHeader) -> (Option<Box<[u8]>>, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
-            return (
-                FsReadResult {
-                    data: Vec::new(),
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+            return (None, DriverStatus::Success);
         };
-        let inner = FsReadParams {
+
+        let buf_cap = p.len;
+        let mut caller_buf = Vec::with_capacity(FS_READ_HDR_AREA + buf_cap);
+        caller_buf.resize(FS_READ_HDR_AREA + buf_cap, 0);
+
+        let header = FsReadHeader {
             fs_file_id: h.inner_id,
             offset: p.offset,
             len: p.len,
         };
-        match self.call_fs::<FsReadParams, FsReadResult>(&h.volume_symlink, FsOp::Read, inner) {
-            Ok(r) => (r, DriverStatus::Success),
-            Err(st) => (
-                FsReadResult {
-                    data: Vec::new(),
-                    error: Some(FileStatus::UnknownFail),
-                },
-                st,
-            ),
+
+        match self.call_fs_rw_read(&h.volume_symlink, header, &mut caller_buf) {
+            Ok(view) => {
+                let boxed = caller_buf.into_boxed_slice();
+                (Some(boxed), DriverStatus::Success)
+            }
+            Err(st) => (None, st),
         }
     }
 
-    pub fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+    pub fn write(
+        &self,
+        header: FsWriteHeader,
+        data: Box<[u8]>,
+    ) -> (FsWriteResultHeader, DriverStatus) {
+        let Some(h) = self.handles.read().get(&header.fs_file_id).cloned() else {
             return (
-                FsWriteResult {
+                FsWriteResultHeader {
                     written: 0,
                     error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
             );
         };
-        p.fs_file_id = h.inner_id;
-        match self.call_fs::<FsWriteParams, FsWriteResult>(&h.volume_symlink, FsOp::Write, p) {
-            Ok(r) => (r, DriverStatus::Success),
+
+        let mut hdr2 = header;
+        hdr2.fs_file_id = h.inner_id;
+
+        let mut payload = data.into_vec();
+
+        match self.call_fs_rw_write(&h.volume_symlink, hdr2, &mut payload) {
+            Ok(res) => (res, DriverStatus::Success),
             Err(st) => (
-                FsWriteResult {
+                FsWriteResultHeader {
                     written: 0,
                     error: Some(FileStatus::UnknownFail),
                 },
@@ -806,20 +874,28 @@ impl FileProvider for Vfs {
         })
     }
 
-    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus) {
-        self.read(FsReadParams {
+    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (Option<Box<[u8]>>, DriverStatus) {
+        self.read(FsReadHeader {
             fs_file_id: file_id,
             offset,
             len: len as usize,
         })
     }
 
-    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus) {
-        self.write(FsWriteParams {
-            fs_file_id: file_id,
-            offset,
-            data: data.to_vec(),
-        })
+    fn write_at(
+        &self,
+        file_id: u64,
+        offset: u64,
+        data: Box<[u8]>,
+    ) -> (FsWriteResultHeader, DriverStatus) {
+        self.write(
+            FsWriteHeader {
+                fs_file_id: file_id,
+                offset,
+                len: data.len(),
+            },
+            data,
+        )
     }
 
     fn flush_handle(&self, file_id: u64) -> (FsFlushResult, DriverStatus) {
@@ -891,11 +967,7 @@ impl FileProvider for Vfs {
         offset: u64,
         len: u32,
     ) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        self.read_async(FsReadParams {
-            fs_file_id: file_id,
-            offset,
-            len: len as usize,
-        })
+        todo!()
     }
 
     fn write_at_async(
@@ -904,10 +976,6 @@ impl FileProvider for Vfs {
         offset: u64,
         data: &[u8],
     ) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        self.write_async(FsWriteParams {
-            fs_file_id: file_id,
-            offset,
-            data: data.to_vec(),
-        })
+        todo!()
     }
 }

@@ -3,6 +3,7 @@ use crate::structs::linked_list::{LinkedList, ListNode};
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::{align_up, VirtAddr};
 
 #[global_allocator]
@@ -158,8 +159,7 @@ impl Allocator {
         }
     }
 }
-//TODO: make this atomic or mutex lock
-static mut INIT: bool = false;
+static mut INIT: AtomicBool = AtomicBool::new(false);
 unsafe impl GlobalAlloc for Locked<Allocator> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // perform layout adjustments
@@ -167,12 +167,11 @@ unsafe impl GlobalAlloc for Locked<Allocator> {
             let (size, align) = Allocator::size_align(layout);
             let mut allocator = self.lock();
 
-            if (INIT == false) {
+            if (INIT.swap(true, Ordering::Relaxed) == false) {
                 let heap_start = VirtAddr::new(HEAP_START as u64);
                 let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
 
                 allocator.free_list.head.next = heap_node_ptr.as_mut();
-                INIT = true;
             }
             if let Some((region, alloc_start)) = allocator.find_region(size, align) {
                 let alloc_end = alloc_start.checked_add(size).expect("overflow");

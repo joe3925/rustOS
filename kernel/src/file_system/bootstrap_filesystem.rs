@@ -16,8 +16,7 @@ use spin::RwLock;
 use crate::file_system::file_structs::{
     FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
     FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult,
+    FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteResultHeader,
 };
 use crate::file_system::{file::FileStatus, file_provider::FileProvider};
 use crate::util::BootPkg;
@@ -344,60 +343,49 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         )
     }
 
-    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus) {
+    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (Option<Box<[u8]>>, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
-                return (
-                    FsReadResult {
-                        data: Vec::new(),
-                        error: Some(FileStatus::PathNotFound),
-                    },
-                    DriverStatus::Success,
-                )
+                return (None, DriverStatus::Success);
             }
         };
+
         match self.read_slice(&path, offset, len) {
-            Ok(v) => (
-                FsReadResult {
-                    data: v,
-                    error: None,
-                },
-                DriverStatus::Success,
-            ),
-            Err(e) => (
-                FsReadResult {
-                    data: Vec::new(),
-                    error: Some(e),
-                },
-                DriverStatus::Success,
-            ),
+            Ok(v) => (Some(v.into_boxed_slice()), DriverStatus::Success),
+            Err(_e) => (None, DriverStatus::Success),
         }
     }
 
-    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus) {
+    fn write_at(
+        &self,
+        file_id: u64,
+        offset: u64,
+        data: Box<[u8]>,
+    ) -> (FsWriteResultHeader, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
                 return (
-                    FsWriteResult {
+                    FsWriteResultHeader {
                         written: 0,
                         error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
-                )
+                );
             }
         };
-        match self.write_slice(&path, offset, data) {
+
+        match self.write_slice(&path, offset, &data) {
             Ok(w) => (
-                FsWriteResult {
-                    written: w as usize, // FsWriteResult expects usize
+                FsWriteResultHeader {
+                    written: w as usize,
                     error: None,
                 },
                 DriverStatus::Success,
             ),
             Err(e) => (
-                FsWriteResult {
+                FsWriteResultHeader {
                     written: 0,
                     error: Some(e),
                 },

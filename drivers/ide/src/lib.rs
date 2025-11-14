@@ -88,7 +88,6 @@ const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 1000;
-pub static LOCK: Mutex<u64> = Mutex::new(0);
 
 #[repr(C)]
 pub struct ChildExt {
@@ -126,8 +125,6 @@ extern "win64" fn ide_pnp_start(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let _guard = LOCK.lock();
-
     let mut child = Request::new(RequestType::Pnp, Box::new([]));
     child.pnp = Some(PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
@@ -142,9 +139,7 @@ extern "win64" fn ide_pnp_start(
         unsafe { kernel_api::alloc_api::ffi::pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
-            req.write().status = qst;
-            unsafe { pnp_complete_request(&req) };
-            return DriverStatus::Success;
+            return qst;
         }
 
         let bars = {
@@ -285,8 +280,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 }
 
 pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
-    let _guard = LOCK.lock();
-
     let cdx = pdo
         .try_devext::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
@@ -512,7 +505,6 @@ fn id_string(words: &[u16]) -> String {
 }
 
 fn ata_identify_words(dx: &DevExt, dh: u8) -> Option<[u16; 256]> {
-    let _guard = LOCK.lock();
     {
         let mut p = dx.ports.lock();
         unsafe { p.drive_head.write(dh) };
@@ -621,12 +613,7 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
         lba = lba.wrapping_add(chunk);
         sectors -= chunk;
     }
-
-    {
-        let mut p = dx.ports.lock();
-        unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
-        wait_not_busy(&mut p.control, TIMEOUT_MS)
-    }
+    true
 }
 
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {

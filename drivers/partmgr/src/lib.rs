@@ -340,7 +340,6 @@ extern "win64" fn partmgr_pnp_query_devrels(
     let hdr_bytes = match read_from_lower_sync(device, sec_sz as u64, sec_sz) {
         Ok(b) => b,
         Err(_) => {
-            request.write().status = DriverStatus::Success;
             return DriverStatus::Success;
         }
     };
