@@ -125,27 +125,27 @@ extern "C" fn worker(pool_ptr: usize) {
             (j.f)(j.a);
             continue;
         }
+        {
+            let mut g = pool.inner.lock();
+            without_interrupts(|| {
+                let should_sleep = {
+                    if let Some(j) = g.q.pop_front() {
+                        drop(g);
 
-        without_interrupts(|| {
-            let should_sleep = {
-                let mut g = pool.inner.lock();
+                        (j.f)(j.a);
+                        false
+                    } else {
+                        me.write().sleep();
+                        g.sleepers.push(me.clone());
+                        true
+                    }
+                };
 
-                if let Some(j) = g.q.pop_front() {
-                    drop(g);
-
-                    (j.f)(j.a);
-                    false
-                } else {
+                if should_sleep {
                     me.write().sleep();
-                    g.sleepers.push(me.clone());
-                    true
                 }
-            };
-
-            if should_sleep {
-                me.write().sleep();
-            }
-        });
+            });
+        }
 
         loop {
             if !me.read().is_sleeping {

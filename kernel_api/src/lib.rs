@@ -853,28 +853,22 @@ pub enum FileStatus {
     //DriverError(DriverStatus),
 }
 impl FileStatus {
-    pub fn to_str(&self) -> String {
+    pub fn to_str(&self) -> &str {
         match self {
-            FileStatus::Success => "Success".to_string(),
-            FileStatus::FileAlreadyExist => "File already exists".to_string(),
-            FileStatus::PathNotFound => "Path not found".to_string(),
-            FileStatus::UnknownFail => "The operation failed for an unknown reason".to_string(),
-            FileStatus::NotFat => "The partition is unformatted or not supported".to_string(),
-            FileStatus::DriveNotFound => "The drive specified doesn't exist".to_string(),
-            FileStatus::IncompatibleFlags => {
-                "The flags can contain CreateNew and Create".to_string()
-            }
-            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".to_string(),
-            FileStatus::InternalError => "Internal error".to_string(),
-            FileStatus::BadPath => "Invalid path".to_string(),
-            FileStatus::AccessDenied => {
-                "Insufficient permissions to access the current file".to_string()
-            }
-            FileStatus::NoSpace => {
-                "Insufficient space on drive to write the requested data".to_string()
-            } // FileStatus::DriverError(e) => {
-              //     format!("The file access failed with a driver error of {}", e)
-              // }
+            FileStatus::Success => "Success",
+            FileStatus::FileAlreadyExist => "File already exists",
+            FileStatus::PathNotFound => "Path not found",
+            FileStatus::UnknownFail => "The operation failed for an unknown reason",
+            FileStatus::NotFat => "The partition is unformatted or not supported",
+            FileStatus::DriveNotFound => "The drive specified doesn't exist",
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt",
+            FileStatus::InternalError => "Internal error",
+            FileStatus::BadPath => "Invalid path",
+            FileStatus::AccessDenied => "Insufficient permissions to access the current file",
+            FileStatus::NoSpace => "Insufficient space on drive to write the requested data", // FileStatus::DriverError(e) => {
+                                                                                              //     format!("The file access failed with a driver error of {}", e)
+                                                                                              // }
         }
     }
 }

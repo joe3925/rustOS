@@ -45,7 +45,6 @@ fn main() {
             &[
                 "-m",
                 "8G",
-                "-no-reboot",
                 "-cpu",
                 "qemu64,+apic,+acpi",
                 "-machine",

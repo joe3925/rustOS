@@ -73,7 +73,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
-
             {
                 let mut w = q.write();
                 if w.status == DriverStatus::Success {
