@@ -88,12 +88,14 @@ extern "win64" fn ps2_query_devrels(
     use kernel_api::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
+        req.write().status = DriverStatus::Pending;
         return DriverStatus::Pending;
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
+            req.write().status = DriverStatus::NoSuchDevice;
             return DriverStatus::Success;
         }
     };
@@ -101,7 +103,8 @@ extern "win64" fn ps2_query_devrels(
     let ext = match device.try_devext::<DevExt>() {
         Ok(g) => g,
         Err(_) => {
-            return DriverStatus::NoSuchDevice;
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
         }
     };
 
@@ -128,6 +131,7 @@ extern "win64" fn ps2_query_devrels(
         );
     }
 
+    req.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
 
@@ -178,7 +182,8 @@ extern "win64" fn ps2_child_query_id(
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
         Err(_) => {
-            return DriverStatus::NoSuchDevice;
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
         }
     };
 

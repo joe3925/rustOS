@@ -21,9 +21,8 @@ use kernel_api::{
     DevExtRefMut, DeviceObject, DriverStatus, FileAttribute, FileStatus, FsCloseParams,
     FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams,
     FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult,
-    FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, Request, RequestType,
-    fs_read_result_into_data, fs_read_view_from_data, fs_write_result_into_data,
-    fs_write_view_from_data, println,
+    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
+    FsSeekWhence, FsWriteParams, FsWriteResult, Request, RequestType, println,
 };
 
 use crate::block_dev::BlockDev;
@@ -124,7 +123,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
             match op {
                 FsOp::Open => {
-                    let mut params: FsOpenParams = unsafe {
+                    let params: FsOpenParams = unsafe {
                         if r.data.len() != size_of::<FsOpenParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
@@ -132,7 +131,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    params.path = params.path.replace('\\', "/");
+                    println!("opening");
 
                     let open_res: Result<(bool, u64, Option<CachedFile>), FsError> = {
                         let fs = fs_opt.as_mut().unwrap();
@@ -147,17 +146,15 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 }
                                 Err(e) => Err(e),
                             },
-
-                            Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
-                                match root.open_dir(&params.path) {
-                                    Ok(_d) => Ok((true, 0, None)),
-                                    Err(e) => Err(e),
-                                }
-                            }
-
+                            Err(FatError::NotFound) => match root.open_dir(&params.path) {
+                                Ok(_d) => Ok((true, 0, None)),
+                                Err(e) => Err(e),
+                            },
                             Err(e) => Err(e),
                         }
                     };
+
+                    println!("opened");
 
                     match open_res {
                         Err(e) => {
@@ -171,7 +168,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             r.status = DriverStatus::Success;
                         }
                         Ok((is_dir, size, cached)) => {
-                            let id = vdx.next_id.fetch_add(1, Ordering::AcqRel) + 1;
+                            let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
 
                             let tbl = tbl_opt.as_mut().unwrap();
                             tbl.insert(
@@ -224,162 +221,142 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
 
                 FsOp::Read => {
-                    let view = match fs_read_view_from_data(&mut r.data) {
-                        Some(v) => v,
-                        None => {
+                    let params: FsReadParams = unsafe {
+                        if r.data.len() != size_of::<FsReadParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
                         }
+                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let hdr = view.hdr;
-                    let buf = view.buf;
+                    let data_or_err = {
+                        let tbl = tbl_opt.as_mut().unwrap();
+                        let ctx = match tbl.get_mut(&params.fs_file_id) {
+                            Some(c) => c,
+                            None => {
+                                r.data = box_to_bytes(Box::new(FsReadResult {
+                                    data: Vec::new(),
+                                    error: Some(FileStatus::PathNotFound),
+                                }));
+                                r.status = DriverStatus::Success;
+                                return;
+                            }
+                        };
 
-                    let tbl = tbl_opt.as_mut().unwrap();
-                    let ctx = match tbl.get_mut(&hdr.fs_file_id) {
-                        Some(c) => c,
-                        None => {
-                            let ok = fs_read_result_into_data(
-                                &mut r.data,
-                                0,
-                                Some(FileStatus::PathNotFound),
-                            );
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                        if ctx.is_dir {
+                            r.data = box_to_bytes(Box::new(FsReadResult {
+                                data: Vec::new(),
+                                error: Some(FileStatus::PathNotFound),
+                            }));
+                            r.status = DriverStatus::Success;
                             return;
                         }
-                    };
 
-                    if ctx.is_dir {
-                        let ok = fs_read_result_into_data(
-                            &mut r.data,
-                            0,
-                            Some(FileStatus::PathNotFound),
-                        );
-                        r.status = if ok {
-                            DriverStatus::Success
+                        let _fs_guard = fs_opt.as_mut().unwrap();
+
+                        let cached_opt = ctx.file.as_mut();
+                        if cached_opt.is_none() {
+                            Err(FatError::NotFound)
                         } else {
-                            DriverStatus::InvalidParameter
-                        };
-                        return;
-                    }
+                            let file = &mut cached_opt.unwrap().file;
 
-                    let _fs_guard = fs_opt.as_mut().unwrap();
-
-                    let cached_opt = ctx.file.as_mut();
-                    let res = if cached_opt.is_none() {
-                        Err(FatError::NotFound)
-                    } else {
-                        let file = &mut cached_opt.unwrap().file;
-                        match file.seek(SeekFrom::Start(hdr.offset as u64)) {
-                            Err(e) => Err(e),
-                            Ok(_) => match file.read(buf) {
-                                Ok(n) => Ok(n),
+                            match file.seek(SeekFrom::Start(params.offset as u64)) {
                                 Err(e) => Err(e),
-                            },
+                                Ok(_) => {
+                                    let mut buf = vec![0u8; params.len];
+                                    match file.read(&mut buf) {
+                                        Ok(n) => {
+                                            buf.truncate(n);
+                                            Ok(buf)
+                                        }
+                                        Err(e) => Err(e),
+                                    }
+                                }
+                            }
                         }
                     };
 
-                    match res {
-                        Ok(n) => {
-                            let ok = fs_read_result_into_data(&mut r.data, n, None);
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                    match data_or_err {
+                        Ok(v) => {
+                            r.data = box_to_bytes(Box::new(FsReadResult {
+                                data: v,
+                                error: None,
+                            }))
                         }
                         Err(e) => {
-                            let ok =
-                                fs_read_result_into_data(&mut r.data, 0, Some(map_fatfs_err(&e)));
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                            r.data = box_to_bytes(Box::new(FsReadResult {
+                                data: Vec::new(),
+                                error: Some(map_fatfs_err(&e)),
+                            }))
                         }
                     }
+                    r.status = DriverStatus::Success;
                 }
+
                 FsOp::Write => {
-                    let view = match fs_write_view_from_data(&r.data) {
-                        Some(v) => v,
-                        None => {
+                    let params: FsWriteParams = unsafe {
+                        if r.data.len() != size_of::<FsWriteParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
                         }
+                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let hdr = view.hdr;
-                    let data = view.buf;
+                    let write_res = {
+                        let tbl = tbl_opt.as_mut().unwrap();
+                        let ctx = match tbl.get_mut(&params.fs_file_id) {
+                            Some(c) => c,
+                            None => {
+                                r.data = box_to_bytes(Box::new(FsWriteResult {
+                                    written: 0,
+                                    error: Some(FileStatus::PathNotFound),
+                                }));
+                                r.status = DriverStatus::Success;
+                                return;
+                            }
+                        };
 
-                    let tbl = tbl_opt.as_mut().unwrap();
-                    let ctx = match tbl.get_mut(&hdr.fs_file_id) {
-                        Some(c) => c,
-                        None => {
-                            let ok = fs_write_result_into_data(
-                                &mut r.data,
-                                0,
-                                Some(FileStatus::PathNotFound),
-                            );
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                        if ctx.is_dir {
+                            r.data = box_to_bytes(Box::new(FsWriteResult {
+                                written: 0,
+                                error: Some(FileStatus::PathNotFound),
+                            }));
+                            r.status = DriverStatus::Success;
                             return;
                         }
-                    };
 
-                    if ctx.is_dir {
-                        let ok = fs_write_result_into_data(
-                            &mut r.data,
-                            0,
-                            Some(FileStatus::PathNotFound),
-                        );
-                        r.status = if ok {
-                            DriverStatus::Success
+                        let _fs_guard = fs_opt.as_mut().unwrap();
+
+                        let cached_opt = ctx.file.as_mut();
+                        if cached_opt.is_none() {
+                            Err(FatError::NotFound)
                         } else {
-                            DriverStatus::InvalidParameter
-                        };
-                        return;
-                    }
+                            let file = &mut cached_opt.unwrap().file;
 
-                    let _fs_guard = fs_opt.as_mut().unwrap();
-
-                    let cached_opt = ctx.file.as_mut();
-                    let res = if cached_opt.is_none() {
-                        Err(FatError::NotFound)
-                    } else {
-                        let file = &mut cached_opt.unwrap().file;
-                        match file.seek(SeekFrom::Start(hdr.offset as u64)) {
-                            Err(e) => Err(e),
-                            Ok(_) => file.write(data),
+                            match file.seek(SeekFrom::Start(params.offset as u64)) {
+                                Err(e) => Err(e),
+                                Ok(_) => file.write(&params.data),
+                            }
                         }
                     };
 
-                    match res {
+                    match write_res {
                         Ok(n) => {
-                            let ok = fs_write_result_into_data(&mut r.data, n, None);
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                            r.data = box_to_bytes(Box::new(FsWriteResult {
+                                written: n,
+                                error: None,
+                            }))
                         }
                         Err(e) => {
-                            let ok =
-                                fs_write_result_into_data(&mut r.data, 0, Some(map_fatfs_err(&e)));
-                            r.status = if ok {
-                                DriverStatus::Success
-                            } else {
-                                DriverStatus::InvalidParameter
-                            };
+                            r.data = box_to_bytes(Box::new(FsWriteResult {
+                                written: 0,
+                                error: Some(map_fatfs_err(&e)),
+                            }))
                         }
                     }
+                    r.status = DriverStatus::Success;
                 }
+
                 FsOp::Seek => {
                     let params: FsSeekParams = unsafe {
                         if r.data.len() != size_of::<FsSeekParams>() {
@@ -454,15 +431,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 FsOp::Create => {
                     drop(tbl_opt.take());
 
-                    let mut params: FsCreateParams = unsafe {
+                    let params: FsCreateParams = unsafe {
                         if r.data.len() != size_of::<FsCreateParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
-
-                    params.path = params.path.replace('\\', "/");
 
                     let err = {
                         let fs = fs_opt.as_mut().unwrap();
@@ -479,16 +454,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 FsOp::Rename => {
                     drop(tbl_opt.take());
 
-                    let mut params: FsRenameParams = unsafe {
+                    let params: FsRenameParams = unsafe {
                         if r.data.len() != size_of::<FsRenameParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
-
-                    params.src = params.src.replace('\\', "/");
-                    params.dst = params.dst.replace('\\', "/");
 
                     let err = {
                         let fs = fs_opt.as_mut().unwrap();
@@ -505,15 +477,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 FsOp::ReadDir => {
                     drop(tbl_opt.take());
 
-                    let mut params: FsListDirParams = unsafe {
+                    let params: FsListDirParams = unsafe {
                         if r.data.len() != size_of::<FsListDirParams>() {
                             r.status = DriverStatus::InvalidParameter;
                             return;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
-
-                    params.path = params.path.replace('\\', "/");
 
                     let names_or_err = {
                         let fs = fs_opt.as_mut().unwrap();

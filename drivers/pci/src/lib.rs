@@ -88,7 +88,8 @@ extern "win64" fn pci_bus_pnp_start(
         unsafe { pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
-            return qst;
+            req.write().status = qst;
+            return DriverStatus::Success;
         }
 
         let blob = {
@@ -246,7 +247,8 @@ extern "win64" fn pci_pdo_query_id(
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
         Err(_) => {
-            return DriverStatus::NoSuchDevice;
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
         }
     };
 
@@ -287,7 +289,8 @@ extern "win64" fn pci_pdo_query_resources(
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
         Err(_) => {
-            return DriverStatus::NoSuchDevice;
+            req.write().status = DriverStatus::NoSuchDevice;
+            return DriverStatus::Success;
         }
     };
 
@@ -311,5 +314,6 @@ extern "win64" fn pci_pdo_query_devrels(
     _dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
+    req.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
