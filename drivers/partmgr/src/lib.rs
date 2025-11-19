@@ -104,19 +104,13 @@ extern "win64" fn partition_pdo_query_resources(
 }
 
 pub fn parent_target_of(from: &Arc<DeviceObject>) -> Result<IoTarget, DriverStatus> {
-    let parent_inst = {
-        let dn = from
-            .dev_node
-            .get()
-            .and_then(|w| w.upgrade())
-            .ok_or(DriverStatus::NoSuchDevice)?;
-        let pw = { dn.parent.read().clone() };
-        pw.and_then(|w| w.upgrade())
-            .map(|p| p.instance_path.clone())
-            .ok_or(DriverStatus::NoSuchDevice)?
-    };
-
-    unsafe { pnp_get_device_target(&parent_inst).ok_or(DriverStatus::NoSuchDevice) }
+    if let Some(upper_device) = from.upper_device.get() {
+        return Ok(IoTarget {
+            target_device: upper_device.upgrade().unwrap(),
+        });
+    } else {
+        return Err(DriverStatus::NoSuchDevice);
+    }
 }
 fn send_child_sync(tgt: &IoTarget, req: Request) -> Result<Box<[u8]>, DriverStatus> {
     let child = Arc::new(RwLock::new(req));

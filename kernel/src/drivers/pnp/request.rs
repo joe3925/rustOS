@@ -165,6 +165,21 @@ impl PnpManager {
         }
     }
 
+    pub fn send_request_to_next_upper(
+        &self,
+        from: &Arc<DeviceObject>,
+        req: Arc<RwLock<Request>>,
+    ) -> DriverStatus {
+        if let Some(target_dev) = from.upper_device.get() {
+            let target = IoTarget {
+                target_device: target_dev.upgrade().unwrap(),
+            };
+            self.send_request(&target, req)
+        } else {
+            DriverStatus::NoSuchDevice
+        }
+    }
+
     pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
         let (func_addr, ctx) = {
             let mut g = req_arc.write();

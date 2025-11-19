@@ -146,10 +146,12 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 }
                                 Err(e) => Err(e),
                             },
-                            Err(FatError::NotFound) => match root.open_dir(&params.path) {
-                                Ok(_d) => Ok((true, 0, None)),
-                                Err(e) => Err(e),
-                            },
+                            Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
+                                match root.open_dir(&params.path) {
+                                    Ok(_d) => Ok((true, 0, None)),
+                                    Err(e) => Err(e),
+                                }
+                            }
                             Err(e) => Err(e),
                         }
                     };

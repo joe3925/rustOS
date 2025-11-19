@@ -187,7 +187,7 @@ pub extern "win64" fn disk_read(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         let child = Arc::new(RwLock::new(Request::new(
             RequestType::DeviceControl(IOCTL_BLOCK_RW),
@@ -290,7 +290,7 @@ pub extern "win64" fn disk_write(
             blocks: this_blocks,
             buf_off: hdr_len as u32,
         };
-        unsafe { core::ptr::write(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
+        unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
 
         {
             let p = parent.read();
