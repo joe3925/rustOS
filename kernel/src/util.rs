@@ -11,7 +11,7 @@ use crate::drivers::interrupt_index::{
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{
-    NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_FAST, TIMER_TIME_SCHED,
+    NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_SCHED,
 };
 use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;

@@ -23,7 +23,6 @@ pub static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
 pub static ROT_TICKET: Al64<AtomicUsize> = Al64(AtomicUsize::new(0));
 
 lazy_static! {
-    pub static ref TIMER_TIME_FAST: PCS<AtomicUsize> = PCS::new();
     pub static ref TIMER_TIME_SCHED: PCS<AtomicUsize> = PCS::new();
     pub static ref PER_CORE_SWITCHES: PCS<AtomicUsize> = PCS::new();
 }
@@ -62,83 +61,6 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let dt = sw.elapsed_nanos() as usize;
     add_time(&TIMER_TIME_SCHED, cpu_id, dt);
 }
-// Decent Average time, a little less fair
-// static ROT_STATE: AtomicU64 = AtomicU64::new(0);
-// static ALLOW_MASK: AtomicUsize = AtomicUsize::new(1);
-
-// #[inline(always)]
-// fn make_mask(head: usize, win: usize, n: usize) -> usize {
-//     let w = win.min(n);
-//     let mut m = 0usize;
-//     for i in 0..w {
-//         m |= 1usize << ((head + i) % n);
-//     }
-//     m
-// }
-
-// #[derive(Copy, Clone)]
-// pub struct TimerDebug {
-//     pub cpu: usize,
-//     pub allowed: bool,
-//     pub did_sched: bool,
-// }
-
-// #[inline(always)]
-// fn timer_wrapper_mask(state: *mut State, cpu: usize, n: usize) -> TimerDebug {
-//     if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-//         return TimerDebug { cpu, allowed: false, did_sched: false };
-//     }
-
-//     let allowed = ((ALLOW_MASK.load(Ordering::Relaxed) >> cpu) & 1) != 0;
-//     if !allowed {
-//         return TimerDebug { cpu, allowed, did_sched: false };
-//     }
-
-//     {
-//         let mut sched = SCHEDULER.lock();
-//         sched.on_timer_tick(state, cpu);
-//     }
-
-//     loop {
-//         let s  = ROT_STATE.load(Ordering::Relaxed);
-//         let h  = (s >> 32) as usize;
-//         let w0 = (s & 0xFFFF_FFFF) as usize;
-
-//         let w2 = (w0 % n) + 1;
-//         let h2 = (h + (w0 / n)) % n;
-
-//         let ns = ((h2 as u64) << 32) | (w2 as u64);
-//         if ROT_STATE
-//             .compare_exchange(s, ns, Ordering::Release, Ordering::Relaxed)
-//             .is_ok()
-//         {
-//             ALLOW_MASK.store(make_mask(h2, w2, n), Ordering::Release);
-//             break;
-//         }
-//     }
-
-//     TimerDebug { cpu, allowed: true, did_sched: true }
-// }
-
-// #[no_mangle]
-// pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
-//     let n   = NUM_CORES.load(Ordering::Relaxed).max(1);
-//     let cpu = (get_current_logical_id() as usize) % n;
-
-//     let sw  = Stopwatch::start();
-//     let dbg = timer_wrapper_mask(state, cpu, n);
-//     let dt  = sw.elapsed_millis() as usize;
-
-//     if dbg.did_sched { add_time(&TIMER_TIME_SCHED, cpu, dt); }
-//     else             { add_time(&TIMER_TIME_FAST,  cpu, dt); }
-// }
-
-// pub fn set_num_cores(n: usize) {
-//     let n = n.max(1);
-//     NUM_CORES.store(n, Ordering::Relaxed);
-//     ROT_STATE.store(((0u64) << 32) | 1, Ordering::Relaxed);
-//     ALLOW_MASK.store(make_mask(0, 1, n), Ordering::Relaxed);
-// }
 
 pub fn set_num_cores(n: usize) {
     let n = n.max(1);
@@ -146,7 +68,6 @@ pub fn set_num_cores(n: usize) {
     ROT_TICKET.0.store(0, Ordering::Relaxed);
 
     for id in 0..n {
-        let _ = TIMER_TIME_FAST.set(id, AtomicUsize::new(0));
         let _ = TIMER_TIME_SCHED.set(id, AtomicUsize::new(0));
         let _ = PER_CORE_SWITCHES.set(id, AtomicUsize::new(0));
     }

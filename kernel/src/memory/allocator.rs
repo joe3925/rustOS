@@ -118,42 +118,24 @@ impl Allocator {
 
     pub fn merge_free_list(&mut self) {
         unsafe {
-            let mut merges_made = true;
-            while merges_made {
-                merges_made = false;
-                let mut current = &mut self.free_list.head as *mut ListNode;
+            let mut current = self.free_list.head.start_addr() as *mut ListNode;
 
-                while let Some(ref mut current_node) = (*current).next {
-                    let mut other = &mut self.free_list.head as *mut ListNode;
+            while !current.is_null() {
+                let current_node = &mut *current;
 
-                    while let Some(ref mut other_node) = (*other).next {
-                        if other_node.start_addr() == current_node.start_addr() {
-                            other = &mut **other_node as *mut ListNode;
-                            continue;
-                        }
+                if let Some(ref mut next_ref) = current_node.next {
+                    let next_ptr = &mut **next_ref as *mut ListNode;
+                    let next_node = &mut *next_ptr;
 
-                        // Check if current_node and other_node are adjacent in memory
-                        if current_node.end_addr() == other_node.start_addr() {
-                            current_node.size += other_node.size;
-                            (*other).next = other_node.next.take();
-                            merges_made = true;
-                            break;
-                        } else if other_node.end_addr() == current_node.start_addr() {
-                            // Merge current_node into other_node
-                            other_node.size += current_node.size;
-                            (*current).next = current_node.next.take();
-                            merges_made = true;
-                            break;
-                        } else {
-                            other = &mut **other_node as *mut ListNode;
-                        }
-                    }
+                    if current_node.end_addr() == next_node.start_addr() {
+                        current_node.size += next_node.size;
 
-                    if merges_made {
-                        break;
+                        current_node.next = next_node.next.take();
                     } else {
-                        current = &mut **current_node as *mut ListNode;
+                        current = next_ptr;
                     }
+                } else {
+                    break;
                 }
             }
         }

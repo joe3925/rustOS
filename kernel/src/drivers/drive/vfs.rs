@@ -378,7 +378,6 @@ impl Vfs {
 
         params.len = orig_len;
 
-        // safe grow + unaligned write of header at the end
         payload.resize(orig_len + hdr_size, 0);
         let hdr_ptr = unsafe { payload.as_mut_ptr().add(orig_len) as *mut FsWriteHeader };
         unsafe {
