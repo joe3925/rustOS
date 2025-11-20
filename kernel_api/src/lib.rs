@@ -116,16 +116,16 @@ impl DeviceObject {
 #[repr(C)]
 pub struct DevNode {
     pub name: String,
-    pub parent: RwLock<Option<alloc::sync::Weak<DevNode>>>,
+    pub parent: Once<alloc::sync::Weak<DevNode>>,
     pub children: RwLock<Vec<Arc<DevNode>>>,
     pub instance_path: String,
     pub ids: DeviceIds,
     pub class: Option<String>,
     pub state: AtomicU8,
-
     pub pdo: RwLock<Option<Arc<DeviceObject>>>,
     pub stack: RwLock<Option<DeviceStack>>,
 }
+
 #[derive(Debug)]
 #[repr(u32)]
 pub enum DevExtError {
@@ -225,7 +225,7 @@ pub struct IoTarget {
     pub target_device: Arc<DeviceObject>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum RequestType {
     Read { offset: u64, len: usize },
@@ -236,7 +236,7 @@ pub enum RequestType {
 
     Dummy,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum FsOp {
     /// data = UTF-8 path bytes; flags in Request.flags (bitfield), length may carry mode/perm
@@ -481,25 +481,37 @@ pub struct Request {
     pub data: Box<[u8]>,
     pub completed: bool,
     pub status: DriverStatus,
+    pub traversal_policy: TraversalPolicy,
 
     pub pnp: Option<PnpRequest>,
 
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
 }
+
 impl Request {
     #[inline]
     pub fn new(kind: RequestType, data: Box<[u8]>) -> Self {
+        if matches!(kind, RequestType::Pnp) {
+            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
+        }
+
         Self {
             id: unsafe { random_number() },
             kind,
             data,
             completed: false,
-            status: DriverStatus::Pending,
+            status: DriverStatus::Continue,
+            traversal_policy: TraversalPolicy::FailIfUnhandled,
             pnp: None,
             completion_routine: None,
             completion_context: 0,
         }
+    }
+    #[inline]
+    pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
+        self.traversal_policy = policy;
+        self
     }
     #[inline]
     pub fn empty() -> Self {
@@ -511,7 +523,22 @@ impl Request {
             data: Box::new([]),
             completed: true,
             status: DriverStatus::Success,
+            traversal_policy: TraversalPolicy::FailIfUnhandled,
             pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+        }
+    }
+    #[inline]
+    pub fn new_pnp(pnp_request: PnpRequest, data: Box<[u8]>) -> Self {
+        Self {
+            id: unsafe { random_number() },
+            kind: RequestType::Pnp,
+            data,
+            completed: false,
+            status: DriverStatus::Continue,
+            traversal_policy: TraversalPolicy::ForwardLower,
+            pnp: Some(pnp_request),
             completion_routine: None,
             completion_context: 0,
         }
@@ -565,6 +592,7 @@ impl TryFrom<u8> for FileAttribute {
 pub enum DriverStatus {
     Success = 0x0000_0000,
     Pending = 0x0000_0103,
+    Continue = 0x0000_0203,
     NotImplemented = 0xC000_0002u32 as i32,
     InvalidParameter = 0xC000_000Du32 as i32,
     InsufficientResources = 0xC000_009Au32 as i32,
@@ -604,6 +632,16 @@ impl FromResidual<DriverStatus> for DriverStatus {
     fn from_residual(r: DriverStatus) -> Self {
         r
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalPolicy {
+    /// Standard I/O behavior: If unhandled, pass to the next lower device.
+    /// If no lower device exists, fail with NoSuchDevice.
+    ForwardLower,
+    /// Strict behavior: If unhandled, fail immediately with NotImplemented.
+    FailIfUnhandled,
+    /// Upward bubbling: If unhandled, pass to the next UPPER device.
+    ForwardUpper,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -839,11 +877,11 @@ pub mod alloc_api {
         }
 
         #[inline]
-        pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+        pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
             match *self {
                 IoType::Read(h) | IoType::Write(h) => {
                     let len = req.read().data.len();
-                    h(dev, req, len);
+                    h(dev, req, len)
                 }
                 IoType::DeviceControl(h) => h(dev, req),
                 IoType::Fs(h) => h(dev, req),
@@ -987,15 +1025,18 @@ pub mod alloc_api {
     pub type EvtDriverDeviceAdd =
         extern "win64" fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
 
-    pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>);
+    pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
 
-    pub type EvtIoRead = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
-    pub type EvtIoWrite = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize);
-    pub type EvtIoDeviceControl = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
+    pub type EvtIoRead =
+        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
+    pub type EvtIoWrite =
+        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
+    pub type EvtIoDeviceControl =
+        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
     pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices =
         extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
-    pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>);
+    pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
     pub type ClassAddCallback =
         extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine =
@@ -1129,6 +1170,14 @@ pub mod alloc_api {
                 init_pdo: DeviceInit,
             ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>;
             pub fn pnp_wait_for_request(req: &Arc<RwLock<Request>>);
+            pub fn pnp_send_request_to_next_upper(
+                from: &Arc<DeviceObject>,
+                req: Arc<RwLock<Request>>,
+            ) -> DriverStatus;
+            pub fn pnp_send_request_to_stack_top(
+                dev_node_weak: &alloc::sync::Weak<DevNode>,
+                req: Arc<RwLock<Request>>,
+            ) -> DriverStatus;
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,

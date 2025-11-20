@@ -16,6 +16,7 @@ use alloc::{
 use core::{
     mem::size_of,
     panic::PanicInfo,
+    ptr::addr_of,
     slice,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
@@ -23,7 +24,8 @@ use spin::{Once, RwLock};
 
 use kernel_api::{
     Data, DevExtRef, DeviceObject, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
-    GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType,
+    GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType, TraversalPolicy,
+    acpi::platform::Processor,
     alloc_api::{
         DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
         ffi::{
@@ -141,34 +143,36 @@ extern "win64" fn volclass_start(
     let _ = refresh_fs_registry_from_registry();
     init_volume_dx(dev);
     mount_if_unmounted(dev);
-    DriverStatus::Success
+    DriverStatus::Continue
 }
 
 pub extern "win64" fn vol_fdo_read(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
     _buf_len: usize,
-) {
-    unsafe { pnp_forward_request_to_next_lower(dev, req) };
+) -> DriverStatus {
+    DriverStatus::Continue
 }
 
 pub extern "win64" fn vol_fdo_write(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
     _buf_len: usize,
-) {
-    unsafe { pnp_forward_request_to_next_lower(dev, req) };
+) -> DriverStatus {
+    DriverStatus::Continue
 }
 
-pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn volclass_ioctl(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
             RequestType::DeviceControl(c) => c,
             _ => {
                 drop(r);
-                let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
-                return;
+                return DriverStatus::NotImplemented;
             }
         }
     };
@@ -189,38 +193,38 @@ pub extern "win64" fn volclass_ioctl(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
-            req.write().status = DriverStatus::Success;
+            DriverStatus::Success
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
             w.data = build_status_blob(dev);
-            w.status = DriverStatus::Success;
+            DriverStatus::Success
         }
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry();
             mount_if_unmounted(dev);
-            req.write().status = DriverStatus::Success;
+            DriverStatus::Success
         }
         IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
             w.data = list_fs_blob();
-            w.status = DriverStatus::Success;
+            DriverStatus::Success
         }
-        _ => {
-            let _ = unsafe { pnp_forward_request_to_next_lower(dev, req) };
-        }
+        _ => DriverStatus::NotImplemented,
     }
 }
 
-pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn volclass_ctrl_ioctl(
+    _dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
             RequestType::DeviceControl(c) => c,
             _ => {
                 drop(r);
-                req.write().status = DriverStatus::InvalidParameter;
-                return;
+                return DriverStatus::NotImplemented;
             }
         }
     };
@@ -232,24 +236,22 @@ pub extern "win64" fn volclass_ctrl_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwL
                 string_from_req(&r)
             };
             match tag {
-                Some(t) if !t.is_empty() => unsafe {
-                    let mut wr = FS_REGISTERED.write();
-                    if !wr.iter().any(|s| s == &t) {
-                        wr.push(t);
+                Some(t) if !t.is_empty() => {
+                    unsafe {
+                        let mut wr = FS_REGISTERED.write();
+                        if !wr.iter().any(|s| s == &t) {
+                            wr.push(t);
+                        }
+                        drop(wr);
+                        let _ = refresh_fs_registry_from_registry();
+                        rescan_all_volumes();
                     }
-                    drop(wr);
-                    let _ = refresh_fs_registry_from_registry();
-                    rescan_all_volumes();
-                    req.write().status = DriverStatus::Success;
-                },
-                _ => {
-                    req.write().status = DriverStatus::InvalidParameter;
+                    DriverStatus::Success
                 }
+                _ => DriverStatus::InvalidParameter,
             }
         }
-        _ => {
-            req.write().status = DriverStatus::NotImplemented;
-        }
+        _ => DriverStatus::NotImplemented,
     }
 }
 
@@ -338,10 +340,13 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
         let ptr = Box::into_raw(id_box) as *mut u8;
         let data: Box<[u8]> = unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len)) };
 
-        let req = Arc::new(RwLock::new(Request::new(
-            RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
-            data,
-        )));
+        let req = Arc::new(RwLock::new(
+            Request::new(
+                RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
+                data,
+            )
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+        ));
         unsafe {
             let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone());
             kernel_api::alloc_api::ffi::pnp_wait_for_request(&req);
@@ -450,12 +455,6 @@ fn refresh_fs_registry_from_registry() -> usize {
 
     const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
 
-    let (old_regs, old_svcs): (Vec<FsReg>, BTreeSet<String>) = unsafe {
-        let rd = FS_REGISTRY.read();
-        let svcs = rd.iter().map(|r| r.svc.clone()).collect();
-        (rd.clone(), svcs)
-    };
-
     let mut by_tag: BTreeMap<String, FsReg> = BTreeMap::new();
     if let Ok(keys) = reg::list_keys(ROOT) {
         for sub in keys {
@@ -474,37 +473,32 @@ fn refresh_fs_registry_from_registry() -> usize {
             by_tag.entry(tag.clone()).or_insert(FsReg { svc, tag, ord });
         }
     }
+
     let mut fresh: Vec<FsReg> = by_tag.into_values().collect();
     fresh.sort_by(|a, b| a.ord.cmp(&b.ord).then_with(|| a.tag.cmp(&b.tag)));
 
-    let new_svcs: Vec<String> = {
-        let mut v = Vec::new();
-        for r in &fresh {
-            if !old_svcs.contains(&r.svc) {
-                v.push(r.svc.clone());
-            }
-        }
-        v
-    };
+    let mut guard = FS_REGISTRY.write();
 
-    unsafe {
-        *FS_REGISTRY.write() = fresh;
+    let old_svcs: BTreeSet<String> = guard.iter().map(|r| r.svc.clone()).collect();
+    let mut new_svcs = Vec::new();
+
+    for r in &fresh {
+        if !old_svcs.contains(&r.svc) {
+            new_svcs.push(r.svc.clone());
+        }
     }
+
+    *guard = fresh;
+
+    drop(guard);
 
     for s in new_svcs {
         let _ = unsafe { pnp_load_service(s) };
     }
 
-    let old_tags: BTreeSet<&str> = old_regs.iter().map(|r| r.tag.as_str()).collect();
-    unsafe {
-        FS_REGISTRY
-            .read()
-            .iter()
-            .filter(|r| !old_tags.contains(r.tag.as_str()))
-            .count()
-    }
+    let guard = FS_REGISTRY.read();
+    guard.len()
 }
-
 fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let len = core::mem::size_of::<T>();
     let p = Box::into_raw(b) as *mut u8;
@@ -585,7 +579,8 @@ fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut 
     let mut req = Request::new(
         RequestType::Fs(kernel_api::FsOp::Open),
         box_to_bytes(Box::new(params)),
-    );
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
     let ctx = Box::into_raw(Box::new(BootReqCtx {
         probe: probe_ptr,
         which,
@@ -613,7 +608,6 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
 }
 
 fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus {
-    println!("Attempt boot bind");
     if VFS_ACTIVE.load(Ordering::Acquire) {
         return DriverStatus::Success;
     }
@@ -650,7 +644,7 @@ fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
 }
 
 fn rescan_all_volumes() {
-    let vols = unsafe { VOLUMES.read() };
+    let vols = VOLUMES.read();
     for dev in vols.clone() {
         mount_if_unmounted(&dev);
     }

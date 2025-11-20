@@ -72,15 +72,16 @@ extern "win64" fn pci_bus_pnp_start(
     device: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    // Ask parent for resources to discover ECAM segments
-    let mut query = Request::new(RequestType::Pnp, Box::new([]));
-    query.pnp = Some(kernel_api::alloc_api::PnpRequest {
-        minor_function: PnpMinorFunction::QueryResources,
-        relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-        id_type: kernel_api::QueryIdType::CompatibleIds,
-        ids_out: Vec::new(),
-        blob_out: Vec::new(),
-    });
+    let query = Request::new_pnp(
+        kernel_api::alloc_api::PnpRequest {
+            minor_function: PnpMinorFunction::QueryResources,
+            relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
+            id_type: kernel_api::QueryIdType::CompatibleIds,
+            ids_out: Vec::new(),
+            blob_out: Vec::new(),
+        },
+        Box::new([]),
+    );
 
     let child = Arc::new(RwLock::new(query));
     let st = unsafe { pnp_forward_request_to_next_lower(device, child.clone()) };
@@ -88,8 +89,7 @@ extern "win64" fn pci_bus_pnp_start(
         unsafe { pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
-            req.write().status = qst;
-            return DriverStatus::Success;
+            return qst;
         }
 
         let blob = {
@@ -103,13 +103,13 @@ extern "win64" fn pci_bus_pnp_start(
 
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
-            return DriverStatus::Success;
+            return DriverStatus::Continue;
         }
 
         if let Ok(ext) = device.try_devext::<DevExt>() {
             ext.segments.call_once(|| segs);
         } else {
-            return DriverStatus::Success;
+            return DriverStatus::Continue;
         }
     } else {
         // Fallback derive segments from parent using platform-specific probe
@@ -119,15 +119,11 @@ extern "win64" fn pci_bus_pnp_start(
                 ext.segments.call_once(|| segs);
             }
         } else {
-            return DriverStatus::Success;
+            return DriverStatus::Continue;
         }
     }
 
-    let down2 = unsafe { pnp_forward_request_to_next_lower(device, req.clone()) };
-    if down2 == DriverStatus::NoSuchDevice {
-        return DriverStatus::Success;
-    }
-    DriverStatus::Pending
+    DriverStatus::Continue
 }
 
 extern "win64" fn pci_bus_pnp_query_devrels(
@@ -137,10 +133,14 @@ extern "win64" fn pci_bus_pnp_query_devrels(
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation == kernel_api::DeviceRelationType::BusRelations {
         let st = enumerate_bus(device, &mut *req.write());
-        return st;
+        if st == DriverStatus::Success {
+            return DriverStatus::Continue;
+        } else {
+            return st;
+        }
     }
 
-    DriverStatus::Pending
+    DriverStatus::Continue
 }
 
 pub extern "win64" fn enumerate_bus(

@@ -78,7 +78,7 @@ extern "win64" fn ps2_start(dev: &Arc<DeviceObject>, _req: Arc<RwLock<Request>>)
     } else {
         return DriverStatus::NoSuchDevice;
     }
-    DriverStatus::Success
+    DriverStatus::Continue
 }
 
 extern "win64" fn ps2_query_devrels(
@@ -88,15 +88,14 @@ extern "win64" fn ps2_query_devrels(
     use kernel_api::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
-        req.write().status = DriverStatus::Pending;
-        return DriverStatus::Pending;
+        return DriverStatus::NotImplemented;
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStatus::Success;
+            return DriverStatus::NoSuchDevice;
         }
     };
 
@@ -104,7 +103,7 @@ extern "win64" fn ps2_query_devrels(
         Ok(g) => g,
         Err(_) => {
             req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStatus::Success;
+            return DriverStatus::NoSuchDevice;
         }
     };
 
@@ -131,7 +130,6 @@ extern "win64" fn ps2_query_devrels(
         );
     }
 
-    req.write().status = DriverStatus::Success;
     DriverStatus::Success
 }
 

@@ -24,7 +24,7 @@ pub struct DriverPackage {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DriverState {
     Loaded,
-    Pending,
+    Continue,
     Started,
     Stopped,
     Failed,

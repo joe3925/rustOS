@@ -14,7 +14,7 @@ use spin::{Mutex, RwLock};
 use kernel_api::{
     DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
     FsIdentify, GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
-    PnpMinorFunction, QueryIdType, Request, RequestType,
+    PnpMinorFunction, QueryIdType, Request, RequestType, TraversalPolicy,
     alloc_api::{
         DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
         ffi::{
@@ -35,7 +35,10 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
-pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn fs_root_ioctl(
+    _dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
@@ -43,7 +46,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
             _ => {
                 drop(r);
                 req.write().status = DriverStatus::InvalidParameter;
-                return;
+                return DriverStatus::NotImplemented;
             }
         }
     };
@@ -52,20 +55,21 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
         IOCTL_FS_IDENTIFY => {
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
-                r.status = DriverStatus::InvalidParameter;
-                return;
+                return DriverStatus::InvalidParameter;
             }
 
             let id: &mut FsIdentify = unsafe { &mut *(r.data.as_mut_ptr() as *mut FsIdentify) };
 
-            let mut q = Request::new(RequestType::Pnp, Box::new([]));
-            q.pnp = Some(PnpRequest {
-                minor_function: PnpMinorFunction::QueryResources,
-                relation: DeviceRelationType::TargetDeviceRelation,
-                id_type: QueryIdType::DeviceId,
-                ids_out: Vec::new(),
-                blob_out: Vec::new(),
-            });
+            let mut q = Request::new_pnp(
+                PnpRequest {
+                    minor_function: PnpMinorFunction::QueryResources,
+                    relation: DeviceRelationType::TargetDeviceRelation,
+                    id_type: QueryIdType::DeviceId,
+                    ids_out: Vec::new(),
+                    blob_out: Vec::new(),
+                },
+                Box::new([]),
+            );
             let q = Arc::new(RwLock::new(q));
 
             unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) };
@@ -92,8 +96,7 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             } else {
                                 id.mount_device = None;
                                 id.can_mount = false;
-                                r.status = DriverStatus::Success;
-                                return;
+                                return DriverStatus::Success;
                             };
                         }
                     }
@@ -109,7 +112,6 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
 
-                    // Build the dev-ext now
                     let ext = VolCtrlDevExt {
                         fs: Mutex::new(fs),
                         next_id: AtomicU64::new(1),
@@ -124,19 +126,16 @@ pub extern "win64" fn fs_root_ioctl(_dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
-                    println!("Can mount");
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
-                Err(_) => {
+                Err(e) => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
             }
         }
-        _ => {
-            req.write().status = DriverStatus::NotImplemented;
-        }
+        _ => DriverStatus::NotImplemented,
     }
 }
 
@@ -145,13 +144,12 @@ pub extern "win64" fn fat_start(
     _dev: &Arc<DeviceObject>,
     _req: Arc<spin::rwlock::RwLock<Request>>,
 ) -> DriverStatus {
-    DriverStatus::Success
+    DriverStatus::Continue
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
-
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
         IoType::DeviceControl(fs_root_ioctl),
@@ -164,10 +162,13 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl =
         unsafe { pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone()) };
 
-    let reg = Arc::new(RwLock::new(Request::new(
-        RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-        ctrl_link.clone().into_bytes().into_boxed_slice(),
-    )));
+    let reg = Arc::new(RwLock::new(
+        Request::new(
+            RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
+            ctrl_link.clone().into_bytes().into_boxed_slice(),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
     unsafe {
         let _ = pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),

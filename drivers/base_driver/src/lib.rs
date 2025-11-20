@@ -42,5 +42,5 @@ pub extern "win64" fn bus_driver_prepare_hardware(
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
-    DriverStatus::Success
+    DriverStatus::Continue
 }

@@ -359,3 +359,17 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
         init_pdo,
     )
 }
+#[no_mangle]
+pub extern "win64" fn pnp_send_request_to_next_upper(
+    from: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    PNP_MANAGER.send_request_to_next_upper(from, req)
+}
+#[no_mangle]
+pub extern "win64" fn pnp_send_request_to_stack_top(
+    dev_node_weak: &alloc::sync::Weak<DevNode>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    PNP_MANAGER.send_request_to_stack_top(dev_node_weak, req)
+}

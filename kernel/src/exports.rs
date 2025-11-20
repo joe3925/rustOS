@@ -69,6 +69,8 @@ export! {
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
+    pnp_send_request_to_next_upper,
+    pnp_send_request_to_stack_top,
     InvalidateDeviceRelations,
 
     driver_get_name,

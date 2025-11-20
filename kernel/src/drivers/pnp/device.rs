@@ -1,7 +1,7 @@
 use crate::drivers::pnp::driver_object::DeviceObject;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU8, Ordering};
-use spin::RwLock;
+use spin::{Once, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct DeviceIds {
@@ -57,7 +57,7 @@ impl DeviceStack {
 #[repr(C)]
 pub struct DevNode {
     pub name: String,
-    pub parent: RwLock<Option<alloc::sync::Weak<DevNode>>>,
+    pub parent: Once<alloc::sync::Weak<DevNode>>,
     pub children: RwLock<Vec<Arc<DevNode>>>,
     pub instance_path: String,
     pub ids: DeviceIds,
@@ -71,7 +71,7 @@ impl DevNode {
     pub fn new_root() -> Arc<Self> {
         Arc::new(Self {
             name: "ROOT".into(),
-            parent: RwLock::new(None),
+            parent: Once::new(),
             children: RwLock::new(Vec::new()),
             instance_path: "ROOT".into(),
             ids: DeviceIds {
@@ -92,9 +92,11 @@ impl DevNode {
         class: Option<String>,
         parent: &Arc<DevNode>,
     ) -> Arc<Self> {
+        let parent_once = Once::new();
+        parent_once.call_once(|| Arc::downgrade(parent));
         let dn = Arc::new(Self {
             name,
-            parent: RwLock::new(Some(Arc::downgrade(parent))),
+            parent: parent_once,
             children: RwLock::new(Vec::new()),
             instance_path,
             ids,

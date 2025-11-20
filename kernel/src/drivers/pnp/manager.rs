@@ -528,7 +528,7 @@ impl PnpManager {
     fn ensure_driver_entry(&self, drv: &Arc<DriverObject>) -> bool {
         let rt = &drv.runtime;
         match rt.get_state() {
-            DriverState::Started | DriverState::Pending => return true,
+            DriverState::Started | DriverState::Continue => return true,
             DriverState::Failed => return false,
             _ => {}
         }
@@ -538,7 +538,7 @@ impl PnpManager {
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
             let st = unsafe { entry(drv) };
             match st {
-                DriverStatus::Success | DriverStatus::Pending => {
+                DriverStatus::Success | DriverStatus::Continue => {
                     rt.set_state(DriverState::Started);
                     true
                 }
@@ -698,8 +698,8 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 blob_out: Vec::new(),
             };
-            let mut start_request = Request::new(RequestType::Pnp, Box::new([]));
-            start_request.pnp = Some(pnp_payload);
+            let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
+
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.set_completion(Self::start_io, ctx);
 
@@ -736,8 +736,7 @@ impl PnpManager {
                     ids_out: Vec::new(),
                     blob_out: Vec::new(),
                 };
-                let mut bus_enum_request = Request::new(RequestType::Pnp, Box::new([]));
-                bus_enum_request.pnp = Some(pnp_payload);
+                let mut bus_enum_request = Request::new_pnp(pnp_payload, Box::new([]));
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
                 bus_enum_request.set_completion(Self::process_enumerated_children, ctx);
 
@@ -767,6 +766,7 @@ impl PnpManager {
             return DriverStatus::NotImplemented;
         }
         if req.status != DriverStatus::Success {
+            println!("{:#?}", req.status);
             return req.status;
         }
 
@@ -848,8 +848,7 @@ impl PnpManager {
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         };
-        let mut req = Request::new(RequestType::Pnp, Box::new([]));
-        req.pnp = Some(pnp_payload);
+        let mut req = Request::new_pnp(pnp_payload, Box::new([]));
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.set_completion(Self::process_enumerated_children, ctx);
         let tgt = IoTarget { target_device: top };
@@ -919,7 +918,30 @@ impl PnpManager {
             None => DriverStatus::NoSuchDevice,
         }
     }
+    pub fn send_request_to_stack_top(
+        &self,
+        dev_node_weak: &alloc::sync::Weak<DevNode>,
+        req: Arc<RwLock<Request>>,
+    ) -> DriverStatus {
+        let dev_node = match dev_node_weak.upgrade() {
+            Some(dn) => dn,
+            None => return DriverStatus::NoSuchDevice,
+        };
 
+        let target_device_opt = dev_node
+            .stack
+            .read()
+            .as_ref()
+            .and_then(|s| s.get_top_device_object())
+            .or_else(|| dev_node.get_pdo());
+
+        if let Some(target_device) = target_device_opt {
+            let target = IoTarget { target_device };
+            self.send_request(&target, req)
+        } else {
+            DriverStatus::NoSuchDevice
+        }
+    }
     pub fn ioctl_via_symlink(
         &self,
         link_path: String,
@@ -1205,8 +1227,7 @@ impl PnpManager {
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         };
-        let mut start_request = Request::new(RequestType::Pnp, Box::new([]));
-        start_request.pnp = Some(pnp_payload);
+        let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
         let ctx = Arc::into_raw(dn.clone()) as usize;
         start_request.set_completion(Self::start_io, ctx);
 

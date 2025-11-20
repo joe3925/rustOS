@@ -782,7 +782,6 @@ extern "win64" fn acpi_pdo_query_resources(
     if let Some(p) = w.pnp.as_mut() {
         p.blob_out = blob;
     }
-    w.status = kernel_api::DriverStatus::Success;
     kernel_api::DriverStatus::Success
 }
 
@@ -829,7 +828,6 @@ extern "win64" fn acpi_pdo_query_id(
         }
     }
 
-    w.status = kernel_api::DriverStatus::Success;
     kernel_api::DriverStatus::Success
 }
 

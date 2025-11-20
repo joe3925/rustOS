@@ -9,7 +9,9 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::drivers::pnp::driver_object::{DriverStatus, FsOp, Request, RequestType};
+use crate::drivers::pnp::driver_object::{
+    DriverStatus, FsOp, Request, RequestType, TraversalPolicy,
+};
 use crate::file_system::file::{FileStatus, OpenFlags};
 use crate::file_system::file_provider::FileProvider;
 use crate::file_system::file_structs::FsReadParams;
@@ -127,10 +129,13 @@ impl Vfs {
     ) -> Result<(String, String, String), DriverStatus> {
         const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
 
-        let req = Arc::new(RwLock::new(Request::new(
-            RequestType::DeviceControl(IOCTL_MOUNTMGR_QUERY),
-            Box::new([]),
-        )));
+        let req = Arc::new(RwLock::new(
+            Request::new(
+                RequestType::DeviceControl(IOCTL_MOUNTMGR_QUERY),
+                Box::new([]),
+            )
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+        ));
         unsafe { pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()) };
         unsafe { pnp_wait_for_request(&req) };
 
@@ -277,10 +282,10 @@ impl Vfs {
         TParam: 'static,
         TResult: 'static,
     {
-        let req = Arc::new(RwLock::new(Request::new(
-            RequestType::Fs(op),
-            Vfs::box_to_bytes(Box::new(param)),
-        )));
+        let req = Arc::new(RwLock::new(
+            Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
+                .set_traversal_policy(TraversalPolicy::ForwardLower),
+        ));
         pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
         unsafe { pnp_wait_for_request(&req) };
 
@@ -303,10 +308,10 @@ impl Vfs {
     where
         TParam: 'static,
     {
-        let req = Arc::new(RwLock::new(Request::new(
-            RequestType::Fs(op),
-            Vfs::box_to_bytes(Box::new(param)),
-        )));
+        let req = Arc::new(RwLock::new(
+            Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
+                .set_traversal_policy(TraversalPolicy::ForwardLower),
+        ));
         unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
         req
     }

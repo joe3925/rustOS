@@ -111,7 +111,10 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     Ok(end)
 }
 
-pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn fs_op_dispatch(
+    dev: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let kind = { req.read().kind };
     match kind {
         RequestType::Fs(op) => {
@@ -125,13 +128,10 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                 FsOp::Open => {
                     let params: FsOpenParams = unsafe {
                         if r.data.len() != size_of::<FsOpenParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
-
-                    println!("opening");
 
                     let open_res: Result<(bool, u64, Option<CachedFile>), FsError> = {
                         let fs = fs_opt.as_mut().unwrap();
@@ -156,8 +156,6 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         }
                     };
 
-                    println!("opened");
-
                     match open_res {
                         Err(e) => {
                             let res = FsOpenResult {
@@ -167,7 +165,6 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 error: Some(map_fatfs_err(&e)),
                             };
                             r.data = box_to_bytes(Box::new(res));
-                            r.status = DriverStatus::Success;
                         }
                         Ok((is_dir, size, cached)) => {
                             let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
@@ -190,9 +187,9 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 error: None,
                             };
                             r.data = box_to_bytes(Box::new(res));
-                            r.status = DriverStatus::Success;
                         }
                     }
+                    DriverStatus::Success
                 }
 
                 FsOp::Close => {
@@ -200,8 +197,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let params: FsCloseParams = unsafe {
                         if r.data.len() != size_of::<FsCloseParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -219,14 +215,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         },
                     };
                     r.data = box_to_bytes(Box::new(res));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Read => {
                     let params: FsReadParams = unsafe {
                         if r.data.len() != size_of::<FsReadParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -240,8 +235,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                     data: Vec::new(),
                                     error: Some(FileStatus::PathNotFound),
                                 }));
-                                r.status = DriverStatus::Success;
-                                return;
+                                return DriverStatus::Success;
                             }
                         };
 
@@ -250,8 +244,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 data: Vec::new(),
                                 error: Some(FileStatus::PathNotFound),
                             }));
-                            r.status = DriverStatus::Success;
-                            return;
+                            return DriverStatus::Success;
                         }
 
                         let _fs_guard = fs_opt.as_mut().unwrap();
@@ -292,14 +285,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             }))
                         }
                     }
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Write => {
                     let params: FsWriteParams = unsafe {
                         if r.data.len() != size_of::<FsWriteParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -313,8 +305,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                     written: 0,
                                     error: Some(FileStatus::PathNotFound),
                                 }));
-                                r.status = DriverStatus::Success;
-                                return;
+                                return DriverStatus::Success;
                             }
                         };
 
@@ -323,8 +314,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                 written: 0,
                                 error: Some(FileStatus::PathNotFound),
                             }));
-                            r.status = DriverStatus::Success;
-                            return;
+                            return DriverStatus::Success;
                         }
 
                         let _fs_guard = fs_opt.as_mut().unwrap();
@@ -356,14 +346,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             }))
                         }
                     }
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Seek => {
                     let params: FsSeekParams = unsafe {
                         if r.data.len() != size_of::<FsSeekParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -377,8 +366,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                     pos: 0,
                                     error: Some(FileStatus::PathNotFound),
                                 }));
-                                r.status = DriverStatus::Success;
-                                return;
+                                return DriverStatus::Success;
                             }
                         };
 
@@ -412,7 +400,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         pos: new_pos,
                         error: None,
                     }));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Flush => {
@@ -421,13 +409,12 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let _params: FsFlushParams = unsafe {
                         if r.data.len() != size_of::<FsFlushParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
                     r.data = box_to_bytes(Box::new(FsFlushResult { error: None }));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Create => {
@@ -435,8 +422,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let params: FsCreateParams = unsafe {
                         if r.data.len() != size_of::<FsCreateParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -450,7 +436,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     };
 
                     r.data = box_to_bytes(Box::new(FsCreateResult { error: err }));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::Rename => {
@@ -458,8 +444,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let params: FsRenameParams = unsafe {
                         if r.data.len() != size_of::<FsRenameParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -473,7 +458,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                     };
 
                     r.data = box_to_bytes(Box::new(FsRenameResult { error: err }));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::ReadDir => {
@@ -481,8 +466,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
 
                     let params: FsListDirParams = unsafe {
                         if r.data.len() != size_of::<FsListDirParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -503,14 +487,13 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                             }))
                         }
                     }
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::GetInfo => {
                     let params: FsGetInfoParams = unsafe {
                         if r.data.len() != size_of::<FsGetInfoParams>() {
-                            r.status = DriverStatus::InvalidParameter;
-                            return;
+                            return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
@@ -525,8 +508,7 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                                     attrs: 0,
                                     error: Some(FileStatus::PathNotFound),
                                 }));
-                                r.status = DriverStatus::Success;
-                                return;
+                                return DriverStatus::Success;
                             }
                             Some(c) => c,
                         };
@@ -553,28 +535,25 @@ pub extern "win64" fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: Arc<RwLock<Re
                         attrs: attrs as u32,
                         error: None,
                     }));
-                    r.status = DriverStatus::Success;
+                    DriverStatus::Success
                 }
 
                 FsOp::SetInfo => {
                     drop(fs_opt.take());
                     drop(tbl_opt.take());
-                    r.status = DriverStatus::NotImplemented;
+                    DriverStatus::NotImplemented
                 }
                 FsOp::Delete => {
                     drop(fs_opt.take());
                     drop(tbl_opt.take());
-                    r.status = DriverStatus::NotImplemented;
+                    DriverStatus::NotImplemented
                 }
             }
         }
 
-        RequestType::DeviceControl(_code) => {
-            req.write().status = DriverStatus::NotImplemented;
-        }
-        _ => {
-            req.write().status = DriverStatus::InvalidParameter;
-        }
+        RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
+
+        _ => DriverStatus::InvalidParameter,
     }
 }
 

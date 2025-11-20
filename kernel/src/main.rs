@@ -17,6 +17,7 @@
 #![feature(try_trait_v2)]
 #![feature(const_trait_impl)]
 #![feature(const_option_ops)]
+#![feature(adt_const_params)]
 extern crate alloc;
 
 pub mod gdt;

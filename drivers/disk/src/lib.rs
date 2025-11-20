@@ -16,6 +16,7 @@ use spin::RwLock;
 use kernel_api::{
     DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DiskInfo, DriverObject,
     DriverStatus, KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
+    TraversalPolicy,
     alloc_api::{
         DeviceInit, IoType, Synchronization,
         ffi::{
@@ -133,33 +134,29 @@ pub extern "win64" fn disk_read(
     dev: &Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
-) {
+) -> DriverStatus {
     let (off, total) = {
         let g = parent.read();
         match g.kind {
             RequestType::Read { offset, len } => (offset, len),
             _ => {
                 drop(g);
-                parent.write().status = DriverStatus::InvalidParameter;
-                return;
+                return DriverStatus::InvalidParameter;
             }
         }
     };
     if total == 0 {
-        parent.write().status = DriverStatus::Success;
-        return;
+        return DriverStatus::Success;
     }
 
     let dx = disk_ext(dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
         if let Err(st) = query_props_sync(dev) {
-            parent.write().status = st;
-            return;
+            return st;
         }
     }
     if !rw_validate(&dx, off, total) {
-        parent.write().status = DriverStatus::InvalidParameter;
-        return;
+        return DriverStatus::InvalidParameter;
     }
 
     let bs_u32 = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
@@ -188,32 +185,26 @@ pub extern "win64" fn disk_read(
             buf_off: hdr_len as u32,
         };
         unsafe { core::ptr::write_unaligned(buf.as_mut_ptr() as *mut BlockRwIn, hdr) }
-
-        let child = Arc::new(RwLock::new(Request::new(
-            RequestType::DeviceControl(IOCTL_BLOCK_RW),
-            buf,
-        )));
+        let mut req_child = Request::new(RequestType::DeviceControl(IOCTL_BLOCK_RW), buf);
+        req_child.traversal_policy = TraversalPolicy::ForwardLower;
+        let child = Arc::new(RwLock::new(req_child));
         let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
         if st == DriverStatus::NoSuchDevice {
-            parent.write().status = DriverStatus::NoSuchDevice;
-            return;
+            return st;
         }
         unsafe { pnp_wait_for_request(&child) };
 
         let c = child.read();
         if c.status != DriverStatus::Success {
-            parent.write().status = c.status;
-            return;
+            return c.status;
         }
         let data = &c.data;
         if data.len() < hdr_len {
-            parent.write().status = DriverStatus::Unsuccessful;
-            return;
+            return DriverStatus::Unsuccessful;
         }
         let payload = &data[hdr_len..];
         if payload.is_empty() {
-            parent.write().status = DriverStatus::Unsuccessful;
-            return;
+            return DriverStatus::Unsuccessful;
         }
 
         let moved = core::cmp::min(payload.len(), remaining);
@@ -229,40 +220,36 @@ pub extern "win64" fn disk_read(
         lba += (moved / bs) as u64;
     }
 
-    parent.write().status = DriverStatus::Success;
+    return DriverStatus::Success;
 }
 
 pub extern "win64" fn disk_write(
     dev: &Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
-) {
+) -> DriverStatus {
     let (off, total) = {
         let g = parent.read();
         match g.kind {
             RequestType::Write { offset, len } => (offset, len),
             _ => {
                 drop(g);
-                parent.write().status = DriverStatus::InvalidParameter;
-                return;
+                return DriverStatus::InvalidParameter;
             }
         }
     };
     if total == 0 {
-        parent.write().status = DriverStatus::Success;
-        return;
+        return DriverStatus::Success;
     }
 
     let dx = disk_ext(dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
         if let Err(st) = query_props_sync(dev) {
-            parent.write().status = st;
-            return;
+            return st;
         }
     }
     if !rw_validate(&dx, off, total) {
-        parent.write().status = DriverStatus::InvalidParameter;
-        return;
+        return DriverStatus::InvalidParameter;
     }
 
     let bs_u32 = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
@@ -297,22 +284,19 @@ pub extern "win64" fn disk_write(
             let src = &p.data[parent_off..parent_off + this_bytes];
             buf[hdr_len..hdr_len + this_bytes].copy_from_slice(src);
         }
+        let mut req_child = Request::new(RequestType::DeviceControl(IOCTL_BLOCK_RW), buf);
+        req_child.traversal_policy = TraversalPolicy::ForwardLower;
+        let child = Arc::new(RwLock::new(req_child));
 
-        let child = Arc::new(RwLock::new(Request::new(
-            RequestType::DeviceControl(IOCTL_BLOCK_RW),
-            buf,
-        )));
         let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
         if st == DriverStatus::NoSuchDevice {
-            parent.write().status = DriverStatus::NoSuchDevice;
-            return;
+            return st;
         }
         unsafe { pnp_wait_for_request(&child) };
 
         let c = child.read();
         if c.status != DriverStatus::Success {
-            parent.write().status = c.status;
-            return;
+            return c.status;
         }
 
         remaining -= this_bytes;
@@ -320,50 +304,71 @@ pub extern "win64" fn disk_write(
         lba += (this_bytes / bs) as u64;
     }
 
-    parent.write().status = DriverStatus::Success;
+    return DriverStatus::Success;
 }
 
-pub extern "win64" fn disk_ioctl(dev: &Arc<DeviceObject>, parent: Arc<RwLock<Request>>) {
+pub extern "win64" fn disk_ioctl(
+    dev: &Arc<DeviceObject>,
+    parent: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let code = match parent.read().kind {
         RequestType::DeviceControl(c) => c,
-        _ => {
-            parent.write().status = DriverStatus::InvalidParameter;
-            return;
-        }
+        _ => return DriverStatus::InvalidParameter,
     };
+
     match code {
         IOCTL_DRIVE_IDENTIFY => {
-            let mut ch = Request::new(RequestType::Pnp, Box::new([]));
-            ch.pnp = Some(kernel_api::alloc_api::PnpRequest {
-                minor_function: PnpMinorFunction::QueryResources,
-                relation: DeviceRelationType::TargetDeviceRelation,
-                id_type: QueryIdType::CompatibleIds,
-                ids_out: alloc::vec::Vec::new(),
-                blob_out: alloc::vec::Vec::new(),
-            });
+            let mut ch = Request::new_pnp(
+                kernel_api::alloc_api::PnpRequest {
+                    minor_function: PnpMinorFunction::QueryResources,
+
+                    relation: DeviceRelationType::TargetDeviceRelation,
+
+                    id_type: QueryIdType::CompatibleIds,
+
+                    ids_out: alloc::vec::Vec::new(),
+
+                    blob_out: alloc::vec::Vec::new(),
+                },
+                Box::new([]),
+            );
+
+            if let Some(pnp) = ch.pnp.as_mut() {
+                pnp.relation = DeviceRelationType::TargetDeviceRelation;
+                pnp.id_type = QueryIdType::CompatibleIds;
+            }
+
             let ch = Arc::new(RwLock::new(ch));
+
             unsafe { pnp_forward_request_to_next_lower(dev, ch.clone()) };
             unsafe { pnp_wait_for_request(&ch) };
-            let blob = { ch.read().pnp.as_ref().unwrap().blob_out.clone() };
+
+            let blob = {
+                let r = ch.read();
+                r.pnp
+                    .as_ref()
+                    .map(|p| p.blob_out.clone())
+                    .unwrap_or_default()
+            };
             let mut w = parent.write();
             w.data = blob.into_boxed_slice();
-            w.status = DriverStatus::Success;
+            DriverStatus::Success
         }
         IOCTL_BLOCK_FLUSH => {
-            let child = Arc::new(RwLock::new(Request::new(
-                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-                Box::new([]),
-            )));
+            let mut req_child =
+                Request::new(RequestType::DeviceControl(IOCTL_BLOCK_FLUSH), Box::new([]));
+            req_child.traversal_policy = TraversalPolicy::ForwardLower;
+            let child = Arc::new(RwLock::new(req_child));
+
             let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
             if st == DriverStatus::NoSuchDevice {
-                parent.write().status = DriverStatus::NoSuchDevice;
-                return;
+                return DriverStatus::NoSuchDevice;
             }
+
             unsafe { pnp_wait_for_request(&child) };
-            let c = child.read();
-            parent.write().status = c.status;
+            child.read().status
         }
-        _ => parent.write().status = DriverStatus::NotImplemented,
+        _ => DriverStatus::NotImplemented,
     }
 }
 
@@ -389,10 +394,11 @@ fn rw_validate(dx: &DiskExt, off: u64, total: usize) -> bool {
 fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     let out_len = core::mem::size_of::<BlockQueryOut>();
     let buf = alloc::vec![0u8; out_len].into_boxed_slice();
-    let child = Arc::new(RwLock::new(Request::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_QUERY),
-        buf,
-    )));
+
+    let child = Arc::new(RwLock::new(
+        Request::new(RequestType::DeviceControl(IOCTL_BLOCK_QUERY), buf)
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
     let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
     if st == DriverStatus::NoSuchDevice {
         return Err(DriverStatus::NoSuchDevice);

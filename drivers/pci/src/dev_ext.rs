@@ -395,50 +395,6 @@ extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) -> Driv
     return DriverStatus::Success;
 }
 
-fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
-    let pnp_payload = PnpRequest {
-        minor_function: PnpMinorFunction::QueryResources,
-        relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-        id_type: kernel_api::QueryIdType::CompatibleIds,
-        ids_out: Vec::new(),
-        blob_out: Vec::new(),
-    };
-
-    let mut req = kernel_api::Request {
-        id: 0,
-        kind: RequestType::Pnp,
-        data: alloc::boxed::Box::new([]),
-        completed: false,
-        status: DriverStatus::Pending,
-        pnp: Some(pnp_payload),
-        completion_routine: None,
-        completion_context: 0,
-    };
-
-    let wc = Box::new(WaitCtx {
-        done: AtomicBool::new(false),
-        status: UnsafeCell::new(DriverStatus::Pending),
-        blob: UnsafeCell::new(Vec::new()),
-    });
-    let ctx = Box::into_raw(wc) as usize;
-
-    req.completion_routine = Some(on_complete);
-    req.completion_context = ctx;
-
-    let _ = unsafe { pnp_forward_request_to_next_lower(device, Arc::new(RwLock::new(req))) };
-
-    let w = unsafe { &*(ctx as *const WaitCtx) };
-    while !w.done.load(Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
-    let wc = unsafe { Box::from_raw(ctx as *mut WaitCtx) };
-    let status = unsafe { *wc.status.get() };
-    if status != DriverStatus::Success {
-        return None;
-    }
-    Some(unsafe { core::ptr::read_unaligned(wc.blob.get()) })
-}
-
 pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
     let mut segs = Vec::new();
     let mut i = 0usize;
@@ -488,16 +444,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
         blob_out: alloc::vec::Vec::new(),
     };
 
-    let req = kernel_api::Request {
-        id: 0,
-        kind: kernel_api::RequestType::Pnp,
-        data: alloc::boxed::Box::new([]),
-        completed: false,
-        status: kernel_api::DriverStatus::Pending,
-        pnp: Some(pnp),
-        completion_routine: None,
-        completion_context: 0,
-    };
+    let req = Request::new_pnp(pnp, Vec::new().into_boxed_slice());
 
     let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
     let down = unsafe { pnp_forward_request_to_next_lower(device, req_arc.clone()) };

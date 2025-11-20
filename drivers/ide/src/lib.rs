@@ -128,23 +128,23 @@ extern "win64" fn ide_pnp_start(
 ) -> DriverStatus {
     let _guard = LOCK.lock();
 
-    let mut child = Request::new(RequestType::Pnp, Box::new([]));
-    child.pnp = Some(PnpRequest {
-        minor_function: PnpMinorFunction::QueryResources,
-        relation: DeviceRelationType::TargetDeviceRelation,
-        id_type: QueryIdType::CompatibleIds,
-        ids_out: Vec::new(),
-        blob_out: Vec::new(),
-    });
+    let mut child = Request::new_pnp(
+        PnpRequest {
+            minor_function: PnpMinorFunction::QueryResources,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::CompatibleIds,
+            ids_out: Vec::new(),
+            blob_out: Vec::new(),
+        },
+        Box::new([]),
+    );
     let child = Arc::new(RwLock::new(child));
     let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
     if st != DriverStatus::NoSuchDevice {
         unsafe { kernel_api::alloc_api::ffi::pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
-            req.write().status = qst;
-            unsafe { pnp_complete_request(&req) };
-            return DriverStatus::Success;
+            return qst;
         }
 
         let bars = {
@@ -172,7 +172,7 @@ extern "win64" fn ide_pnp_start(
         dx.enumerated.store(false, Ordering::Release);
     }
 
-    DriverStatus::Pending
+    DriverStatus::Continue
 }
 
 extern "win64" fn ide_pnp_query_devrels(
@@ -182,9 +182,10 @@ extern "win64" fn ide_pnp_query_devrels(
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(dev);
+        // We are the only ones to enum this bus, prevent lower drivers from adding new drives
         return DriverStatus::Success;
     }
-    DriverStatus::Pending
+    DriverStatus::Continue
 }
 
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
@@ -284,29 +285,32 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
         .expect("ide: PDO ChildExt missing");
 }
 
-pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) {
+pub extern "win64" fn ide_pdo_internal_ioctl(
+    pdo: &Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let _guard = LOCK.lock();
 
     let cdx = pdo
         .try_devext::<ChildExt>()
         .expect("ide: PDO ChildExt missing");
+
     if !cdx.present.load(Ordering::Acquire) {
-        req.write().status = DriverStatus::NoSuchDevice;
-        return;
+        return DriverStatus::NoSuchDevice;
     }
+
     let parent: Arc<DeviceObject> = cdx.parent_device.upgrade().expect("parent device gone");
 
     let dx = parent
         .try_devext::<DevExt>()
         .expect("No parent IDE dev ext");
+
+    // OPTIMIZATION: Use read lock to get the code
     let code = {
-        let mut w = req.write();
-        match w.kind {
+        let r = req.read();
+        match r.kind {
             RequestType::DeviceControl(c) => c,
-            _ => {
-                w.status = DriverStatus::InvalidParameter;
-                return;
-            }
+            _ => return DriverStatus::InvalidParameter,
         }
     };
 
@@ -314,39 +318,33 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
         IOCTL_BLOCK_QUERY => {
             let mut w = req.write();
             if w.data.len() < size_of::<BlockQueryOut>() {
-                w.status = DriverStatus::InsufficientResources;
-                return;
+                return DriverStatus::InsufficientResources;
             }
             let out = unsafe { &mut *(w.data.as_mut_ptr() as *mut BlockQueryOut) };
             out.block_size = 512;
             out.max_blocks = 256;
             out.alignment_mask = 0;
             out.features = FEAT_FLUSH;
-            w.status = DriverStatus::Success;
+            DriverStatus::Success
         }
 
         IOCTL_BLOCK_RW => {
             let (hdr, need, off) = {
-                let w = req.read();
-                if w.data.len() < size_of::<BlockRwIn>() {
-                    drop(w);
-                    req.write().status = DriverStatus::InvalidParameter;
-                    return;
+                let r = req.read();
+                if r.data.len() < size_of::<BlockRwIn>() {
+                    return DriverStatus::InvalidParameter;
                 }
-                let hdr = unsafe { *(w.data.as_ptr() as *const BlockRwIn) };
+                let hdr = unsafe { *(r.data.as_ptr() as *const BlockRwIn) };
                 let need = (hdr.blocks as usize) * 512;
                 let off = hdr.buf_off as usize;
-                if hdr.blocks == 0
-                    || off
-                        .checked_add(need)
-                        .map(|e| e <= w.data.len())
-                        .unwrap_or(false)
-                        == false
-                    || (hdr.lba >> 28) != 0
-                {
-                    drop(w);
-                    req.write().status = DriverStatus::InvalidParameter;
-                    return;
+
+                let bounds_check = off
+                    .checked_add(need)
+                    .map(|e| e <= r.data.len())
+                    .unwrap_or(false);
+
+                if hdr.blocks == 0 || !bounds_check || (hdr.lba >> 28) != 0 {
+                    return DriverStatus::InvalidParameter;
                 }
                 (hdr, need, off)
             };
@@ -367,16 +365,14 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
                     hdr.blocks as u32,
                     &w.data[off..off + need],
                 ),
-                _ => {
-                    w.status = DriverStatus::InvalidParameter;
-                    return;
-                }
+                _ => return DriverStatus::InvalidParameter,
             };
-            w.status = if ok {
+
+            if ok {
                 DriverStatus::Success
             } else {
                 DriverStatus::Unsuccessful
-            };
+            }
         }
 
         IOCTL_BLOCK_FLUSH => {
@@ -384,24 +380,22 @@ pub extern "win64" fn ide_pdo_internal_ioctl(pdo: &Arc<DeviceObject>, req: Arc<R
                 let mut p = dx.ports.lock();
                 unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
             }
-            let mut w = req.write();
+
             let ok = {
                 let mut p = dx.ports.lock();
                 wait_not_busy(&mut p.control, TIMEOUT_MS)
             };
-            w.status = if ok {
+
+            if ok {
                 DriverStatus::Success
             } else {
                 DriverStatus::Unsuccessful
-            };
+            }
         }
 
-        _ => {
-            req.write().status = DriverStatus::NotImplemented;
-        }
+        _ => DriverStatus::NotImplemented,
     }
 }
-
 #[derive(Default, Clone, Copy)]
 struct IdeBars {
     cmd: u16,
@@ -729,7 +723,6 @@ extern "win64" fn ide_pdo_query_id(
             );
         }
     }
-    w.status = DriverStatus::Success;
     DriverStatus::Success
 }
 
@@ -740,29 +733,23 @@ extern "win64" fn ide_pdo_query_resources(
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
         Err(_) => {
-            let mut w = req.write();
-            w.status = DriverStatus::NoSuchDevice;
             return DriverStatus::NoSuchDevice;
         }
     };
 
     let mut w = req.write();
     let Some(p) = w.pnp.as_mut() else {
-        w.status = DriverStatus::InvalidParameter;
         return DriverStatus::InvalidParameter;
     };
 
     let Some(di) = cdx.disk_info.as_ref() else {
-        w.status = DriverStatus::DeviceNotReady;
-        return DriverStatus::Success;
+        return DriverStatus::DeviceNotReady;
     };
-
     let di_ptr = di.as_ref() as *const DiskInfo as *const u8;
     let n = core::mem::size_of::<DiskInfo>();
     let bytes = unsafe { core::slice::from_raw_parts(di_ptr, n) };
     p.blob_out = bytes.to_vec();
 
-    w.status = DriverStatus::Success;
     DriverStatus::Success
 }
 

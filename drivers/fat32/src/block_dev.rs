@@ -6,7 +6,7 @@ use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    FileStatus, IoTarget, Request, RequestType,
+    DriverStatus, FileStatus, IoTarget, Request, RequestType, TraversalPolicy,
     alloc_api::ffi::{pnp_send_request, pnp_wait_for_request},
     println,
 };
@@ -23,14 +23,14 @@ pub struct BlockDev {
 pub enum BlkError {
     InvalidInput,
     Io,
+    Driver(DriverStatus),
 }
-impl From<FileStatus> for BlkError {
-    fn from(_v: FileStatus) -> Self {
-        BlkError::Io
+impl From<DriverStatus> for BlkError {
+    fn from(_v: DriverStatus) -> Self {
+        Self::Driver(_v)
     }
 }
 
-/* fatfs requires Error = () for IoBase on this crate version */
 impl IoBase for BlockDev {
     type Error = ();
 }
@@ -177,30 +177,130 @@ impl Seek for BlockDev {
 }
 
 /* === Sector IO === */
+// pub fn read_sectors_sync(
+//     target: &Arc<IoTarget>,
+//     lba: u64,
+//     sectors: usize,
+//     bps: usize,
+//     out: &mut [u8],
+// ) -> Result<(), DriverStatus> {
+//     let bytes = match sectors.checked_mul(bps) {
+//         Some(b) => b,
+//         None => return Err(DriverStatus::InvalidParameter),
+//     };
+
+//     if out.len() < bytes {
+//         return Err(DriverStatus::InvalidParameter);
+//     }
+
+//     let offset = match lba.checked_mul(bps as u64) {
+//         Some(o) => o,
+//         None => return Err(DriverStatus::InvalidParameter),
+//     };
+
+//     let req = Arc::new(RwLock::new(Request::new(
+//         RequestType::Read { offset, len: bytes },
+//         alloc::vec![0u8; bytes].into_boxed_slice(),
+//     )));
+
+//     unsafe { pnp_send_request(target.as_ref(), req.clone()) };
+//     unsafe { pnp_wait_for_request(&req) };
+
+//     let r = req.read();
+//     if r.status != DriverStatus::Success {
+//         println!("")
+//         return Err(r.status);
+//     }
+
+//     if r.data.len() < bytes {
+//         return Err(DriverStatus::Unsuccessful);
+//     }
+
+//     out[..bytes].copy_from_slice(&r.data[..bytes]);
+//     Ok(())
+// }
+
+// pub fn write_sectors_sync(
+//     target: &Arc<IoTarget>,
+//     lba: u64,
+//     sectors: usize,
+//     bps: usize,
+//     data: &[u8],
+// ) -> Result<(), DriverStatus> {
+//     let bytes = match sectors.checked_mul(bps) {
+//         Some(b) => b,
+//         None => return Err(DriverStatus::InvalidParameter),
+//     };
+
+//     if data.len() < bytes {
+//         return Err(DriverStatus::InvalidParameter);
+//     }
+
+//     let offset = match lba.checked_mul(bps as u64) {
+//         Some(o) => o,
+//         None => return Err(DriverStatus::InvalidParameter),
+//     };
+
+//     let req = Arc::new(RwLock::new(Request::new(
+//         RequestType::Write { offset, len: bytes },
+//         data[..bytes].to_vec().into_boxed_slice(),
+//     )));
+
+//     unsafe { pnp_send_request(&**target, req.clone()) };
+//     unsafe { pnp_wait_for_request(&req) };
+
+//     let status = req.read().status;
+//     if status == DriverStatus::Success {
+//         Ok(())
+//     } else {
+//         Err(status)
+//     }
+// }
 pub fn read_sectors_sync(
     target: &Arc<IoTarget>,
     lba: u64,
     sectors: usize,
     bps: usize,
     out: &mut [u8],
-) -> Result<(), FileStatus> {
-    let bytes = sectors.checked_mul(bps).ok_or(FileStatus::UnknownFail)?;
+) -> Result<(), DriverStatus> {
+    let bytes = match sectors.checked_mul(bps) {
+        Some(b) => b,
+        None => return Err(DriverStatus::InvalidParameter),
+    };
+
     if out.len() < bytes {
-        return Err(FileStatus::UnknownFail);
+        return Err(DriverStatus::InvalidParameter);
     }
-    let req = Arc::new(RwLock::new(Request::new(
-        RequestType::Read {
-            offset: lba.checked_mul(bps as u64).ok_or(FileStatus::UnknownFail)?,
-            len: bytes,
-        },
-        vec![0u8; bytes].into_boxed_slice(),
-    )));
+
+    let offset = match lba.checked_mul(bps as u64) {
+        Some(o) => o,
+        None => return Err(DriverStatus::InvalidParameter),
+    };
+    let mut req_owned = Request::new(
+        RequestType::Read { offset, len: bytes },
+        alloc::vec![0u8; bytes].into_boxed_slice(),
+    );
+    req_owned.traversal_policy = TraversalPolicy::ForwardLower;
+    let req = Arc::new(RwLock::new(req_owned));
+
     unsafe { pnp_send_request(target.as_ref(), req.clone()) };
     unsafe { pnp_wait_for_request(&req) };
-    if req.read().data.len() < bytes {
-        return Err(FileStatus::UnknownFail);
+
+    let r = req.read();
+    if r.status != DriverStatus::Success {
+        println!(
+            "Read failed: LBA={} Count={} Status={:?}",
+            lba, sectors, r.status
+        );
+        return Err(r.status);
     }
-    out[..bytes].copy_from_slice(&req.read().data[..bytes]);
+
+    if r.data.len() < bytes {
+        println!("Read incomplete: expected {} got {}", bytes, r.data.len());
+        return Err(DriverStatus::Unsuccessful);
+    }
+
+    out[..bytes].copy_from_slice(&r.data[..bytes]);
     Ok(())
 }
 
@@ -210,19 +310,38 @@ pub fn write_sectors_sync(
     sectors: usize,
     bps: usize,
     data: &[u8],
-) -> Result<(), FileStatus> {
-    let bytes = sectors.checked_mul(bps).ok_or(FileStatus::UnknownFail)?;
+) -> Result<(), DriverStatus> {
+    let bytes = match sectors.checked_mul(bps) {
+        Some(b) => b,
+        None => return Err(DriverStatus::InvalidParameter),
+    };
+
     if data.len() < bytes {
-        return Err(FileStatus::UnknownFail);
+        return Err(DriverStatus::InvalidParameter);
     }
-    let req = Arc::new(RwLock::new(Request::new(
-        RequestType::Write {
-            offset: lba.checked_mul(bps as u64).ok_or(FileStatus::UnknownFail)?,
-            len: bytes,
-        },
+
+    let offset = match lba.checked_mul(bps as u64) {
+        Some(o) => o,
+        None => return Err(DriverStatus::InvalidParameter),
+    };
+    let mut req_owned = Request::new(
+        RequestType::Write { offset, len: bytes },
         data[..bytes].to_vec().into_boxed_slice(),
-    )));
+    );
+    req_owned.traversal_policy = TraversalPolicy::ForwardLower;
+    let req = Arc::new(RwLock::new(req_owned));
+
     unsafe { pnp_send_request(&**target, req.clone()) };
     unsafe { pnp_wait_for_request(&req) };
-    Ok(())
+
+    let status = req.read().status;
+    if status == DriverStatus::Success {
+        Ok(())
+    } else {
+        println!(
+            "Write failed: LBA={} Count={} Status={:?}",
+            lba, sectors, status
+        );
+        Err(status)
+    }
 }

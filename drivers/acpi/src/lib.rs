@@ -85,13 +85,13 @@ pub extern "win64" fn bus_driver_prepare_hardware(
     }
     if let Err(e) = aml_ctx.initialize_objects() {
         println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
-        return DriverStatus::Success;
+        return DriverStatus::Continue;
     }
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
-    DriverStatus::Success
+    DriverStatus::Continue
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
