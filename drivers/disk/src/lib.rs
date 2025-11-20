@@ -422,3 +422,10 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         .store(true, core::sync::atomic::Ordering::Release);
     Ok(())
 }
+
+extern "win64" fn disk_on_flush_done(child: &mut Request, ctx: usize) {
+    let parent_arc: Arc<RwLock<Request>> =
+        *unsafe { Box::from_raw(ctx as *mut Arc<RwLock<Request>>) };
+    parent_arc.write().status = child.status;
+    unsafe { pnp_complete_request(&parent_arc) };
+}

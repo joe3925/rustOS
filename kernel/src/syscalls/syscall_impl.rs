@@ -469,7 +469,7 @@ pub(crate) fn sys_file_open(
     let flg = unsafe { core::slice::from_raw_parts(flags, n) };
     match File::open(&abs_path, flg) {
         Ok(f) => unsafe {
-            core::ptr::write(out, f);
+            core::ptr::write_unaligned(out, f);
             0
         },
         Err(_) => make_err(ErrClass::File, FileErr::Io as u16, 0),
@@ -712,7 +712,7 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
     let q = qref.write();
     match q.queue.front() {
         Some(m) => unsafe {
-            core::ptr::write(msg_ptr, m.clone());
+            core::ptr::write_unaligned(msg_ptr, m.clone());
             0
         },
         None => make_err(ErrClass::Message, MsgErr::TargetResolveFailed as u16, 0),
@@ -756,7 +756,7 @@ pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) 
     loop {
         if let Some(m) = qref.write().queue.pop_front() {
             unsafe {
-                core::ptr::write(msg_ptr, m);
+                core::ptr::write_unaligned(msg_ptr, m);
             }
             return 0;
         }

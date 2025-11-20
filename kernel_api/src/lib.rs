@@ -62,7 +62,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
 pub struct DeviceObject {
     pub lower_device: Once<Arc<DeviceObject>>,
-    pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
+    pub upper_device: Once<alloc::sync::Weak<DeviceObject>>,
     dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
@@ -76,7 +76,7 @@ impl DeviceObject {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
         Arc::new(Self {
             lower_device: Once::new(),
-            upper_device: RwLock::new(None),
+            upper_device: Once::new(),
             dev_ext,
             dev_init: init,
             queue: Mutex::new(VecDeque::new()),
@@ -103,7 +103,9 @@ impl DeviceObject {
     }
     pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
         this.lower_device.call_once(|| lower.clone());
-        *lower.upper_device.write() = Some(Arc::downgrade(this));
+        lower
+            .upper_device
+            .call_once(|| Arc::downgrade(this).clone());
     }
     pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
         self.dev_node.call_once(|| Arc::downgrade(dn));
@@ -291,187 +293,30 @@ pub struct FsCloseResult {
 
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FsReadHeader {
+pub struct FsReadParams {
     pub fs_file_id: u64,
     pub offset: u64,
     pub len: usize,
 }
-
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FsReadResultHeader {
-    pub read_len: usize,
+pub struct FsReadResult {
+    pub data: Vec<u8>,
     pub error: Option<FileStatus>,
 }
 
-pub const FS_READ_HDR_AREA: usize = {
-    const A: usize = core::mem::size_of::<FsReadHeader>();
-    const B: usize = core::mem::size_of::<FsReadResultHeader>();
-    if A > B {
-        A
-    } else {
-        B
-    }
-};
-
-pub struct ReadView<'a> {
-    pub hdr: FsReadHeader,
-    pub buf: &'a mut [u8],
-}
-
-pub fn fs_read_view_from_data(data: &mut Box<[u8]>) -> Option<ReadView<'_>> {
-    let hdr_area = FS_READ_HDR_AREA;
-    if data.len() < hdr_area {
-        return None;
-    }
-
-    let total = data.len();
-    let data_len = total - hdr_area;
-
-    // header is stored at the end, unaligned
-    let hdr =
-        unsafe { core::ptr::read_unaligned(data.as_ptr().add(data_len) as *const FsReadHeader) };
-
-    if hdr.len > data_len {
-        return None;
-    }
-
-    let buf = &mut data[..hdr.len];
-
-    Some(ReadView { hdr, buf })
-}
-
-pub fn fs_read_result_into_data(
-    data: &mut Box<[u8]>,
-    read_len: usize,
-    error: Option<FileStatus>,
-) -> bool {
-    let hdr_area = FS_READ_HDR_AREA;
-    if data.len() < hdr_area {
-        return false;
-    }
-
-    let total = data.len();
-    let data_len = total - hdr_area;
-    if read_len > data_len {
-        return false;
-    }
-
-    let hdr = FsReadResultHeader { read_len, error };
-    let hdr_ptr = unsafe { data.as_mut_ptr().add(data_len) as *mut FsReadResultHeader };
-    unsafe {
-        core::ptr::write_unaligned(hdr_ptr, hdr);
-    }
-    true
-}
-
-pub fn make_read_request(fs_file_id: u64, offset: u64, buf_cap: usize) -> Request {
-    let hdr_area = FS_READ_HDR_AREA;
-    let total = hdr_area + buf_cap;
-    let mut data = vec![0u8; total].into_boxed_slice();
-
-    let data_len = total - hdr_area;
-    let hdr = FsReadHeader {
-        fs_file_id,
-        offset,
-        len: buf_cap,
-    };
-
-    let hdr_ptr = unsafe { data.as_mut_ptr().add(data_len) as *mut FsReadHeader };
-    unsafe {
-        core::ptr::write_unaligned(hdr_ptr, hdr);
-    }
-
-    Request::new(RequestType::Fs(FsOp::Read), data)
-}
-
-pub fn interpret_read_result(data: Box<[u8]>) -> (usize, Option<FileStatus>, Box<[u8]>) {
-    let hdr_area = FS_READ_HDR_AREA;
-    let total = data.len();
-    if total < hdr_area {
-        return (0, Some(FileStatus::UnknownFail), data);
-    }
-
-    let data_len = total - hdr_area;
-    let result = unsafe {
-        core::ptr::read_unaligned(data.as_ptr().add(data_len) as *const FsReadResultHeader)
-    };
-
-    (result.read_len, result.error, data)
-}
-
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FsWriteHeader {
+pub struct FsWriteParams {
     pub fs_file_id: u64,
     pub offset: u64,
-    pub len: usize,
+    pub data: Vec<u8>,
 }
-
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FsWriteResultHeader {
+pub struct FsWriteResult {
     pub written: usize,
     pub error: Option<FileStatus>,
-}
-
-pub const FS_WRITE_HDR_AREA: usize = {
-    const A: usize = core::mem::size_of::<FsWriteHeader>();
-    const B: usize = core::mem::size_of::<FsWriteResultHeader>();
-    if A > B {
-        A
-    } else {
-        B
-    }
-};
-
-pub struct WriteView<'a> {
-    pub hdr: FsWriteHeader,
-    pub buf: &'a [u8],
-}
-
-pub fn fs_write_view_from_data(data: &Box<[u8]>) -> Option<WriteView<'_>> {
-    let hdr_area = FS_WRITE_HDR_AREA;
-    if data.len() < hdr_area {
-        return None;
-    }
-
-    let total = data.len();
-    let data_len = total - hdr_area;
-
-    let hdr =
-        unsafe { core::ptr::read_unaligned(data.as_ptr().add(data_len) as *const FsWriteHeader) };
-    if hdr.len > data_len {
-        return None;
-    }
-
-    let buf = &data[..hdr.len];
-
-    Some(WriteView { hdr, buf })
-}
-
-pub fn fs_write_result_into_data(
-    data: &mut Box<[u8]>,
-    written: usize,
-    error: Option<FileStatus>,
-) -> bool {
-    let hdr_area = FS_WRITE_HDR_AREA;
-    if data.len() < hdr_area {
-        return false;
-    }
-
-    let total = data.len();
-    let data_len = total - hdr_area;
-    if written > data_len {
-        return false;
-    }
-
-    let hdr = FsWriteResultHeader { written, error };
-    let hdr_ptr = unsafe { data.as_mut_ptr().add(data_len) as *mut FsWriteResultHeader };
-    unsafe {
-        core::ptr::write_unaligned(hdr_ptr, hdr);
-    }
-    true
 }
 
 #[repr(C)]
@@ -853,28 +698,22 @@ pub enum FileStatus {
     //DriverError(DriverStatus),
 }
 impl FileStatus {
-    pub fn to_str(&self) -> String {
+    pub fn to_str(&self) -> &str {
         match self {
-            FileStatus::Success => "Success".to_string(),
-            FileStatus::FileAlreadyExist => "File already exists".to_string(),
-            FileStatus::PathNotFound => "Path not found".to_string(),
-            FileStatus::UnknownFail => "The operation failed for an unknown reason".to_string(),
-            FileStatus::NotFat => "The partition is unformatted or not supported".to_string(),
-            FileStatus::DriveNotFound => "The drive specified doesn't exist".to_string(),
-            FileStatus::IncompatibleFlags => {
-                "The flags can contain CreateNew and Create".to_string()
-            }
-            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".to_string(),
-            FileStatus::InternalError => "Internal error".to_string(),
-            FileStatus::BadPath => "Invalid path".to_string(),
-            FileStatus::AccessDenied => {
-                "Insufficient permissions to access the current file".to_string()
-            }
-            FileStatus::NoSpace => {
-                "Insufficient space on drive to write the requested data".to_string()
-            } // FileStatus::DriverError(e) => {
-              //     format!("The file access failed with a driver error of {}", e)
-              // }
+            FileStatus::Success => "Success",
+            FileStatus::FileAlreadyExist => "File already exists",
+            FileStatus::PathNotFound => "Path not found",
+            FileStatus::UnknownFail => "The operation failed for an unknown reason",
+            FileStatus::NotFat => "The partition is unformatted or not supported",
+            FileStatus::DriveNotFound => "The drive specified doesn't exist",
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt",
+            FileStatus::InternalError => "Internal error",
+            FileStatus::BadPath => "Invalid path",
+            FileStatus::AccessDenied => "Insufficient permissions to access the current file",
+            FileStatus::NoSpace => "Insufficient space on drive to write the requested data", // FileStatus::DriverError(e) => {
+                                                                                              //     format!("The file access failed with a driver error of {}", e)
+                                                                                              // }
         }
     }
 }

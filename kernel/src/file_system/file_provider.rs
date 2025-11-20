@@ -10,19 +10,15 @@ use crate::file_system::file::{FileStatus, OpenFlags};
 use crate::file_system::file_structs::{
     FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
     FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteResultHeader,
+    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
+    FsSeekWhence, FsWriteParams, FsWriteResult,
 };
 
 pub trait FileProvider: Send + Sync {
     fn open_path(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus);
     fn close_handle(&self, file_id: u64) -> (FsCloseResult, DriverStatus);
-    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (Option<Box<[u8]>>, DriverStatus);
-    fn write_at(
-        &self,
-        file_id: u64,
-        offset: u64,
-        data: Box<[u8]>,
-    ) -> (FsWriteResultHeader, DriverStatus);
+    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus);
+    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus);
     fn flush_handle(&self, file_id: u64) -> (FsFlushResult, DriverStatus);
     fn get_info(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus);
 

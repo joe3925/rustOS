@@ -325,9 +325,12 @@ pub mod reg {
 
         let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])
             .ok()
-            .ok_or(RegError::FileIO)?;
-
-        file.write(&bytes).ok().ok_or(RegError::FileIO)?;
+            .expect("Registry persistence failed ");
+        if let Some(binding) = file.write(&bytes).err() {
+            let err_str = binding.to_str();
+            println!("{}", err_str);
+        }
+        //file.write(&bytes).expect("Registry persistence failed ");
         Ok(())
     }
     pub fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {

@@ -436,7 +436,7 @@ fn query_parent_resources_blob(device: &Arc<DeviceObject>) -> Option<Vec<u8>> {
     if status != DriverStatus::Success {
         return None;
     }
-    Some(unsafe { core::ptr::read(wc.blob.get()) })
+    Some(unsafe { core::ptr::read_unaligned(wc.blob.get()) })
 }
 
 pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {

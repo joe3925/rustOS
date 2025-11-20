@@ -83,28 +83,22 @@ pub enum FileStatus {
     // DriverError(DriverStatus),
 }
 impl FileStatus {
-    pub fn to_str(&self) -> String {
+    pub fn to_str(&self) -> &str {
         match self {
-            FileStatus::Success => "Success".to_string(),
-            FileStatus::FileAlreadyExist => "File already exists".to_string(),
-            FileStatus::PathNotFound => "Path not found".to_string(),
-            FileStatus::UnknownFail => "The operation failed for an unknown reason".to_string(),
-            FileStatus::NotFat => "The partition is unformatted or not supported".to_string(),
-            FileStatus::DriveNotFound => "The drive specified doesn't exist".to_string(),
-            FileStatus::IncompatibleFlags => {
-                "The flags can contain CreateNew and Create".to_string()
-            }
-            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt".to_string(),
-            FileStatus::InternalError => "Internal error".to_string(),
-            FileStatus::BadPath => "Invalid path".to_string(),
-            FileStatus::AccessDenied => {
-                "Insufficient permissions to access the current file".to_string()
-            }
-            FileStatus::NoSpace => {
-                "Insufficient space on drive to write the requested data".to_string()
-            } // FileStatus::DriverError(e) => {
-              //     format!("The file access failed with a driver error of {}", e)
-              // }
+            FileStatus::Success => "Success",
+            FileStatus::FileAlreadyExist => "File already exists",
+            FileStatus::PathNotFound => "Path not found",
+            FileStatus::UnknownFail => "The operation failed for an unknown reason",
+            FileStatus::NotFat => "The partition is unformatted or not supported",
+            FileStatus::DriveNotFound => "The drive specified doesn't exist",
+            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
+            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt",
+            FileStatus::InternalError => "Internal error",
+            FileStatus::BadPath => "Invalid path",
+            FileStatus::AccessDenied => "Insufficient permissions to access the current file",
+            FileStatus::NoSpace => "Insufficient space on drive to write the requested data", // FileStatus::DriverError(e) => {
+                                                                                              //     format!("The file access failed with a driver error of {}", e)
+                                                                                              // }
         }
     }
 }
@@ -237,32 +231,27 @@ impl File {
     pub extern "win64" fn read(&self) -> Result<Vec<u8>, FileStatus> {
         let (gi, st1) = file_provider::provider().get_info(self.fs_file_id);
         if st1 != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::InternalError);
+            return Err(FileStatus::UnknownFail);
         }
         if let Some(e) = gi.error {
             return Err(e);
         }
-
         let size = gi.size as usize;
-        let (buf_opt, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
+        let (rr, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
         if st2 != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::InternalError);
+            return Err(FileStatus::UnknownFail);
         }
-
-        match buf_opt {
-            Some(buf) => Ok(buf.into_vec()),
-            None => Err(FileStatus::InternalError),
+        match rr.error {
+            None => Ok(rr.data),
+            Some(e) => Err(e),
         }
     }
 
     pub extern "win64" fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
-        let boxed = data.to_vec().into_boxed_slice();
-
-        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, boxed);
+        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, data);
         if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
-            return Err(FileStatus::InternalError);
+            return Err(FileStatus::UnknownFail);
         }
-
         match wr.error {
             None => Ok(()),
             Some(e) => Err(e),

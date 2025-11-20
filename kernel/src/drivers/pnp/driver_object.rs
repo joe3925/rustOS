@@ -79,7 +79,7 @@ pub struct ReqJob {
 
 pub struct DeviceObject {
     pub lower_device: Once<Arc<DeviceObject>>,
-    pub upper_device: RwLock<Option<alloc::sync::Weak<DeviceObject>>>,
+    pub upper_device: Once<alloc::sync::Weak<DeviceObject>>,
     dev_ext: DevExtBox,
     pub dev_init: DeviceInit,
     pub queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
@@ -92,7 +92,7 @@ impl DeviceObject {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
         Arc::new(Self {
             lower_device: Once::new(),
-            upper_device: RwLock::new(None),
+            upper_device: Once::new(),
             dev_ext,
             dev_init: init,
             queue: Mutex::new(VecDeque::new()),
@@ -120,7 +120,9 @@ impl DeviceObject {
 
     pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
         this.lower_device.call_once(|| lower.clone());
-        *lower.upper_device.write() = Some(Arc::downgrade(this));
+        lower
+            .upper_device
+            .call_once(|| Arc::downgrade(this).clone());
     }
     pub fn attach_devnode(&self, dn: &Arc<DevNode>) {
         self.dev_node.call_once(|| Arc::downgrade(dn));
