@@ -32,3 +32,4 @@ fatfs = { default-features = false, git = "https://github.com/rafalh/rust-fatfs"
     "lfn",
     "unicode",
 ] }
+log = "0.4.28"

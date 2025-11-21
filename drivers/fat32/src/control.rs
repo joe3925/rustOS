@@ -28,8 +28,31 @@ use kernel_api::{
 
 use crate::block_dev::BlockDev;
 use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
+use log::{Level, Metadata, Record};
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
+struct KernelLogger;
+
+impl log::Log for KernelLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= Level::Debug
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            println!("FAT32 [{}]: {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: KernelLogger = KernelLogger;
+
+fn init_logger() {
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Debug);
+}
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
@@ -60,7 +83,7 @@ pub extern "win64" fn fs_root_ioctl(
 
             let id: &mut FsIdentify = unsafe { &mut *(r.data.as_mut_ptr() as *mut FsIdentify) };
 
-            let mut q = Request::new_pnp(
+            let q = Request::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
@@ -122,13 +145,15 @@ pub extern "win64" fn fs_root_ioctl(
                     init.set_dev_ext_from(ext);
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
-                    let vol_ctrl = unsafe { pnp_create_control_device_with_init(vol_name, init) };
-
+                    let vol_ctrl =
+                        unsafe { pnp_create_control_device_with_init(vol_name.clone(), init) };
+                    println!("Mounting fat for volume {}", vol_name);
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
                     DriverStatus::Success
                 }
                 Err(e) => {
+                    println!("No mount");
                     id.mount_device = None;
                     id.can_mount = false;
                     DriverStatus::Success
@@ -150,6 +175,7 @@ pub extern "win64" fn fat_start(
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, fs_device_add) };
+    init_logger();
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
         IoType::DeviceControl(fs_root_ioctl),

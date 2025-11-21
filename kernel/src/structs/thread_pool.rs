@@ -62,90 +62,61 @@ impl ThreadPool {
         }
     }
 
+    // Best-effort: only queue if there is a sleeping worker to run it.
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
-        let started = Arc::new(AtomicBool::new(false));
-
-        let sleeper = {
+        let to_wake = {
             let mut g = self.inner.lock();
             match g.sleepers.pop() {
                 Some(t) => {
-                    let payload = Box::new(TrampPayload {
-                        f,
-                        a,
-                        started: started.clone(),
-                    });
-                    g.q.push_front(Job {
-                        f: job_start_trampoline,
-                        a: Box::into_raw(payload) as usize,
-                    });
-                    t
+                    g.q.push_back(Job { f, a });
+                    Some(t)
                 }
-                None => return false,
+                None => None,
             }
         };
-        without_interrupts(|| {
-            sleeper.write().wake();
-        });
 
-        let mut spins = 0usize;
-        while !started.load(Ordering::Acquire) {
-            core::hint::spin_loop();
-            spins = spins.wrapping_add(1);
-            if spins > 1_000_000 {
-                println!("Timeout");
-                return false;
-            }
+        if let Some(t) = to_wake {
+            without_interrupts(|| {
+                t.write().wake();
+            });
+            true
+        } else {
+            false
         }
-        true
     }
-}
-
-struct TrampPayload {
-    f: JobFn,
-    a: usize,
-    started: Arc<AtomicBool>,
-}
-
-extern "win64" fn job_start_trampoline(p: usize) {
-    let b: Box<TrampPayload> = unsafe { Box::from_raw(p as *mut TrampPayload) };
-    b.started.store(true, Ordering::Release);
-    (b.f)(b.a);
 }
 
 extern "C" fn worker(pool_ptr: usize) {
     let pool: &ThreadPool = unsafe { &*(pool_ptr as *const ThreadPool) };
-    let me = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
+    let me = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .expect("worker task missing");
 
     loop {
-        // Fast path: try get a job.
-        if let Some(j) = {
+        let job = {
             let mut g = pool.inner.lock();
-            g.q.pop_front()
-        } {
+
+            if let Some(j) = g.q.pop_front() {
+                if let Some(idx) = g.sleepers.iter().position(|t| Arc::ptr_eq(t, &me)) {
+                    g.sleepers.swap_remove(idx);
+                }
+                Some(j)
+            } else {
+                if !g.sleepers.iter().any(|t| Arc::ptr_eq(t, &me)) {
+                    g.sleepers.push(me.clone());
+                }
+                None
+            }
+        };
+
+        if let Some(j) = job {
             (j.f)(j.a);
             continue;
         }
-        {
-            let mut g = pool.inner.lock();
-            without_interrupts(|| {
-                let should_sleep = {
-                    if let Some(j) = g.q.pop_front() {
-                        drop(g);
 
-                        (j.f)(j.a);
-                        false
-                    } else {
-                        me.write().sleep();
-                        g.sleepers.push(me.clone());
-                        true
-                    }
-                };
-
-                if should_sleep {
-                    me.write().sleep();
-                }
-            });
-        }
+        without_interrupts(|| {
+            me.write().sleep();
+        });
 
         loop {
             if !me.read().is_sleeping {

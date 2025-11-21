@@ -21,7 +21,6 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe { panic_common(MOD_NAME, info) }
 }
 mod msvc_shims;
-mod structs;
 
 mod control;
 mod volume;

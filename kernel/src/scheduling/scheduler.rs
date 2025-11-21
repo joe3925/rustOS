@@ -2,6 +2,7 @@ use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::timer_driver::PER_CORE_SWITCHES;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::println;
 use crate::scheduling::state::State;
 use crate::scheduling::task::{idle_task, Task};
 use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
@@ -38,6 +39,8 @@ pub struct Scheduler {
     cores: Box<[CoreScheduler]>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
+
+    balance_lock: Mutex<()>,
 }
 
 lazy_static! {
@@ -51,6 +54,8 @@ impl Scheduler {
             cores: Vec::new().into_boxed_slice(),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
+
+            balance_lock: Mutex::new(()),
         }
     }
 
@@ -120,14 +125,17 @@ impl Scheduler {
             if let Some(mut guard) = cur.try_write() {
                 guard.update_from_context(state);
             } else {
+                println!("early return");
                 return;
             }
         }
 
         if ((TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0) {
-            self.reap_tasks(cpu_id);
-            //self.balance();
+            if let Some(_guard) = self.balance_lock.try_lock() {
+                self.balance();
+            }
         }
+
         let next = self.schedule_next(cpu_id);
 
         let (needs_restore, ctx_ptr) = {
@@ -149,7 +157,12 @@ impl Scheduler {
     fn schedule_next(&self, cpu_id: usize) -> TaskHandle {
         let core = &self.cores[cpu_id];
 
-        if let Some(previous_task) = core.current.write().take() {
+        let previous = {
+            let mut cur_guard = core.current.write();
+            cur_guard.take()
+        };
+
+        if let Some(previous_task) = previous {
             if !Arc::ptr_eq(&previous_task, &core.idle_task) {
                 core.run_queue.lock().push_back(previous_task);
             }
@@ -188,28 +201,35 @@ impl Scheduler {
         })
     }
 
-    fn reap_tasks(&self, cpu_id: usize) {
-        let core = &self.cores[cpu_id];
-        let mut q = core.run_queue.lock();
-        q.retain(|h| !h.read().terminated);
-        if let Some(cur) = core.current.read().as_ref() {
-            if cur.read().terminated {
-                *core.current.write() = None;
-            }
-        }
-    }
-
     pub fn balance(&self) {
         let n = self.num_cores.load(Ordering::Relaxed);
-        if n < 2 {
-            return;
-        }
+
         let mut busiest = 0usize;
         let mut least = 0usize;
         let mut max_len = 0usize;
         let mut min_len = usize::MAX;
+
         for i in 0..n {
-            let len = self.cores[i].run_queue.lock().len();
+            let core = &self.cores[i];
+
+            let len = {
+                let mut q = core.run_queue.lock();
+                q.retain(|h| !h.read().terminated);
+
+                q.iter()
+                    .filter(|h| !Arc::ptr_eq(h, &core.idle_task))
+                    .count()
+            };
+
+            {
+                let mut cur_guard = core.current.write();
+                if let Some(cur) = cur_guard.as_ref() {
+                    if cur.read().terminated {
+                        *cur_guard = None;
+                    }
+                }
+            }
+
             if len > max_len {
                 max_len = len;
                 busiest = i;
@@ -219,9 +239,28 @@ impl Scheduler {
                 least = i;
             }
         }
-        if busiest != least && max_len > min_len + 1 {
-            if let Some(task) = self.cores[busiest].run_queue.lock().pop_back() {
-                self.cores[least].run_queue.lock().push_front(task);
+
+        if n >= 2 && busiest != least && max_len > min_len + 1 {
+            let moved = {
+                let mut q = self.cores[busiest].run_queue.lock();
+                let idle_handle = &self.cores[busiest].idle_task;
+                let mut moved = None;
+
+                let mut idx = q.len();
+                while idx > 0 {
+                    idx -= 1;
+                    if !Arc::ptr_eq(&q[idx], idle_handle) {
+                        moved = q.remove(idx);
+                        break;
+                    }
+                }
+
+                moved
+            };
+
+            if let Some(task) = moved {
+                let mut q = self.cores[least].run_queue.lock();
+                q.push_front(task);
             }
         }
     }

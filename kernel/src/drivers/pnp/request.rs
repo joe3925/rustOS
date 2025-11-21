@@ -31,7 +31,9 @@ const START_THREADS: usize = 12;
 
 lazy_static::lazy_static! {
     static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
-    static ref DISPATCH_DEVQ: Mutex<VecDeque<Arc<DeviceObject>>> = Mutex::new(VecDeque::new());
+    // Changed: Queue now stores pairs of Device + Request, not just Devices.
+    // This enables per-request granularity (work stealing) instead of device claiming.
+    static ref DISPATCH_REQ_Q: Mutex<VecDeque<(Arc<DeviceObject>, Arc<RwLock<Request>>)>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
 
@@ -71,6 +73,8 @@ impl PnpManager {
         let pair = Box::new((dpc.func, dpc.arg));
         let ptr = Box::into_raw(pair) as usize;
 
+        // Note: DPC logic kept as is (using submit_if_runnable),
+        // assuming priority execution is still desired for DPCs.
         if !THREADS.submit_if_runnable(job_run_dpc, ptr) {
             let _ = unsafe { Box::from_raw(ptr as *mut (extern "win64" fn(usize), usize)) };
             GLOBAL_DPCQ.lock().push_front(dpc);
@@ -80,74 +84,50 @@ impl PnpManager {
     }
 
     pub fn pump_queue_once(&self) -> bool {
-        let dev_opt = { DISPATCH_DEVQ.lock().pop_front() };
-        let Some(dev) = dev_opt else {
-            return false;
+        // Pop a specific (Device, Request) tuple.
+        let item = {
+            let mut q = DISPATCH_REQ_Q.lock();
+            q.pop_front()
         };
 
-        dev.in_queue.store(false, Ordering::Release);
-        let _ = dev
-            .dispatch_tickets
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-                Some(cur.saturating_sub(1))
-            });
-
-        self.drain_device(&dev);
-        true
+        if let Some((dev, req)) = item {
+            // Process the request immediately on this thread.
+            // This prevents the deadlock where a thread waiting for I/O
+            // cannot process the very request it is waiting for because
+            // another thread has "claimed" the device.
+            self.call_device_handler(&dev, req);
+            return true;
+        }
+        false
     }
 
     fn run_one_device_request(&self) -> bool {
-        let dev_opt = { DISPATCH_DEVQ.lock().pop_front() };
-        let Some(dev) = dev_opt else {
+        // Pop a specific (Device, Request) tuple.
+        let item = {
+            let mut q = DISPATCH_REQ_Q.lock();
+            q.pop_front()
+        };
+
+        let Some((dev, req)) = item else {
             return false;
         };
 
-        dev.in_queue.store(false, Ordering::Release);
-        let _ = dev
-            .dispatch_tickets
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |cur| {
-                Some(cur.saturating_sub(1))
-            });
-
-        let arg = Box::new(DrainJobArg { dev: dev.clone() });
+        let arg = Box::new(DispatchJobArg { dev, req });
         let ptr = Box::into_raw(arg) as usize;
 
-        if !THREADS.submit_if_runnable(job_drain_device, ptr) {
-            let _ = unsafe { Box::from_raw(ptr as *mut DrainJobArg) };
-            dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel);
-            if !dev.in_queue.swap(true, Ordering::AcqRel) {
-                DISPATCH_DEVQ.lock().push_front(dev);
-            }
-            return false;
-        }
+        // Changed: Unconditionally submit to the thread pool as requested.
+        // This avoids the complexity of "runnable" checks for standard I/O.
+        THREADS.submit(job_dispatch_request, ptr);
+
         true
     }
 
-    fn drain_device(&self, dev: &Arc<DeviceObject>) {
-        loop {
-            let req_opt = { dev.queue.lock().pop_front() };
-
-            if let Some(req) = req_opt {
-                self.call_device_handler(dev, req);
-                continue;
-            }
-
-            let needs_requeue = {
-                let more = dev.dispatch_tickets.load(Ordering::Acquire);
-                let has_items = { !dev.queue.lock().is_empty() };
-                more > 0 || has_items
-            };
-
-            if needs_requeue && !dev.in_queue.swap(true, Ordering::AcqRel) {
-                DISPATCH_DEVQ.lock().push_back(dev.clone());
-            }
-            return;
-        }
-    }
-
     pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
-        target.target_device.queue.lock().push_back(req);
-        self.schedule_device_dispatch(&target.target_device);
+        // Push the (Device, Request) pair directly to the global queue.
+        // We do NOT use target.target_device.queue here to enforce per-thread pickup.
+        DISPATCH_REQ_Q
+            .lock()
+            .push_back((target.target_device.clone(), req));
         DriverStatus::Success
     }
 
@@ -201,13 +181,6 @@ impl PnpManager {
         }
     }
 
-    fn schedule_device_dispatch(&self, dev: &Arc<DeviceObject>) {
-        let _ = dev.dispatch_tickets.fetch_add(1, Ordering::AcqRel);
-        if !dev.in_queue.swap(true, Ordering::AcqRel) {
-            DISPATCH_DEVQ.lock().push_back(dev.clone());
-        }
-    }
-
     fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let (kind, policy) = {
             let r = req_arc.read();
@@ -245,9 +218,12 @@ impl PnpManager {
                         },
                     );
 
-                    if
-                    //admit.is_ok()
-                    true {
+                    // Note: Concurrency limits are handled here.
+                    // If admission fails, the request needs to be re-queued or rejected.
+                    // For now keeping existing logic "true" which bypasses limit check
+                    // (assumed temporary based on original code).
+                    if true {
+                        // admit.is_ok()
                         let st = h.handler.invoke(dev, req_arc.clone());
                         h.running_request.fetch_sub(1, Ordering::Release);
                         st
@@ -376,18 +352,13 @@ impl PnpManager {
     }
 }
 
-#[inline]
-fn with_req_mut<F: FnOnce(&mut Request)>(r: &Arc<RwLock<Request>>, f: F) {
-    let mut g = r.write();
-    f(&mut *g);
-}
-
 extern "C" fn io_dispatcher_trampoline() {
     PNP_MANAGER.dispatch_forever();
 }
 
-struct DrainJobArg {
+struct DispatchJobArg {
     dev: Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
 }
 
 extern "win64" fn job_run_dpc(arg: usize) {
@@ -396,7 +367,7 @@ extern "win64" fn job_run_dpc(arg: usize) {
     let _ = unsafe { Box::from_raw(arg as *mut (extern "win64" fn(usize), usize)) };
 }
 
-extern "win64" fn job_drain_device(arg: usize) {
-    let b: Box<DrainJobArg> = unsafe { Box::from_raw(arg as *mut DrainJobArg) };
-    PNP_MANAGER.drain_device(&b.dev);
+extern "win64" fn job_dispatch_request(arg: usize) {
+    let b: Box<DispatchJobArg> = unsafe { Box::from_raw(arg as *mut DispatchJobArg) };
+    PNP_MANAGER.call_device_handler(&b.dev, b.req);
 }

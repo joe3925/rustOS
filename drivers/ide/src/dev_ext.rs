@@ -40,6 +40,7 @@ pub struct DevExt {
     pub present: AtomicBool,
     pub enumerated: AtomicBool,
     pub ports: Mutex<Ports>,
+    pub busy: AtomicBool,
 }
 
 impl DevExt {
@@ -48,6 +49,7 @@ impl DevExt {
             present: AtomicBool::new(false),
             enumerated: AtomicBool::new(false),
             ports: Mutex::new(Ports::new(io_base, ctrl_base)),
+            busy: AtomicBool::new(false),
         }
     }
 

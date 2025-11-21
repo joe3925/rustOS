@@ -324,8 +324,7 @@ pub mod reg {
         *REGISTRY.write() = Arc::new(new_reg.clone());
 
         let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])
-            .ok()
-            .expect("Registry persistence failed ");
+            .expect("Registry persistence failed");
         if let Some(binding) = file.write(&bytes).err() {
             let err_str = binding.to_str();
             println!("{}", err_str);

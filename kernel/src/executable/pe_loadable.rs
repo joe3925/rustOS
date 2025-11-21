@@ -118,7 +118,6 @@ impl PELoader {
         Some(parse_base_relocations(buffer))
     }
     pub fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
-        // ---------- sanity checks ----------
         if !self.pe.is_lib {
             return Err(LoadError::NotDLL);
         }
@@ -126,7 +125,7 @@ impl PELoader {
             return Err(LoadError::Not64Bit);
         }
 
-        let new_cr3 = program.cr3; // target address space
+        let new_cr3 = program.cr3;
         let exports = self.collect_exports(); // (name, rva) list
 
         let opt = self
@@ -158,8 +157,19 @@ impl PELoader {
                 self.relocate()?;
                 self.resolve_imports(program);
                 self.patch_imports(program);
+
+                let title = file_parser(&self.path).last().unwrap().to_string();
+                let base = self.current_base.as_u64();
+                println!(
+                    "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
+                    title,
+                    base,
+                    base + image_size,
+                    image_size
+                );
+
                 let module = Module {
-                    title: file_parser(&self.path).last().unwrap().to_string(),
+                    title,
                     image_path: self.path.clone(),
                     parent_pid: program.pid,
                     image_base: self.current_base,
@@ -182,8 +192,19 @@ impl PELoader {
             self.load_sections()?;
             self.resolve_imports(program);
             self.patch_imports(program);
+
+            let title = file_parser(&self.path).last().unwrap().to_string();
+            let base = self.current_base.as_u64();
+            println!(
+                "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
+                title,
+                base,
+                base + image_size,
+                image_size
+            );
+
             let module = Module {
-                title: file_parser(&self.path).last().unwrap().to_string(),
+                title,
                 image_path: self.path.clone(),
                 parent_pid: program.pid,
                 image_base: self.current_base,

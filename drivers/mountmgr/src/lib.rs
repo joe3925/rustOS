@@ -517,7 +517,7 @@ struct BootProbe {
     need: AtomicU32,
     mod_ok: AtomicBool,
     inf_ok: AtomicBool,
-    hive_ok: AtomicBool,
+    reg_ok: AtomicBool,
     inst_path: String,
 }
 
@@ -529,39 +529,51 @@ struct BootReqCtx {
 
 extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> DriverStatus {
     let reqctx: Box<BootReqCtx> = unsafe { Box::from_raw(ctx as *mut BootReqCtx) };
-    let ok = if r.status == DriverStatus::Success
-        && r.data.len() == core::mem::size_of::<kernel_api::FsOpenResult>()
-    {
-        let res: kernel_api::FsOpenResult =
-            unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
-        res.error.is_none()
-    } else {
-        false
-    };
+    let res: kernel_api::FsOpenResult =
+        unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
 
     let probe = unsafe { &*reqctx.probe };
     match reqctx.which {
         0 => {
-            if ok {
+            if r.status == DriverStatus::Success && res.error.is_none() {
+                println!("mod ok");
                 probe.mod_ok.store(true, Ordering::Release);
+            } else {
+                println!(
+                    "Mod failed status {:#?}, open status {:#?}",
+                    r.status, res.error
+                )
             }
         }
         1 => {
-            if ok {
+            if r.status == DriverStatus::Success && res.error.is_none() {
+                println!("inf ok");
                 probe.inf_ok.store(true, Ordering::Release);
+            } else {
+                println!(
+                    "Inf failed status {:#?}, open status {:#?}",
+                    r.status, res.error
+                )
             }
         }
         _ => {
-            if ok {
-                probe.hive_ok.store(true, Ordering::Release);
+            if r.status == DriverStatus::Success && res.error.is_none() {
+                println!("reg ok");
+                probe.reg_ok.store(true, Ordering::Release);
+            } else {
+                println!(
+                    "Reg failed status {:#?}, open status {:#?}",
+                    r.status, res.error
+                )
             }
         }
     }
     if probe.need.fetch_sub(1, Ordering::AcqRel) == 1 {
         let all = probe.mod_ok.load(Ordering::Acquire)
             && probe.inf_ok.load(Ordering::Acquire)
-            && probe.hive_ok.load(Ordering::Acquire);
+            && probe.reg_ok.load(Ordering::Acquire);
         if all {
+            println!("start boot bind");
             let _ = attempt_boot_bind(&probe.inst_path, &probe.link);
         }
         unsafe {
@@ -598,7 +610,7 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
         need: AtomicU32::new(3),
         mod_ok: AtomicBool::new(false),
         inf_ok: AtomicBool::new(false),
-        hive_ok: AtomicBool::new(false),
+        reg_ok: AtomicBool::new(false),
         inst_path: inst_path.to_string(),
     });
     let probe_ptr = Box::into_raw(probe);

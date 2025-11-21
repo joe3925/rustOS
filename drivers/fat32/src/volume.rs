@@ -115,26 +115,25 @@ pub extern "win64" fn fs_op_dispatch(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
+    // Optimization: Peek at kind without holding a write lock
     let kind = { req.read().kind };
+
     match kind {
         RequestType::Fs(op) => {
-            let mut r = req.write();
             let vdx = ext_mut::<VolCtrlDevExt>(dev);
-
-            let mut tbl_opt = Some(vdx.table.write());
-            let mut fs_opt = Some(vdx.fs.lock());
 
             match op {
                 FsOp::Open => {
                     let params: FsOpenParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsOpenParams>() {
                             return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let open_res: Result<(bool, u64, Option<CachedFile>), FsError> = {
-                        let fs = fs_opt.as_mut().unwrap();
+                    let open_res = {
+                        let mut fs = vdx.fs.lock();
                         let root = fs.root_dir();
 
                         match root.open_file(&params.path) {
@@ -156,24 +155,15 @@ pub extern "win64" fn fs_op_dispatch(
                         }
                     };
 
+                    let mut r = req.write();
                     match open_res {
-                        Err(e) => {
-                            let res = FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(map_fatfs_err(&e)),
-                            };
-                            r.data = box_to_bytes(Box::new(res));
-                        }
                         Ok((is_dir, size, cached)) => {
                             let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
-
-                            let tbl = tbl_opt.as_mut().unwrap();
+                            let mut tbl = vdx.table.write();
                             tbl.insert(
                                 id,
                                 FileCtx {
-                                    path: params.path.clone(),
+                                    path: params.path,
                                     is_dir,
                                     pos: 0,
                                     file: cached,
@@ -188,14 +178,22 @@ pub extern "win64" fn fs_op_dispatch(
                             };
                             r.data = box_to_bytes(Box::new(res));
                         }
+                        Err(e) => {
+                            let res = FsOpenResult {
+                                fs_file_id: 0,
+                                is_dir: false,
+                                size: 0,
+                                error: Some(map_fatfs_err(&e)),
+                            };
+                            r.data = box_to_bytes(Box::new(res));
+                        }
                     }
                     DriverStatus::Success
                 }
 
                 FsOp::Close => {
-                    drop(fs_opt.take());
-
                     let params: FsCloseParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsCloseParams>() {
                             return DriverStatus::InvalidParameter;
                         }
@@ -203,10 +201,11 @@ pub extern "win64" fn fs_op_dispatch(
                     };
 
                     let removed = {
-                        let tbl = tbl_opt.as_mut().unwrap();
+                        let mut tbl = vdx.table.write();
                         tbl.remove(&params.fs_file_id).is_some()
                     };
 
+                    let mut r = req.write();
                     let res = FsCloseResult {
                         error: if removed {
                             None
@@ -220,57 +219,53 @@ pub extern "win64" fn fs_op_dispatch(
 
                 FsOp::Read => {
                     let params: FsReadParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsReadParams>() {
                             return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
+                    // Perform Read
                     let data_or_err = {
-                        let tbl = tbl_opt.as_mut().unwrap();
-                        let ctx = match tbl.get_mut(&params.fs_file_id) {
-                            Some(c) => c,
-                            None => {
-                                r.data = box_to_bytes(Box::new(FsReadResult {
-                                    data: Vec::new(),
-                                    error: Some(FileStatus::PathNotFound),
-                                }));
-                                return DriverStatus::Success;
-                            }
-                        };
+                        // We need write lock on table because FileCtx might be mutated (unclear from struct def,
+                        // but usually seeking/reading mutates internal state of the file handle)
+                        let mut tbl = vdx.table.write();
 
-                        if ctx.is_dir {
-                            r.data = box_to_bytes(Box::new(FsReadResult {
-                                data: Vec::new(),
-                                error: Some(FileStatus::PathNotFound),
-                            }));
-                            return DriverStatus::Success;
-                        }
-
-                        let _fs_guard = fs_opt.as_mut().unwrap();
-
-                        let cached_opt = ctx.file.as_mut();
-                        if cached_opt.is_none() {
-                            Err(FatError::NotFound)
-                        } else {
-                            let file = &mut cached_opt.unwrap().file;
-
-                            match file.seek(SeekFrom::Start(params.offset as u64)) {
-                                Err(e) => Err(e),
-                                Ok(_) => {
-                                    let mut buf = vec![0u8; params.len];
-                                    match file.read(&mut buf) {
-                                        Ok(n) => {
-                                            buf.truncate(n);
-                                            Ok(buf)
+                        match tbl.get_mut(&params.fs_file_id) {
+                            Some(ctx) => {
+                                if ctx.is_dir {
+                                    Ok(Vec::new())
+                                } else {
+                                    let _fs_guard = vdx.fs.lock();
+                                    if let Some(ref mut cached) = ctx.file {
+                                        let file = &mut cached.file;
+                                        match file.seek(SeekFrom::Start(params.offset as u64)) {
+                                            Err(e) => Err(e),
+                                            Ok(_) => {
+                                                let mut buf = vec![0u8; params.len];
+                                                match file.read(&mut buf) {
+                                                    Ok(n) => {
+                                                        buf.truncate(n);
+                                                        Ok(buf)
+                                                    }
+                                                    Err(e) => Err(e),
+                                                }
+                                            }
                                         }
-                                        Err(e) => Err(e),
+                                    } else {
+                                        Err(FatError::NotFound)
                                     }
                                 }
+                            }
+                            None => {
+                                // Signal "not found" to result generation
+                                Err(FatError::NotFound)
                             }
                         }
                     };
 
+                    let mut r = req.write();
                     match data_or_err {
                         Ok(v) => {
                             r.data = box_to_bytes(Box::new(FsReadResult {
@@ -279,9 +274,16 @@ pub extern "win64" fn fs_op_dispatch(
                             }))
                         }
                         Err(e) => {
+                            // Map "NotFound" from table lookup to PathNotFound for consistency
+                            let status = if matches!(e, FatError::NotFound) {
+                                FileStatus::PathNotFound
+                            } else {
+                                map_fatfs_err(&e)
+                            };
+
                             r.data = box_to_bytes(Box::new(FsReadResult {
                                 data: Vec::new(),
-                                error: Some(map_fatfs_err(&e)),
+                                error: Some(status),
                             }))
                         }
                     }
@@ -290,6 +292,7 @@ pub extern "win64" fn fs_op_dispatch(
 
                 FsOp::Write => {
                     let params: FsWriteParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsWriteParams>() {
                             return DriverStatus::InvalidParameter;
                         }
@@ -297,41 +300,33 @@ pub extern "win64" fn fs_op_dispatch(
                     };
 
                     let write_res = {
-                        let tbl = tbl_opt.as_mut().unwrap();
-                        let ctx = match tbl.get_mut(&params.fs_file_id) {
-                            Some(c) => c,
-                            None => {
-                                r.data = box_to_bytes(Box::new(FsWriteResult {
-                                    written: 0,
-                                    error: Some(FileStatus::PathNotFound),
-                                }));
-                                return DriverStatus::Success;
+                        let mut tbl = vdx.table.write();
+                        match tbl.get_mut(&params.fs_file_id) {
+                            Some(ctx) => {
+                                if ctx.is_dir {
+                                    // Writes to directories generally fail or return 0
+                                    Ok(0)
+                                } else {
+                                    let _fs_guard = vdx.fs.lock();
+                                    if let Some(ref mut cached) = ctx.file {
+                                        let file = &mut cached.file;
+                                        match file.seek(SeekFrom::Start(params.offset as u64)) {
+                                            Err(e) => Err(e),
+                                            Ok(_) => match file.write(&params.data) {
+                                                Ok(n) => Ok(n),
+                                                Err(e) => Err(e),
+                                            },
+                                        }
+                                    } else {
+                                        Err(FatError::NotFound)
+                                    }
+                                }
                             }
-                        };
-
-                        if ctx.is_dir {
-                            r.data = box_to_bytes(Box::new(FsWriteResult {
-                                written: 0,
-                                error: Some(FileStatus::PathNotFound),
-                            }));
-                            return DriverStatus::Success;
-                        }
-
-                        let _fs_guard = fs_opt.as_mut().unwrap();
-
-                        let cached_opt = ctx.file.as_mut();
-                        if cached_opt.is_none() {
-                            Err(FatError::NotFound)
-                        } else {
-                            let file = &mut cached_opt.unwrap().file;
-
-                            match file.seek(SeekFrom::Start(params.offset as u64)) {
-                                Err(e) => Err(e),
-                                Ok(_) => file.write(&params.data),
-                            }
+                            None => Err(FatError::NotFound),
                         }
                     };
 
+                    let mut r = req.write();
                     match write_res {
                         Ok(n) => {
                             r.data = box_to_bytes(Box::new(FsWriteResult {
@@ -340,9 +335,14 @@ pub extern "win64" fn fs_op_dispatch(
                             }))
                         }
                         Err(e) => {
+                            let status = if matches!(e, FatError::NotFound) {
+                                FileStatus::PathNotFound
+                            } else {
+                                map_fatfs_err(&e)
+                            };
                             r.data = box_to_bytes(Box::new(FsWriteResult {
                                 written: 0,
-                                error: Some(map_fatfs_err(&e)),
+                                error: Some(status),
                             }))
                         }
                     }
@@ -351,76 +351,82 @@ pub extern "win64" fn fs_op_dispatch(
 
                 FsOp::Seek => {
                     let params: FsSeekParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsSeekParams>() {
                             return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let new_pos = {
-                        let tbl = tbl_opt.as_mut().unwrap();
-                        let ctx = match tbl.get_mut(&params.fs_file_id) {
-                            Some(c) => c,
-                            None => {
-                                r.data = box_to_bytes(Box::new(FsSeekResult {
-                                    pos: 0,
-                                    error: Some(FileStatus::PathNotFound),
-                                }));
-                                return DriverStatus::Success;
+                    // Needs table write lock to update 'pos'
+                    let result = {
+                        let mut tbl = vdx.table.write();
+                        match tbl.get_mut(&params.fs_file_id) {
+                            Some(ctx) => {
+                                let size = if ctx.is_dir {
+                                    0
+                                } else {
+                                    let _fs_guard = vdx.fs.lock();
+                                    if let Some(ref mut cached) = ctx.file {
+                                        match cached_file_len(&mut cached.file) {
+                                            Ok(sz) => sz,
+                                            Err(_) => 0,
+                                        }
+                                    } else {
+                                        0
+                                    }
+                                };
+
+                                let base: i128 = match params.origin {
+                                    FsSeekWhence::Set => 0,
+                                    FsSeekWhence::Cur => ctx.pos as i128,
+                                    FsSeekWhence::End => size as i128,
+                                };
+
+                                let pos_i = base + params.offset as i128;
+                                let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
+                                ctx.pos = clamped;
+                                Ok(clamped)
                             }
-                        };
-
-                        let size = if ctx.is_dir {
-                            0
-                        } else {
-                            let _fs_guard = fs_opt.as_mut().unwrap();
-                            if let Some(ref mut cached) = ctx.file {
-                                match cached_file_len(&mut cached.file) {
-                                    Ok(sz) => sz,
-                                    Err(_) => 0,
-                                }
-                            } else {
-                                0
-                            }
-                        };
-
-                        let base: i128 = match params.origin {
-                            FsSeekWhence::Set => 0,
-                            FsSeekWhence::Cur => ctx.pos as i128,
-                            FsSeekWhence::End => size as i128,
-                        };
-
-                        let pos_i = base + params.offset as i128;
-                        let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
-                        ctx.pos = clamped;
-                        clamped
+                            None => Err(FileStatus::PathNotFound),
+                        }
                     };
 
-                    r.data = box_to_bytes(Box::new(FsSeekResult {
-                        pos: new_pos,
-                        error: None,
-                    }));
+                    let mut r = req.write();
+                    match result {
+                        Ok(pos) => {
+                            r.data = box_to_bytes(Box::new(FsSeekResult { pos, error: None }))
+                        }
+                        Err(e) => {
+                            r.data = box_to_bytes(Box::new(FsSeekResult {
+                                pos: 0,
+                                error: Some(e),
+                            }))
+                        }
+                    }
                     DriverStatus::Success
                 }
 
                 FsOp::Flush => {
-                    drop(fs_opt.take());
-                    drop(tbl_opt.take());
-
-                    let _params: FsFlushParams = unsafe {
+                    unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsFlushParams>() {
                             return DriverStatus::InvalidParameter;
                         }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                        let _ = *bytes_to_box::<FsFlushParams>(core::mem::replace(
+                            &mut r.data,
+                            Box::new([]),
+                        ));
                     };
+
+                    let mut r = req.write();
                     r.data = box_to_bytes(Box::new(FsFlushResult { error: None }));
                     DriverStatus::Success
                 }
 
                 FsOp::Create => {
-                    drop(tbl_opt.take());
-
                     let params: FsCreateParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsCreateParams>() {
                             return DriverStatus::InvalidParameter;
                         }
@@ -428,21 +434,21 @@ pub extern "win64" fn fs_op_dispatch(
                     };
 
                     let err = {
-                        let fs = fs_opt.as_mut().unwrap();
+                        let mut fs = vdx.fs.lock();
                         match create_entry(&mut *fs, &params.path, params.dir) {
                             Ok(()) => None,
                             Err(e) => Some(map_fatfs_err(&e)),
                         }
                     };
 
+                    let mut r = req.write();
                     r.data = box_to_bytes(Box::new(FsCreateResult { error: err }));
                     DriverStatus::Success
                 }
 
                 FsOp::Rename => {
-                    drop(tbl_opt.take());
-
                     let params: FsRenameParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsRenameParams>() {
                             return DriverStatus::InvalidParameter;
                         }
@@ -450,21 +456,21 @@ pub extern "win64" fn fs_op_dispatch(
                     };
 
                     let err = {
-                        let fs = fs_opt.as_mut().unwrap();
+                        let mut fs = vdx.fs.lock();
                         match rename_entry(&mut *fs, &params.src, &params.dst) {
                             Ok(()) => None,
                             Err(e) => Some(map_fatfs_err(&e)),
                         }
                     };
 
+                    let mut r = req.write();
                     r.data = box_to_bytes(Box::new(FsRenameResult { error: err }));
                     DriverStatus::Success
                 }
 
                 FsOp::ReadDir => {
-                    drop(tbl_opt.take());
-
                     let params: FsListDirParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsListDirParams>() {
                             return DriverStatus::InvalidParameter;
                         }
@@ -472,10 +478,11 @@ pub extern "win64" fn fs_op_dispatch(
                     };
 
                     let names_or_err = {
-                        let fs = fs_opt.as_mut().unwrap();
+                        let mut fs = vdx.fs.lock();
                         list_names(&mut *fs, &params.path)
                     };
 
+                    let mut r = req.write();
                     match names_or_err {
                         Ok(names) => {
                             r.data = box_to_bytes(Box::new(FsListDirResult { names, error: None }))
@@ -492,71 +499,66 @@ pub extern "win64" fn fs_op_dispatch(
 
                 FsOp::GetInfo => {
                     let params: FsGetInfoParams = unsafe {
+                        let mut r = req.write();
                         if r.data.len() != size_of::<FsGetInfoParams>() {
                             return DriverStatus::InvalidParameter;
                         }
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let (is_dir, size, attrs) = {
-                        let tbl = tbl_opt.as_mut().unwrap();
-                        let ctx = match tbl.get_mut(&params.fs_file_id) {
-                            None => {
-                                r.data = box_to_bytes(Box::new(FsGetInfoResult {
-                                    size: 0,
-                                    is_dir: false,
-                                    attrs: 0,
-                                    error: Some(FileStatus::PathNotFound),
-                                }));
-                                return DriverStatus::Success;
-                            }
-                            Some(c) => c,
-                        };
-
-                        if ctx.is_dir {
-                            (true, 0u64, u8::from(FileAttribute::Directory))
-                        } else {
-                            let _fs_guard = fs_opt.as_mut().unwrap();
-                            let size = if let Some(ref mut cached) = ctx.file {
-                                match cached_file_len(&mut cached.file) {
-                                    Ok(sz) => sz,
-                                    Err(_) => 0,
+                    // Needs table lock to find file, then FS lock to query
+                    let result = {
+                        let mut tbl = vdx.table.write();
+                        match tbl.get_mut(&params.fs_file_id) {
+                            Some(ctx) => {
+                                if ctx.is_dir {
+                                    Ok((true, 0u64, u8::from(FileAttribute::Directory)))
+                                } else {
+                                    let _fs_guard = vdx.fs.lock();
+                                    let size = if let Some(ref mut cached) = ctx.file {
+                                        match cached_file_len(&mut cached.file) {
+                                            Ok(sz) => sz,
+                                            Err(_) => 0,
+                                        }
+                                    } else {
+                                        0
+                                    };
+                                    Ok((false, size, u8::from(FileAttribute::Archive)))
                                 }
-                            } else {
-                                0
-                            };
-                            (false, size, u8::from(FileAttribute::Archive))
+                            }
+                            None => Err(FileStatus::PathNotFound),
                         }
                     };
 
-                    r.data = box_to_bytes(Box::new(FsGetInfoResult {
-                        size,
-                        is_dir,
-                        attrs: attrs as u32,
-                        error: None,
-                    }));
+                    let mut r = req.write();
+                    match result {
+                        Ok((is_dir, size, attrs)) => {
+                            r.data = box_to_bytes(Box::new(FsGetInfoResult {
+                                size,
+                                is_dir,
+                                attrs: attrs as u32,
+                                error: None,
+                            }));
+                        }
+                        Err(e) => {
+                            r.data = box_to_bytes(Box::new(FsGetInfoResult {
+                                size: 0,
+                                is_dir: false,
+                                attrs: 0,
+                                error: Some(e),
+                            }));
+                        }
+                    }
                     DriverStatus::Success
                 }
 
-                FsOp::SetInfo => {
-                    drop(fs_opt.take());
-                    drop(tbl_opt.take());
-                    DriverStatus::NotImplemented
-                }
-                FsOp::Delete => {
-                    drop(fs_opt.take());
-                    drop(tbl_opt.take());
-                    DriverStatus::NotImplemented
-                }
+                FsOp::SetInfo | FsOp::Delete => DriverStatus::NotImplemented,
             }
         }
-
         RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
-
         _ => DriverStatus::InvalidParameter,
     }
 }
-
 pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String>, FileStatus> {
     let params = FsListDirParams {
         path: path.to_string(),
