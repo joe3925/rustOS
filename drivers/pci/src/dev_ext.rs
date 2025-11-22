@@ -7,7 +7,7 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::alloc_api::PnpRequest;
-use kernel_api::alloc_api::ffi::{pnp_forward_request_to_next_lower, pnp_wait_for_request};
+use kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower;
 use kernel_api::{
     DeviceObject, DriverStatus, PnpMinorFunction, Request, RequestType, ResourceKind,
 };
@@ -448,11 +448,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
 
     let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
     let down = unsafe { pnp_forward_request_to_next_lower(device, req_arc.clone()) };
-    if down == kernel_api::DriverStatus::NoSuchDevice {
-        return alloc::vec::Vec::new();
-    }
 
-    unsafe { pnp_wait_for_request(&req_arc) };
     let st = { req_arc.read().status };
     if st != kernel_api::DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");

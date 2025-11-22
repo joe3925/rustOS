@@ -22,7 +22,7 @@ use kernel_api::{
     FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams,
     FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult,
     FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult, Request, RequestType, println,
+    FsSeekWhence, FsWriteParams, FsWriteResult, Request, RequestType, io_handler, println,
 };
 
 use crate::block_dev::BlockDev;
@@ -110,17 +110,13 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
-
-pub extern "win64" fn fs_op_dispatch(
-    dev: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    // Optimization: Peek at kind without holding a write lock
+#[io_handler]
+pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let kind = { req.read().kind };
 
     match kind {
         RequestType::Fs(op) => {
-            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let vdx = ext_mut::<VolCtrlDevExt>(&dev);
 
             match op {
                 FsOp::Open => {
@@ -557,34 +553,5 @@ pub extern "win64" fn fs_op_dispatch(
         }
         RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
         _ => DriverStatus::InvalidParameter,
-    }
-}
-pub fn test_fs_readdir(dev: &Arc<DeviceObject>, path: &str) -> Result<Vec<String>, FileStatus> {
-    let params = FsListDirParams {
-        path: path.to_string(),
-    };
-    let req = Request::new(
-        RequestType::Fs(FsOp::ReadDir),
-        box_to_bytes(Box::new(params)),
-    );
-
-    let areq = Arc::new(RwLock::new(req));
-    fs_op_dispatch(dev, areq.clone());
-
-    let mut guard = areq.write();
-    if guard.status != DriverStatus::Success {
-        return Err(FileStatus::UnknownFail);
-    }
-
-    let result: FsListDirResult = unsafe {
-        if guard.data.len() != core::mem::size_of::<FsListDirResult>() {
-            return Err(FileStatus::CorruptFilesystem);
-        }
-        *bytes_to_box(core::mem::replace(&mut guard.data, Box::new([])))
-    };
-
-    match result.error {
-        None => Ok(result.names),
-        Some(e) => Err(e),
     }
 }

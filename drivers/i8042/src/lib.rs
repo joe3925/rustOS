@@ -52,7 +52,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn ps2_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp = PnpVtable::new();
@@ -68,7 +68,7 @@ pub extern "win64" fn ps2_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn ps2_start(dev: &Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
+extern "win64" fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     if let Ok(mut ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -82,7 +82,7 @@ extern "win64" fn ps2_start(dev: &Arc<DeviceObject>, _req: Arc<RwLock<Request>>)
 }
 
 extern "win64" fn ps2_query_devrels(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     use kernel_api::DeviceRelationType;
@@ -174,7 +174,7 @@ fn make_child_pdo(
 }
 
 extern "win64" fn ps2_child_query_id(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
@@ -236,13 +236,11 @@ extern "win64" fn ps2_child_query_id(
 }
 
 extern "win64" fn ps2_child_start(
-    _dev: &Arc<DeviceObject>,
+    _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     DriverStatus::Success
 }
-
-/* --- minimal i8042 probing --- */
 
 const I8042_DATA: u16 = 0x60;
 const I8042_STS: u16 = 0x64;

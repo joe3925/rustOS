@@ -763,7 +763,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 
 /* --------------------------- PnP minor callbacks --------------------------- */
 extern "win64" fn acpi_pdo_query_resources(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
@@ -786,7 +786,7 @@ extern "win64" fn acpi_pdo_query_resources(
 }
 
 extern "win64" fn acpi_pdo_query_id(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
@@ -832,7 +832,7 @@ extern "win64" fn acpi_pdo_query_id(
 }
 
 extern "win64" fn acpi_pdo_start(
-    _dev: &Arc<DeviceObject>,
+    _dev: Arc<DeviceObject>,
     req: Arc<RwLock<kernel_api::Request>>,
 ) -> kernel_api::DriverStatus {
     kernel_api::DriverStatus::Success

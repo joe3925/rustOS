@@ -27,16 +27,16 @@ use kernel_api::{
     GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType, TraversalPolicy,
     acpi::platform::Processor,
     alloc_api::{
-        DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
+        DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, RequestResultExt, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
             pnp_create_symlink, pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink,
-            pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink, reg,
+            pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink, reg, spawn_boxed,
         },
     },
     ffi::switch_to_vfs,
-    println,
+    io_handler, println, spawn,
 };
 
 #[inline]
@@ -111,7 +111,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn volclass_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -137,35 +137,35 @@ pub extern "win64" fn volclass_device_add(
 }
 
 extern "win64" fn volclass_start(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     _request: Arc<RwLock<kernel_api::Request>>,
 ) -> DriverStatus {
     let _ = refresh_fs_registry_from_registry();
-    init_volume_dx(dev);
+    init_volume_dx(&dev);
     mount_if_unmounted(dev);
     DriverStatus::Continue
 }
 
-pub extern "win64" fn vol_fdo_read(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn vol_fdo_read(
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
     DriverStatus::Continue
 }
 
-pub extern "win64" fn vol_fdo_write(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn vol_fdo_write(
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
     DriverStatus::Continue
 }
 
-pub extern "win64" fn volclass_ioctl(
-    dev: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[io_handler]
+pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
@@ -187,7 +187,7 @@ pub extern "win64" fn volclass_ioctl(
             if !target.is_empty() {
                 let _ = unsafe { pnp_remove_symlink(target) };
             } else {
-                let dx = ext::<VolFdoExt>(dev);
+                let dx = ext::<VolFdoExt>(&dev);
                 if let Some(pl) = dx.public_link.get() {
                     let _ = unsafe { pnp_remove_symlink(pl.clone()) };
                 }
@@ -197,7 +197,7 @@ pub extern "win64" fn volclass_ioctl(
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
-            w.data = build_status_blob(dev);
+            w.data = build_status_blob(&dev);
             DriverStatus::Success
         }
         IOCTL_MOUNTMGR_RESYNC => {
@@ -214,8 +214,9 @@ pub extern "win64" fn volclass_ioctl(
     }
 }
 
-pub extern "win64" fn volclass_ctrl_ioctl(
-    _dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn volclass_ctrl_ioctl(
+    _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let code = {
@@ -277,9 +278,9 @@ fn init_volume_dx(dev: &Arc<DeviceObject>) {
     }
 }
 
-fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
+async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
     {
-        let dx = ext::<VolFdoExt>(dev);
+        let dx = ext::<VolFdoExt>(&dev);
         if dx
             .fs_attached
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -289,14 +290,14 @@ fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
         }
     }
 
-    let dx = ext::<VolFdoExt>(dev);
+    let dx = ext::<VolFdoExt>(&dev);
     let public = dx.public_link.get().cloned().unwrap_or_default();
     if public.is_empty() {
         dx.fs_attached.store(false, Ordering::Release);
         return;
     }
 
-    if try_bind_filesystems_for_parent_fdo(dev, &public) {
+    if try_bind_filesystems_for_parent_fdo(&dev, &public).await {
         let link = dx.fs_link.get().cloned().unwrap_or_else(|| public.clone());
         let inst = dx.inst_path.get().cloned().unwrap_or_default();
         start_boot_probe_async(&link, &inst);
@@ -305,7 +306,10 @@ fn mount_if_unmounted(dev: &Arc<DeviceObject>) {
     }
 }
 
-fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_link: &str) -> bool {
+async fn try_bind_filesystems_for_parent_fdo(
+    parent_fdo: &Arc<DeviceObject>,
+    public_link: &str,
+) -> bool {
     let _ = refresh_fs_registry_from_registry();
     let dx_vol = ext::<VolFdoExt>(parent_fdo);
     let vid = dx_vol.vid.get().copied().unwrap_or(0);
@@ -348,8 +352,9 @@ fn try_bind_filesystems_for_parent_fdo(parent_fdo: &Arc<DeviceObject>, public_li
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
         unsafe {
-            let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone());
-            kernel_api::alloc_api::ffi::pnp_wait_for_request(&req);
+            let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
+                .resolve()
+                .await;
         }
 
         let mut w = req.write();
@@ -658,7 +663,7 @@ fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
 fn rescan_all_volumes() {
     let vols = VOLUMES.read();
     for dev in vols.clone() {
-        mount_if_unmounted(&dev);
+        unsafe { spawn(mount_if_unmounted(dev.clone())) };
     }
 }
 

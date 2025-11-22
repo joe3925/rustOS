@@ -51,7 +51,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -65,7 +65,7 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 pub extern "win64" fn bus_driver_prepare_hardware(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let acpi_tables = unsafe { get_acpi_tables() };
@@ -113,13 +113,13 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 pub extern "win64" fn enumerate_bus(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = unsafe {
-        (*(Arc::as_ptr(device) as *const DeviceObject))
+        (*(Arc::as_ptr(&device) as *const DeviceObject))
             .dev_node
             .get()
             .unwrap()

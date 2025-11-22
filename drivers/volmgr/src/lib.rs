@@ -17,9 +17,12 @@ use kernel_api::DevExtRef;
 use kernel_api::DevExtRefMut;
 use kernel_api::PartitionInfo;
 use kernel_api::TraversalPolicy;
-use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
+use kernel_api::alloc_api::RequestResultExt;
+use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
 use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
+use kernel_api::block_on;
 use kernel_api::bytes_to_box;
+use kernel_api::io_handler;
 use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
     alloc_api::{
@@ -93,7 +96,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn vol_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -109,7 +112,7 @@ pub extern "win64" fn vol_device_add(
 }
 
 extern "win64" fn vol_prepare_hardware(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut req = Request::new_pnp(
@@ -124,15 +127,14 @@ extern "win64" fn vol_prepare_hardware(
     );
 
     let req_lock = Arc::new(RwLock::new(req));
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, req_lock.clone()) };
+    let st =
+        block_on(unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone()).resolve() });
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
 
-    unsafe { pnp_wait_for_request(&req_lock) };
-
     let mut g = req_lock.write();
-    let mut dx = ext::<VolExt>(dev);
+    let mut dx = ext::<VolExt>(&dev);
 
     if g.status != DriverStatus::Success {
         return g.status;
@@ -157,10 +159,10 @@ extern "win64" fn vol_prepare_hardware(
     DriverStatus::Continue
 }
 pub extern "win64" fn vol_enumerate_devices(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dx = ext::<VolExt>(device);
+    let dx = ext::<VolExt>(&device);
 
     let binding = dx.part.get();
     let pi = if let Some(ref pi) = binding {
@@ -260,8 +262,9 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStat
     return DriverStatus::Success;
 }
 // TODO: this can be optimized
-pub extern "win64" fn vol_pdo_read(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn vol_pdo_read(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
@@ -276,7 +279,7 @@ pub extern "win64" fn vol_pdo_read(
         }
     };
 
-    let binding = ext::<VolPdoExt>(dev);
+    let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
@@ -294,13 +297,13 @@ pub extern "win64" fn vol_pdo_read(
     })) as usize;
     child.set_completion(bridge_complete, ctx);
     let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
+    unsafe { pnp_send_request(&*tgt, req.clone()).resolve().await };
     return DriverStatus::Success;
 }
 
-pub extern "win64" fn vol_pdo_write(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn vol_pdo_write(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
@@ -317,7 +320,7 @@ pub extern "win64" fn vol_pdo_write(
         }
     };
 
-    let binding = ext::<VolPdoExt>(dev);
+    let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
@@ -333,13 +336,11 @@ pub extern "win64" fn vol_pdo_write(
     child.set_completion(bridge_complete, ctx);
 
     let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
-
+    unsafe { pnp_send_request(&*tgt, req.clone()).resolve().await };
     return DriverStatus::Success;
 }
 extern "win64" fn vol_pdo_query_resources(
-    pdo: &Arc<DeviceObject>,
+    pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut w = req.write();
@@ -351,7 +352,7 @@ extern "win64" fn vol_pdo_query_resources(
         }
     };
 
-    if let Some(pi) = ext::<VolPdoExt>(pdo).part.get() {
+    if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
         let mut out = vec![0u8; core::mem::size_of::<PartitionInfo>()];
         unsafe {
             core::ptr::copy_nonoverlapping(

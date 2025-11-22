@@ -3,32 +3,42 @@
 #![feature(variant_count)]
 #![feature(try_trait_v2)]
 pub extern crate alloc;
-
 use crate::alloc::format;
 use crate::alloc::vec;
+use crate::alloc_api::ffi::block_on_driver_status;
+use crate::alloc_api::ffi::pnp_poll_request;
+use crate::alloc_api::ffi::spawn_boxed;
 pub use acpi;
 use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::sync::{Arc, Weak};
+use alloc::task::Wake;
 use alloc::vec::Vec;
 use alloc_api::{CompletionRoutine, DeviceInit, PnpRequest};
 use core::alloc::{GlobalAlloc, Layout};
 use core::any::{type_name, Any, TypeId};
 use core::cell::UnsafeCell;
+use core::future::Future;
 use core::marker::PhantomData;
 use core::ops::{ControlFlow, Deref, DerefMut, FromResidual, Try};
+use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
+use core::sync::atomic::Ordering;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+use core::task::Context;
+use core::task::Poll;
 use core::task::Waker;
 use ffi::random_number;
+pub use kernel_macros::io_handler;
 use spin::Once;
 use spin::{Mutex, RwLock};
 use strum::Display;
 pub use x86_64;
 use x86_64::addr::{PhysAddr, VirtAddr};
+use x86_64::instructions::hlt;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 
@@ -46,6 +56,7 @@ pub const IOCTL_FS_CREATE_FUNCTION_FDO: u32 = 0x4653_3001;
 pub const GLOBAL_NS: &str = "\\GLOBAL";
 pub const GLOBAL_CTRL_LINK: &str = "\\GLOBAL\\MountMgr";
 pub const GLOBAL_VOLUMES_BASE: &str = "\\GLOBAL\\Volumes";
+
 pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
@@ -58,9 +69,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
     }
 }
 
+/// A pinned, boxed future returned by I/O handlers.
+pub type BoxedIoFuture = Pin<Box<dyn Future<Output = DriverStatus> + Send + 'static>>;
+
 #[derive(Debug)]
 #[repr(C)]
-
 pub struct DeviceObject {
     pub lower_device: Once<Arc<DeviceObject>>,
     pub upper_device: Once<alloc::sync::Weak<DeviceObject>>,
@@ -112,6 +125,13 @@ impl DeviceObject {
         self.dev_node.call_once(|| Arc::downgrade(dn));
     }
 }
+pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub fn box_future<F>(f: F) -> BoxFuture
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    Box::pin(f)
+}
 
 #[derive(Debug)]
 #[repr(C)]
@@ -145,6 +165,8 @@ impl<'a, T: 'static> Deref for DevExtRef<'a, T> {
         unsafe { self.ptr.as_ref() }
     }
 }
+unsafe impl<'a, T: Sync> Send for DevExtRef<'a, T> {}
+unsafe impl<'a, T: Sync> Sync for DevExtRef<'a, T> {}
 #[repr(C)]
 pub struct DevExtRefMut<'a, T: 'static> {
     ptr: NonNull<T>,
@@ -200,7 +222,6 @@ impl DevExtBox {
     fn as_const_ptr<T: 'static>(&self) -> *const T {
         match self.inner.get() {
             Some(b) => {
-                // &Box<dyn Any> -> &dyn Any -> &T (if types match)
                 let a: &dyn Any = &**b;
                 a.downcast_ref::<T>()
                     .map(|r| r as *const T)
@@ -234,35 +255,22 @@ pub enum RequestType {
     DeviceControl(u32),
     Fs(FsOp),
     Pnp,
-
     Dummy,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum FsOp {
-    /// data = UTF-8 path bytes; flags in Request.flags (bitfield), length may carry mode/perm
     Create,
-    /// data = UTF-8 path bytes; flags in Request.flags (bitfield)
     Open,
-    /// uses Request.handle
     Close,
-    /// uses Request.handle + Request.offset/length; returns bytes in Request.data
     Read,
-    /// uses Request.handle + Request.offset; bytes to write in Request.data
     Write,
-    /// uses Request.handle; ensure durable
     Flush,
-    /// uses Request.handle + Request.offset (absolute)
     Seek,
-    /// uses Request.handle; returns serialized dir entries in Request.data
     ReadDir,
-    /// uses Request.handle; returns serialized stat/attributes in Request.data
     GetInfo,
-    /// uses Request.handle; takes serialized attrs in Request.data
     SetInfo,
-    /// data = UTF-8 path bytes (or uses Request.handle if nonzero)
     Delete,
-    /// data = "old\0new" UTF-8 bytes
     Rename,
 }
 
@@ -556,6 +564,23 @@ impl Request {
         self.completion_context = context;
     }
 }
+pub struct RequestFuture {
+    pub req: Arc<RwLock<Request>>,
+}
+
+impl Future for RequestFuture {
+    type Output = DriverStatus;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let status = unsafe { pnp_poll_request(&self.req, cx.waker()) };
+
+        if status == DriverStatus::Pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(status)
+        }
+    }
+}
 #[repr(C)]
 pub struct File {
     _private: [u8; 0],
@@ -642,13 +667,10 @@ impl FromResidual<DriverStatus> for DriverStatus {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum TraversalPolicy {
-    /// Standard I/O behavior: If unhandled, pass to the next lower device.
-    /// If no lower device exists, fail with NoSuchDevice.
     ForwardLower,
-    /// Strict behavior: If unhandled, fail immediately with NotImplemented.
     FailIfUnhandled,
-    /// Upward bubbling: If unhandled, pass to the next UPPER device.
     ForwardUpper,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -757,7 +779,6 @@ pub enum FileStatus {
     BadPath,
     AccessDenied,
     NoSpace,
-    //DriverError(DriverStatus),
 }
 impl FileStatus {
     pub fn to_str(&self) -> &str {
@@ -773,9 +794,7 @@ impl FileStatus {
             FileStatus::InternalError => "Internal error",
             FileStatus::BadPath => "Invalid path",
             FileStatus::AccessDenied => "Insufficient permissions to access the current file",
-            FileStatus::NoSpace => "Insufficient space on drive to write the requested data", // FileStatus::DriverError(e) => {
-                                                                                              //     format!("The file access failed with a driver error of {}", e)
-                                                                                              // }
+            FileStatus::NoSpace => "Insufficient space on drive to write the requested data",
         }
     }
 }
@@ -881,7 +900,7 @@ pub mod alloc_api {
             }
         }
     }
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Clone, Copy)]
     #[repr(C)]
     pub enum IoType {
         Read(EvtIoRead),
@@ -901,7 +920,7 @@ pub mod alloc_api {
         }
 
         #[inline]
-        pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+        pub fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> BoxedIoFuture {
             match *self {
                 IoType::Read(h) | IoType::Write(h) => {
                     let len = req.read().data.len();
@@ -931,16 +950,25 @@ pub mod alloc_api {
         Async,
         FireAndForget,
     }
+    #[derive(Clone)]
     #[repr(C)]
-    #[derive(Debug, Clone)]
+
     pub struct IoHandler {
         pub handler: IoType,
         pub synchronization: Synchronization,
         pub depth: usize,
         pub running_request: Arc<AtomicU64>,
     }
-    #[repr(C)]
+    impl core::fmt::Debug for IoHandler {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("IoHandler")
+                .field("synchronization", &self.synchronization)
+                .finish()
+        }
+    }
     #[derive(Debug)]
+    #[repr(C)]
+
     pub struct IoVtable {
         pub handlers: Vec<Option<IoHandler>>,
     }
@@ -948,7 +976,7 @@ pub mod alloc_api {
     impl IoVtable {
         #[inline]
         pub fn new() -> Self {
-            let n = core::mem::variant_count::<IoType>();
+            let n = 4;
             Self {
                 handlers: alloc::vec![None; n],
             }
@@ -1003,6 +1031,19 @@ pub mod alloc_api {
             self.set_dev_ext_from::<T>(T::default());
         }
     }
+    pub trait RequestResultExt {
+        async fn resolve(self) -> DriverStatus;
+    }
+
+    impl RequestResultExt for Result<RequestFuture, DriverStatus> {
+        #[inline(always)]
+        async fn resolve(self) -> DriverStatus {
+            match self {
+                Ok(future) => future.await,
+                Err(status) => status,
+            }
+        }
+    }
     #[repr(C)]
     #[derive(Debug, Clone)]
     pub struct PnpRequest {
@@ -1047,26 +1088,25 @@ pub mod alloc_api {
     }
 
     pub type EvtDriverDeviceAdd =
-        extern "win64" fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
+        extern "win64" fn(driver: Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
 
-    pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
+    pub type EvtDriverUnload = extern "win64" fn(driver: Arc<DriverObject>) -> DriverStatus;
 
-    pub type EvtIoRead =
-        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
-    pub type EvtIoWrite =
-        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
-    pub type EvtIoDeviceControl =
-        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
-    pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
+    pub type EvtIoRead = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
+    pub type EvtIoWrite = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
+    pub type EvtIoDeviceControl = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
+    pub type EvtIoFs = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
+
+    pub type EvtDevicePrepareHardware = extern "win64" fn(Arc<DeviceObject>) -> DriverStatus;
     pub type EvtDeviceEnumerateDevices =
-        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
-    pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+        extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+
     pub type ClassAddCallback =
-        extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
+        extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
     pub type CompletionRoutine =
         extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
     pub type PnpMinorCallback =
-        extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+        extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
     pub mod ffi {
         use core::panic::PanicInfo;
@@ -1120,6 +1160,8 @@ pub mod alloc_api {
         }
         extern "win64" {
             pub fn create_kernel_task(entry: usize, name: String) -> u64;
+            pub fn spawn_boxed(future: BoxFuture);
+            pub fn block_on_driver_status(fut: BoxStatusFuture) -> DriverStatus;
             pub fn panic_common(mod_name: &'static str, info: &PanicInfo) -> !;
             pub fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus>;
             pub fn fs_list_dir(path: &str) -> Result<Vec<String>, FileStatus>;
@@ -1148,8 +1190,11 @@ pub mod alloc_api {
             pub fn pnp_forward_request_to_next_lower(
                 from: &Arc<DeviceObject>,
                 req: Arc<RwLock<Request>>,
-            ) -> DriverStatus;
-            pub fn pnp_send_request(target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus;
+            ) -> Result<RequestFuture, DriverStatus>;
+            pub fn pnp_send_request(
+                target: &IoTarget,
+                req: Arc<RwLock<Request>>,
+            ) -> Result<RequestFuture, DriverStatus>;
             pub fn pnp_complete_request(req: &Arc<RwLock<Request>>);
             pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
             pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
@@ -1162,13 +1207,13 @@ pub mod alloc_api {
             pub fn pnp_send_request_via_symlink(
                 link_path: String,
                 req: Arc<RwLock<Request>>,
-            ) -> DriverStatus;
+            ) -> Result<RequestFuture, DriverStatus>;
 
             pub fn pnp_ioctl_via_symlink(
                 link_path: String,
                 control_code: u32,
                 request: Arc<RwLock<Request>>,
-            ) -> DriverStatus;
+            ) -> Result<RequestFuture, DriverStatus>;
             pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>>;
             pub fn pnp_create_control_device_with_init(
                 name: alloc::string::String,
@@ -1193,19 +1238,22 @@ pub mod alloc_api {
                 function_fdo: &Arc<DeviceObject>,
                 init_pdo: DeviceInit,
             ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>;
-            pub fn pnp_wait_for_request(req: &Arc<RwLock<Request>>);
             pub fn pnp_send_request_to_next_upper(
                 from: &Arc<DeviceObject>,
                 req: Arc<RwLock<Request>>,
-            ) -> DriverStatus;
+            ) -> Result<RequestFuture, DriverStatus>;
             pub fn pnp_send_request_to_stack_top(
                 dev_node_weak: &alloc::sync::Weak<DevNode>,
                 req: Arc<RwLock<Request>>,
+            ) -> Result<RequestFuture, DriverStatus>;
+            pub fn pnp_poll_request(
+                req: &Arc<RwLock<Request>>,
+                waker: &core::task::Waker,
             ) -> DriverStatus;
             pub fn InvalidateDeviceRelations(
                 device: &Arc<DeviceObject>,
                 relation: DeviceRelationType,
-            ) -> DriverStatus;
+            ) -> Result<RequestFuture, DriverStatus>;
             pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
             pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
             pub fn driver_set_evt_device_add(
@@ -1266,4 +1314,27 @@ macro_rules! print {
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", $crate::alloc::format!($($arg)*)));
+}
+
+pub fn spawn<F>(f: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    unsafe { spawn_boxed(box_future(f)) };
+}
+pub type BoxStatusFuture = Pin<Box<dyn Future<Output = DriverStatus> + Send + 'static>>;
+
+#[inline]
+pub fn box_status_future<F>(f: F) -> BoxStatusFuture
+where
+    F: Future<Output = DriverStatus> + Send + 'static,
+{
+    Box::pin(f)
+}
+#[inline]
+pub fn block_on<F>(f: F) -> DriverStatus
+where
+    F: Future<Output = DriverStatus> + Send + 'static,
+{
+    unsafe { block_on_driver_status(box_status_future(f)) }
 }

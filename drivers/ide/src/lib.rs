@@ -17,8 +17,8 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
-use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType};
+use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, RequestResultExt, Synchronization};
+use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType, block_on, io_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -104,7 +104,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn ide_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut vt = PnpVtable::new();
@@ -122,7 +122,7 @@ pub extern "win64" fn ide_device_add(
 }
 
 extern "win64" fn ide_pnp_start(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut child = Request::new_pnp(
@@ -136,9 +136,8 @@ extern "win64" fn ide_pnp_start(
         Box::new([]),
     );
     let child = Arc::new(RwLock::new(child));
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
+    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }.resolve());
     if st != DriverStatus::NoSuchDevice {
-        unsafe { kernel_api::alloc_api::ffi::pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
             return qst;
@@ -173,12 +172,12 @@ extern "win64" fn ide_pnp_start(
 }
 
 extern "win64" fn ide_pnp_query_devrels(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
-        ide_enumerate_bus(dev);
+        ide_enumerate_bus(&dev);
         return DriverStatus::Success;
     }
     DriverStatus::Continue
@@ -307,8 +306,9 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 }
 
-pub extern "win64" fn ide_pdo_internal_ioctl(
-    pdo: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn ide_pdo_internal_ioctl(
+    pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let cdx = pdo
@@ -752,7 +752,7 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
 }
 
 extern "win64" fn ide_pdo_query_id(
-    pdo: &Arc<DeviceObject>,
+    pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     use QueryIdType::*;
@@ -787,7 +787,7 @@ extern "win64" fn ide_pdo_query_id(
 }
 
 extern "win64" fn ide_pdo_query_resources(
-    pdo: &Arc<DeviceObject>,
+    pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -814,7 +814,7 @@ extern "win64" fn ide_pdo_query_resources(
 }
 
 extern "win64" fn ide_pdo_start(
-    _pdo: &Arc<DeviceObject>,
+    _pdo: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     DriverStatus::Success

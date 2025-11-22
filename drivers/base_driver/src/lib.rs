@@ -28,7 +28,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    driver: &Arc<DriverObject>,
+    driver: Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -38,7 +38,7 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 pub extern "win64" fn bus_driver_prepare_hardware(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");

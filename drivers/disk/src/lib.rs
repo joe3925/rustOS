@@ -18,13 +18,10 @@ use kernel_api::{
     DriverStatus, KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
     TraversalPolicy,
     alloc_api::{
-        DeviceInit, IoType, Synchronization,
-        ffi::{
-            driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower,
-            pnp_wait_for_request,
-        },
+        DeviceInit, IoType, RequestResultExt, Synchronization,
+        ffi::{driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower},
     },
-    println,
+    io_handler, println,
 };
 
 #[global_allocator]
@@ -114,7 +111,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn disk_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     dev_init
@@ -129,9 +126,9 @@ pub extern "win64" fn disk_device_add(
     dev_init.set_dev_ext_default::<DiskExt>();
     DriverStatus::Success
 }
-
-pub extern "win64" fn disk_read(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn disk_read(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
@@ -149,9 +146,9 @@ pub extern "win64" fn disk_read(
         return DriverStatus::Success;
     }
 
-    let dx = disk_ext(dev);
+    let dx = disk_ext(&dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
-        if let Err(st) = query_props_sync(dev) {
+        if let Err(st) = query_props_sync(&dev).await {
             return st;
         }
     }
@@ -188,11 +185,9 @@ pub extern "win64" fn disk_read(
         let mut req_child = Request::new(RequestType::DeviceControl(IOCTL_BLOCK_RW), buf);
         req_child.traversal_policy = TraversalPolicy::ForwardLower;
         let child = Arc::new(RwLock::new(req_child));
-        let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-        if st == DriverStatus::NoSuchDevice {
-            return st;
-        }
-        unsafe { pnp_wait_for_request(&child) };
+        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
+            .resolve()
+            .await;
 
         let c = child.read();
         if c.status != DriverStatus::Success {
@@ -223,8 +218,9 @@ pub extern "win64" fn disk_read(
     return DriverStatus::Success;
 }
 
-pub extern "win64" fn disk_write(
-    dev: &Arc<DeviceObject>,
+#[io_handler]
+pub async fn disk_write(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
@@ -242,9 +238,9 @@ pub extern "win64" fn disk_write(
         return DriverStatus::Success;
     }
 
-    let dx = disk_ext(dev);
+    let dx = disk_ext(&dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
-        if let Err(st) = query_props_sync(dev) {
+        if let Err(st) = query_props_sync(&dev).await {
             return st;
         }
     }
@@ -288,11 +284,9 @@ pub extern "win64" fn disk_write(
         req_child.traversal_policy = TraversalPolicy::ForwardLower;
         let child = Arc::new(RwLock::new(req_child));
 
-        let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-        if st == DriverStatus::NoSuchDevice {
-            return st;
-        }
-        unsafe { pnp_wait_for_request(&child) };
+        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
+            .resolve()
+            .await?;
 
         let c = child.read();
         if c.status != DriverStatus::Success {
@@ -307,10 +301,8 @@ pub extern "win64" fn disk_write(
     return DriverStatus::Success;
 }
 
-pub extern "win64" fn disk_ioctl(
-    dev: &Arc<DeviceObject>,
-    parent: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[io_handler]
+pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStatus {
     let code = match parent.read().kind {
         RequestType::DeviceControl(c) => c,
         _ => return DriverStatus::InvalidParameter,
@@ -340,8 +332,9 @@ pub extern "win64" fn disk_ioctl(
 
             let ch = Arc::new(RwLock::new(ch));
 
-            unsafe { pnp_forward_request_to_next_lower(dev, ch.clone()) };
-            unsafe { pnp_wait_for_request(&ch) };
+            unsafe { pnp_forward_request_to_next_lower(&dev, ch.clone()) }
+                .resolve()
+                .await;
 
             let blob = {
                 let r = ch.read();
@@ -360,12 +353,10 @@ pub extern "win64" fn disk_ioctl(
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
             let child = Arc::new(RwLock::new(req_child));
 
-            let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-            if st == DriverStatus::NoSuchDevice {
-                return DriverStatus::NoSuchDevice;
-            }
+            unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
+                .resolve()
+                .await?;
 
-            unsafe { pnp_wait_for_request(&child) };
             child.read().status
         }
         _ => DriverStatus::NotImplemented,
@@ -391,7 +382,7 @@ fn rw_validate(dx: &DiskExt, off: u64, total: usize) -> bool {
     }
     true
 }
-fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
+async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     let out_len = core::mem::size_of::<BlockQueryOut>();
     let buf = alloc::vec![0u8; out_len].into_boxed_slice();
 
@@ -399,11 +390,9 @@ fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         Request::new(RequestType::DeviceControl(IOCTL_BLOCK_QUERY), buf)
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-    if st == DriverStatus::NoSuchDevice {
-        return Err(DriverStatus::NoSuchDevice);
-    }
-    unsafe { pnp_wait_for_request(&child) };
+    unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) }
+        .resolve()
+        .await;
 
     let c = child.read();
     if c.status != DriverStatus::Success || c.data.len() < core::mem::size_of::<BlockQueryOut>() {

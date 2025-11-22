@@ -11,6 +11,8 @@ use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
 use crate::memory::paging::virt_tracker::unmap_range;
+use crate::scheduling::executor::spawn;
+use crate::scheduling::executor::spawn_boxed;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
@@ -27,6 +29,8 @@ export! {
     switch_to_vfs,
     panic_common,
 
+    spawn_boxed,
+    block_on_driver_status,
     get_rsdp,
     get_acpi_tables,
 
@@ -71,6 +75,7 @@ export! {
     pnp_create_devnode_over_pdo_with_function,
     pnp_send_request_to_next_upper,
     pnp_send_request_to_stack_top,
+    pnp_poll_request,
     InvalidateDeviceRelations,
 
     driver_get_name,
@@ -86,4 +91,5 @@ export! {
     reg_delete_value,
     reg_list_keys,
     reg_list_values,
+
 }

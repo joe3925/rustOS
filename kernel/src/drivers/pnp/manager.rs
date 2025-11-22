@@ -1,21 +1,17 @@
-use super::driver_index::{
-    self as idx, escape_key, DriverBinding, DriverPackage, DriverRuntime, DriverState, HwIndex,
-    MatchClass,
-};
+use super::driver_index::{self as idx, DriverPackage, DriverRuntime, DriverState, HwIndex};
 use super::request::IoTarget;
 use crate::drivers::driver_install::{BootType, DriverError};
 use crate::drivers::pnp::device::{DevNode, DevNodeState, DeviceIds, DeviceStack, StackLayer};
 use crate::drivers::pnp::driver_object::{
     ClassAddCallback, ClassListener, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
-    DriverStatus, IoVtable, PnpMinorFunction, PnpRequest, QueryIdType, Request, RequestType,
-    Synchronization,
+    DriverStatus, IoVtable, PnpMinorFunction, PnpRequest, QueryIdType, Request, RequestFuture,
+    RequestType,
 };
-use crate::executable::program::{ModuleHandle, PROGRAM_MANAGER};
+use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
-use crate::registry::{self as reg, Data, RegError};
-use crate::util::{generate_guid, random_number};
+use crate::registry::{Data, RegError};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
@@ -67,7 +63,7 @@ impl PnpManager {
                 hardware: vec![alloc::format!("ROOT\\{}", pkg.name)],
                 compatible: Vec::new(),
             };
-            let mut pdo_init = DeviceInit::new(IoVtable::new(), None);
+            let pdo_init = DeviceInit::new(IoVtable::new(), None);
 
             let (devnode, _pdo) = self.create_child_devnode_and_pdo_with_init(
                 &root_node,
@@ -90,6 +86,7 @@ impl PnpManager {
         *self.hw.write() = Arc::new(idx::build_hw_index()?);
         Ok(())
     }
+
     pub fn recheck_all_devices(&self) {
         self.rebuild_index();
         let root = self.root();
@@ -147,6 +144,7 @@ impl PnpManager {
             self.rescan_buses_started(&ch);
         }
     }
+
     pub fn create_child_devnode_and_pdo(
         &self,
         parent: &Arc<DevNode>,
@@ -565,7 +563,7 @@ impl PnpManager {
         }
         if let Some(cb) = drv.evt_device_add {
             let mut dev_init = DeviceInit::new(IoVtable::new(), None);
-            let st = cb(drv, &mut dev_init);
+            let st = cb(drv.clone(), &mut dev_init);
             if st == DriverStatus::Success {
                 let devobj = DeviceObject::new(dev_init);
                 devobj.attach_devnode(&dn);
@@ -708,7 +706,7 @@ impl PnpManager {
             let target = IoTarget {
                 target_device: top_device,
             };
-            let st = self.send_request(&target, req_arc.clone());
+            let _ = self.send_request(&target, req_arc.clone());
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -745,7 +743,7 @@ impl PnpManager {
                 let target = IoTarget {
                     target_device: top_device,
                 };
-                let st = pnp_manager.send_request(&target, req_arc.clone());
+                let _ = pnp_manager.send_request(&target, req_arc.clone());
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
@@ -831,7 +829,7 @@ impl PnpManager {
         &self,
         dev_node: &Arc<DevNode>,
         relation: DeviceRelationType,
-    ) -> DriverStatus {
+    ) -> Result<RequestFuture, DriverStatus> {
         let Some(top) = dev_node
             .stack
             .read()
@@ -839,7 +837,7 @@ impl PnpManager {
             .and_then(|s| s.get_top_device_object())
             .or_else(|| dev_node.get_pdo())
         else {
-            return DriverStatus::NoSuchDevice;
+            return Err(DriverStatus::NoSuchDevice);
         };
         let pnp_payload = PnpRequest {
             minor_function: PnpMinorFunction::QueryDeviceRelations,
@@ -908,24 +906,25 @@ impl PnpManager {
         &self,
         link_path: String,
         req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
-        match self.resolve_targetio_from_symlink(link_path.clone()) {
+    ) -> Result<RequestFuture, DriverStatus> {
+        match self.resolve_targetio_from_symlink(link_path) {
             Some(tgt) => {
-                let kind = { req.read().kind };
-                let st = self.send_request(&tgt, req.clone());
-                st
+                let _kind = { req.read().kind };
+
+                self.send_request(&tgt, req)
             }
-            None => DriverStatus::NoSuchDevice,
+            None => Err(DriverStatus::NoSuchDevice),
         }
     }
+
     pub fn send_request_to_stack_top(
         &self,
         dev_node_weak: &alloc::sync::Weak<DevNode>,
         req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+    ) -> Result<RequestFuture, DriverStatus> {
         let dev_node = match dev_node_weak.upgrade() {
             Some(dn) => dn,
-            None => return DriverStatus::NoSuchDevice,
+            None => return Err(DriverStatus::NoSuchDevice),
         };
 
         let target_device_opt = dev_node
@@ -939,7 +938,7 @@ impl PnpManager {
             let target = IoTarget { target_device };
             self.send_request(&target, req)
         } else {
-            DriverStatus::NoSuchDevice
+            Err(DriverStatus::NoSuchDevice)
         }
     }
     pub fn ioctl_via_symlink(
@@ -947,7 +946,7 @@ impl PnpManager {
         link_path: String,
         _control_code: u32,
         req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+    ) -> Result<RequestFuture, DriverStatus> {
         self.send_request_via_symlink(link_path, req)
     }
 
@@ -983,7 +982,7 @@ impl PnpManager {
                 .collect()
         };
         for (dev, cb) in hits {
-            cb(dn, &dev);
+            cb(dn.clone(), &dev);
         }
     }
 

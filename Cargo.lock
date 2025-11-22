@@ -415,9 +415,19 @@ name = "kernel_api"
 version = "0.1.0"
 dependencies = [
  "acpi 5.2.0",
+ "kernel_macros",
  "spin 0.10.0",
  "strum",
  "x86_64 0.15.2",
+]
+
+[[package]]
+name = "kernel_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.100",
 ]
 
 [[package]]

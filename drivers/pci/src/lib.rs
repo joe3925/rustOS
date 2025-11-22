@@ -20,14 +20,13 @@ use kernel_api::{
     DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
     RequestType,
     alloc_api::{
-        DeviceIds, DeviceInit, IoVtable, PnpVtable,
+        DeviceIds, DeviceInit, IoVtable, PnpVtable, RequestResultExt,
         ffi::{
             driver_set_evt_device_add, pnp_complete_request,
             pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-            pnp_wait_for_request,
         },
     },
-    println,
+    block_on, println,
 };
 use spin::{Once, RwLock};
 
@@ -50,7 +49,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut vt = PnpVtable::new();
@@ -69,7 +68,7 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 extern "win64" fn pci_bus_pnp_start(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let query = Request::new_pnp(
@@ -84,9 +83,10 @@ extern "win64" fn pci_bus_pnp_start(
     );
 
     let child = Arc::new(RwLock::new(query));
-    let st = unsafe { pnp_forward_request_to_next_lower(device, child.clone()) };
+    let st =
+        block_on(unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }.resolve());
+
     if st != DriverStatus::NoSuchDevice {
-        unsafe { pnp_wait_for_request(&child) };
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
             return qst;
@@ -113,7 +113,7 @@ extern "win64" fn pci_bus_pnp_start(
         }
     } else {
         // Fallback derive segments from parent using platform-specific probe
-        let segs = load_segments_from_parent(device);
+        let segs = load_segments_from_parent(&device);
         if let Ok(ext) = device.try_devext::<DevExt>() {
             if !segs.is_empty() {
                 ext.segments.call_once(|| segs);
@@ -127,12 +127,12 @@ extern "win64" fn pci_bus_pnp_start(
 }
 
 extern "win64" fn pci_bus_pnp_query_devrels(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation == kernel_api::DeviceRelationType::BusRelations {
-        let st = enumerate_bus(device, &mut *req.write());
+        let st = enumerate_bus(&device, &mut *req.write());
         if st == DriverStatus::Success {
             return DriverStatus::Continue;
         } else {
@@ -239,7 +239,7 @@ fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
 }
 
 extern "win64" fn pci_pdo_query_id(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     use kernel_api::QueryIdType;
@@ -283,7 +283,7 @@ extern "win64" fn pci_pdo_query_id(
 }
 
 extern "win64" fn pci_pdo_query_resources(
-    dev: &Arc<DeviceObject>,
+    dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let ext = match dev.try_devext::<PciPdoExt>() {
@@ -302,7 +302,7 @@ extern "win64" fn pci_pdo_query_resources(
 }
 
 extern "win64" fn pci_pdo_start(
-    _dev: &Arc<DeviceObject>,
+    _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut r = req.write();
@@ -311,7 +311,7 @@ extern "win64" fn pci_pdo_start(
 }
 
 extern "win64" fn pci_pdo_query_devrels(
-    _dev: &Arc<DeviceObject>,
+    _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     req.write().status = DriverStatus::Success;

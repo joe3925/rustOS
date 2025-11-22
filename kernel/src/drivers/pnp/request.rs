@@ -1,16 +1,15 @@
 use crate::drivers::pnp::driver_object::{
-    DeviceObject, DriverStatus, PnpMinorFunction, Request, RequestType, Synchronization,
+    DeviceObject, DriverStatus, Request, RequestFuture, RequestType, Synchronization,
     TraversalPolicy,
 };
 use crate::drivers::pnp::manager::{PnpManager, PNP_MANAGER};
-
+use crate::scheduling::executor;
 use crate::static_handlers::create_kernel_task;
 use crate::structs::thread_pool::ThreadPool;
 use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 use spin::RwLock;
-
 #[derive(Clone, Copy)]
 pub struct Dpc {
     pub func: DpcFn,
@@ -30,7 +29,7 @@ static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 const START_THREADS: usize = 12;
 
 lazy_static::lazy_static! {
-    static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
+    pub static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
     static ref DISPATCH_REQ_Q: Mutex<VecDeque<(Arc<DeviceObject>, Arc<RwLock<Request>>)>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
@@ -78,16 +77,13 @@ impl PnpManager {
         }
         true
     }
+
     pub fn execute_one() -> bool {
         THREADS.try_execute_one()
     }
 
     fn run_one_device_request(&self) -> bool {
-        let item = {
-            let mut q = DISPATCH_REQ_Q.lock();
-            q.pop_front()
-        };
-
+        let item = { DISPATCH_REQ_Q.lock().pop_front() };
         let Some((dev, req)) = item else {
             return false;
         };
@@ -96,29 +92,39 @@ impl PnpManager {
         let ptr = Box::into_raw(arg) as usize;
 
         THREADS.submit(job_dispatch_request, ptr);
-
         true
     }
 
-    pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
+    pub fn send_request(
+        &self,
+        target: &IoTarget,
+        req: Arc<RwLock<Request>>,
+    ) -> Result<RequestFuture, DriverStatus> {
+        {
+            let mut guard = req.write();
+            guard.status = DriverStatus::Pending;
+            guard.completed = false;
+        }
         DISPATCH_REQ_Q
             .lock()
-            .push_back((target.target_device.clone(), req));
-        DriverStatus::Success
+            .push_back((target.target_device.clone(), req.clone()));
+        Ok(RequestFuture { req })
     }
 
     pub fn send_request_to_next_lower(
         &self,
         from: &Arc<DeviceObject>,
         req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+    ) -> Result<RequestFuture, DriverStatus> {
         if let Some(target_dev) = from.lower_device.get() {
-            let target = IoTarget {
-                target_device: target_dev.clone(),
-            };
-            self.send_request(&target, req)
+            self.send_request(
+                &IoTarget {
+                    target_device: target_dev.clone(),
+                },
+                req,
+            )
         } else {
-            DriverStatus::NoSuchDevice
+            Err(DriverStatus::NoSuchDevice)
         }
     }
 
@@ -126,37 +132,51 @@ impl PnpManager {
         &self,
         from: &Arc<DeviceObject>,
         req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+    ) -> Result<RequestFuture, DriverStatus> {
         if let Some(target_dev) = from.upper_device.get() {
-            let target = IoTarget {
-                target_device: target_dev.upgrade().unwrap(),
-            };
-            self.send_request(&target, req)
+            self.send_request(
+                &IoTarget {
+                    target_device: target_dev.upgrade().unwrap(),
+                },
+                req,
+            )
         } else {
-            DriverStatus::NoSuchDevice
+            Err(DriverStatus::NoSuchDevice)
         }
     }
 
     pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
         let (func_addr, ctx) = {
             let mut g = req_arc.write();
-            let f = g.completion_routine.take().map(|fp| fp as usize);
-            let ctx = g.completion_context;
             g.completed = true;
-            (f, ctx)
+            (
+                g.completion_routine.take().map(|fp| fp as usize),
+                g.completion_context,
+            )
         };
 
         if let Some(addr) = func_addr {
             let f: CompletionRoutine = unsafe { core::mem::transmute(addr) };
+            // Note: Completion routine is called *before* waking the async waiter.
             let ref_req = &mut req_arc.write();
             ref_req.status = f(ref_req, ctx);
         }
-        let mut req = req_arc.write();
-        if req.status == DriverStatus::Continue || req.status == DriverStatus::Pending {
-            req.status = DriverStatus::Success;
+
+        let waker = {
+            let mut req = req_arc.write();
+            if req.status == DriverStatus::Continue || req.status == DriverStatus::Pending {
+                req.status = DriverStatus::Success;
+            }
+            req.waker.take()
+        };
+
+        if let Some(w) = waker {
+            w.wake();
         }
     }
 
+    /// The entry point for async request dispatch.
+    /// Finds the handler, spawns a task on the executor, and handles the result asynchronously.
     fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let (kind, policy) = {
             let r = req_arc.read();
@@ -167,103 +187,112 @@ impl PnpManager {
             return;
         }
 
+        // PnP dispatch is currently still synchronous in logic, but could be wrapped.
         if matches!(kind, RequestType::Pnp) {
             Self::pnp_minor_dispatch(dev, req_arc.clone());
             return;
         }
 
-        let status = if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
+        if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
+            // Check queue depth limits
             match h.synchronization {
-                Synchronization::FireAndForget => h.handler.invoke(dev, req_arc.clone()),
                 Synchronization::Sync | Synchronization::Async => {
                     let depth = if matches!(h.synchronization, Synchronization::Sync) {
                         1u64
                     } else {
                         h.depth as u64
                     };
-
-                    let admit = h.running_request.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                        |cur| {
-                            if depth == 0 || cur < depth {
-                                Some(cur + 1)
-                            } else {
-                                None
-                            }
-                        },
-                    );
-
-                    // Note: Concurrency limits are handled here.
-                    // If admission fails, the request needs to be re-queued or rejected.
-                    // For now keeping existing logic "true" which bypasses limit check
-                    // (assumed temporary based on original code).
-                    if true {
-                        // admit.is_ok()
-                        let st = h.handler.invoke(dev, req_arc.clone());
+                    let cur = h.running_request.fetch_add(1, Ordering::AcqRel);
+                    if depth > 0 && cur >= depth {
                         h.running_request.fetch_sub(1, Ordering::Release);
-                        st
-                    } else {
-                        DriverStatus::DeviceNotReady
+                        {
+                            req_arc.write().status = DriverStatus::DeviceNotReady;
+                        }
+                        self.complete_request(&req_arc);
+                        return;
                     }
                 }
+                _ => {}
             }
-        } else {
-            DriverStatus::NotImplemented
-        };
 
-        match status {
-            DriverStatus::Pending => {
-                {
-                    let mut w = req_arc.write();
-                    w.status = DriverStatus::Pending;
+            let future = h.handler.invoke(dev.clone(), req_arc.clone());
+            let req_for_task = req_arc.clone();
+            let dev_for_task = dev.clone();
+
+            executor::spawn(async move {
+                let status = future.await;
+
+                match h.synchronization {
+                    Synchronization::Sync | Synchronization::Async => {
+                        h.running_request.fetch_sub(1, Ordering::Release);
+                    }
+                    _ => {}
                 }
-                return;
-            }
 
-            DriverStatus::Continue | DriverStatus::NotImplemented => match policy {
-                TraversalPolicy::ForwardLower => {
-                    let fwd = self.send_request_to_next_lower(dev, req_arc.clone());
-                    if fwd == DriverStatus::NoSuchDevice {
+                match status {
+                    DriverStatus::Pending => {
+                        req_for_task.write().status = DriverStatus::Pending;
+                    }
+                    DriverStatus::Continue | DriverStatus::NotImplemented => {
+                        let next_res = match policy {
+                            TraversalPolicy::ForwardLower => PNP_MANAGER
+                                .send_request_to_next_lower(&dev_for_task, req_for_task.clone()),
+                            TraversalPolicy::ForwardUpper => PNP_MANAGER
+                                .send_request_to_next_upper(&dev_for_task, req_for_task.clone()),
+                            TraversalPolicy::FailIfUnhandled => Err(DriverStatus::NotImplemented),
+                        };
+
+                        if next_res.is_err() {
+                            {
+                                req_for_task.write().status = DriverStatus::NotImplemented;
+                            }
+                            PNP_MANAGER.complete_request(&req_for_task);
+                        }
+                    }
+                    other => {
                         {
-                            let mut w = req_arc.write();
-                            w.status = DriverStatus::NotImplemented;
+                            req_for_task.write().status = other;
+                        }
+                        PNP_MANAGER.complete_request(&req_for_task);
+                    }
+                }
+            });
+        } else {
+            match policy {
+                TraversalPolicy::ForwardLower => {
+                    if PNP_MANAGER
+                        .send_request_to_next_lower(dev, req_arc.clone())
+                        .is_err()
+                    {
+                        {
+                            req_arc.write().status = DriverStatus::NotImplemented;
                         }
                         self.complete_request(&req_arc);
                     }
                 }
                 TraversalPolicy::ForwardUpper => {
-                    let fwd = self.send_request_to_next_upper(dev, req_arc.clone());
-                    if fwd == DriverStatus::NoSuchDevice {
+                    if PNP_MANAGER
+                        .send_request_to_next_upper(dev, req_arc.clone())
+                        .is_err()
+                    {
                         {
-                            let mut w = req_arc.write();
-                            w.status = DriverStatus::NotImplemented;
+                            req_arc.write().status = DriverStatus::NotImplemented;
                         }
                         self.complete_request(&req_arc);
                     }
                 }
                 TraversalPolicy::FailIfUnhandled => {
                     {
-                        let mut w = req_arc.write();
-                        w.status = DriverStatus::NotImplemented;
+                        req_arc.write().status = DriverStatus::NotImplemented;
                     }
                     self.complete_request(&req_arc);
                 }
-            },
-
-            other => {
-                {
-                    let mut w = req_arc.write();
-                    w.status = other;
-                }
-                self.complete_request(&req_arc);
             }
         }
     }
 
     fn pnp_minor_dispatch(device: &Arc<DeviceObject>, request: Arc<RwLock<Request>>) {
         let me = &*PNP_MANAGER;
-
         let (minor_opt, policy) = {
             let r = request.read();
             (r.pnp.as_ref().map(|p| p.minor_function), r.traversal_policy)
@@ -271,8 +300,7 @@ impl PnpManager {
 
         let Some(minor) = minor_opt else {
             {
-                let mut g = request.write();
-                g.status = DriverStatus::InvalidParameter;
+                request.write().status = DriverStatus::InvalidParameter;
             }
             me.complete_request(&request);
             return;
@@ -280,48 +308,36 @@ impl PnpManager {
 
         if policy != TraversalPolicy::ForwardLower {
             {
-                let mut g = request.write();
-                g.status = DriverStatus::InvalidParameter;
+                request.write().status = DriverStatus::InvalidParameter;
             }
             me.complete_request(&request);
             return;
         }
 
-        let cb_opt = device
+        if let Some(cb) = device
             .dev_init
             .pnp_vtable
             .as_ref()
-            .and_then(|vt| vt.get(minor));
-
-        if let Some(cb) = cb_opt {
-            let status = cb(device, request.clone());
-
-            match status {
-                DriverStatus::Pending => {
-                    {
-                        let mut g = request.write();
-                        g.status = DriverStatus::Pending;
-                    }
-                    return;
-                }
-                DriverStatus::Continue | DriverStatus::NotImplemented => {}
-                other => {
-                    {
-                        let mut g = request.write();
-                        g.status = other;
-                    }
-                    me.complete_request(&request);
-                    return;
-                }
+            .and_then(|vt| vt.get(minor))
+        {
+            let status = cb(device.clone(), request.clone());
+            if status == DriverStatus::Pending {
+                request.write().status = DriverStatus::Pending;
+                return;
+            }
+            if status != DriverStatus::Continue && status != DriverStatus::NotImplemented {
+                request.write().status = status;
+                me.complete_request(&request);
+                return;
             }
         }
 
-        let st = me.send_request_to_next_lower(device, request.clone());
-
-        if st == DriverStatus::NoSuchDevice {
+        if me
+            .send_request_to_next_lower(device, request.clone())
+            .is_err()
+        {
             {
-                let mut g = request.write();
-                g.status = minor.default_status_for_unhandled();
+                request.write().status = minor.default_status_for_unhandled();
             }
             me.complete_request(&request);
         }

@@ -7,7 +7,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{mem::size_of, sync::atomic::AtomicU64};
+use core::{future, mem::size_of, sync::atomic::AtomicU64};
 use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
@@ -16,14 +16,13 @@ use kernel_api::{
     FsIdentify, GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
     PnpMinorFunction, QueryIdType, Request, RequestType, TraversalPolicy,
     alloc_api::{
-        DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
+        DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, RequestResultExt, Synchronization,
         ffi::{
             driver_set_evt_device_add, pnp_create_control_device_and_link,
             pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
-            pnp_wait_for_request,
         },
     },
-    bytes_to_box, println,
+    block_on, bytes_to_box, io_handler, println,
 };
 
 use crate::block_dev::BlockDev;
@@ -57,11 +56,8 @@ fn init_logger() {
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
-
-pub extern "win64" fn fs_root_ioctl(
-    _dev: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[io_handler]
+pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
@@ -95,8 +91,9 @@ pub extern "win64" fn fs_root_ioctl(
             );
             let q = Arc::new(RwLock::new(q));
 
-            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) };
-            unsafe { pnp_wait_for_request(&q) };
+            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) }
+                .resolve()
+                .await;
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
@@ -196,19 +193,20 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
     unsafe {
-        let _ = pnp_ioctl_via_symlink(
+        let future = pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
-        );
-        pnp_wait_for_request(&reg);
+        )
+        .resolve();
+        block_on(future);
     }
 
     DriverStatus::Success
 }
 
 pub extern "win64" fn fs_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     _dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     DriverStatus::Success
