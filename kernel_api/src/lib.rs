@@ -22,6 +22,7 @@ use core::ops::{ControlFlow, Deref, DerefMut, FromResidual, Try};
 use core::ptr;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+use core::task::Waker;
 use ffi::random_number;
 use spin::Once;
 use spin::{Mutex, RwLock};
@@ -487,6 +488,7 @@ pub struct Request {
 
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
+    pub waker: Option<Waker>,
 }
 
 impl Request {
@@ -506,6 +508,8 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+
+            waker: None,
         }
     }
     #[inline]
@@ -527,6 +531,8 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+
+            waker: None,
         }
     }
     #[inline]
@@ -541,6 +547,8 @@ impl Request {
             pnp: Some(pnp_request),
             completion_routine: None,
             completion_context: 0,
+
+            waker: None,
         }
     }
     pub fn set_completion(&mut self, routine: CompletionRoutine, context: usize) {
@@ -717,6 +725,22 @@ pub enum PnpMinorFunction {
     QueryDeviceRelations,
     QueryId,
     QueryResources,
+    SurpriseRemoval,
+    RemoveDevice,
+    StopDevice,
+}
+impl PnpMinorFunction {
+    pub fn default_status_for_unhandled(&self) -> DriverStatus {
+        match self {
+            Self::StartDevice
+            | Self::QueryDeviceRelations
+            | Self::SurpriseRemoval
+            | Self::RemoveDevice
+            | Self::StopDevice => DriverStatus::Success,
+
+            Self::QueryId | Self::QueryResources => DriverStatus::NotImplemented,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]

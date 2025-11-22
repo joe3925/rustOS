@@ -1,6 +1,7 @@
 use crate::{
     alloc::vec,
     drivers::pnp::{device::DevNode, driver_index::DriverRuntime, request::CompletionRoutine},
+    structs::async_future::AsyncWaitable,
     util::random_number,
 };
 use alloc::{
@@ -10,7 +11,6 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::marker::ConstParamTy;
 use core::ptr;
 use core::{
     any::{type_name, Any, TypeId},
@@ -22,6 +22,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
 };
 use core::{cell::OnceCell, ops::FromResidual};
+use core::{marker::ConstParamTy, task::Waker};
 use spin::{Mutex, Once, RwLock};
 use strum::Display;
 #[repr(i32)]
@@ -224,6 +225,15 @@ pub struct PnpRequest {
     pub ids_out: Vec<String>,
     pub blob_out: Vec<u8>,
 }
+impl AsyncWaitable for Request {
+    fn is_ready(&self) -> bool {
+        self.status != DriverStatus::Pending && self.status != DriverStatus::Continue
+    }
+
+    fn set_waker(&mut self, waker: Option<Waker>) {
+        self.waker = waker;
+    }
+}
 pub type PnpMinorCallback =
     extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
@@ -410,6 +420,8 @@ pub struct Request {
 
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
+
+    pub waker: Option<Waker>,
 }
 
 impl Request {
@@ -429,6 +441,7 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+            waker: None,
         }
     }
     #[inline]
@@ -439,7 +452,7 @@ impl Request {
     #[inline]
     pub fn new_pnp(pnp: PnpRequest, data: Box<[u8]>) -> Self {
         Self {
-            id: unsafe { crate::util::random_number() },
+            id: crate::util::random_number(),
             kind: RequestType::Pnp,
             data,
             completed: false,
@@ -448,6 +461,7 @@ impl Request {
             pnp: Some(pnp),
             completion_routine: None,
             completion_context: 0,
+            waker: None,
         }
     }
     #[inline]
@@ -464,6 +478,7 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+            waker: None,
         }
     }
     pub fn set_completion(&mut self, routine: CompletionRoutine, context: usize) {

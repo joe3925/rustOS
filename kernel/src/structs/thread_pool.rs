@@ -84,6 +84,19 @@ impl ThreadPool {
             false
         }
     }
+    pub fn try_execute_one(&self) -> bool {
+        let job = {
+            let mut g = self.inner.lock();
+            g.q.pop_front()
+        };
+
+        if let Some(j) = job {
+            (j.f)(j.a);
+            return true;
+        }
+
+        false
+    }
 }
 
 extern "C" fn worker(pool_ptr: usize) {
@@ -93,36 +106,34 @@ extern "C" fn worker(pool_ptr: usize) {
         .expect("worker task missing");
 
     loop {
-        let job = {
-            let mut g = pool.inner.lock();
-
-            if let Some(j) = g.q.pop_front() {
-                if let Some(idx) = g.sleepers.iter().position(|t| Arc::ptr_eq(t, &me)) {
-                    g.sleepers.swap_remove(idx);
-                }
-                Some(j)
-            } else {
-                if !g.sleepers.iter().any(|t| Arc::ptr_eq(t, &me)) {
-                    g.sleepers.push(me.clone());
-                }
-                None
-            }
-        };
-
-        if let Some(j) = job {
-            (j.f)(j.a);
-            continue;
-        }
-
-        without_interrupts(|| {
-            me.write().sleep();
-        });
+        let mut guard = pool.inner.lock();
 
         loop {
-            if !me.read().is_sleeping {
+            if let Some(j) = guard.q.pop_front() {
+                if let Some(idx) = guard.sleepers.iter().position(|t| Arc::ptr_eq(t, &me)) {
+                    guard.sleepers.swap_remove(idx);
+                }
+
+                drop(guard);
+                (j.f)(j.a);
                 break;
             }
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+
+            if !guard.sleepers.iter().any(|t| Arc::ptr_eq(t, &me)) {
+                guard.sleepers.push(me.clone());
+            }
+
+            drop(guard);
+
+            without_interrupts(|| {
+                me.write().sleep();
+            });
+
+            while me.read().is_sleeping {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+            }
+
+            guard = pool.inner.lock();
         }
     }
 }

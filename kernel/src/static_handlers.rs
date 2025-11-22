@@ -21,7 +21,7 @@ use crate::{
                 ClassAddCallback, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
                 DriverStatus, EvtDriverDeviceAdd, EvtDriverUnload, Request,
             },
-            manager::PNP_MANAGER,
+            manager::{PnpManager, PNP_MANAGER},
             request::{DpcFn, IoTarget},
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
@@ -330,13 +330,11 @@ pub extern "win64" fn pnp_add_class_listener(
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
     loop {
-        if let Some(r) = req.try_read() {
-            if r.completed {
-                return;
-            }
+        PnpManager::execute_one();
+        if (req.read().completed == true) {
+            return;
         }
-        let _ = PNP_MANAGER.pump_queue_once();
-        core::hint::spin_loop();
+        //crate::scheduling::scheduler::kernel_task_yield();
     }
 }
 #[no_mangle]

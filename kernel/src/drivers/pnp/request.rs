@@ -31,8 +31,6 @@ const START_THREADS: usize = 12;
 
 lazy_static::lazy_static! {
     static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
-    // Changed: Queue now stores pairs of Device + Request, not just Devices.
-    // This enables per-request granularity (work stealing) instead of device claiming.
     static ref DISPATCH_REQ_Q: Mutex<VecDeque<(Arc<DeviceObject>, Arc<RwLock<Request>>)>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
@@ -73,8 +71,6 @@ impl PnpManager {
         let pair = Box::new((dpc.func, dpc.arg));
         let ptr = Box::into_raw(pair) as usize;
 
-        // Note: DPC logic kept as is (using submit_if_runnable),
-        // assuming priority execution is still desired for DPCs.
         if !THREADS.submit_if_runnable(job_run_dpc, ptr) {
             let _ = unsafe { Box::from_raw(ptr as *mut (extern "win64" fn(usize), usize)) };
             GLOBAL_DPCQ.lock().push_front(dpc);
@@ -82,27 +78,11 @@ impl PnpManager {
         }
         true
     }
-
-    pub fn pump_queue_once(&self) -> bool {
-        // Pop a specific (Device, Request) tuple.
-        let item = {
-            let mut q = DISPATCH_REQ_Q.lock();
-            q.pop_front()
-        };
-
-        if let Some((dev, req)) = item {
-            // Process the request immediately on this thread.
-            // This prevents the deadlock where a thread waiting for I/O
-            // cannot process the very request it is waiting for because
-            // another thread has "claimed" the device.
-            self.call_device_handler(&dev, req);
-            return true;
-        }
-        false
+    pub fn execute_one() -> bool {
+        THREADS.try_execute_one()
     }
 
     fn run_one_device_request(&self) -> bool {
-        // Pop a specific (Device, Request) tuple.
         let item = {
             let mut q = DISPATCH_REQ_Q.lock();
             q.pop_front()
@@ -115,16 +95,12 @@ impl PnpManager {
         let arg = Box::new(DispatchJobArg { dev, req });
         let ptr = Box::into_raw(arg) as usize;
 
-        // Changed: Unconditionally submit to the thread pool as requested.
-        // This avoids the complexity of "runnable" checks for standard I/O.
         THREADS.submit(job_dispatch_request, ptr);
 
         true
     }
 
     pub fn send_request(&self, target: &IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
-        // Push the (Device, Request) pair directly to the global queue.
-        // We do NOT use target.target_device.queue here to enforce per-thread pickup.
         DISPATCH_REQ_Q
             .lock()
             .push_back((target.target_device.clone(), req));
