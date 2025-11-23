@@ -1,23 +1,34 @@
-use super::driver_index::{self as idx, DriverPackage, DriverRuntime, DriverState, HwIndex};
+use super::driver_index::{self as idx, HwIndex};
 use super::request::IoTarget;
-use crate::drivers::driver_install::{BootType, DriverError};
-use crate::drivers::pnp::device::{DevNode, DevNodeState, DeviceIds, DeviceStack, StackLayer};
-use crate::drivers::pnp::driver_object::{
-    ClassAddCallback, ClassListener, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
-    DriverStatus, IoVtable, PnpMinorFunction, PnpRequest, QueryIdType, Request, RequestFuture,
-    RequestType,
-};
+use crate::drivers::driver_install::DriverError;
+use crate::drivers::pnp::device::DevNodeExt;
+use crate::drivers::pnp::request::RequestExt;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
-use crate::registry::{Data, RegError};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use kernel_types::device::{
+    DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
+    DriverRuntime, DriverState, StackLayer,
+};
+use kernel_types::io::IoVtable;
+use kernel_types::pnp::{
+    BootType, DeviceIds, DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType,
+};
+use kernel_types::request::{Request, RequestFuture};
+use kernel_types::status::{Data, DriverStatus, RegError};
+use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
-
+#[repr(C)]
+pub struct ClassListener {
+    pub class: String,
+    pub dev: Arc<DeviceObject>,
+    pub cb: ClassAddCallback,
+}
 pub struct PnpManager {
     hw: RwLock<Arc<HwIndex>>,
     drivers: RwLock<BTreeMap<String, Arc<DriverObject>>>,

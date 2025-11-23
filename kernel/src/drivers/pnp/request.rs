@@ -1,15 +1,17 @@
-use crate::drivers::pnp::driver_object::{
-    DeviceObject, DriverStatus, Request, RequestFuture, RequestType, Synchronization,
-    TraversalPolicy,
-};
 use crate::drivers::pnp::manager::{PnpManager, PNP_MANAGER};
-use crate::scheduling::executor;
 use crate::static_handlers::create_kernel_task;
 use crate::structs::thread_pool::ThreadPool;
+use crate::util::random_number;
 use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_types::device::DeviceObject;
+use kernel_types::io::Synchronization;
+use kernel_types::pnp::PnpRequest;
+use kernel_types::request::{Request, RequestFuture, RequestType, TraversalPolicy};
+use kernel_types::status::DriverStatus;
 use spin::Mutex;
 use spin::RwLock;
+
 #[derive(Clone, Copy)]
 pub struct Dpc {
     pub func: DpcFn,
@@ -29,7 +31,7 @@ static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
 const START_THREADS: usize = 12;
 
 lazy_static::lazy_static! {
-    pub static ref THREADS: Arc<ThreadPool> = ThreadPool::new();
+    pub static ref THREADS: Arc<ThreadPool> = ThreadPool::new(START_THREADS);
     static ref DISPATCH_REQ_Q: Mutex<VecDeque<(Arc<DeviceObject>, Arc<RwLock<Request>>)>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
@@ -41,7 +43,6 @@ impl PnpManager {
 
     pub fn init_io_dispatcher(&self) {
         if !DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
-            THREADS.start(START_THREADS);
             create_kernel_task(
                 io_dispatcher_trampoline as usize,
                 alloc::format!("io-dispatch{:x}", crate::util::random_number()),
@@ -102,7 +103,9 @@ impl PnpManager {
     ) -> Result<RequestFuture, DriverStatus> {
         {
             let mut guard = req.write();
-            guard.status = DriverStatus::Pending;
+            // Initialize as Continue (Waiting in queue/Traversing).
+            // Pending is reserved for when a driver takes ownership (untracked).
+            guard.status = DriverStatus::Continue;
             guard.completed = false;
         }
         DISPATCH_REQ_Q
@@ -146,32 +149,39 @@ impl PnpManager {
     }
 
     pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
-        let (func_addr, ctx) = {
+        let (comp_routine_addr, comp_ctx, waker_func, waker_ctx) = {
             let mut g = req_arc.write();
             g.completed = true;
-            (
-                g.completion_routine.take().map(|fp| fp as usize),
-                g.completion_context,
-            )
+
+            let cr = g.completion_routine.take().map(|fp| fp as usize);
+            let cc = g.completion_context;
+
+            let wf = g.waker_func.take();
+            let wc = g.waker_context;
+
+            g.waker_context = None;
+
+            (cr, cc, wf, wc)
         };
 
-        if let Some(addr) = func_addr {
+        if let Some(addr) = comp_routine_addr {
             let f: CompletionRoutine = unsafe { core::mem::transmute(addr) };
-            // Note: Completion routine is called *before* waking the async waiter.
+
             let ref_req = &mut req_arc.write();
-            ref_req.status = f(ref_req, ctx);
+            ref_req.status = f(ref_req, comp_ctx);
         }
 
-        let waker = {
+        {
             let mut req = req_arc.write();
-            if req.status == DriverStatus::Continue || req.status == DriverStatus::Pending {
+            // Only default to Success if the status is Continue (meaning it was just waiting/traversing).
+            // If it is Pending, the driver explicitly set it to Untracked, so the driver *must* have set a result status.
+            if req.status == DriverStatus::Continue {
                 req.status = DriverStatus::Success;
             }
-            req.waker.take()
-        };
+        }
 
-        if let Some(w) = waker {
-            w.wake();
+        if let Some(func) = waker_func {
+            func(waker_ctx.unwrap());
         }
     }
 
@@ -219,7 +229,7 @@ impl PnpManager {
             let req_for_task = req_arc.clone();
             let dev_for_task = dev.clone();
 
-            executor::spawn(async move {
+            nostd_runtime::spawn(async move {
                 let status = future.await;
 
                 match h.synchronization {
@@ -231,6 +241,7 @@ impl PnpManager {
 
                 match status {
                     DriverStatus::Pending => {
+                        // Driver took ownership (Untracked). Mark as Pending.
                         req_for_task.write().status = DriverStatus::Pending;
                     }
                     DriverStatus::Continue | DriverStatus::NotImplemented => {
@@ -362,4 +373,62 @@ extern "win64" fn job_run_dpc(arg: usize) {
 extern "win64" fn job_dispatch_request(arg: usize) {
     let b: Box<DispatchJobArg> = unsafe { Box::from_raw(arg as *mut DispatchJobArg) };
     PNP_MANAGER.call_device_handler(&b.dev, b.req);
+}
+
+pub trait RequestExt {
+    fn new(kind: RequestType, data: Box<[u8]>) -> Self;
+    fn new_pnp(pnp: PnpRequest, data: Box<[u8]>) -> Self;
+}
+
+impl RequestExt for Request {
+    fn new(kind: RequestType, data: Box<[u8]>) -> Self {
+        if matches!(kind, RequestType::Pnp) {
+            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
+        }
+
+        Self {
+            id: random_number(),
+            kind,
+            data,
+            completed: false,
+            status: DriverStatus::Continue,
+            traversal_policy: TraversalPolicy::FailIfUnhandled,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+            waker_context: None,
+            waker_func: None,
+        }
+    }
+
+    #[inline]
+    fn new_pnp(pnp_request: PnpRequest, data: Box<[u8]>) -> Self {
+        Self {
+            id: random_number(),
+            kind: RequestType::Pnp,
+            data,
+            completed: false,
+            status: DriverStatus::Continue,
+            traversal_policy: TraversalPolicy::ForwardLower,
+            pnp: Some(pnp_request),
+            completion_routine: None,
+            completion_context: 0,
+            waker_context: None,
+            waker_func: None,
+        }
+    }
+}
+
+pub trait RequestResultExt {
+    async fn resolve(self) -> DriverStatus;
+}
+
+impl RequestResultExt for Result<RequestFuture, DriverStatus> {
+    #[inline(always)]
+    async fn resolve(self) -> DriverStatus {
+        match self {
+            Ok(future) => future.await,
+            Err(status) => status,
+        }
+    }
 }

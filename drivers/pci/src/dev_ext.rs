@@ -6,14 +6,18 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_api::alloc_api::PnpRequest;
-use kernel_api::alloc_api::ffi::pnp_forward_request_to_next_lower;
-use kernel_api::{
-    DeviceObject, DriverStatus, PnpMinorFunction, Request, RequestType, ResourceKind,
+use kernel_api::RequestExt;
+use kernel_api::device::DeviceObject;
+use kernel_api::memory::{map_mmio_region, unmap_range};
+use kernel_api::request::Request;
+use kernel_api::status::{DriverStatus, PageMapError};
+
+use kernel_api::pnp::{
+    DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, ResourceKind,
+    pnp_forward_request_to_next_lower,
 };
+
 use kernel_api::{
-    PageMapError,
-    ffi::{map_mmio_region, unmap_range},
     println,
     x86_64::{PhysAddr, VirtAddr},
 };
@@ -379,7 +383,7 @@ struct WaitCtx {
     blob: UnsafeCell<Vec<u8>>,
 }
 
-extern "win64" fn on_complete(req: &mut kernel_api::Request, ctx: usize) -> DriverStatus {
+extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(p) = req.pnp.as_ref() {
@@ -436,10 +440,10 @@ pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
 }
 
 pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
-    let pnp = kernel_api::alloc_api::PnpRequest {
-        minor_function: kernel_api::PnpMinorFunction::QueryResources,
-        relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-        id_type: kernel_api::QueryIdType::CompatibleIds,
+    let pnp = PnpRequest {
+        minor_function: PnpMinorFunction::QueryResources,
+        relation: DeviceRelationType::TargetDeviceRelation,
+        id_type: QueryIdType::CompatibleIds,
         ids_out: alloc::vec::Vec::new(),
         blob_out: alloc::vec::Vec::new(),
     };
@@ -450,7 +454,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
     let down = unsafe { pnp_forward_request_to_next_lower(device, req_arc.clone()) };
 
     let st = { req_arc.read().status };
-    if st != kernel_api::DriverStatus::Success {
+    if st != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");
         return alloc::vec::Vec::new();
     }

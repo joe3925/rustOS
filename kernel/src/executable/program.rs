@@ -6,6 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use kernel_types::device::ModuleHandle;
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
@@ -38,7 +39,6 @@ use super::pe_loadable::{self, LoadError};
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
 pub type QueueHandle = Arc<RwLock<MessageQueue>>;
-pub type ModuleHandle = Arc<RwLock<Module>>;
 pub type UserHandle = u64;
 
 #[inline]
@@ -77,15 +77,6 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 }
 
 // ───────────────────────── runtime types ─────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct Module {
-    pub title: String,
-    pub image_path: String,
-    pub parent_pid: u64,
-    pub image_base: VirtAddr,
-    pub symbols: Vec<(String, usize)>,
-}
 
 #[derive(Debug)]
 pub struct MessageQueue {

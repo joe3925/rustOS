@@ -1,7 +1,7 @@
 use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
-use crate::file_system::file::{file_parser, File, OpenFlags};
+use crate::file_system::file::{file_parser, File};
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
@@ -16,6 +16,9 @@ use alloc::vec::Vec;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
 use goblin::Object;
+use kernel_types::device::ModuleHandle;
+use kernel_types::fs::OpenFlags;
+use kernel_types::memory::Module;
 use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
@@ -24,7 +27,7 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
-use super::program::{HandleTable, Module, ModuleHandle, Program, PROGRAM_MANAGER};
+use super::program::{HandleTable, Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,

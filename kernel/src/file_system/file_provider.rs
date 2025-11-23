@@ -5,13 +5,10 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
-use crate::drivers::pnp::driver_object::{DriverStatus, Request};
-use crate::file_system::file::{FileStatus, OpenFlags};
-use crate::file_system::file_structs::{
-    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
-    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult,
+use kernel_types::{
+    fs::*,
+    request::Request,
+    status::{DriverStatus, FileStatus},
 };
 
 pub trait FileProvider: Send + Sync {

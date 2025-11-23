@@ -6,6 +6,9 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use kernel_api::device::DeviceObject;
+use kernel_api::request::{Request, RequestType};
+use kernel_api::status::{DriverStatus, FileStatus};
 
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -18,11 +21,13 @@ use fatfs::{
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    DevExtRefMut, DeviceObject, DriverStatus, FileAttribute, FileStatus, FsCloseParams,
-    FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams,
-    FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult,
-    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult, Request, RequestType, io_handler, println,
+    fs::{
+        FileAttribute, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
+        FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp,
+        FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
+        FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
+    },
+    io_handler, println,
 };
 
 use crate::block_dev::BlockDev;

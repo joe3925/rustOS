@@ -2,7 +2,7 @@ use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
-use crate::file_system::file::{File, OpenFlags};
+use crate::file_system::file::File;
 use crate::file_system::path::Path;
 use crate::format;
 use crate::memory::paging::constants::{KERNEL_SPACE_BASE, KERNEL_STACK_SIZE};
@@ -13,6 +13,7 @@ use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use kernel_types::fs::OpenFlags;
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};

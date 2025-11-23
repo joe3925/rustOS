@@ -7,22 +7,15 @@ use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_types::request::{Request, RequestType, TraversalPolicy};
+use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
 
-use crate::drivers::pnp::driver_object::{
-    DriverStatus, FsOp, Request, RequestType, TraversalPolicy,
-};
-use crate::file_system::file::{FileStatus, OpenFlags};
+use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
-use crate::file_system::file_structs::FsReadParams;
-use crate::file_system::file_structs::{
-    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
-    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult, FsWriteParams,
-    FsWriteResult,
-};
 use crate::println;
 use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
+use kernel_types::fs::*;
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {

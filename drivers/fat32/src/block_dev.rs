@@ -6,9 +6,12 @@ use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    DriverStatus, FileStatus, IoTarget, Request, RequestType, TraversalPolicy,
-    alloc_api::{RequestResultExt, ffi::pnp_send_request},
-    block_on, println,
+    RequestExt,
+    kernel_types::io::IoTarget,
+    pnp::pnp_send_request,
+    println,
+    request::{Request, RequestType, TraversalPolicy},
+    status::DriverStatus,
 };
 
 #[derive(Clone)]
@@ -288,9 +291,7 @@ pub async fn read_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(target.as_ref(), req.clone()) }
-        .resolve()
-        .await;
+    unsafe { pnp_send_request(target.as_ref(), req.clone()) }?.await;
     let r = req.read();
     if r.status != DriverStatus::Success {
         println!(
@@ -336,9 +337,7 @@ pub async fn write_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(&**target, req.clone()) }
-        .resolve()
-        .await;
+    unsafe { pnp_send_request(&**target, req.clone()) }?.await;
 
     let status = req.read().status;
     if status == DriverStatus::Success {

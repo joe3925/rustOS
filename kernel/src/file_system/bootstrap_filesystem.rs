@@ -13,15 +13,14 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::file_system::file_structs::{
-    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
-    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult,
-};
-use crate::file_system::{file::FileStatus, file_provider::FileProvider};
+use crate::file_system::file;
+use crate::file_system::file_provider::FileProvider;
 use crate::util::BootPkg;
-use crate::{drivers::pnp::driver_object::DriverStatus, file_system::file::OpenFlags};
+use kernel_types::{
+    fs::*,
+    request::Request,
+    status::{DriverStatus, FileStatus},
+};
 
 const C_PREFIX: &str = "C:\\";
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
@@ -626,7 +625,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         &self,
         path: &str,
         flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         todo!()
     }
 
@@ -635,7 +634,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         todo!()
     }
 
@@ -644,7 +643,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<crate::drivers::pnp::driver_object::Request>>, FileStatus> {
+    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
         todo!()
     }
 }

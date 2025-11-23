@@ -13,32 +13,39 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::DevExtRef;
-use kernel_api::DevExtRefMut;
-use kernel_api::PartitionInfo;
-use kernel_api::TraversalPolicy;
-use kernel_api::alloc_api::RequestResultExt;
-use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
+use kernel_api::RequestExt;
 use kernel_api::block_on;
-use kernel_api::bytes_to_box;
+use kernel_api::device::DevExtRef;
+use kernel_api::device::DeviceInit;
+use kernel_api::device::DeviceObject;
+use kernel_api::device::DriverObject;
 use kernel_api::io_handler;
-use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
-    alloc_api::{
-        DeviceIds, DeviceInit, PnpRequest,
-        ffi::{
-            driver_set_evt_device_add, pnp_complete_request,
-            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-        },
-    },
-    println,
-};
-use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
+use kernel_api::kernel_types::io::IoTarget;
+use kernel_api::kernel_types::io::IoType;
+use kernel_api::kernel_types::io::IoVtable;
+use kernel_api::kernel_types::io::PartitionInfo;
+use kernel_api::kernel_types::io::Synchronization;
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::pnp::DeviceRelationType;
+use kernel_api::pnp::PnpMinorFunction;
+use kernel_api::pnp::PnpRequest;
+use kernel_api::pnp::PnpVtable;
+use kernel_api::pnp::QueryIdType;
+use kernel_api::pnp::driver_set_evt_device_add;
+use kernel_api::pnp::pnp_complete_request;
+use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
+use kernel_api::pnp::pnp_forward_request_to_next_lower;
+use kernel_api::pnp::pnp_get_device_target;
+use kernel_api::pnp::pnp_send_request;
+use kernel_api::println;
+use kernel_api::request::Request;
+use kernel_api::request::RequestType;
+use kernel_api::request::TraversalPolicy;
+use kernel_api::status::DriverStatus;
+use kernel_api::util::bytes_to_box;
 use spin::Once;
 use spin::RwLock;
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+
 mod msvc_shims;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -46,9 +53,10 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 #[repr(C)]
 #[derive(Default)]
@@ -117,9 +125,9 @@ extern "win64" fn vol_prepare_hardware(
 ) -> DriverStatus {
     let mut req = Request::new_pnp(
         PnpRequest {
-            minor_function: kernel_api::PnpMinorFunction::QueryResources,
-            relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-            id_type: kernel_api::QueryIdType::DeviceId,
+            minor_function: PnpMinorFunction::QueryResources,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::DeviceId,
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
@@ -127,8 +135,7 @@ extern "win64" fn vol_prepare_hardware(
     );
 
     let req_lock = Arc::new(RwLock::new(req));
-    let st =
-        block_on(unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone()).resolve() });
+    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone())? });
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
@@ -297,7 +304,7 @@ pub async fn vol_pdo_read(
     })) as usize;
     child.set_completion(bridge_complete, ctx);
     let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()).resolve().await };
+    unsafe { pnp_send_request(&*tgt, req.clone())?.await };
     return DriverStatus::Success;
 }
 
@@ -336,7 +343,7 @@ pub async fn vol_pdo_write(
     child.set_completion(bridge_complete, ctx);
 
     let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()).resolve().await };
+    unsafe { pnp_send_request(&*tgt, req.clone())?.await };
     return DriverStatus::Success;
 }
 extern "win64" fn vol_pdo_query_resources(

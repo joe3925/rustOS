@@ -14,25 +14,20 @@ use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use core::sync::atomic::Ordering;
 use core::{intrinsics::size_of, mem, ptr};
 use dev_ext::DevExt;
-use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
-    acpi::fadt::{self, Fadt},
-    alloc_api::{
-        DeviceIds, DeviceInit, IoVtable, PnpVtable,
-        ffi::{
-            driver_set_evt_device_add, get_acpi_tables, pnp_create_child_devnode_and_pdo_with_init,
-            pnp_send_request,
-        },
-    },
-    ffi::{self},
-    println,
-    x86_64::PhysAddr,
+use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::kernel_types::io::IoVtable;
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::memory::map_mmio_region;
+use kernel_api::pnp::{
+    PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
+    pnp_create_child_devnode_and_pdo_with_init,
 };
+use kernel_api::println;
+use kernel_api::request::Request;
+use kernel_api::status::DriverStatus;
+use kernel_api::x86_64::PhysAddr;
 use spin::{Mutex, RwLock};
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
@@ -40,7 +35,7 @@ use core::panic::PanicInfo;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
+    use kernel_api::util::panic_common;
 
     unsafe { panic_common(MOD_NAME, info) }
 }
@@ -99,14 +94,13 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let need = len + offset;
     let size_rounded = (need + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    let va =
-        match unsafe { ffi::map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) } {
-            Ok(va) => va,
-            Err(e) => {
-                kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
-                core::intrinsics::abort();
-            }
-        };
+    let va = match unsafe { map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) } {
+        Ok(va) => va,
+        Err(e) => {
+            kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
+            core::intrinsics::abort();
+        }
+    };
 
     let ptr = (va.as_u64() as usize + offset) as *const u8;
     unsafe { core::slice::from_raw_parts(ptr, len) }
@@ -158,7 +152,7 @@ pub extern "win64" fn enumerate_bus(
 
     DriverStatus::Success
 }
-fn create_synthetic_i8042_pdo(parent: &Arc<kernel_api::DevNode>) {
+fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let ids = DeviceIds {
         hardware: alloc::vec!["ACPI\\I8042".to_string()],
         compatible: alloc::vec![],

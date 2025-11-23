@@ -23,20 +23,26 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    Data, DevExtRef, DeviceObject, DriverObject, DriverStatus, FsIdentify, GLOBAL_CTRL_LINK,
-    GLOBAL_VOLUMES_BASE, IoTarget, KernelAllocator, Request, RequestType, TraversalPolicy,
-    acpi::platform::Processor,
-    alloc_api::{
-        DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, RequestResultExt, Synchronization,
-        ffi::{
-            driver_set_evt_device_add, pnp_create_control_device_and_link,
-            pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
-            pnp_create_symlink, pnp_forward_request_to_next_lower, pnp_ioctl_via_symlink,
-            pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink, reg, spawn_boxed,
-        },
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt,
+    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
+    fs::{FsOp, FsOpenParams, FsOpenResult},
+    io_handler,
+    kernel_types::{
+        fs::OpenFlags,
+        io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
+        pnp::DeviceIds,
     },
-    ffi::switch_to_vfs,
-    io_handler, println, spawn,
+    pnp::{
+        PnpMinorFunction, PnpVtable, driver_set_evt_device_add, pnp_create_control_device_and_link,
+        pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
+        pnp_create_symlink, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
+        pnp_send_request_via_symlink,
+    },
+    println,
+    reg::{self, switch_to_vfs},
+    request::{Request, RequestType, TraversalPolicy},
+    spawn,
+    status::{Data, DriverStatus, RegError},
 };
 
 #[inline]
@@ -74,16 +80,15 @@ fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 
 static NEXT_VOL_ID: AtomicU32 = AtomicU32::new(1);
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
-
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -115,7 +120,7 @@ pub extern "win64" fn volclass_device_add(
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
-    pnp_vtable.set(kernel_api::PnpMinorFunction::StartDevice, volclass_start);
+    pnp_vtable.set(PnpMinorFunction::StartDevice, volclass_start);
 
     dev_init
         .io_vtable
@@ -138,7 +143,7 @@ pub extern "win64" fn volclass_device_add(
 
 extern "win64" fn volclass_start(
     dev: Arc<DeviceObject>,
-    _request: Arc<RwLock<kernel_api::Request>>,
+    _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let _ = refresh_fs_registry_from_registry();
     init_volume_dx(&dev);
@@ -352,9 +357,13 @@ async fn try_bind_filesystems_for_parent_fdo(
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
         unsafe {
-            let _ = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
-                .resolve()
-                .await;
+            let err =
+                pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
+                    .resolve()
+                    .await;
+            if err != DriverStatus::Success {
+                return false;
+            }
         }
 
         let mut w = req.write();
@@ -534,8 +543,7 @@ struct BootReqCtx {
 
 extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> DriverStatus {
     let reqctx: Box<BootReqCtx> = unsafe { Box::from_raw(ctx as *mut BootReqCtx) };
-    let res: kernel_api::FsOpenResult =
-        unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
+    let res: FsOpenResult = unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
 
     let probe = unsafe { &*reqctx.probe };
     match reqctx.which {
@@ -589,15 +597,12 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> Dr
 }
 
 fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut BootProbe) {
-    let params = kernel_api::FsOpenParams {
-        flags: kernel_api::OpenFlags::Open,
+    let params = FsOpenParams {
+        flags: OpenFlags::Open,
         path: path.to_string(),
     };
-    let mut req = Request::new(
-        RequestType::Fs(kernel_api::FsOp::Open),
-        box_to_bytes(Box::new(params)),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    let mut req = Request::new(RequestType::Fs(FsOp::Open), box_to_bytes(Box::new(params)))
+        .set_traversal_policy(TraversalPolicy::ForwardLower);
     let ctx = Box::into_raw(Box::new(BootReqCtx {
         probe: probe_ptr,
         which,
@@ -667,11 +672,11 @@ fn rescan_all_volumes() {
     }
 }
 
-fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::RegError> {
+fn set_label_for_link(public_link: &str, label: u8) -> Result<(), RegError> {
     let _ = reg::create_key(MP_ROOT);
     if let Ok(vals) = reg::list_values(MP_ROOT) {
         for name in vals {
-            if let Some(kernel_api::Data::Str(s)) = reg::get_value(MP_ROOT, &name) {
+            if let Some(Data::Str(s)) = reg::get_value(MP_ROOT, &name) {
                 if s == public_link {
                     let _ = reg::delete_value(MP_ROOT, &name);
                 }
@@ -682,7 +687,7 @@ fn set_label_for_link(public_link: &str, label: u8) -> Result<(), kernel_api::Re
     reg::set_value(
         MP_ROOT,
         &dev_name_for(label),
-        kernel_api::Data::Str(public_link.to_string()),
+        Data::Str(public_link.to_string()),
     )
 }
 

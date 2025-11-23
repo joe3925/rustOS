@@ -10,17 +10,17 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use kernel_api::{
-    DevNode, DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction,
-    QueryIdType, Request,
-    alloc_api::{
-        DeviceIds, DeviceInit, IoVtable, PnpVtable, ffi::pnp_create_child_devnode_and_pdo_with_init,
+    device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    kernel_types::{io::IoVtable, pnp::DeviceIds},
+    pnp::{
+        PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
+        pnp_create_child_devnode_and_pdo_with_init,
     },
     print, println,
+    request::Request,
+    status::DriverStatus,
 };
 use spin::RwLock;
-
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 mod msvc_shims;
 
@@ -28,9 +28,10 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
 #[cfg(not(test))]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 #[repr(C)]
 pub struct DevExt {
@@ -46,7 +47,6 @@ pub struct Ps2ChildExt {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    use kernel_api::alloc_api::ffi::driver_set_evt_device_add;
     unsafe { driver_set_evt_device_add(driver, ps2_device_add) };
     DriverStatus::Success
 }
@@ -85,7 +85,7 @@ extern "win64" fn ps2_query_devrels(
     device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    use kernel_api::DeviceRelationType;
+    use kernel_api::pnp::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
         return DriverStatus::NotImplemented;

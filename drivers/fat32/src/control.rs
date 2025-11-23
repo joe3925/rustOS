@@ -12,17 +12,19 @@ use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
-    FsIdentify, GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
-    PnpMinorFunction, QueryIdType, Request, RequestType, TraversalPolicy,
-    alloc_api::{
-        DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, RequestResultExt, Synchronization,
-        ffi::{
-            driver_set_evt_device_add, pnp_create_control_device_and_link,
-            pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
-        },
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt, block_on,
+    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
+    io_handler,
+    kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+    pnp::{
+        DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
+        pnp_create_control_device_and_link, pnp_create_control_device_with_init,
+        pnp_ioctl_via_symlink, pnp_send_request,
     },
-    block_on, bytes_to_box, io_handler, println,
+    println,
+    request::{Request, RequestType, TraversalPolicy},
+    status::DriverStatus,
+    util::bytes_to_box,
 };
 
 use crate::block_dev::BlockDev;
@@ -91,9 +93,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             );
             let q = Arc::new(RwLock::new(q));
 
-            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) }
-                .resolve()
-                .await;
+            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) }?.await;
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
@@ -197,8 +197,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
-        )
-        .resolve();
+        )?;
         block_on(future);
     }
 

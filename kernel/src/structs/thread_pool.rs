@@ -30,17 +30,19 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(threads: usize) -> Arc<Self> {
+        let pool = Arc::new(Self {
             inner: Mutex::new(Inner {
                 q: VecDeque::new(),
                 sleepers: Vec::new(),
             }),
-        })
+        });
+        pool.start(threads);
+        pool
     }
 
-    pub fn start(self: &Arc<Self>, n: usize) {
-        for _ in 0..n {
+    fn start(self: &Arc<Self>, threads: usize) {
+        for _ in 0..threads {
             let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
             without_interrupts(|| {
                 t.write().context.rdi = Arc::as_ptr(self) as u64;
@@ -49,10 +51,13 @@ impl ThreadPool {
         }
     }
 
-    pub fn submit(&self, f: JobFn, a: usize) {
+    pub fn submit(&self, function: JobFn, context: usize) {
         let to_wake = {
             let mut g = self.inner.lock();
-            g.q.push_back(Job { f, a });
+            g.q.push_back(Job {
+                f: function,
+                a: context,
+            });
             g.sleepers.pop()
         };
         if let Some(t) = to_wake {

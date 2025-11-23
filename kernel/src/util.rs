@@ -13,9 +13,9 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{
     NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_SCHED,
 };
-use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
+use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file::{File, FileStatus, OpenFlags};
+use crate::file_system::file::File;
 use crate::file_system::file_provider::install_file_provider;
 use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
@@ -42,6 +42,7 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use kernel_types::memory::Module;
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;

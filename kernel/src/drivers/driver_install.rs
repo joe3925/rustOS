@@ -1,16 +1,15 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::pe_loadable::LoadError;
-use crate::registry::RegError;
 use crate::{format, println};
 use alloc::{string::String, vec::Vec};
+use kernel_types::fs::OpenFlags;
+use kernel_types::pnp::BootType;
+use kernel_types::status::{Data, FileStatus, RegError};
 use toml::de::{DeInteger, DeTable};
 use toml::Spanned;
 
 use crate::alloc::string::ToString;
-use crate::{
-    file_system::file::{File, FileStatus, OpenFlags},
-    registry::{reg, Data},
-};
+use crate::{file_system::file::File, registry::reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverRole {
@@ -77,16 +76,16 @@ pub struct DriverToml {
 
 #[derive(Debug)]
 pub enum DriverError {
-    File(crate::file_system::file::FileStatus),
+    File(FileStatus),
     InvalidUtf8,
     TomlParse,
     DriverAlreadyInstalled,
     NoParent,
-    Registry(crate::registry::RegError),
+    Registry(RegError),
     LoadErr(LoadError),
 }
-impl From<crate::file_system::file::FileStatus> for DriverError {
-    fn from(e: crate::file_system::file::FileStatus) -> Self {
+impl From<FileStatus> for DriverError {
+    fn from(e: FileStatus) -> Self {
         if e == FileStatus::FileAlreadyExist {
             return DriverError::DriverAlreadyInstalled;
         }
@@ -94,8 +93,8 @@ impl From<crate::file_system::file::FileStatus> for DriverError {
     }
 }
 
-impl From<crate::registry::RegError> for DriverError {
-    fn from(e: crate::registry::RegError) -> Self {
+impl From<RegError> for DriverError {
+    fn from(e: RegError) -> Self {
         DriverError::Registry(e)
     }
 }
@@ -104,31 +103,6 @@ impl From<LoadError> for DriverError {
         DriverError::LoadErr(e)
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum BootType {
-    Boot = 0,
-    System = 1,
-    Demand = 2,
-    Disabled = 3,
-}
-
-impl BootType {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "boot" => Some(BootType::Boot),
-            "system" => Some(BootType::System),
-            "demand" => Some(BootType::Demand),
-            "disabled" => Some(BootType::Disabled),
-            _ => None,
-        }
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
-
 #[inline(always)]
 fn inner<'a, T>(s: &'a Spanned<T>) -> &'a T {
     s.get_ref()

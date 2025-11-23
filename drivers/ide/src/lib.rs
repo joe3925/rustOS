@@ -17,37 +17,33 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, RequestResultExt, Synchronization};
-use kernel_api::{DiskInfo, PnpMinorFunction, QueryIdType, block_on, io_handler};
+use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::pnp::{
+    DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType, ResourceKind,
+    driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
+    pnp_forward_request_to_next_lower,
+};
+use kernel_api::request::{Request, RequestType};
+use kernel_api::status::DriverStatus;
+use kernel_api::util::wait_ms;
+use kernel_api::x86_64::instructions::port::Port;
+use kernel_api::{RequestExt, block_on, io_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
 use dev_ext::{DevExt, Ports};
-use kernel_api::{
-    DeviceObject, DeviceRelationType, DriverObject, DriverStatus, KernelAllocator, Request,
-    RequestType, ResourceKind,
-    alloc_api::{
-        DeviceIds, DeviceInit, PnpRequest,
-        ffi::{
-            InvalidateDeviceRelations, driver_set_evt_device_add, pnp_complete_request,
-            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-        },
-    },
-    ffi::wait_ms,
-    println,
-    x86_64::instructions::port::Port,
-};
-static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 
 const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
@@ -136,7 +132,7 @@ extern "win64" fn ide_pnp_start(
         Box::new([]),
     );
     let child = Arc::new(RwLock::new(child));
-    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }.resolve());
+    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?);
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
         if qst != DriverStatus::Success {

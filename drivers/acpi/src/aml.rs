@@ -12,16 +12,26 @@ use aml::value::Args;
 use aml::{AmlContext, AmlName, AmlValue, Handler};
 use core::ptr::{read_volatile, write_volatile};
 use kernel_api::acpi::mcfg::Mcfg;
-use kernel_api::alloc_api::DeviceInit;
-use kernel_api::alloc_api::IoVtable;
-use kernel_api::alloc_api::PnpVtable;
-use kernel_api::alloc_api::ffi::get_acpi_tables;
-use kernel_api::{
-    DevNode, DeviceObject, PnpMinorFunction, QueryIdType, ResourceKind, acpi, ffi, println,
-    x86_64::{PhysAddr, VirtAddr, instructions::port::Port},
-};
+use kernel_api::device::DevNode;
+use kernel_api::device::DeviceInit;
+use kernel_api::device::DeviceObject;
+use kernel_api::kernel_types::io::IoVtable;
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::memory::map_mmio_region;
+use kernel_api::memory::unmap_range;
+use kernel_api::pnp::PnpMinorFunction;
+use kernel_api::pnp::PnpVtable;
+use kernel_api::pnp::QueryIdType;
+use kernel_api::pnp::ResourceKind;
+use kernel_api::pnp::get_acpi_tables;
+use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
+use kernel_api::println;
+use kernel_api::request::Request;
+use kernel_api::status::DriverStatus;
+use kernel_api::x86_64::PhysAddr;
+use kernel_api::x86_64::VirtAddr;
+use kernel_api::x86_64::instructions::port::Port;
 use spin::{Mutex, RwLock};
-
 pub const PAGE_SIZE: usize = 4096;
 
 pub struct KernelAmlHandler;
@@ -45,7 +55,7 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
     let base = paddr - off;
     let size = round_up(off + bytes, PAGE_SIZE);
     let va = unsafe {
-        ffi::map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
+        map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
             kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
             core::intrinsics::abort();
         })
@@ -55,7 +65,7 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
 
 #[inline]
 unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
-    unsafe { ffi::unmap_range(va, size as u64) };
+    unsafe { unmap_range(va, size as u64) };
 }
 
 #[inline]
@@ -336,7 +346,7 @@ pub fn create_pnp_bus_from_acpi(
         return false;
     }
 
-    let device_ids = kernel_api::alloc_api::DeviceIds {
+    let device_ids = DeviceIds {
         hardware: hardware_ids,
         compatible: cids,
     };
@@ -352,13 +362,11 @@ pub fn create_pnp_bus_from_acpi(
         dev_name.as_string()
     };
 
-    // PnP vtable
     let mut vt = PnpVtable::new();
     vt.set(PnpMinorFunction::QueryResources, acpi_pdo_query_resources);
     vt.set(PnpMinorFunction::QueryId, acpi_pdo_query_id);
     vt.set(PnpMinorFunction::StartDevice, acpi_pdo_start);
 
-    // Init: set PnP vtable and dev-ext from a prebuilt value (no Default)
     let mut init = DeviceInit::new(IoVtable::new(), Some(vt));
     let mut ext = AcpiPdoExt {
         acpi_path: dev_name.clone(),
@@ -397,7 +405,7 @@ pub fn create_pnp_bus_from_acpi(
     init.set_dev_ext_from(ext);
 
     let (_dn, mut pdo) = unsafe {
-        kernel_api::alloc_api::ffi::pnp_create_child_devnode_and_pdo_with_init(
+        pnp_create_child_devnode_and_pdo_with_init(
             parent_dev_node,
             short_name,
             instance_path,
@@ -764,8 +772,8 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 /* --------------------------- PnP minor callbacks --------------------------- */
 extern "win64" fn acpi_pdo_query_resources(
     dev: Arc<DeviceObject>,
-    req: Arc<RwLock<kernel_api::Request>>,
-) -> kernel_api::DriverStatus {
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ctx_lock = &pext.ctx;
@@ -782,13 +790,13 @@ extern "win64" fn acpi_pdo_query_resources(
     if let Some(p) = w.pnp.as_mut() {
         p.blob_out = blob;
     }
-    kernel_api::DriverStatus::Success
+    DriverStatus::Success
 }
 
 extern "win64" fn acpi_pdo_query_id(
     dev: Arc<DeviceObject>,
-    req: Arc<RwLock<kernel_api::Request>>,
-) -> kernel_api::DriverStatus {
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
@@ -814,26 +822,26 @@ extern "win64" fn acpi_pdo_query_id(
             if let Some(h) = hid_opt {
                 p.ids_out.push(h);
             } else {
-                w.status = kernel_api::DriverStatus::NoSuchDevice;
-                return kernel_api::DriverStatus::NoSuchDevice;
+                w.status = DriverStatus::NoSuchDevice;
+                return DriverStatus::NoSuchDevice;
             }
         }
         QueryIdType::InstanceId => {
             if let Some(dn) = dev.dev_node.get().unwrap().upgrade() {
                 p.ids_out.push(dn.instance_path.clone());
             } else {
-                w.status = kernel_api::DriverStatus::NoSuchDevice;
-                return kernel_api::DriverStatus::NoSuchDevice;
+                w.status = DriverStatus::NoSuchDevice;
+                return DriverStatus::NoSuchDevice;
             }
         }
     }
 
-    kernel_api::DriverStatus::Success
+    DriverStatus::Success
 }
 
 extern "win64" fn acpi_pdo_start(
     _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<kernel_api::Request>>,
-) -> kernel_api::DriverStatus {
-    kernel_api::DriverStatus::Success
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    DriverStatus::Success
 }

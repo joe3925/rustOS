@@ -14,27 +14,29 @@ use core::{
 use spin::RwLock;
 
 use kernel_api::{
-    DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DiskInfo, DriverObject,
-    DriverStatus, KernelAllocator, PnpMinorFunction, QueryIdType, Request, RequestType,
-    TraversalPolicy,
-    alloc_api::{
-        DeviceInit, IoType, RequestResultExt, Synchronization,
-        ffi::{driver_set_evt_device_add, pnp_complete_request, pnp_forward_request_to_next_lower},
+    RequestExt,
+    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
+    io_handler,
+    kernel_types::io::{IoType, Synchronization},
+    pnp::{
+        DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
+        pnp_complete_request, pnp_forward_request_to_next_lower,
     },
-    io_handler, println,
+    println,
+    request::{Request, RequestType, TraversalPolicy},
+    status::DriverStatus,
 };
 
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
 mod msvc_shims;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
 #[cfg(not(test))]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 
 #[inline]
@@ -185,9 +187,7 @@ pub async fn disk_read(
         let mut req_child = Request::new(RequestType::DeviceControl(IOCTL_BLOCK_RW), buf);
         req_child.traversal_policy = TraversalPolicy::ForwardLower;
         let child = Arc::new(RwLock::new(req_child));
-        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
-            .resolve()
-            .await;
+        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await;
 
         let c = child.read();
         if c.status != DriverStatus::Success {
@@ -284,9 +284,7 @@ pub async fn disk_write(
         req_child.traversal_policy = TraversalPolicy::ForwardLower;
         let child = Arc::new(RwLock::new(req_child));
 
-        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
-            .resolve()
-            .await?;
+        unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await?;
 
         let c = child.read();
         if c.status != DriverStatus::Success {
@@ -311,7 +309,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
     match code {
         IOCTL_DRIVE_IDENTIFY => {
             let mut ch = Request::new_pnp(
-                kernel_api::alloc_api::PnpRequest {
+                PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
 
                     relation: DeviceRelationType::TargetDeviceRelation,
@@ -332,9 +330,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
 
             let ch = Arc::new(RwLock::new(ch));
 
-            unsafe { pnp_forward_request_to_next_lower(&dev, ch.clone()) }
-                .resolve()
-                .await;
+            unsafe { pnp_forward_request_to_next_lower(&dev, ch.clone()) }?.await;
 
             let blob = {
                 let r = ch.read();
@@ -353,9 +349,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
             let child = Arc::new(RwLock::new(req_child));
 
-            unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }
-                .resolve()
-                .await?;
+            unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await?;
 
             child.read().status
         }
@@ -390,9 +384,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         Request::new(RequestType::DeviceControl(IOCTL_BLOCK_QUERY), buf)
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) }
-        .resolve()
-        .await;
+    pnp_forward_request_to_next_lower(dev, child.clone())?.await;
 
     let c = child.read();
     if c.status != DriverStatus::Success || c.data.len() < core::mem::size_of::<BlockQueryOut>() {
@@ -416,11 +408,4 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     dx.props_ready
         .store(true, core::sync::atomic::Ordering::Release);
     Ok(())
-}
-
-extern "win64" fn disk_on_flush_done(child: &mut Request, ctx: usize) {
-    let parent_arc: Arc<RwLock<Request>> =
-        *unsafe { Box::from_raw(ctx as *mut Arc<RwLock<Request>>) };
-    parent_arc.write().status = child.status;
-    unsafe { pnp_complete_request(&parent_arc) };
 }

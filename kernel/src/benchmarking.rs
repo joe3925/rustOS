@@ -5,6 +5,7 @@ use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
+use kernel_types::fs::OpenFlags;
 use spin::RwLock;
 use x86_64::instructions::interrupts;
 
@@ -13,9 +14,7 @@ use crate::{
         interrupt_index::wait_millis_idle,
         timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED},
     },
-    file_system::file::OpenFlags,
     file_system::file_provider::provider,
-    file_system::file_structs::{FsGetInfoParams, FsOpenResult, FsWriteResult},
     memory::{
         allocator::ALLOCATOR,
         heap::HEAP_SIZE,

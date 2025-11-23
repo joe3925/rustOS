@@ -39,19 +39,19 @@
                 "target modules load --file \"acpi.dll\" .text 0xffff900002b1f000",
                 // pci.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\pci\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff9000048ef000",
+                "target modules load --file \"pci.dll\" .text 0xffff9000048f2000",
                 // i8042.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\i8042\\i8042.dll\"",
-                "target modules load --file \"i8042.dll\" .text 0xffff900004935000",
+                "target modules load --file \"i8042.dll\" .text 0xffff90000493f000",
                 // ide.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\ide\\ide.dll\"",
-                "target modules load --file \"ide.dll\" .text 0xffff90000496a000",
+                "target modules load --file \"ide.dll\" .text 0xffff900004976000",
                 // disk.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\disk\\disk.dll\"",
-                "target modules load --file \"disk.dll\" .text 0xffff9000049b9000",
+                "target modules load --file \"disk.dll\" .text 0xffff9000049ca000",
                 // partmgr.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\partmgr\\partmgr.dll\"",
-                "target modules load --file \"partmgr.dll\" .text 0xffff9000049ee000",
+                "target modules load --file \"partmgr.dll\" .text 0xffff900004a09000",
                 // volmgr.dll
                 "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\volmgr\\volmgr.dll\"",
                 "target modules load --file \"volmgr.dll\" .text 0xffff900004a36000",

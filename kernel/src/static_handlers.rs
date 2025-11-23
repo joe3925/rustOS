@@ -14,6 +14,14 @@ use alloc::{
     task::Wake,
     vec::Vec,
 };
+use kernel_types::{
+    device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    fs::OpenFlags,
+    pnp::{DeviceIds, DeviceRelationType},
+    request::{Request, RequestFuture},
+    status::{Data, DriverStatus, FileStatus, RegError},
+    ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
+};
 use spin::{Mutex, RwLock};
 use x86_64::instructions::hlt;
 
@@ -24,26 +32,19 @@ use crate::{
         driver_install::DriverError,
         interrupt_index::wait_millis,
         pnp::{
-            device::{DevNode, DeviceIds},
-            driver_object::{
-                ClassAddCallback, DeviceInit, DeviceObject, DeviceRelationType, DriverObject,
-                DriverStatus, EvtDriverDeviceAdd, EvtDriverUnload, Request, RequestFuture,
-            },
             manager::{PnpManager, PNP_MANAGER},
             request::{DpcFn, IoTarget},
         },
         ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
     },
-    file_system::{
-        file::{File, FileStatus, OpenFlags},
-        file_provider::install_file_provider,
-    },
+    file_system::{file::File, file_provider::install_file_provider},
     memory::{allocator::ALLOCATOR, paging::constants::KERNEL_STACK_SIZE},
     registry::{
         reg::{self, rebind_and_persist_after_provider_switch},
-        Data, RegDelta, RegError,
+        RegDelta,
     },
     scheduling::{
+        executer::RUNTIME_POOL,
         scheduler::{TaskError, SCHEDULER},
         task::Task,
     },
@@ -248,9 +249,6 @@ pub extern "win64" fn InvalidateDeviceRelations(
     let Some(dn) = device.dev_node.get() else {
         return Err(DriverStatus::NoSuchDevice);
     };
-
-    // Assuming invalidate_device_relations_for_node was updated to return Result<RequestFuture, DriverStatus>
-    // If not, you may need to update PnpManager::invalidate_device_relations_for_node as well.
     mgr.invalidate_device_relations_for_node(&dn.upgrade().unwrap(), relation)
 }
 #[inline]
@@ -384,65 +382,9 @@ pub extern "win64" fn pnp_send_request_to_stack_top(
     PNP_MANAGER.send_request_to_stack_top(dev_node_weak, req)
 }
 #[no_mangle]
-pub extern "win64" fn pnp_poll_request(req: &Arc<RwLock<Request>>, waker: &Waker) -> DriverStatus {
-    let mut guard = req.write();
-
-    if guard.status != DriverStatus::Pending && guard.status != DriverStatus::Continue {
-        guard.waker = None;
-        return guard.status;
-    }
-
-    if let Some(existing) = &guard.waker {
-        if !existing.will_wake(waker) {
-            guard.waker = Some(waker.clone());
-        }
-    } else {
-        guard.waker = Some(waker.clone());
-    }
-
-    DriverStatus::Pending
-}
-struct ThreadNotify {
-    ready: AtomicBool,
-}
-
-impl ThreadNotify {
-    fn new() -> Self {
-        Self {
-            ready: AtomicBool::new(false),
-        }
-    }
-}
-
-impl alloc::task::Wake for ThreadNotify {
-    fn wake(self: Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-    }
-}
-
-fn block_on_internal<F>(mut fut: Pin<Box<F>>) -> F::Output
-where
-    F: Future + ?Sized,
-{
-    let notify = Arc::new(ThreadNotify::new());
-    let waker = Waker::from(notify.clone());
-    let mut cx = Context::from_waker(&waker);
-
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => return output,
-            Poll::Pending => {
-                while !notify.ready.swap(false, Ordering::Acquire) {
-                    hlt();
-                }
-            }
-        }
-    }
-}
-
-pub type BoxStatusFuture = Pin<Box<dyn Future<Output = DriverStatus> + Send + 'static>>;
-
-#[no_mangle]
-pub extern "win64" fn block_on_driver_status(fut: BoxStatusFuture) -> DriverStatus {
-    block_on_internal(fut)
+pub unsafe extern "win64" fn submit_runtime_internal(
+    trampoline: extern "win64" fn(usize),
+    ctx: usize,
+) {
+    RUNTIME_POOL.submit(trampoline, ctx);
 }

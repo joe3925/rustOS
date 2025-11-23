@@ -1,49 +1,17 @@
-use crate::drivers::driver_install::{self, BootType, DriverError};
-use crate::executable::program::ModuleHandle;
+use crate::drivers::driver_install::{self, DriverError};
 use crate::registry::reg::{get_value, list_keys};
-use crate::registry::{self as reg, Data, RegError};
+use crate::registry::{self as reg};
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use kernel_types::device::DriverPackage;
+use kernel_types::pnp::BootType;
+use kernel_types::status::{Data, RegError};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchClass {
     Exact,
     Compatible,
     Class,
-}
-
-#[derive(Debug, Clone)]
-pub struct DriverPackage {
-    pub name: String,
-    pub image_path: String,
-    pub toml_path: String,
-    pub start: BootType,
-    pub hwids: Vec<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DriverState {
-    Loaded,
-    Continue,
-    Started,
-    Stopped,
-    Failed,
-}
-
-#[derive(Debug)]
-pub struct DriverRuntime {
-    pub pkg: Arc<DriverPackage>,
-    pub module: ModuleHandle,
-    pub state: AtomicU8,
-    pub refcnt: AtomicU32,
-}
-impl DriverRuntime {
-    pub fn set_state(&self, s: DriverState) {
-        self.state.store(s as u8, Ordering::Release);
-    }
-    pub fn get_state(&self) -> DriverState {
-        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
-    }
 }
 
 #[derive(Debug, Clone)]

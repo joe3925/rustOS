@@ -1,7 +1,7 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
 
 use crate::executable::program::{Message, UserHandle};
-use crate::file_system::file::{File, OpenFlags};
+use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::println;
 use crate::syscalls::syscall_impl::*;
@@ -9,6 +9,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::slice;
+use kernel_types::fs::OpenFlags;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
 use x86_64::VirtAddr;

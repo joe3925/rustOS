@@ -1,4 +1,4 @@
-use crate::file_system::file::{File, OpenFlags};
+use crate::file_system::file::File;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use bincode::{Decode, Encode};
+use kernel_types::{fs::OpenFlags, status::Data};
 use lazy_static::lazy_static;
 use spin::{Once, RwLock};
 
@@ -25,30 +26,6 @@ const CLASS_LIST: &[(&str, &str)] = &[
     ("serial", "Serial ports / UART"),
     ("parallel", "Parallel ports"),
 ];
-
-/* ---------- data layer -------------- */
-#[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Data {
-    U32(u32),
-    U64(u64),
-    I32(i32),
-    I64(i64),
-    Bool(bool),
-    Str(String),
-}
-#[derive(Debug)]
-#[repr(u32)]
-pub enum RegError {
-    KeyAlreadyExists,
-    KeyNotFound,
-    ValueNotFound,
-    PersistenceFailed,
-    EncodingFailed,
-    CorruptReg,
-    FileIO,
-}
-
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Key {
     pub values: BTreeMap<String, Data>,
@@ -174,11 +151,10 @@ fn ensure_loaded() {
     });
 }
 pub mod reg {
+    use kernel_types::status::{Data, RegError};
+
     use super::*;
-    use crate::{
-        file_system::file::{File, FileStatus, OpenFlags},
-        println,
-    };
+    use crate::println;
 
     fn walk<'a>(root: &'a BTreeMap<String, Key>, path: &str) -> Option<&'a Key> {
         let mut node_map = root;
@@ -463,7 +439,7 @@ pub mod reg {
         out
     }
 
-    pub fn rebind_and_persist_after_provider_switch() -> Result<(), super::RegError> {
+    pub fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
         ensure_loaded();
         let current = (**REGISTRY.read()).clone();
 

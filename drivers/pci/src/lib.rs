@@ -17,30 +17,29 @@ use dev_ext::{
 };
 
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
-    RequestType,
-    alloc_api::{
-        DeviceIds, DeviceInit, IoVtable, PnpVtable, RequestResultExt,
-        ffi::{
-            driver_set_evt_device_add, pnp_complete_request,
-            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-        },
+    RequestExt, block_on,
+    device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    kernel_types::{io::IoVtable, pnp::DeviceIds},
+    pnp::{
+        DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
+        driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
+        pnp_forward_request_to_next_lower,
     },
-    block_on, println,
+    println,
+    request::Request,
+    status::DriverStatus,
 };
 use spin::{Once, RwLock};
-
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -72,10 +71,10 @@ extern "win64" fn pci_bus_pnp_start(
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let query = Request::new_pnp(
-        kernel_api::alloc_api::PnpRequest {
+        PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
-            relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-            id_type: kernel_api::QueryIdType::CompatibleIds,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
@@ -83,8 +82,7 @@ extern "win64" fn pci_bus_pnp_start(
     );
 
     let child = Arc::new(RwLock::new(query));
-    let st =
-        block_on(unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }.resolve());
+    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }?);
 
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
@@ -131,7 +129,7 @@ extern "win64" fn pci_bus_pnp_query_devrels(
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let relation = req.read().pnp.as_ref().unwrap().relation;
-    if relation == kernel_api::DeviceRelationType::BusRelations {
+    if relation == DeviceRelationType::BusRelations {
         let st = enumerate_bus(&device, &mut *req.write());
         if st == DriverStatus::Success {
             return DriverStatus::Continue;
@@ -204,7 +202,7 @@ pub extern "win64" fn enumerate_bus(
     DriverStatus::Success
 }
 
-fn make_pdo_for_function(parent: &Arc<kernel_api::DevNode>, p: &PciPdoExt) {
+fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     let (hardware, compatible, class_tag) = hwids_for(p);
     let ids = DeviceIds {
         hardware,
@@ -242,7 +240,7 @@ extern "win64" fn pci_pdo_query_id(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    use kernel_api::QueryIdType;
+    use kernel_api::pnp::QueryIdType;
 
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,

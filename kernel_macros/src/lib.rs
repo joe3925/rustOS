@@ -1,12 +1,9 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
-use syn::{
-    parse_macro_input, spanned::Spanned, Attribute, FnArg, ItemFn, Pat, ReturnType, Signature,
-    Type, Visibility,
-};
+use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
-const IO_FUTURE_PATH: &str = "::kernel_api::BoxedIoFuture";
+const IO_FUTURE_PATH: &str = "::kernel_api::kernel_types::BoxedIoFuture";
 
 #[proc_macro_attribute]
 pub fn io_handler(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -108,18 +105,6 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let io_future_type: Type =
         syn::parse_str(IO_FUTURE_PATH).expect("Failed to parse IoFuture path");
     sig.output = ReturnType::Type(Default::default(), Box::new(io_future_type));
-    let arg_names: Vec<TokenStream2> = sig
-        .inputs
-        .iter()
-        .map(|arg| {
-            if let FnArg::Typed(pat_ty) = arg {
-                let pat = &pat_ty.pat;
-                quote!(#pat)
-            } else {
-                quote!()
-            }
-        })
-        .collect();
 
     let original_stmts = &body.stmts;
 
