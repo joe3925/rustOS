@@ -382,9 +382,6 @@ pub extern "win64" fn pnp_send_request_to_stack_top(
     PNP_MANAGER.send_request_to_stack_top(dev_node_weak, req)
 }
 #[no_mangle]
-pub unsafe extern "win64" fn submit_runtime_internal(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
+pub unsafe extern "win64" fn submit_runtime_internal(trampoline: extern "C" fn(usize), ctx: usize) {
     RUNTIME_POOL.submit(trampoline, ctx);
 }

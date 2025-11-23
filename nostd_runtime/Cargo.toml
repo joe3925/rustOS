@@ -3,5 +3,21 @@ name = "nostd_runtime"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["rlib"]
+
 [dependencies]
 spin = "0.10.0"
+
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+panic = "abort"
+
+[profile.release]
+opt-level = 1
+debug = true
+lto = false
+panic = "abort"

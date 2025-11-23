@@ -45,3 +45,15 @@ nostd_runtime = { path = "../nostd_runtime" }
 [dependencies.lazy_static]
 version = "1.0"
 features = ["spin_no_std"]
+
+[profile.dev]
+opt-level = 0
+debug = true
+lto = false
+panic = "abort"
+
+[profile.release]
+opt-level = 1
+debug = true
+lto = false
+panic = "abort"

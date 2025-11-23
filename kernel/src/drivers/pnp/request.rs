@@ -364,13 +364,13 @@ struct DispatchJobArg {
     req: Arc<RwLock<Request>>,
 }
 
-extern "win64" fn job_run_dpc(arg: usize) {
+extern "C" fn job_run_dpc(arg: usize) {
     let p = unsafe { &*(arg as *const (extern "win64" fn(usize), usize)) };
     (p.0)(p.1);
     let _ = unsafe { Box::from_raw(arg as *mut (extern "win64" fn(usize), usize)) };
 }
 
-extern "win64" fn job_dispatch_request(arg: usize) {
+extern "C" fn job_dispatch_request(arg: usize) {
     let b: Box<DispatchJobArg> = unsafe { Box::from_raw(arg as *mut DispatchJobArg) };
     PNP_MANAGER.call_device_handler(&b.dev, b.req);
 }

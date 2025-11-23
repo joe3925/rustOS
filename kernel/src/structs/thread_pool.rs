@@ -12,7 +12,7 @@ use crate::println;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::scheduling::task::Task;
 
-pub type JobFn = extern "win64" fn(usize);
+pub type JobFn = extern "C" fn(usize);
 
 #[derive(Clone, Copy)]
 struct Job {

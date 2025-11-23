@@ -44,7 +44,7 @@ unsafe extern "win64" {
     pub fn create_kernel_task(entry: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
     pub fn pnp_queue_dpc(func: DpcFn, arg: usize);
-    pub fn submit_runtime_internal(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub fn submit_runtime_internal(trampoline: extern "C" fn(usize), ctx: usize);
     // =========================================================================
     // Paging / VMM
     // =========================================================================

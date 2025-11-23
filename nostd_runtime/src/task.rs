@@ -7,40 +7,43 @@ use spin::Mutex;
 
 use crate::waker::TaskWaker;
 
-pub struct Task {
+pub struct FutureTask {
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
 
-impl Task {
+impl FutureTask {
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
             future: Mutex::new(Box::pin(future)),
         }
     }
+}
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn poll_trampoline(ctx: usize) {
+    let task: Arc<FutureTask> = unsafe {
+        let raw = ctx as *const FutureTask;
 
-    pub extern "win64" fn poll_trampoline(ctx: usize) {
-        let task = unsafe { Arc::from_raw(ctx as *const Task) };
+        // Borrow the Arc behind `ctx` without consuming that owner.
+        let tmp = Arc::from_raw(raw);
+        let cloned = tmp.clone();
+        core::mem::forget(tmp);
 
-        let waker = TaskWaker::create_waker(task.clone());
-        let mut context = Context::from_waker(&waker);
+        cloned
+    };
+    let waker = TaskWaker::create_waker(task.clone());
+    let mut context = Context::from_waker(&waker);
 
-        let mut future_guard = task.future.lock();
-        match future_guard.as_mut().poll(&mut context) {
-            Poll::Ready(()) => {
-                // The Future is complete.
-                // We do nothing.
-                // - `task` (the Arc we reconstructed) drops here.
-                // - `waker` drops here.
-                // If this was the last reference, the memory is freed.
-            }
-            Poll::Pending => {
-                // The Future is waiting for something (e.g., IO, Timer).
-                // - `task` drops here (decrementing the count we claimed from the scheduler).
-                //
-                // CRITICAL: The Future only returns Pending if it has stored a clone
-                // of our `waker` somewhere (e.g. in the IO Driver).
-                // That stored `waker` holds a reference to `Task`, keeping it alive.
-            }
+    let mut future_guard = task.future.lock();
+    match future_guard.as_mut().poll(&mut context) {
+        Poll::Ready(()) => {
+            // Task finished. At this point:
+            // - `task` is dropped at function end (decrement refcount)
+            // - Wakers you'll drop will decrement their refs.
+            // When no wakers remain, the final `Arc` will be dropped and free the Task.
+        }
+        Poll::Pending => {
+            // Do nothing. Ownership is now *only* via wakers and the `ctx` raw pointer.
         }
     }
 }

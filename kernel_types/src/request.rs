@@ -113,8 +113,7 @@ extern "win64" fn waker_trampoline(context: usize) {
     }
 
     unsafe {
-        let waker = Box::from_raw(context as *mut Waker);
-
-        waker.wake();
+        let w = Box::from_raw(context as *mut Waker);
+        w.wake_by_ref();
     }
 }
