@@ -6,7 +6,7 @@ use core::task::{Context, Poll};
 use spin::Mutex;
 
 use crate::waker::TaskWaker;
-
+#[repr(C)]
 pub struct FutureTask {
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }

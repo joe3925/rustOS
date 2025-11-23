@@ -3,7 +3,7 @@ use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::submit_raw;
 use crate::task::FutureTask;
-
+#[repr(C)]
 pub struct TaskWaker;
 
 impl TaskWaker {

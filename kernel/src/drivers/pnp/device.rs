@@ -94,6 +94,6 @@ impl DevNodeExt for DevNode {
     }
 
     fn get_state(&self) -> DevNodeState {
-        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
+        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire) as u32) }
     }
 }

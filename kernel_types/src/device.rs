@@ -17,7 +17,7 @@ use crate::request::Request;
 use crate::{EvtDriverDeviceAdd, EvtDriverUnload};
 
 pub type ModuleHandle = Arc<RwLock<Module>>;
-
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevNodeState {
     Empty,
@@ -29,6 +29,7 @@ pub enum DevNodeState {
     Deleted,
     Faulted,
 }
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct DriverPackage {
     pub name: String,
@@ -108,13 +109,13 @@ impl DriverObject {
         f(&mut cfg);
     }
 }
-
+#[repr(C)]
 #[derive(Debug, Clone)]
 pub struct StackLayer {
     pub driver: Arc<DriverObject>,
     pub devobj: Option<Arc<DeviceObject>>,
 }
-
+#[repr(C)]
 #[derive(Debug)]
 pub struct DeviceStack {
     pub pdo_bus_service: Option<String>,

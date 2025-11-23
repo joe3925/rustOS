@@ -1,6 +1,6 @@
 use alloc::{string::String, vec::Vec};
 use x86_64::VirtAddr;
-
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct Module {
     pub title: String,

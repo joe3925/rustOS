@@ -33,7 +33,7 @@ use kernel_api::x86_64::VirtAddr;
 use kernel_api::x86_64::instructions::port::Port;
 use spin::{Mutex, RwLock};
 pub const PAGE_SIZE: usize = 4096;
-
+#[repr(C)]
 pub struct KernelAmlHandler;
 
 #[repr(C)]

@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
 /// A simple notification signal used to wake the blocking thread.
+#[repr(C)]
 struct ThreadNotify {
     /// Whether the future has signaled it is ready to be polled again.
     ready: AtomicBool,
