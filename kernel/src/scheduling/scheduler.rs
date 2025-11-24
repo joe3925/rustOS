@@ -211,7 +211,7 @@ impl Scheduler {
     }
 
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
-        self.cores[cpu_id].current.read().clone()
+        without_interrupts(|| self.cores[cpu_id].current.read().clone())
     }
 
     pub fn balance(&self) {

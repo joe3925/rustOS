@@ -668,7 +668,7 @@ fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
 async fn rescan_all_volumes() {
     let vols = VOLUMES.read();
     for dev in vols.clone() {
-        unsafe { mount_if_unmounted(dev.clone()).await };
+        unsafe { block_on(mount_if_unmounted(dev.clone())) };
     }
 }
 
