@@ -23,7 +23,7 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt,
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt, block_on,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult},
     io_handler,
@@ -250,7 +250,7 @@ pub async fn volclass_ctrl_ioctl(
                         }
                         drop(wr);
                         let _ = refresh_fs_registry_from_registry();
-                        rescan_all_volumes();
+                        rescan_all_volumes().await;
                     }
                     DriverStatus::Success
                 }
@@ -665,10 +665,10 @@ fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
     let _ = unsafe { pnp_create_symlink(link_colon, fs_mount_link.to_string()) };
 }
 
-fn rescan_all_volumes() {
+async fn rescan_all_volumes() {
     let vols = VOLUMES.read();
     for dev in vols.clone() {
-        unsafe { spawn(mount_if_unmounted(dev.clone())) };
+        unsafe { mount_if_unmounted(dev.clone()).await };
     }
 }
 

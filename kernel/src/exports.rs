@@ -29,7 +29,7 @@ export! {
     submit_runtime_internal,
     get_rsdp,
     get_acpi_tables,
-
+    task_yield,
     allocate_auto_kernel_range_mapped,
     allocate_kernel_range_mapped,
     deallocate_kernel_range,
@@ -65,7 +65,6 @@ export! {
     pnp_ioctl_via_symlink,
     pnp_load_service,
     pnp_add_class_listener,
-    pnp_wait_for_request,
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,

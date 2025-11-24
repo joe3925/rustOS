@@ -44,42 +44,19 @@ impl Wake for ThreadNotify {
 /// disabled, `hlt` may hang the CPU indefinitely if the future is waiting
 /// on an I/O interrupt.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    // 1. Pin the future on the heap.
-    // We need it pinned to poll it.
     let mut pinned_future = Box::pin(future);
 
-    // 2. Create the notification signal.
     let notify = Arc::new(ThreadNotify::new());
-
-    // 3. Convert the Arc<ThreadNotify> into a Waker.
-    // The `Wake` trait impl handles the vtable construction for us.
     let waker = Waker::from(notify.clone());
 
-    // 4. Create the polling context.
     let mut cx = Context::from_waker(&waker);
 
-    // 5. The Drive Loop
     loop {
-        // Poll the future
         match pinned_future.as_mut().poll(&mut cx) {
             Poll::Ready(output) => return output,
             Poll::Pending => {
-                // The future is not ready. We wait until `wake()` is called.
-
-                // We check the atomic flag. If it is true, we swap it to false
-                // and immediately loop back to poll again.
-                // If it is false, we halt the CPU to save power until an interrupt occurs.
-                //
-                // Acquire ordering ensures we see the data written by the task
-                // before it woke us up.
                 while !notify.ready.swap(false, Ordering::Acquire) {
-                    // Execute x86 HLT instruction.
-                    // This pauses the CPU until the next hardware interrupt (e.g., timer, I/O).
-                    // When an interrupt fires, the CPU wakes up, the ISR runs,
-                    // completion routines run (setting our atomic bool), and execution resumes.
-                    unsafe {
-                        core::arch::asm!("hlt");
-                    }
+                    //unsafe { task_yield() };
                 }
             }
         }

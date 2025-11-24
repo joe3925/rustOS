@@ -5,12 +5,13 @@ use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::println;
 use crate::scheduling::state::State;
 use crate::scheduling::task::{idle_task, Task};
+use crate::static_handlers::task_yield;
 use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::asm;
+use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
@@ -30,6 +31,7 @@ pub type TaskHandle = Arc<RwLock<Task>>;
 #[derive(Debug)]
 pub struct CoreScheduler {
     run_queue: Mutex<VecDeque<TaskHandle>>,
+    sleep_queue: Mutex<Vec<TaskHandle>>,
     current: RwLock<Option<TaskHandle>>,
     idle_task: TaskHandle,
 }
@@ -39,7 +41,6 @@ pub struct Scheduler {
     cores: Box<[CoreScheduler]>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
-
     balance_lock: Mutex<()>,
 }
 
@@ -54,7 +55,6 @@ impl Scheduler {
             cores: Vec::new().into_boxed_slice(),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
-
             balance_lock: Mutex::new(()),
         }
     }
@@ -73,11 +73,12 @@ impl Scheduler {
             }
             cores_vec.push(CoreScheduler {
                 run_queue: Mutex::new(VecDeque::new()),
+                sleep_queue: Mutex::new(Vec::new()),
                 current: RwLock::new(None),
                 idle_task: self.get_task_by_id(idle_id).expect("idle missing"),
             });
         }
-        // SAFETY: replace empty slice once
+
         let cores_box = cores_vec.into_boxed_slice();
         let ptr = &self.cores as *const _ as *mut Box<[CoreScheduler]>;
         unsafe { ptr.write(cores_box) };
@@ -92,6 +93,7 @@ impl Scheduler {
             let n = self.num_cores.load(Ordering::Relaxed);
             let mut best = 0usize;
             let mut best_len = usize::MAX;
+
             for i in 0..n {
                 let len = self.cores[i].run_queue.lock().len();
                 if len < best_len {
@@ -157,48 +159,59 @@ impl Scheduler {
     fn schedule_next(&self, cpu_id: usize) -> TaskHandle {
         let core = &self.cores[cpu_id];
 
-        let previous = {
-            let mut cur_guard = core.current.write();
-            cur_guard.take()
-        };
+        let previous = core.current.write().take();
 
         if let Some(previous_task) = previous {
             if !Arc::ptr_eq(&previous_task, &core.idle_task) {
-                core.run_queue.lock().push_back(previous_task);
+                let (terminated, sleeping) = {
+                    let t = previous_task.read();
+                    (t.terminated, t.is_sleeping)
+                };
+
+                if terminated {
+                } else if sleeping {
+                    core.sleep_queue.lock().push(previous_task);
+                } else {
+                    core.run_queue.lock().push_back(previous_task);
+                }
             }
         }
 
-        let next_task = {
-            let mut run_queue_guard = core.run_queue.lock();
-            let queue_len = run_queue_guard.len();
-            for _ in 0..queue_len {
-                if let Some(task_handle) = run_queue_guard.pop_front() {
-                    let is_runnable = {
-                        let task = task_handle.read();
-                        !task.is_sleeping && !task.terminated
-                    };
-                    if is_runnable {
-                        drop(run_queue_guard);
-                        *core.current.write() = Some(task_handle.clone());
-                        return task_handle;
-                    } else {
-                        run_queue_guard.push_back(task_handle);
-                    }
-                } else {
-                    break;
+        let mut run_queue_guard = core.run_queue.lock();
+        if let Some(next_task) = run_queue_guard.pop_front() {
+            drop(run_queue_guard);
+            *core.current.write() = Some(next_task.clone());
+            next_task
+        } else {
+            drop(run_queue_guard);
+            *core.current.write() = Some(core.idle_task.clone());
+            core.idle_task.clone()
+        }
+    }
+
+    pub fn wake_task(&self, task_handle: &TaskHandle) {
+        without_interrupts(|| {
+            task_handle.write().is_sleeping = false;
+
+            let n = self.num_cores.load(Ordering::Relaxed);
+            for i in 0..n {
+                let mut sleep_lock = self.cores[i].sleep_queue.lock();
+                if let Some(idx) = sleep_lock.iter().position(|t| Arc::ptr_eq(t, task_handle)) {
+                    sleep_lock.swap_remove(idx);
+                    drop(sleep_lock);
+
+                    self.cores[i]
+                        .run_queue
+                        .lock()
+                        .push_back(task_handle.clone());
+                    return;
                 }
             }
-            core.idle_task.clone()
-        };
-
-        *core.current.write() = Some(next_task.clone());
-        next_task
+        });
     }
 
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            self.cores[cpu_id].current.read().clone()
-        })
+        self.cores[cpu_id].current.read().clone()
     }
 
     pub fn balance(&self) {
@@ -210,25 +223,7 @@ impl Scheduler {
         let mut min_len = usize::MAX;
 
         for i in 0..n {
-            let core = &self.cores[i];
-
-            let len = {
-                let mut q = core.run_queue.lock();
-                q.retain(|h| !h.read().terminated);
-
-                q.iter()
-                    .filter(|h| !Arc::ptr_eq(h, &core.idle_task))
-                    .count()
-            };
-
-            {
-                let mut cur_guard = core.current.write();
-                if let Some(cur) = cur_guard.as_ref() {
-                    if cur.read().terminated {
-                        *cur_guard = None;
-                    }
-                }
-            }
+            let len = self.cores[i].run_queue.lock().len();
 
             if len > max_len {
                 max_len = len;
@@ -243,19 +238,7 @@ impl Scheduler {
         if n >= 2 && busiest != least && max_len > min_len + 1 {
             let moved = {
                 let mut q = self.cores[busiest].run_queue.lock();
-                let idle_handle = &self.cores[busiest].idle_task;
-                let mut moved = None;
-
-                let mut idx = q.len();
-                while idx > 0 {
-                    idx -= 1;
-                    if !Arc::ptr_eq(&q[idx], idle_handle) {
-                        moved = q.remove(idx);
-                        break;
-                    }
-                }
-
-                moved
+                q.pop_back()
             };
 
             if let Some(task) = moved {
@@ -272,6 +255,9 @@ impl Scheduler {
     pub fn delete_task(&self, id: u64) -> Result<(), TaskError> {
         if let Some(h) = self.get_task_by_id(id) {
             h.write().terminated = true;
+            if h.read().is_sleeping {
+                self.wake_task(&h);
+            }
             Ok(())
         } else {
             Err(TaskError::NotFound(id))
@@ -291,14 +277,57 @@ impl Scheduler {
             let _ = self.delete_task(id);
         }
     }
+
+    pub fn sleep_and_yield(&self) {
+        without_interrupts(|| {
+            let cpu_id = current_cpu_id() as usize;
+            if let Some(task) = self.get_current_task(cpu_id) {
+                task.write().is_sleeping = true;
+            }
+        });
+        unsafe {
+            task_yield();
+        }
+    }
 }
 
-pub fn kernel_task_yield() {
-    unsafe { asm!("int 0x20") };
+#[no_mangle]
+pub extern "C" fn yield_handler_c(state: *mut State) {
+    if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+
+    let cpu_id = current_cpu_id() as usize;
+    SCHEDULER.on_timer_tick(state, cpu_id);
+}
+
+#[unsafe(naked)]
+pub extern "x86-interrupt" fn yield_interrupt_entry() -> ! {
+    naked_asm!(
+        "cli",
+        "push r15","push r14","push r13","push r12",
+        "push r11","push r10","push r9","push r8",
+        "push rdi","push rsi","push rbp","push rbx",
+        "push rdx","push rcx","push rax",
+
+        "mov  rdi, rsp",
+        "cld",
+
+        "sub  rsp, 8",
+        "call {handler}",
+        "add  rsp, 8",
+
+        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
+        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
+        "pop  r9","pop  r10","pop  r11","pop  r12",
+        "pop  r13","pop  r14","pop  r15",
+        "sti",
+        "iretq",
+        handler = sym yield_handler_c,
+    );
 }
 
 pub fn kernel_task_end() -> ! {
-    // TODO: need a better pattern then this
     interrupts::without_interrupts(|| {
         let id = SCHEDULER
             .get_current_task(current_cpu_id() as usize)

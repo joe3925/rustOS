@@ -14,6 +14,7 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kernel_types::fs::OpenFlags;
+use nostd_runtime::block_on;
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};
@@ -324,7 +325,7 @@ pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
         return make_err(ErrClass::File, FileErr::ReadZeroLen as u16, 0);
     }
     let f = unsafe { &mut *file };
-    let data = match f.read() {
+    let data = match block_on(f.read()) {
         Ok(d) => d,
         Err(_) => return make_err(ErrClass::File, FileErr::Io as u16, 0),
     };
@@ -365,7 +366,7 @@ pub(crate) fn sys_file_write(file: *mut File, buf: *const u8, len: usize) -> u64
     }
     let f = unsafe { &mut *file };
     let src = unsafe { core::slice::from_raw_parts(buf, len) };
-    match f.write(src) {
+    match block_on(f.write(src)) {
         Ok(_) => len as u64,
         Err(_) => make_err(ErrClass::File, FileErr::WriteFailed as u16, 0),
     }
@@ -398,7 +399,7 @@ pub(crate) fn list_dir(path: *const u8) -> u64 {
         }
     };
     let abs_path = resolve_with_working_dir(&caller, pname);
-    let entries = match File::list_dir(&abs_path) {
+    let entries = match block_on(File::list_dir(&abs_path)) {
         Ok(v) => v,
         Err(_) => return make_err(ErrClass::File, FileErr::Io as u16, 0),
     };
@@ -468,7 +469,7 @@ pub(crate) fn sys_file_open(
     };
     let abs_path = resolve_with_working_dir(&caller, pname);
     let flg = unsafe { core::slice::from_raw_parts(flags, n) };
-    match File::open(&abs_path, flg) {
+    match block_on(File::open(&abs_path, flg)) {
         Ok(f) => unsafe {
             core::ptr::write_unaligned(out, f);
             0
@@ -482,7 +483,7 @@ pub(crate) fn sys_file_delete(file: *mut File) -> u64 {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
     let f = unsafe { &mut *file };
-    match f.delete() {
+    match block_on(f.delete()) {
         Ok(_) => 0,
         Err(_) => make_err(ErrClass::File, FileErr::DeleteFailed as u16, 0),
     }
@@ -836,7 +837,7 @@ pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
         let newp = Path::parse(raw, Some(&base));
         newp.to_string()
     };
-    if File::list_dir(&abs_str).is_err() {
+    if block_on(File::list_dir(&abs_str)).is_err() {
         return make_err(ErrClass::File, FileErr::PathInvalid as u16, 1);
     }
     caller.write().working_dir = Path::parse(&abs_str, None);

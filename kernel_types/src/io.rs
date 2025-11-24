@@ -1,6 +1,8 @@
+use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
 use crate::request::{Request, RequestType};
-use crate::{BoxedIoFuture, EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
+use crate::status::DriverStatus;
+use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
@@ -96,7 +98,7 @@ impl IoType {
     }
 
     #[inline]
-    pub fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> BoxedIoFuture {
+    pub fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
                 let len = req.read().data.len();

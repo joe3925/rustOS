@@ -2,15 +2,16 @@ use alloc::boxed::Box;
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::println;
-use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
+use crate::scheduling::scheduler::{self, TaskHandle, SCHEDULER};
 use crate::scheduling::task::Task;
+use crate::static_handlers::task_yield;
 
 pub type JobFn = extern "C" fn(usize);
 
@@ -20,46 +21,69 @@ struct Job {
     a: usize,
 }
 
-struct Inner {
+struct WorkerInner {
     q: VecDeque<Job>,
-    sleepers: Vec<TaskHandle>,
+    sleeper: Option<TaskHandle>,
 }
 
 pub struct ThreadPool {
-    inner: Mutex<Inner>,
+    workers: Box<[Mutex<WorkerInner>]>,
+    last_worker_idx: AtomicUsize,
+}
+
+struct WorkerArgs {
+    pool: Arc<ThreadPool>,
+    index: usize,
 }
 
 impl ThreadPool {
     pub fn new(threads: usize) -> Arc<Self> {
-        let pool = Arc::new(Self {
-            inner: Mutex::new(Inner {
+        let mut worker_inners = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            worker_inners.push(Mutex::new(WorkerInner {
                 q: VecDeque::new(),
-                sleepers: Vec::new(),
-            }),
+                sleeper: None,
+            }));
+        }
+
+        let pool = Arc::new(Self {
+            workers: worker_inners.into_boxed_slice(),
+            last_worker_idx: AtomicUsize::new(0),
         });
+
         pool.start(threads);
         pool
     }
 
     fn start(self: &Arc<Self>, threads: usize) {
-        for _ in 0..threads {
+        for i in 0..threads {
             let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
+
+            let args = Box::new(WorkerArgs {
+                pool: self.clone(),
+                index: i,
+            });
+            let args_ptr = Box::into_raw(args) as usize;
+
             without_interrupts(|| {
-                t.write().context.rdi = Arc::as_ptr(self) as u64;
+                t.write().context.rdi = args_ptr as u64;
             });
             SCHEDULER.add_task(t);
         }
     }
 
     pub fn submit(&self, function: JobFn, context: usize) {
+        let idx = self.last_worker_idx.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+
         let to_wake = {
-            let mut g = self.inner.lock();
-            g.q.push_back(Job {
+            let mut guard = self.workers[idx].lock();
+            guard.q.push_back(Job {
                 f: function,
                 a: context,
             });
-            g.sleepers.pop()
+            guard.sleeper.take()
         };
+
         if let Some(t) = to_wake {
             without_interrupts(|| {
                 t.write().wake();
@@ -67,78 +91,88 @@ impl ThreadPool {
         }
     }
 
-    // Best-effort: only queue if there is a sleeping worker to run it.
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
-        let to_wake = {
-            let mut g = self.inner.lock();
-            match g.sleepers.pop() {
-                Some(t) => {
-                    g.q.push_back(Job { f, a });
-                    Some(t)
-                }
-                None => None,
-            }
-        };
+        for worker_lock in self.workers.iter() {
+            let mut guard = worker_lock.lock();
+            if guard.sleeper.is_some() {
+                guard.q.push_back(Job { f, a });
+                let t = guard.sleeper.take().unwrap();
 
-        if let Some(t) = to_wake {
-            without_interrupts(|| {
-                t.write().wake();
-            });
-            true
-        } else {
-            false
+                without_interrupts(|| {
+                    t.write().wake();
+                });
+                return true;
+            }
         }
+        false
     }
     pub fn try_execute_one(&self) -> bool {
-        let job = {
-            let mut g = self.inner.lock();
-            g.q.pop_front()
-        };
+        for worker_lock in self.workers.iter() {
+            let job = {
+                let mut guard = worker_lock.lock();
+                guard.q.pop_front()
+            };
 
-        if let Some(j) = job {
-            (j.f)(j.a);
-            return true;
+            if let Some(j) = job {
+                (j.f)(j.a);
+                return true;
+            }
         }
-
         false
     }
 }
 
-extern "C" fn worker(pool_ptr: usize) {
-    let pool: &ThreadPool = unsafe { &*(pool_ptr as *const ThreadPool) };
+extern "C" fn worker(args_ptr: usize) {
+    let args = unsafe { Box::from_raw(args_ptr as *mut WorkerArgs) };
+    let pool = args.pool;
+    let my_idx = args.index;
+
     let me = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("worker task missing");
 
     loop {
-        let mut guard = pool.inner.lock();
+        let mut job = None;
 
-        loop {
-            if let Some(j) = guard.q.pop_front() {
-                if let Some(idx) = guard.sleepers.iter().position(|t| Arc::ptr_eq(t, &me)) {
-                    guard.sleepers.swap_remove(idx);
+        {
+            let mut guard = pool.workers[my_idx].lock();
+            job = guard.q.pop_front();
+        }
+
+        if job.is_none() {
+            for i in 1..pool.workers.len() {
+                let victim_idx = (my_idx + i) % pool.workers.len();
+
+                if let Some(mut guard) = pool.workers[victim_idx].try_lock() {
+                    if let Some(stolen) = guard.q.pop_front() {
+                        job = Some(stolen);
+                        break;
+                    }
                 }
+            }
+        }
 
-                drop(guard);
+        match job {
+            Some(j) => {
                 (j.f)(j.a);
-                break;
             }
+            None => {
+                let mut guard = pool.workers[my_idx].lock();
 
-            if !guard.sleepers.iter().any(|t| Arc::ptr_eq(t, &me)) {
-                guard.sleepers.push(me.clone());
+                if guard.q.is_empty() {
+                    guard.sleeper = Some(me.clone());
+
+                    without_interrupts(|| {
+                        me.write().is_sleeping = true;
+                    });
+
+                    drop(guard);
+
+                    unsafe {
+                        task_yield();
+                    }
+                }
             }
-
-            drop(guard);
-
-            without_interrupts(|| {
-                me.write().sleep();
-            });
-
-            while me.read().is_sleeping {
-                unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
-            }
-
-            guard = pool.inner.lock();
         }
     }
 }

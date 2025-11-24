@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::any::TypeId;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -18,9 +19,13 @@ impl FutureTask {
         }
     }
 }
-#[no_mangle]
 #[inline(never)]
-pub extern "C" fn poll_trampoline(ctx: usize) {
+pub extern "C" fn poll_trampoline<T: 'static>(ctx: usize) {
+    unsafe {
+        let id = TypeId::of::<T>();
+        core::ptr::read_volatile(&id as *const _ as *const u8);
+    }
+
     let task: Arc<FutureTask> = unsafe {
         let raw = ctx as *const FutureTask;
 

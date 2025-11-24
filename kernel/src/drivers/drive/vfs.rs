@@ -7,6 +7,7 @@ use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::request::{Request, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
@@ -14,7 +15,7 @@ use spin::RwLock;
 use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
-use crate::static_handlers::{pnp_send_request_via_symlink, pnp_wait_for_request};
+use crate::static_handlers::pnp_send_request_via_symlink;
 use kernel_types::fs::*;
 
 #[derive(Clone, Debug)]
@@ -67,14 +68,14 @@ impl Vfs {
         self.label_map.write().remove(label);
     }
 
-    pub fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
+    pub async fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
         let mounts = self.enumerate_mount_symlinks();
 
         let mut out: Vec<MountedVolume> = Vec::new();
         let mut labels = self.label_map.write();
 
         for m in mounts {
-            let (public, label_link, object_name) = match self.query_volume_status(&m) {
+            let (public, label_link, object_name) = match self.query_volume_status(&m).await {
                 Ok(t) => t,
                 Err(_) => continue,
             };
@@ -116,7 +117,7 @@ impl Vfs {
         Vec::new()
     }
 
-    fn query_volume_status(
+    async fn query_volume_status(
         &self,
         mount_symlink: &str,
     ) -> Result<(String, String, String), DriverStatus> {
@@ -129,8 +130,7 @@ impl Vfs {
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        unsafe { pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()) };
-        unsafe { pnp_wait_for_request(&req) };
+        unsafe { pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()) }?.await;
 
         let r = req.read();
         if r.status != DriverStatus::Success {
@@ -265,7 +265,7 @@ impl Vfs {
         Box::from_raw(ptr)
     }
 
-    fn call_fs<TParam, TResult>(
+    async fn call_fs<TParam, TResult>(
         &self,
         volume_symlink: &str,
         op: FsOp,
@@ -280,7 +280,6 @@ impl Vfs {
                 .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
         pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
-        unsafe { pnp_wait_for_request(&req) };
 
         let mut w = req.write();
         if w.status != DriverStatus::Success {
@@ -352,7 +351,7 @@ impl Vfs {
 
     // ---------- SYNC API (unchanged behavior) ----------
 
-    pub fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
+    pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {
             Ok(v) => v,
             Err(e) => {
@@ -368,9 +367,12 @@ impl Vfs {
             }
         };
 
-        let call_open = |this: &Self, link: &String, path: String, flags: OpenFlags| {
+        let call_open = async |this: &Self, link: &String, path: String, flags: OpenFlags| {
             let inner = FsOpenParams { flags, path };
-            match this.call_fs::<FsOpenParams, FsOpenResult>(link, FsOp::Open, inner) {
+            match this
+                .call_fs::<FsOpenParams, FsOpenResult>(link, FsOp::Open, inner)
+                .await
+            {
                 Ok(mut r) => {
                     if matches!(r.error, Some(FileStatus::Success)) {
                         r.error = None;
@@ -396,7 +398,7 @@ impl Vfs {
                     dir: false,
                     flags: OpenFlags::CreateNew,
                 };
-                let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq) {
+                let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq).await {
                     Ok(r) => r,
                     Err(st) => {
                         return (
@@ -424,7 +426,7 @@ impl Vfs {
                     }
                 }
 
-                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open);
+                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st);
                 }
@@ -450,7 +452,8 @@ impl Vfs {
             }
 
             OpenFlags::Create => {
-                let (try_open, st) = call_open(self, &symlink, fs_path.clone(), OpenFlags::Open);
+                let (try_open, st) =
+                    call_open(self, &symlink, fs_path.clone(), OpenFlags::Open).await;
                 if st != DriverStatus::Success {
                     return (try_open, st);
                 }
@@ -480,20 +483,21 @@ impl Vfs {
                         dir: false,
                         flags: OpenFlags::Create,
                     };
-                    let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq) {
-                        Ok(r) => r,
-                        Err(st) => {
-                            return (
-                                FsOpenResult {
-                                    fs_file_id: 0,
-                                    is_dir: false,
-                                    size: 0,
-                                    error: Some(FileStatus::UnknownFail),
-                                },
-                                st,
-                            )
-                        }
-                    };
+                    let cres: FsCreateResult =
+                        match self.call_fs(&symlink, FsOp::Create, creq).await {
+                            Ok(r) => r,
+                            Err(st) => {
+                                return (
+                                    FsOpenResult {
+                                        fs_file_id: 0,
+                                        is_dir: false,
+                                        size: 0,
+                                        error: Some(FileStatus::UnknownFail),
+                                    },
+                                    st,
+                                )
+                            }
+                        };
                     if let Some(e) = cres.error {
                         if e != FileStatus::Success {
                             return (
@@ -508,7 +512,8 @@ impl Vfs {
                         }
                     }
 
-                    let (inner_res, st2) = call_open(self, &symlink, fs_path, OpenFlags::Open);
+                    let (inner_res, st2) =
+                        call_open(self, &symlink, fs_path, OpenFlags::Open).await;
                     if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                         return (inner_res, st2);
                     }
@@ -536,7 +541,7 @@ impl Vfs {
             }
 
             OpenFlags::Open | OpenFlags::ReadOnly | OpenFlags::WriteOnly | OpenFlags::ReadWrite => {
-                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open);
+                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st);
                 }
@@ -562,7 +567,7 @@ impl Vfs {
         }
     }
 
-    pub fn close(&self, p: FsCloseParams) -> (FsCloseResult, DriverStatus) {
+    pub async fn close(&self, p: FsCloseParams) -> (FsCloseResult, DriverStatus) {
         let Some(h) = self.handles.write().remove(&p.fs_file_id) else {
             return (
                 FsCloseResult {
@@ -576,7 +581,7 @@ impl Vfs {
             fs_file_id: h.inner_id,
         };
         let res: Result<FsCloseResult, DriverStatus> =
-            self.call_fs(&h.volume_symlink, FsOp::Close, inner);
+            self.call_fs(&h.volume_symlink, FsOp::Close, inner).await;
         match res {
             Ok(mut r) => {
                 if r.error.is_none() {
@@ -593,7 +598,7 @@ impl Vfs {
         }
     }
 
-    pub fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
+    pub async fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsReadResult {
@@ -608,7 +613,10 @@ impl Vfs {
             offset: p.offset,
             len: p.len,
         };
-        match self.call_fs::<FsReadParams, FsReadResult>(&h.volume_symlink, FsOp::Read, inner) {
+        match self
+            .call_fs::<FsReadParams, FsReadResult>(&h.volume_symlink, FsOp::Read, inner)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsReadResult {
@@ -620,7 +628,7 @@ impl Vfs {
         }
     }
 
-    pub fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
+    pub async fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsWriteResult {
@@ -631,7 +639,10 @@ impl Vfs {
             );
         };
         p.fs_file_id = h.inner_id;
-        match self.call_fs::<FsWriteParams, FsWriteResult>(&h.volume_symlink, FsOp::Write, p) {
+        match self
+            .call_fs::<FsWriteParams, FsWriteResult>(&h.volume_symlink, FsOp::Write, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsWriteResult {
@@ -643,7 +654,7 @@ impl Vfs {
         }
     }
 
-    pub fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
+    pub async fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsSeekResult {
@@ -654,7 +665,10 @@ impl Vfs {
             );
         };
         p.fs_file_id = h.inner_id;
-        match self.call_fs::<FsSeekParams, FsSeekResult>(&h.volume_symlink, FsOp::Seek, p) {
+        match self
+            .call_fs::<FsSeekParams, FsSeekResult>(&h.volume_symlink, FsOp::Seek, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsSeekResult {
@@ -666,7 +680,7 @@ impl Vfs {
         }
     }
 
-    pub fn flush(&self, mut p: FsFlushParams) -> (FsFlushResult, DriverStatus) {
+    pub async fn flush(&self, mut p: FsFlushParams) -> (FsFlushResult, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsFlushResult {
@@ -676,7 +690,10 @@ impl Vfs {
             );
         };
         p.fs_file_id = h.inner_id;
-        match self.call_fs::<FsFlushParams, FsFlushResult>(&h.volume_symlink, FsOp::Flush, p) {
+        match self
+            .call_fs::<FsFlushParams, FsFlushResult>(&h.volume_symlink, FsOp::Flush, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsFlushResult {
@@ -687,7 +704,7 @@ impl Vfs {
         }
     }
 
-    pub fn get_info(&self, mut p: FsGetInfoParams) -> (FsGetInfoResult, DriverStatus) {
+    pub async fn get_info(&self, mut p: FsGetInfoParams) -> (FsGetInfoResult, DriverStatus) {
         let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
             return (
                 FsGetInfoResult {
@@ -700,7 +717,9 @@ impl Vfs {
             );
         };
         p.fs_file_id = h.inner_id;
-        match self.call_fs::<FsGetInfoParams, FsGetInfoResult>(&h.volume_symlink, FsOp::GetInfo, p)
+        match self
+            .call_fs::<FsGetInfoParams, FsGetInfoResult>(&h.volume_symlink, FsOp::GetInfo, p)
+            .await
         {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
@@ -715,13 +734,16 @@ impl Vfs {
         }
     }
 
-    pub fn create(&self, mut p: FsCreateParams) -> (FsCreateResult, DriverStatus) {
+    pub async fn create(&self, mut p: FsCreateParams) -> (FsCreateResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {
             Ok(v) => v,
             Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
         };
         p.path = fs_path;
-        match self.call_fs::<FsCreateParams, FsCreateResult>(&symlink, FsOp::Create, p) {
+        match self
+            .call_fs::<FsCreateParams, FsCreateResult>(&symlink, FsOp::Create, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsCreateResult {
@@ -732,7 +754,7 @@ impl Vfs {
         }
     }
 
-    pub fn rename(&self, mut p: FsRenameParams) -> (FsRenameResult, DriverStatus) {
+    pub async fn rename(&self, mut p: FsRenameParams) -> (FsRenameResult, DriverStatus) {
         let (src_symlink, src_rel) = match self.resolve_path(&p.src) {
             Ok(v) => v,
             Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
@@ -751,7 +773,10 @@ impl Vfs {
         }
         p.src = src_rel;
         p.dst = dst_rel;
-        match self.call_fs::<FsRenameParams, FsRenameResult>(&src_symlink, FsOp::Rename, p) {
+        match self
+            .call_fs::<FsRenameParams, FsRenameResult>(&src_symlink, FsOp::Rename, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsRenameResult {
@@ -762,7 +787,7 @@ impl Vfs {
         }
     }
 
-    pub fn list_dir(&self, mut p: FsListDirParams) -> (FsListDirResult, DriverStatus) {
+    pub async fn list_dir(&self, mut p: FsListDirParams) -> (FsListDirResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {
             Ok(v) => v,
             Err(e) => {
@@ -776,7 +801,10 @@ impl Vfs {
             }
         };
         p.path = fs_path;
-        match self.call_fs::<FsListDirParams, FsListDirResult>(&symlink, FsOp::ReadDir, p) {
+        match self
+            .call_fs::<FsListDirParams, FsListDirResult>(&symlink, FsOp::ReadDir, p)
+            .await
+        {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsListDirResult {
@@ -790,122 +818,132 @@ impl Vfs {
 }
 
 impl FileProvider for Vfs {
-    fn open_path(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
-        let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
-        self.open(FsOpenParams {
-            flags: f,
-            path: path.to_string(),
-        })
-    }
-
-    fn close_handle(&self, file_id: u64) -> (FsCloseResult, DriverStatus) {
-        self.close(FsCloseParams {
-            fs_file_id: file_id,
-        })
-    }
-
-    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus) {
-        self.read(FsReadParams {
-            fs_file_id: file_id,
-            offset,
-            len: len as usize,
-        })
-    }
-
-    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus) {
-        self.write(FsWriteParams {
-            fs_file_id: file_id,
-            offset,
-            data: data.to_vec(),
-        })
-    }
-
-    fn flush_handle(&self, file_id: u64) -> (FsFlushResult, DriverStatus) {
-        self.flush(FsFlushParams {
-            fs_file_id: file_id,
-        })
-    }
-
-    fn get_info(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
-        self.get_info(FsGetInfoParams {
-            fs_file_id: file_id,
-        })
-    }
-
-    fn list_dir_path(&self, path: &str) -> (FsListDirResult, DriverStatus) {
-        self.list_dir(FsListDirParams {
-            path: path.to_string(),
-        })
-    }
-
-    fn make_dir_path(&self, path: &str) -> (FsCreateResult, DriverStatus) {
-        self.create(FsCreateParams {
-            path: path.to_string(),
-            dir: true,
-            flags: OpenFlags::Create,
-        })
-    }
-
-    fn remove_dir_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
-        (
-            FsCreateResult {
-                error: Some(FileStatus::UnknownFail),
-            },
-            DriverStatus::Success,
-        )
-    }
-
-    fn rename_path(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus) {
-        self.rename(FsRenameParams {
-            src: src.to_string(),
-            dst: dst.to_string(),
-        })
-    }
-
-    fn delete_path(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
-        (
-            FsCreateResult {
-                error: Some(FileStatus::UnknownFail),
-            },
-            DriverStatus::Success,
-        )
-    }
-
-    fn open_path_async(
+    fn open_path(
         &self,
         path: &str,
         flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
+    ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
         let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
-        self.open_async(FsOpenParams {
+
+        this.open(FsOpenParams {
             flags: f,
             path: path.to_string(),
         })
+        .into_ffi()
     }
 
-    fn read_at_async(
+    fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.close(FsCloseParams {
+            fs_file_id: file_id,
+        })
+        .into_ffi()
+    }
+
+    fn read_at(
         &self,
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        self.read_async(FsReadParams {
+    ) -> FfiFuture<(FsReadResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.read(FsReadParams {
             fs_file_id: file_id,
             offset,
             len: len as usize,
         })
+        .into_ffi()
     }
 
-    fn write_at_async(
+    fn write_at(
         &self,
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        self.write_async(FsWriteParams {
+    ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+        let data = data.to_vec();
+
+        this.write(FsWriteParams {
             fs_file_id: file_id,
             offset,
-            data: data.to_vec(),
+            data,
         })
+        .into_ffi()
+    }
+
+    fn flush_handle(&self, file_id: u64) -> FfiFuture<(FsFlushResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.flush(FsFlushParams {
+            fs_file_id: file_id,
+        })
+        .into_ffi()
+    }
+
+    fn get_info(&self, file_id: u64) -> FfiFuture<(FsGetInfoResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.get_info(FsGetInfoParams {
+            fs_file_id: file_id,
+        })
+        .into_ffi()
+    }
+
+    fn list_dir_path(&self, path: &str) -> FfiFuture<(FsListDirResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.list_dir(FsListDirParams {
+            path: path.to_string(),
+        })
+        .into_ffi()
+    }
+
+    fn make_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.create(FsCreateParams {
+            path: path.to_string(),
+            dir: true,
+            flags: OpenFlags::Create,
+        })
+        .into_ffi()
+    }
+
+    fn remove_dir_path(&self, _path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        async {
+            (
+                FsCreateResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::Success,
+            )
+        }
+        .into_ffi()
+    }
+
+    fn rename_path(&self, src: &str, dst: &str) -> FfiFuture<(FsRenameResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.rename(FsRenameParams {
+            src: src.to_string(),
+            dst: dst.to_string(),
+        })
+        .into_ffi()
+    }
+
+    fn delete_path(&self, _path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        async {
+            (
+                FsCreateResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::Success,
+            )
+        }
+        .into_ffi()
     }
 }

@@ -6,7 +6,7 @@ use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    RequestExt,
+    RequestExt, block_on,
     kernel_types::io::IoTarget,
     pnp::pnp_send_request,
     println,
@@ -141,15 +141,13 @@ impl BlockDev {
 
 impl Read for BlockDev {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        todo!();
-        //block_on(self.read_bytes(buf)).map_err(|_| ())
+        block_on(self.read_bytes(buf)).map_err(|_| ())
     }
 }
 
 impl Write for BlockDev {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        todo!();
-        //block_on(self.write_bytes(buf)).map_err(|_| ())
+        block_on(self.write_bytes(buf)).map_err(|_| ())
     }
     fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())

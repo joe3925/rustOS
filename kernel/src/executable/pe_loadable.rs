@@ -19,6 +19,7 @@ use goblin::Object;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::OpenFlags;
 use kernel_types::memory::Module;
+use nostd_runtime::block_on;
 use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
@@ -40,8 +41,8 @@ impl PELoader {
     /// Opens and prepares a PE loader from the given path.
     pub fn new(path: &str) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
-        let file_handle = File::open(path, &open_flags).ok()?;
-        let file_data: Vec<u8> = file_handle.read().ok()?;
+        let file_handle = block_on(File::open(path, &open_flags)).ok()?;
+        let file_data: Vec<u8> = block_on(file_handle.read()).ok()?;
 
         let boxed: Box<[u8]> = file_data.into_boxed_slice();
 

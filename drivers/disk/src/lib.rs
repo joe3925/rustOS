@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
+    future,
     mem::size_of,
     panic::PanicInfo,
     ptr,
@@ -15,6 +16,8 @@ use spin::RwLock;
 
 use kernel_api::{
     RequestExt,
+    async_ffi::FutureExt,
+    block_on,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     io_handler,
     kernel_types::io::{IoType, Synchronization},

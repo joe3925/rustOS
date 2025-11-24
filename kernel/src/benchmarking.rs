@@ -1,11 +1,13 @@
 use crate::alloc::format;
 use crate::alloc::vec;
 use crate::drivers::pnp::manager::PNP_MANAGER;
+use crate::file_system::file::File;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use kernel_types::fs::OpenFlags;
+use nostd_runtime::block_on;
 use spin::RwLock;
 use x86_64::instructions::interrupts;
 
@@ -249,7 +251,7 @@ pub fn run_stats_loop() {
                     acc_total_sched_ns,
                     &cfg,
                 );
-                let _ = append_to_file(&cfg.path, log.as_bytes());
+                block_on(append_to_file(&cfg.path, log.as_bytes()));
             }
             acc_minutes = 0;
             acc_total_ms = 0;
@@ -384,44 +386,28 @@ fn build_window_log(
     out
 }
 
-fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
-    provider().make_dir_path(path);
-    let file_path = path.to_string() + "\\benchmark.txt";
-    let (res, _) = provider().open_path(file_path.as_str(), &[OpenFlags::Create]);
-    let handle: u64 = if res.error.is_none() {
-        res.fs_file_id
-    } else {
-        let (res2, _) = provider().open_path(file_path.as_str(), &[OpenFlags::Open]);
-        if res2.error.is_none() {
-            res2.fs_file_id
-        } else {
-            return Err(());
-        }
+pub async fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
+    File::make_dir(path.to_string()).await;
+
+    let file_path = alloc::format!("{path}\\benchmark.txt");
+
+    let mut file = match File::open(&file_path, &[OpenFlags::Create]).await {
+        Ok(f) => f,
+        Err(_) => File::open(&file_path, &[OpenFlags::Open])
+            .await
+            .map_err(|_| ())?,
     };
 
-    let (gi, _) = provider().get_info(handle);
-    let mut off = gi.size;
-    let mut written_total: u64 = 0;
-    while written_total < data.len() as u64 {
-        let chunk = core::cmp::min(128 * 1024, data.len() - written_total as usize);
-        let (wr, _) = provider().write_at(
-            handle,
-            off,
-            &data[written_total as usize..written_total as usize + chunk],
-        );
-        if wr.error.is_some() || wr.written == 0 {
-            break;
-        }
-        off += wr.written as u64;
-        written_total += wr.written as u64;
-    }
-    let _ = provider().flush_handle(handle);
-    let _ = provider().close_handle(handle);
-    if written_total == data.len() as u64 {
-        Ok(())
-    } else {
-        Err(())
-    }
+    let mut buf = match file.read().await {
+        Ok(existing) => existing,
+        Err(_) => Vec::new(),
+    };
+
+    buf.extend_from_slice(data);
+
+    file.write(&buf).await.map_err(|_| ())?;
+
+    Ok(())
 }
 
 pub fn used_memory() -> usize {

@@ -2,7 +2,7 @@ use super::driver_index::{self as idx, HwIndex};
 use super::request::IoTarget;
 use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
-use crate::drivers::pnp::request::RequestExt;
+use crate::drivers::pnp::request::{RequestExt, RequestResultExt};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
@@ -22,6 +22,7 @@ use kernel_types::pnp::{
 use kernel_types::request::{Request, RequestFuture};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
+use nostd_runtime::block_on;
 use spin::{Mutex, RwLock};
 #[repr(C)]
 pub struct ClassListener {
@@ -89,12 +90,12 @@ impl PnpManager {
             }
         }
 
-        self.init_io_dispatcher();
         Ok(())
     }
 
     pub fn rebuild_index(&self) -> Result<(), RegError> {
-        *self.hw.write() = Arc::new(idx::build_hw_index()?);
+        // TODO: change this whole path to async at some point
+        *self.hw.write() = Arc::new(block_on(idx::build_hw_index())?);
         Ok(())
     }
 
@@ -303,25 +304,30 @@ impl PnpManager {
         let Some(class) = class_opt else {
             return Ok(None);
         };
+
         let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
-        let svc = match get_value(&class_key, "Class") {
+        let svc = match block_on(get_value(&class_key, "Class")) {
             Some(Data::Str(s)) if !s.is_empty() => s,
             _ => return Ok(None),
         };
+
         if let Some(pkg) = self.hw.read().by_driver.get(&svc) {
             return Ok(Some(pkg.clone()));
         }
 
         let svc_key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
-        let image = match get_value(&svc_key, "ImagePath") {
+
+        let image = match block_on(get_value(&svc_key, "ImagePath")) {
             Some(Data::Str(s)) => s,
             _ => return Ok(None),
         };
-        let toml_path = match get_value(&svc_key, "TomlPath") {
+
+        let toml_path = match block_on(get_value(&svc_key, "TomlPath")) {
             Some(Data::Str(s)) => s,
             _ => return Ok(None),
         };
-        let start = match get_value(&svc_key, "Start") {
+
+        let start = match block_on(get_value(&svc_key, "Start")) {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -331,6 +337,7 @@ impl PnpManager {
             },
             _ => BootType::Demand,
         };
+
         Ok(Some(Arc::new(DriverPackage {
             name: svc.clone(),
             image_path: image,
@@ -351,6 +358,7 @@ impl PnpManager {
             order: u32,
             service: String,
         }
+
         let mut lowers: Vec<Item> = Vec::new();
         let mut uppers: Vec<Item> = Vec::new();
 
@@ -358,13 +366,13 @@ impl PnpManager {
             let key = idx::escape_key(id);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/{pos}");
-                if let Some(children) = list_keys(&base).ok() {
+                if let Some(children) = block_on(list_keys(&base)).ok() {
                     for svc_path in children {
-                        let order = match get_value(&svc_path, "Order") {
+                        let order = match block_on(get_value(&svc_path, "Order")) {
                             Some(Data::U32(v)) => v,
                             _ => 100,
                         };
-                        let service = match get_value(&svc_path, "Service") {
+                        let service = match block_on(get_value(&svc_path, "Service")) {
                             Some(Data::Str(s)) => s,
                             _ => svc_path
                                 .rsplit_once('/')
@@ -385,13 +393,13 @@ impl PnpManager {
             let key = idx::escape_key(class);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/{pos}");
-                if let Some(children) = list_keys(&base).ok() {
+                if let Some(children) = block_on(list_keys(&base)).ok() {
                     for svc_path in children {
-                        let order = match get_value(&svc_path, "Order") {
+                        let order = match block_on(get_value(&svc_path, "Order")) {
                             Some(Data::U32(v)) => v,
                             _ => 100,
                         };
-                        let service = match get_value(&svc_path, "Service") {
+                        let service = match block_on(get_value(&svc_path, "Service")) {
                             Some(Data::Str(s)) => s,
                             _ => svc_path
                                 .rsplit_once('/')
@@ -406,12 +414,13 @@ impl PnpManager {
                     }
                 }
             }
+
             let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{class}");
             for (list_name, target_vec) in
                 [("LowerFilters", &mut lowers), ("UpperFilters", &mut uppers)]
             {
                 let list_key = alloc::format!("{class_key}/{list_name}");
-                if let Some(k) = get_key(&list_key) {
+                if let Some(k) = block_on(get_key(&list_key)) {
                     let base_order = if list_name == "LowerFilters" {
                         10_000
                     } else {
@@ -419,7 +428,7 @@ impl PnpManager {
                     };
                     for i in 0..k.values.len() {
                         let idxs = alloc::format!("{}", i);
-                        if let Some(Data::Str(svc)) = get_value(&list_key, &idxs) {
+                        if let Some(Data::Str(svc)) = block_on(get_value(&list_key, &idxs)) {
                             target_vec.push(Item {
                                 order: base_order + (i as u32),
                                 service: svc,
@@ -436,13 +445,13 @@ impl PnpManager {
                 idx::escape_key(function_service),
                 pos
             );
-            if let Some(children) = list_keys(&base).ok() {
+            if let Some(children) = block_on(list_keys(&base)).ok() {
                 for svc_path in children {
-                    let order = match get_value(&svc_path, "Order") {
+                    let order = match block_on(get_value(&svc_path, "Order")) {
                         Some(Data::U32(v)) => v,
                         _ => 100,
                     };
-                    let service = match get_value(&svc_path, "Service") {
+                    let service = match block_on(get_value(&svc_path, "Service")) {
                         Some(Data::Str(s)) => s,
                         _ => svc_path
                             .rsplit_once('/')
@@ -473,6 +482,7 @@ impl PnpManager {
         let mut seen_u = BTreeMap::<String, u32>::new();
         let mut lower_svcs = Vec::new();
         let mut upper_svcs = Vec::new();
+
         for it in lowers {
             if !seen_l.contains_key(&it.service) {
                 seen_l.insert(it.service.clone(), it.order);
@@ -492,12 +502,14 @@ impl PnpManager {
                 lower_rts.push(rt);
             }
         }
+
         let mut upper_rts = Vec::new();
         for svc in upper_svcs {
             if let Some(rt) = self.pkg_by_service(&svc) {
                 upper_rts.push(rt);
             }
         }
+
         Ok((lower_rts, upper_rts))
     }
 
@@ -505,16 +517,20 @@ impl PnpManager {
         if let Some(p) = self.hw.read().by_driver.get(svc) {
             return Some(p.clone());
         }
+
         let key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
-        let image = match get_value(&key, "ImagePath") {
+
+        let image = match block_on(get_value(&key, "ImagePath")) {
             Some(Data::Str(s)) => s,
             _ => return None,
         };
-        let toml = match get_value(&key, "TomlPath") {
+
+        let toml = match block_on(get_value(&key, "TomlPath")) {
             Some(Data::Str(s)) => s,
             _ => return None,
         };
-        let start = match get_value(&key, "Start") {
+
+        let start = match block_on(get_value(&key, "Start")) {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -524,6 +540,7 @@ impl PnpManager {
             },
             _ => BootType::Demand,
         };
+
         Some(Arc::new(DriverPackage {
             name: svc.to_string(),
             image_path: image,
@@ -717,7 +734,7 @@ impl PnpManager {
             let target = IoTarget {
                 target_device: top_device,
             };
-            let _ = self.send_request(&target, req_arc.clone());
+            block_on(self.send_request(&target, req_arc.clone()).resolve());
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -754,7 +771,7 @@ impl PnpManager {
                 let target = IoTarget {
                     target_device: top_device,
                 };
-                let _ = pnp_manager.send_request(&target, req_arc.clone());
+                block_on(pnp_manager.send_request(&target, req_arc.clone())?);
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
@@ -1244,7 +1261,10 @@ impl PnpManager {
         let tgt = IoTarget {
             target_device: top.clone(),
         };
-        let _ = self.send_request(&tgt, Arc::new(RwLock::new(start_request)));
+        block_on(
+            self.send_request(&tgt, Arc::new(RwLock::new(start_request)))
+                .resolve(),
+        );
 
         dn.set_state(DevNodeState::Started);
         Ok((dn, top))

@@ -93,10 +93,10 @@ pub fn escape_key(s: &str) -> String {
     out
 }
 
-pub fn build_hw_index() -> Result<HwIndex, RegError> {
+pub async fn build_hw_index() -> Result<HwIndex, RegError> {
     let mut idx = HwIndex::new();
     let services_root = "SYSTEM/CurrentControlSet/Services";
-    let service_keys = list_keys(services_root)?;
+    let service_keys = list_keys(services_root).await?;
     for kpath in service_keys {
         let rel = kpath
             .strip_prefix(&(services_root.to_string() + "/"))
@@ -106,15 +106,15 @@ pub fn build_hw_index() -> Result<HwIndex, RegError> {
         }
         let drv_name = rel.to_string();
 
-        let image = match get_value(&kpath, "ImagePath") {
+        let image = match get_value(&kpath, "ImagePath").await {
             Some(Data::Str(s)) => s,
             _ => continue,
         };
-        let toml_path = match get_value(&kpath, "TomlPath") {
+        let toml_path = match get_value(&kpath, "TomlPath").await {
             Some(Data::Str(s)) => s,
             _ => continue,
         };
-        let start = match get_value(&kpath, "Start") {
+        let start = match get_value(&kpath, "Start").await {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -125,7 +125,7 @@ pub fn build_hw_index() -> Result<HwIndex, RegError> {
             _ => BootType::Demand,
         };
 
-        let dt = match driver_install::parse_driver_toml(&toml_path) {
+        let dt = match driver_install::parse_driver_toml(&toml_path).await {
             Ok(d) => d,
             Err(_) => continue,
         };

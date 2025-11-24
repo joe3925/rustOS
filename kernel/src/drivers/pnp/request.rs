@@ -1,7 +1,9 @@
 use crate::drivers::pnp::manager::{PnpManager, PNP_MANAGER};
+use crate::println;
 use crate::static_handlers::create_kernel_task;
 use crate::structs::thread_pool::ThreadPool;
 use crate::util::random_number;
+use acpi::spcr::SpcrInterfaceType;
 use alloc::{boxed::Box, collections::vec_deque::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_types::device::DeviceObject;
@@ -27,73 +29,24 @@ pub type DpcFn = extern "win64" fn(usize);
 pub type CompletionRoutine =
     extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
 
-static DISPATCHER_STARTED: AtomicBool = AtomicBool::new(false);
-const START_THREADS: usize = 12;
-
 lazy_static::lazy_static! {
-    pub static ref THREADS: Arc<ThreadPool> = ThreadPool::new(START_THREADS);
-    static ref DISPATCH_REQ_Q: Mutex<VecDeque<(Arc<DeviceObject>, Arc<RwLock<Request>>)>> = Mutex::new(VecDeque::new());
     static ref GLOBAL_DPCQ: Mutex<VecDeque<Dpc>> = Mutex::new(VecDeque::new());
 }
 
 impl PnpManager {
     pub fn queue_dpc(&self, func: extern "win64" fn(usize), arg: usize) {
         GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });
+
+        nostd_runtime::spawn(PNP_MANAGER.run_one_dpc());
     }
 
-    pub fn init_io_dispatcher(&self) {
-        if !DISPATCHER_STARTED.swap(true, Ordering::AcqRel) {
-            create_kernel_task(
-                io_dispatcher_trampoline as usize,
-                alloc::format!("io-dispatch{:x}", crate::util::random_number()),
-            );
-        }
-    }
-
-    pub fn run_once(&self) -> bool {
-        self.run_one_dpc() | self.run_one_device_request()
-    }
-
-    pub fn dispatch_forever(&self) -> ! {
-        loop {
-            if !self.run_once() {
-                core::hint::spin_loop();
-            }
-        }
-    }
-
-    fn run_one_dpc(&self) -> bool {
+    async fn run_one_dpc(&self) {
         let dpc_opt = { GLOBAL_DPCQ.lock().pop_front() };
         let Some(dpc) = dpc_opt else {
-            return false;
+            return;
         };
 
-        let pair = Box::new((dpc.func, dpc.arg));
-        let ptr = Box::into_raw(pair) as usize;
-
-        if !THREADS.submit_if_runnable(job_run_dpc, ptr) {
-            let _ = unsafe { Box::from_raw(ptr as *mut (extern "win64" fn(usize), usize)) };
-            GLOBAL_DPCQ.lock().push_front(dpc);
-            return false;
-        }
-        true
-    }
-
-    pub fn execute_one() -> bool {
-        THREADS.try_execute_one()
-    }
-
-    fn run_one_device_request(&self) -> bool {
-        let item = { DISPATCH_REQ_Q.lock().pop_front() };
-        let Some((dev, req)) = item else {
-            return false;
-        };
-
-        let arg = Box::new(DispatchJobArg { dev, req });
-        let ptr = Box::into_raw(arg) as usize;
-
-        THREADS.submit(job_dispatch_request, ptr);
-        true
+        (dpc.func)(dpc.arg);
     }
 
     pub fn send_request(
@@ -103,14 +56,15 @@ impl PnpManager {
     ) -> Result<RequestFuture, DriverStatus> {
         {
             let mut guard = req.write();
-            // Initialize as Continue (Waiting in queue/Traversing).
-            // Pending is reserved for when a driver takes ownership (untracked).
             guard.status = DriverStatus::Continue;
             guard.completed = false;
         }
-        DISPATCH_REQ_Q
-            .lock()
-            .push_back((target.target_device.clone(), req.clone()));
+
+        let dev = target.target_device.clone();
+        let req_clone = req.clone();
+
+        nostd_runtime::spawn(PNP_MANAGER.call_device_handler(dev, req_clone));
+
         Ok(RequestFuture { req })
     }
 
@@ -173,8 +127,6 @@ impl PnpManager {
 
         {
             let mut req = req_arc.write();
-            // Only default to Success if the status is Continue (meaning it was just waiting/traversing).
-            // If it is Pending, the driver explicitly set it to Untracked, so the driver *must* have set a result status.
             if req.status == DriverStatus::Continue {
                 req.status = DriverStatus::Success;
             }
@@ -187,7 +139,7 @@ impl PnpManager {
 
     /// The entry point for async request dispatch.
     /// Finds the handler, spawns a task on the executor, and handles the result asynchronously.
-    fn call_device_handler(&self, dev: &Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
+    async fn call_device_handler(&self, dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let (kind, policy) = {
             let r = req_arc.read();
             (r.kind, r.traversal_policy)
@@ -197,14 +149,12 @@ impl PnpManager {
             return;
         }
 
-        // PnP dispatch is currently still synchronous in logic, but could be wrapped.
         if matches!(kind, RequestType::Pnp) {
-            Self::pnp_minor_dispatch(dev, req_arc.clone());
+            Self::pnp_minor_dispatch(&dev, req_arc.clone());
             return;
         }
 
         if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-            // Check queue depth limits
             match h.synchronization {
                 Synchronization::Sync | Synchronization::Async => {
                     let depth = if matches!(h.synchronization, Synchronization::Sync) {
@@ -218,85 +168,81 @@ impl PnpManager {
                         {
                             req_arc.write().status = DriverStatus::DeviceNotReady;
                         }
-                        self.complete_request(&req_arc);
+                        PNP_MANAGER.complete_request(&req_arc);
                         return;
                     }
                 }
                 _ => {}
             }
 
-            let future = h.handler.invoke(dev.clone(), req_arc.clone());
+            let status = h.handler.invoke(dev.clone(), req_arc.clone());
+
             let req_for_task = req_arc.clone();
             let dev_for_task = dev.clone();
 
-            nostd_runtime::spawn(async move {
-                let status = future.await;
-
-                match h.synchronization {
-                    Synchronization::Sync | Synchronization::Async => {
-                        h.running_request.fetch_sub(1, Ordering::Release);
-                    }
-                    _ => {}
+            match h.synchronization {
+                Synchronization::Sync | Synchronization::Async => {
+                    h.running_request.fetch_sub(1, Ordering::Release);
                 }
+                _ => {}
+            }
 
-                match status {
-                    DriverStatus::Pending => {
-                        // Driver took ownership (Untracked). Mark as Pending.
-                        req_for_task.write().status = DriverStatus::Pending;
-                    }
-                    DriverStatus::Continue | DriverStatus::NotImplemented => {
-                        let next_res = match policy {
-                            TraversalPolicy::ForwardLower => PNP_MANAGER
-                                .send_request_to_next_lower(&dev_for_task, req_for_task.clone()),
-                            TraversalPolicy::ForwardUpper => PNP_MANAGER
-                                .send_request_to_next_upper(&dev_for_task, req_for_task.clone()),
-                            TraversalPolicy::FailIfUnhandled => Err(DriverStatus::NotImplemented),
-                        };
+            match status {
+                DriverStatus::Pending => {
+                    req_for_task.write().status = DriverStatus::Pending;
+                }
+                DriverStatus::Continue | DriverStatus::NotImplemented => {
+                    let next_res = match policy {
+                        TraversalPolicy::ForwardLower => PNP_MANAGER
+                            .send_request_to_next_lower(&dev_for_task, req_for_task.clone()),
+                        TraversalPolicy::ForwardUpper => PNP_MANAGER
+                            .send_request_to_next_upper(&dev_for_task, req_for_task.clone()),
+                        TraversalPolicy::FailIfUnhandled => Err(DriverStatus::NotImplemented),
+                    };
 
-                        if next_res.is_err() {
-                            {
-                                req_for_task.write().status = DriverStatus::NotImplemented;
-                            }
-                            PNP_MANAGER.complete_request(&req_for_task);
-                        }
-                    }
-                    other => {
+                    if next_res.is_err() {
                         {
-                            req_for_task.write().status = other;
+                            req_for_task.write().status = DriverStatus::NotImplemented;
                         }
                         PNP_MANAGER.complete_request(&req_for_task);
                     }
                 }
-            });
+                other => {
+                    {
+                        req_for_task.write().status = other;
+                    }
+                    PNP_MANAGER.complete_request(&req_for_task);
+                }
+            }
         } else {
             match policy {
                 TraversalPolicy::ForwardLower => {
                     if PNP_MANAGER
-                        .send_request_to_next_lower(dev, req_arc.clone())
+                        .send_request_to_next_lower(&dev, req_arc.clone())
                         .is_err()
                     {
                         {
                             req_arc.write().status = DriverStatus::NotImplemented;
                         }
-                        self.complete_request(&req_arc);
+                        PNP_MANAGER.complete_request(&req_arc);
                     }
                 }
                 TraversalPolicy::ForwardUpper => {
                     if PNP_MANAGER
-                        .send_request_to_next_upper(dev, req_arc.clone())
+                        .send_request_to_next_upper(&dev, req_arc.clone())
                         .is_err()
                     {
                         {
                             req_arc.write().status = DriverStatus::NotImplemented;
                         }
-                        self.complete_request(&req_arc);
+                        PNP_MANAGER.complete_request(&req_arc);
                     }
                 }
                 TraversalPolicy::FailIfUnhandled => {
                     {
                         req_arc.write().status = DriverStatus::NotImplemented;
                     }
-                    self.complete_request(&req_arc);
+                    PNP_MANAGER.complete_request(&req_arc);
                 }
             }
         }
@@ -355,24 +301,10 @@ impl PnpManager {
     }
 }
 
-extern "C" fn io_dispatcher_trampoline() {
-    PNP_MANAGER.dispatch_forever();
-}
-
-struct DispatchJobArg {
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-}
-
 extern "C" fn job_run_dpc(arg: usize) {
     let p = unsafe { &*(arg as *const (extern "win64" fn(usize), usize)) };
     (p.0)(p.1);
     let _ = unsafe { Box::from_raw(arg as *mut (extern "win64" fn(usize), usize)) };
-}
-
-extern "C" fn job_dispatch_request(arg: usize) {
-    let b: Box<DispatchJobArg> = unsafe { Box::from_raw(arg as *mut DispatchJobArg) };
-    PNP_MANAGER.call_device_handler(&b.dev, b.req);
 }
 
 pub trait RequestExt {

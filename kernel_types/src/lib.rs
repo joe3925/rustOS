@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+pub mod async_ffi;
 pub mod device;
 pub mod fs;
 pub mod io;
@@ -11,18 +12,16 @@ pub mod memory;
 pub mod pnp;
 pub mod request;
 pub mod status;
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
 
+use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::request::Request;
 use crate::status::DriverStatus;
 use spin::RwLock;
-pub type BoxedIoFuture = Pin<Box<dyn Future<Output = DriverStatus> + Send + 'static>>;
-pub type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 pub type EvtDriverDeviceAdd = extern "win64" fn(
     driver: Arc<device::DriverObject>,
@@ -30,10 +29,13 @@ pub type EvtDriverDeviceAdd = extern "win64" fn(
 ) -> DriverStatus;
 pub type EvtDriverUnload = extern "win64" fn(driver: Arc<device::DriverObject>) -> DriverStatus;
 
-pub type EvtIoRead = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
-pub type EvtIoWrite = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
-pub type EvtIoDeviceControl = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
-pub type EvtIoFs = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
+pub type EvtIoRead =
+    extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
+pub type EvtIoWrite =
+    extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
+pub type EvtIoDeviceControl =
+    extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+pub type EvtIoFs = extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
 pub type EvtDevicePrepareHardware = extern "win64" fn(Arc<DeviceObject>) -> DriverStatus;
 pub type EvtDeviceEnumerateDevices =

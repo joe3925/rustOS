@@ -3,8 +3,6 @@ use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
 use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
-const IO_FUTURE_PATH: &str = "::kernel_api::kernel_types::BoxedIoFuture";
-
 #[proc_macro_attribute]
 pub fn io_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
@@ -34,10 +32,12 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ));
     }
 
+    // We still reject manual ABIs because the macro is responsible for applying
+    // the correct 'extern "win64"' ABI.
     if let Some(abi) = &sig.abi {
         return Err(syn::Error::new_spanned(
             abi,
-            "#[io_handler] does not support extern functions; remove the ABI",
+            "#[io_handler] applies the ABI automatically; remove the explicit 'extern' declaration",
         ));
     }
 
@@ -100,17 +100,25 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let sig = &mut func.sig;
     let body = &func.block;
 
+    // 1. Remove async since we are executing strictly inside block_on
     sig.asyncness = None;
 
-    let io_future_type: Type =
-        syn::parse_str(IO_FUTURE_PATH).expect("Failed to parse IoFuture path");
-    sig.output = ReturnType::Type(Default::default(), Box::new(io_future_type));
+    // 2. FORCE EXTERN "win64" ABI
+    // This makes the function callable from the Windows Kernel dispatcher.
+    sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
+
+    // 3. Return Type
+    // We do NOT modify sig.output here.
+    // `validate_function` confirmed the user wrote `-> DriverStatus`,
+    // so we keep that exactly as is.
 
     let original_stmts = &body.stmts;
 
+    // 4. Transform body to wrap the async block in ::kernel_api::block_on
     let new_body = quote_spanned! {body.brace_token.span.join() =>
         {
-            ::alloc::boxed::Box::pin(async move {
+            // Execute the future synchronously on this thread
+            ::kernel_api::block_on(async move {
                 #(#original_stmts)*
             })
         }

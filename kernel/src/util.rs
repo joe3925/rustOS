@@ -43,6 +43,7 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use kernel_types::memory::Module;
+use nostd_runtime::block_on;
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -133,9 +134,8 @@ pub fn kernel_main() {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
-    crate::drivers::driver_install::install_prepacked_drivers()
+    block_on(crate::drivers::driver_install::install_prepacked_drivers())
         .expect("Failed to install pre packed drivers");
-
     PNP_MANAGER
         .init_from_registry()
         .expect("Driver init failed");

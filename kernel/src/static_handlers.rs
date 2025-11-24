@@ -1,5 +1,6 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
+    arch::asm,
     future::Future,
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
@@ -22,6 +23,7 @@ use kernel_types::{
     status::{Data, DriverStatus, FileStatus, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
+use nostd_runtime::block_on;
 use spin::{Mutex, RwLock};
 use x86_64::instructions::hlt;
 
@@ -85,41 +87,41 @@ pub extern "win64" fn wait_ms(ms: u64) {
 }
 #[no_mangle]
 pub extern "win64" fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus> {
-    File::open(path, flags)
+    block_on(File::open(path, flags))
 }
 
 #[no_mangle]
 pub extern "win64" fn fs_list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
-    File::list_dir(path)
+    block_on(File::list_dir(path))
 }
 
 #[no_mangle]
 pub extern "win64" fn fs_remove_dir(path: &str) -> Result<(), FileStatus> {
-    File::remove_dir(path.to_string())
+    block_on(File::remove_dir(path.to_string()))
 }
 
 #[no_mangle]
 pub extern "win64" fn fs_make_dir(path: &str) -> Result<(), FileStatus> {
-    File::make_dir(path.to_string())
+    block_on(File::make_dir(path.to_string()))
 }
 
 #[no_mangle]
 pub extern "win64" fn file_read(file: &File) -> Result<Vec<u8>, FileStatus> {
-    file.read()
+    block_on(file.read())
 }
 
 #[no_mangle]
 pub extern "win64" fn file_write(file: &mut File, data: &[u8]) -> Result<(), FileStatus> {
-    file.write(data)
+    block_on(file.write(data))
 }
 
 #[no_mangle]
 pub extern "win64" fn file_delete(file: &mut File) -> Result<(), FileStatus> {
-    file.delete()
+    block_on(file.delete())
 }
 #[no_mangle]
 pub extern "win64" fn reg_get_value(key_path: &str, name: &str) -> Option<Data> {
-    reg::get_value(key_path, name)
+    block_on(reg::get_value(key_path, name))
 }
 
 #[no_mangle]
@@ -128,32 +130,32 @@ pub extern "win64" fn reg_set_value(
     name: &str,
     data: Data,
 ) -> Result<(), RegError> {
-    reg::set_value(key_path, name, data)
+    block_on(reg::set_value(key_path, name, data))
 }
 
 #[no_mangle]
 pub extern "win64" fn reg_create_key(path: &str) -> Result<(), RegError> {
-    reg::create_key(path)
+    block_on(reg::create_key(path))
 }
 
 #[no_mangle]
 pub extern "win64" fn reg_delete_key(path: &str) -> Result<bool, RegError> {
-    reg::delete_key(path)
+    block_on(reg::delete_key(path))
 }
 
 #[no_mangle]
 pub extern "win64" fn reg_delete_value(key_path: &str, name: &str) -> Result<bool, RegError> {
-    reg::delete_value(key_path, name)
+    block_on(reg::delete_value(key_path, name))
 }
 
 #[no_mangle]
 pub extern "win64" fn reg_list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
-    reg::list_keys(base_path)
+    block_on(reg::list_keys(base_path))
 }
 
 #[no_mangle]
 pub extern "win64" fn reg_list_values(base_path: &str) -> Result<Vec<String>, RegError> {
-    reg::list_values(base_path)
+    block_on(reg::list_values(base_path))
 }
 pub extern "win64" fn get_acpi_tables() -> Arc<AcpiTables<ACPIImpl>> {
     return ACPI_TABLES.get_tables();
@@ -337,16 +339,7 @@ pub extern "win64" fn pnp_add_class_listener(
 ) {
     PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
 }
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_wait_for_request(req: &Arc<RwLock<Request>>) {
-    loop {
-        PnpManager::execute_one();
-        if (req.read().completed == true) {
-            return;
-        }
-        //crate::scheduling::scheduler::kernel_task_yield();
-    }
-}
+
 #[no_mangle]
 pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
     parent_dn: &Arc<DevNode>,
@@ -384,4 +377,7 @@ pub extern "win64" fn pnp_send_request_to_stack_top(
 #[no_mangle]
 pub unsafe extern "win64" fn submit_runtime_internal(trampoline: extern "C" fn(usize), ctx: usize) {
     RUNTIME_POOL.submit(trampoline, ctx);
+}
+pub unsafe extern "win64" fn task_yield() {
+    unsafe { asm!("int 0x80") };
 }

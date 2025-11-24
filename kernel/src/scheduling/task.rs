@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::asm;
 use spin::RwLock;
+use x86_64::instructions::hlt;
 use x86_64::VirtAddr;
 
 use super::scheduler::TaskHandle;
@@ -157,8 +158,6 @@ impl Task {
 //Idle task to prevent return
 pub(crate) extern "C" fn idle_task() {
     loop {
-        unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        hlt();
     }
 }

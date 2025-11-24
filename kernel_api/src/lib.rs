@@ -7,7 +7,7 @@ use kernel_sys::submit_runtime_internal;
 use kernel_types::pnp::PnpRequest;
 use kernel_types::request::{Request, RequestFuture, RequestType, TraversalPolicy};
 use kernel_types::status::DriverStatus;
-pub use kernel_types::{device, request, status};
+pub use kernel_types::{async_ffi, device, request, status};
 
 pub use kernel_types;
 
