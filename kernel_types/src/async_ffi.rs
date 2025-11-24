@@ -1,3 +1,5 @@
+// this is a no_std version of async_ffi
+
 //! # FFI-compatible [`Future`][`core::future::Future`]s
 //!
 //! Rust currently doesn't provide stable ABI nor stable layout of related structs like
@@ -15,11 +17,6 @@
 //! For non-[`Send`] or non-`'static` futures, see the section
 //! [Variants of `FfiFuture`](#variants-of-ffifuture) below.
 //!
-//! ## NO_STD Note
-//! This crate has been modified to support `#![no_std]`.
-//! **Panic Safety:** `std::panic::catch_unwind` is not available in `no_std`.
-//! Consequently, if a wrapped future panics, it will not be caught and converted to
-//! `FfiPoll::Panicked`. It will strictly panic/abort the kernel context immediately.
 //!
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
