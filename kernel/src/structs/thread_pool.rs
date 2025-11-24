@@ -1,17 +1,16 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
-use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use spin::Mutex;
 use spin::RwLock;
 use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::scheduling::scheduler;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::scheduling::task::Task;
-use crate::static_handlers::task_yield;
 
 pub type JobFn = extern "C" fn(usize);
 
@@ -21,111 +20,17 @@ struct Job {
     a: usize,
 }
 
-struct Node {
-    job: MaybeUninit<Job>,
-    next: AtomicPtr<Node>,
-}
-
-struct JobQueue {
-    head: AtomicPtr<Node>,
-    tail: AtomicPtr<Node>,
-}
-
-impl JobQueue {
-    fn new() -> Self {
-        let dummy = Box::into_raw(Box::new(Node {
-            job: MaybeUninit::uninit(),
-            next: AtomicPtr::new(ptr::null_mut()),
-        }));
-
-        JobQueue {
-            head: AtomicPtr::new(dummy),
-            tail: AtomicPtr::new(dummy),
-        }
-    }
-
-    fn push(&self, job: Job) {
-        let node = Box::into_raw(Box::new(Node {
-            job: MaybeUninit::new(job),
-            next: AtomicPtr::new(ptr::null_mut()),
-        }));
-
-        loop {
-            let tail = self.tail.load(Ordering::Acquire);
-            let next = unsafe { (*tail).next.load(Ordering::Acquire) };
-
-            if tail == self.tail.load(Ordering::Acquire) {
-                if next.is_null() {
-                    if unsafe {
-                        (*tail).next.compare_exchange(
-                            next,
-                            node,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                    }
-                    .is_ok()
-                    {
-                        let _ = self.tail.compare_exchange(
-                            tail,
-                            node,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        );
-                        break;
-                    }
-                } else {
-                    let _ =
-                        self.tail
-                            .compare_exchange(tail, next, Ordering::AcqRel, Ordering::Acquire);
-                }
-            }
-        }
-    }
-
-    fn pop(&self) -> Option<Job> {
-        loop {
-            let head = self.head.load(Ordering::Acquire);
-            let tail = self.tail.load(Ordering::Acquire);
-            let next = unsafe { (*head).next.load(Ordering::Acquire) };
-
-            if head == self.head.load(Ordering::Acquire) {
-                if head == tail {
-                    if next.is_null() {
-                        return None;
-                    }
-
-                    let _ =
-                        self.tail
-                            .compare_exchange(tail, next, Ordering::AcqRel, Ordering::Acquire);
-                } else {
-                    if next.is_null() {
-                        continue;
-                    }
-
-                    let job = unsafe { (*next).job.as_ptr().read() };
-
-                    if self
-                        .head
-                        .compare_exchange(head, next, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        unsafe {
-                            let _ = Box::from_raw(head);
-                        }
-                        return Some(job);
-                    }
-                }
-            }
-        }
-    }
+struct WorkerSlot {
+    task: RwLock<Option<TaskHandle>>,
+    queue: Mutex<Vec<Job>>,
 }
 
 pub struct ThreadPool {
-    queue: JobQueue,
-    sleepers: Box<[AtomicUsize]>,
-    last_worker_idx: AtomicUsize,
+    workers: Box<[WorkerSlot]>,
     worker_count: usize,
+    next_worker: AtomicUsize,
+    deferred: Mutex<Vec<Job>>,
+    deferred_hint: AtomicBool,
 }
 
 struct WorkerArgs {
@@ -135,24 +40,28 @@ struct WorkerArgs {
 
 impl ThreadPool {
     pub fn new(threads: usize) -> Arc<Self> {
-        let mut sleepers = Vec::with_capacity(threads);
+        let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
-            sleepers.push(AtomicUsize::new(0));
+            workers.push(WorkerSlot {
+                task: RwLock::new(None),
+                queue: Mutex::new(Vec::new()),
+            });
         }
 
         let pool = Arc::new(Self {
-            queue: JobQueue::new(),
-            sleepers: sleepers.into_boxed_slice(),
-            last_worker_idx: AtomicUsize::new(0),
+            workers: workers.into_boxed_slice(),
             worker_count: threads,
+            next_worker: AtomicUsize::new(0),
+            deferred: Mutex::new(Vec::new()),
+            deferred_hint: AtomicBool::new(false),
         });
 
-        pool.start(threads);
+        pool.start();
         pool
     }
 
-    fn start(self: &Arc<Self>, threads: usize) {
-        for i in 0..threads {
+    fn start(self: &Arc<Self>) {
+        for i in 0..self.worker_count {
             let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
 
             let args = Box::new(WorkerArgs {
@@ -169,49 +78,86 @@ impl ThreadPool {
         }
     }
 
+    fn take_deferred(&self) -> Option<Job> {
+        if !self.deferred_hint.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut dq = self.deferred.lock();
+        let job = dq.pop();
+        if dq.is_empty() {
+            self.deferred_hint.store(false, Ordering::Release);
+        }
+        job
+    }
+
     pub fn submit(&self, function: JobFn, context: usize) {
-        self.queue.push(Job {
+        let job = Job {
             f: function,
             a: context,
-        });
+        };
 
-        let idx = self.last_worker_idx.fetch_add(1, Ordering::Relaxed) % self.worker_count;
+        for slot in self.workers.iter() {
+            let handle_opt = slot.task.read().clone();
+            if let Some(handle) = handle_opt {
+                let sleeping = {
+                    let t = handle.read();
+                    t.is_sleeping()
+                };
 
-        let sleeper_ptr = self.sleepers[idx].swap(0, Ordering::AcqRel);
-        if sleeper_ptr != 0 {
-            unsafe {
-                let task: Arc<RwLock<Task>> = Arc::from_raw(sleeper_ptr as *const _);
-                without_interrupts(|| {
-                    task.write().wake();
-                });
+                if sleeping {
+                    {
+                        let mut q = slot.queue.lock();
+                        q.push(job);
+                    }
+                    SCHEDULER.wake_task(&handle);
+                    return;
+                }
             }
         }
+
+        let start = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count;
+
+        for off in 0..self.worker_count {
+            let idx = (start + off) % self.worker_count;
+            let slot = &self.workers[idx];
+
+            if let Some(mut guard) = slot.queue.try_lock() {
+                guard.push(job);
+
+                if let Some(handle) = slot.task.read().clone() {
+                    SCHEDULER.wake_task(&handle);
+                }
+                return;
+            }
+        }
+
+        let mut dq = self.deferred.lock();
+        dq.push(job);
+        self.deferred_hint.store(true, Ordering::Release);
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
-        self.queue.push(Job { f, a });
+        self.submit(f, a);
+        true
+    }
 
-        for sleeper in self.sleepers.iter() {
-            let sleeper_ptr = sleeper.swap(0, Ordering::AcqRel);
-            if sleeper_ptr != 0 {
-                unsafe {
-                    let task: Arc<RwLock<Task>> = Arc::from_raw(sleeper_ptr as *const _);
-                    without_interrupts(|| {
-                        task.write().wake();
-                    });
-                }
+    pub fn try_execute_one(&self) -> bool {
+        for slot in self.workers.iter() {
+            let job_opt = {
+                let mut q = slot.queue.lock();
+                q.pop()
+            };
+            if let Some(job) = job_opt {
+                (job.f)(job.a);
                 return true;
             }
         }
 
-        false
-    }
-
-    pub fn try_execute_one(&self) -> bool {
-        if let Some(j) = self.queue.pop() {
-            (j.f)(j.a);
+        if let Some(job) = self.take_deferred() {
+            (job.f)(job.a);
             return true;
         }
+
         false
     }
 }
@@ -225,40 +171,38 @@ extern "C" fn worker(args_ptr: usize) {
         .get_current_task(current_cpu_id())
         .expect("worker task missing");
 
+    {
+        let mut slot = pool.workers[my_idx].task.write();
+        *slot = Some(me.clone());
+    }
+
     loop {
-        if let Some(j) = pool.queue.pop() {
-            (j.f)(j.a);
-            continue;
-        }
+        loop {
+            let job_opt = {
+                let mut q = pool.workers[my_idx].queue.lock();
+                q.pop()
+            };
+            if let Some(job) = job_opt {
+                (job.f)(job.a);
 
-        let raw = Arc::into_raw(me.clone()) as usize;
-
-        match pool.sleepers[my_idx].compare_exchange(0, raw, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => {
-                without_interrupts(|| {
-                    me.write().is_sleeping = true;
-                });
-
-                unsafe {
-                    task_yield();
+                if pool.deferred_hint.load(Ordering::Acquire) {
+                    if let Some(djob) = pool.take_deferred() {
+                        (djob.f)(djob.a);
+                    }
                 }
 
                 continue;
             }
-            Err(existing) => {
-                unsafe {
-                    let _ = TaskHandle::from_raw(raw as *const _);
-                }
+            break;
+        }
 
-                if existing != 0 {
-                    unsafe {
-                        let task: TaskHandle = Arc::from_raw(existing as *const _);
-                        without_interrupts(|| {
-                            task.write().wake();
-                        });
-                    }
-                }
+        if pool.deferred_hint.load(Ordering::Acquire) {
+            if let Some(job) = pool.take_deferred() {
+                (job.f)(job.a);
+                continue;
             }
         }
+
+        SCHEDULER.sleep_and_yield();
     }
 }

@@ -147,7 +147,7 @@ extern "win64" fn volclass_start(
 ) -> DriverStatus {
     let _ = refresh_fs_registry_from_registry();
     init_volume_dx(&dev);
-    mount_if_unmounted(dev);
+    block_on(mount_if_unmounted(dev));
     DriverStatus::Continue
 }
 
@@ -207,7 +207,7 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry();
-            mount_if_unmounted(dev);
+            mount_if_unmounted(dev).await;
             DriverStatus::Success
         }
         IOCTL_MOUNTMGR_LIST_FS => {

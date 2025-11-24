@@ -153,6 +153,9 @@ impl Task {
     pub fn wake(&mut self) {
         self.is_sleeping = false;
     }
+    pub fn is_sleeping(&self) -> bool {
+        self.is_sleeping
+    }
 }
 
 //Idle task to prevent return
