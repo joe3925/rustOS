@@ -135,7 +135,7 @@ pub extern "win64" fn reg_set_value(
 
 #[no_mangle]
 pub extern "win64" fn reg_create_key(path: &str) -> Result<(), RegError> {
-    block_on(reg::create_key(path))
+    block_on(reg::create_key(path.to_string()))
 }
 
 #[no_mangle]
@@ -170,7 +170,7 @@ pub extern "win64" fn pnp_create_pdo(
     PNP_MANAGER.create_child_devnode_and_pdo(parent_devnode, name, instance_path, ids, class)
 }
 pub extern "win64" fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
-    PNP_MANAGER.bind_and_start(dn)
+    block_on(PNP_MANAGER.bind_and_start(dn))
 }
 
 pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
@@ -311,7 +311,7 @@ pub extern "win64" fn pnp_ioctl_via_symlink(
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
-    PNP_MANAGER.load_service(&name)
+    block_on(PNP_MANAGER.load_service(&name))
 }
 
 #[unsafe(no_mangle)]
@@ -350,7 +350,7 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
     function_fdo: &Arc<DeviceObject>,
     init_pdo: DeviceInit,
 ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError> {
-    PNP_MANAGER.create_devnode_over_pdo_with_function(
+    block_on(PNP_MANAGER.create_devnode_over_pdo_with_function(
         parent_dn.clone(),
         instance_path,
         ids,
@@ -358,7 +358,7 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
         function_service,
         function_fdo.clone(),
         init_pdo,
-    )
+    ))
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_send_request_to_next_upper(

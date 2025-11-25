@@ -19,7 +19,6 @@ use kernel_api::{
     async_ffi::FutureExt,
     block_on,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    io_handler,
     kernel_types::io::{IoType, Synchronization},
     pnp::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
@@ -27,6 +26,7 @@ use kernel_api::{
     },
     println,
     request::{Request, RequestType, TraversalPolicy},
+    request_handler,
     status::DriverStatus,
 };
 
@@ -114,7 +114,6 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     unsafe { driver_set_evt_device_add(driver, disk_device_add) };
     DriverStatus::Success
 }
-
 pub extern "win64" fn disk_device_add(
     _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
@@ -131,7 +130,7 @@ pub extern "win64" fn disk_device_add(
     dev_init.set_dev_ext_default::<DiskExt>();
     DriverStatus::Success
 }
-#[io_handler]
+#[request_handler]
 pub async fn disk_read(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
@@ -221,7 +220,7 @@ pub async fn disk_read(
     return DriverStatus::Success;
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn disk_write(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
@@ -302,7 +301,7 @@ pub async fn disk_write(
     return DriverStatus::Success;
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStatus {
     let code = match parent.read().kind {
         RequestType::DeviceControl(c) => c,

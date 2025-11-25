@@ -18,6 +18,7 @@ use kernel_api::{
     },
     print, println,
     request::Request,
+    request_handler,
     status::DriverStatus,
 };
 use spin::RwLock;
@@ -68,7 +69,8 @@ pub extern "win64" fn ps2_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
+#[request_handler]
+pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     if let Ok(mut ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -81,7 +83,8 @@ extern "win64" fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) 
     DriverStatus::Continue
 }
 
-extern "win64" fn ps2_query_devrels(
+#[request_handler]
+pub async fn ps2_query_devrels(
     device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {

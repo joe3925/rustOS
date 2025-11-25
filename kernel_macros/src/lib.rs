@@ -4,7 +4,7 @@ use quote::{quote, quote_spanned};
 use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
 #[proc_macro_attribute]
-pub fn io_handler(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
         return syn::Error::new(Span::call_site(), "#[io_handler] does not accept arguments")
             .to_compile_error()

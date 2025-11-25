@@ -27,6 +27,7 @@ use kernel_api::pnp::get_acpi_tables;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::println;
 use kernel_api::request::Request;
+use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
 use kernel_api::x86_64::VirtAddr;
@@ -770,7 +771,8 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 }
 
 /* --------------------------- PnP minor callbacks --------------------------- */
-extern "win64" fn acpi_pdo_query_resources(
+#[request_handler]
+pub async fn acpi_pdo_query_resources(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -793,10 +795,8 @@ extern "win64" fn acpi_pdo_query_resources(
     DriverStatus::Success
 }
 
-extern "win64" fn acpi_pdo_query_id(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn acpi_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
@@ -839,9 +839,7 @@ extern "win64" fn acpi_pdo_query_id(
     DriverStatus::Success
 }
 
-extern "win64" fn acpi_pdo_start(
-    _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn acpi_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     DriverStatus::Success
 }

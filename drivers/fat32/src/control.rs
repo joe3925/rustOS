@@ -14,7 +14,6 @@ use spin::{Mutex, RwLock};
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt, block_on,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    io_handler,
     kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
     pnp::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
@@ -23,6 +22,7 @@ use kernel_api::{
     },
     println,
     request::{Request, RequestType, TraversalPolicy},
+    request_handler,
     status::DriverStatus,
     util::bytes_to_box,
 };
@@ -58,7 +58,7 @@ fn init_logger() {
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
-#[io_handler]
+#[request_handler]
 pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
         let r = req.read();

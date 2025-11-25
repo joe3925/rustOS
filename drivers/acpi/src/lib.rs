@@ -22,10 +22,10 @@ use kernel_api::pnp::{
     PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::println;
 use kernel_api::request::Request;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
+use kernel_api::{println, request_handler};
 use spin::{Mutex, RwLock};
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -59,7 +59,8 @@ pub extern "win64" fn bus_driver_device_add(
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_prepare_hardware(
+#[request_handler]
+pub async fn bus_driver_prepare_hardware(
     device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -106,10 +107,8 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     unsafe { core::slice::from_raw_parts(ptr, len) }
 }
 
-pub extern "win64" fn enumerate_bus(
-    device: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = unsafe {

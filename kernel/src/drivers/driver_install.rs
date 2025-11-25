@@ -265,11 +265,13 @@ fn escape_key(s: &str) -> alloc::string::String {
 }
 async fn ensure_class_key(cls: &str) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
+
     if reg::get_key(&class_key).await.is_none() {
-        reg::create_key(&class_key).await;
+        reg::create_key(class_key.clone()).await?;
     }
-    reg::create_key(&alloc::format!("{}/UpperFilters", class_key)).await;
-    reg::create_key(&alloc::format!("{}/LowerFilters", class_key)).await;
+
+    reg::create_key(alloc::format!("{}/UpperFilters", class_key)).await?;
+    reg::create_key(alloc::format!("{}/LowerFilters", class_key)).await?;
     Ok(())
 }
 
@@ -291,11 +293,14 @@ async fn reg_add_filter_index(
     };
 
     let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/{}/{}", kind, id_key);
-    reg::create_key(&base).await?;
+    reg::create_key(base.clone()).await?;
+
     let pos_path = alloc::format!("{}/{}", base, pos_s);
-    reg::create_key(&pos_path).await?;
+    reg::create_key(pos_path.clone()).await?;
+
     let svc_path = alloc::format!("{}/{}", pos_path, service);
-    reg::create_key(&svc_path).await?;
+    reg::create_key(svc_path.clone()).await?;
+
     reg::set_value(&svc_path, "Order", Data::U32(order)).await?;
     reg::set_value(&svc_path, "Service", Data::Str(service.to_string())).await?;
     Ok(())
@@ -308,7 +313,7 @@ async fn reg_append_class_filter(
 ) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
     if reg::get_key(&class_key).await.is_none() {
-        let _ = reg::create_key(&class_key).await;
+        reg::create_key(class_key.clone()).await?;
     }
 
     let list_key = match pos {
@@ -317,7 +322,7 @@ async fn reg_append_class_filter(
     };
 
     if reg::get_key(&list_key).await.is_none() {
-        let _ = reg::create_key(&list_key).await;
+        reg::create_key(list_key.clone()).await?;
     }
 
     let idx = reg::get_key(&list_key)
@@ -336,12 +341,12 @@ async fn reg_append_class_filter(
 async fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
     if reg::get_key(&class_key).await.is_none() {
-        let _ = reg::create_key(&class_key).await;
+        reg::create_key(class_key.clone()).await?;
     }
 
     let members_key = alloc::format!("{}/Members", class_key);
     if reg::get_key(&members_key).await.is_none() {
-        let _ = reg::create_key(&members_key).await;
+        reg::create_key(members_key.clone()).await?;
     }
 
     if let Some(k) = reg::get_key(&members_key).await {
@@ -371,8 +376,8 @@ fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
 
-pub async fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
-    let driver = parse_driver_toml(toml_path)
+pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
+    let driver = parse_driver_toml(&toml_path)
         .await
         .map_err(|_| DriverError::TomlParse)?;
     let driver_name = service_name_from_image(&driver.image);
@@ -392,10 +397,10 @@ pub async fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
     let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     img_src.move_no_copy(&img_target_path).await?;
 
-    let toml_src = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
+    let toml_src = File::open(&toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     toml_src.move_no_copy(&toml_target_path).await?;
 
-    reg::create_key(&key_path).await?;
+    reg::create_key(key_path.clone()).await?;
     reg::set_value(
         &key_path,
         "ImagePath",
@@ -439,7 +444,7 @@ pub async fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
 
             if !driver.hwids.is_empty() {
                 let hwk = alloc::format!("{}/Hwids", key_path.trim_end_matches('/'));
-                reg::create_key(&hwk).await?;
+                reg::create_key(hwk.clone()).await?;
                 for (i, h) in driver.hwids.iter().enumerate() {
                     reg::set_value(&hwk, &alloc::format!("{}", i), Data::Str(h.clone())).await?;
                 }
@@ -449,7 +454,7 @@ pub async fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         DriverRole::Filter => {
             let f = driver.filter.as_ref().ok_or(DriverError::TomlParse)?;
             let flt_key = alloc::format!("{}/Filter", key_path.trim_end_matches('/'));
-            reg::create_key(&flt_key).await?;
+            reg::create_key(flt_key.clone()).await?;
             let pos_s = match f.position {
                 FilterPosition::Upper => "upper",
                 FilterPosition::Lower => "lower",
@@ -482,59 +487,67 @@ pub async fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
     }
 
     for rw in driver.reg_writes.iter() {
-        reg::create_key(&rw.path).await?;
+        reg::create_key(rw.path.clone()).await?;
         for (name, val) in rw.values.iter() {
             reg::set_value(&rw.path, name, val.clone()).await?;
         }
     }
 
-    PNP_MANAGER.recheck_all_devices();
+    PNP_MANAGER.recheck_all_devices().await;
     Ok(())
 }
 
 pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
-    const DRIVER_ROOT: &str = "C:\\INSTALL\\DRIVERS";
+    let driver_root: &str = "C:\\INSTALL\\DRIVERS";
 
-    let packages = File::list_dir(DRIVER_ROOT)
+    let packages = File::list_dir(driver_root)
         .await
         .map_err(DriverError::File)?;
 
     for pkg in packages {
-        let pkg_path = alloc::format!("{}\\{}", DRIVER_ROOT, pkg);
+        let pkg_path = alloc::format!("{driver_root}\\{pkg}");
 
         let entries = match File::list_dir(&pkg_path).await {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        if let Some(toml_name) = entries
-            .iter()
-            .find(|n| n.to_ascii_lowercase().ends_with(".toml"))
-        {
-            let toml_path = alloc::format!("{}\\{}", pkg_path, toml_name);
-            //TODO: log every non fatal error
-            match install_driver_toml(&toml_path).await {
-                Ok(_) => {
-                    println!("Installed {}", toml_path);
-                }
-                Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
-                    println!(
-                        "Couldn't install driver {} failed with error: {:#?}",
-                        toml_path,
-                        DriverError::Registry(RegError::KeyAlreadyExists)
-                    );
-                }
-                Err(DriverError::Registry(e)) => {
-                    return Err(DriverError::Registry(e));
-                }
-                Err(e) => {
-                    println!(
-                        "Couldn't install driver {} failed with error: {:#?}",
-                        toml_path, e
-                    );
-                }
+        let mut toml_name: Option<String> = None;
+        for entry in entries {
+            let name_str: &str = entry.as_ref();
+            if name_str.to_ascii_lowercase().ends_with(".toml") {
+                toml_name = Some(name_str.to_string());
+                break;
             }
         }
+
+        let Some(toml_name) = toml_name else {
+            continue;
+        };
+
+        let toml_path = alloc::format!("{pkg_path}\\{toml_name}");
+        install_driver_toml(toml_path).await;
+        // match install_driver_toml(&toml_path).await {
+        //     Ok(_) => {
+        //         println!("Installed {}", toml_path);
+        //     }
+        //     Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
+        //         println!(
+        //             "Couldn't install driver {} failed with error: {:#?}",
+        //             toml_path,
+        //             DriverError::Registry(RegError::KeyAlreadyExists)
+        //         );
+        //     }
+        //     Err(DriverError::Registry(e)) => {
+        //         return Err(DriverError::Registry(e));
+        //     }
+        //     Err(e) => {
+        //         println!(
+        //             "Couldn't install driver {} failed with error: {:#?}",
+        //             toml_path, e
+        //         );
+        //     }
+        // }
     }
 
     Ok(())

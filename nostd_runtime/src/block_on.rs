@@ -53,7 +53,9 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 
     loop {
         match pinned_future.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => return output,
+            Poll::Ready(output) => {
+                return output;
+            }
             Poll::Pending => {
                 while !notify.ready.swap(false, Ordering::Acquire) {
                     //unsafe { task_yield() };

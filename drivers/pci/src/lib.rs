@@ -27,6 +27,7 @@ use kernel_api::{
     },
     println,
     request::Request,
+    request_handler,
     status::DriverStatus,
 };
 use spin::{Once, RwLock};
@@ -66,7 +67,8 @@ pub extern "win64" fn bus_driver_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn pci_bus_pnp_start(
+#[request_handler]
+pub async fn pci_bus_pnp_start(
     device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -82,7 +84,7 @@ extern "win64" fn pci_bus_pnp_start(
     );
 
     let child = Arc::new(RwLock::new(query));
-    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }?);
+    let st = unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }?.await;
 
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
@@ -124,7 +126,8 @@ extern "win64" fn pci_bus_pnp_start(
     DriverStatus::Continue
 }
 
-extern "win64" fn pci_bus_pnp_query_devrels(
+#[request_handler]
+pub async fn pci_bus_pnp_query_devrels(
     device: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -236,10 +239,8 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     };
 }
 
-extern "win64" fn pci_pdo_query_id(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn pci_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     use kernel_api::pnp::QueryIdType;
 
     let ext = match dev.try_devext::<PciPdoExt>() {
@@ -280,7 +281,8 @@ extern "win64" fn pci_pdo_query_id(
     DriverStatus::Success
 }
 
-extern "win64" fn pci_pdo_query_resources(
+#[request_handler]
+pub async fn pci_pdo_query_resources(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -299,16 +301,15 @@ extern "win64" fn pci_pdo_query_resources(
     DriverStatus::Success
 }
 
-extern "win64" fn pci_pdo_start(
-    _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn pci_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let mut r = req.write();
 
     DriverStatus::Success
 }
 
-extern "win64" fn pci_pdo_query_devrels(
+#[request_handler]
+pub async fn pci_pdo_query_devrels(
     _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {

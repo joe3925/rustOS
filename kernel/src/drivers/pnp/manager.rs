@@ -22,14 +22,15 @@ use kernel_types::pnp::{
 use kernel_types::request::{Request, RequestFuture};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
-use nostd_runtime::block_on;
 use spin::{Mutex, RwLock};
+
 #[repr(C)]
 pub struct ClassListener {
     pub class: String,
     pub dev: Arc<DeviceObject>,
     pub cb: ClassAddCallback,
 }
+
 pub struct PnpManager {
     hw: RwLock<Arc<HwIndex>>,
     drivers: RwLock<BTreeMap<String, Arc<DriverObject>>>,
@@ -53,8 +54,8 @@ impl PnpManager {
         self.dev_root.clone()
     }
 
-    pub fn init_from_registry(&self) -> Result<(), RegError> {
-        self.rebuild_index()?;
+    pub async fn init_from_registry(&self) -> Result<(), RegError> {
+        self.rebuild_index().await?;
         let root_node = self.root();
         let boot_packages: Vec<_> = {
             let hw = self.hw.read();
@@ -85,7 +86,7 @@ impl PnpManager {
                 None,
                 pdo_init,
             );
-            if let Err(e) = self.bind_and_start(&devnode) {
+            if let Err(e) = self.bind_and_start(&devnode).await {
                 println!("-> bind/start '{}' failed: {:?}", devnode.name, e);
             }
         }
@@ -93,54 +94,59 @@ impl PnpManager {
         Ok(())
     }
 
-    pub fn rebuild_index(&self) -> Result<(), RegError> {
-        // TODO: change this whole path to async at some point
-        *self.hw.write() = Arc::new(block_on(idx::build_hw_index())?);
+    pub async fn rebuild_index(&self) -> Result<(), RegError> {
+        let hw = idx::build_hw_index().await?;
+        *self.hw.write() = Arc::new(hw);
         Ok(())
     }
 
-    pub fn recheck_all_devices(&self) {
-        self.rebuild_index();
+    pub async fn recheck_all_devices(&self) {
+        let _ = self.rebuild_index().await;
         let root = self.root();
-        self.rebind_tree(&root);
+        self.rebind_tree(&root).await;
         self.rescan_buses_started(&root);
     }
 
-    pub fn rebind_faulted_and_unbound(&self) {
+    pub async fn rebind_faulted_and_unbound(&self) {
         if self.hw.read().by_driver.is_empty() {
-            let _ = self.rebuild_index();
+            let _ = self.rebuild_index().await;
         }
         let root = self.root();
-        self.rebind_tree(&root);
+        self.rebind_tree(&root).await;
     }
 
-    fn rebind_tree(&self, dn: &Arc<DevNode>) {
-        let state = dn.get_state();
-        let needs_function = {
-            let g = dn.stack.read();
-            match g.as_ref() {
-                None => true,
-                Some(stk) => stk
-                    .function
-                    .as_ref()
-                    .and_then(|l| l.devobj.as_ref())
-                    .is_none(),
+    async fn rebind_tree(&self, dn: &Arc<DevNode>) {
+        let mut stack: Vec<Arc<DevNode>> = Vec::new();
+        stack.push(dn.clone());
+
+        while let Some(node) = stack.pop() {
+            let state = node.get_state();
+            let needs_function = {
+                let g = node.stack.read();
+                match g.as_ref() {
+                    None => true,
+                    Some(stk) => stk
+                        .function
+                        .as_ref()
+                        .and_then(|l| l.devobj.as_ref())
+                        .is_none(),
+                }
+            };
+            if needs_function
+                && matches!(
+                    state,
+                    DevNodeState::Initialized | DevNodeState::Faulted | DevNodeState::Stopped
+                )
+            {
+                let _ = self.bind_and_start(&node).await;
             }
-        };
-        if needs_function
-            && matches!(
-                state,
-                DevNodeState::Initialized | DevNodeState::Faulted | DevNodeState::Stopped
-            )
-        {
-            let _ = self.bind_and_start(dn);
-        }
-        let kids: Vec<Arc<DevNode>> = {
-            let g = dn.children.read();
-            g.iter().cloned().collect()
-        };
-        for ch in kids {
-            self.rebind_tree(&ch);
+            let kids: Vec<Arc<DevNode>> = {
+                let g = node.children.read();
+                g.iter().cloned().collect()
+            };
+            for ch in kids {
+                stack.push(ch);
+            }
         }
     }
 
@@ -190,7 +196,7 @@ impl PnpManager {
         instance_path: String,
         ids: DeviceIds,
         class: Option<String>,
-        mut init: DeviceInit,
+        init: DeviceInit,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
         let pdo = DeviceObject::new(init);
@@ -211,13 +217,13 @@ impl PnpManager {
         (dev_node, pdo)
     }
 
-    pub fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
-        self.bind_device(dn)?;
-        self.start_stack(dn);
+    pub async fn bind_and_start(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
+        self.bind_device(dn).await?;
+        self.start_stack(dn).await;
         Ok(())
     }
 
-    fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
+    async fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         let mut func_pkg: Option<Arc<DriverPackage>> = None;
 
         if let Some(hwid) = dn.ids.hardware.get(0) {
@@ -242,7 +248,7 @@ impl PnpManager {
             }
         }
         if func_pkg.is_none() {
-            if let Some(pkg) = self.resolve_class_driver(dn.class.as_deref())? {
+            if let Some(pkg) = self.resolve_class_driver(dn.class.as_deref()).await? {
                 func_pkg = Some(pkg);
             }
         }
@@ -253,15 +259,10 @@ impl PnpManager {
         let func_drv = self.ensure_loaded(&resolved_func_pkg)?;
 
         let class_name = dn.class.as_deref();
-        let (lower_pkgs, upper_pkgs) = self.resolve_filters(
-            &dn.ids
-                .hardware
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>(),
-            class_name,
-            &resolved_func_pkg.name,
-        )?;
+        let hw_ids: Vec<&str> = dn.ids.hardware.iter().map(|s| s.as_str()).collect();
+        let (lower_pkgs, upper_pkgs) = self
+            .resolve_filters(&hw_ids, class_name, &resolved_func_pkg.name)
+            .await?;
 
         let lower_layers: Vec<_> = lower_pkgs
             .into_iter()
@@ -297,7 +298,7 @@ impl PnpManager {
         Ok(())
     }
 
-    fn resolve_class_driver(
+    async fn resolve_class_driver(
         &self,
         class_opt: Option<&str>,
     ) -> Result<Option<Arc<DriverPackage>>, DriverError> {
@@ -306,7 +307,7 @@ impl PnpManager {
         };
 
         let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
-        let svc = match block_on(get_value(&class_key, "Class")) {
+        let svc = match get_value(&class_key, "Class").await {
             Some(Data::Str(s)) if !s.is_empty() => s,
             _ => return Ok(None),
         };
@@ -317,17 +318,17 @@ impl PnpManager {
 
         let svc_key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
 
-        let image = match block_on(get_value(&svc_key, "ImagePath")) {
+        let image = match get_value(&svc_key, "ImagePath").await {
             Some(Data::Str(s)) => s,
             _ => return Ok(None),
         };
 
-        let toml_path = match block_on(get_value(&svc_key, "TomlPath")) {
+        let toml_path = match get_value(&svc_key, "TomlPath").await {
             Some(Data::Str(s)) => s,
             _ => return Ok(None),
         };
 
-        let start = match block_on(get_value(&svc_key, "Start")) {
+        let start = match get_value(&svc_key, "Start").await {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -347,7 +348,7 @@ impl PnpManager {
         })))
     }
 
-    fn resolve_filters(
+    async fn resolve_filters(
         &self,
         ids: &[&str],
         class_opt: Option<&str>,
@@ -366,13 +367,13 @@ impl PnpManager {
             let key = idx::escape_key(id);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/{pos}");
-                if let Some(children) = block_on(list_keys(&base)).ok() {
+                if let Some(children) = list_keys(&base).await.ok() {
                     for svc_path in children {
-                        let order = match block_on(get_value(&svc_path, "Order")) {
+                        let order = match get_value(&svc_path, "Order").await {
                             Some(Data::U32(v)) => v,
                             _ => 100,
                         };
-                        let service = match block_on(get_value(&svc_path, "Service")) {
+                        let service = match get_value(&svc_path, "Service").await {
                             Some(Data::Str(s)) => s,
                             _ => svc_path
                                 .rsplit_once('/')
@@ -393,13 +394,13 @@ impl PnpManager {
             let key = idx::escape_key(class);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/{pos}");
-                if let Some(children) = block_on(list_keys(&base)).ok() {
+                if let Some(children) = list_keys(&base).await.ok() {
                     for svc_path in children {
-                        let order = match block_on(get_value(&svc_path, "Order")) {
+                        let order = match get_value(&svc_path, "Order").await {
                             Some(Data::U32(v)) => v,
                             _ => 100,
                         };
-                        let service = match block_on(get_value(&svc_path, "Service")) {
+                        let service = match get_value(&svc_path, "Service").await {
                             Some(Data::Str(s)) => s,
                             _ => svc_path
                                 .rsplit_once('/')
@@ -420,7 +421,7 @@ impl PnpManager {
                 [("LowerFilters", &mut lowers), ("UpperFilters", &mut uppers)]
             {
                 let list_key = alloc::format!("{class_key}/{list_name}");
-                if let Some(k) = block_on(get_key(&list_key)) {
+                if let Some(k) = get_key(&list_key).await {
                     let base_order = if list_name == "LowerFilters" {
                         10_000
                     } else {
@@ -428,7 +429,7 @@ impl PnpManager {
                     };
                     for i in 0..k.values.len() {
                         let idxs = alloc::format!("{}", i);
-                        if let Some(Data::Str(svc)) = block_on(get_value(&list_key, &idxs)) {
+                        if let Some(Data::Str(svc)) = get_value(&list_key, &idxs).await {
                             target_vec.push(Item {
                                 order: base_order + (i as u32),
                                 service: svc,
@@ -445,13 +446,13 @@ impl PnpManager {
                 idx::escape_key(function_service),
                 pos
             );
-            if let Some(children) = block_on(list_keys(&base)).ok() {
+            if let Some(children) = list_keys(&base).await.ok() {
                 for svc_path in children {
-                    let order = match block_on(get_value(&svc_path, "Order")) {
+                    let order = match get_value(&svc_path, "Order").await {
                         Some(Data::U32(v)) => v,
                         _ => 100,
                     };
-                    let service = match block_on(get_value(&svc_path, "Service")) {
+                    let service = match get_value(&svc_path, "Service").await {
                         Some(Data::Str(s)) => s,
                         _ => svc_path
                             .rsplit_once('/')
@@ -498,14 +499,14 @@ impl PnpManager {
 
         let mut lower_rts = Vec::new();
         for svc in lower_svcs {
-            if let Some(rt) = self.pkg_by_service(&svc) {
+            if let Some(rt) = self.pkg_by_service(&svc).await {
                 lower_rts.push(rt);
             }
         }
 
         let mut upper_rts = Vec::new();
         for svc in upper_svcs {
-            if let Some(rt) = self.pkg_by_service(&svc) {
+            if let Some(rt) = self.pkg_by_service(&svc).await {
                 upper_rts.push(rt);
             }
         }
@@ -513,24 +514,24 @@ impl PnpManager {
         Ok((lower_rts, upper_rts))
     }
 
-    fn pkg_by_service(&self, svc: &str) -> Option<Arc<DriverPackage>> {
+    async fn pkg_by_service(&self, svc: &str) -> Option<Arc<DriverPackage>> {
         if let Some(p) = self.hw.read().by_driver.get(svc) {
             return Some(p.clone());
         }
 
         let key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
 
-        let image = match block_on(get_value(&key, "ImagePath")) {
+        let image = match get_value(&key, "ImagePath").await {
             Some(Data::Str(s)) => s,
             _ => return None,
         };
 
-        let toml = match block_on(get_value(&key, "TomlPath")) {
+        let toml = match get_value(&key, "TomlPath").await {
             Some(Data::Str(s)) => s,
             _ => return None,
         };
 
-        let start = match block_on(get_value(&key, "Start")) {
+        let start = match get_value(&key, "Start").await {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -615,7 +616,7 @@ impl PnpManager {
         None
     }
 
-    fn ensure_function_attached(&self, dn: &Arc<DevNode>, stk: &mut DeviceStack) -> bool {
+    async fn ensure_function_attached(&self, dn: &Arc<DevNode>, stk: &mut DeviceStack) -> bool {
         if stk
             .function
             .as_ref()
@@ -628,9 +629,9 @@ impl PnpManager {
             Some(c) => c,
             None => return false,
         };
-        let pkg = match self.resolve_class_driver(Some(class)).ok().flatten() {
-            Some(p) => p,
-            None => return false,
+        let pkg = match self.resolve_class_driver(Some(class)).await {
+            Ok(Some(p)) => p,
+            _ => return false,
         };
         let drv = match self.ensure_loaded(&pkg) {
             Ok(d) => d,
@@ -653,7 +654,7 @@ impl PnpManager {
         }
     }
 
-    fn start_stack(&self, dn: &Arc<DevNode>) {
+    async fn start_stack(&self, dn: &Arc<DevNode>) {
         let top_of_stack: Option<Arc<DeviceObject>> = {
             let mut guard = dn.stack.write();
             let stk = guard.as_mut().unwrap();
@@ -680,7 +681,7 @@ impl PnpManager {
                 }
             }
 
-            let have_function = self.ensure_function_attached(dn, stk);
+            let have_function = self.ensure_function_attached(dn, stk).await;
             if !have_function {
                 stk.lower.clear();
                 stk.upper.clear();
@@ -734,7 +735,8 @@ impl PnpManager {
             let target = IoTarget {
                 target_device: top_device,
             };
-            block_on(self.send_request(&target, req_arc.clone()).resolve());
+
+            self.send_request(&target, req_arc).resolve().await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -748,7 +750,6 @@ impl PnpManager {
 
         if req.status == DriverStatus::Success {
             dev_node.set_state(DevNodeState::Started);
-            let pnp_manager = &*PNP_MANAGER;
             if let Some(top_device) = dev_node
                 .stack
                 .read()
@@ -771,12 +772,21 @@ impl PnpManager {
                 let target = IoTarget {
                     target_device: top_device,
                 };
-                block_on(pnp_manager.send_request(&target, req_arc.clone())?);
+
+                let send_res = (&*PNP_MANAGER).send_request(&target, req_arc);
+                let fut = match send_res {
+                    Ok(f) => f,
+                    Err(status) => return status,
+                };
+
+                nostd_runtime::spawn(async move {
+                    fut.await;
+                });
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
         }
-        return DriverStatus::Success;
+        DriverStatus::Success
     }
 
     pub extern "win64" fn process_enumerated_children(
@@ -796,7 +806,6 @@ impl PnpManager {
             return req.status;
         }
 
-        let pnp_manager = &*PNP_MANAGER;
         let children_to_start: Vec<Arc<DevNode>> = parent_dev_node
             .children
             .read()
@@ -805,10 +814,12 @@ impl PnpManager {
             .cloned()
             .collect();
         for child_dn in children_to_start {
-            let r = pnp_manager.bind_and_start(&child_dn);
-            if let Err(e) = r {}
+            let dn = child_dn.clone();
+            nostd_runtime::spawn(async move {
+                let _ = PNP_MANAGER.bind_and_start(&dn).await;
+            });
         }
-        return DriverStatus::Success;
+        DriverStatus::Success
     }
 
     fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
@@ -969,6 +980,7 @@ impl PnpManager {
             Err(DriverStatus::NoSuchDevice)
         }
     }
+
     pub fn ioctl_via_symlink(
         &self,
         link_path: String,
@@ -1115,7 +1127,7 @@ impl PnpManager {
             })
     }
 
-    pub fn create_devnode_over_pdo_with_function(
+    pub async fn create_devnode_over_pdo_with_function(
         &self,
         parent_dn: Arc<DevNode>,
         instance_path: String,
@@ -1155,6 +1167,7 @@ impl PnpManager {
 
         let func_pkg = self
             .pkg_by_service(function_service)
+            .await
             .ok_or(DriverError::NoParent)?;
         let func_drv = self.ensure_loaded(&func_pkg)?;
 
@@ -1164,8 +1177,9 @@ impl PnpManager {
             .map(|s| s.as_str())
             .chain(ids.compatible.iter().map(|s| s.as_str()))
             .collect();
-        let (lower_pkgs, upper_pkgs) =
-            self.resolve_filters(&id_strs, class.as_deref(), function_service)?;
+        let (lower_pkgs, upper_pkgs) = self
+            .resolve_filters(&id_strs, class.as_deref(), function_service)
+            .await?;
 
         let lower_layers: Vec<StackLayer> = lower_pkgs
             .into_iter()
@@ -1261,10 +1275,9 @@ impl PnpManager {
         let tgt = IoTarget {
             target_device: top.clone(),
         };
-        block_on(
-            self.send_request(&tgt, Arc::new(RwLock::new(start_request)))
-                .resolve(),
-        );
+        self.send_request(&tgt, Arc::new(RwLock::new(start_request)))
+            .resolve()
+            .await;
 
         dn.set_state(DevNodeState::Started);
         Ok((dn, top))
@@ -1305,19 +1318,25 @@ impl PnpManager {
         dev
     }
 
-    pub fn load_service(&self, svc: &str) -> Option<Arc<DriverObject>> {
+    pub async fn load_service(&self, svc: &str) -> Option<Arc<DriverObject>> {
         if let Some(drv) = self.drivers.read().get(svc).cloned() {
             let _ = self.ensure_driver_entry(&drv);
             return Some(drv);
         }
 
-        let pkg = if let Some(p) = self.hw.read().by_driver.get(svc) {
-            p.clone()
-        } else {
-            match self.pkg_by_service(svc) {
-                Some(p) => p,
-                None => return None,
-            }
+        if let Some(p) = self.hw.read().by_driver.get(svc) {
+            let pkg = p.clone();
+            let drv = match self.ensure_loaded(&pkg) {
+                Ok(d) => d,
+                Err(_) => return None,
+            };
+            let _ = self.ensure_driver_entry(&drv);
+            return Some(drv);
+        }
+
+        let pkg = match self.pkg_by_service(svc).await {
+            Some(p) => p,
+            None => return None,
         };
 
         let drv = match self.ensure_loaded(&pkg) {

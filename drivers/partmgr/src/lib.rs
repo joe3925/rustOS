@@ -20,7 +20,7 @@ use kernel_api::pnp::{
 use kernel_api::request::{Request, RequestType, TraversalPolicy};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::box_to_bytes;
-use kernel_api::{RequestExt, block_on, io_handler};
+use kernel_api::{RequestExt, block_on, request_handler};
 use spin::{Once, RwLock};
 
 use kernel_api::println;
@@ -128,7 +128,7 @@ async fn send_req_parent(
         Err(g.status)
     }
 }
-#[io_handler]
+#[request_handler]
 pub async fn partition_pdo_read(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
@@ -181,7 +181,7 @@ pub async fn partition_pdo_read(
         }
     }
 }
-#[io_handler]
+#[request_handler]
 pub async fn partition_pdo_write(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
@@ -234,7 +234,8 @@ pub async fn partition_pdo_write(
     }
 }
 
-extern "win64" fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+#[request_handler]
+pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let mut dx = ext::<PartMgrExt>(&dev);
 
     let parent = Arc::new(RwLock::new(
@@ -244,7 +245,7 @@ extern "win64" fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    block_on(unsafe { pnp_forward_request_to_next_lower(&dev, parent.clone()) }?);
+    unsafe { pnp_forward_request_to_next_lower(&dev, parent.clone()) }?.await;
 
     let (st, data) = {
         let g = parent.read();
@@ -279,7 +280,8 @@ async fn read_from_lower_async(
     }
 }
 
-extern "win64" fn partmgr_pnp_query_devrels(
+#[request_handler]
+pub async fn partmgr_pnp_query_devrels(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -312,7 +314,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
         return DriverStatus::Continue;
     }
     let sec_sz = sec_sz_u32 as usize;
-    let hdr_bytes = match block_on(read_from_lower_async(&device, sec_sz as u64, sec_sz)) {
+    let hdr_bytes = match read_from_lower_async(&device, sec_sz as u64, sec_sz).await {
         Ok(b) => b,
         Err(st) => {
             return st;
@@ -334,11 +336,13 @@ extern "win64" fn partmgr_pnp_query_devrels(
 
     let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
     let aligned_bytes = (total_bytes + (sec_sz - 1)) & !(sec_sz - 1);
-    let entries = match block_on(read_from_lower_async(
+    let entries = match read_from_lower_async(
         &device,
         hdr.partition_entry_lba.saturating_mul(sec_sz as u64),
         aligned_bytes,
-    )) {
+    )
+    .await
+    {
         Ok(b) => b,
         Err(st) => {
             return st;

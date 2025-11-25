@@ -19,7 +19,6 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::io_handler;
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -41,6 +40,7 @@ use kernel_api::println;
 use kernel_api::request::Request;
 use kernel_api::request::RequestType;
 use kernel_api::request::TraversalPolicy;
+use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::bytes_to_box;
 use spin::Once;
@@ -119,7 +119,8 @@ pub extern "win64" fn vol_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn vol_prepare_hardware(
+#[request_handler]
+pub async fn vol_prepare_hardware(
     dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -135,7 +136,7 @@ extern "win64" fn vol_prepare_hardware(
     );
 
     let req_lock = Arc::new(RwLock::new(req));
-    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone())? });
+    let st = unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone())? }.await;
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
@@ -165,7 +166,8 @@ extern "win64" fn vol_prepare_hardware(
 
     DriverStatus::Continue
 }
-pub extern "win64" fn vol_enumerate_devices(
+#[request_handler]
+pub async fn vol_enumerate_devices(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -269,7 +271,7 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStat
     return DriverStatus::Success;
 }
 // TODO: this can be optimized
-#[io_handler]
+#[request_handler]
 pub async fn vol_pdo_read(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
@@ -308,7 +310,7 @@ pub async fn vol_pdo_read(
     return DriverStatus::Success;
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn vol_pdo_write(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,

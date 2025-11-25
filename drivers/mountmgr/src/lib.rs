@@ -26,7 +26,6 @@ use kernel_api::{
     GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt, block_on,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult},
-    io_handler,
     kernel_types::{
         fs::OpenFlags,
         io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
@@ -41,7 +40,7 @@ use kernel_api::{
     println,
     reg::{self, switch_to_vfs},
     request::{Request, RequestType, TraversalPolicy},
-    spawn,
+    request_handler, spawn,
     status::{Data, DriverStatus, RegError},
 };
 
@@ -141,17 +140,18 @@ pub extern "win64" fn volclass_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn volclass_start(
+#[request_handler]
+pub async fn volclass_start(
     dev: Arc<DeviceObject>,
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let _ = refresh_fs_registry_from_registry();
     init_volume_dx(&dev);
-    block_on(mount_if_unmounted(dev));
+    mount_if_unmounted(dev).await;
     DriverStatus::Continue
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn vol_fdo_read(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -160,7 +160,7 @@ pub async fn vol_fdo_read(
     DriverStatus::Continue
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn vol_fdo_write(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -169,7 +169,7 @@ pub async fn vol_fdo_write(
     DriverStatus::Continue
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
         let r = req.read();
@@ -219,7 +219,7 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
     }
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn volclass_ctrl_ioctl(
     _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -668,7 +668,7 @@ fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
 async fn rescan_all_volumes() {
     let vols = VOLUMES.read();
     for dev in vols.clone() {
-        unsafe { block_on(mount_if_unmounted(dev.clone())) };
+        unsafe { mount_if_unmounted(dev.clone()).await };
     }
 }
 

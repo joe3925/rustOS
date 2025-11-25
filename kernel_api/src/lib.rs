@@ -15,7 +15,7 @@ pub use x86_64;
 
 use crate::util::random_number;
 pub use acpi;
-pub use kernel_macros::io_handler;
+pub use kernel_macros::request_handler;
 pub use nostd_runtime::block_on::*;
 pub use nostd_runtime::*;
 

@@ -10,6 +10,7 @@ use kernel_api::{
     pnp::{PnpMinorFunction, PnpVtable, driver_set_evt_device_add},
     println,
     request::Request,
+    request_handler,
     status::DriverStatus,
 };
 use spin::RwLock;
@@ -36,7 +37,8 @@ pub extern "win64" fn bus_driver_device_add(
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_prepare_hardware(
+#[request_handler]
+pub async fn bus_driver_prepare_hardware(
     device: Arc<DeviceObject>,
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {

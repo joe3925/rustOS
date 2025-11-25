@@ -3,6 +3,7 @@ extern crate rand_xoshiro;
 use crate::alloc::format;
 use crate::benchmarking::run_stats_loop;
 use crate::boot_packages;
+use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
     calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
@@ -43,7 +44,7 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use kernel_types::memory::Module;
-use nostd_runtime::block_on;
+use nostd_runtime::{block_on, spawn};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -134,11 +135,11 @@ pub fn kernel_main() {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
-    block_on(crate::drivers::driver_install::install_prepacked_drivers())
-        .expect("Failed to install pre packed drivers");
-    PNP_MANAGER
-        .init_from_registry()
-        .expect("Driver init failed");
+    spawn(async move {
+        install_prepacked_drivers().await;
+
+        PNP_MANAGER.init_from_registry().await;
+    });
 
     println!("");
     let task = Task::new_kernel_mode(

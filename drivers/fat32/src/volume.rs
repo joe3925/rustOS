@@ -27,7 +27,7 @@ use kernel_api::{
         FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
         FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
     },
-    io_handler, println,
+    request_handler, println,
 };
 
 use crate::block_dev::BlockDev;
@@ -115,7 +115,7 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
-#[io_handler]
+#[request_handler]
 pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let kind = { req.read().kind };
 

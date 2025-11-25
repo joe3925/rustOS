@@ -29,7 +29,7 @@ use kernel_api::request::{Request, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_ms;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::{RequestExt, block_on, io_handler};
+use kernel_api::{RequestExt, block_on, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -116,11 +116,8 @@ pub extern "win64" fn ide_device_add(
 
     DriverStatus::Success
 }
-
-extern "win64" fn ide_pnp_start(
-    dev: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+async fn ide_pnp_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     let mut child = Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
@@ -132,7 +129,7 @@ extern "win64" fn ide_pnp_start(
         Box::new([]),
     );
     let child = Arc::new(RwLock::new(child));
-    let st = block_on(unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?);
+    let st = unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await;
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
@@ -167,10 +164,8 @@ extern "win64" fn ide_pnp_start(
     DriverStatus::Continue
 }
 
-extern "win64" fn ide_pnp_query_devrels(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+async fn ide_pnp_query_devrels(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(&dev);
@@ -302,7 +297,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 }
 
-#[io_handler]
+#[request_handler]
 pub async fn ide_pdo_internal_ioctl(
     pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
@@ -747,10 +742,8 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
     false
 }
 
-extern "win64" fn ide_pdo_query_id(
-    pdo: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn ide_pdo_query_id(pdo: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     use QueryIdType::*;
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
     let mut w = req.write();
@@ -782,7 +775,8 @@ extern "win64" fn ide_pdo_query_id(
     DriverStatus::Success
 }
 
-extern "win64" fn ide_pdo_query_resources(
+#[request_handler]
+pub async fn ide_pdo_query_resources(
     pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
@@ -809,9 +803,7 @@ extern "win64" fn ide_pdo_query_resources(
     DriverStatus::Success
 }
 
-extern "win64" fn ide_pdo_start(
-    _pdo: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn ide_pdo_start(_pdo: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     DriverStatus::Success
 }

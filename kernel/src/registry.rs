@@ -206,32 +206,35 @@ pub mod reg {
         ensure_loaded().await;
         walk(&REGISTRY.read().root, path).cloned()
     }
-
-    pub async fn create_key(path: &str) -> Result<(), RegError> {
+    // this needs to be String not &str because of a compiler bug
+    pub async fn create_key(path: String) -> Result<(), RegError> {
         ensure_loaded().await;
         let mut new: Registry = (**REGISTRY.read()).clone();
 
-        let mut node_map = &mut new.root;
-        let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
+        {
+            let mut node_map = &mut new.root;
+            let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
 
-        while let Some(seg) = segments.next() {
-            let is_last = segments.peek().is_none();
+            while let Some(seg) = segments.next() {
+                let is_last = segments.peek().is_none();
 
-            if is_last {
-                if node_map.contains_key(seg) {
-                    return Err(RegError::KeyAlreadyExists);
+                if is_last {
+                    if node_map.contains_key(seg) {
+                        return Err(RegError::KeyAlreadyExists);
+                    } else {
+                        node_map.insert(seg.to_string(), Key::empty());
+                    }
                 } else {
-                    node_map.insert(seg.to_string(), Key::empty());
+                    node_map = &mut node_map
+                        .entry(seg.to_string())
+                        .or_insert_with(Key::empty)
+                        .sub_keys;
                 }
-            } else {
-                node_map = &mut node_map
-                    .entry(seg.to_string())
-                    .or_insert_with(Key::empty)
-                    .sub_keys;
             }
         }
 
-        persist(&new).await
+        persist(&new).await;
+        Ok(())
     }
 
     pub async fn delete_key(path: &str) -> Result<bool, RegError> {
