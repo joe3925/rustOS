@@ -63,7 +63,7 @@ impl PnpManager {
         let dev = target.target_device.clone();
         let req_clone = req.clone();
 
-        nostd_runtime::spawn(PNP_MANAGER.call_device_handler(dev, req_clone));
+        Self::spawn_device_handler(dev, req_clone);
 
         Ok(RequestFuture { req })
     }
@@ -136,9 +136,9 @@ impl PnpManager {
             func(waker_ctx.unwrap());
         }
     }
-
-    /// The entry point for async request dispatch.
-    /// Finds the handler, spawns a task on the executor, and handles the result asynchronously.
+    pub fn spawn_device_handler(dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
+        nostd_runtime::spawn(PNP_MANAGER.call_device_handler(dev.clone(), req_arc.clone()));
+    }
     async fn call_device_handler(&self, dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let (kind, policy) = {
             let r = req_arc.read();
@@ -155,25 +155,24 @@ impl PnpManager {
         }
 
         if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-            match h.synchronization {
-                Synchronization::Sync | Synchronization::Async => {
-                    let depth = if matches!(h.synchronization, Synchronization::Sync) {
-                        1u64
-                    } else {
-                        h.depth as u64
-                    };
-                    let cur = h.running_request.fetch_add(1, Ordering::AcqRel);
-                    if depth > 0 && cur >= depth {
-                        h.running_request.fetch_sub(1, Ordering::Release);
-                        {
-                            req_arc.write().status = DriverStatus::DeviceNotReady;
-                        }
-                        PNP_MANAGER.complete_request(&req_arc);
-                        return;
-                    }
-                }
-                _ => {}
-            }
+            // match h.synchronization {
+            //     Synchronization::Sync | Synchronization::Async => {
+            //         let depth = if matches!(h.synchronization, Synchronization::Sync) {
+            //             1u64
+            //         } else {
+            //             h.depth as u64
+            //         };
+            //         let cur = h.running_request.fetch_add(1, Ordering::AcqRel);
+            //         if depth > 0 && cur >= depth {
+            //             h.running_request.fetch_sub(1, Ordering::Release);
+            //             {
+            //                 Self::spawn_device_handler(dev, req_arc);
+            //             }
+            //             return;
+            //         }
+            //     }
+            //     _ => {}
+            // }
 
             let status = h.handler.invoke(dev.clone(), req_arc.clone());
 
