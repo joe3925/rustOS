@@ -816,7 +816,13 @@ impl PnpManager {
         for child_dn in children_to_start {
             let dn = child_dn.clone();
             nostd_runtime::spawn(async move {
-                let _ = PNP_MANAGER.bind_and_start(&dn).await;
+                let status: Result<(), DriverError> = PNP_MANAGER.bind_and_start(&dn).await;
+                if let Some(err) = status.err() {
+                    println!(
+                        "[MANAGER] Failed to bind and start node: {:#?} with error: {:#?}",
+                        dn.instance_path, err
+                    );
+                }
             });
         }
         DriverStatus::Success

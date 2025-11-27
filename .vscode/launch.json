@@ -1,25 +1,3 @@
-// {
-//     "version": "0.2.0",
-//     "configurations": [
-//         {
-//             "name": "LLDB Rust Kernel EFI",
-//             "type": "lldb",
-//             "request": "custom",
-//             "preLaunchTask": "dbg chain",
-//             "targetCreateCommands": [
-//                 "target create --no-dependents --arch x86_64 ${workspaceRoot}/target/debug/kernel.efi"
-//             ],
-//             "processCreateCommands": [
-//                 "gdb-remote localhost:1234",
-//                 "target modules load --file kernel.efi .text 0xFFFF850000000000"
-//             ],
-//             "sourceLanguages": [
-//                 "rust"
-//             ],
-//             "cwd": "${workspaceRoot}/kernel/src",
-//         }
-//     ]
-// }
 {
     "version": "0.2.0",
     "configurations": [
@@ -35,31 +13,31 @@
                 "gdb-remote localhost:1234",
                 "target modules load --file kernel.efi .text 0xFFFF850000000000",
                 // acpi.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\acpi\\acpi.dll\"",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\acpi\\acpi.dll\"",
                 "target modules load --file \"acpi.dll\" .text 0xffff900006d40000",
                 // pci.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\pci\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff900006f0a000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\pci\\pci.dll\"",
+                "target modules load --file \"pci.dll\" .text 0xffff900006f09000",
                 // i8042.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\i8042\\i8042.dll\"",
-                "target modules load --file \"i8042.dll\" .text 0xffff900006f5a000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\i8042\\i8042.dll\"",
+                "target modules load --file \"i8042.dll\" .text 0xffff900006f58000",
                 // ide.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\ide\\ide.dll\"",
-                "target modules load --file \"ide.dll\" .text 0xffff900006f94000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\ide\\ide.dll\"",
+                "target modules load --file \"ide.dll\" .text 0xffff900006f93000",
                 // disk.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\disk\\disk.dll\"",
-                "target modules load --file \"disk.dll\" .text 0xffff900006feb000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\disk\\disk.dll\"",
+                "target modules load --file \"disk.dll\" .text 0xffff900006fe9000",
                 // partmgr.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\partmgr\\partmgr.dll\"",
-                "target modules load --file \"partmgr.dll\" .text 0xffff90000702d000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\partmgr\\partmgr.dll\"",
+                "target modules load --file \"partmgr.dll\" .text 0xffff90000702b000",
                 // volmgr.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\volmgr\\volmgr.dll\"",
-                "target modules load --file \"volmgr.dll\" .text 0xffff90000707d000",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\volmgr\\volmgr.dll\"",
+                "target modules load --file \"volmgr.dll\" .text 0xffff90000707c000",
                 // mountmgr.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\mountmgr\\mountmgr.dll\"",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\mountmgr\\mountmgr.dll\"",
                 "target modules load --file \"mountmgr.dll\" .text 0xffff900006e92000",
                 // fat32.dll
-                "target modules add \"C:\\Users\\Boden\\Documents\\rustOS\\target\\DRIVERS\\fat32\\fat32.dll\"",
+                "target modules add \"${workspaceRoot}\\target\\DRIVERS\\fat32\\fat32.dll\"",
                 "target modules load --file \"fat32.dll\" .text 0xffff900006f22000"
             ],
             "sourceLanguages": [

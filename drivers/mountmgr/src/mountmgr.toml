@@ -2,4 +2,4 @@ image = "mountmgr.dll"
 start = "demand"
 role = "function"
 class = "volume"
-hwids = []
+hwids = ["STOR\\Volume\\GPT", "STOR\\Volume"]

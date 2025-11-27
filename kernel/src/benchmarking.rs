@@ -194,6 +194,8 @@ pub fn run_stats_loop() {
     let mut acc_total_sw: u128 = 0;
     let mut acc_sched_ns: Vec<u128> = vec![0; prev_sched_ns.len()];
     let mut acc_total_sched_ns: u128 = 0;
+    wait_millis_idle(20000);
+    PNP_MANAGER.print_device_tree();
     loop {
         wait_millis_idle(70000);
         let core_ms_now = read_all_core_timer_ms();
