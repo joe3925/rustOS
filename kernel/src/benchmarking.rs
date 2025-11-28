@@ -253,7 +253,7 @@ pub fn run_stats_loop() {
                     acc_total_sched_ns,
                     &cfg,
                 );
-                block_on(append_to_file(&cfg.path, log.as_bytes()));
+                //              block_on(append_to_file(&cfg.path, log.as_bytes()));
             }
             acc_minutes = 0;
             acc_total_ms = 0;

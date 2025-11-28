@@ -279,74 +279,11 @@ impl Vfs {
             Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
                 .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?;
+        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?.await?;
 
-        let mut w = req.write();
-        if w.status != DriverStatus::Success {
-            return Err(w.status);
-        }
-        let raw = core::mem::replace(&mut w.data, Box::new([]));
+        let raw = core::mem::replace(&mut req.write().data, Box::new([]));
         let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };
         Ok(*out)
-    }
-
-    #[inline]
-    fn call_fs_async<TParam>(
-        &self,
-        volume_symlink: &str,
-        op: FsOp,
-        param: TParam,
-    ) -> Arc<RwLock<Request>>
-    where
-        TParam: 'static,
-    {
-        let req = Arc::new(RwLock::new(
-            Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
-                .set_traversal_policy(TraversalPolicy::ForwardLower),
-        ));
-        unsafe { pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()) };
-        req
-    }
-
-    // ---------- ASYNC API: returns the sent Request; no waits ----------
-
-    pub fn open_async(&self, p: FsOpenParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        let (symlink, fs_path) = self.resolve_path(&p.path)?;
-        let param = FsOpenParams {
-            flags: p.flags,
-            path: fs_path,
-        };
-        Ok(self.call_fs_async(&symlink, FsOp::Open, param))
-    }
-
-    pub fn read_async(&self, p: FsReadParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        let h = self
-            .handles
-            .read()
-            .get(&p.fs_file_id)
-            .cloned()
-            .ok_or(FileStatus::PathNotFound)?;
-        let param = FsReadParams {
-            fs_file_id: h.inner_id,
-            offset: p.offset,
-            len: p.len,
-        };
-        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Read, param))
-    }
-
-    pub fn write_async(&self, p: FsWriteParams) -> Result<Arc<RwLock<Request>>, FileStatus> {
-        let h = self
-            .handles
-            .read()
-            .get(&p.fs_file_id)
-            .cloned()
-            .ok_or(FileStatus::PathNotFound)?;
-        let param = FsWriteParams {
-            fs_file_id: h.inner_id,
-            offset: p.offset,
-            data: p.data,
-        };
-        Ok(self.call_fs_async(&h.volume_symlink, FsOp::Write, param))
     }
 
     // ---------- SYNC API (unchanged behavior) ----------
