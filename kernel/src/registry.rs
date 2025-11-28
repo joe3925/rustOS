@@ -316,9 +316,8 @@ pub mod reg {
 
         *REGISTRY.write() = Arc::new(new_reg.clone());
 
-        let mut file = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])
-            .await
-            .map_err(|_| RegError::FileIO)?;
+        let mut file =
+            File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
         if let Err(e) = file.write(&bytes).await {
             let err_str = e.to_str();
             println!("{}", err_str);
@@ -387,10 +386,8 @@ pub mod reg {
     }
 
     async fn load_from_disk() -> Result<super::Registry, RegError> {
-        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])
-            .await
-            .map_err(|_| RegError::FileIO)?;
-        let buf = f.read().await.map_err(|_| RegError::FileIO)?;
+        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]).await?;
+        let buf = f.read().await?;
         let (r, _) =
             bincode::decode_from_slice::<super::Registry, _>(&buf, bincode::config::standard())
                 .map_err(|_| RegError::CorruptReg)?;
@@ -459,10 +456,11 @@ pub mod reg {
     pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
         ensure_loaded().await;
         let current = (**REGISTRY.read()).clone();
-
-        let on_disk = match load_from_disk().await {
+        let status = load_from_disk().await;
+        println!("Status {:#?}", status);
+        let on_disk = match status {
             Ok(r) => r,
-            Err(RegError::FileIO) | Err(RegError::CorruptReg) => super::Registry::empty(),
+            Err(RegError::FileIO(_)) | Err(RegError::CorruptReg) => super::Registry::empty(),
             Err(e) => return Err(e),
         };
 

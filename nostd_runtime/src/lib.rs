@@ -13,7 +13,7 @@ pub use block_on::block_on;
 use crate::task::poll_trampoline;
 
 unsafe extern "win64" {
-    fn _driver_runtime_submit_task(trampoline: extern "C" fn(usize), ctx: usize);
+    fn _driver_runtime_submit_task(trampoline: extern "win64" fn(usize), ctx: usize);
     //unsafe fn task_yield();
 }
 
@@ -32,12 +32,4 @@ pub(crate) fn submit_raw(ptr: usize) {
     unsafe {
         _driver_runtime_submit_task(poll_trampoline::<u64>, ptr);
     }
-}
-#[inline(never)]
-pub extern "C" fn debug_test<T>(ctx: usize) {
-    let test = 15;
-    let test2 = 12;
-    let test3 = test + test2;
-    let addr = test3 as u64 as *mut usize;
-    unsafe { *addr = ctx };
 }

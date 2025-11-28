@@ -147,7 +147,7 @@ pub async fn volclass_start(
 ) -> DriverStatus {
     let _ = refresh_fs_registry_from_registry();
     init_volume_dx(&dev);
-    mount_if_unmounted(dev).await;
+    spawn(mount_if_unmounted(dev));
     DriverStatus::Continue
 }
 
@@ -250,7 +250,7 @@ pub async fn volclass_ctrl_ioctl(
                         }
                         drop(wr);
                         let _ = refresh_fs_registry_from_registry();
-                        rescan_all_volumes().await;
+                        spawn(rescan_all_volumes());
                     }
                     DriverStatus::Success
                 }

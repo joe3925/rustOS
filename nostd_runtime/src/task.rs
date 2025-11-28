@@ -20,7 +20,7 @@ impl FutureTask {
     }
 }
 #[inline(never)]
-pub extern "C" fn poll_trampoline<T: 'static>(ctx: usize) {
+pub extern "win64" fn poll_trampoline<T: 'static>(ctx: usize) {
     unsafe {
         let id = TypeId::of::<T>();
         core::ptr::read_volatile(&id as *const _ as *const u8);

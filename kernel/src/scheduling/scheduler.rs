@@ -127,7 +127,6 @@ impl Scheduler {
             if let Some(mut guard) = cur.try_write() {
                 guard.update_from_context(state);
             } else {
-                println!("early return");
                 return;
             }
         }

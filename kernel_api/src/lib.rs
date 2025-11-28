@@ -107,7 +107,7 @@ impl RequestResultExt for Result<RequestFuture, DriverStatus> {
 }
 #[no_mangle]
 pub unsafe extern "win64" fn _driver_runtime_submit_task(
-    trampoline: extern "C" fn(usize),
+    trampoline: extern "win64" fn(usize),
     ctx: usize,
 ) {
     submit_runtime_internal(trampoline, ctx);

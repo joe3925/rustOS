@@ -145,7 +145,7 @@ impl PartialEq for FileStatus {
 }
 
 #[derive(Debug)]
-#[repr(u32)]
+#[repr(C)]
 pub enum RegError {
     KeyAlreadyExists,
     KeyNotFound,
@@ -153,7 +153,13 @@ pub enum RegError {
     PersistenceFailed,
     EncodingFailed,
     CorruptReg,
-    FileIO,
+    FileIO(FileStatus),
+}
+
+impl From<FileStatus> for RegError {
+    fn from(status: FileStatus) -> Self {
+        RegError::FileIO(status)
+    }
 }
 #[derive(Debug, Clone, Encode, Decode, PartialEq)]
 #[repr(u32)]
