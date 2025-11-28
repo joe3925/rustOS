@@ -11,7 +11,7 @@ use crate::waker::TaskWaker;
 pub struct FutureTask {
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>,
 }
-
+// TODO: get rid of this alloc should be possible as the future task is only seen by the ffi side that called spawn
 impl FutureTask {
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
