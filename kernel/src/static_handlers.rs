@@ -381,6 +381,7 @@ pub unsafe extern "win64" fn submit_runtime_internal(
 ) {
     RUNTIME_POOL.submit(trampoline, ctx);
 }
+#[no_mangle]
 pub unsafe extern "win64" fn task_yield() {
     unsafe { asm!("int 0x80") };
 }

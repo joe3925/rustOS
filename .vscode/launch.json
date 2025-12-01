@@ -5,7 +5,7 @@
             "name": "LLDB Rust Kernel EFI",
             "type": "lldb",
             "request": "custom",
-            "preLaunchTask": "dbg chain",
+            "preLaunchTask": "dbg full chain",
             "targetCreateCommands": [
                 "target create --no-dependents --arch x86_64 ${workspaceRoot}/target/debug/kernel.efi"
             ],
@@ -14,31 +14,31 @@
                 "target modules load --file kernel.efi .text 0xFFFF850000000000",
                 // acpi.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\acpi\\acpi.dll\"",
-                "target modules load --file \"acpi.dll\" .text 0xffff900006d40000",
+                "target modules load --file \"acpi.dll\" .text 0xffff900004d30000",
                 // pci.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\pci\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff900006f44000",
+                "target modules load --file \"pci.dll\" .text 0xffff900004efa000",
                 // i8042.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\i8042\\i8042.dll\"",
-                "target modules load --file \"i8042.dll\" .text 0xffff900006f0a000",
+                "target modules load --file \"i8042.dll\" .text 0xffff900004f4a000",
                 // ide.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\ide\\ide.dll\"",
-                "target modules load --file \"ide.dll\" .text 0xffff900006f94000",
+                "target modules load --file \"ide.dll\" .text 0xffff900004f84000",
                 // disk.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\disk\\disk.dll\"",
-                "target modules load --file \"disk.dll\" .text 0xffff900006feb000",
+                "target modules load --file \"disk.dll\" .text 0xffff900004fdc000",
                 // partmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\partmgr\\partmgr.dll\"",
-                "target modules load --file \"partmgr.dll\" .text 0xffff90000702d000",
+                "target modules load --file \"partmgr.dll\" .text 0xffff90000503d000",
                 // volmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\volmgr\\volmgr.dll\"",
-                "target modules load --file \"volmgr.dll\" .text 0xffff90000707e000",
+                "target modules load --file \"volmgr.dll\" .text 0xffff90000508e000",
                 // mountmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\mountmgr\\mountmgr.dll\"",
-                "target modules load --file \"mountmgr.dll\" .text 0xffff9000070cd000",
+                "target modules load --file \"mountmgr.dll\" .text 0xffff9000050dc000",
                 // fat32.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\fat32\\fat32.dll\"",
-                "target modules load --file \"fat32.dll\" .text 0xffff900007160000"
+                "target modules load --file \"fat32.dll\" .text 0xffff90000516f000"
             ],
             "sourceLanguages": [
                 "rust"

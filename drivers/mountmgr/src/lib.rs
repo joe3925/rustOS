@@ -607,7 +607,7 @@ fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut 
         probe: probe_ptr,
         which,
     })) as usize;
-    req.set_completion(fs_open_boot_check_complete, ctx);
+    req.add_completion(fs_open_boot_check_complete, ctx);
     let req = Arc::new(RwLock::new(req));
     unsafe {
         let _ = pnp_send_request_via_symlink(public_link.to_string(), req.clone());

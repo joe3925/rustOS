@@ -253,7 +253,7 @@ pub fn run_stats_loop() {
                     acc_total_sched_ns,
                     &cfg,
                 );
-                //              block_on(append_to_file(&cfg.path, log.as_bytes()));
+                block_on(append_to_file(&cfg.path, log.as_bytes()));
             }
             acc_minutes = 0;
             acc_total_ms = 0;
@@ -413,8 +413,9 @@ pub async fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
 }
 
 pub fn used_memory() -> usize {
-    let allocator = unsafe { ALLOCATOR.lock() };
-    HEAP_SIZE - allocator.free_memory()
+    0
+    // let allocator = unsafe { ALLOCATOR.lock() };
+    // HEAP_SIZE - allocator.free_memory()
 }
 
 fn mem_report_string() -> String {

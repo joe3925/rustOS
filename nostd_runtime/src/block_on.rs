@@ -5,6 +5,8 @@ use core::future::Future;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use crate::task_yield;
+
 /// A simple notification signal used to wake the blocking thread.
 #[repr(C)]
 struct ThreadNotify {

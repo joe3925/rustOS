@@ -188,7 +188,7 @@ impl PnpManager {
 
             match status {
                 DriverStatus::Pending => {
-                    req_for_task.write().status = DriverStatus::Pending;
+                    // Pending was returned we no longer own the request
                 }
                 DriverStatus::Continue | DriverStatus::NotImplemented => {
                     let next_res = match policy {

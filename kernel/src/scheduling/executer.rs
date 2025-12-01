@@ -2,7 +2,7 @@ use alloc::sync::Arc;
 
 use crate::structs::thread_pool::ThreadPool;
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(32);
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(16);
 }
 #[no_mangle]
 unsafe extern "win64" fn _driver_runtime_submit_task(

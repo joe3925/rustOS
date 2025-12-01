@@ -15,8 +15,8 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -29,7 +29,7 @@ use kernel_api::request::{Request, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_ms;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::{RequestExt, block_on, request_handler};
+use kernel_api::{RequestExt, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -46,32 +46,7 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
-const IOCTL_BLOCK_QUERY: u32 = 0xB000_0001;
-const IOCTL_BLOCK_RW: u32 = 0xB000_0002;
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-
-const BLOCK_RW_READ: u32 = 0;
-const BLOCK_RW_WRITE: u32 = 1;
-
-const FEAT_FLUSH: u64 = 1 << 0;
-
-#[repr(C)]
-pub struct BlockQueryOut {
-    pub block_size: u32,
-    pub max_blocks: u32,
-    pub alignment_mask: u32,
-    pub features: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BlockRwIn {
-    pub op: u32,
-    pub _rsvd: u32,
-    pub lba: u64,
-    pub blocks: u32,
-    pub buf_off: u32,
-}
 
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
@@ -116,6 +91,7 @@ pub extern "win64" fn ide_device_add(
 
     DriverStatus::Success
 }
+
 #[request_handler]
 async fn ide_pnp_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     let mut child = Request::new_pnp(
@@ -180,7 +156,7 @@ fn acquire_controller(dx: &DevExt) {
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
-        unsafe { wait_ms(1) };
+        //unsafe { wait_ms(1) };
     }
 }
 
@@ -258,6 +234,8 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 
     let mut io_vtable = IoVtable::new();
+    io_vtable.set(IoType::Read(ide_pdo_read), Synchronization::Sync, 0);
+    io_vtable.set(IoType::Write(ide_pdo_write), Synchronization::Sync, 0);
     io_vtable.set(
         IoType::DeviceControl(ide_pdo_internal_ioctl),
         Synchronization::Sync,
@@ -290,7 +268,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
     let instance = alloc::format!("IDE\\DRV_{:02}", drive);
 
-    let (_dn, pdo) = unsafe {
+    let (_dn, _pdo) = unsafe {
         pnp_create_child_devnode_and_pdo_with_init(
             &parent_dn, short_name, instance, ids, class, child_init,
         )
@@ -298,22 +276,171 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 }
 
 #[request_handler]
-pub async fn ide_pdo_internal_ioctl(
+pub async fn ide_pdo_read(
     pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
+    _buf_len: usize,
 ) -> DriverStatus {
-    let cdx = pdo
-        .try_devext::<ChildExt>()
-        .expect("ide: PDO ChildExt missing");
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(x) => x,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
 
     if !cdx.present.load(Ordering::Acquire) {
         return DriverStatus::NoSuchDevice;
     }
 
-    let parent: Arc<DeviceObject> = cdx.parent_device.upgrade().expect("parent device gone");
-    let dx = parent
-        .try_devext::<DevExt>()
-        .expect("No parent IDE dev ext");
+    let parent = match cdx.parent_device.upgrade() {
+        Some(p) => p,
+        None => return DriverStatus::NoSuchDevice,
+    };
+
+    let dx = match parent.try_devext::<DevExt>() {
+        Ok(dx) => dx,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
+
+    let (offset, len) = {
+        let r = req.read();
+        match r.kind {
+            RequestType::Read { offset, len } => (offset, len),
+            _ => return DriverStatus::InvalidParameter,
+        }
+    };
+
+    if len == 0 {
+        return DriverStatus::Success;
+    }
+
+    if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+        return DriverStatus::InvalidParameter;
+    }
+
+    let lba = offset >> 9;
+    let sectors = (len / 512) as u32;
+
+    if sectors == 0 || (lba >> 28) != 0 {
+        return DriverStatus::InvalidParameter;
+    }
+
+    let _guard = ControllerGuard::new(&dx);
+
+    let mut w = req.write();
+    if w.data.len() < len {
+        return DriverStatus::InsufficientResources;
+    }
+
+    let buf = &mut w.data[..len];
+
+    let ok = ata_pio_read(
+        &dx,
+        cdx.dh.load(Ordering::Acquire),
+        lba as u32,
+        sectors,
+        buf,
+    );
+
+    if ok {
+        DriverStatus::Success
+    } else {
+        DriverStatus::Unsuccessful
+    }
+}
+
+#[request_handler]
+pub async fn ide_pdo_write(
+    pdo: Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+    _buf_len: usize,
+) -> DriverStatus {
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(x) => x,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
+
+    if !cdx.present.load(Ordering::Acquire) {
+        return DriverStatus::NoSuchDevice;
+    }
+
+    let parent = match cdx.parent_device.upgrade() {
+        Some(p) => p,
+        None => return DriverStatus::NoSuchDevice,
+    };
+
+    let dx = match parent.try_devext::<DevExt>() {
+        Ok(dx) => dx,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
+
+    let (offset, len) = {
+        let r = req.read();
+        match r.kind {
+            RequestType::Write { offset, len } => (offset, len),
+            _ => return DriverStatus::InvalidParameter,
+        }
+    };
+
+    if len == 0 {
+        return DriverStatus::Success;
+    }
+
+    if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
+        return DriverStatus::InvalidParameter;
+    }
+
+    let lba = offset >> 9;
+    let sectors = (len / 512) as u32;
+
+    if sectors == 0 || (lba >> 28) != 0 {
+        return DriverStatus::InvalidParameter;
+    }
+
+    let _guard = ControllerGuard::new(&dx);
+
+    let w = req.read();
+    if w.data.len() < len {
+        return DriverStatus::InsufficientResources;
+    }
+
+    let buf = &w.data[..len];
+
+    let ok = ata_pio_write(
+        &dx,
+        cdx.dh.load(Ordering::Acquire),
+        lba as u32,
+        sectors,
+        buf,
+    );
+
+    if ok {
+        DriverStatus::Success
+    } else {
+        DriverStatus::Unsuccessful
+    }
+}
+
+#[request_handler]
+pub async fn ide_pdo_internal_ioctl(
+    pdo: Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    let cdx = match pdo.try_devext::<ChildExt>() {
+        Ok(x) => x,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
+
+    if !cdx.present.load(Ordering::Acquire) {
+        return DriverStatus::NoSuchDevice;
+    }
+
+    let parent: Arc<DeviceObject> = match cdx.parent_device.upgrade() {
+        Some(p) => p,
+        None => return DriverStatus::NoSuchDevice,
+    };
+    let dx = match parent.try_devext::<DevExt>() {
+        Ok(dx) => dx,
+        Err(_) => return DriverStatus::NoSuchDevice,
+    };
 
     let code = {
         let r = req.read();
@@ -324,67 +451,6 @@ pub async fn ide_pdo_internal_ioctl(
     };
 
     match code {
-        IOCTL_BLOCK_QUERY => {
-            let mut w = req.write();
-            if w.data.len() < size_of::<BlockQueryOut>() {
-                return DriverStatus::InsufficientResources;
-            }
-            let out = unsafe { &mut *(w.data.as_mut_ptr() as *mut BlockQueryOut) };
-            out.block_size = 512;
-            out.max_blocks = 256;
-            out.alignment_mask = 0;
-            out.features = FEAT_FLUSH;
-            DriverStatus::Success
-        }
-
-        IOCTL_BLOCK_RW => {
-            let _guard = ControllerGuard::new(&dx);
-
-            let (hdr, need, off) = {
-                let r = req.read();
-                if r.data.len() < size_of::<BlockRwIn>() {
-                    return DriverStatus::InvalidParameter;
-                }
-                let hdr = unsafe { *(r.data.as_ptr() as *const BlockRwIn) };
-                let need = (hdr.blocks as usize) * 512;
-                let off = hdr.buf_off as usize;
-                let bounds_check = off
-                    .checked_add(need)
-                    .map(|e| e <= r.data.len())
-                    .unwrap_or(false);
-
-                if hdr.blocks == 0 || !bounds_check || (hdr.lba >> 28) != 0 {
-                    return DriverStatus::InvalidParameter;
-                }
-                (hdr, need, off)
-            };
-
-            let mut w = req.write();
-            let ok = match hdr.op {
-                BLOCK_RW_READ => ata_pio_read(
-                    &dx,
-                    cdx.dh.load(Ordering::Acquire),
-                    hdr.lba as u32,
-                    hdr.blocks as u32,
-                    &mut w.data[off..off + need],
-                ),
-                BLOCK_RW_WRITE => ata_pio_write(
-                    &dx,
-                    cdx.dh.load(Ordering::Acquire),
-                    hdr.lba as u32,
-                    hdr.blocks as u32,
-                    &w.data[off..off + need],
-                ),
-                _ => return DriverStatus::InvalidParameter,
-            };
-
-            if ok {
-                DriverStatus::Success
-            } else {
-                DriverStatus::Unsuccessful
-            }
-        }
-
         IOCTL_BLOCK_FLUSH => {
             let _guard = ControllerGuard::new(&dx);
 
@@ -401,7 +467,6 @@ pub async fn ide_pdo_internal_ioctl(
                 DriverStatus::Unsuccessful
             }
         }
-
         _ => DriverStatus::NotImplemented,
     }
 }

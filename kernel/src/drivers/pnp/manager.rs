@@ -728,7 +728,7 @@ impl PnpManager {
             let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
-            start_request.set_completion(Self::start_io, ctx);
+            start_request.add_completion(Self::start_io, ctx);
 
             let req_arc = Arc::new(RwLock::new(start_request));
 
@@ -765,7 +765,7 @@ impl PnpManager {
                 };
                 let mut bus_enum_request = Request::new_pnp(pnp_payload, Box::new([]));
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
-                bus_enum_request.set_completion(Self::process_enumerated_children, ctx);
+                bus_enum_request.add_completion(Self::process_enumerated_children, ctx);
 
                 let req_arc = Arc::new(RwLock::new(bus_enum_request));
 
@@ -893,7 +893,7 @@ impl PnpManager {
         };
         let mut req = Request::new_pnp(pnp_payload, Box::new([]));
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
-        req.set_completion(Self::process_enumerated_children, ctx);
+        req.add_completion(Self::process_enumerated_children, ctx);
         let tgt = IoTarget { target_device: top };
         self.send_request(&tgt, Arc::new(RwLock::new(req)))
     }
@@ -1276,7 +1276,7 @@ impl PnpManager {
         };
         let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
         let ctx = Arc::into_raw(dn.clone()) as usize;
-        start_request.set_completion(Self::start_io, ctx);
+        start_request.add_completion(Self::start_io, ctx);
 
         let tgt = IoTarget {
             target_device: top.clone(),

@@ -131,17 +131,23 @@ impl Scheduler {
             }
         }
 
-        if ((TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0) {
+        if (TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0 {
             if let Some(_guard) = self.balance_lock.try_lock() {
                 self.balance();
             }
         }
 
-        let next = self.schedule_next(cpu_id);
+        let next = match self.schedule_next(cpu_id) {
+            Some(task) => task,
+            None => return,
+        };
 
         let (needs_restore, ctx_ptr) = {
-            let t = next.read();
-            (t.parent_pid != 0, &t.context as *const _ as *mut State)
+            if let Some(t) = next.try_read() {
+                (t.parent_pid != 0, &t.context as *const _ as *mut State)
+            } else {
+                return;
+            }
         };
 
         if needs_restore {
@@ -155,37 +161,63 @@ impl Scheduler {
         unsafe { (*ctx_ptr).restore(state) };
     }
 
-    fn schedule_next(&self, cpu_id: usize) -> TaskHandle {
+    fn schedule_next(&self, cpu_id: usize) -> Option<TaskHandle> {
         let core = &self.cores[cpu_id];
 
-        let previous = core.current.write().take();
+        let mut current_guard = core.current.write();
+        let previous = current_guard.take();
+        let mut previous_for_fallback = previous.clone();
 
-        if let Some(previous_task) = previous {
-            if !Arc::ptr_eq(&previous_task, &core.idle_task) {
-                let (terminated, sleeping) = {
-                    let t = previous_task.read();
-                    (t.terminated, t.is_sleeping)
-                };
+        if let Some(ref previous_task) = previous {
+            if !Arc::ptr_eq(previous_task, &core.idle_task) {
+                if let Some(t) = previous_task.try_read() {
+                    let terminated = t.terminated;
+                    let sleeping = t.is_sleeping;
+                    drop(t);
 
-                if terminated {
-                } else if sleeping {
-                    core.sleep_queue.lock().push(previous_task);
+                    if terminated {
+                        previous_for_fallback = None;
+                    } else if sleeping {
+                        core.sleep_queue.lock().push(previous_task.clone());
+                        previous_for_fallback = None;
+                    } else {
+                        core.run_queue.lock().push_back(previous_task.clone());
+                    }
                 } else {
-                    core.run_queue.lock().push_back(previous_task);
+                    *current_guard = previous.clone();
+                    return None;
                 }
             }
         }
 
         let mut run_queue_guard = core.run_queue.lock();
-        if let Some(next_task) = run_queue_guard.pop_front() {
-            drop(run_queue_guard);
-            *core.current.write() = Some(next_task.clone());
-            next_task
-        } else {
-            drop(run_queue_guard);
-            *core.current.write() = Some(core.idle_task.clone());
-            core.idle_task.clone()
+        let len = run_queue_guard.len();
+        let mut next: Option<TaskHandle> = None;
+
+        for _ in 0..len {
+            if let Some(candidate) = run_queue_guard.pop_front() {
+                if candidate.try_read().is_some() {
+                    next = Some(candidate.clone());
+                    break;
+                } else {
+                    run_queue_guard.push_back(candidate);
+                }
+            }
         }
+        drop(run_queue_guard);
+
+        if let Some(n) = next {
+            *current_guard = Some(n.clone());
+            return Some(n);
+        }
+
+        if let Some(prev) = previous_for_fallback {
+            *current_guard = Some(prev.clone());
+            return Some(prev);
+        }
+
+        *current_guard = Some(core.idle_task.clone());
+        Some(core.idle_task.clone())
     }
 
     pub fn wake_task(&self, task_handle: &TaskHandle) {
@@ -287,6 +319,14 @@ impl Scheduler {
         unsafe {
             task_yield();
         }
+    }
+    pub fn sleep(&self) {
+        without_interrupts(|| {
+            let cpu_id = current_cpu_id() as usize;
+            if let Some(task) = self.get_current_task(cpu_id) {
+                task.write().sleep();
+            }
+        });
     }
 }
 

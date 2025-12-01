@@ -14,7 +14,7 @@ use crate::task::poll_trampoline;
 
 unsafe extern "win64" {
     fn _driver_runtime_submit_task(trampoline: extern "win64" fn(usize), ctx: usize);
-    //unsafe fn task_yield();
+    unsafe fn task_yield();
 }
 
 pub fn spawn<F>(future: F)

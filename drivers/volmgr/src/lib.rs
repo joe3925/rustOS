@@ -8,6 +8,7 @@ use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::mem::take;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::Acquire;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
@@ -270,7 +271,10 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStat
     unsafe { pnp_complete_request(&parent) };
     return DriverStatus::Success;
 }
-// TODO: this can be optimized
+static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_READ: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_WRITE: AtomicUsize = AtomicUsize::new(0);
 #[request_handler]
 pub async fn vol_pdo_read(
     dev: Arc<DeviceObject>,
@@ -281,12 +285,23 @@ pub async fn vol_pdo_read(
         let r = parent.read();
         match r.kind {
             RequestType::Read { offset, len } => (offset, len),
-            _ => {
-                drop(r);
-                return DriverStatus::InvalidParameter;
-            }
+            _ => return DriverStatus::InvalidParameter,
         }
     };
+    let total_read_kib = TOTAL_READ.fetch_add(len, Ordering::AcqRel) / 1024;
+    let total_write_kib = TOTAL_WRITE.load(Ordering::Acquire) / 1024;
+
+    println!(
+        "read #{}, total read: {} KiB, write #{}, total write: {} KiB",
+        READ_COUNTER.fetch_add(1, Ordering::AcqRel),
+        total_read_kib,
+        WRITE_COUNTER.load(Ordering::Acquire),
+        total_write_kib,
+    );
+
+    if len == 0 {
+        return DriverStatus::Success;
+    }
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
@@ -296,18 +311,31 @@ pub async fn vol_pdo_read(
         }
     };
 
-    let mut child = Request::new(
-        RequestType::Read { offset: off, len },
-        vec![0u8; len].into_boxed_slice(),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let ctx = Box::into_raw(Box::new(BridgeCtx {
-        parent: parent.clone(),
-    })) as usize;
-    child.set_completion(bridge_complete, ctx);
-    let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone())?.await };
-    return DriverStatus::Success;
+    let buf = {
+        let mut w = parent.write();
+        core::mem::take(&mut w.data)
+    };
+
+    let child = Arc::new(RwLock::new(
+        Request::new(RequestType::Read { offset: off, len }, buf)
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+
+    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+
+    let (st, data) = {
+        let mut g = child.write();
+        let st = g.status;
+        let data = core::mem::take(&mut g.data);
+        (st, data)
+    };
+
+    {
+        let mut p = parent.write();
+        p.data = data;
+    }
+
+    st
 }
 
 #[request_handler]
@@ -316,18 +344,18 @@ pub async fn vol_pdo_write(
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
-    let (off, len, moved) = {
-        let mut w = parent.write();
-        match w.kind {
-            RequestType::Write { offset, len } => {
-                let data = mem::take(&mut w.data);
-                (offset, len, data)
-            }
-            _ => {
-                return DriverStatus::InvalidParameter;
-            }
+    let (off, len) = {
+        let r = parent.read();
+        match r.kind {
+            RequestType::Write { offset, len } => (offset, len),
+            _ => return DriverStatus::InvalidParameter,
         }
     };
+    WRITE_COUNTER.fetch_add(1, Ordering::AcqRel);
+    TOTAL_WRITE.fetch_add(len, Ordering::AcqRel);
+    if len == 0 {
+        return DriverStatus::Success;
+    }
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
@@ -337,16 +365,24 @@ pub async fn vol_pdo_write(
         }
     };
 
-    let mut child = Request::new(RequestType::Write { offset: off, len }, moved)
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let ctx = Box::into_raw(Box::new(BridgeCtx {
-        parent: parent.clone(),
-    })) as usize;
-    child.set_completion(bridge_complete, ctx);
+    let moved = {
+        let mut w = parent.write();
+        core::mem::take(&mut w.data)
+    };
 
-    let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone())?.await };
-    return DriverStatus::Success;
+    let child = Arc::new(RwLock::new(
+        Request::new(RequestType::Write { offset: off, len }, moved)
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+
+    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+
+    let st = {
+        let g = child.read();
+        g.status
+    };
+
+    st
 }
 extern "win64" fn vol_pdo_query_resources(
     pdo: Arc<DeviceObject>,
