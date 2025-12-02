@@ -142,13 +142,14 @@ pub fn kernel_main() {
     });
 
     println!("");
-    let task = Task::new_kernel_mode(
-        run_stats_loop as usize,
-        KERNEL_STACK_SIZE,
-        "Log Thread".to_string(),
-        0,
-    );
-    SCHEDULER.add_task(task);
+    nostd_runtime::spawn(run_stats_loop());
+    // let task = Task::new_kernel_mode(
+    //     run_stats_loop as usize,
+    //     KERNEL_STACK_SIZE,
+    //     "Log Thread".to_string(),
+    //     0,
+    // );
+    // SCHEDULER.add_task(task);
 }
 #[inline(always)]
 fn halt_loop() -> ! {

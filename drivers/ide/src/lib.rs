@@ -621,6 +621,7 @@ fn ata_probe_drive(dx: &DevExt, dh: u8) -> bool {
 
 fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
     let mut off = 0usize;
+
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
@@ -631,7 +632,7 @@ fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [
 
         {
             let mut p = dx.ports.lock();
-            let devsel = 0xE0 | (dh & 0x10) | ((lba >> 24) as u8 & 0x0F);
+            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
             unsafe { p.drive_head.write(devsel) };
             io_wait_400ns(&mut p.control);
         }
@@ -672,14 +673,17 @@ fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [
                 }
             }
         }
+
         lba = lba.wrapping_add(chunk);
         sectors -= chunk;
     }
+
     true
 }
 
 fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
     let mut off = 0usize;
+
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
@@ -690,8 +694,9 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
 
         {
             let mut p = dx.ports.lock();
-            unsafe { p.drive_head.write((dh & 0xF0) | ((lba >> 24) as u8 & 0x0F)) };
-            io_wait_400ns(&mut p.command);
+            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+            unsafe { p.drive_head.write(devsel) };
+            io_wait_400ns(&mut p.control);
         }
 
         if !wait_ready(&dx.ports, TIMEOUT_MS) {
@@ -723,6 +728,7 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
                 }
             }
         }
+
         lba = lba.wrapping_add(chunk);
         sectors -= chunk;
     }
@@ -731,6 +737,7 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
         let mut p = dx.ports.lock();
         unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
     }
+
     wait_not_busy(&dx.ports, TIMEOUT_MS)
 }
 

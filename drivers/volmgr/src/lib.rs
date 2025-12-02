@@ -291,13 +291,13 @@ pub async fn vol_pdo_read(
     let total_read_kib = TOTAL_READ.fetch_add(len, Ordering::AcqRel) / 1024;
     let total_write_kib = TOTAL_WRITE.load(Ordering::Acquire) / 1024;
 
-    println!(
-        "read #{}, total read: {} KiB, write #{}, total write: {} KiB",
-        READ_COUNTER.fetch_add(1, Ordering::AcqRel),
-        total_read_kib,
-        WRITE_COUNTER.load(Ordering::Acquire),
-        total_write_kib,
-    );
+    // println!(
+    //     "read #{}, total read: {} KiB, write #{}, total write: {} KiB",
+    //     READ_COUNTER.fetch_add(1, Ordering::AcqRel),
+    //     total_read_kib,
+    //     WRITE_COUNTER.load(Ordering::Acquire),
+    //     total_write_kib,
+    // );
 
     if len == 0 {
         return DriverStatus::Success;

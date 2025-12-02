@@ -212,8 +212,11 @@ impl BuddyLocked {
             });
         }
     }
-    fn free_memory(&self) -> usize {
-        self.inner.lock().stats_total_bytes() - self.inner.lock().stats_alloc_actual()
+    pub fn free_memory(&self) -> usize {
+        without_interrupts(|| {
+            let inner = self.inner.lock();
+            inner.stats_total_bytes() - inner.stats_alloc_actual()
+        })
     }
 }
 

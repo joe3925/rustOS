@@ -2,6 +2,8 @@ use crate::alloc::format;
 use crate::alloc::vec;
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::file_system::file::File;
+use crate::memory::allocator::BuddyLocked;
+use crate::println;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -181,7 +183,7 @@ fn max_gap_x1000(percs: &[u128]) -> (usize, usize, u128) {
     (min_idx, max_idx, max_val - min_val)
 }
 
-pub fn run_stats_loop() {
+pub async fn run_stats_loop() {
     let mut prev_total_ms: u128 = 0;
     let mut prev_core_ms: Vec<u128> = read_all_core_timer_ms();
     let mut prev_core_sw: Vec<u64> = read_all_core_switches();
@@ -253,7 +255,8 @@ pub fn run_stats_loop() {
                     acc_total_sched_ns,
                     &cfg,
                 );
-                block_on(append_to_file(&cfg.path, log.as_bytes()));
+                println!("{}", log);
+                block_on(append_to_file(&cfg.path, log.as_bytes())).expect("write failed");
             }
             acc_minutes = 0;
             acc_total_ms = 0;
@@ -413,9 +416,7 @@ pub async fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
 }
 
 pub fn used_memory() -> usize {
-    0
-    // let allocator = unsafe { ALLOCATOR.lock() };
-    // HEAP_SIZE - allocator.free_memory()
+    HEAP_SIZE - ALLOCATOR.free_memory()
 }
 
 fn mem_report_string() -> String {
