@@ -11,7 +11,6 @@
 #![feature(once_cell_get_mut)]
 #![test_runner(crate::test_runner)]
 #![allow(static_mut_refs)]
-#![feature(slice_as_array)]
 #![feature(variant_count)]
 #![allow(improper_ctypes_definitions)]
 #![feature(try_trait_v2)]

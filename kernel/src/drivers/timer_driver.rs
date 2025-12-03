@@ -73,7 +73,7 @@ pub fn set_num_cores(n: usize) {
     }
 }
 #[unsafe(naked)]
-pub extern "x86-interrupt" fn timer_interrupt_entry() -> ! {
+pub extern "win64" fn timer_interrupt_entry() -> ! {
     naked_asm!(
         "cli",
         "push r15","push r14","push r13","push r12",

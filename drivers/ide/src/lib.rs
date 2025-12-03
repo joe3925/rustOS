@@ -733,6 +733,10 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
         sectors -= chunk;
     }
 
+    if !wait_not_busy(&dx.ports, TIMEOUT_MS) {
+        return false;
+    }
+
     {
         let mut p = dx.ports.lock();
         unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };

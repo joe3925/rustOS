@@ -199,7 +199,7 @@ impl BuddyLocked {
             init: AtomicBool::new(false),
         }
     }
-
+    #[inline(always)]
     unsafe fn ensure_init(&self) {
         if !self.init.load(Ordering::Acquire) {
             without_interrupts(|| {

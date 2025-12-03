@@ -341,7 +341,7 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
 }
 
 #[unsafe(naked)]
-pub extern "x86-interrupt" fn yield_interrupt_entry() -> ! {
+pub extern "win64" fn yield_interrupt_entry() -> ! {
     naked_asm!(
         "cli",
         "push r15","push r14","push r13","push r12",

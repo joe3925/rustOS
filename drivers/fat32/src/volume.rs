@@ -27,7 +27,7 @@ use kernel_api::{
         FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
         FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
     },
-    request_handler, println,
+    println, request_handler,
 };
 
 use crate::block_dev::BlockDev;
@@ -305,7 +305,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         match tbl.get_mut(&params.fs_file_id) {
                             Some(ctx) => {
                                 if ctx.is_dir {
-                                    // Writes to directories generally fail or return 0
                                     Ok(0)
                                 } else {
                                     let _fs_guard = vdx.fs.lock();

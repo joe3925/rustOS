@@ -105,25 +105,23 @@ extern "win64" fn partition_pdo_query_resources(
 async fn send_req_parent(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
-) -> Result<Box<[u8]>, DriverStatus> {
-    unsafe {
-        pnp_send_request_to_stack_top(
-            dev.dev_node
-                .get()
-                .unwrap()
-                .upgrade()
-                .unwrap()
-                .parent
-                .get()
-                .unwrap(),
-            req.clone(),
-        )
-    }?
+) -> Result<(), DriverStatus> {
+    pnp_send_request_to_stack_top(
+        dev.dev_node
+            .get()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .parent
+            .get()
+            .unwrap(),
+        req.clone(),
+    )?
     .await;
 
     let g = req.read();
     if g.status == DriverStatus::Success {
-        Ok(g.data.clone())
+        Ok(())
     } else {
         Err(g.status)
     }
@@ -158,27 +156,34 @@ pub async fn partition_pdo_read(
 
     let phys_off = off + ((start_lba as u64) << 9);
 
+    let buf = {
+        let mut w = request.write();
+        mem::take(&mut w.data)
+    };
+
     let child_req = Request::new(
         RequestType::Read {
             offset: phys_off,
             len: buf_len,
         },
-        vec![0u8; buf_len].into_boxed_slice(),
+        buf,
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    match send_req_parent(&device, Arc::new(RwLock::new(child_req))).await {
-        Ok(data) => {
-            let mut w = request.write();
-            let n = core::cmp::min(w.data.len(), data.len());
-            if n != 0 {
-                w.data[..n].copy_from_slice(&data[..n]);
-            }
-            return DriverStatus::Success;
-        }
-        Err(st) => {
-            return st;
-        }
+    let child_req_arc = Arc::new(RwLock::new(child_req));
+
+    let res = send_req_parent(&device, child_req_arc.clone()).await;
+
+    let mut c = child_req_arc.write();
+    let returned_buf = mem::take(&mut c.data);
+    drop(c);
+
+    let mut w = request.write();
+    w.data = returned_buf;
+
+    match res {
+        Ok(()) => DriverStatus::Success,
+        Err(st) => st,
     }
 }
 #[request_handler]
