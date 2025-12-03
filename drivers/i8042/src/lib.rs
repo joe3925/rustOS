@@ -176,10 +176,8 @@ fn make_child_pdo(
     };
 }
 
-extern "win64" fn ps2_child_query_id(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+async fn ps2_child_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
         Err(_) => {
@@ -238,10 +236,8 @@ extern "win64" fn ps2_child_query_id(
     DriverStatus::Success
 }
 
-extern "win64" fn ps2_child_start(
-    _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+async fn ps2_child_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     DriverStatus::Success
 }
 

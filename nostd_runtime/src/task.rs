@@ -25,7 +25,9 @@ pub extern "win64" fn poll_trampoline<T: 'static>(ctx: usize) {
         let id = TypeId::of::<T>();
         core::ptr::read_volatile(&id as *const _ as *const u8);
     }
-
+    if ctx < 0x1000 {
+        panic!("ctx passed is null ptr");
+    }
     let task: Arc<FutureTask> = unsafe {
         let raw = ctx as *const FutureTask;
 

@@ -84,7 +84,8 @@ struct PartDevExt {
     part: Once<PartitionInfo>,
 }
 
-extern "win64" fn partition_pdo_query_resources(
+#[request_handler]
+async fn partition_pdo_query_resources(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {

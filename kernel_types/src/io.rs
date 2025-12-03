@@ -98,14 +98,14 @@ impl IoType {
     }
 
     #[inline]
-    pub fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+    pub async fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
                 let len = req.read().data.len();
-                h(dev, req, len)
+                h(dev, req, len).await
             }
-            IoType::DeviceControl(h) => h(dev, req),
-            IoType::Fs(h) => h(dev, req),
+            IoType::DeviceControl(h) => h(dev, req).await,
+            IoType::Fs(h) => h(dev, req).await,
         }
     }
 

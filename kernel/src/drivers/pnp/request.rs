@@ -150,7 +150,7 @@ impl PnpManager {
         }
 
         if matches!(kind, RequestType::Pnp) {
-            Self::pnp_minor_dispatch(&dev, req_arc.clone());
+            Self::pnp_minor_dispatch(&dev, req_arc.clone()).await;
             return;
         }
 
@@ -174,7 +174,7 @@ impl PnpManager {
             //     _ => {}
             // }
 
-            let status = h.handler.invoke(dev.clone(), req_arc.clone());
+            let status = h.handler.invoke(dev.clone(), req_arc.clone()).await;
 
             let req_for_task = req_arc.clone();
             let dev_for_task = dev.clone();
@@ -247,7 +247,7 @@ impl PnpManager {
         }
     }
 
-    fn pnp_minor_dispatch(device: &Arc<DeviceObject>, request: Arc<RwLock<Request>>) {
+    async fn pnp_minor_dispatch(device: &Arc<DeviceObject>, request: Arc<RwLock<Request>>) {
         let me = &*PNP_MANAGER;
         let (minor_opt, policy) = {
             let r = request.read();
@@ -276,7 +276,7 @@ impl PnpManager {
             .as_ref()
             .and_then(|vt| vt.get(minor))
         {
-            let status = cb(device.clone(), request.clone());
+            let status = cb(device.clone(), request.clone()).await;
             if status == DriverStatus::Pending {
                 request.write().status = DriverStatus::Pending;
                 return;

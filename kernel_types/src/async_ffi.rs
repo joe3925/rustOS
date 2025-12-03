@@ -53,8 +53,6 @@ pub enum FfiPoll<T> {
     /// Represents that a value is not ready yet.
     Pending,
     /// Represents that the future panicked.
-    /// Note: In no_std/kernel environments, this variant is effectively unreachable
-    /// because panics usually abort the system immediately.
     Panicked,
 }
 
@@ -72,8 +70,6 @@ impl DropBomb {
 
 impl Drop for DropBomb {
     fn drop(&mut self) {
-        // In no_std, we cannot write to stderr. We just panic with the message.
-        // If panic = abort, this terminates the context.
         panic!(
             "async-ffi: abort due to panic across FFI boundary: {}",
             self.0
@@ -159,7 +155,7 @@ pub trait ContextExt {
 impl ContextExt for Context<'_> {
     fn with_ffi_context<T, F: FnOnce(&mut FfiContext) -> T>(&mut self, closure: F) -> T {
         static C_WAKER_VTABLE_OWNED: FfiWakerVTable = {
-            unsafe extern "C" fn clone(data: *const FfiWakerBase) -> *const FfiWakerBase {
+            unsafe extern "win64" fn clone(data: *const FfiWakerBase) -> *const FfiWakerBase {
                 DropBomb::with("Waker::clone", || {
                     let data = data as *mut FfiWaker;
                     let waker: Waker = (*(*data).waker.owned).clone();
@@ -176,20 +172,20 @@ impl ContextExt for Context<'_> {
             }
             // In this case, we must own `data`. This can only happen when the `data` pointer is returned from `clone`.
             // Thus the it is `Box<FfiWaker>`.
-            unsafe extern "C" fn wake(data: *const FfiWakerBase) {
+            unsafe extern "win64" fn wake(data: *const FfiWakerBase) {
                 DropBomb::with("Waker::wake", || {
                     let b = Box::from_raw(data as *mut FfiWaker);
                     ManuallyDrop::into_inner(b.waker.owned).wake();
                 });
             }
-            unsafe extern "C" fn wake_by_ref(data: *const FfiWakerBase) {
+            unsafe extern "win64" fn wake_by_ref(data: *const FfiWakerBase) {
                 DropBomb::with("Waker::wake_by_ref", || {
                     let data = data as *mut FfiWaker;
                     (*data).waker.owned.wake_by_ref();
                 });
             }
             // Same as `wake`.
-            unsafe extern "C" fn drop(data: *const FfiWakerBase) {
+            unsafe extern "win64" fn drop(data: *const FfiWakerBase) {
                 DropBomb::with("Waker::drop", || {
                     let mut b = Box::from_raw(data as *mut FfiWaker);
                     ManuallyDrop::drop(&mut b.waker.owned);
@@ -205,7 +201,7 @@ impl ContextExt for Context<'_> {
         };
 
         static C_WAKER_VTABLE_REF: FfiWakerVTable = {
-            unsafe extern "C" fn clone(data: *const FfiWakerBase) -> *const FfiWakerBase {
+            unsafe extern "win64" fn clone(data: *const FfiWakerBase) -> *const FfiWakerBase {
                 DropBomb::with("Waker::clone", || {
                     let data = data as *mut FfiWaker;
                     let waker: Waker = (*(*data).waker.reference).clone();
@@ -220,13 +216,13 @@ impl ContextExt for Context<'_> {
                     .cast()
                 })
             }
-            unsafe extern "C" fn wake_by_ref(data: *const FfiWakerBase) {
+            unsafe extern "win64" fn wake_by_ref(data: *const FfiWakerBase) {
                 DropBomb::with("Waker::wake_by_ref", || {
                     let data = data as *mut FfiWaker;
                     (*(*data).waker.reference).wake_by_ref();
                 });
             }
-            unsafe extern "C" fn unreachable(_: *const FfiWakerBase) {
+            unsafe extern "win64" fn unreachable(_: *const FfiWakerBase) {
                 panic!("async-ffi: unreachable waker call");
             }
             FfiWakerVTable {
@@ -280,10 +276,10 @@ union WakerUnion {
 #[repr(C)]
 #[cfg_attr(feature = "abi_stable", derive(abi_stable::StableAbi))]
 struct FfiWakerVTable {
-    clone: unsafe extern "C" fn(*const FfiWakerBase) -> *const FfiWakerBase,
-    wake: unsafe extern "C" fn(*const FfiWakerBase),
-    wake_by_ref: unsafe extern "C" fn(*const FfiWakerBase),
-    drop: unsafe extern "C" fn(*const FfiWakerBase),
+    clone: unsafe extern "win64" fn(*const FfiWakerBase) -> *const FfiWakerBase,
+    wake: unsafe extern "win64" fn(*const FfiWakerBase),
+    wake_by_ref: unsafe extern "win64" fn(*const FfiWakerBase),
+    drop: unsafe extern "win64" fn(*const FfiWakerBase),
 }
 
 /// The FFI compatible future type with [`Send`] bound.
@@ -409,10 +405,11 @@ impl<T> Future for BorrowingFfiFuture<'_, T> {
 #[cfg_attr(feature = "abi_stable", derive(abi_stable::StableAbi))]
 pub struct LocalBorrowingFfiFuture<'a, T> {
     fut_ptr: *mut (),
-    poll_fn: unsafe extern "C" fn(fut_ptr: *mut (), context_ptr: *mut FfiContext) -> FfiPoll<T>,
-    drop_fn: unsafe extern "C" fn(*mut ()),
+    poll_fn: unsafe extern "win64" fn(fut_ptr: *mut (), context_ptr: *mut FfiContext) -> FfiPoll<T>,
+    drop_fn: unsafe extern "win64" fn(*mut ()),
     _marker: PhantomData<&'a ()>,
 }
+
 impl<'a, T> fmt::Debug for LocalBorrowingFfiFuture<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalBorrowingFfiFuture")
@@ -428,6 +425,7 @@ impl<'a, T> fmt::Debug for BorrowingFfiFuture<'a, T> {
         f.debug_tuple("BorrowingFfiFuture").field(&self.0).finish()
     }
 }
+
 /// The FFI compatible future type without `Send` bound but with `'static` lifetime.
 ///
 /// See [module level documentation](`crate`) for more details.
@@ -438,19 +436,16 @@ impl<'a, T> LocalBorrowingFfiFuture<'a, T> {
     ///
     /// Usually [`FutureExt::into_local_ffi`] is preferred and is identical to this method.
     pub fn new<F: Future<Output = T> + 'a>(fut: F) -> Self {
-        unsafe extern "C" fn poll_fn<F: Future>(
+        unsafe extern "win64" fn poll_fn<F: Future>(
             fut_ptr: *mut (),
             context_ptr: *mut FfiContext,
         ) -> FfiPoll<F::Output> {
-            // NO_STD MODIFICATION:
-            // catch_unwind is not supported in no_std. If F::poll panics,
-            // the kernel will abort. We cannot catch it.
             let fut_pin = Pin::new_unchecked(&mut *fut_ptr.cast::<F>());
             let poll_res = (*context_ptr).with_context(|ctx| F::poll(fut_pin, ctx));
             poll_res.into()
         }
 
-        unsafe extern "C" fn drop_fn<T>(ptr: *mut ()) {
+        unsafe extern "win64" fn drop_fn<T>(ptr: *mut ()) {
             DropBomb::with("Future::drop", || {
                 drop(Box::from_raw(ptr.cast::<T>()));
             });
@@ -483,10 +478,6 @@ impl<T> Future for LocalBorrowingFfiFuture<'_, T> {
         // SAFETY: This is safe since `poll_fn` is constructed from `LocalBorrowingFfiFuture::new`
         // and it just forwards to the original safe `Future::poll`.
         let result = ctx.with_ffi_context(|ctx| unsafe { (self.poll_fn)(self.fut_ptr, ctx) });
-
-        // NO_STD MODIFICATION:
-        // Since we removed catch_unwind, we will never realistically see Panicked here
-        // generated from *our* side. If the other side generates it, we panic.
         result
             .try_into()
             .expect("FFI future panicked (and was caught by the other side)")

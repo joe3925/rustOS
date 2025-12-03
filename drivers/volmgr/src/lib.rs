@@ -15,6 +15,7 @@ use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
 use kernel_api::RequestExt;
+use kernel_api::acpi::handler;
 use kernel_api::block_on;
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
@@ -384,7 +385,8 @@ pub async fn vol_pdo_write(
 
     st
 }
-extern "win64" fn vol_pdo_query_resources(
+#[request_handler]
+async fn vol_pdo_query_resources(
     pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
