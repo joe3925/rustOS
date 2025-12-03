@@ -18,6 +18,7 @@ use kernel_types::{
 use crate::{
     drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
+    println,
     registry::reg::rebind_and_persist_after_provider_switch,
 };
 use crate::{
@@ -88,8 +89,6 @@ impl File {
         }
         Ok(())
     }
-
-    // --- async file ops ---
 
     pub async fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
         let (res, st) = file_provider::provider().open_path(path, flags).await;
@@ -195,8 +194,51 @@ impl File {
             Some(e) => Err(e),
         }
     }
-}
+    pub async fn seek(
+        &self,
+        offset: i64,
+        origin: kernel_types::fs::FsSeekWhence,
+    ) -> Result<u64, FileStatus> {
+        let (res, st) = file_provider::provider()
+            .seek_handle(self.fs_file_id, offset, origin)
+            .await;
 
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = res.error {
+            return Err(e);
+        }
+        Ok(res.pos)
+    }
+
+    pub async fn close(self) -> Result<(), FileStatus> {
+        let (res, st) = file_provider::provider()
+            .close_handle(self.fs_file_id)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match res.error {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+}
+impl Drop for File {
+    fn drop(&mut self) {
+        // TODO: there probably is a way to just call self.close I don't care to figure it out
+        if self.fs_file_id == 0 {
+            return;
+        }
+
+        let id = self.fs_file_id;
+        self.fs_file_id = 0;
+
+        let _ = block_on(provider().close_handle(id));
+    }
+}
 // Helper functions; keep sync and block on async provider/File API.
 
 fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {

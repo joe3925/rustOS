@@ -794,7 +794,21 @@ impl FileProvider for Vfs {
         })
         .into_ffi()
     }
+    fn seek_handle(
+        &self,
+        file_id: u64,
+        offset: i64,
+        origin: FsSeekWhence,
+    ) -> FfiFuture<(FsSeekResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
+        this.seek(FsSeekParams {
+            fs_file_id: file_id,
+            offset,
+            origin,
+        })
+        .into_ffi()
+    }
     fn write_at(
         &self,
         file_id: u64,

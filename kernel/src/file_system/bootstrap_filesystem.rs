@@ -205,7 +205,44 @@ impl<'a> BootstrapProvider<'a> {
             }
         }
     }
+    fn seek_handle_sync(
+        &self,
+        file_id: u64,
+        offset: i64,
+        origin: FsSeekWhence,
+    ) -> (FsSeekResult, DriverStatus) {
+        let path = match self.handles.read().get(&file_id) {
+            Some(p) => p.clone(),
+            None => {
+                return (
+                    FsSeekResult {
+                        pos: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
 
+        let size = self.size_of(&path) as i128;
+
+        let base: i128 = match origin {
+            FsSeekWhence::Set => 0,
+            FsSeekWhence::Cur => 0,
+            FsSeekWhence::End => size,
+        };
+
+        let new_pos_i = base + offset as i128;
+        let new_pos = if new_pos_i < 0 { 0 } else { new_pos_i as u64 };
+
+        (
+            FsSeekResult {
+                pos: new_pos,
+                error: None,
+            },
+            DriverStatus::Success,
+        )
+    }
     fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileStatus> {
         let mut cur = path.to_string();
 
@@ -640,7 +677,15 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         let res = self.close_handle_sync(file_id);
         async move { res }.into_ffi()
     }
-
+    fn seek_handle(
+        &self,
+        file_id: u64,
+        offset: i64,
+        origin: FsSeekWhence,
+    ) -> FfiFuture<(FsSeekResult, DriverStatus)> {
+        let res = self.seek_handle_sync(file_id, offset, origin);
+        async move { res }.into_ffi()
+    }
     fn read_at(
         &self,
         file_id: u64,

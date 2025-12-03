@@ -84,11 +84,12 @@ impl BlockDev {
         let end_lba = self.lba_of(end_byte - 1) + 1;
         let n_sectors = (end_lba - start_lba) as usize;
 
+        let pos = self.pos;
+
         let mut tmp = Vec::with_capacity(n_sectors * bps);
         unsafe {
             tmp.set_len(n_sectors * bps);
         }
-
         read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
             .await
             .map_err(BlkError::from)?;
@@ -113,6 +114,8 @@ impl BlockDev {
 
         let head_off = self.in_sector_off(self.pos);
         let tail_bytes = ((self.pos as usize + to_write) % bps) as usize;
+
+        let pos = self.pos;
 
         if head_off == 0 && tail_bytes == 0 {
             let sectors_exact = to_write / bps;

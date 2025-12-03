@@ -199,7 +199,8 @@ pub async fn run_stats_loop() {
     wait_millis_idle(25000);
     //PNP_MANAGER.print_device_tree();
     loop {
-        wait_millis_idle(10000);
+        wait_millis_idle(60000);
+
         let core_ms_now = read_all_core_timer_ms();
         let total_ms_now = TOTAL_TIME.wait().elapsed_millis() as u128;
         let delta_total_ms = total_ms_now.saturating_sub(prev_total_ms);
@@ -255,7 +256,6 @@ pub async fn run_stats_loop() {
                     acc_total_sched_ns,
                     &cfg,
                 );
-                println!("{}", log);
                 block_on(append_to_file(&cfg.path, log.as_bytes()));
             }
             acc_minutes = 0;

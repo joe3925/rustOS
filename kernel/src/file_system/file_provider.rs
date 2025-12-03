@@ -17,7 +17,12 @@ pub trait FileProvider: Send + Sync {
         -> FfiFuture<(FsOpenResult, DriverStatus)>;
 
     fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)>;
-
+    fn seek_handle(
+        &self,
+        file_id: u64,
+        offset: i64,
+        origin: FsSeekWhence,
+    ) -> FfiFuture<(FsSeekResult, DriverStatus)>;
     fn read_at(
         &self,
         file_id: u64,

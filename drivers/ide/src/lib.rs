@@ -29,7 +29,7 @@ use kernel_api::request::{Request, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_ms;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::{RequestExt, request_handler};
+use kernel_api::{RequestExt, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -622,6 +622,13 @@ fn ata_probe_drive(dx: &DevExt, dh: u8) -> bool {
 fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
     let mut off = 0usize;
 
+    let total_sectors = sectors;
+    let bps = if total_sectors != 0 {
+        out.len() / total_sectors as usize
+    } else {
+        512
+    };
+
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
@@ -683,6 +690,13 @@ fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [
 
 fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
     let mut off = 0usize;
+
+    let total_sectors = sectors;
+    let bps = if total_sectors != 0 {
+        data.len() / total_sectors as usize
+    } else {
+        512
+    };
 
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);

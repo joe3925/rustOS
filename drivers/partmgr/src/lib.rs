@@ -186,6 +186,7 @@ pub async fn partition_pdo_read(
         Err(st) => st,
     }
 }
+
 #[request_handler]
 pub async fn partition_pdo_write(
     device: Arc<DeviceObject>,
@@ -215,7 +216,6 @@ pub async fn partition_pdo_write(
     }
 
     let phys_off = off + ((start_lba as u64) << 9);
-
     let moved = {
         let mut w = request.write();
         mem::take(&mut w.data)
@@ -230,12 +230,8 @@ pub async fn partition_pdo_write(
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
     match send_req_parent(&device, Arc::new(RwLock::new(child_req))).await {
-        Ok(_ignored) => {
-            return DriverStatus::Success;
-        }
-        Err(st) => {
-            return st;
-        }
+        Ok(_) => DriverStatus::Success,
+        Err(st) => st,
     }
 }
 

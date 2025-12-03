@@ -457,7 +457,6 @@ pub mod reg {
         ensure_loaded().await;
         let current = (**REGISTRY.read()).clone();
         let status = load_from_disk().await;
-        println!("Status {:#?}", status);
         let on_disk = match status {
             Ok(r) => r,
             Err(RegError::FileIO(_)) | Err(RegError::CorruptReg) => super::Registry::empty(),

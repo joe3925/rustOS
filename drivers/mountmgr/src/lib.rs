@@ -549,7 +549,7 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> Dr
     match reqctx.which {
         0 => {
             if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("mod ok");
+                println!("Mod found");
                 probe.mod_ok.store(true, Ordering::Release);
             } else {
                 println!(
@@ -560,7 +560,7 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> Dr
         }
         1 => {
             if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("inf ok");
+                println!("Inf found");
                 probe.inf_ok.store(true, Ordering::Release);
             } else {
                 println!(
@@ -571,7 +571,7 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> Dr
         }
         _ => {
             if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("reg ok");
+                println!("Reg found");
                 probe.reg_ok.store(true, Ordering::Release);
             } else {
                 println!(
@@ -586,7 +586,6 @@ extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> Dr
             && probe.inf_ok.load(Ordering::Acquire)
             && probe.reg_ok.load(Ordering::Acquire);
         if all {
-            println!("start boot bind");
             let _ = attempt_boot_bind(&probe.inst_path, &probe.link);
         }
         unsafe {

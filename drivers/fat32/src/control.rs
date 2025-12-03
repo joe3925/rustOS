@@ -144,13 +144,11 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl =
                         unsafe { pnp_create_control_device_with_init(vol_name.clone(), init) };
-                    println!("Mounting fat for volume {}", vol_name);
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
                     DriverStatus::Success
                 }
                 Err(e) => {
-                    println!("No mount");
                     id.mount_device = None;
                     id.can_mount = false;
                     DriverStatus::Success

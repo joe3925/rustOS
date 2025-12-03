@@ -6,10 +6,6 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use kernel_api::device::DeviceObject;
-use kernel_api::request::{Request, RequestType};
-use kernel_api::status::{DriverStatus, FileStatus};
-
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,6 +16,9 @@ use fatfs::{
 
 use spin::{Mutex, RwLock};
 
+use kernel_api::device::DeviceObject;
+use kernel_api::request::{Request, RequestType};
+use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
         FileAttribute, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
@@ -68,6 +67,7 @@ fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let p = Box::into_raw(b) as *mut u8;
     unsafe { Box::from_raw(core::slice::from_raw_parts_mut(p, len)) }
 }
+
 unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     let p = Box::into_raw(b) as *mut u8 as *mut T;
     Box::from_raw(p)
@@ -115,6 +115,7 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
+
 #[request_handler]
 pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let kind = { req.read().kind };
@@ -133,62 +134,94 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let open_res = {
-                        let mut fs = vdx.fs.lock();
-                        let root = fs.root_dir();
+                    // First, try to reuse an existing context for this path
+                    let reuse_res = {
+                        let mut tbl = vdx.table.write();
+                        if let Some((&id, ctx)) =
+                            tbl.iter_mut().find(|(_, c)| c.path == params.path)
+                        {
+                            let size = if ctx.is_dir {
+                                0
+                            } else {
+                                let _fs_guard = vdx.fs.lock();
+                                if let Some(ref mut cached) = ctx.file {
+                                    match cached_file_len(&mut cached.file) {
+                                        Ok(sz) => sz,
+                                        Err(_) => 0,
+                                    }
+                                } else {
+                                    0
+                                }
+                            };
+                            Some((id, ctx.is_dir, size))
+                        } else {
+                            None
+                        }
+                    };
 
-                        match root.open_file(&params.path) {
-                            Ok(mut f) => match f.seek(SeekFrom::End(0)) {
-                                Ok(end) => {
-                                    let f_static: FatFile<'static> =
-                                        unsafe { core::mem::transmute(f) };
-                                    Ok((false, end, Some(CachedFile { file: f_static })))
+                    let (fs_file_id, is_dir, size) = if let Some((id, is_dir, size)) = reuse_res {
+                        (id, is_dir, size)
+                    } else {
+                        let open_res = {
+                            let mut fs = vdx.fs.lock();
+                            let root = fs.root_dir();
+
+                            match root.open_file(&params.path) {
+                                Ok(mut f) => match f.seek(SeekFrom::End(0)) {
+                                    Ok(end) => {
+                                        let f_static: FatFile<'static> =
+                                            unsafe { core::mem::transmute(f) };
+                                        Ok((false, end, Some(CachedFile { file: f_static })))
+                                    }
+                                    Err(e) => Err(e),
+                                },
+                                Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
+                                    match root.open_dir(&params.path) {
+                                        Ok(_d) => Ok((true, 0, None)),
+                                        Err(e) => Err(e),
+                                    }
                                 }
                                 Err(e) => Err(e),
-                            },
-                            Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
-                                match root.open_dir(&params.path) {
-                                    Ok(_d) => Ok((true, 0, None)),
-                                    Err(e) => Err(e),
-                                }
                             }
-                            Err(e) => Err(e),
+                        };
+
+                        match open_res {
+                            Ok((is_dir, size, cached)) => {
+                                let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
+                                let mut tbl = vdx.table.write();
+                                tbl.insert(
+                                    id,
+                                    FileCtx {
+                                        path: params.path,
+                                        is_dir,
+                                        pos: 0,
+                                        file: cached,
+                                    },
+                                );
+                                (id, is_dir, size)
+                            }
+                            Err(e) => {
+                                let mut r = req.write();
+                                let res = FsOpenResult {
+                                    fs_file_id: 0,
+                                    is_dir: false,
+                                    size: 0,
+                                    error: Some(map_fatfs_err(&e)),
+                                };
+                                r.data = box_to_bytes(Box::new(res));
+                                return DriverStatus::Success;
+                            }
                         }
                     };
 
                     let mut r = req.write();
-                    match open_res {
-                        Ok((is_dir, size, cached)) => {
-                            let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
-                            let mut tbl = vdx.table.write();
-                            tbl.insert(
-                                id,
-                                FileCtx {
-                                    path: params.path,
-                                    is_dir,
-                                    pos: 0,
-                                    file: cached,
-                                },
-                            );
-
-                            let res = FsOpenResult {
-                                fs_file_id: id,
-                                is_dir,
-                                size,
-                                error: None,
-                            };
-                            r.data = box_to_bytes(Box::new(res));
-                        }
-                        Err(e) => {
-                            let res = FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(map_fatfs_err(&e)),
-                            };
-                            r.data = box_to_bytes(Box::new(res));
-                        }
-                    }
+                    let res = FsOpenResult {
+                        fs_file_id,
+                        is_dir,
+                        size,
+                        error: None,
+                    };
+                    r.data = box_to_bytes(Box::new(res));
                     DriverStatus::Success
                 }
 
@@ -201,19 +234,30 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    let removed = {
+                    let err = {
                         let mut tbl = vdx.table.write();
-                        tbl.remove(&params.fs_file_id).is_some()
+                        if let Some(mut ctx) = tbl.remove(&params.fs_file_id) {
+                            if !ctx.is_dir {
+                                if let Some(ref mut cached) = ctx.file {
+                                    let _fs_guard = vdx.fs.lock();
+                                    if let Err(e) = cached.file.flush() {
+                                        Some(map_fatfs_err(&e))
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            Some(FileStatus::PathNotFound)
+                        }
                     };
 
                     let mut r = req.write();
-                    let res = FsCloseResult {
-                        error: if removed {
-                            None
-                        } else {
-                            Some(FileStatus::PathNotFound)
-                        },
-                    };
+                    let res = FsCloseResult { error: err };
                     r.data = box_to_bytes(Box::new(res));
                     DriverStatus::Success
                 }
@@ -227,10 +271,7 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    // Perform Read
                     let data_or_err = {
-                        // We need write lock on table because FileCtx might be mutated (unclear from struct def,
-                        // but usually seeking/reading mutates internal state of the file handle)
                         let mut tbl = vdx.table.write();
 
                         match tbl.get_mut(&params.fs_file_id) {
@@ -259,10 +300,7 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                                     }
                                 }
                             }
-                            None => {
-                                // Signal "not found" to result generation
-                                Err(FatError::NotFound)
-                            }
+                            None => Err(FatError::NotFound),
                         }
                     };
 
@@ -275,7 +313,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                             }))
                         }
                         Err(e) => {
-                            // Map "NotFound" from table lookup to PathNotFound for consistency
                             let status = if matches!(e, FatError::NotFound) {
                                 FileStatus::PathNotFound
                             } else {
@@ -313,7 +350,10 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                                         match file.seek(SeekFrom::Start(params.offset as u64)) {
                                             Err(e) => Err(e),
                                             Ok(_) => match file.write(&params.data) {
-                                                Ok(n) => Ok(n),
+                                                Ok(n) => match file.flush() {
+                                                    Ok(()) => Ok(n),
+                                                    Err(e) => Err(e),
+                                                },
                                                 Err(e) => Err(e),
                                             },
                                         }
@@ -358,7 +398,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    // Needs table write lock to update 'pos'
                     let result = {
                         let mut tbl = vdx.table.write();
                         match tbl.get_mut(&params.fs_file_id) {
@@ -408,19 +447,49 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                 }
 
                 FsOp::Flush => {
-                    unsafe {
+                    let params: FsFlushParams = unsafe {
                         let mut r = req.write();
                         if r.data.len() != size_of::<FsFlushParams>() {
                             return DriverStatus::InvalidParameter;
                         }
-                        let _ = *bytes_to_box::<FsFlushParams>(core::mem::replace(
-                            &mut r.data,
-                            Box::new([]),
-                        ));
+                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    };
+
+                    let flush_res = {
+                        let mut tbl = vdx.table.write();
+                        match tbl.get_mut(&params.fs_file_id) {
+                            Some(ctx) => {
+                                if ctx.is_dir {
+                                    Ok(())
+                                } else {
+                                    let _fs_guard = vdx.fs.lock();
+                                    if let Some(ref mut cached) = ctx.file {
+                                        cached.file.flush()
+                                    } else {
+                                        Err(FatError::NotFound)
+                                    }
+                                }
+                            }
+                            None => Err(FatError::NotFound),
+                        }
                     };
 
                     let mut r = req.write();
-                    r.data = box_to_bytes(Box::new(FsFlushResult { error: None }));
+                    match flush_res {
+                        Ok(()) => {
+                            r.data = box_to_bytes(Box::new(FsFlushResult { error: None }));
+                        }
+                        Err(e) => {
+                            let status = if matches!(e, FatError::NotFound) {
+                                FileStatus::PathNotFound
+                            } else {
+                                map_fatfs_err(&e)
+                            };
+                            r.data = box_to_bytes(Box::new(FsFlushResult {
+                                error: Some(status),
+                            }));
+                        }
+                    }
                     DriverStatus::Success
                 }
 
@@ -506,7 +575,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    // Needs table lock to find file, then FS lock to query
                     let result = {
                         let mut tbl = vdx.table.write();
                         match tbl.get_mut(&params.fs_file_id) {
