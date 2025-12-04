@@ -26,7 +26,13 @@ use crate::{
     },
     util::{boot_info, TOTAL_TIME},
 };
-
+// TODO: full benchmarking framework
+// 1. rip sampling
+// 2. lop export conditions (ex. request X is sent from device Y we must capture this log window and export it)
+// 3. benchmarking proc macros (ex. placed at the start of a function and will then capture the avg time this function takes to complete)
+// 4. request benchmarking capture the avg amount of time each type of request takes to finish.
+// 5. handler benchmarking, add benchmarking to the request_handler proc macro.
+// 6. this all must only occur in a debug build of the kernel.
 pub struct LogConfig {
     pub log_util: bool,
     pub log_per_core: bool,

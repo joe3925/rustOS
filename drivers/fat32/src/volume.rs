@@ -8,7 +8,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
-
 use fatfs::{
     Dir as FatDirT, Error as FatError, File as FatFileT, FileSystem as FatFsT, IoBase,
     LossyOemCpConverter, NullTimeProvider, Read, Seek, SeekFrom, Write,
@@ -115,6 +114,8 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
+// TODO: add a way to spawn blocking work. Modify this so that fsops are spawned as blocking task which must be done because the fstfs crate doesn't support async
+// TODO: ban the usage of block_on in request handlers, maybe implement some type of IRQL.
 
 #[request_handler]
 pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
