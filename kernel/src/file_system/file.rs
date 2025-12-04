@@ -10,103 +10,23 @@ use alloc::{
     vec::Vec,
 };
 use core::cmp::PartialEq;
+use kernel_types::{
+    fs::OpenFlags,
+    status::{DriverStatus, FileStatus, RegError},
+};
 
 use crate::{
-    drivers::{drive::vfs::Vfs, pnp::driver_object::DriverStatus},
+    drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
-    registry::{reg::rebind_and_persist_after_provider_switch, RegError},
+    println,
+    registry::reg::rebind_and_persist_after_provider_switch,
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
-    file_system::{file_provider::provider, file_structs::FsSeekWhence},
+    file_system::file_provider::provider,
     registry::is_first_boot,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum FileAttribute {
-    ReadOnly = 0x01,
-    Hidden = 0x02,
-    System = 0x04,
-    VolumeLabel = 0x08,
-    LFN = 0x0F,
-    Directory = 0x10,
-    Archive = 0x20,
-    Unknown = 0xFF,
-}
-impl From<FileAttribute> for u8 {
-    fn from(attribute: FileAttribute) -> Self {
-        attribute as u8
-    }
-}
-impl TryFrom<u8> for FileAttribute {
-    type Error = ();
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        Ok(match value {
-            0x01 => FileAttribute::ReadOnly,
-            0x02 => FileAttribute::Hidden,
-            0x04 => FileAttribute::System,
-            0x08 => FileAttribute::VolumeLabel,
-            0x0F => FileAttribute::LFN,
-            0x10 => FileAttribute::Directory,
-            0x20 => FileAttribute::Archive,
-            _ => FileAttribute::Unknown,
-        })
-    }
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum OpenFlags {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-    Create,    // create if missing, otherwise open
-    CreateNew, // create only if missing, error if exists
-    Open,      // open only if exists
-}
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u32)]
-pub enum FileStatus {
-    Success = 0x00,
-    FileAlreadyExist = 0x01,
-    PathNotFound = 0x02,
-    UnknownFail = 0x03,
-    NotFat = 0x04,
-    DriveNotFound,
-    IncompatibleFlags,
-    CorruptFilesystem,
-    InternalError,
-    BadPath,
-    AccessDenied,
-    NoSpace,
-    // DriverError(DriverStatus),
-}
-impl FileStatus {
-    pub fn to_str(&self) -> &str {
-        match self {
-            FileStatus::Success => "Success",
-            FileStatus::FileAlreadyExist => "File already exists",
-            FileStatus::PathNotFound => "Path not found",
-            FileStatus::UnknownFail => "The operation failed for an unknown reason",
-            FileStatus::NotFat => "The partition is unformatted or not supported",
-            FileStatus::DriveNotFound => "The drive specified doesn't exist",
-            FileStatus::IncompatibleFlags => "The flags can contain CreateNew and Create",
-            FileStatus::CorruptFilesystem => "The File Allocation Table is corrupt",
-            FileStatus::InternalError => "Internal error",
-            FileStatus::BadPath => "Invalid path",
-            FileStatus::AccessDenied => "Insufficient permissions to access the current file",
-            FileStatus::NoSpace => "Insufficient space on drive to write the requested data", // FileStatus::DriverError(e) => {
-                                                                                              //     format!("The file access failed with a driver error of {}", e)
-                                                                                              // }
-        }
-    }
-}
-impl PartialEq for FileStatus {
-    fn eq(&self, other: &FileStatus) -> bool {
-        self.to_str() == other.to_str()
-    }
-}
+use nostd_runtime::block_on;
 
 #[derive(Debug)]
 pub struct File {
@@ -125,6 +45,7 @@ impl File {
             path
         }
     }
+
     pub extern "win64" fn remove_file_from_path(path: &str) -> &str {
         let parent = path.rsplit_once('\\').map_or("", |(parent, _)| parent);
         if parent.is_empty() || parent == "\\\\" {
@@ -133,6 +54,7 @@ impl File {
             parent
         }
     }
+
     pub extern "win64" fn get_drive_letter(path: &[u8]) -> Option<String> {
         if path.len() >= 3
             && (path[0] as char).is_ascii_alphabetic()
@@ -168,9 +90,9 @@ impl File {
         Ok(())
     }
 
-    pub extern "win64" fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
-        let (res, st) = file_provider::provider().open_path(path, flags);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
+        let (res, st) = file_provider::provider().open_path(path, flags).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         if let Some(e) = res.error {
@@ -184,9 +106,9 @@ impl File {
         })
     }
 
-    pub extern "win64" fn delete(&mut self) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().delete_path(&self.path);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn delete(&mut self) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().delete_path(&self.path).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match r.error {
@@ -195,9 +117,9 @@ impl File {
         }
     }
 
-    pub extern "win64" fn list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
-        let (r, st) = file_provider::provider().list_dir_path(path);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
+        let (r, st) = file_provider::provider().list_dir_path(path).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match r.error {
@@ -206,9 +128,9 @@ impl File {
         }
     }
 
-    pub extern "win64" fn remove_dir(path: String) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().remove_dir_path(&path);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn remove_dir(path: String) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().remove_dir_path(&path).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match r.error {
@@ -217,9 +139,9 @@ impl File {
         }
     }
 
-    pub extern "win64" fn make_dir(path: String) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().make_dir_path(&path);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn make_dir(path: String) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().make_dir_path(&path).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match r.error {
@@ -228,17 +150,19 @@ impl File {
         }
     }
 
-    pub extern "win64" fn read(&self) -> Result<Vec<u8>, FileStatus> {
-        let (gi, st1) = file_provider::provider().get_info(self.fs_file_id);
-        if st1 != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn read(&self) -> Result<Vec<u8>, FileStatus> {
+        let (gi, st1) = file_provider::provider().get_info(self.fs_file_id).await;
+        if st1 != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         if let Some(e) = gi.error {
             return Err(e);
         }
         let size = gi.size as usize;
-        let (rr, st2) = file_provider::provider().read_at(self.fs_file_id, 0, size as u32);
-        if st2 != crate::drivers::pnp::driver_object::DriverStatus::Success {
+        let (rr, st2) = file_provider::provider()
+            .read_at(self.fs_file_id, 0, size as u32)
+            .await;
+        if st2 != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match rr.error {
@@ -247,9 +171,11 @@ impl File {
         }
     }
 
-    pub extern "win64" fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
-        let (wr, st) = file_provider::provider().write_at(self.fs_file_id, 0, data);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
+        let (wr, st) = file_provider::provider()
+            .write_at(self.fs_file_id, 0, data)
+            .await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match wr.error {
@@ -258,9 +184,9 @@ impl File {
         }
     }
 
-    pub extern "win64" fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().rename_path(&self.path, dst);
-        if st != crate::drivers::pnp::driver_object::DriverStatus::Success {
+    pub async fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().rename_path(&self.path, dst).await;
+        if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match r.error {
@@ -268,9 +194,54 @@ impl File {
             Some(e) => Err(e),
         }
     }
+    pub async fn seek(
+        &self,
+        offset: i64,
+        origin: kernel_types::fs::FsSeekWhence,
+    ) -> Result<u64, FileStatus> {
+        let (res, st) = file_provider::provider()
+            .seek_handle(self.fs_file_id, offset, origin)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = res.error {
+            return Err(e);
+        }
+        Ok(res.pos)
+    }
+
+    pub async fn close(self) -> Result<(), FileStatus> {
+        let (res, st) = file_provider::provider()
+            .close_handle(self.fs_file_id)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match res.error {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
 }
-fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
-    let (res, _) = provider().list_dir_path(dir);
+impl Drop for File {
+    fn drop(&mut self) {
+        // TODO: there probably is a way to just call self.close I don't care to figure it out
+        if self.fs_file_id == 0 {
+            return;
+        }
+
+        let id = self.fs_file_id;
+        self.fs_file_id = 0;
+
+        let _ = provider().close_handle(id);
+    }
+}
+
+async fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
+    let (res, _) = provider().list_dir_path(dir).await;
     if res.error.is_none() {
         res.names
     } else {
@@ -278,46 +249,39 @@ fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
     }
 }
 
-fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]) {
-        Ok(mut f) => f.read().ok(),
+async fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
+        Ok(f) => f.read().await.ok(),
         Err(_) => None,
     }
 }
 
-fn ensure_dir(path: &str) {
+async fn ensure_dir(path: &str) {
     let _ = provider().make_dir_path(path);
 }
 
-fn file_exists(path: &str) -> bool {
-    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]) {
+async fn file_exists(path: &str) -> bool {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
         Ok(_) => true,
         Err(_) => false,
     }
 }
 
-pub fn switch_to_vfs() -> Result<(), RegError> {
-    // TODO: At some point I need to figure out what to do with the boot strap drivers, DriverObject images not resolving.
-    // Options:
-    // 1. OM resolution, add memory backed files resolved from the OM
-
-    // 2. create a ramfs driver that registers with the vfs, get rid of the file provider stuff
-
-    // 3. add memory backed files that file system drivers must support.
-
+pub async fn switch_to_vfs() -> Result<(), RegError> {
     install_file_provider(Box::new(Vfs::new()));
 
-    rebind_and_persist_after_provider_switch()?;
+    rebind_and_persist_after_provider_switch().await?;
 
     let vfs_mod = "C:\\SYSTEM\\MOD";
     let vfs_toml = "C:\\SYSTEM\\TOML";
-    ensure_dir(vfs_mod);
-    ensure_dir(vfs_toml);
-    if (is_first_boot()) {
+    ensure_dir(vfs_mod).await;
+    ensure_dir(vfs_toml).await;
+    if is_first_boot().await {
         //install_prepacked_drivers();
     }
     Ok(())
 }
+
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {
     path.trim_start_matches('\\').split('\\').collect()
 }

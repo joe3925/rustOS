@@ -18,5 +18,6 @@ pub extern "C" fn fmaf(_x: f32, _y: f32, z: f32) -> f32 {
     z
 }
 // TODO: add as a kernel_api binding if this becomes an issue
+// TODO: this is now an issue and must be implemented at some point
 #[unsafe(no_mangle)]
 pub extern "C" fn __chkstk() {}

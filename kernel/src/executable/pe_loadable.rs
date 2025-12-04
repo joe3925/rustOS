@@ -1,7 +1,7 @@
 use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
-use crate::file_system::file::{file_parser, File, OpenFlags};
+use crate::file_system::file::{file_parser, File};
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
@@ -16,6 +16,10 @@ use alloc::vec::Vec;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
 use goblin::Object;
+use kernel_types::device::ModuleHandle;
+use kernel_types::fs::OpenFlags;
+use kernel_types::memory::Module;
+use nostd_runtime::block_on;
 use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
@@ -24,7 +28,7 @@ use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
-use super::program::{HandleTable, Module, ModuleHandle, Program, PROGRAM_MANAGER};
+use super::program::{HandleTable, Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -35,10 +39,10 @@ pub struct PELoader {
 
 impl PELoader {
     /// Opens and prepares a PE loader from the given path.
-    pub fn new(path: &str) -> Option<Self> {
+    pub async fn new(path: &str) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
-        let file_handle = File::open(path, &open_flags).ok()?;
-        let file_data: Vec<u8> = file_handle.read().ok()?;
+        let file_handle = File::open(path, &open_flags).await.ok()?;
+        let file_data: Vec<u8> = file_handle.read().await.ok()?;
 
         let boxed: Box<[u8]> = file_data.into_boxed_slice();
 
@@ -103,7 +107,6 @@ impl PELoader {
     pub fn needs_relocation(&self) -> bool {
         self.is_aslr() && self.reloc_table().is_some()
     }
-    /// Returns the .reloc section data if present.
     pub fn reloc_table(&self) -> Option<impl Iterator<Item = RelocationEntry> + '_> {
         let section = self
             .pe
@@ -117,17 +120,10 @@ impl PELoader {
 
         Some(parse_base_relocations(buffer))
     }
-    pub fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
-        if !self.pe.is_lib {
-            return Err(LoadError::NotDLL);
-        }
-        if !self.pe.is_64 {
-            return Err(LoadError::Not64Bit);
-        }
-
-        let new_cr3 = program.cr3;
-        let exports = self.collect_exports(); // (name, rva) list
-
+    fn map_into_program(
+        &mut self,
+        program: &mut Program,
+    ) -> Result<(ModuleHandle, Vec<(String, usize)>, u64), LoadError> {
         let opt = self
             .pe
             .header
@@ -135,51 +131,24 @@ impl PELoader {
             .as_ref()
             .ok_or(LoadError::MissingSections)?;
         let image_size = opt.windows_fields.size_of_image as u64;
-        let preferred_base = opt.windows_fields.image_base; // u32
+        let preferred_base = opt.windows_fields.image_base;
 
-        let old_cr3 = Cr3::read();
-        unsafe { Cr3::write(new_cr3, old_cr3.1) };
+        let exports = self.collect_exports();
 
-        let result = (|| {
-            let need_reloc = program.tracker.alloc(preferred_base, image_size).is_err()
-                || self.needs_relocation();
+        let need_reloc =
+            program.tracker.alloc(preferred_base, image_size).is_err() || self.needs_relocation();
 
-            if need_reloc {
-                // ----- relocated path -----
-                let new_base = self.calculate_relocation_base(&program.tracker)?;
-                self.current_base = new_base;
+        if need_reloc {
+            let new_base = self.calculate_relocation_base(&program.tracker)?;
+            self.current_base = new_base;
 
-                program
-                    .virtual_map_alloc(new_base, image_size as usize)
-                    .map_err(|_| LoadError::NoMemory)?;
+            program
+                .virtual_map_alloc(new_base, image_size as usize)
+                .map_err(|_| LoadError::NoMemory)?;
 
-                self.load_sections()?;
-                self.relocate()?;
-                self.resolve_imports(program);
-                self.patch_imports(program);
-
-                let title = file_parser(&self.path).last().unwrap().to_string();
-                let base = self.current_base.as_u64();
-                println!(
-                    "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
-                    title,
-                    base,
-                    base + image_size,
-                    image_size
-                );
-
-                let module = Module {
-                    title,
-                    image_path: self.path.clone(),
-                    parent_pid: program.pid,
-                    image_base: self.current_base,
-                    symbols: exports,
-                };
-                let handle = Arc::new(RwLock::new(module));
-                program.modules.write().push(handle.clone());
-                return Ok(handle);
-            }
-
+            self.load_sections()?;
+            self.relocate()?;
+        } else {
             unsafe {
                 program
                     .virtual_map(VirtAddr::new(preferred_base), image_size as usize)
@@ -190,42 +159,66 @@ impl PELoader {
             }
             self.current_base = VirtAddr::new(preferred_base);
             self.load_sections()?;
-            self.resolve_imports(program);
-            self.patch_imports(program);
+        }
 
-            let title = file_parser(&self.path).last().unwrap().to_string();
-            let base = self.current_base.as_u64();
-            println!(
-                "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
-                title,
-                base,
-                base + image_size,
-                image_size
-            );
+        let title = file_parser(&self.path).last().unwrap().to_string();
+        let base = self.current_base.as_u64();
+        println!(
+            "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
+            title,
+            base,
+            base + image_size,
+            image_size
+        );
 
-            let module = Module {
-                title,
-                image_path: self.path.clone(),
-                parent_pid: program.pid,
-                image_base: self.current_base,
-                symbols: exports,
-            };
-            let handle = Arc::new(RwLock::new(module));
-            program.modules.write().push(handle.clone());
-            Ok(handle)
-        })();
+        let module = Module {
+            title,
+            image_path: self.path.clone(),
+            parent_pid: program.pid,
+            image_base: self.current_base,
+            symbols: exports.clone(),
+        };
+        let handle = Arc::new(RwLock::new(module));
+        program.modules.write().push(handle.clone());
 
-        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
-
-        result
+        Ok((handle, exports, image_size))
     }
 
+    fn patch_imports_sync(&mut self, program: &mut Program) -> Result<(), LoadError> {
+        self.patch_imports(program)
+    }
+
+    pub async fn dll_load(&mut self, program: &mut Program) -> Result<ModuleHandle, LoadError> {
+        if !self.pe.is_lib {
+            return Err(LoadError::NotDLL);
+        }
+        if !self.pe.is_64 {
+            return Err(LoadError::Not64Bit);
+        }
+
+        let new_cr3 = program.cr3;
+        let old_cr3 = Cr3::read();
+
+        let (handle, _exports, _image_size) = {
+            unsafe { Cr3::write(new_cr3, old_cr3.1) };
+            let r = self.map_into_program(program);
+            unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+            r?
+        };
+
+        unsafe { Cr3::write(new_cr3, old_cr3.1) };
+        let r = self.patch_imports_sync(program);
+        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+        r?;
+
+        Ok(handle)
+    }
     /// Loads the PE into memory and prepares it for execution.
     ///
     /// Error: LoadError
     ///
     /// Ok: PID of the loaded program
-    pub fn load(&mut self) -> Result<u64, LoadError> {
+    pub async fn load(&mut self) -> Result<u64, LoadError> {
         let were_enabled = interrupts::are_enabled();
         if were_enabled {
             interrupts::disable();
@@ -296,7 +289,11 @@ impl PELoader {
         }
 
         let thread = Task::new_user_mode(
-            (self.pe.entry as i64 + self.current_base.as_u64() as i64) as usize,
+            unsafe {
+                *(((self.pe.entry as i64 + self.current_base.as_u64() as i64) as usize)
+                    as *const extern "win64" fn(usize))
+            },
+            0,
             stack_size,
             File::remove_file_from_path(self.path.as_str()).to_string(),
             stack_addr,
@@ -308,7 +305,7 @@ impl PELoader {
         if (self.needs_relocation()) {
             self.relocate()?;
         }
-        self.resolve_imports(&mut program);
+        self.resolve_imports(&mut program).await;
         self.patch_imports(&mut program);
 
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
@@ -323,7 +320,7 @@ impl PELoader {
 
         Ok(pid)
     }
-    pub fn resolve_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
+    pub async fn resolve_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
         loop {
             let mut added = false;
 
@@ -339,7 +336,7 @@ impl PELoader {
                     continue;
                 }
                 let path = alloc::format!(r"C:\BIN\MOD\{}", dll);
-                program.load_module(path)?;
+                program.load_module(path).await?;
                 added = true;
             }
 

@@ -1,8 +1,6 @@
 use crate::{
     alloc::vec,
     drivers::pnp::{device::DevNode, driver_index::DriverRuntime, request::CompletionRoutine},
-    structs::async_future::AsyncWaitable,
-    util::random_number,
 };
 use alloc::{
     boxed::Box,
@@ -11,20 +9,19 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::ptr;
 use core::{
     any::{type_name, Any, TypeId},
-    cell::UnsafeCell,
     marker::PhantomData,
-    mem,
-    ops::{ControlFlow, Deref, DerefMut, Try},
-    ptr::NonNull,
+    ops::{ControlFlow, FromResidual, Try},
+    pin::Pin,
+    ptr::{self, NonNull},
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64},
+    task::{Context, Poll, Waker},
 };
-use core::{cell::OnceCell, ops::FromResidual};
-use core::{marker::ConstParamTy, task::Waker};
+use core::{cell::OnceCell, future::Future};
 use spin::{Mutex, Once, RwLock};
 use strum::Display;
+
 #[repr(i32)]
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStatus {
@@ -39,15 +36,14 @@ pub enum DriverStatus {
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
 }
+
 impl Try for DriverStatus {
     type Output = ();
     type Residual = DriverStatus;
-
     #[inline]
     fn from_output((): Self::Output) -> Self {
         DriverStatus::Success
     }
-
     #[inline]
     fn branch(self) -> ControlFlow<Self::Residual, Self::Output> {
         if self == DriverStatus::Success {
@@ -57,39 +53,32 @@ impl Try for DriverStatus {
         }
     }
 }
-
 impl<T> FromResidual<DriverStatus> for Result<T, DriverStatus> {
     #[inline]
     fn from_residual(r: DriverStatus) -> Self {
         Err(r)
     }
 }
-
 impl FromResidual<DriverStatus> for DriverStatus {
     #[inline]
     fn from_residual(r: DriverStatus) -> Self {
         r
     }
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
 pub enum TraversalPolicy {
-    /// Standard I/O behavior: If unhandled, pass to the next lower device.
-    /// If no lower device exists, fail with NoSuchDevice.
     ForwardLower,
-    /// Strict behavior: If unhandled, fail immediately with NotImplemented.
     FailIfUnhandled,
-    /// Upward bubbling: If unhandled, pass to the next UPPER device.
     ForwardUpper,
 }
-#[repr(C)]
-pub struct ReqJob {
-    pub(crate) dev: Arc<DeviceObject>,
-    pub(crate) req: Arc<RwLock<Request>>,
-}
+
+/// Common type for futures returned by I/O handlers.
+pub type BoxedIoFuture = Pin<Box<dyn Future<Output = DriverStatus> + Send + 'static>>;
 
 #[derive(Debug)]
 #[repr(C)]
-
 pub struct DeviceObject {
     pub lower_device: Once<Arc<DeviceObject>>,
     pub upper_device: Once<alloc::sync::Weak<DeviceObject>>,
@@ -100,6 +89,7 @@ pub struct DeviceObject {
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
 }
+
 impl DeviceObject {
     pub fn new(mut init: DeviceInit) -> Arc<Self> {
         let dev_ext = init.dev_ext_ready.take().unwrap_or_else(DevExtBox::none);
@@ -130,7 +120,6 @@ impl DeviceObject {
             _nosend: PhantomData,
         })
     }
-
     pub fn set_lower_upper(this: &Arc<Self>, lower: Arc<DeviceObject>) {
         this.lower_device.call_once(|| lower.clone());
         lower
@@ -141,31 +130,22 @@ impl DeviceObject {
         self.dev_node.call_once(|| Arc::downgrade(dn));
     }
 }
-fn self_arc(this: &DeviceObject) -> Arc<DeviceObject> {
-    unsafe { Arc::from_raw(Arc::as_ptr(&Arc::new_uninit().assume_init())) }
-}
-pub type ClassAddCallback =
-    extern "win64" fn(node: &Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 
+pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type EvtDriverDeviceAdd =
-    extern "win64" fn(driver: &Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
+    extern "win64" fn(driver: Arc<DriverObject>, init: &mut DeviceInit) -> DriverStatus;
+pub type EvtDriverUnload = extern "win64" fn(driver: Arc<DriverObject>) -> DriverStatus;
 
-pub type EvtDriverUnload = extern "win64" fn(driver: &Arc<DriverObject>) -> DriverStatus;
+// Async Handler Types - Note: These are Rust function pointers, not extern "C"
+pub type EvtIoRead = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
+pub type EvtIoWrite = fn(Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> BoxedIoFuture;
+pub type EvtIoDeviceControl = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
+pub type EvtIoFs = fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> BoxedIoFuture;
 
-pub type EvtIoRead =
-    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
-pub type EvtIoWrite =
-    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>, usize) -> DriverStatus;
-pub type EvtIoDeviceControl =
-    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
-pub type EvtDevicePrepareHardware = extern "win64" fn(&Arc<DeviceObject>) -> DriverStatus;
-pub type EvtDeviceEnumerateDevices =
-    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
-pub type EvtIoFs = extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+pub type EvtDevicePrepareHardware = extern "win64" fn(Arc<DeviceObject>) -> DriverStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
-
 pub enum DeviceRelationType {
     BusRelations,
     EjectionRelations,
@@ -181,13 +161,6 @@ pub enum QueryIdType {
     HardwareIds,
     CompatibleIds,
     InstanceId,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum ResourceKind {
-    Memory = 1,
-    Port = 2,
-    Interrupt = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +182,6 @@ impl PnpMinorFunction {
             | Self::SurpriseRemoval
             | Self::RemoveDevice
             | Self::StopDevice => DriverStatus::Success,
-
             Self::QueryId | Self::QueryResources => DriverStatus::NotImplemented,
         }
     }
@@ -221,37 +193,26 @@ pub struct PnpRequest {
     pub minor_function: PnpMinorFunction,
     pub relation: DeviceRelationType,
     pub id_type: QueryIdType,
-
     pub ids_out: Vec<String>,
     pub blob_out: Vec<u8>,
 }
-impl AsyncWaitable for Request {
-    fn is_ready(&self) -> bool {
-        self.status != DriverStatus::Pending && self.status != DriverStatus::Continue
-    }
 
-    fn set_waker(&mut self, waker: Option<Waker>) {
-        self.waker = waker;
-    }
-}
 pub type PnpMinorCallback =
-    extern "win64" fn(&Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
+    extern "win64" fn(Arc<DeviceObject>, Arc<RwLock<Request>>) -> DriverStatus;
 
 #[repr(C)]
 #[derive(Debug)]
 pub struct PnpVtable {
     pub handlers: Vec<Option<PnpMinorCallback>>,
 }
-
 impl PnpVtable {
     #[inline]
     pub fn new() -> Self {
         let n = core::mem::variant_count::<PnpMinorFunction>();
         Self {
-            handlers: alloc::vec![None; n],
+            handlers: vec![None; n],
         }
     }
-
     #[inline]
     pub fn set(&mut self, m: PnpMinorFunction, cb: PnpMinorCallback) {
         let i = m as usize;
@@ -259,7 +220,6 @@ impl PnpVtable {
             self.handlers[i] = Some(cb);
         }
     }
-
     #[inline]
     pub fn get(&self, m: PnpMinorFunction) -> Option<PnpMinorCallback> {
         let i = m as usize;
@@ -270,6 +230,7 @@ impl PnpVtable {
         }
     }
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum RequestType {
@@ -278,39 +239,27 @@ pub enum RequestType {
     DeviceControl(u32),
     Fs(FsOp),
     Pnp,
-
     Dummy,
 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub enum FsOp {
-    /// data = UTF-8 path bytes; flags in Request.flags (bitfield), length may carry mode/perm
     Create,
-    /// data = UTF-8 path bytes; flags in Request.flags (bitfield)
     Open,
-    /// uses Request.handle
     Close,
-    /// uses Request.handle + Request.offset/length; returns bytes in Request.data
     Read,
-    /// uses Request.handle + Request.offset; bytes to write in Request.data
     Write,
-    /// uses Request.handle; ensure durable
     Flush,
-    /// uses Request.handle + Request.offset (absolute)
     Seek,
-    /// uses Request.handle; returns serialized dir entries in Request.data
     ReadDir,
-    /// uses Request.handle; returns serialized stat/attributes in Request.data
     GetInfo,
-    /// uses Request.handle; takes serialized attrs in Request.data
     SetInfo,
-    /// data = UTF-8 path bytes (or uses Request.handle if nonzero)
     Delete,
-    /// data = "old\0new" UTF-8 bytes
     Rename,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub enum IoType {
     Read(EvtIoRead),
@@ -318,6 +267,7 @@ pub enum IoType {
     DeviceControl(EvtIoDeviceControl),
     Fs(EvtIoFs),
 }
+
 impl IoType {
     #[inline]
     pub fn slot(&self) -> usize {
@@ -328,9 +278,8 @@ impl IoType {
             IoType::Fs(_) => 3,
         }
     }
-
     #[inline]
-    pub fn invoke(&self, dev: &Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+    pub fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> BoxedIoFuture {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
                 let len = req.read().data.len();
@@ -340,7 +289,6 @@ impl IoType {
             IoType::Fs(h) => h(dev, req),
         }
     }
-
     #[inline]
     pub fn slot_for_request(r: &RequestType) -> Option<usize> {
         match r {
@@ -352,6 +300,7 @@ impl IoType {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub enum Synchronization {
@@ -359,29 +308,38 @@ pub enum Synchronization {
     Async,
     FireAndForget,
 }
+
+#[derive(Clone)]
 #[repr(C)]
-#[derive(Debug, Clone)]
 pub struct IoHandler {
     pub handler: IoType,
     pub synchronization: Synchronization,
     pub depth: usize,
     pub running_request: Arc<AtomicU64>,
 }
-#[repr(C)]
+
+// Custom debug impl to avoid printing function pointers
+impl core::fmt::Debug for IoHandler {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("IoHandler")
+            .field("synchronization", &self.synchronization)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
+#[repr(C)]
 pub struct IoVtable {
     pub handlers: Vec<Option<IoHandler>>,
 }
-
 impl IoVtable {
     #[inline]
     pub fn new() -> Self {
-        let n = core::mem::variant_count::<IoType>();
+        let n = 4; // Read, Write, DC, Fs
         Self {
-            handlers: alloc::vec![None; n],
+            handlers: vec![None; n],
         }
     }
-
     #[inline]
     pub fn set(&mut self, cb: IoType, synchronization: Synchronization, depth: usize) {
         let i = cb.slot();
@@ -394,18 +352,19 @@ impl IoVtable {
             });
         }
     }
-
     #[inline]
     pub fn get_for(&self, r: &RequestType) -> Option<IoHandler> {
         IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).cloned().flatten())
     }
 }
+
 #[repr(C)]
 pub struct ClassListener {
     pub class: String,
     pub dev: Arc<DeviceObject>,
     pub cb: ClassAddCallback,
 }
+
 #[derive(Debug)]
 #[repr(C)]
 pub struct Request {
@@ -415,12 +374,9 @@ pub struct Request {
     pub completed: bool,
     pub status: DriverStatus,
     pub traversal_policy: TraversalPolicy,
-
     pub pnp: Option<PnpRequest>,
-
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
-
     pub waker: Option<Waker>,
 }
 
@@ -428,9 +384,8 @@ impl Request {
     #[inline]
     pub fn new(kind: RequestType, data: Box<[u8]>) -> Self {
         if matches!(kind, RequestType::Pnp) {
-            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
+            panic!("Use Request::new_pnp for PnP requests.");
         }
-
         Self {
             id: unsafe { crate::util::random_number() },
             kind,
@@ -452,7 +407,7 @@ impl Request {
     #[inline]
     pub fn new_pnp(pnp: PnpRequest, data: Box<[u8]>) -> Self {
         Self {
-            id: crate::util::random_number(),
+            id: unsafe { crate::util::random_number() },
             kind: RequestType::Pnp,
             data,
             completed: false,
@@ -464,28 +419,30 @@ impl Request {
             waker: None,
         }
     }
-    #[inline]
-    pub fn empty() -> Self {
-        let dummy_kind = RequestType::Dummy;
-
-        Self {
-            id: 0,
-            kind: dummy_kind,
-            data: Box::new([]),
-            completed: true,
-            status: DriverStatus::Success,
-            traversal_policy: TraversalPolicy::FailIfUnhandled,
-            pnp: None,
-            completion_routine: None,
-            completion_context: 0,
-            waker: None,
-        }
-    }
     pub fn set_completion(&mut self, routine: CompletionRoutine, context: usize) {
         self.completion_routine = Some(routine);
         self.completion_context = context;
     }
 }
+
+pub struct RequestFuture {
+    pub req: Arc<RwLock<Request>>,
+}
+
+impl Future for RequestFuture {
+    type Output = DriverStatus;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut req = self.req.write();
+        if req.completed {
+            Poll::Ready(req.status)
+        } else {
+            req.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {
@@ -506,13 +463,11 @@ impl DeviceInit {
             dev_ext_ready: None,
         }
     }
-
     pub fn set_dev_ext_from<T: 'static + Send + Sync>(&mut self, value: T) {
         self.dev_ext_size = core::mem::size_of::<T>();
         self.dev_ext_type = Some(TypeId::of::<T>());
         self.dev_ext_ready = Some(DevExtBox::from_value(value));
     }
-
     pub fn set_dev_ext_default<T: Default + 'static + Send + Sync>(&mut self) {
         self.set_dev_ext_from::<T>(T::default());
     }
@@ -524,7 +479,6 @@ pub struct DriverObject {
     pub runtime: Arc<DriverRuntime>,
     pub driver_name: String,
     pub flags: u32,
-
     pub evt_device_add: Option<EvtDriverDeviceAdd>,
     pub evt_driver_unload: Option<EvtDriverUnload>,
 }
@@ -539,27 +493,18 @@ impl DriverObject {
             evt_driver_unload: None,
         })
     }
-
     pub fn configure<F: FnOnce(&mut DriverConfig)>(this: &Arc<Self>, f: F) {
         let mut cfg = DriverConfig {
             driver: Arc::as_ptr(this),
         };
         f(&mut cfg);
     }
-
-    pub unsafe fn configure_raw<F: FnOnce(&mut DriverConfig)>(
-        driver_ptr: *const DriverObject,
-        f: F,
-    ) {
-        let mut cfg = DriverConfig { driver: driver_ptr };
-        f(&mut cfg);
-    }
 }
+
 #[repr(C)]
 pub struct DriverConfig {
     driver: *const DriverObject,
 }
-
 impl DriverConfig {
     pub fn on_device_add(&mut self, cb: EvtDriverDeviceAdd) -> &mut Self {
         unsafe {
@@ -574,16 +519,18 @@ impl DriverConfig {
         self
     }
 }
+
 #[repr(u32)]
 pub enum DevExtError {
     NotPresent,
     TypeMismatch { expected: &'static str },
 }
+
 #[repr(C)]
 pub struct DevExtRef<'a, T: 'static> {
-    ptr: core::ptr::NonNull<T>,
-    _lt: core::marker::PhantomData<&'a T>,
-    _nosend: core::marker::PhantomData<*mut T>,
+    ptr: NonNull<T>,
+    _lt: PhantomData<&'a T>,
+    _nosend: PhantomData<*mut T>,
 }
 impl<'a, T: 'static> core::ops::Deref for DevExtRef<'a, T> {
     type Target = T;
@@ -591,27 +538,6 @@ impl<'a, T: 'static> core::ops::Deref for DevExtRef<'a, T> {
         unsafe { self.ptr.as_ref() }
     }
 }
-#[repr(C)]
-pub struct DevExtRefMut<'a, T: 'static> {
-    ptr: core::ptr::NonNull<T>,
-    _lt: core::marker::PhantomData<&'a mut T>,
-    _nosend: core::marker::PhantomData<*mut T>,
-}
-impl<'a, T: 'static> core::ops::Deref for DevExtRefMut<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        unsafe { self.ptr.as_ref() }
-    }
-}
-impl<'a, T: 'static> core::ops::DerefMut for DevExtRefMut<'a, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        unsafe { self.ptr.as_mut() }
-    }
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct NoDevExt;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -620,9 +546,7 @@ struct DevExtBox {
     ty: TypeId,
     present: bool,
 }
-
 impl DevExtBox {
-    #[inline]
     fn none() -> Self {
         Self {
             inner: Once::new(),
@@ -630,29 +554,24 @@ impl DevExtBox {
             present: false,
         }
     }
-
-    #[inline]
     fn from_value<T: 'static + Send + Sync>(v: T) -> Self {
         let mut b = Self {
             inner: Once::new(),
             ty: TypeId::of::<T>(),
             present: true,
         };
-        b.inner
-            .call_once(|| Box::new(v) as Box<dyn Any + Send + Sync>);
+        b.inner.call_once(|| Box::new(v));
         b
     }
-
-    #[inline]
     fn as_const_ptr<T: 'static>(&self) -> *const T {
-        match self.inner.get() {
-            Some(b) => {
-                let a: &dyn Any = &**b;
-                a.downcast_ref::<T>()
+        self.inner
+            .get()
+            .map(|b| {
+                (&**b as &dyn Any)
+                    .downcast_ref::<T>()
                     .map(|r| r as *const T)
                     .unwrap_or(ptr::null())
-            }
-            None => ptr::null(),
-        }
+            })
+            .unwrap_or(ptr::null())
     }
 }

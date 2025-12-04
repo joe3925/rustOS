@@ -6,6 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
+use kernel_types::device::ModuleHandle;
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
@@ -16,6 +17,7 @@ use x86_64::{
 };
 
 use crate::{
+    executable::pe_loadable::PELoader,
     file_system::path::Path,
     memory::paging::paging::map_page,
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
@@ -38,7 +40,6 @@ use super::pe_loadable::{self, LoadError};
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
 pub type QueueHandle = Arc<RwLock<MessageQueue>>;
-pub type ModuleHandle = Arc<RwLock<Module>>;
 pub type UserHandle = u64;
 
 #[inline]
@@ -77,15 +78,6 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 }
 
 // ───────────────────────── runtime types ─────────────────────────
-
-#[derive(Clone, Debug)]
-pub struct Module {
-    pub title: String,
-    pub image_path: String,
-    pub parent_pid: u64,
-    pub image_base: VirtAddr,
-    pub symbols: Vec<(String, usize)>,
-}
 
 #[derive(Debug)]
 pub struct MessageQueue {
@@ -280,12 +272,28 @@ impl Program {
         result
     }
 
-    pub fn load_module(&mut self, path: String) -> Result<ModuleHandle, LoadError> {
-        if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
-            let module = dll.dll_load(self)?;
-            return Ok(module);
+    pub async fn load_module(&mut self, root_path: String) -> Result<ModuleHandle, LoadError> {
+        let mut queue = Vec::new();
+        queue.push(root_path);
+
+        let mut last_handle = None;
+
+        while let Some(path) = queue.pop() {
+            let mut loader = PELoader::new(&path).await.ok_or(LoadError::NoFile)?;
+            let handle = loader.dll_load(self).await?;
+
+            last_handle = Some(handle.clone());
+
+            for dll in loader.list_import_dlls() {
+                // Add more dll search locations
+                let dep_path = alloc::format!(r"C:\BIN\MOD\{}", dll);
+                if !self.has_module(&dll) {
+                    queue.push(dep_path);
+                }
+            }
         }
-        Err(LoadError::NoFile)
+
+        last_handle.ok_or(LoadError::NotDLL)
     }
 
     pub fn kill(&mut self) -> Result<(), LoadError> {

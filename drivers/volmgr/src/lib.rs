@@ -8,34 +8,46 @@ use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::mem::take;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering::Acquire;
 use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
-use kernel_api::DevExtRef;
-use kernel_api::DevExtRefMut;
-use kernel_api::PartitionInfo;
-use kernel_api::TraversalPolicy;
-use kernel_api::alloc_api::ffi::{pnp_get_device_target, pnp_send_request, pnp_wait_for_request};
-use kernel_api::alloc_api::{IoType, IoVtable, PnpVtable, Synchronization};
-use kernel_api::bytes_to_box;
-use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, Request, RequestType,
-    alloc_api::{
-        DeviceIds, DeviceInit, PnpRequest,
-        ffi::{
-            driver_set_evt_device_add, pnp_complete_request,
-            pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
-        },
-    },
-    println,
-};
-use kernel_api::{GptHeader, GptPartitionEntry, IoTarget, PnpMinorFunction};
+use kernel_api::RequestExt;
+use kernel_api::acpi::handler;
+use kernel_api::block_on;
+use kernel_api::device::DevExtRef;
+use kernel_api::device::DeviceInit;
+use kernel_api::device::DeviceObject;
+use kernel_api::device::DriverObject;
+use kernel_api::kernel_types::io::IoTarget;
+use kernel_api::kernel_types::io::IoType;
+use kernel_api::kernel_types::io::IoVtable;
+use kernel_api::kernel_types::io::PartitionInfo;
+use kernel_api::kernel_types::io::Synchronization;
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::pnp::DeviceRelationType;
+use kernel_api::pnp::PnpMinorFunction;
+use kernel_api::pnp::PnpRequest;
+use kernel_api::pnp::PnpVtable;
+use kernel_api::pnp::QueryIdType;
+use kernel_api::pnp::driver_set_evt_device_add;
+use kernel_api::pnp::pnp_complete_request;
+use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
+use kernel_api::pnp::pnp_forward_request_to_next_lower;
+use kernel_api::pnp::pnp_get_device_target;
+use kernel_api::pnp::pnp_send_request;
+use kernel_api::println;
+use kernel_api::request::Request;
+use kernel_api::request::RequestType;
+use kernel_api::request::TraversalPolicy;
+use kernel_api::request_handler;
+use kernel_api::status::DriverStatus;
+use kernel_api::util::bytes_to_box;
 use spin::Once;
 use spin::RwLock;
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+
 mod msvc_shims;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -43,9 +55,10 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 #[repr(C)]
 #[derive(Default)]
@@ -93,7 +106,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn vol_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -108,15 +121,16 @@ pub extern "win64" fn vol_device_add(
     DriverStatus::Success
 }
 
-extern "win64" fn vol_prepare_hardware(
-    dev: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn vol_prepare_hardware(
+    dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut req = Request::new_pnp(
         PnpRequest {
-            minor_function: kernel_api::PnpMinorFunction::QueryResources,
-            relation: kernel_api::DeviceRelationType::TargetDeviceRelation,
-            id_type: kernel_api::QueryIdType::DeviceId,
+            minor_function: PnpMinorFunction::QueryResources,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::DeviceId,
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
@@ -124,15 +138,13 @@ extern "win64" fn vol_prepare_hardware(
     );
 
     let req_lock = Arc::new(RwLock::new(req));
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, req_lock.clone()) };
+    let st = unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone())? }.await;
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
 
-    unsafe { pnp_wait_for_request(&req_lock) };
-
     let mut g = req_lock.write();
-    let mut dx = ext::<VolExt>(dev);
+    let mut dx = ext::<VolExt>(&dev);
 
     if g.status != DriverStatus::Success {
         return g.status;
@@ -156,11 +168,12 @@ extern "win64" fn vol_prepare_hardware(
 
     DriverStatus::Continue
 }
-pub extern "win64" fn vol_enumerate_devices(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn vol_enumerate_devices(
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let dx = ext::<VolExt>(device);
+    let dx = ext::<VolExt>(&device);
 
     let binding = dx.part.get();
     let pi = if let Some(ref pi) = binding {
@@ -259,9 +272,13 @@ extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStat
     unsafe { pnp_complete_request(&parent) };
     return DriverStatus::Success;
 }
-// TODO: this can be optimized
-pub extern "win64" fn vol_pdo_read(
-    dev: &Arc<DeviceObject>,
+static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_READ: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_WRITE: AtomicUsize = AtomicUsize::new(0);
+#[request_handler]
+pub async fn vol_pdo_read(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
@@ -269,14 +286,25 @@ pub extern "win64" fn vol_pdo_read(
         let r = parent.read();
         match r.kind {
             RequestType::Read { offset, len } => (offset, len),
-            _ => {
-                drop(r);
-                return DriverStatus::InvalidParameter;
-            }
+            _ => return DriverStatus::InvalidParameter,
         }
     };
+    let total_read_kib = TOTAL_READ.fetch_add(len, Ordering::AcqRel) / 1024;
+    let total_write_kib = TOTAL_WRITE.load(Ordering::Acquire) / 1024;
 
-    let binding = ext::<VolPdoExt>(dev);
+    // println!(
+    //     "read #{}, total read: {} KiB, write #{}, total write: {} KiB",
+    //     READ_COUNTER.fetch_add(1, Ordering::AcqRel),
+    //     total_read_kib,
+    //     WRITE_COUNTER.load(Ordering::Acquire),
+    //     total_write_kib,
+    // );
+
+    if len == 0 {
+        return DriverStatus::Success;
+    }
+
+    let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
@@ -284,40 +312,53 @@ pub extern "win64" fn vol_pdo_read(
         }
     };
 
-    let mut child = Request::new(
-        RequestType::Read { offset: off, len },
-        vec![0u8; len].into_boxed_slice(),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let ctx = Box::into_raw(Box::new(BridgeCtx {
-        parent: parent.clone(),
-    })) as usize;
-    child.set_completion(bridge_complete, ctx);
-    let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
-    return DriverStatus::Success;
+    let buf = {
+        let mut w = parent.write();
+        core::mem::take(&mut w.data)
+    };
+
+    let child = Arc::new(RwLock::new(
+        Request::new(RequestType::Read { offset: off, len }, buf)
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+
+    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+
+    let (st, data) = {
+        let mut g = child.write();
+        let st = g.status;
+        let data = core::mem::take(&mut g.data);
+        (st, data)
+    };
+
+    {
+        let mut p = parent.write();
+        p.data = data;
+    }
+
+    st
 }
 
-pub extern "win64" fn vol_pdo_write(
-    dev: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn vol_pdo_write(
+    dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
-    let (off, len, moved) = {
-        let mut w = parent.write();
-        match w.kind {
-            RequestType::Write { offset, len } => {
-                let data = mem::take(&mut w.data);
-                (offset, len, data)
-            }
-            _ => {
-                return DriverStatus::InvalidParameter;
-            }
+    let (off, len) = {
+        let r = parent.read();
+        match r.kind {
+            RequestType::Write { offset, len } => (offset, len),
+            _ => return DriverStatus::InvalidParameter,
         }
     };
+    WRITE_COUNTER.fetch_add(1, Ordering::AcqRel);
+    TOTAL_WRITE.fetch_add(len, Ordering::AcqRel);
+    if len == 0 {
+        return DriverStatus::Success;
+    }
 
-    let binding = ext::<VolPdoExt>(dev);
+    let binding = ext::<VolPdoExt>(&dev);
     let tgt = match &binding.backing.get() {
         Some(t) => t.clone(),
         None => {
@@ -325,21 +366,28 @@ pub extern "win64" fn vol_pdo_write(
         }
     };
 
-    let mut child = Request::new(RequestType::Write { offset: off, len }, moved)
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let ctx = Box::into_raw(Box::new(BridgeCtx {
-        parent: parent.clone(),
-    })) as usize;
-    child.set_completion(bridge_complete, ctx);
+    let moved = {
+        let mut w = parent.write();
+        core::mem::take(&mut w.data)
+    };
 
-    let req = Arc::new(RwLock::new(child));
-    unsafe { pnp_send_request(&*tgt, req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
+    let child = Arc::new(RwLock::new(
+        Request::new(RequestType::Write { offset: off, len }, moved)
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
 
-    return DriverStatus::Success;
+    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+
+    let st = {
+        let g = child.read();
+        g.status
+    };
+
+    st
 }
-extern "win64" fn vol_pdo_query_resources(
-    pdo: &Arc<DeviceObject>,
+#[request_handler]
+async fn vol_pdo_query_resources(
+    pdo: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut w = req.write();
@@ -351,7 +399,7 @@ extern "win64" fn vol_pdo_query_resources(
         }
     };
 
-    if let Some(pi) = ext::<VolPdoExt>(pdo).part.get() {
+    if let Some(pi) = ext::<VolPdoExt>(&pdo).part.get() {
         let mut out = vec![0u8; core::mem::size_of::<PartitionInfo>()];
         unsafe {
             core::ptr::copy_nonoverlapping(

@@ -7,26 +7,23 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::{mem, ptr};
-use kernel_api::alloc_api::ffi::{pnp_send_request_to_next_upper, pnp_send_request_to_stack_top};
-use kernel_api::{DevExtRef, DevExtRefMut, DiskInfo, PartitionInfo, TraversalPolicy};
+use kernel_api::device::{DevExtRef, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::kernel_types::io::{
+    DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo, Synchronization,
+};
+use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::pnp::{
+    DeviceRelationType, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
+    pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
+    pnp_send_request_to_stack_top,
+};
+use kernel_api::request::{Request, RequestType, TraversalPolicy};
+use kernel_api::status::DriverStatus;
+use kernel_api::util::box_to_bytes;
+use kernel_api::{RequestExt, block_on, request_handler};
 use spin::{Once, RwLock};
 
-use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, GptHeader, GptPartitionEntry, IoTarget,
-    KernelAllocator, PnpMinorFunction, Request, RequestType,
-    alloc_api::{
-        DeviceIds, DeviceInit, IoType, IoVtable, PnpVtable, Synchronization,
-        ffi::{
-            driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-            pnp_forward_request_to_next_lower, pnp_get_device_target, pnp_send_request,
-            pnp_wait_for_request,
-        },
-    },
-    println,
-};
-
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
+use kernel_api::println;
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -35,9 +32,10 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    use kernel_api::alloc_api::ffi::panic_common;
-
-    unsafe { panic_common(MOD_NAME, info) }
+    unsafe {
+        use kernel_api::util::panic_common;
+        panic_common(MOD_NAME, info)
+    }
 }
 mod msvc_shims;
 
@@ -50,7 +48,7 @@ pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverSt
 }
 
 pub extern "win64" fn partmgr_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     init: &mut DeviceInit,
 ) -> DriverStatus {
     init.set_dev_ext_default::<PartMgrExt>();
@@ -86,8 +84,9 @@ struct PartDevExt {
     part: Once<PartitionInfo>,
 }
 
-extern "win64" fn partition_pdo_query_resources(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+async fn partition_pdo_query_resources(
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     let mut w = request.write();
@@ -95,48 +94,46 @@ extern "win64" fn partition_pdo_query_resources(
         return DriverStatus::Success;
     };
 
-    let dx = ext::<PartDevExt>(device);
+    let dx = ext::<PartDevExt>(&device);
     if let Some(pi) = dx.part.get() {
-        let bytes: Box<[u8]> = kernel_api::box_to_bytes(Box::new((*pi).clone()));
+        let bytes: Box<[u8]> = box_to_bytes(Box::new((*pi).clone()));
         pnp.blob_out = bytes.into_vec();
     }
 
     DriverStatus::Success
 }
 
-fn send_req_parent(
+async fn send_req_parent(
     dev: &Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
-) -> Result<Box<[u8]>, DriverStatus> {
-    unsafe {
-        pnp_send_request_to_stack_top(
-            dev.dev_node
-                .get()
-                .unwrap()
-                .upgrade()
-                .unwrap()
-                .parent
-                .get()
-                .unwrap(),
-            req.clone(),
-        )
-    };
-    unsafe { pnp_wait_for_request(&req) };
+) -> Result<(), DriverStatus> {
+    pnp_send_request_to_stack_top(
+        dev.dev_node
+            .get()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .parent
+            .get()
+            .unwrap(),
+        req.clone(),
+    )?
+    .await;
 
     let g = req.read();
     if g.status == DriverStatus::Success {
-        Ok(g.data.clone())
+        Ok(())
     } else {
         Err(g.status)
     }
 }
-
-pub extern "win64" fn partition_pdo_read(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn partition_pdo_read(
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
     buf_len: usize,
 ) -> DriverStatus {
-    let dx = ext::<PartDevExt>(device);
+    let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
     let (off, want) = {
@@ -160,36 +157,44 @@ pub extern "win64" fn partition_pdo_read(
 
     let phys_off = off + ((start_lba as u64) << 9);
 
+    let buf = {
+        let mut w = request.write();
+        mem::take(&mut w.data)
+    };
+
     let child_req = Request::new(
         RequestType::Read {
             offset: phys_off,
             len: buf_len,
         },
-        vec![0u8; buf_len].into_boxed_slice(),
+        buf,
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    match send_req_parent(&device, Arc::new(RwLock::new(child_req))) {
-        Ok(data) => {
-            let mut w = request.write();
-            let n = core::cmp::min(w.data.len(), data.len());
-            if n != 0 {
-                w.data[..n].copy_from_slice(&data[..n]);
-            }
-            return DriverStatus::Success;
-        }
-        Err(st) => {
-            return st;
-        }
+    let child_req_arc = Arc::new(RwLock::new(child_req));
+
+    let res = send_req_parent(&device, child_req_arc.clone()).await;
+
+    let mut c = child_req_arc.write();
+    let returned_buf = mem::take(&mut c.data);
+    drop(c);
+
+    let mut w = request.write();
+    w.data = returned_buf;
+
+    match res {
+        Ok(()) => DriverStatus::Success,
+        Err(st) => st,
     }
 }
 
-pub extern "win64" fn partition_pdo_write(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn partition_pdo_write(
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
     buf_len: usize,
 ) -> DriverStatus {
-    let dx = ext::<PartDevExt>(device);
+    let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
     let (off, want) = {
@@ -212,7 +217,6 @@ pub extern "win64" fn partition_pdo_write(
     }
 
     let phys_off = off + ((start_lba as u64) << 9);
-
     let moved = {
         let mut w = request.write();
         mem::take(&mut w.data)
@@ -226,21 +230,15 @@ pub extern "win64" fn partition_pdo_write(
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    match send_req_parent(&device, Arc::new(RwLock::new(child_req))) {
-        Ok(_ignored) => {
-            return DriverStatus::Success;
-        }
-        Err(st) => {
-            return st;
-        }
+    match send_req_parent(&device, Arc::new(RwLock::new(child_req))).await {
+        Ok(_) => DriverStatus::Success,
+        Err(st) => st,
     }
 }
 
-extern "win64" fn partmgr_start(
-    dev: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    let mut dx = ext::<PartMgrExt>(dev);
+#[request_handler]
+pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+    let mut dx = ext::<PartMgrExt>(&dev);
 
     let parent = Arc::new(RwLock::new(
         Request::new(
@@ -249,8 +247,7 @@ extern "win64" fn partmgr_start(
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    unsafe { pnp_forward_request_to_next_lower(dev, parent.clone()) };
-    unsafe { pnp_wait_for_request(&parent) };
+    unsafe { pnp_forward_request_to_next_lower(&dev, parent.clone()) }?.await;
 
     let (st, data) = {
         let g = parent.read();
@@ -264,7 +261,7 @@ extern "win64" fn partmgr_start(
     DriverStatus::Continue
 }
 
-fn read_from_lower_sync(
+async fn read_from_lower_async(
     dev: &Arc<DeviceObject>,
     offset: u64,
     len: usize,
@@ -276,11 +273,7 @@ fn read_from_lower_sync(
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    let st = unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) };
-    if st == DriverStatus::NoSuchDevice {
-        return Err(DriverStatus::NoSuchDevice);
-    }
-    unsafe { pnp_wait_for_request(&child) };
+    unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) }?.await;
     let g = child.read();
     if g.status == DriverStatus::Success {
         Ok(g.data.clone())
@@ -289,18 +282,17 @@ fn read_from_lower_sync(
     }
 }
 
-extern "win64" fn partmgr_pnp_query_devrels(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn partmgr_pnp_query_devrels(
+    device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    use kernel_api::DeviceRelationType;
-
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != DeviceRelationType::BusRelations {
         return DriverStatus::NotImplemented;
     }
 
-    let pmx = ext::<PartMgrExt>(device);
+    let pmx = ext::<PartMgrExt>(&device);
 
     if pmx
         .enumerated
@@ -324,8 +316,7 @@ extern "win64" fn partmgr_pnp_query_devrels(
         return DriverStatus::Continue;
     }
     let sec_sz = sec_sz_u32 as usize;
-
-    let hdr_bytes = match read_from_lower_sync(device, sec_sz as u64, sec_sz) {
+    let hdr_bytes = match read_from_lower_async(&device, sec_sz as u64, sec_sz).await {
         Ok(b) => b,
         Err(st) => {
             return st;
@@ -347,12 +338,13 @@ extern "win64" fn partmgr_pnp_query_devrels(
 
     let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
     let aligned_bytes = (total_bytes + (sec_sz - 1)) & !(sec_sz - 1);
-
-    let entries = match read_from_lower_sync(
-        device,
+    let entries = match read_from_lower_async(
+        &device,
         hdr.partition_entry_lba.saturating_mul(sec_sz as u64),
         aligned_bytes,
-    ) {
+    )
+    .await
+    {
         Ok(b) => b,
         Err(st) => {
             return st;

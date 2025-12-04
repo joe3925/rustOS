@@ -13,12 +13,12 @@ use core::{
     any::Any,
     sync::atomic::{AtomicU64, Ordering},
 };
+use kernel_types::device::{DeviceObject, ModuleHandle};
 use lazy_static::lazy_static;
 use spin::RwLock;
 
 // ---- external object types we want to host in the OM ----------------------
-use crate::drivers::pnp::driver_object::DeviceObject;
-use crate::executable::program::{MessageQueue, ModuleHandle, ProgramHandle};
+use crate::executable::program::{MessageQueue, ProgramHandle};
 use crate::scheduling::scheduler::TaskHandle;
 
 pub type TaskQueueRef = Arc<RwLock<MessageQueue>>;

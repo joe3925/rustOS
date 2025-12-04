@@ -6,9 +6,12 @@ use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    DriverStatus, FileStatus, IoTarget, Request, RequestType, TraversalPolicy,
-    alloc_api::ffi::{pnp_send_request, pnp_wait_for_request},
+    RequestExt, block_on,
+    kernel_types::io::IoTarget,
+    pnp::pnp_send_request,
     println,
+    request::{Request, RequestType, TraversalPolicy},
+    status::DriverStatus,
 };
 
 #[derive(Clone)]
@@ -69,7 +72,7 @@ impl BlockDev {
         (byte_off % self.sector_size as u64) as usize
     }
 
-    fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, BlkError> {
+    async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, BlkError> {
         let to_read = self.clamp_len(dst.len());
         if to_read == 0 {
             return Ok(0);
@@ -81,12 +84,14 @@ impl BlockDev {
         let end_lba = self.lba_of(end_byte - 1) + 1;
         let n_sectors = (end_lba - start_lba) as usize;
 
+        let pos = self.pos;
+
         let mut tmp = Vec::with_capacity(n_sectors * bps);
         unsafe {
             tmp.set_len(n_sectors * bps);
         }
-
-        read_sectors_sync(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
+        read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
+            .await
             .map_err(BlkError::from)?;
 
         let in_off = self.in_sector_off(self.pos);
@@ -95,7 +100,7 @@ impl BlockDev {
         Ok(to_read)
     }
 
-    fn write_bytes(&mut self, src: &[u8]) -> Result<usize, BlkError> {
+    async fn write_bytes(&mut self, src: &[u8]) -> Result<usize, BlkError> {
         let to_write = self.clamp_len(src.len());
         if to_write == 0 {
             return Ok(0);
@@ -110,20 +115,25 @@ impl BlockDev {
         let head_off = self.in_sector_off(self.pos);
         let tail_bytes = ((self.pos as usize + to_write) % bps) as usize;
 
+        let pos = self.pos;
+
         if head_off == 0 && tail_bytes == 0 {
             let sectors_exact = to_write / bps;
             let buf = &src[..to_write];
-            write_sectors_sync(&self.volume, start_lba, sectors_exact, bps, buf)
+            write_sectors_async(&self.volume, start_lba, sectors_exact, bps, buf)
+                .await
                 .map_err(BlkError::from)?;
         } else {
             let mut buf = Vec::with_capacity(n_sectors * bps);
             unsafe {
                 buf.set_len(n_sectors * bps);
             }
-            read_sectors_sync(&self.volume, start_lba, n_sectors, bps, &mut buf[..])
+            read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut buf[..])
+                .await
                 .map_err(BlkError::from)?;
             buf[head_off..head_off + to_write].copy_from_slice(&src[..to_write]);
-            write_sectors_sync(&self.volume, start_lba, n_sectors, bps, &buf[..])
+            write_sectors_async(&self.volume, start_lba, n_sectors, bps, &buf[..])
+                .await
                 .map_err(BlkError::from)?;
         }
 
@@ -132,16 +142,15 @@ impl BlockDev {
     }
 }
 
-/* === fatfs::Read/Write/Seek impls (map internal BlkError -> ()) === */
 impl Read for BlockDev {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.read_bytes(buf).map_err(|_| ())
+        block_on(self.read_bytes(buf)).map_err(|_| ())
     }
 }
 
 impl Write for BlockDev {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.write_bytes(buf).map_err(|_| ())
+        block_on(self.write_bytes(buf)).map_err(|_| ())
     }
     fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())
@@ -256,7 +265,7 @@ impl Seek for BlockDev {
 //         Err(status)
 //     }
 // }
-pub fn read_sectors_sync(
+pub async fn read_sectors_async(
     target: &Arc<IoTarget>,
     lba: u64,
     sectors: usize,
@@ -283,9 +292,7 @@ pub fn read_sectors_sync(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(target.as_ref(), req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
-
+    unsafe { pnp_send_request(target.as_ref(), req.clone()) }?.await;
     let r = req.read();
     if r.status != DriverStatus::Success {
         println!(
@@ -304,7 +311,7 @@ pub fn read_sectors_sync(
     Ok(())
 }
 
-pub fn write_sectors_sync(
+pub async fn write_sectors_async(
     target: &Arc<IoTarget>,
     lba: u64,
     sectors: usize,
@@ -331,8 +338,7 @@ pub fn write_sectors_sync(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(&**target, req.clone()) };
-    unsafe { pnp_wait_for_request(&req) };
+    unsafe { pnp_send_request(&**target, req.clone()) }?.await;
 
     let status = req.read().status;
     if status == DriverStatus::Success {

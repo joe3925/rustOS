@@ -3,6 +3,7 @@ extern crate rand_xoshiro;
 use crate::alloc::format;
 use crate::benchmarking::run_stats_loop;
 use crate::boot_packages;
+use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
     calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
@@ -13,9 +14,9 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{
     NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_SCHED,
 };
-use crate::executable::program::{Module, Program, PROGRAM_MANAGER};
+use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file::{File, FileStatus, OpenFlags};
+use crate::file_system::file::File;
 use crate::file_system::file_provider::install_file_provider;
 use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
@@ -42,6 +43,8 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use kernel_types::memory::Module;
+use nostd_runtime::{block_on, spawn};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -57,7 +60,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 156_800;
+pub const APIC_START_PERIOD: u64 = 106_800;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -111,7 +114,7 @@ pub unsafe fn init() {
     }
 }
 
-pub fn kernel_main() {
+pub extern "win64" fn kernel_main(ctx: usize) {
     install_file_provider(Box::new(BootstrapProvider::new(BOOTSET)));
 
     let mut program = Program::new(
@@ -132,21 +135,21 @@ pub fn kernel_main() {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
-    crate::drivers::driver_install::install_prepacked_drivers()
-        .expect("Failed to install pre packed drivers");
+    spawn(async move {
+        install_prepacked_drivers().await;
 
-    PNP_MANAGER
-        .init_from_registry()
-        .expect("Driver init failed");
+        PNP_MANAGER.init_from_registry().await;
+    });
 
     println!("");
-    let task = Task::new_kernel_mode(
-        run_stats_loop as usize,
-        KERNEL_STACK_SIZE,
-        "Log Thread".to_string(),
-        0,
-    );
-    SCHEDULER.add_task(task);
+    nostd_runtime::spawn_blocking(run_stats_loop);
+    // let task = Task::new_kernel_mode(
+    //     run_stats_loop as usize,
+    //     KERNEL_STACK_SIZE,
+    //     "Log Thread".to_string(),
+    //     0,
+    // );
+    // SCHEDULER.add_task(task);
 }
 #[inline(always)]
 fn halt_loop() -> ! {

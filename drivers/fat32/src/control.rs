@@ -7,29 +7,29 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{mem::size_of, sync::atomic::AtomicU64};
+use core::{future, mem::size_of, sync::atomic::AtomicU64};
 use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    DevExtRef, DevExtRefMut, DeviceObject, DeviceRelationType, DriverObject, DriverStatus,
-    FsIdentify, GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS, PartitionInfo,
-    PnpMinorFunction, QueryIdType, Request, RequestType, TraversalPolicy,
-    alloc_api::{
-        DeviceInit, IoType, IoVtable, PnpRequest, PnpVtable, Synchronization,
-        ffi::{
-            driver_set_evt_device_add, pnp_create_control_device_and_link,
-            pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
-            pnp_wait_for_request,
-        },
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt, block_on,
+    device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
+    kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+    pnp::{
+        DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
+        pnp_create_control_device_and_link, pnp_create_control_device_with_init,
+        pnp_ioctl_via_symlink, pnp_send_request,
     },
-    bytes_to_box, println,
+    println,
+    request::{Request, RequestType, TraversalPolicy},
+    request_handler, spawn_blocking,
+    status::DriverStatus,
+    util::bytes_to_box,
 };
 
 use crate::block_dev::BlockDev;
-use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
+use crate::volume::{VolCtrlDevExt, fs_op_dispatch, start_fs_worker_for_volume};
 use log::{Level, Metadata, Record};
-const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 struct KernelLogger;
 
@@ -53,15 +53,14 @@ fn init_logger() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Debug);
 }
+
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
-pub extern "win64" fn fs_root_ioctl(
-    _dev: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+#[request_handler]
+pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
         let r = req.read();
         match r.kind {
@@ -95,8 +94,7 @@ pub extern "win64" fn fs_root_ioctl(
             );
             let q = Arc::new(RwLock::new(q));
 
-            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) };
-            unsafe { pnp_wait_for_request(&q) };
+            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) }?.await;
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
@@ -127,10 +125,15 @@ pub extern "win64" fn fs_root_ioctl(
             }
 
             let options = FsOptions::new();
-            match fatfs::FileSystem::new(
-                BlockDev::new(id.volume_fdo.clone(), sector_size, total_sectors),
-                options,
-            ) {
+            let target_clone = id.volume_fdo.clone();
+            let result = spawn_blocking(move || {
+                fatfs::FileSystem::new(
+                    BlockDev::new(target_clone, sector_size, total_sectors),
+                    options,
+                )
+            })
+            .await;
+            match result {
                 Ok(fs) => {
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
@@ -139,6 +142,8 @@ pub extern "win64" fn fs_root_ioctl(
                         fs: Mutex::new(fs),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
+                        queue: Mutex::new(alloc::collections::VecDeque::new()),
+                        worker_task_id: AtomicU64::new(0),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);
@@ -147,13 +152,15 @@ pub extern "win64" fn fs_root_ioctl(
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl =
                         unsafe { pnp_create_control_device_with_init(vol_name.clone(), init) };
-                    println!("Mounting fat for volume {}", vol_name);
+
+                    // Start per-volume worker thread that will run FATFS code
+                    start_fs_worker_for_volume(vol_ctrl.clone());
+
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
                     DriverStatus::Success
                 }
-                Err(e) => {
-                    println!("No mount");
+                Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
                     DriverStatus::Success
@@ -196,19 +203,18 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
     unsafe {
-        let _ = pnp_ioctl_via_symlink(
+        pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
-        );
-        pnp_wait_for_request(&reg);
+        )?;
     }
 
     DriverStatus::Success
 }
 
 pub extern "win64" fn fs_device_add(
-    _driver: &Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     _dev_init: &mut DeviceInit,
 ) -> DriverStatus {
     DriverStatus::Success
