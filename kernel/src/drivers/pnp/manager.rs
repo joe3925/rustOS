@@ -67,7 +67,7 @@ impl PnpManager {
         };
 
         for pkg in boot_packages {
-            if let Err(e) = self.ensure_loaded(&pkg) {
+            if let Err(e) = self.ensure_loaded(&pkg).await {
                 println!("-> load boot-start {} failed: {:?}", pkg.name, e);
                 continue;
             }
@@ -256,7 +256,7 @@ impl PnpManager {
             dn.set_state(DevNodeState::Initialized);
             return Ok(());
         };
-        let func_drv = self.ensure_loaded(&resolved_func_pkg)?;
+        let func_drv = self.ensure_loaded(&resolved_func_pkg).await?;
 
         let class_name = dn.class.as_deref();
         let hw_ids: Vec<&str> = dn.ids.hardware.iter().map(|s| s.as_str()).collect();
@@ -264,24 +264,23 @@ impl PnpManager {
             .resolve_filters(&hw_ids, class_name, &resolved_func_pkg.name)
             .await?;
 
-        let lower_layers: Vec<_> = lower_pkgs
-            .into_iter()
-            .map(|pkg| {
-                Ok(StackLayer {
-                    driver: self.ensure_loaded(&pkg)?,
-                    devobj: None,
-                })
-            })
-            .collect::<Result<_, DriverError>>()?;
-        let upper_layers: Vec<_> = upper_pkgs
-            .into_iter()
-            .map(|pkg| {
-                Ok(StackLayer {
-                    driver: self.ensure_loaded(&pkg)?,
-                    devobj: None,
-                })
-            })
-            .collect::<Result<_, DriverError>>()?;
+        let mut lower_layers = Vec::with_capacity(lower_pkgs.len());
+        for pkg in lower_pkgs {
+            let driver = self.ensure_loaded(&pkg).await?;
+            lower_layers.push(StackLayer {
+                driver,
+                devobj: None,
+            });
+        }
+
+        let mut upper_layers = Vec::with_capacity(upper_pkgs.len());
+        for pkg in upper_pkgs {
+            let driver = self.ensure_loaded(&pkg).await?;
+            upper_layers.push(StackLayer {
+                driver,
+                devobj: None,
+            });
+        }
         let function_layer = StackLayer {
             driver: func_drv,
             devobj: None,
@@ -633,7 +632,7 @@ impl PnpManager {
             Ok(Some(p)) => p,
             _ => return false,
         };
-        let drv = match self.ensure_loaded(&pkg) {
+        let drv = match self.ensure_loaded(&pkg).await {
             Ok(d) => d,
             Err(_) => return false,
         };
@@ -828,7 +827,10 @@ impl PnpManager {
         DriverStatus::Success
     }
 
-    fn ensure_loaded(&self, pkg: &Arc<DriverPackage>) -> Result<Arc<DriverObject>, DriverError> {
+    async fn ensure_loaded(
+        &self,
+        pkg: &Arc<DriverPackage>,
+    ) -> Result<Arc<DriverObject>, DriverError> {
         let mut map = self.drivers.write();
 
         if let Some(d) = map.get(&pkg.name).cloned() {
@@ -838,7 +840,7 @@ impl PnpManager {
         let module = {
             let pm = PROGRAM_MANAGER.get(0).expect("Kernel terminated").clone();
             let mut prog = pm.write();
-            prog.load_module(pkg.image_path.clone())?
+            prog.load_module(pkg.image_path.clone()).await?
         };
 
         let _ = OBJECT_MANAGER.mkdir_p("\\Modules".to_string());
@@ -1175,7 +1177,7 @@ impl PnpManager {
             .pkg_by_service(function_service)
             .await
             .ok_or(DriverError::NoParent)?;
-        let func_drv = self.ensure_loaded(&func_pkg)?;
+        let func_drv = self.ensure_loaded(&func_pkg).await?;
 
         let id_strs: Vec<&str> = ids
             .hardware
@@ -1187,25 +1189,23 @@ impl PnpManager {
             .resolve_filters(&id_strs, class.as_deref(), function_service)
             .await?;
 
-        let lower_layers: Vec<StackLayer> = lower_pkgs
-            .into_iter()
-            .map(|p| {
-                Ok::<StackLayer, DriverError>(StackLayer {
-                    driver: self.ensure_loaded(&p)?,
-                    devobj: None,
-                })
-            })
-            .collect::<Result<Vec<StackLayer>, DriverError>>()?;
+        let mut lower_layers = Vec::with_capacity(lower_pkgs.len());
+        for pkg in lower_pkgs {
+            let driver = self.ensure_loaded(&pkg).await?;
+            lower_layers.push(StackLayer {
+                driver,
+                devobj: None,
+            });
+        }
 
-        let upper_layers: Vec<StackLayer> = upper_pkgs
-            .into_iter()
-            .map(|p| {
-                Ok::<StackLayer, DriverError>(StackLayer {
-                    driver: self.ensure_loaded(&p)?,
-                    devobj: None,
-                })
-            })
-            .collect::<Result<Vec<StackLayer>, DriverError>>()?;
+        let mut upper_layers = Vec::with_capacity(upper_pkgs.len());
+        for pkg in upper_pkgs {
+            let driver = self.ensure_loaded(&pkg).await?;
+            upper_layers.push(StackLayer {
+                driver,
+                devobj: None,
+            });
+        }
 
         {
             let mut g = dn.stack.write();
@@ -1332,7 +1332,7 @@ impl PnpManager {
 
         if let Some(p) = self.hw.read().by_driver.get(svc) {
             let pkg = p.clone();
-            let drv = match self.ensure_loaded(&pkg) {
+            let drv = match self.ensure_loaded(&pkg).await {
                 Ok(d) => d,
                 Err(_) => return None,
             };
@@ -1345,7 +1345,7 @@ impl PnpManager {
             None => return None,
         };
 
-        let drv = match self.ensure_loaded(&pkg) {
+        let drv = match self.ensure_loaded(&pkg).await {
             Ok(d) => d,
             Err(_) => return None,
         };

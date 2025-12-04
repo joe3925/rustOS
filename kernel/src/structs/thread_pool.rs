@@ -4,12 +4,12 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use spin::Mutex;
 use spin::RwLock;
-use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::scheduler;
-use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
+use crate::scheduling::scheduler::TaskHandle;
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 
 pub type JobFn = extern "win64" fn(usize);
@@ -26,11 +26,14 @@ struct WorkerSlot {
 }
 
 pub struct ThreadPool {
-    workers: Box<[WorkerSlot]>,
-    worker_count: usize,
+    workers: RwLock<Vec<WorkerSlot>>,
+    base_workers: usize,
+    max_workers: AtomicUsize,
+    dynamic_enabled: AtomicBool,
     next_worker: AtomicUsize,
     deferred: Mutex<Vec<Job>>,
     deferred_hint: AtomicBool,
+    self_arc: Mutex<Option<Arc<ThreadPool>>>,
 }
 
 struct WorkerArgs {
@@ -40,42 +43,55 @@ struct WorkerArgs {
 
 impl ThreadPool {
     pub fn new(threads: usize) -> Arc<Self> {
-        let mut workers = Vec::with_capacity(threads);
+        let mut workers_vec = Vec::with_capacity(threads);
         for _ in 0..threads {
-            workers.push(WorkerSlot {
+            workers_vec.push(WorkerSlot {
                 task: RwLock::new(None),
                 queue: Mutex::new(Vec::new()),
             });
         }
 
         let pool = Arc::new(Self {
-            workers: workers.into_boxed_slice(),
-            worker_count: threads,
+            workers: RwLock::new(workers_vec),
+            base_workers: threads,
+            max_workers: AtomicUsize::new(threads),
+            dynamic_enabled: AtomicBool::new(false),
             next_worker: AtomicUsize::new(0),
             deferred: Mutex::new(Vec::new()),
             deferred_hint: AtomicBool::new(false),
+            self_arc: Mutex::new(None),
         });
 
-        pool.start();
+        {
+            let mut s = pool.self_arc.lock();
+            *s = Some(pool.clone());
+        }
+
+        pool.start_initial();
         pool
     }
 
-    fn start(self: &Arc<Self>) {
-        for i in 0..self.worker_count {
-            let t = Task::new_kernel_mode(worker as usize, KERNEL_STACK_SIZE, "".into(), 0);
-
-            let args = Box::new(WorkerArgs {
-                pool: self.clone(),
-                index: i,
-            });
-            let args_ptr = Box::into_raw(args) as usize;
-
-            without_interrupts(|| {
-                t.write().context.rdi = args_ptr as u64;
-            });
-
-            SCHEDULER.add_task(t);
+    fn start_initial(self: &Arc<Self>) {
+        for i in 0..self.base_workers {
+            self.spawn_worker(i);
         }
+    }
+
+    fn spawn_worker(self: &Arc<Self>, index: usize) {
+        let args = Box::new(WorkerArgs {
+            pool: self.clone(),
+            index,
+        });
+        let args_ptr = Box::into_raw(args) as usize;
+        let t = Task::new_kernel_mode(worker, args_ptr, KERNEL_STACK_SIZE, "".into(), 0);
+        SCHEDULER.add_task(t);
+    }
+
+    fn get_self_arc(&self) -> Arc<ThreadPool> {
+        let s = self.self_arc.lock();
+        s.as_ref()
+            .expect("ThreadPool self_arc not initialized")
+            .clone()
     }
 
     fn take_deferred(&self) -> Option<Job> {
@@ -90,50 +106,100 @@ impl ThreadPool {
         job
     }
 
+    pub fn enable_dynamic(&self, max_threads: usize) {
+        let min = self.base_workers;
+        let max = if max_threads < min { min } else { max_threads };
+        self.max_workers.store(max, Ordering::Release);
+        self.dynamic_enabled.store(true, Ordering::Release);
+    }
+
+    fn try_grow(&self) {
+        if !self.dynamic_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let max = self.max_workers.load(Ordering::Acquire);
+
+        {
+            let workers = self.workers.read();
+            if workers.len() >= max {
+                return;
+            }
+        }
+
+        let new_index;
+        {
+            let mut workers = self.workers.write();
+            if workers.len() >= max {
+                return;
+            }
+            new_index = workers.len();
+            workers.push(WorkerSlot {
+                task: RwLock::new(None),
+                queue: Mutex::new(Vec::new()),
+            });
+        }
+
+        let pool_arc = self.get_self_arc();
+        pool_arc.spawn_worker(new_index);
+    }
+
     pub fn submit(&self, function: JobFn, context: usize) {
         let job = Job {
             f: function,
             a: context,
         };
 
-        for slot in self.workers.iter() {
-            let handle_opt = slot.task.read().clone();
-            if let Some(handle) = handle_opt {
-                let sleeping = {
-                    let t = handle.read();
-                    t.is_sleeping()
-                };
+        {
+            let workers = self.workers.read();
+            for slot in workers.iter() {
+                let handle_opt = slot.task.read().clone();
+                if let Some(handle) = handle_opt {
+                    let sleeping = {
+                        let t = handle.read();
+                        t.is_sleeping()
+                    };
 
-                if sleeping {
-                    {
-                        let mut q = slot.queue.lock();
-                        q.push(job);
+                    if sleeping {
+                        {
+                            let mut q = slot.queue.lock();
+                            q.push(job);
+                        }
+                        SCHEDULER.wake_task(&handle);
+                        return;
                     }
-                    SCHEDULER.wake_task(&handle);
-                    return;
                 }
             }
         }
 
-        let start = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count;
+        {
+            let workers = self.workers.read();
+            let count = workers.len();
+            if count != 0 {
+                let start = self.next_worker.fetch_add(1, Ordering::Relaxed) % count;
+                for off in 0..count {
+                    let idx = (start + off) % count;
+                    let slot = &workers[idx];
 
-        for off in 0..self.worker_count {
-            let idx = (start + off) % self.worker_count;
-            let slot = &self.workers[idx];
+                    if let Some(mut guard) = slot.queue.try_lock() {
+                        guard.push(job);
 
-            if let Some(mut guard) = slot.queue.try_lock() {
-                guard.push(job);
-
-                if let Some(handle) = slot.task.read().clone() {
-                    SCHEDULER.wake_task(&handle);
+                        if let Some(handle) = slot.task.read().clone() {
+                            SCHEDULER.wake_task(&handle);
+                        }
+                        return;
+                    }
                 }
-                return;
             }
         }
 
-        let mut dq = self.deferred.lock();
-        dq.push(job);
-        self.deferred_hint.store(true, Ordering::Release);
+        {
+            let mut dq = self.deferred.lock();
+            dq.push(job);
+            self.deferred_hint.store(true, Ordering::Release);
+        }
+
+        self.try_grow();
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
@@ -142,14 +208,17 @@ impl ThreadPool {
     }
 
     pub fn try_execute_one(&self) -> bool {
-        for slot in self.workers.iter() {
-            let job_opt = {
-                let mut q = slot.queue.lock();
-                q.pop()
-            };
-            if let Some(job) = job_opt {
-                (job.f)(job.a);
-                return true;
+        {
+            let workers = self.workers.read();
+            for slot in workers.iter() {
+                let job_opt = {
+                    let mut q = slot.queue.lock();
+                    q.pop()
+                };
+                if let Some(job) = job_opt {
+                    (job.f)(job.a);
+                    return true;
+                }
             }
         }
 
@@ -162,7 +231,7 @@ impl ThreadPool {
     }
 }
 
-extern "C" fn worker(args_ptr: usize) {
+extern "win64" fn worker(args_ptr: usize) {
     let args = unsafe { Box::from_raw(args_ptr as *mut WorkerArgs) };
     let pool = args.pool;
     let my_idx = args.index;
@@ -172,14 +241,16 @@ extern "C" fn worker(args_ptr: usize) {
         .expect("worker task missing");
 
     {
-        let mut slot = pool.workers[my_idx].task.write();
+        let workers = pool.workers.read();
+        let mut slot = workers[my_idx].task.write();
         *slot = Some(me.clone());
     }
 
     loop {
         loop {
             let job_opt = {
-                let mut q = pool.workers[my_idx].queue.lock();
+                let workers = pool.workers.read();
+                let mut q = workers[my_idx].queue.lock();
                 q.pop()
             };
             if let Some(job) = job_opt {

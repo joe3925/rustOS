@@ -1,6 +1,5 @@
 use crate::alloc::string::ToString;
 use crate::export;
-use crate::file_system::file::switch_to_vfs;
 use crate::file_system::file::File;
 use crate::function;
 use crate::get_rva;
@@ -24,9 +23,13 @@ export! {
     wait_ms,
     create_kernel_task,
     kill_kernel_task_by_id,
-    switch_to_vfs,
+    sleep_self,
+    sleep_self_and_yield,
+    wake_task,
+    switch_to_vfs_async,
     panic_common,
     submit_runtime_internal,
+    submit_blocking_internal,
     get_rsdp,
     get_acpi_tables,
     task_yield,
@@ -45,9 +48,6 @@ export! {
     fs_list_dir,
     fs_remove_dir,
     fs_make_dir,
-    file_read,
-    file_write,
-    file_delete,
 
     pnp_create_pdo,
     pnp_bind_and_start,

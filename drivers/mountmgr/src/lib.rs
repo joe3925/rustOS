@@ -23,7 +23,7 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt, block_on,
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult},
     kernel_types::{
@@ -38,7 +38,7 @@ use kernel_api::{
         pnp_send_request_via_symlink,
     },
     println,
-    reg::{self, switch_to_vfs},
+    reg::{self, switch_to_vfs_async},
     request::{Request, RequestType, TraversalPolicy},
     request_handler, spawn,
     status::{Data, DriverStatus, RegError},
@@ -110,7 +110,6 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         )
     };
 
-    let _ = refresh_fs_registry_from_registry();
     DriverStatus::Success
 }
 
@@ -136,7 +135,6 @@ pub extern "win64" fn volclass_device_add(
     dev_init.set_dev_ext_default::<VolFdoExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);
 
-    let _ = refresh_fs_registry_from_registry();
     DriverStatus::Success
 }
 
@@ -145,7 +143,7 @@ pub async fn volclass_start(
     dev: Arc<DeviceObject>,
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let _ = refresh_fs_registry_from_registry();
+    let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
     spawn(mount_if_unmounted(dev));
     DriverStatus::Continue
@@ -153,8 +151,8 @@ pub async fn volclass_start(
 
 #[request_handler]
 pub async fn vol_fdo_read(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
+    _dev: Arc<DeviceObject>,
+    _req: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
     DriverStatus::Continue
@@ -162,8 +160,8 @@ pub async fn vol_fdo_read(
 
 #[request_handler]
 pub async fn vol_fdo_write(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
+    _dev: Arc<DeviceObject>,
+    _req: Arc<RwLock<Request>>,
     _buf_len: usize,
 ) -> DriverStatus {
     DriverStatus::Continue
@@ -206,7 +204,7 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             DriverStatus::Success
         }
         IOCTL_MOUNTMGR_RESYNC => {
-            let _ = refresh_fs_registry_from_registry();
+            let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev).await;
             DriverStatus::Success
         }
@@ -249,7 +247,7 @@ pub async fn volclass_ctrl_ioctl(
                             wr.push(t);
                         }
                         drop(wr);
-                        let _ = refresh_fs_registry_from_registry();
+                        let _ = refresh_fs_registry_from_registry().await;
                         spawn(rescan_all_volumes());
                     }
                     DriverStatus::Success
@@ -315,7 +313,7 @@ async fn try_bind_filesystems_for_parent_fdo(
     parent_fdo: &Arc<DeviceObject>,
     public_link: &str,
 ) -> bool {
-    let _ = refresh_fs_registry_from_registry();
+    let _ = refresh_fs_registry_from_registry().await;
     let dx_vol = ext::<VolFdoExt>(parent_fdo);
     let vid = dx_vol.vid.get().copied().unwrap_or(0);
     let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
@@ -384,28 +382,23 @@ async fn try_bind_filesystems_for_parent_fdo(
             None => continue,
         };
 
-        let created = unsafe {
-            pnp_create_devnode_over_pdo_with_function(
-                &parent_dn,
-                fs_inst.clone(),
-                ids.clone(),
-                class.clone(),
-                &svc,
-                &function_fdo.clone(),
-                DeviceInit::new(IoVtable::new(), None),
-            )
-        };
+        let created = pnp_create_devnode_over_pdo_with_function(
+            &parent_dn,
+            fs_inst.clone(),
+            ids.clone(),
+            class.clone(),
+            &svc,
+            &function_fdo.clone(),
+            DeviceInit::new(IoVtable::new(), None),
+        )
+        .await;
 
         if let Ok((dn, _top)) = created {
             let primary_link = public_link.to_string();
             let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
 
-            let _ = unsafe {
-                pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone())
-            };
-            let _ = unsafe {
-                pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone())
-            };
+            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
+            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
 
             let dx = ext::<VolFdoExt>(parent_fdo);
             dx.fs_link.call_once(|| primary_link);
@@ -464,23 +457,23 @@ fn list_fs_blob() -> Box<[u8]> {
     s.into_bytes().into_boxed_slice()
 }
 
-fn refresh_fs_registry_from_registry() -> usize {
+async fn refresh_fs_registry_from_registry() -> usize {
     use alloc::collections::{BTreeMap, BTreeSet};
 
     const ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/Filesystems";
 
     let mut by_tag: BTreeMap<String, FsReg> = BTreeMap::new();
-    if let Ok(keys) = reg::list_keys(ROOT) {
+    if let Ok(keys) = reg::list_keys(ROOT).await {
         for sub in keys {
-            let svc = match reg::get_value(&sub, "Service") {
+            let svc = match reg::get_value(&sub, "Service").await {
                 Some(Data::Str(s)) if !s.is_empty() => s,
                 _ => continue,
             };
-            let tag = match reg::get_value(&sub, "ControlLink") {
+            let tag = match reg::get_value(&sub, "ControlLink").await {
                 Some(Data::Str(s)) if !s.is_empty() => s,
                 _ => continue,
             };
-            let ord = match reg::get_value(&sub, "Order") {
+            let ord = match reg::get_value(&sub, "Order").await {
                 Some(Data::U32(v)) => v,
                 _ => 100,
             };
@@ -507,12 +500,13 @@ fn refresh_fs_registry_from_registry() -> usize {
     drop(guard);
 
     for s in new_svcs {
-        let _ = unsafe { pnp_load_service(s) };
+        let _ = pnp_load_service(s).await;
     }
 
     let guard = FS_REGISTRY.read();
     guard.len()
 }
+
 fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let len = core::mem::size_of::<T>();
     let p = Box::into_raw(b) as *mut u8;
@@ -525,115 +519,76 @@ unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     Box::from_raw(p)
 }
 
-#[repr(C)]
-struct BootProbe {
-    link: String,
-    need: AtomicU32,
-    mod_ok: AtomicBool,
-    inf_ok: AtomicBool,
-    reg_ok: AtomicBool,
-    inst_path: String,
-}
+// Async boot device checks: just await each FsOpen instead of using completion routines.
 
-#[repr(C)]
-struct BootReqCtx {
-    probe: *mut BootProbe,
-    which: u8,
-}
-
-extern "win64" fn fs_open_boot_check_complete(r: &mut Request, ctx: usize) -> DriverStatus {
-    let reqctx: Box<BootReqCtx> = unsafe { Box::from_raw(ctx as *mut BootReqCtx) };
-    let res: FsOpenResult = unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
-
-    let probe = unsafe { &*reqctx.probe };
-    match reqctx.which {
-        0 => {
-            if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("Mod found");
-                probe.mod_ok.store(true, Ordering::Release);
-            } else {
-                println!(
-                    "Mod failed status {:#?}, open status {:#?}",
-                    r.status, res.error
-                )
-            }
-        }
-        1 => {
-            if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("Inf found");
-                probe.inf_ok.store(true, Ordering::Release);
-            } else {
-                println!(
-                    "Inf failed status {:#?}, open status {:#?}",
-                    r.status, res.error
-                )
-            }
-        }
-        _ => {
-            if r.status == DriverStatus::Success && res.error.is_none() {
-                println!("Reg found");
-                probe.reg_ok.store(true, Ordering::Release);
-            } else {
-                println!(
-                    "Reg failed status {:#?}, open status {:#?}",
-                    r.status, res.error
-                )
-            }
-        }
-    }
-    if probe.need.fetch_sub(1, Ordering::AcqRel) == 1 {
-        let all = probe.mod_ok.load(Ordering::Acquire)
-            && probe.inf_ok.load(Ordering::Acquire)
-            && probe.reg_ok.load(Ordering::Acquire);
-        if all {
-            let _ = attempt_boot_bind(&probe.inst_path, &probe.link);
-        }
-        unsafe {
-            drop(Box::from_raw(reqctx.probe));
-        }
-    }
-    return DriverStatus::Success;
-}
-
-fn send_fs_open_async(public_link: &str, path: &str, which: u8, probe_ptr: *mut BootProbe) {
+async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
         flags: OpenFlags::Open,
         path: path.to_string(),
     };
-    let mut req = Request::new(RequestType::Fs(FsOp::Open), box_to_bytes(Box::new(params)))
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let ctx = Box::into_raw(Box::new(BootReqCtx {
-        probe: probe_ptr,
-        which,
-    })) as usize;
-    req.add_completion(fs_open_boot_check_complete, ctx);
-    let req = Arc::new(RwLock::new(req));
-    unsafe {
-        let _ = pnp_send_request_via_symlink(public_link.to_string(), req.clone());
+    let req = Arc::new(RwLock::new(
+        Request::new(RequestType::Fs(FsOp::Open), box_to_bytes(Box::new(params)))
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+
+    let err = unsafe {
+        pnp_send_request_via_symlink(public_link.to_string(), req.clone())
+            .resolve()
+            .await
+    };
+    if err != DriverStatus::Success {
+        println!("Boot check {}: send error {:#?}", path, err);
+        return false;
+    }
+
+    let mut r = req.write();
+    if r.status != DriverStatus::Success || r.data.len() != size_of::<FsOpenResult>() {
+        println!(
+            "Boot check {}: status {:#?}, len {}",
+            path,
+            r.status,
+            r.data.len()
+        );
+        return false;
+    }
+
+    let res: FsOpenResult = unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
+
+    if res.error.is_none() {
+        println!("Boot check {}: OK", path);
+        true
+    } else {
+        println!("Boot check {}: FsOpenResult error {:#?}", path, res.error);
+        false
     }
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str) {
-    let probe = Box::new(BootProbe {
-        link: public_link.to_string(),
-        need: AtomicU32::new(3),
-        mod_ok: AtomicBool::new(false),
-        inf_ok: AtomicBool::new(false),
-        reg_ok: AtomicBool::new(false),
-        inst_path: inst_path.to_string(),
+    let link = public_link.to_string();
+    let inst = inst_path.to_string();
+
+    spawn(async move {
+        let mod_ok = fs_check_open(&link, "SYSTEM/MOD").await;
+        let inf_ok = fs_check_open(&link, "SYSTEM/TOML").await;
+        let reg_ok = fs_check_open(&link, "SYSTEM/REGISTRY.BIN").await;
+
+        if mod_ok && inf_ok && reg_ok {
+            let _ = attempt_boot_bind(&inst, &link).await;
+        } else {
+            println!(
+                "Boot probe '{}' failed: mod_ok={}, inf_ok={}, reg_ok={}",
+                link, mod_ok, inf_ok, reg_ok
+            );
+        }
     });
-    let probe_ptr = Box::into_raw(probe);
-    send_fs_open_async(public_link, "SYSTEM/MOD", 0, probe_ptr);
-    send_fs_open_async(public_link, "SYSTEM/TOML", 1, probe_ptr);
-    send_fs_open_async(public_link, "SYSTEM/REGISTRY.BIN", 2, probe_ptr);
 }
 
-fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus {
+async fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus {
     if VFS_ACTIVE.load(Ordering::Acquire) {
         return DriverStatus::Success;
     }
-    assign_drive_letter(b'C', fs_mount_link);
-    match unsafe { switch_to_vfs() } {
+    assign_drive_letter(b'C', fs_mount_link).await;
+    match unsafe { switch_to_vfs_async().await } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
             println!("System volume mounted at '{}'", fs_mount_link);
@@ -646,48 +601,50 @@ fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus 
     }
 }
 
-fn assign_drive_letter(letter: u8, fs_mount_link: &str) {
+async fn assign_drive_letter(letter: u8, fs_mount_link: &str) -> Result<(), RegError> {
     let ch = (letter as char).to_ascii_uppercase();
     if ch < 'A' || ch > 'Z' {
-        return;
+        return Ok(());
     }
 
-    let _ = set_label_for_link(fs_mount_link, ch as u8);
+    set_label_for_link(fs_mount_link, ch as u8).await?;
 
     let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
     let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
 
-    let _ = unsafe { pnp_remove_symlink(link_nocolon.clone()) };
-    let _ = unsafe { pnp_remove_symlink(link_colon.clone()) };
+    pnp_remove_symlink(link_nocolon.clone());
+    pnp_remove_symlink(link_colon.clone());
 
-    let _ = unsafe { pnp_create_symlink(link_nocolon, fs_mount_link.to_string()) };
-    let _ = unsafe { pnp_create_symlink(link_colon, fs_mount_link.to_string()) };
+    pnp_create_symlink(link_nocolon, fs_mount_link.to_string());
+    pnp_create_symlink(link_colon, fs_mount_link.to_string());
+    Ok(())
 }
 
 async fn rescan_all_volumes() {
     let vols = VOLUMES.read();
     for dev in vols.clone() {
-        unsafe { mount_if_unmounted(dev.clone()).await };
+        mount_if_unmounted(dev.clone()).await;
     }
 }
 
-fn set_label_for_link(public_link: &str, label: u8) -> Result<(), RegError> {
-    let _ = reg::create_key(MP_ROOT);
-    if let Ok(vals) = reg::list_values(MP_ROOT) {
+async fn set_label_for_link(public_link: &str, label: u8) -> Result<(), RegError> {
+    reg::create_key(MP_ROOT).await;
+    if let Ok(vals) = reg::list_values(MP_ROOT).await {
         for name in vals {
-            if let Some(Data::Str(s)) = reg::get_value(MP_ROOT, &name) {
+            if let Some(Data::Str(s)) = reg::get_value(MP_ROOT, &name).await {
                 if s == public_link {
-                    let _ = reg::delete_value(MP_ROOT, &name);
+                    let _ = reg::delete_value(MP_ROOT, &name).await;
                 }
             }
         }
     }
-    let _ = reg::delete_value(MP_ROOT, &dev_name_for(label));
+    let _ = reg::delete_value(MP_ROOT, &dev_name_for(label)).await;
     reg::set_value(
         MP_ROOT,
         &dev_name_for(label),
         Data::Str(public_link.to_string()),
     )
+    .await
 }
 
 fn dev_name_for(label: u8) -> String {

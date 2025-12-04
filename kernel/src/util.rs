@@ -114,7 +114,7 @@ pub unsafe fn init() {
     }
 }
 
-pub fn kernel_main() {
+pub extern "win64" fn kernel_main(ctx: usize) {
     install_file_provider(Box::new(BootstrapProvider::new(BOOTSET)));
 
     let mut program = Program::new(
@@ -142,7 +142,7 @@ pub fn kernel_main() {
     });
 
     println!("");
-    nostd_runtime::spawn(run_stats_loop());
+    nostd_runtime::spawn_blocking(run_stats_loop);
     // let task = Task::new_kernel_mode(
     //     run_stats_loop as usize,
     //     KERNEL_STACK_SIZE,

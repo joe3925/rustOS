@@ -305,7 +305,9 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         );
     };
     let task = Task::new_user_mode(
-        entry,
+        // TODO: check this 
+        unsafe { *(entry as *const extern "win64" fn(usize)) },
+        0,
         KERNEL_STACK_SIZE,
         format!("{} Worker {}", caller.read().title, managed),
         stack,

@@ -236,13 +236,12 @@ impl Drop for File {
         let id = self.fs_file_id;
         self.fs_file_id = 0;
 
-        let _ = block_on(provider().close_handle(id));
+        let _ = provider().close_handle(id);
     }
 }
-// Helper functions; keep sync and block on async provider/File API.
 
-fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
-    let (res, _) = block_on(provider().list_dir_path(dir));
+async fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
+    let (res, _) = provider().list_dir_path(dir).await;
     if res.error.is_none() {
         res.names
     } else {
@@ -250,34 +249,34 @@ fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
     }
 }
 
-fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
-    match block_on(File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly])) {
-        Ok(f) => block_on(f.read()).ok(),
+async fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
+        Ok(f) => f.read().await.ok(),
         Err(_) => None,
     }
 }
 
-fn ensure_dir(path: &str) {
-    let _ = block_on(provider().make_dir_path(path));
+async fn ensure_dir(path: &str) {
+    let _ = provider().make_dir_path(path);
 }
 
-fn file_exists(path: &str) -> bool {
-    match block_on(File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly])) {
+async fn file_exists(path: &str) -> bool {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
         Ok(_) => true,
         Err(_) => false,
     }
 }
 
-pub fn switch_to_vfs() -> Result<(), RegError> {
+pub async fn switch_to_vfs() -> Result<(), RegError> {
     install_file_provider(Box::new(Vfs::new()));
 
-    block_on(rebind_and_persist_after_provider_switch())?;
+    rebind_and_persist_after_provider_switch().await?;
 
     let vfs_mod = "C:\\SYSTEM\\MOD";
     let vfs_toml = "C:\\SYSTEM\\TOML";
-    ensure_dir(vfs_mod);
-    ensure_dir(vfs_toml);
-    if block_on(is_first_boot()) {
+    ensure_dir(vfs_mod).await;
+    ensure_dir(vfs_toml).await;
+    if is_first_boot().await {
         //install_prepacked_drivers();
     }
     Ok(())

@@ -1,6 +1,7 @@
 #![no_std]
 #![allow(improper_ctypes, improper_ctypes_definitions)]
 extern crate alloc;
+
 use acpi::PhysicalMapping;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -8,6 +9,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
+use kernel_types::async_ffi::FfiFuture;
 use spin::RwLock;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
@@ -22,8 +24,6 @@ use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
 use kernel_types::{ClassAddCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverUnload};
-
-// Typedef for Data enum which was inline in the original but needed for Reg FFI
 
 #[link(name = "KRNL")]
 unsafe extern "win64" {
@@ -41,10 +41,15 @@ unsafe extern "win64" {
     // =========================================================================
     // Tasking
     // =========================================================================
-    pub fn create_kernel_task(entry: usize, name: String) -> u64;
+    pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
     pub fn pnp_queue_dpc(func: DpcFn, arg: usize);
     pub fn submit_runtime_internal(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub fn submit_blocking_internal(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub unsafe fn sleep_self();
+    pub unsafe fn sleep_self_and_yield();
+    pub unsafe fn wake_task(id: u64);
+
     // =========================================================================
     // Paging / VMM
     // =========================================================================
@@ -64,27 +69,28 @@ unsafe extern "win64" {
     pub fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr>;
 
     // =========================================================================
-    // Registry
+    // Registry (async FFI)
     // =========================================================================
-    pub fn reg_get_value(key_path: &str, name: &str) -> Option<Data>;
-    pub fn reg_set_value(key_path: &str, name: &str, data: Data) -> Result<(), RegError>;
-    pub fn reg_create_key(path: &str) -> Result<(), RegError>;
-    pub fn reg_delete_key(path: &str) -> Result<bool, RegError>;
-    pub fn reg_delete_value(key_path: &str, name: &str) -> Result<bool, RegError>;
-    pub fn reg_list_keys(base_path: &str) -> Result<Vec<String>, RegError>;
-    pub fn reg_list_values(base_path: &str) -> Result<Vec<String>, RegError>;
-    pub fn switch_to_vfs() -> Result<(), RegError>;
+    pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
+    pub fn reg_set_value(key_path: &str, name: &str, data: Data)
+    -> FfiFuture<Result<(), RegError>>;
+    pub fn reg_create_key(path: &str) -> FfiFuture<Result<(), RegError>>;
+    pub fn reg_delete_key(path: &str) -> FfiFuture<Result<bool, RegError>>;
+    pub fn reg_delete_value(key_path: &str, name: &str) -> FfiFuture<Result<bool, RegError>>;
+    pub fn reg_list_keys(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>>;
+    pub fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>>;
+    pub fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>>;
 
     // =========================================================================
-    // File System
+    // File System (async FFI)
     // =========================================================================
-    pub fn file_open(path: &str, flags: &[OpenFlags]) -> Result<File, FileStatus>;
-    pub fn fs_list_dir(path: &str) -> Result<Vec<String>, FileStatus>;
-    pub fn fs_remove_dir(path: &str) -> Result<(), FileStatus>;
-    pub fn fs_make_dir(path: &str) -> Result<(), FileStatus>;
-    pub fn file_read(file: &File) -> Result<Vec<u8>, FileStatus>;
-    pub fn file_write(file: &mut File, data: &[u8]) -> Result<(), FileStatus>;
-    pub fn file_delete(file: &mut File) -> Result<(), FileStatus>;
+    pub fn file_open(path: &str, flags: &[OpenFlags]) -> FfiFuture<Result<File, FileStatus>>;
+    pub fn fs_list_dir(path: &str) -> FfiFuture<Result<Vec<String>, FileStatus>>;
+    pub fn fs_remove_dir(path: &str) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn fs_make_dir(path: &str) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn file_read(file: &File) -> FfiFuture<Result<Vec<u8>, FileStatus>>;
+    pub fn file_write(file: &mut File, data: &[u8]) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn file_delete(file: &mut File) -> FfiFuture<Result<(), FileStatus>>;
 
     // =========================================================================
     // PnP / Device Management
@@ -111,7 +117,7 @@ unsafe extern "win64" {
         init: DeviceInit,
     ) -> (Arc<DevNode>, Arc<DeviceObject>);
 
-    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError>;
+    pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
     pub fn pnp_forward_request_to_next_lower(
@@ -142,7 +148,7 @@ unsafe extern "win64" {
         request: Arc<RwLock<Request>>,
     ) -> Result<RequestFuture, DriverStatus>;
 
-    pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>>;
+    pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
     pub fn pnp_create_control_device_with_init(name: String, init: DeviceInit)
     -> Arc<DeviceObject>;
@@ -167,7 +173,7 @@ unsafe extern "win64" {
         function_service: &str,
         function_fdo: &Arc<DeviceObject>,
         init_pdo: DeviceInit,
-    ) -> Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>;
+    ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
     pub fn pnp_send_request_to_next_upper(
         from: &Arc<DeviceObject>,
@@ -187,10 +193,10 @@ unsafe extern "win64" {
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
 }
 
-// This struct must be defined here
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct KernelAcpiHandler;
+
 impl acpi::AcpiHandler for KernelAcpiHandler {
     unsafe fn map_physical_region<T>(
         &self,

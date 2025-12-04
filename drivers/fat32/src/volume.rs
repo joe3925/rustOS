@@ -1,13 +1,15 @@
 #![no_std]
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_api::task::{create_kernel_task, sleep_self, sleep_self_and_yield, wake_task};
+
 use fatfs::{
     Dir as FatDirT, Error as FatError, File as FatFileT, FileSystem as FatFsT, IoBase,
     LossyOemCpConverter, NullTimeProvider, Read, Seek, SeekFrom, Write,
@@ -16,6 +18,7 @@ use fatfs::{
 use spin::{Mutex, RwLock};
 
 use kernel_api::device::DeviceObject;
+use kernel_api::pnp::pnp_complete_request;
 use kernel_api::request::{Request, RequestType};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
@@ -45,6 +48,8 @@ pub struct VolCtrlDevExt {
     pub fs: Mutex<Fs>,
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
+    pub(crate) queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
+    pub(crate) worker_task_id: AtomicU64,
 }
 
 pub struct CachedFile {
@@ -59,6 +64,10 @@ pub struct FileCtx {
     is_dir: bool,
     pos: u64,
     file: Option<CachedFile>,
+}
+
+struct FsWorkerCtx {
+    dev: Arc<DeviceObject>,
 }
 
 fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
@@ -114,16 +123,57 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
 }
-// TODO: add a way to spawn blocking work. Modify this so that fsops are spawned as blocking task which must be done because the fstfs crate doesn't support async
-// TODO: ban the usage of block_on in request handlers, maybe implement some type of IRQL.
 
-#[request_handler]
-pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+// Called from the control module after the per-volume device is created.
+pub fn start_fs_worker_for_volume(dev: Arc<DeviceObject>) {
+    let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+    let existing = vdx.worker_task_id.load(Ordering::Acquire);
+    if existing != 0 {
+        return;
+    }
+
+    let ctx = Box::new(FsWorkerCtx { dev: dev.clone() });
+    let raw_ctx = Box::into_raw(ctx) as usize;
+    let name = alloc::format!("fat32.fs.worker.{:p}", dev.as_ref());
+    let id = create_kernel_task(fs_worker_thread, raw_ctx, name);
+    vdx.worker_task_id.store(id, Ordering::Release);
+}
+
+extern "win64" fn fs_worker_thread(ctx: usize) {
+    let ctx_ref: &FsWorkerCtx = unsafe { &*(ctx as *const FsWorkerCtx) };
+
+    loop {
+        let req_opt = {
+            let vdx = ext_mut::<VolCtrlDevExt>(&ctx_ref.dev);
+            let mut q = vdx.queue.lock();
+            q.pop_front()
+        };
+
+        match req_opt {
+            Some(req) => {
+                let status = handle_fs_request(&ctx_ref.dev, &req);
+                {
+                    let mut r = req.write();
+                    r.status = status;
+                }
+                unsafe {
+                    pnp_complete_request(&req);
+                }
+            }
+            None => unsafe {
+                sleep_self_and_yield();
+            },
+        }
+    }
+}
+
+// Synchronous version of the old fs_op_dispatch body, run on the worker thread.
+fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> DriverStatus {
     let kind = { req.read().kind };
 
     match kind {
         RequestType::Fs(op) => {
-            let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
 
             match op {
                 FsOp::Open => {
@@ -135,7 +185,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
-                    // First, try to reuse an existing context for this path
                     let reuse_res = {
                         let mut tbl = vdx.table.write();
                         if let Some((&id, ctx)) =
@@ -623,6 +672,25 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
                 FsOp::SetInfo | FsOp::Delete => DriverStatus::NotImplemented,
             }
+        }
+        RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
+        _ => DriverStatus::InvalidParameter,
+    }
+}
+
+#[request_handler]
+pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+    let kind = { req.read().kind };
+
+    match kind {
+        RequestType::Fs(_) => {
+            let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+            {
+                let mut q = vdx.queue.lock();
+                q.push_back(req);
+                wake_task(vdx.worker_task_id.load(Ordering::Acquire));
+            }
+            DriverStatus::Pending
         }
         RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
         _ => DriverStatus::InvalidParameter,

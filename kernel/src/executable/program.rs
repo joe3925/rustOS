@@ -17,6 +17,7 @@ use x86_64::{
 };
 
 use crate::{
+    executable::pe_loadable::PELoader,
     file_system::path::Path,
     memory::paging::paging::map_page,
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
@@ -271,12 +272,28 @@ impl Program {
         result
     }
 
-    pub fn load_module(&mut self, path: String) -> Result<ModuleHandle, LoadError> {
-        if let Some(mut dll) = pe_loadable::PELoader::new(&path) {
-            let module = dll.dll_load(self)?;
-            return Ok(module);
+    pub async fn load_module(&mut self, root_path: String) -> Result<ModuleHandle, LoadError> {
+        let mut queue = Vec::new();
+        queue.push(root_path);
+
+        let mut last_handle = None;
+
+        while let Some(path) = queue.pop() {
+            let mut loader = PELoader::new(&path).await.ok_or(LoadError::NoFile)?;
+            let handle = loader.dll_load(self).await?;
+
+            last_handle = Some(handle.clone());
+
+            for dll in loader.list_import_dlls() {
+                // Add more dll search locations
+                let dep_path = alloc::format!(r"C:\BIN\MOD\{}", dll);
+                if !self.has_module(&dll) {
+                    queue.push(dep_path);
+                }
+            }
         }
-        Err(LoadError::NoFile)
+
+        last_handle.ok_or(LoadError::NotDLL)
     }
 
     pub fn kill(&mut self) -> Result<(), LoadError> {

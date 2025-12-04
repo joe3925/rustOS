@@ -64,7 +64,7 @@ impl Scheduler {
 
         let mut cores_vec: Vec<CoreScheduler> = Vec::with_capacity(num_cores);
         for _ in 0..num_cores {
-            let idle = Task::new_kernel_mode(idle_task as usize, KERNEL_STACK_SIZE, "".into(), 0);
+            let idle = Task::new_kernel_mode(idle_task, 0, KERNEL_STACK_SIZE, "".into(), 0);
             let idle_handle = idle;
             let idle_id = self.add_task_internal(idle_handle.clone());
             {
@@ -83,8 +83,7 @@ impl Scheduler {
         let ptr = &self.cores as *const _ as *mut Box<[CoreScheduler]>;
         unsafe { ptr.write(cores_box) };
 
-        let kernel =
-            Task::new_kernel_mode(kernel_main as usize, KERNEL_STACK_SIZE, "kernel".into(), 0);
+        let kernel = Task::new_kernel_mode(kernel_main, 0, KERNEL_STACK_SIZE, "kernel".into(), 0);
         self.add_task(kernel);
     }
 

@@ -22,15 +22,14 @@ use kernel_api::{
     },
     println,
     request::{Request, RequestType, TraversalPolicy},
-    request_handler,
+    request_handler, spawn_blocking,
     status::DriverStatus,
     util::bytes_to_box,
 };
 
 use crate::block_dev::BlockDev;
-use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
+use crate::volume::{VolCtrlDevExt, fs_op_dispatch, start_fs_worker_for_volume};
 use log::{Level, Metadata, Record};
-const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 struct KernelLogger;
 
@@ -54,10 +53,12 @@ fn init_logger() {
     let _ = log::set_logger(&LOGGER);
     log::set_max_level(log::LevelFilter::Debug);
 }
+
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
+
 #[request_handler]
 pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
     let code = {
@@ -124,10 +125,15 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             }
 
             let options = FsOptions::new();
-            match fatfs::FileSystem::new(
-                BlockDev::new(id.volume_fdo.clone(), sector_size, total_sectors),
-                options,
-            ) {
+            let target_clone = id.volume_fdo.clone();
+            let result = spawn_blocking(move || {
+                fatfs::FileSystem::new(
+                    BlockDev::new(target_clone, sector_size, total_sectors),
+                    options,
+                )
+            })
+            .await;
+            match result {
                 Ok(fs) => {
                     let mut io_vtable = IoVtable::new();
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
@@ -136,6 +142,8 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         fs: Mutex::new(fs),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
+                        queue: Mutex::new(alloc::collections::VecDeque::new()),
+                        worker_task_id: AtomicU64::new(0),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);
@@ -144,11 +152,15 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl =
                         unsafe { pnp_create_control_device_with_init(vol_name.clone(), init) };
+
+                    // Start per-volume worker thread that will run FATFS code
+                    start_fs_worker_for_volume(vol_ctrl.clone());
+
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
                     DriverStatus::Success
                 }
-                Err(e) => {
+                Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
                     DriverStatus::Success
@@ -191,12 +203,11 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
     unsafe {
-        let future = pnp_ioctl_via_symlink(
+        pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             reg.clone(),
         )?;
-        block_on(future);
     }
 
     DriverStatus::Success

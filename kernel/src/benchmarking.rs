@@ -189,7 +189,7 @@ fn max_gap_x1000(percs: &[u128]) -> (usize, usize, u128) {
     (min_idx, max_idx, max_val - min_val)
 }
 
-pub async fn run_stats_loop() {
+pub fn run_stats_loop() {
     let mut prev_total_ms: u128 = 0;
     let mut prev_core_ms: Vec<u128> = read_all_core_timer_ms();
     let mut prev_core_sw: Vec<u64> = read_all_core_switches();

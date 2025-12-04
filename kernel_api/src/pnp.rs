@@ -44,8 +44,8 @@ pub fn pnp_create_child_devnode_and_pdo_with_init(
     }
 }
 
-pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
-    unsafe { kernel_sys::pnp_bind_and_start(dn) }
+pub async fn pnp_bind_and_start(dn: &Arc<DevNode>) -> Result<(), DriverError> {
+    unsafe { kernel_sys::pnp_bind_and_start(dn).await }
 }
 
 pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget> {
@@ -102,7 +102,7 @@ pub fn pnp_ioctl_via_symlink(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn pnp_create_devnode_over_pdo_with_function(
+pub async fn pnp_create_devnode_over_pdo_with_function(
     parent_dn: &Arc<DevNode>,
     instance_path: String,
     ids: DeviceIds,
@@ -121,6 +121,7 @@ pub fn pnp_create_devnode_over_pdo_with_function(
             function_fdo,
             init_pdo,
         )
+        .await
     }
 }
 pub fn pnp_create_device_symlink_top(
@@ -157,8 +158,8 @@ pub fn pnp_send_request_to_stack_top(
 ) -> Result<RequestFuture, DriverStatus> {
     unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req) }
 }
-pub fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
-    unsafe { kernel_sys::pnp_load_service(name) }
+pub async fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
+    unsafe { kernel_sys::pnp_load_service(name).await }
 }
 pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd) {
     unsafe { kernel_sys::driver_set_evt_device_add(driver, callback) }

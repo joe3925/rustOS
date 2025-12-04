@@ -3,7 +3,7 @@
 pub extern crate alloc;
 
 use alloc::boxed::Box;
-use kernel_sys::submit_runtime_internal;
+use kernel_sys::{submit_blocking_internal, submit_runtime_internal};
 use kernel_types::pnp::PnpRequest;
 use kernel_types::request::{Request, RequestFuture, RequestType, TraversalPolicy};
 use kernel_types::status::DriverStatus;
@@ -24,6 +24,7 @@ pub mod memory;
 pub mod pnp;
 pub mod reg;
 pub mod runtime;
+pub mod task;
 pub mod util;
 pub const IOCTL_MOUNTMGR_REGISTER_FS: u32 = 0x4D4D_0001;
 pub const IOCTL_FS_IDENTIFY: u32 = 0x4653_0002;
@@ -111,4 +112,11 @@ pub unsafe extern "win64" fn _driver_runtime_submit_task(
     ctx: usize,
 ) {
     submit_runtime_internal(trampoline, ctx);
+}
+#[no_mangle]
+pub unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
+    trampoline: extern "win64" fn(usize),
+    ctx: usize,
+) {
+    submit_blocking_internal(trampoline, ctx);
 }
