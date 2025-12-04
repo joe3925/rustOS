@@ -1,16 +1,15 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::pe_loadable::LoadError;
-use crate::registry::RegError;
 use crate::{format, println};
 use alloc::{string::String, vec::Vec};
+use kernel_types::fs::OpenFlags;
+use kernel_types::pnp::BootType;
+use kernel_types::status::{Data, FileStatus, RegError};
 use toml::de::{DeInteger, DeTable};
 use toml::Spanned;
 
 use crate::alloc::string::ToString;
-use crate::{
-    file_system::file::{File, FileStatus, OpenFlags},
-    registry::{reg, Data},
-};
+use crate::{file_system::file::File, registry::reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverRole {
@@ -77,16 +76,16 @@ pub struct DriverToml {
 
 #[derive(Debug)]
 pub enum DriverError {
-    File(crate::file_system::file::FileStatus),
+    File(FileStatus),
     InvalidUtf8,
     TomlParse,
     DriverAlreadyInstalled,
     NoParent,
-    Registry(crate::registry::RegError),
+    Registry(RegError),
     LoadErr(LoadError),
 }
-impl From<crate::file_system::file::FileStatus> for DriverError {
-    fn from(e: crate::file_system::file::FileStatus) -> Self {
+impl From<FileStatus> for DriverError {
+    fn from(e: FileStatus) -> Self {
         if e == FileStatus::FileAlreadyExist {
             return DriverError::DriverAlreadyInstalled;
         }
@@ -94,8 +93,8 @@ impl From<crate::file_system::file::FileStatus> for DriverError {
     }
 }
 
-impl From<crate::registry::RegError> for DriverError {
-    fn from(e: crate::registry::RegError) -> Self {
+impl From<RegError> for DriverError {
+    fn from(e: RegError) -> Self {
         DriverError::Registry(e)
     }
 }
@@ -104,39 +103,14 @@ impl From<LoadError> for DriverError {
         DriverError::LoadErr(e)
     }
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
-pub enum BootType {
-    Boot = 0,
-    System = 1,
-    Demand = 2,
-    Disabled = 3,
-}
-
-impl BootType {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "boot" => Some(BootType::Boot),
-            "system" => Some(BootType::System),
-            "demand" => Some(BootType::Demand),
-            "disabled" => Some(BootType::Disabled),
-            _ => None,
-        }
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self as u32
-    }
-}
-
 #[inline(always)]
 fn inner<'a, T>(s: &'a Spanned<T>) -> &'a T {
     s.get_ref()
 }
 
-pub fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
-    let mut f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    let bytes = f.read()?;
+pub async fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
+    let mut f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
+    let bytes = f.read().await?;
     let src = core::str::from_utf8(&bytes).map_err(|_| FileStatus::InternalError)?;
 
     let (tbl_span, _errs) = DeTable::parse_recoverable(src);
@@ -289,17 +263,19 @@ fn escape_key(s: &str) -> alloc::string::String {
     }
     out
 }
-fn ensure_class_key(cls: &str) -> Result<(), RegError> {
+async fn ensure_class_key(cls: &str) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
-    if reg::get_key(&class_key).is_none() {
-        let _ = reg::create_key(&class_key);
+
+    if reg::get_key(&class_key).await.is_none() {
+        reg::create_key(class_key.clone()).await?;
     }
-    let _ = reg::create_key(&alloc::format!("{}/UpperFilters", class_key));
-    let _ = reg::create_key(&alloc::format!("{}/LowerFilters", class_key));
+
+    reg::create_key(alloc::format!("{}/UpperFilters", class_key)).await?;
+    reg::create_key(alloc::format!("{}/LowerFilters", class_key)).await?;
     Ok(())
 }
 
-fn reg_add_filter_index(
+async fn reg_add_filter_index(
     tgt: &FilterTarget,
     pos: FilterPosition,
     order: u32,
@@ -317,48 +293,63 @@ fn reg_add_filter_index(
     };
 
     let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/{}/{}", kind, id_key);
-    reg::create_key(&base)?;
+    reg::create_key(base.clone()).await?;
+
     let pos_path = alloc::format!("{}/{}", base, pos_s);
-    reg::create_key(&pos_path)?;
+    reg::create_key(pos_path.clone()).await?;
+
     let svc_path = alloc::format!("{}/{}", pos_path, service);
-    reg::create_key(&svc_path)?;
-    reg::set_value(&svc_path, "Order", Data::U32(order))?;
-    reg::set_value(&svc_path, "Service", Data::Str(service.to_string()))?;
+    reg::create_key(svc_path.clone()).await?;
+
+    reg::set_value(&svc_path, "Order", Data::U32(order)).await?;
+    reg::set_value(&svc_path, "Service", Data::Str(service.to_string())).await?;
     Ok(())
 }
-fn reg_append_class_filter(
+
+async fn reg_append_class_filter(
     class: &str,
     pos: FilterPosition,
     service: &str,
 ) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
-    if reg::get_key(&class_key).is_none() {
-        let _ = reg::create_key(&class_key);
+    if reg::get_key(&class_key).await.is_none() {
+        reg::create_key(class_key.clone()).await?;
     }
+
     let list_key = match pos {
         FilterPosition::Upper => alloc::format!("{}/UpperFilters", class_key),
         FilterPosition::Lower => alloc::format!("{}/LowerFilters", class_key),
     };
-    if reg::get_key(&list_key).is_none() {
-        let _ = reg::create_key(&list_key);
+
+    if reg::get_key(&list_key).await.is_none() {
+        reg::create_key(list_key.clone()).await?;
     }
-    let idx = reg::get_key(&list_key).map(|k| k.values.len()).unwrap_or(0);
+
+    let idx = reg::get_key(&list_key)
+        .await
+        .map(|k| k.values.len())
+        .unwrap_or(0);
+
     reg::set_value(
         &list_key,
         &alloc::format!("{}", idx),
         Data::Str(service.to_string()),
     )
+    .await
 }
-fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
+
+async fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", class);
-    if reg::get_key(&class_key).is_none() {
-        let _ = reg::create_key(&class_key);
+    if reg::get_key(&class_key).await.is_none() {
+        reg::create_key(class_key.clone()).await?;
     }
+
     let members_key = alloc::format!("{}/Members", class_key);
-    if reg::get_key(&members_key).is_none() {
-        let _ = reg::create_key(&members_key);
+    if reg::get_key(&members_key).await.is_none() {
+        reg::create_key(members_key.clone()).await?;
     }
-    if let Some(k) = reg::get_key(&members_key) {
+
+    if let Some(k) = reg::get_key(&members_key).await {
         for (_k, v) in k.values {
             if let Data::Str(s) = v {
                 if s == service {
@@ -367,20 +358,28 @@ fn reg_append_class_member(class: &str, service: &str) -> Result<(), RegError> {
             }
         }
     }
+
     let idx = reg::get_key(&members_key)
+        .await
         .map(|k| k.values.len())
         .unwrap_or(0);
+
     reg::set_value(
         &members_key,
         &alloc::format!("{}", idx),
         Data::Str(service.to_string()),
     )
+    .await
 }
+
 fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
-pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
-    let driver = parse_driver_toml(toml_path).map_err(|_| DriverError::TomlParse)?;
+
+pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
+    let driver = parse_driver_toml(&toml_path)
+        .await
+        .map_err(|_| DriverError::TomlParse)?;
     let driver_name = service_name_from_image(&driver.image);
 
     let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}/", driver_name);
@@ -391,60 +390,63 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
     let img_src_dir = toml_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
     let img_src_full = alloc::format!("{}\\{}", img_src_dir, driver.image);
 
-    let _ = File::make_dir("C:\\SYSTEM".to_string());
-    let _ = File::make_dir("C:\\SYSTEM\\TOML".to_string());
-    let _ = File::make_dir("C:\\SYSTEM\\MOD".to_string());
+    let _ = File::make_dir("C:\\SYSTEM".to_string()).await;
+    let _ = File::make_dir("C:\\SYSTEM\\TOML".to_string()).await;
+    let _ = File::make_dir("C:\\SYSTEM\\MOD".to_string()).await;
 
-    let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    img_src.move_no_copy(&img_target_path)?;
+    let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
+    img_src.move_no_copy(&img_target_path).await?;
 
-    let toml_src = File::open(toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open])?;
-    toml_src.move_no_copy(&toml_target_path)?;
+    let toml_src = File::open(&toml_path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
+    toml_src.move_no_copy(&toml_target_path).await?;
 
-    reg::create_key(&key_path)?;
+    reg::create_key(key_path.clone()).await?;
     reg::set_value(
         &key_path,
         "ImagePath",
         Data::Str(img_target_path.to_string()),
-    )?;
+    )
+    .await?;
     reg::set_value(
         &key_path,
         "TomlPath",
         Data::Str(toml_target_path.to_string()),
-    )?;
-    reg::set_value(&key_path, "Start", Data::U32(driver.start.as_u32()))?;
+    )
+    .await?;
+    reg::set_value(&key_path, "Start", Data::U32(driver.start.as_u32())).await?;
 
     let role_u32 = match driver.role {
         DriverRole::Function => 0,
         DriverRole::Filter => 1,
         DriverRole::Base => 2,
     };
-    reg::set_value(&key_path, "Role", Data::U32(role_u32))?;
+    reg::set_value(&key_path, "Role", Data::U32(role_u32)).await?;
 
     match driver.role {
         DriverRole::Function => {
             if let Some(cls) = &driver.class {
-                reg::set_value(&key_path, "Class", Data::Str(cls.clone()))?;
-                ensure_class_key(cls)?;
-                reg_append_class_member(cls, driver_name)?;
+                reg::set_value(&key_path, "Class", Data::Str(cls.clone())).await?;
+                ensure_class_key(cls).await?;
+                reg_append_class_member(cls, driver_name).await?;
 
                 if driver.hwids.is_empty() {
                     let class_key = alloc::format!("SYSTEM/CurrentControlSet/Class/{}", cls);
-                    reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string()))?;
-                    if reg::get_value(&class_key, "Version").is_none() {
-                        let _ = reg::set_value(&class_key, "Version", Data::U32(1));
+                    reg::set_value(&class_key, "Class", Data::Str(driver_name.to_string())).await?;
+                    if reg::get_value(&class_key, "Version").await.is_none() {
+                        let _ = reg::set_value(&class_key, "Version", Data::U32(1)).await;
                     }
-                    if reg::get_value(&class_key, "Description").is_none() {
-                        let _ = reg::set_value(&class_key, "Description", Data::Str(cls.clone()));
+                    if reg::get_value(&class_key, "Description").await.is_none() {
+                        let _ =
+                            reg::set_value(&class_key, "Description", Data::Str(cls.clone())).await;
                     }
                 }
             }
 
             if !driver.hwids.is_empty() {
                 let hwk = alloc::format!("{}/Hwids", key_path.trim_end_matches('/'));
-                reg::create_key(&hwk)?;
+                reg::create_key(hwk.clone()).await?;
                 for (i, h) in driver.hwids.iter().enumerate() {
-                    reg::set_value(&hwk, &alloc::format!("{}", i), Data::Str(h.clone()))?;
+                    reg::set_value(&hwk, &alloc::format!("{}", i), Data::Str(h.clone())).await?;
                 }
             }
         }
@@ -452,89 +454,100 @@ pub fn install_driver_toml(toml_path: &str) -> Result<(), DriverError> {
         DriverRole::Filter => {
             let f = driver.filter.as_ref().ok_or(DriverError::TomlParse)?;
             let flt_key = alloc::format!("{}/Filter", key_path.trim_end_matches('/'));
-            reg::create_key(&flt_key)?;
+            reg::create_key(flt_key.clone()).await?;
             let pos_s = match f.position {
                 FilterPosition::Upper => "upper",
                 FilterPosition::Lower => "lower",
             };
-            reg::set_value(&flt_key, "Position", Data::Str(pos_s.to_string()))?;
-            reg::set_value(&flt_key, "Order", Data::U32(f.order))?;
+            reg::set_value(&flt_key, "Position", Data::Str(pos_s.to_string())).await?;
+            reg::set_value(&flt_key, "Order", Data::U32(f.order)).await?;
             match &f.target {
                 FilterTarget::Hwid(s) => {
-                    reg::set_value(&flt_key, "TargetKind", Data::Str("hwid".into()))?;
-                    reg::set_value(&flt_key, "Target", Data::Str(s.clone()))?;
+                    reg::set_value(&flt_key, "TargetKind", Data::Str("hwid".into())).await?;
+                    reg::set_value(&flt_key, "Target", Data::Str(s.clone())).await?;
                 }
                 FilterTarget::Class(s) => {
-                    reg::set_value(&flt_key, "TargetKind", Data::Str("class".into()))?;
-                    reg::set_value(&flt_key, "Target", Data::Str(s.clone()))?;
-                    reg_append_class_filter(s, f.position, driver_name)?;
+                    reg::set_value(&flt_key, "TargetKind", Data::Str("class".into())).await?;
+                    reg::set_value(&flt_key, "Target", Data::Str(s.clone())).await?;
+                    reg_append_class_filter(s, f.position, driver_name).await?;
                     if driver.start != BootType::Demand {
-                        reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))?;
+                        reg::set_value(&key_path, "Start", Data::U32(BootType::Demand.as_u32()))
+                            .await?;
                     }
                 }
                 FilterTarget::Driver(s) => {
-                    reg::set_value(&flt_key, "TargetKind", Data::Str("driver".into()))?;
-                    reg::set_value(&flt_key, "Target", Data::Str(s.clone()))?;
+                    reg::set_value(&flt_key, "TargetKind", Data::Str("driver".into())).await?;
+                    reg::set_value(&flt_key, "Target", Data::Str(s.clone())).await?;
                 }
             }
-            reg_add_filter_index(&f.target, f.position, f.order, driver_name)?;
+            reg_add_filter_index(&f.target, f.position, f.order, driver_name).await?;
         }
 
         DriverRole::Base => {}
     }
 
     for rw in driver.reg_writes.iter() {
-        reg::create_key(&rw.path)?;
+        reg::create_key(rw.path.clone()).await?;
         for (name, val) in rw.values.iter() {
-            reg::set_value(&rw.path, name, val.clone())?;
+            reg::set_value(&rw.path, name, val.clone()).await?;
         }
     }
 
-    PNP_MANAGER.recheck_all_devices();
+    PNP_MANAGER.recheck_all_devices().await;
     Ok(())
 }
 
-pub fn install_prepacked_drivers() -> Result<(), DriverError> {
-    const DRIVER_ROOT: &str = "C:\\INSTALL\\DRIVERS";
+pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
+    let driver_root: &str = "C:\\INSTALL\\DRIVERS";
 
-    let packages = File::list_dir(DRIVER_ROOT).map_err(DriverError::File)?;
+    let packages = File::list_dir(driver_root)
+        .await
+        .map_err(DriverError::File)?;
 
     for pkg in packages {
-        let pkg_path = alloc::format!("{}\\{}", DRIVER_ROOT, pkg);
+        let pkg_path = alloc::format!("{driver_root}\\{pkg}");
 
-        let entries = match File::list_dir(&pkg_path) {
+        let entries = match File::list_dir(&pkg_path).await {
             Ok(e) => e,
             Err(_) => continue,
         };
 
-        if let Some(toml_name) = entries
-            .iter()
-            .find(|n| n.to_ascii_lowercase().ends_with(".toml"))
-        {
-            let toml_path = alloc::format!("{}\\{}", pkg_path, toml_name);
-            //TODO: log every non fatal error
-            match install_driver_toml(&toml_path) {
-                Ok(_) => {
-                    println!("Installed {}", toml_path);
-                }
-                Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
-                    println!(
-                        "Couldn't install driver {} failed with error: {:#?}",
-                        toml_path,
-                        DriverError::Registry(RegError::KeyAlreadyExists)
-                    );
-                }
-                Err(DriverError::Registry(e)) => {
-                    return Err(DriverError::Registry(e));
-                }
-                Err(e) => {
-                    println!(
-                        "Couldn't install driver {} failed with error: {:#?}",
-                        toml_path, e
-                    );
-                }
+        let mut toml_name: Option<String> = None;
+        for entry in entries {
+            let name_str: &str = entry.as_ref();
+            if name_str.to_ascii_lowercase().ends_with(".toml") {
+                toml_name = Some(name_str.to_string());
+                break;
             }
         }
+
+        let Some(toml_name) = toml_name else {
+            continue;
+        };
+
+        let toml_path = alloc::format!("{pkg_path}\\{toml_name}");
+        install_driver_toml(toml_path).await;
+        // match install_driver_toml(&toml_path).await {
+        //     Ok(_) => {
+        //         println!("Installed {}", toml_path);
+        //     }
+        //     Err(DriverError::Registry(RegError::KeyAlreadyExists)) => {
+        //         println!(
+        //             "Couldn't install driver {} failed with error: {:#?}",
+        //             toml_path,
+        //             DriverError::Registry(RegError::KeyAlreadyExists)
+        //         );
+        //     }
+        //     Err(DriverError::Registry(e)) => {
+        //         return Err(DriverError::Registry(e));
+        //     }
+        //     Err(e) => {
+        //         println!(
+        //             "Couldn't install driver {} failed with error: {:#?}",
+        //             toml_path, e
+        //         );
+        //     }
+        // }
     }
 
     Ok(())

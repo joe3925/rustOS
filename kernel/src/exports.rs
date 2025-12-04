@@ -1,6 +1,5 @@
 use crate::alloc::string::ToString;
 use crate::export;
-use crate::file_system::file::switch_to_vfs;
 use crate::file_system::file::File;
 use crate::function;
 use crate::get_rva;
@@ -24,12 +23,16 @@ export! {
     wait_ms,
     create_kernel_task,
     kill_kernel_task_by_id,
-    switch_to_vfs,
+    sleep_self,
+    sleep_self_and_yield,
+    wake_task,
+    switch_to_vfs_async,
     panic_common,
-
+    submit_runtime_internal,
+    submit_blocking_internal,
     get_rsdp,
     get_acpi_tables,
-
+    task_yield,
     allocate_auto_kernel_range_mapped,
     allocate_kernel_range_mapped,
     deallocate_kernel_range,
@@ -45,9 +48,6 @@ export! {
     fs_list_dir,
     fs_remove_dir,
     fs_make_dir,
-    file_read,
-    file_write,
-    file_delete,
 
     pnp_create_pdo,
     pnp_bind_and_start,
@@ -65,7 +65,6 @@ export! {
     pnp_ioctl_via_symlink,
     pnp_load_service,
     pnp_add_class_listener,
-    pnp_wait_for_request,
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
@@ -86,4 +85,5 @@ export! {
     reg_delete_value,
     reg_list_keys,
     reg_list_values,
+
 }

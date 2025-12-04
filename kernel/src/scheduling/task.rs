@@ -8,10 +8,11 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::asm;
 use spin::RwLock;
+use x86_64::instructions::hlt;
 use x86_64::VirtAddr;
 
 use super::scheduler::TaskHandle;
-
+pub type TaskEntry = extern "win64" fn(usize);
 #[derive(Debug, Clone)]
 pub struct Task {
     pub name: String,
@@ -26,7 +27,8 @@ pub struct Task {
 }
 impl Task {
     pub fn new_user_mode(
-        entry_point: usize,
+        entry_point: TaskEntry,
+        context: usize,
         stack_size: u64,
         name: String,
         stack_pointer: VirtAddr,
@@ -78,7 +80,8 @@ impl Task {
     }
 
     pub fn new_kernel_mode(
-        entry_point: usize,
+        entry_point: TaskEntry,
+        context: usize,
         stack_size: u64,
         name: String,
         parent_pid: u64,
@@ -94,6 +97,7 @@ impl Task {
 
         let mut state = State::new(0);
         state.rip = entry_point as u64;
+        state.rcx = context as u64;
         state.rsp = stack_top.as_u64() - 8;
         state.rflags = 0x00000202;
 
@@ -152,13 +156,14 @@ impl Task {
     pub fn wake(&mut self) {
         self.is_sleeping = false;
     }
+    pub fn is_sleeping(&self) -> bool {
+        self.is_sleeping
+    }
 }
 
 //Idle task to prevent return
-pub(crate) extern "C" fn idle_task() {
+pub(crate) extern "win64" fn idle_task(ctx: usize) {
     loop {
-        unsafe {
-            asm!("hlt", options(nomem, nostack, preserves_flags));
-        }
+        hlt();
     }
 }

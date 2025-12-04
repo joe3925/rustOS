@@ -1,4 +1,8 @@
-use crate::file_system::file::{File, OpenFlags};
+#![no_std]
+
+extern crate alloc;
+
+use crate::file_system::file::File;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -6,8 +10,10 @@ use alloc::{
     vec::Vec,
 };
 use bincode::{Decode, Encode};
+use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_types::{fs::OpenFlags, status::Data};
 use lazy_static::lazy_static;
-use spin::{Once, RwLock};
+use spin::{Mutex, RwLock};
 
 const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
 const CLASS_LIST: &[(&str, &str)] = &[
@@ -26,29 +32,6 @@ const CLASS_LIST: &[(&str, &str)] = &[
     ("parallel", "Parallel ports"),
 ];
 
-/* ---------- data layer -------------- */
-#[derive(Debug, Clone, Encode, Decode, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Data {
-    U32(u32),
-    U64(u64),
-    I32(i32),
-    I64(i64),
-    Bool(bool),
-    Str(String),
-}
-#[derive(Debug)]
-#[repr(u32)]
-pub enum RegError {
-    KeyAlreadyExists,
-    KeyNotFound,
-    ValueNotFound,
-    PersistenceFailed,
-    EncodingFailed,
-    CorruptReg,
-    FileIO,
-}
-
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Key {
     pub values: BTreeMap<String, Data>,
@@ -63,6 +46,7 @@ impl Key {
         }
     }
 }
+
 #[derive(Debug, Clone)]
 pub enum RegDelta {
     CreateKey {
@@ -98,6 +82,9 @@ impl Registry {
 lazy_static! {
     static ref REGISTRY: RwLock<Arc<Registry>> = RwLock::new(Arc::new(Registry::empty()));
 }
+
+static REGISTRY_INIT: AtomicBool = AtomicBool::new(false);
+static REGISTRY_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 fn init_class_catalog(reg: &mut Registry) {
     let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
@@ -138,47 +125,54 @@ fn init_class_catalog(reg: &mut Registry) {
     }
 }
 
-fn ensure_loaded() {
-    use bincode::config::standard;
-    static LOADER: Once = Once::new();
+async fn ensure_loaded() {
+    if REGISTRY_INIT.load(Ordering::Acquire) {
+        return;
+    }
 
-    LOADER.call_once(|| {
-        if let Ok(mut f) = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]) {
-            if let Ok(buf) = f.read() {
-                if let Ok((disk_reg, _)) =
-                    bincode::decode_from_slice::<Registry, _>(&buf, standard())
-                {
-                    *REGISTRY.write() = Arc::new(disk_reg);
-                    return;
-                }
+    let _guard = REGISTRY_INIT_LOCK.lock();
+
+    if REGISTRY_INIT.load(Ordering::Acquire) {
+        return;
+    }
+
+    if let Ok(mut f) = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
+        if let Ok(buf) = f.read().await {
+            if let Ok((disk_reg, _)) =
+                bincode::decode_from_slice::<Registry, _>(&buf, bincode::config::standard())
+            {
+                *REGISTRY.write() = Arc::new(disk_reg);
+                REGISTRY_INIT.store(true, Ordering::Release);
+                return;
             }
         }
+    }
 
-        let mut reg = Registry::empty();
+    let mut reg = Registry::empty();
 
-        let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
-        let setup = system
-            .sub_keys
-            .entry("SETUP".into())
-            .or_insert_with(Key::empty);
-        setup.values.insert("FirstBoot".into(), Data::Bool(true));
+    let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
+    let setup = system
+        .sub_keys
+        .entry("SETUP".into())
+        .or_insert_with(Key::empty);
+    setup.values.insert("FirstBoot".into(), Data::Bool(true));
 
-        init_class_catalog(&mut reg);
+    init_class_catalog(&mut reg);
 
-        if let Ok(mut f) = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]) {
-            let bytes = bincode::encode_to_vec(&reg, standard()).unwrap();
-            let _ = f.write(&bytes);
-        }
+    if let Ok(mut f) = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await {
+        let bytes = bincode::encode_to_vec(&reg, bincode::config::standard()).unwrap();
+        let _ = f.write(&bytes).await;
+    }
 
-        *REGISTRY.write() = Arc::new(reg);
-    });
+    *REGISTRY.write() = Arc::new(reg);
+    REGISTRY_INIT.store(true, Ordering::Release);
 }
+
 pub mod reg {
+    use kernel_types::status::{Data, RegError};
+
     use super::*;
-    use crate::{
-        file_system::file::{File, FileStatus, OpenFlags},
-        println,
-    };
+    use crate::println;
 
     fn walk<'a>(root: &'a BTreeMap<String, Key>, path: &str) -> Option<&'a Key> {
         let mut node_map = root;
@@ -208,40 +202,43 @@ pub mod reg {
         last.map(|nn| unsafe { &mut *nn.as_ptr() })
     }
 
-    pub fn get_key(path: &str) -> Option<Key> {
-        ensure_loaded();
+    pub async fn get_key(path: &str) -> Option<Key> {
+        ensure_loaded().await;
         walk(&REGISTRY.read().root, path).cloned()
     }
-
-    pub fn create_key(path: &str) -> Result<(), RegError> {
-        ensure_loaded();
+    // this needs to be String not &str because of a compiler bug
+    pub async fn create_key(path: String) -> Result<(), RegError> {
+        ensure_loaded().await;
         let mut new: Registry = (**REGISTRY.read()).clone();
 
-        let mut node_map = &mut new.root;
-        let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
+        {
+            let mut node_map = &mut new.root;
+            let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
 
-        while let Some(seg) = segments.next() {
-            let is_last = segments.peek().is_none();
+            while let Some(seg) = segments.next() {
+                let is_last = segments.peek().is_none();
 
-            if is_last {
-                if node_map.contains_key(seg) {
-                    return Err(RegError::KeyAlreadyExists);
+                if is_last {
+                    if node_map.contains_key(seg) {
+                        return Err(RegError::KeyAlreadyExists);
+                    } else {
+                        node_map.insert(seg.to_string(), Key::empty());
+                    }
                 } else {
-                    node_map.insert(seg.to_string(), Key::empty());
+                    node_map = &mut node_map
+                        .entry(seg.to_string())
+                        .or_insert_with(Key::empty)
+                        .sub_keys;
                 }
-            } else {
-                node_map = &mut node_map
-                    .entry(seg.to_string())
-                    .or_insert_with(Key::empty)
-                    .sub_keys;
             }
         }
 
-        persist(&new)
+        persist(&new).await;
+        Ok(())
     }
 
-    pub fn delete_key(path: &str) -> Result<bool, RegError> {
-        ensure_loaded();
+    pub async fn delete_key(path: &str) -> Result<bool, RegError> {
+        ensure_loaded().await;
         let mut segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if segs.is_empty() {
             return Ok(false);
@@ -251,49 +248,45 @@ pub mod reg {
         let parent = walk_mut(&mut new.root, &segs.join("/")).ok_or(RegError::KeyNotFound)?;
         let removed = parent.sub_keys.remove(last).is_some();
         if removed {
-            persist(&new)?;
+            persist(&new).await?;
         }
         Ok(removed)
     }
 
-    /* -----------------------------------------------------------------
-     *  VALUE API
-     * ----------------------------------------------------------------- */
-    pub fn get_value(key_path: &str, name: &str) -> Option<Data> {
-        ensure_loaded();
+    pub async fn get_value(key_path: &str, name: &str) -> Option<Data> {
+        ensure_loaded().await;
         walk(&REGISTRY.read().root, key_path)
             .and_then(|k| k.values.get(name))
             .cloned()
     }
 
-    pub fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), RegError> {
-        ensure_loaded();
+    pub async fn set_value(key_path: &str, name: &str, data: Data) -> Result<(), RegError> {
+        ensure_loaded().await;
         let mut new: Registry = (**REGISTRY.read()).clone();
         let key = walk_mut(&mut new.root, key_path).ok_or(RegError::KeyNotFound)?;
         key.values.insert(name.to_string(), data);
-        persist(&new)
+        persist(&new).await
     }
 
-    pub fn delete_value(key_path: &str, name: &str) -> Result<bool, RegError> {
-        ensure_loaded();
+    pub async fn delete_value(key_path: &str, name: &str) -> Result<bool, RegError> {
+        ensure_loaded().await;
         let mut new: Registry = (**REGISTRY.read()).clone();
         let key = walk_mut(&mut new.root, key_path).ok_or(RegError::KeyNotFound)?;
         let removed = key.values.remove(name).is_some();
         if removed {
-            persist(&new)?;
+            persist(&new).await?;
         }
         Ok(removed)
     }
-    pub fn print_tree() {
+
+    pub async fn print_tree() {
         fn dump(name: &str, key: &Key, depth: usize) {
-            // build indentation without std
             let mut indent = alloc::string::String::new();
             for _ in 0..depth {
                 indent.push_str("  ");
             }
             println!("{}[{}]", indent, name);
 
-            // print values under this key
             for (val_name, data) in &key.values {
                 match data {
                     Data::U32(v) => println!("{}  {} = U32({})", indent, val_name, v),
@@ -305,34 +298,34 @@ pub mod reg {
                 }
             }
 
-            // recurse into sub-keys
             for (sub_name, sub_key) in &key.sub_keys {
                 dump(sub_name, sub_key, depth + 1);
             }
         }
 
-        ensure_loaded();
+        ensure_loaded().await;
         let reg = REGISTRY.read();
         for (root_name, root_key) in &reg.root {
             dump(root_name, root_key, 0);
         }
     }
-    fn persist(new_reg: &Registry) -> Result<(), RegError> {
+
+    async fn persist(new_reg: &Registry) -> Result<(), RegError> {
         let bytes = bincode::encode_to_vec(new_reg, bincode::config::standard())
             .map_err(|_| RegError::EncodingFailed)?;
 
         *REGISTRY.write() = Arc::new(new_reg.clone());
 
-        let mut file = File::open(REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create])
-            .expect("Registry persistence failed");
-        if let Some(binding) = file.write(&bytes).err() {
-            let err_str = binding.to_str();
+        let mut file =
+            File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+        if let Err(e) = file.write(&bytes).await {
+            let err_str = e.to_str();
             println!("{}", err_str);
         }
-        //file.write(&bytes).expect("Registry persistence failed ");
         Ok(())
     }
-    pub fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
+
+    pub async fn list_keys(base_path: &str) -> Result<Vec<String>, RegError> {
         fn join(base: &str, seg: &str) -> String {
             if base.is_empty() {
                 seg.to_string()
@@ -348,7 +341,7 @@ pub mod reg {
             }
         }
 
-        ensure_loaded();
+        ensure_loaded().await;
         let base_norm = base_path.trim_matches('/');
         let reg = REGISTRY.read();
         let start = if base_norm.is_empty() {
@@ -367,7 +360,7 @@ pub mod reg {
         Ok(out)
     }
 
-    pub fn list_values(base_path: &str) -> Result<Vec<String>, RegError> {
+    pub async fn list_values(base_path: &str) -> Result<Vec<String>, RegError> {
         fn join(base: &str, seg: &str) -> String {
             if base.is_empty() {
                 seg.to_string()
@@ -376,7 +369,7 @@ pub mod reg {
             }
         }
 
-        ensure_loaded();
+        ensure_loaded().await;
         let base_norm = base_path.trim_matches('/');
         let reg = REGISTRY.read();
 
@@ -391,15 +384,13 @@ pub mod reg {
         }
         Ok(out)
     }
-    fn load_from_disk() -> Result<super::Registry, RegError> {
-        use bincode::config::standard;
 
-        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])
-            .ok()
-            .ok_or(RegError::FileIO)?;
-        let buf = f.read().ok().ok_or(RegError::FileIO)?;
-        let (r, _) = bincode::decode_from_slice::<super::Registry, _>(&buf, standard())
-            .map_err(|_| RegError::CorruptReg)?;
+    async fn load_from_disk() -> Result<super::Registry, RegError> {
+        let f = File::open(super::REG_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]).await?;
+        let buf = f.read().await?;
+        let (r, _) =
+            bincode::decode_from_slice::<super::Registry, _>(&buf, bincode::config::standard())
+                .map_err(|_| RegError::CorruptReg)?;
         Ok(r)
     }
 
@@ -423,7 +414,6 @@ pub mod reg {
             }
         }
 
-        // subkeys
         for (name, sub_to) in &to.sub_keys {
             let child_path = if base_path.is_empty() {
                 name.clone()
@@ -463,25 +453,26 @@ pub mod reg {
         out
     }
 
-    pub fn rebind_and_persist_after_provider_switch() -> Result<(), super::RegError> {
-        ensure_loaded();
+    pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
+        ensure_loaded().await;
         let current = (**REGISTRY.read()).clone();
-
-        let on_disk = match load_from_disk() {
+        let status = load_from_disk().await;
+        let on_disk = match status {
             Ok(r) => r,
-            Err(RegError::FileIO) | Err(RegError::CorruptReg) => super::Registry::empty(),
+            Err(RegError::FileIO(_)) | Err(RegError::CorruptReg) => super::Registry::empty(),
             Err(e) => return Err(e),
         };
 
         let _deltas = diff_registry(&on_disk, &current);
 
-        persist(&current)?;
+        persist(&current).await?;
         Ok(())
     }
 }
-pub fn is_first_boot() -> bool {
+
+pub async fn is_first_boot() -> bool {
     matches!(
-        reg::get_value("SYSTEM/SETUP", "FirstBoot"),
+        reg::get_value("SYSTEM/SETUP", "FirstBoot").await,
         Some(Data::Bool(true))
     )
 }

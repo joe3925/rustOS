@@ -1,8 +1,15 @@
+use core::arch::naked_asm;
+use core::sync::atomic::Ordering;
+
 use crate::drivers;
+use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::kbd_driver::keyboard_interrupt_handler;
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
+use crate::scheduling::scheduler::{yield_interrupt_entry, SCHEDULER};
+use crate::scheduling::state::State;
+use crate::util::KERNEL_INITIALIZED;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
@@ -33,7 +40,7 @@ lazy_static! {
         //hardware interrupts
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()].set_handler_addr(VirtAddr::new(timer_interrupt_entry as u64)).set_stack_index(TIMER_IST_INDEX);
         idt[drivers::interrupt_index::InterruptIndex::KeyboardIndex.as_u8()].set_handler_fn(keyboard_interrupt_handler);
-
+        idt[0x80].set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64));
 
         idt
     };

@@ -1,0 +1,16 @@
+[package]
+name = "kernel_sys"
+version = "0.1.0"
+edition = "2024"
+
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+kernel_types = { path = "../kernel_types" }
+acpi = "5.0.0"
+x86_64 = { version = "0.15.2", default-features = false, features = [
+    "instructions",
+] }
+spin = "0.10.0"

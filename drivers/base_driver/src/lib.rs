@@ -6,14 +6,14 @@ use core::panic::PanicInfo;
 
 use alloc::sync::Arc;
 use kernel_api::{
-    DeviceObject, DriverObject, DriverStatus, KernelAllocator, PnpMinorFunction, Request,
-    alloc_api::{DeviceInit, PnpVtable, ffi::driver_set_evt_device_add},
+    device::{DeviceInit, DeviceObject, DriverObject},
+    pnp::{PnpMinorFunction, PnpVtable, driver_set_evt_device_add},
     println,
+    request::Request,
+    request_handler,
+    status::DriverStatus,
 };
 use spin::RwLock;
-
-#[global_allocator]
-static ALLOCATOR: KernelAllocator = KernelAllocator;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -28,7 +28,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    driver: &Arc<DriverObject>,
+    driver: Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStatus {
     let mut pnp_vtable = PnpVtable::new();
@@ -37,8 +37,9 @@ pub extern "win64" fn bus_driver_device_add(
     DriverStatus::Success
 }
 
-pub extern "win64" fn bus_driver_prepare_hardware(
-    device: &Arc<DeviceObject>,
+#[request_handler]
+pub async fn bus_driver_prepare_hardware(
+    device: Arc<DeviceObject>,
     _request: Arc<RwLock<Request>>,
 ) -> DriverStatus {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");

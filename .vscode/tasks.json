@@ -2,9 +2,15 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "dbg build",
+            "label": "dbg full build",
             "type": "shell",
             "command": "Set-Location '${workspaceFolder}\\drivers'; .\\build_drivers; if (-not $?) { exit 1 }; Set-Location '${workspaceFolder}\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "problemMatcher": []
+        },
+        {
+            "label": "dbg kernel build",
+            "type": "shell",
+            "command": "Set-Location '${workspaceFolder}\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "problemMatcher": []
         },
         {
@@ -15,9 +21,18 @@
             "isBackground": true
         },
         {
-            "label": "dbg chain",
+            "label": "dbg full chain",
             "dependsOn": [
-                "dbg build",
+                "dbg full build",
+                "dbg launch"
+            ],
+            "dependsOrder": "sequence",
+            "problemMatcher": []
+        },
+        {
+            "label": "dbg kernel chain",
+            "dependsOn": [
+                "dbg kernel build",
                 "dbg launch"
             ],
             "dependsOrder": "sequence",

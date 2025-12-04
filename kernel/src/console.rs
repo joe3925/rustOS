@@ -1,5 +1,6 @@
 use crate::util::boot_info;
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
 use core::fmt::Write;
@@ -265,45 +266,16 @@ macro_rules! println {
     };
 }
 
-pub(crate) fn _print(args: core::fmt::Arguments) {
-    let mut buffer = [0u8; 1024];
-    let mut writer = BufferWriter::new(&mut buffer);
-    core::fmt::write(&mut writer, args).unwrap();
-    CONSOLE.lock().print(writer.as_bytes());
+pub(crate) fn _print(args: alloc::fmt::Arguments) {
+    let mut writer = ConsoleWriter;
+    let _ = writer.write_fmt(args);
 }
 
-struct BufferWriter<'a> {
-    buffer: &'a mut [u8],
-    position: usize,
-}
+struct ConsoleWriter;
 
-impl<'a> BufferWriter<'a> {
-    fn new(buffer: &'a mut [u8]) -> Self {
-        BufferWriter {
-            buffer,
-            position: 0,
-        }
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.buffer[..self.position]
-    }
-}
-
-impl<'a> Write for BufferWriter<'a> {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let bytes = s.as_bytes();
-        let available_space = self.buffer.len() - self.position;
-        let bytes_to_write = bytes.len().min(available_space);
-
-        self.buffer[self.position..self.position + bytes_to_write]
-            .copy_from_slice(&bytes[..bytes_to_write]);
-        self.position += bytes_to_write;
-
-        if bytes_to_write < bytes.len() {
-            return Err(core::fmt::Error); // Buffer overflow
-        }
-
+impl Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> alloc::fmt::Result {
+        CONSOLE.lock().print(s.as_bytes());
         Ok(())
     }
 }

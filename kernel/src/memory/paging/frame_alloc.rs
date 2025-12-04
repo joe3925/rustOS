@@ -44,7 +44,6 @@ impl BootInfoFrameAllocator {
             memory_map[w] = !0u64; // mark every bit in the word
         }
 
-        /* ── 2. Tag all non‑Usable regions from the firmware/bootloader map ───── */
         for region in memory_regions {
             if region.kind == MemoryRegionKind::Usable {
                 continue;

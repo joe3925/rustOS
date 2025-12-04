@@ -5,47 +5,51 @@ extern crate alloc;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;
 
-use crate::drivers::pnp::driver_object::{DriverStatus, Request};
-use crate::file_system::file::{FileStatus, OpenFlags};
-use crate::file_system::file_structs::{
-    FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult,
-    FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOpenParams, FsOpenResult,
-    FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-    FsSeekWhence, FsWriteParams, FsWriteResult,
+use kernel_types::{
+    async_ffi::FfiFuture,
+    fs::*,
+    request::Request,
+    status::{DriverStatus, FileStatus},
 };
 
 pub trait FileProvider: Send + Sync {
-    fn open_path(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus);
-    fn close_handle(&self, file_id: u64) -> (FsCloseResult, DriverStatus);
-    fn read_at(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus);
-    fn write_at(&self, file_id: u64, offset: u64, data: &[u8]) -> (FsWriteResult, DriverStatus);
-    fn flush_handle(&self, file_id: u64) -> (FsFlushResult, DriverStatus);
-    fn get_info(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus);
+    fn open_path(&self, path: &str, flags: &[OpenFlags])
+        -> FfiFuture<(FsOpenResult, DriverStatus)>;
 
-    fn list_dir_path(&self, path: &str) -> (FsListDirResult, DriverStatus);
-    fn make_dir_path(&self, path: &str) -> (FsCreateResult, DriverStatus);
-    fn remove_dir_path(&self, path: &str) -> (FsCreateResult, DriverStatus);
-    fn rename_path(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus);
-    fn delete_path(&self, path: &str) -> (FsCreateResult, DriverStatus);
-
-    // Async variants: return the in-flight Request handle without waiting.
-    fn open_path_async(
+    fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)>;
+    fn seek_handle(
         &self,
-        path: &str,
-        flags: &[OpenFlags],
-    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
-    fn read_at_async(
+        file_id: u64,
+        offset: i64,
+        origin: FsSeekWhence,
+    ) -> FfiFuture<(FsSeekResult, DriverStatus)>;
+    fn read_at(
         &self,
         file_id: u64,
         offset: u64,
         len: u32,
-    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
-    fn write_at_async(
+    ) -> FfiFuture<(FsReadResult, DriverStatus)>;
+
+    fn write_at(
         &self,
         file_id: u64,
         offset: u64,
         data: &[u8],
-    ) -> Result<Arc<RwLock<Request>>, FileStatus>;
+    ) -> FfiFuture<(FsWriteResult, DriverStatus)>;
+
+    fn flush_handle(&self, file_id: u64) -> FfiFuture<(FsFlushResult, DriverStatus)>;
+
+    fn get_info(&self, file_id: u64) -> FfiFuture<(FsGetInfoResult, DriverStatus)>;
+
+    fn list_dir_path(&self, path: &str) -> FfiFuture<(FsListDirResult, DriverStatus)>;
+
+    fn make_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+
+    fn remove_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+
+    fn rename_path(&self, src: &str, dst: &str) -> FfiFuture<(FsRenameResult, DriverStatus)>;
+
+    fn delete_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
 }
 
 static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);

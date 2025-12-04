@@ -1,49 +1,17 @@
-use crate::drivers::driver_install::{self, BootType, DriverError};
-use crate::executable::program::ModuleHandle;
+use crate::drivers::driver_install::{self, DriverError};
 use crate::registry::reg::{get_value, list_keys};
-use crate::registry::{self as reg, Data, RegError};
+use crate::registry::{self as reg};
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use kernel_types::device::DriverPackage;
+use kernel_types::pnp::BootType;
+use kernel_types::status::{Data, RegError};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MatchClass {
     Exact,
     Compatible,
     Class,
-}
-
-#[derive(Debug, Clone)]
-pub struct DriverPackage {
-    pub name: String,
-    pub image_path: String,
-    pub toml_path: String,
-    pub start: BootType,
-    pub hwids: Vec<String>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum DriverState {
-    Loaded,
-    Continue,
-    Started,
-    Stopped,
-    Failed,
-}
-
-#[derive(Debug)]
-pub struct DriverRuntime {
-    pub pkg: Arc<DriverPackage>,
-    pub module: ModuleHandle,
-    pub state: AtomicU8,
-    pub refcnt: AtomicU32,
-}
-impl DriverRuntime {
-    pub fn set_state(&self, s: DriverState) {
-        self.state.store(s as u8, Ordering::Release);
-    }
-    pub fn get_state(&self) -> DriverState {
-        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire)) }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -125,10 +93,10 @@ pub fn escape_key(s: &str) -> String {
     out
 }
 
-pub fn build_hw_index() -> Result<HwIndex, RegError> {
+pub async fn build_hw_index() -> Result<HwIndex, RegError> {
     let mut idx = HwIndex::new();
     let services_root = "SYSTEM/CurrentControlSet/Services";
-    let service_keys = list_keys(services_root)?;
+    let service_keys = list_keys(services_root).await?;
     for kpath in service_keys {
         let rel = kpath
             .strip_prefix(&(services_root.to_string() + "/"))
@@ -138,15 +106,15 @@ pub fn build_hw_index() -> Result<HwIndex, RegError> {
         }
         let drv_name = rel.to_string();
 
-        let image = match get_value(&kpath, "ImagePath") {
+        let image = match get_value(&kpath, "ImagePath").await {
             Some(Data::Str(s)) => s,
             _ => continue,
         };
-        let toml_path = match get_value(&kpath, "TomlPath") {
+        let toml_path = match get_value(&kpath, "TomlPath").await {
             Some(Data::Str(s)) => s,
             _ => continue,
         };
-        let start = match get_value(&kpath, "Start") {
+        let start = match get_value(&kpath, "Start").await {
             Some(Data::U32(v)) => match v {
                 0 => BootType::Boot,
                 1 => BootType::System,
@@ -157,7 +125,7 @@ pub fn build_hw_index() -> Result<HwIndex, RegError> {
             _ => BootType::Demand,
         };
 
-        let dt = match driver_install::parse_driver_toml(&toml_path) {
+        let dt = match driver_install::parse_driver_toml(&toml_path).await {
             Ok(d) => d,
             Err(_) => continue,
         };

@@ -1,5 +1,4 @@
 pub(crate) mod aligned_buffer;
-pub mod async_future;
 pub(crate) mod linked_list;
 pub(crate) mod per_core_storage;
 pub mod range_tracker;

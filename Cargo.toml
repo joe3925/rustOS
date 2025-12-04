@@ -15,7 +15,6 @@ members = [
     "drivers/mountmgr",
     "drivers/fat32",
     "drivers/i8042",
-    "kernel_api",
 ]
 exclude = ["rustos-api"]
 resolver = "2"
