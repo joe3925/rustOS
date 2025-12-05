@@ -1,4 +1,3 @@
-// ───────────────────────── updated: object_manager.rs (ID allocation fix) ─────────────────────────
 #![allow(dead_code)]
 
 use alloc::{
@@ -17,7 +16,6 @@ use kernel_types::device::{DeviceObject, ModuleHandle};
 use lazy_static::lazy_static;
 use spin::RwLock;
 
-// ---- external object types we want to host in the OM ----------------------
 use crate::executable::program::{MessageQueue, ProgramHandle};
 use crate::scheduling::scheduler::TaskHandle;
 

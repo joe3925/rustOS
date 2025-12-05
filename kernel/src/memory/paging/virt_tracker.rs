@@ -2,7 +2,7 @@ use crate::{
     memory::paging::{
         constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
         frame_alloc::BootInfoFrameAllocator,
-        paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl, PageMapError},
+        paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl},
         tables::init_mapper,
     },
     structs::range_tracker::{RangeAllocationError, RangeTracker},
@@ -10,6 +10,7 @@ use crate::{
 };
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
+use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 

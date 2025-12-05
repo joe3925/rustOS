@@ -15,7 +15,7 @@ use kernel_types::{fs::OpenFlags, status::Data};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 
-const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
+const REG_PATH: &str = "C:\\system\\registry.bin";
 const CLASS_LIST: &[(&str, &str)] = &[
     ("disk", "Disk devices / block storage"),
     ("volume", "Mountable partitions"),

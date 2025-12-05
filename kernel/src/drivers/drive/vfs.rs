@@ -215,7 +215,6 @@ impl Vfs {
 
         const VOL_PREFIX: &str = "\\GLOBAL\\Volumes\\";
         if user_path.starts_with(VOL_PREFIX) {
-            // \GLOBAL\Volumes\<mount>\<tail...>
             let mut parts = user_path.splitn(4, '\\');
             let _ = parts.next(); // ""
             let g = parts.next().unwrap_or("");
@@ -285,8 +284,6 @@ impl Vfs {
         let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };
         Ok(*out)
     }
-
-    // ---------- SYNC API (unchanged behavior) ----------
 
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(&p.path) {

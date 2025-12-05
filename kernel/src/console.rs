@@ -81,7 +81,7 @@ impl Screen {
             None
         }
     }
-    ///Draws to a given pixel, leave rgb blank for grayscale only set a
+    /// Draws to a given pixel
     pub fn set(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8, a: u8) {
         let pixel_index = (y * self.width + x) * self.bytes_per_pixel;
         if (!self.is_greyscale) {

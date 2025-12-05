@@ -11,9 +11,9 @@ pub struct Ports {
     pub lba_mid: Port<u8>,
     pub lba_hi: Port<u8>,
     pub drive_head: Port<u8>,
-    pub command: Port<u8>,             // status shares this port
-    pub control: Port<u8>,             // alt-status shares this port
-    pub alternative_command: Port<u8>, // same as control on ATA
+    pub command: Port<u8>,
+    pub control: Port<u8>,
+    pub alternative_command: Port<u8>,
 }
 
 impl Ports {

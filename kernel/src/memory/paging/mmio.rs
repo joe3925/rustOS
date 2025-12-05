@@ -1,5 +1,6 @@
 use core::sync::atomic::AtomicU64;
 
+use kernel_types::status::PageMapError;
 use x86_64::{
     structures::paging::{
         mapper::MapToError, Mapper as _, Page, PageTableFlags, PhysFrame, Size4KiB,
@@ -14,8 +15,6 @@ use crate::{
     },
     util::boot_info,
 };
-
-use super::paging::PageMapError;
 
 static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
 pub extern "win64" fn map_mmio_region(

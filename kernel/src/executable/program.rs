@@ -6,7 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::device::ModuleHandle;
+use kernel_types::{device::ModuleHandle, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
@@ -19,7 +19,7 @@ use x86_64::{
 use crate::{
     executable::pe_loadable::PELoader,
     file_system::path::Path,
-    memory::paging::paging::map_page,
+    memory::paging::paging::{map_page, map_range_with_huge_pages},
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
     scheduling::scheduler::{self, Scheduler, TaskHandle},
     util::{generate_guid, random_number},
@@ -34,8 +34,6 @@ use crate::{
 };
 
 use super::pe_loadable::{self, LoadError};
-
-// ───────────────────────── helpers ─────────────────────────
 
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
@@ -76,8 +74,6 @@ fn guid_to_string(g: &[u8; 16]) -> String {
         g[15]
     )
 }
-
-// ───────────────────────── runtime types ─────────────────────────
 
 #[derive(Debug)]
 pub struct MessageQueue {
@@ -196,17 +192,13 @@ impl Program {
         }
     }
 
-    pub fn virtual_map_alloc(
-        &self,
-        virt_addr: VirtAddr,
-        size: usize,
-    ) -> Result<(), MapToError<Size4KiB>> {
+    pub fn virtual_map_alloc(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
         self.tracker
             .alloc(start.as_u64(), size as u64)
-            .map_err(|_| MapToError::FrameAllocationFailed)?;
+            .map_err(|_| PageMapError::NoMemory())?;
 
         let old_cr3 = Cr3::read();
         unsafe { Cr3::write(self.cr3, old_cr3.1) };
@@ -225,10 +217,13 @@ impl Program {
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;
 
-            for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
-                let page = Page::containing_address(VirtAddr::new(addr));
-                map_page(&mut mapper, page, &mut frame_alloc, flags)?;
-            }
+            map_range_with_huge_pages(
+                &mut mapper,
+                start,
+                end.as_u64() - start.as_u64(),
+                &mut frame_alloc,
+                flags,
+            )?;
             Ok(())
         })();
 
@@ -236,11 +231,7 @@ impl Program {
         res
     }
 
-    pub unsafe fn virtual_map(
-        &self,
-        virt_addr: VirtAddr,
-        size: usize,
-    ) -> Result<(), MapToError<Size4KiB>> {
+    pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
 
@@ -261,10 +252,13 @@ impl Program {
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;
 
-            for addr in (start.as_u64()..end.as_u64()).step_by(0x1000) {
-                let page = Page::containing_address(VirtAddr::new(addr));
-                map_page(&mut mapper, page, &mut frame_alloc, flags)?;
-            }
+            map_range_with_huge_pages(
+                &mut mapper,
+                start,
+                end.as_u64() - start.as_u64(),
+                &mut frame_alloc,
+                flags,
+            )?;
             Ok(())
         })();
 
@@ -285,7 +279,7 @@ impl Program {
             last_handle = Some(handle.clone());
 
             for dll in loader.list_import_dlls() {
-                // Add more dll search locations
+                // TODO: Add more dll search locations
                 let dep_path = alloc::format!(r"C:\BIN\MOD\{}", dll);
                 if !self.has_module(&dll) {
                     queue.push(dep_path);

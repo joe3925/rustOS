@@ -7,10 +7,8 @@ use core::task::{Context, Poll, Waker};
 
 use crate::task_yield;
 
-/// A simple notification signal used to wake the blocking thread.
 #[repr(C)]
 struct ThreadNotify {
-    /// Whether the future has signaled it is ready to be polled again.
     ready: AtomicBool,
 }
 
@@ -30,8 +28,7 @@ impl Wake for ThreadNotify {
 
     fn wake_by_ref(self: &Arc<Self>) {
         // Signal that the future is ready to proceed.
-        // Release ordering ensures any memory writes done by the future
-        // are visible to the thread waking up.
+
         self.ready.store(true, Ordering::Release);
     }
 }
@@ -41,10 +38,6 @@ impl Wake for ThreadNotify {
 /// This function will block the caller until the given future has resolved.
 /// It yields the CPU (via `hlt`) while waiting for interrupts/signals.
 ///
-/// # Safety
-/// This function assumes that interrupts are enabled. If run with interrupts
-/// disabled, `hlt` may hang the CPU indefinitely if the future is waiting
-/// on an I/O interrupt.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut pinned_future = Box::pin(future);
 

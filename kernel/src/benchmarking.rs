@@ -4,15 +4,6 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::allocator::BuddyLocked;
 use crate::println;
-use alloc::string::String;
-use alloc::string::ToString;
-use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
-use kernel_types::fs::OpenFlags;
-use nostd_runtime::block_on;
-use spin::RwLock;
-use x86_64::instructions::interrupts;
-
 use crate::{
     drivers::{
         interrupt_index::wait_millis_idle,
@@ -26,6 +17,15 @@ use crate::{
     },
     util::{boot_info, TOTAL_TIME},
 };
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
+use kernel_types::fs::FsSeekWhence;
+use kernel_types::fs::OpenFlags;
+use nostd_runtime::block_on;
+use spin::RwLock;
+use x86_64::instructions::interrupts;
 // TODO: full benchmarking framework
 // 1. rip sampling
 // 2. lop export conditions (ex. request X is sent from device Y we must capture this log window and export it)
@@ -48,7 +48,7 @@ static LOG_CONFIG: RwLock<LogConfig> = RwLock::new(LogConfig {
     log_dist: true,
     log_mem: true,
     log_window: 1,
-    path: "C:\\SYSTEM\\LOGS",
+    path: "C:\\system\\logs",
 });
 
 pub fn set_log_config(cfg: LogConfig) {
@@ -205,7 +205,7 @@ pub fn run_stats_loop() {
     wait_millis_idle(25000);
     //PNP_MANAGER.print_device_tree();
     loop {
-        wait_millis_idle(60000);
+        //wait_millis_idle(60000);
 
         let core_ms_now = read_all_core_timer_ms();
         let total_ms_now = TOTAL_TIME.wait().elapsed_millis() as u128;
@@ -409,18 +409,14 @@ pub async fn append_to_file(path: &str, data: &[u8]) -> Result<(), ()> {
             .map_err(|_| ())?,
     };
 
-    let mut buf = match file.read().await {
-        Ok(existing) => existing,
-        Err(_) => Vec::new(),
-    };
+    if file.seek(0, FsSeekWhence::End).await.is_err() {
+        return Err(());
+    }
 
-    buf.extend_from_slice(data);
-
-    file.write(&buf).await.map_err(|_| ())?;
+    file.write(data).await.map_err(|_| ())?;
 
     Ok(())
 }
-
 pub fn used_memory() -> usize {
     HEAP_SIZE - ALLOCATOR.free_memory()
 }

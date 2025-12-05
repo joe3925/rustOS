@@ -24,8 +24,8 @@ use kernel_types::{
 };
 
 const C_PREFIX: &str = "C:\\";
-const REG_PATH: &str = "C:\\SYSTEM\\REGISTRY.BIN";
-const DRIVER_ROOT: &str = "C:\\INSTALL\\DRIVERS";
+const REG_PATH: &str = "C:\\system\\registry.bin";
+const DRIVER_ROOT: &str = "C:\\install\\drivers";
 
 fn norm_upcase(p: &str) -> String {
     let s = p.replace('/', "\\");
@@ -118,11 +118,11 @@ impl<'a> BootstrapProvider<'a> {
 
         for d in [
             "C:\\",
-            "C:\\INSTALL",
+            "C:\\install",
             DRIVER_ROOT,
-            "C:\\SYSTEM",
-            "C:\\SYSTEM\\TOML",
-            "C:\\SYSTEM\\MOD",
+            "C:\\system",
+            "C:\\system\\toml",
+            "C:\\system\\mod",
         ] {
             let dk = norm_upcase(d);
             n.entry(dk.clone()).or_insert_with(Node::dir);
@@ -130,7 +130,7 @@ impl<'a> BootstrapProvider<'a> {
 
         let reg_key = norm_upcase(REG_PATH);
         n.insert(reg_key.clone(), Node::file(DataRef::Ram(Vec::new())));
-        n.get_mut(&norm_upcase("C:\\SYSTEM"))
+        n.get_mut(&norm_upcase("C:\\system"))
             .unwrap()
             .children
             .insert("registry.bin".into(), reg_key);
@@ -162,18 +162,18 @@ impl<'a> BootstrapProvider<'a> {
                 .children
                 .insert(dll_name.clone(), dll_src.clone());
 
-            let toml_target = norm_upcase(&alloc::format!("C:\\SYSTEM\\TOML\\{}", toml_name));
-            let dll_target = norm_upcase(&alloc::format!("C:\\SYSTEM\\MOD\\{}", dll_name));
+            let toml_target = norm_upcase(&alloc::format!("C:\\system\\toml\\{}", toml_name));
+            let dll_target = norm_upcase(&alloc::format!("C:\\system\\mod\\{}", dll_name));
 
             n.insert(toml_target.clone(), Node::file(DataRef::Alias(toml_src)));
             n.insert(dll_target.clone(), Node::file(DataRef::Alias(dll_src)));
 
-            n.get_mut(&norm_upcase("C:\\SYSTEM\\TOML"))
+            n.get_mut(&norm_upcase("C:\\system\\toml"))
                 .unwrap()
                 .children
                 .insert(toml_name, toml_target);
 
-            n.get_mut(&norm_upcase("C:\\SYSTEM\\MOD"))
+            n.get_mut(&norm_upcase("C:\\system\\mod"))
                 .unwrap()
                 .children
                 .insert(dll_name, dll_target);

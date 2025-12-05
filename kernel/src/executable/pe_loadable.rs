@@ -19,13 +19,14 @@ use goblin::Object;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::OpenFlags;
 use kernel_types::memory::Module;
+use kernel_types::status::PageMapError;
 use nostd_runtime::block_on;
 use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{PageTable, PhysFrame};
+use x86_64::structures::paging::{PageTable, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::program::{HandleTable, Program, PROGRAM_MANAGER};
@@ -153,7 +154,9 @@ impl PELoader {
                 program
                     .virtual_map(VirtAddr::new(preferred_base), image_size as usize)
                     .map_err(|e| match e {
-                        MapToError::PageAlreadyMapped(_) => LoadError::UnsupportedImageBase,
+                        PageMapError::Page4KiB(MapToError::PageAlreadyMapped(_)) => {
+                            LoadError::UnsupportedImageBase
+                        }
                         _ => LoadError::NoMemory,
                     })?;
             }
@@ -214,10 +217,6 @@ impl PELoader {
         Ok(handle)
     }
     /// Loads the PE into memory and prepares it for execution.
-    ///
-    /// Error: LoadError
-    ///
-    /// Ok: PID of the loaded program
     pub async fn load(&mut self) -> Result<u64, LoadError> {
         let were_enabled = interrupts::are_enabled();
         if were_enabled {
@@ -283,7 +282,9 @@ impl PELoader {
             program.image_base,
             (image_size + 0x1000 + stack_size + heap_size) as usize,
         ) {
-            Err(MapToError::FrameAllocationFailed) => return Err(LoadError::NoMemory),
+            Err(PageMapError::Page4KiB(MapToError::FrameAllocationFailed)) => {
+                return Err(LoadError::NoMemory)
+            }
             Err(_) => (),
             Ok(_) => (),
         }

@@ -167,7 +167,6 @@ extern "win64" fn fs_worker_thread(ctx: usize) {
     }
 }
 
-// Synchronous version of the old fs_op_dispatch body, run on the worker thread.
 fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> DriverStatus {
     let kind = { req.read().kind };
 
@@ -392,20 +391,22 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
                         match tbl.get_mut(&params.fs_file_id) {
                             Some(ctx) => {
                                 if ctx.is_dir {
-                                    Ok(0)
+                                    Ok(0usize)
                                 } else {
                                     let _fs_guard = vdx.fs.lock();
                                     if let Some(ref mut cached) = ctx.file {
                                         let file = &mut cached.file;
-                                        match file.seek(SeekFrom::Start(params.offset as u64)) {
-                                            Err(e) => Err(e),
-                                            Ok(_) => match file.write(&params.data) {
-                                                Ok(n) => match file.flush() {
+                                        let n = params.data.len();
+
+                                        match file.write_all(&params.data) {
+                                            Ok(()) => {
+                                                ctx.pos = ctx.pos.saturating_add(n as u64);
+                                                match file.flush() {
                                                     Ok(()) => Ok(n),
                                                     Err(e) => Err(e),
-                                                },
-                                                Err(e) => Err(e),
-                                            },
+                                                }
+                                            }
+                                            Err(e) => Err(e),
                                         }
                                     } else {
                                         Err(FatError::NotFound)
@@ -418,9 +419,9 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
 
                     let mut r = req.write();
                     match write_res {
-                        Ok(n) => {
+                        Ok(written) => {
                             r.data = box_to_bytes(Box::new(FsWriteResult {
-                                written: n,
+                                written,
                                 error: None,
                             }))
                         }
@@ -436,6 +437,7 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
                             }))
                         }
                     }
+
                     DriverStatus::Success
                 }
 

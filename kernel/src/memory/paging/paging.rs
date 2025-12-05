@@ -1,3 +1,4 @@
+use kernel_types::status::PageMapError;
 use x86_64::{
     structures::paging::{
         mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB,
@@ -11,33 +12,6 @@ use crate::{
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
     util::boot_info,
 };
-
-#[derive(Debug)]
-#[repr(u32)]
-
-pub enum PageMapError {
-    Page4KiB(MapToError<Size4KiB>),
-    Page2MiB(MapToError<Size2MiB>),
-    Page1GiB(MapToError<Size1GiB>),
-    NoMemory(),
-    NoMemoryMap(),
-}
-
-impl From<MapToError<Size4KiB>> for PageMapError {
-    fn from(e: MapToError<Size4KiB>) -> Self {
-        PageMapError::Page4KiB(e)
-    }
-}
-impl From<MapToError<Size2MiB>> for PageMapError {
-    fn from(e: MapToError<Size2MiB>) -> Self {
-        PageMapError::Page2MiB(e)
-    }
-}
-impl From<MapToError<Size1GiB>> for PageMapError {
-    fn from(e: MapToError<Size1GiB>) -> Self {
-        PageMapError::Page1GiB(e)
-    }
-}
 
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)

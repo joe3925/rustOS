@@ -143,13 +143,6 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
     println!("");
     nostd_runtime::spawn_blocking(run_stats_loop);
-    // let task = Task::new_kernel_mode(
-    //     run_stats_loop as usize,
-    //     KERNEL_STACK_SIZE,
-    //     "Log Thread".to_string(),
-    //     0,
-    // );
-    // SCHEDULER.add_task(task);
 }
 #[inline(always)]
 fn halt_loop() -> ! {

@@ -67,7 +67,7 @@ pub struct FilterSpec {
 pub struct DriverToml {
     pub image: String,
     pub start: BootType,
-    pub hwids: Vec<String>,         // function-only; ignored when role==Filter
+    pub hwids: Vec<String>,         // function-only
     pub role: DriverRole,           // default Function
     pub class: Option<String>,      // optional for function drivers
     pub filter: Option<FilterSpec>, // present when role==Filter
@@ -384,15 +384,15 @@ pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
 
     let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}/", driver_name);
 
-    let toml_target_path = alloc::format!("C:\\SYSTEM\\TOML\\{}.toml", driver_name);
-    let img_target_path = alloc::format!("C:\\SYSTEM\\MOD\\{}", driver.image);
+    let toml_target_path = alloc::format!("C:\\system\\toml\\{}.toml", driver_name);
+    let img_target_path = alloc::format!("C:\\system\\mod\\{}", driver.image);
 
     let img_src_dir = toml_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
     let img_src_full = alloc::format!("{}\\{}", img_src_dir, driver.image);
 
-    let _ = File::make_dir("C:\\SYSTEM".to_string()).await;
-    let _ = File::make_dir("C:\\SYSTEM\\TOML".to_string()).await;
-    let _ = File::make_dir("C:\\SYSTEM\\MOD".to_string()).await;
+    let _ = File::make_dir("C:\\system".to_string()).await;
+    let _ = File::make_dir("C:\\system\\toml".to_string()).await;
+    let _ = File::make_dir("C:\\system\\mod".to_string()).await;
 
     let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     img_src.move_no_copy(&img_target_path).await?;

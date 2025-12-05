@@ -272,8 +272,8 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     rebind_and_persist_after_provider_switch().await?;
 
-    let vfs_mod = "C:\\SYSTEM\\MOD";
-    let vfs_toml = "C:\\SYSTEM\\TOML";
+    let vfs_mod = "C:\\system\\mod";
+    let vfs_toml = "C:\\system\\toml";
     ensure_dir(vfs_mod).await;
     ensure_dir(vfs_toml).await;
     if is_first_boot().await {

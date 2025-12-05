@@ -43,14 +43,7 @@ pub extern "win64" fn poll_trampoline<T: 'static>(ctx: usize) {
 
     let mut future_guard = task.future.lock();
     match future_guard.as_mut().poll(&mut context) {
-        Poll::Ready(()) => {
-            // Task finished. At this point:
-            // - `task` is dropped at function end (decrement refcount)
-            // - Wakers you'll drop will decrement their refs.
-            // When no wakers remain, the final `Arc` will be dropped and free the Task.
-        }
-        Poll::Pending => {
-            // Do nothing. Ownership is now *only* via wakers and the `ctx` raw pointer.
-        }
+        Poll::Ready(()) => {}
+        Poll::Pending => {}
     }
 }

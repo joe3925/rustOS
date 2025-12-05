@@ -142,7 +142,6 @@ impl Task {
                 .deallocate(VirtAddr::new(self.stack_start));
         }
     }
-    /// Prints the task's RIP, RSP, and ID in one line.
     pub fn print(&self) {
         println!(
             "Task ID: {}, RIP: {:X}, RSP: {:X}",

@@ -519,8 +519,6 @@ unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
     Box::from_raw(p)
 }
 
-// Async boot device checks: just await each FsOpen instead of using completion routines.
-
 async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
         flags: OpenFlags::Open,
@@ -568,9 +566,9 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
     let inst = inst_path.to_string();
 
     spawn(async move {
-        let mod_ok = fs_check_open(&link, "SYSTEM/MOD").await;
-        let inf_ok = fs_check_open(&link, "SYSTEM/TOML").await;
-        let reg_ok = fs_check_open(&link, "SYSTEM/REGISTRY.BIN").await;
+        let mod_ok = fs_check_open(&link, "system/mod").await;
+        let inf_ok = fs_check_open(&link, "system/toml").await;
+        let reg_ok = fs_check_open(&link, "system/registry.bin").await;
 
         if mod_ok && inf_ok && reg_ok {
             let _ = attempt_boot_bind(&inst, &link).await;

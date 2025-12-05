@@ -1,9 +1,10 @@
 use alloc::collections::linked_list::LinkedList;
+use kernel_types::status::PageMapError;
 use spin::Mutex;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
 use crate::memory::paging::{
-    paging::{align_up_4k, PageMapError},
+    paging::align_up_4k,
     virt_tracker::{allocate_auto_kernel_range_mapped, unmap_range},
 };
 
