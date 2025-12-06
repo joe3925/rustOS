@@ -240,7 +240,7 @@ fn cache_clear(dx: &DiskExt) {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, disk_device_add) };
+    driver_set_evt_device_add(driver, disk_device_add);
     DriverStatus::Success
 }
 
@@ -423,7 +423,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
 
             let ch = Arc::new(RwLock::new(ch));
 
-            unsafe { pnp_forward_request_to_next_lower(&dev, ch.clone()) }?.await;
+            pnp_forward_request_to_next_lower(&dev, ch.clone())?.await;
 
             let blob = {
                 let r = ch.read();
@@ -445,7 +445,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
             let child = Arc::new(RwLock::new(req_child));
 
-            unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await?;
+            pnp_forward_request_to_next_lower(&dev, child.clone())?.await?;
 
             let st = child.read().status;
             if st == DriverStatus::Success {

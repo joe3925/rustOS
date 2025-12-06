@@ -130,7 +130,7 @@ impl Vfs {
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        unsafe { pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()) }?.await;
+        pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone())?.await;
 
         let r = req.read();
         if r.status != DriverStatus::Success {

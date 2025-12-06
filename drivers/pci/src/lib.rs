@@ -44,7 +44,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };
+    driver_set_evt_device_add(driver, bus_driver_device_add);
     DriverStatus::Success
 }
 
@@ -84,7 +84,7 @@ pub async fn pci_bus_pnp_start(
     );
 
     let child = Arc::new(RwLock::new(query));
-    let st = unsafe { pnp_forward_request_to_next_lower(&device, child.clone()) }?.await;
+    let st = pnp_forward_request_to_next_lower(&device, child.clone())?.await;
 
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
@@ -227,16 +227,14 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     let name = name_for(p);
     let instance_path = instance_path_for(p);
 
-    let (_child_dn, _child_pdo) = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(
-            parent,
-            name,
-            instance_path,
-            ids,
-            Some(class_tag),
-            child_init,
-        )
-    };
+    let (_child_dn, _child_pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        parent,
+        name,
+        instance_path,
+        ids,
+        Some(class_tag),
+        child_init,
+    );
 }
 
 #[request_handler]

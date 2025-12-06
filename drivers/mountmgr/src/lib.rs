@@ -92,7 +92,7 @@ fn panic(info: &PanicInfo) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, volclass_device_add) };
+    driver_set_evt_device_add(driver, volclass_device_add);
 
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
@@ -102,13 +102,11 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     );
 
     let init = DeviceInit::new(io_vtable, None);
-    let _ctrl = unsafe {
-        pnp_create_control_device_and_link(
-            "\\Device\\volclass.ctrl".to_string(),
-            init,
-            GLOBAL_CTRL_LINK.to_string(),
-        )
-    };
+    let _ctrl = pnp_create_control_device_and_link(
+        "\\Device\\volclass.ctrl".to_string(),
+        init,
+        GLOBAL_CTRL_LINK.to_string(),
+    );
 
     DriverStatus::Success
 }
@@ -188,11 +186,11 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             };
 
             if !target.is_empty() {
-                let _ = unsafe { pnp_remove_symlink(target) };
+                let _ = pnp_remove_symlink(target);
             } else {
                 let dx = ext::<VolFdoExt>(&dev);
                 if let Some(pl) = dx.public_link.get() {
-                    let _ = unsafe { pnp_remove_symlink(pl.clone()) };
+                    let _ = pnp_remove_symlink(pl.clone());
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
@@ -335,7 +333,7 @@ async fn try_bind_filesystems_for_parent_fdo(
     let vol_target = Arc::new(IoTarget {
         target_device: parent_fdo.clone(),
     });
-    let tags = unsafe { FS_REGISTERED.read().clone() };
+    let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
         let id_box = Box::new(FsIdentify {
@@ -354,14 +352,11 @@ async fn try_bind_filesystems_for_parent_fdo(
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        unsafe {
-            let err =
-                pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
-                    .resolve()
-                    .await;
-            if err != DriverStatus::Success {
-                return false;
-            }
+        let err = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
+            .resolve()
+            .await;
+        if err != DriverStatus::Success {
+            return false;
         }
 
         let mut w = req.write();
@@ -443,7 +438,7 @@ fn string_from_req(req: &Request) -> Option<String> {
 }
 
 fn list_fs_blob() -> Box<[u8]> {
-    let s = unsafe {
+    let s = {
         let rd = FS_REGISTRY.read();
         let mut out = String::new();
         for (i, r) in rd.iter().enumerate() {
@@ -534,19 +529,9 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
             .resolve()
             .await
     };
-    if err != DriverStatus::Success {
-        println!("Boot check {}: send error {:#?}", path, err);
-        return false;
-    }
 
     let mut r = req.write();
     if r.status != DriverStatus::Success || r.data.len() != size_of::<FsOpenResult>() {
-        println!(
-            "Boot check {}: status {:#?}, len {}",
-            path,
-            r.status,
-            r.data.len()
-        );
         return false;
     }
 
@@ -556,7 +541,6 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         println!("Boot check {}: OK", path);
         true
     } else {
-        println!("Boot check {}: FsOpenResult error {:#?}", path, res.error);
         false
     }
 }
@@ -572,11 +556,6 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
 
         if mod_ok && inf_ok && reg_ok {
             let _ = attempt_boot_bind(&inst, &link).await;
-        } else {
-            println!(
-                "Boot probe '{}' failed: mod_ok={}, inf_ok={}, reg_ok={}",
-                link, mod_ok, inf_ok, reg_ok
-            );
         }
     });
 }

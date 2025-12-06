@@ -70,7 +70,7 @@ pub struct ChildExt {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, ide_device_add) };
+    driver_set_evt_device_add(driver, ide_device_add);
     DriverStatus::Success
 }
 
@@ -105,7 +105,7 @@ async fn ide_pnp_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> Dr
         Box::new([]),
     );
     let child = Arc::new(RwLock::new(child));
-    let st = unsafe { pnp_forward_request_to_next_lower(&dev, child.clone()) }?.await;
+    let st = pnp_forward_request_to_next_lower(&dev, child.clone())?.await;
     if st != DriverStatus::NoSuchDevice {
         let qst = { child.read().status };
         if qst != DriverStatus::Success {
@@ -268,11 +268,9 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     let short_name = alloc::format!("IDE_Disk_{}_{}", channel, drive);
     let instance = alloc::format!("IDE\\DRV_{:02}", drive);
 
-    let (_dn, _pdo) = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(
-            &parent_dn, short_name, instance, ids, class, child_init,
-        )
-    };
+    let (_dn, _pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        &parent_dn, short_name, instance, ids, class, child_init,
+    );
 }
 
 #[request_handler]
@@ -796,7 +794,7 @@ fn wait_not_busy(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        unsafe { wait_ms(1) };
+        wait_ms(1);
     }
     false
 }
@@ -810,7 +808,7 @@ fn wait_ready(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        unsafe { wait_ms(1) };
+        wait_ms(1);
     }
     false
 }
@@ -827,7 +825,7 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        unsafe { wait_ms(1) };
+        wait_ms(1);
     }
     false
 }

@@ -156,9 +156,8 @@ extern "win64" fn fs_worker_thread(ctx: usize) {
                     let mut r = req.write();
                     r.status = status;
                 }
-                unsafe {
-                    pnp_complete_request(&req);
-                }
+
+                pnp_complete_request(&req);
             }
             None => unsafe {
                 sleep_self_and_yield();

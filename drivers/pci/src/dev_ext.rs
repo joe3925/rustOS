@@ -104,7 +104,7 @@ fn ecam_phys_addr(seg: &McfgSegment, bus: u8, dev: u8, func: u8, offset: u16) ->
 }
 
 #[inline]
-unsafe fn map_cfg_page(
+fn map_cfg_page(
     seg: &McfgSegment,
     bus: u8,
     dev: u8,
@@ -112,7 +112,7 @@ unsafe fn map_cfg_page(
 ) -> Result<(VirtAddr, u64), PageMapError> {
     let pa = PhysAddr::new(ecam_phys_addr(seg, bus, dev, func, 0));
     let sz = 4096u64;
-    unsafe { map_mmio_region(pa, sz).map(|va| (va, sz)) }
+    map_mmio_region(pa, sz).map(|va| (va, sz))
 }
 
 #[inline]
@@ -135,7 +135,7 @@ unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
 }
 
 pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
-    let (va, sz) = unsafe { map_cfg_page(seg, bus, dev, func).ok()? };
+    let (va, sz) = map_cfg_page(seg, bus, dev, func).ok()?;
 
     let vendor = unsafe { cfg_read32(va, 0x00) } & 0xFFFF;
     if vendor == 0xFFFF {
@@ -451,7 +451,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
     let req = Request::new_pnp(pnp, Vec::new().into_boxed_slice());
 
     let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
-    let down = unsafe { pnp_forward_request_to_next_lower(device, req_arc.clone()) };
+    let down = pnp_forward_request_to_next_lower(device, req_arc.clone());
 
     let st = { req_arc.read().status };
     if st != DriverStatus::Success {

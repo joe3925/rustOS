@@ -23,7 +23,7 @@ fn panic(_info: &PanicInfo) -> ! {
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     println!("BaseBusDriver: DriverEntry called.\n");
-    unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };
+    driver_set_evt_device_add(driver, bus_driver_device_add);
     DriverStatus::Success
 }
 

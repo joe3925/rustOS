@@ -101,7 +101,7 @@ fn guid_to_string(g: &[u8; 16]) -> String {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, vol_device_add) };
+    driver_set_evt_device_add(driver, vol_device_add);
     DriverStatus::Success
 }
 
@@ -138,7 +138,7 @@ pub async fn vol_prepare_hardware(
     );
 
     let req_lock = Arc::new(RwLock::new(req));
-    let st = unsafe { pnp_forward_request_to_next_lower(&dev, req_lock.clone())? }.await;
+    let st = pnp_forward_request_to_next_lower(&dev, req_lock.clone())?.await;
     if st == DriverStatus::NoSuchDevice {
         return DriverStatus::Success;
     }
@@ -234,18 +234,16 @@ pub async fn vol_enumerate_devices(
     pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
     let mut init = DeviceInit::new(io_table, Some(pnp_vtable));
     init.set_dev_ext_default::<VolPdoExt>();
-    let (_dn, pdo) = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(
-            &parent_dn,
-            name,
-            inst,
-            ids,
-            Some("volume".into()),
-            init,
-        )
-    };
+    let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        &parent_dn,
+        name,
+        inst,
+        ids,
+        Some("volume".into()),
+        init,
+    );
 
-    if let Some(tgt) = unsafe { pnp_get_device_target(&parent_dn.instance_path) } {
+    if let Some(tgt) = pnp_get_device_target(&parent_dn.instance_path) {
         ext::<VolPdoExt>(&pdo).backing.call_once(|| Arc::new(tgt));
         ext::<VolPdoExt>(&pdo)
             .part
@@ -253,29 +251,6 @@ pub async fn vol_enumerate_devices(
     }
     DriverStatus::Continue
 }
-#[repr(C)]
-struct BridgeCtx {
-    parent: Arc<RwLock<Request>>,
-}
-
-extern "win64" fn bridge_complete(child: &mut Request, ctx: usize) -> DriverStatus {
-    let boxed = unsafe { Box::from_raw(ctx as *mut BridgeCtx) };
-    let parent = boxed.parent;
-    {
-        let mut g = parent.write();
-        g.status = child.status;
-        if g.status == DriverStatus::Success {
-            let n = core::cmp::min(g.data.len(), child.data.len());
-            g.data[..n].copy_from_slice(&child.data[..n]);
-        }
-    }
-    unsafe { pnp_complete_request(&parent) };
-    return DriverStatus::Success;
-}
-static READ_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static WRITE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_READ: AtomicUsize = AtomicUsize::new(0);
-static TOTAL_WRITE: AtomicUsize = AtomicUsize::new(0);
 #[request_handler]
 pub async fn vol_pdo_read(
     dev: Arc<DeviceObject>,
@@ -289,16 +264,6 @@ pub async fn vol_pdo_read(
             _ => return DriverStatus::InvalidParameter,
         }
     };
-    let total_read_kib = TOTAL_READ.fetch_add(len, Ordering::AcqRel) / 1024;
-    let total_write_kib = TOTAL_WRITE.load(Ordering::Acquire) / 1024;
-
-    // println!(
-    //     "read #{}, total read: {} KiB, write #{}, total write: {} KiB",
-    //     READ_COUNTER.fetch_add(1, Ordering::AcqRel),
-    //     total_read_kib,
-    //     WRITE_COUNTER.load(Ordering::Acquire),
-    //     total_write_kib,
-    // );
 
     if len == 0 {
         return DriverStatus::Success;
@@ -322,7 +287,7 @@ pub async fn vol_pdo_read(
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
-    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+    pnp_send_request(&*tgt, child.clone())?.await;
 
     let (st, data) = {
         let mut g = child.write();
@@ -352,8 +317,6 @@ pub async fn vol_pdo_write(
             _ => return DriverStatus::InvalidParameter,
         }
     };
-    WRITE_COUNTER.fetch_add(1, Ordering::AcqRel);
-    TOTAL_WRITE.fetch_add(len, Ordering::AcqRel);
     if len == 0 {
         return DriverStatus::Success;
     }
@@ -376,7 +339,7 @@ pub async fn vol_pdo_write(
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
-    unsafe { pnp_send_request(&*tgt, child.clone())?.await };
+    pnp_send_request(&*tgt, child.clone())?.await;
 
     let st = {
         let g = child.read();

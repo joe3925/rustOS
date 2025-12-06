@@ -41,7 +41,7 @@ fn panic(info: &PanicInfo) -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, bus_driver_device_add) };
+    driver_set_evt_device_add(driver, bus_driver_device_add);
     DriverStatus::Success
 }
 
@@ -64,7 +64,7 @@ pub async fn bus_driver_prepare_hardware(
     device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    let acpi_tables = unsafe { get_acpi_tables() };
+    let acpi_tables = get_acpi_tables();
     let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
 
     if let Ok(dsdt) = acpi_tables.dsdt() {
@@ -95,7 +95,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let need = len + offset;
     let size_rounded = (need + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
-    let va = match unsafe { map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) } {
+    let va = match map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) {
         Ok(va) => va,
         Err(e) => {
             kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
@@ -111,14 +111,12 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
-    let parent_dev_node = unsafe {
-        (*(Arc::as_ptr(&device) as *const DeviceObject))
-            .dev_node
-            .get()
-            .unwrap()
-            .upgrade()
-            .expect("ACPI PDO has no DevNode")
-    };
+    let parent_dev_node = device
+        .dev_node
+        .get()
+        .unwrap()
+        .upgrade()
+        .expect("ACPI PDO has no DevNode");
     let devices_to_report: Vec<AmlName> = {
         let mut v = Vec::new();
         let _ = dev_ext
@@ -162,7 +160,6 @@ fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let name = "\\Device\\ACPI_I8042".to_string();
     let instance = "ACPI\\I8042\\0".to_string();
 
-    let _ = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(parent, name, instance, ids, None, child_init)
-    };
+    let _ =
+        pnp_create_child_devnode_and_pdo_with_init(parent, name, instance, ids, None, child_init);
 }

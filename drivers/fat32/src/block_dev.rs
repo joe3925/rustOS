@@ -84,18 +84,27 @@ impl BlockDev {
         let end_lba = self.lba_of(end_byte - 1) + 1;
         let n_sectors = (end_lba - start_lba) as usize;
 
-        let pos = self.pos;
+        let head_off = self.in_sector_off(self.pos);
+        let tail_bytes = (head_off + to_read) % bps;
 
-        let mut tmp = Vec::with_capacity(n_sectors * bps);
-        unsafe {
-            tmp.set_len(n_sectors * bps);
+        if head_off == 0 && tail_bytes == 0 {
+            // Full-sector aligned read: read directly into dst (no temp buffer).
+            let sectors_exact = to_read / bps;
+            let buf = &mut dst[..to_read];
+            read_sectors_async(&self.volume, start_lba, sectors_exact, bps, buf)
+                .await
+                .map_err(BlkError::from)?;
+        } else {
+            // Unaligned: need a sector-sized buffer covering the entire span.
+            let mut tmp = vec![0u8; n_sectors * bps];
+            read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
+                .await
+                .map_err(BlkError::from)?;
+
+            let in_off = self.in_sector_off(self.pos);
+            dst[..to_read].copy_from_slice(&tmp[in_off..in_off + to_read]);
         }
-        read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
-            .await
-            .map_err(BlkError::from)?;
 
-        let in_off = self.in_sector_off(self.pos);
-        dst[..to_read].copy_from_slice(&tmp[in_off..in_off + to_read]);
         self.pos += to_read as u64;
         Ok(to_read)
     }
@@ -113,9 +122,7 @@ impl BlockDev {
         let n_sectors = (end_lba - start_lba) as usize;
 
         let head_off = self.in_sector_off(self.pos);
-        let tail_bytes = ((self.pos as usize + to_write) % bps) as usize;
-
-        let pos = self.pos;
+        let tail_bytes = (head_off + to_write) % bps;
 
         if head_off == 0 && tail_bytes == 0 {
             let sectors_exact = to_write / bps;
@@ -124,14 +131,13 @@ impl BlockDev {
                 .await
                 .map_err(BlkError::from)?;
         } else {
-            let mut buf = Vec::with_capacity(n_sectors * bps);
-            unsafe {
-                buf.set_len(n_sectors * bps);
-            }
+            let mut buf = vec![0u8; n_sectors * bps];
             read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut buf[..])
                 .await
                 .map_err(BlkError::from)?;
+
             buf[head_off..head_off + to_write].copy_from_slice(&src[..to_write]);
+
             write_sectors_async(&self.volume, start_lba, n_sectors, bps, &buf[..])
                 .await
                 .map_err(BlkError::from)?;
@@ -212,7 +218,7 @@ pub async fn read_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(target.as_ref(), req.clone()) }?.await;
+    pnp_send_request(target.as_ref(), req.clone())?.await;
     let r = req.read();
     if r.status != DriverStatus::Success {
         println!(
@@ -258,7 +264,7 @@ pub async fn write_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    unsafe { pnp_send_request(&**target, req.clone()) }?.await;
+    pnp_send_request(&**target, req.clone())?.await;
 
     let status = req.read().status;
     if status == DriverStatus::Success {

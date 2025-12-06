@@ -247,7 +247,7 @@ pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) ->
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    unsafe { pnp_forward_request_to_next_lower(&dev, parent.clone()) }?.await;
+    pnp_forward_request_to_next_lower(&dev, parent.clone())?.await;
 
     let (st, data) = {
         let g = parent.read();
@@ -273,7 +273,7 @@ async fn read_from_lower_async(
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    unsafe { pnp_forward_request_to_next_lower(dev, child.clone()) }?.await;
+    pnp_forward_request_to_next_lower(dev, child.clone())?.await;
     let g = child.read();
     if g.status == DriverStatus::Success {
         Ok(g.data.clone())
@@ -414,16 +414,14 @@ pub async fn partmgr_pnp_query_devrels(
             compatible: vec!["STOR\\Partition".into()],
         };
 
-        let (_dn_child, pdo) = unsafe {
-            pnp_create_child_devnode_and_pdo_with_init(
-                &parent_dn,
-                name,
-                inst,
-                ids,
-                Some("DiskPartition".into()),
-                child_init,
-            )
-        };
+        let (_dn_child, pdo) = pnp_create_child_devnode_and_pdo_with_init(
+            &parent_dn,
+            name,
+            inst,
+            ids,
+            Some("DiskPartition".into()),
+            child_init,
+        );
 
         let pext = ext::<PartDevExt>(&pdo);
         pext.start_lba.call_once(|| e.first_lba);

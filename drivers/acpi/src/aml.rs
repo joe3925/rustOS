@@ -55,12 +55,11 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
     let off = paddr & (PAGE_SIZE - 1);
     let base = paddr - off;
     let size = round_up(off + bytes, PAGE_SIZE);
-    let va = unsafe {
-        map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
-            kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
-            core::intrinsics::abort();
-        })
-    };
+    let va = map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
+        kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
+        core::intrinsics::abort();
+    });
+
     (va, off, size)
 }
 
@@ -380,7 +379,7 @@ pub fn create_pnp_bus_from_acpi(
     let bbn = read_int_method(&mut ctx, &dev_name, "_BBN").unwrap_or(0) as u8;
     let (sb, eb) = bus_range_from_crs(&mut ctx, &dev_name).unwrap_or((bbn, 0xFF));
 
-    let tables = unsafe { get_acpi_tables() };
+    let tables = get_acpi_tables();
     let mut ecam = alloc::vec::Vec::new();
     if let Ok(map) = tables.find_table::<Mcfg>() {
         let raw = unsafe {
@@ -405,16 +404,15 @@ pub fn create_pnp_bus_from_acpi(
     ext.ecam = ecam;
     init.set_dev_ext_from(ext);
 
-    let (_dn, mut pdo) = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(
-            parent_dev_node,
-            short_name,
-            instance_path,
-            device_ids,
-            None,
-            init,
-        )
-    };
+    let (_dn, mut pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        parent_dev_node,
+        short_name,
+        instance_path,
+        device_ids,
+        None,
+        init,
+    );
+
     drop(ctx);
     true
 }

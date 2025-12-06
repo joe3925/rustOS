@@ -61,7 +61,7 @@ impl GDTTracker {
         let privilege_stack =
             allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc privilege stack ");
 
-        let double_fault_stack = unsafe {
+        let double_fault_stack = {
             let stack_end =
                 VirtAddr::new(DOUBLE_FAULT_STACK.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64);
             let stack_start = stack_end - KERNEL_STACK_SIZE;

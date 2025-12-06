@@ -72,7 +72,7 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
-        test_full_heap();
+        //test_full_heap();
 
         init_kernel_cr3();
 
@@ -105,6 +105,7 @@ pub unsafe fn init() {
     }
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
     TOTAL_TIME.call_once(Stopwatch::start);
+
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
     SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
     x86_64::instructions::interrupts::enable();

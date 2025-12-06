@@ -48,7 +48,7 @@ pub struct Ps2ChildExt {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, ps2_device_add) };
+    driver_set_evt_device_add(driver, ps2_device_add);
     DriverStatus::Success
 }
 

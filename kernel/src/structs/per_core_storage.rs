@@ -1,5 +1,4 @@
 use alloc::vec::Vec;
-use hashbrown::HashMap;
 use spin::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 pub struct PCS<T> {
@@ -8,7 +7,8 @@ pub struct PCS<T> {
 
 struct PCSInner<T> {
     items: Vec<T>,
-    logical_id_map: HashMap<usize, usize>,
+    // logical_id -> Some(index into items) or None if not present
+    logical_id_map: Vec<Option<usize>>,
 }
 
 pub struct PCSGuard<'a, T> {
@@ -79,14 +79,17 @@ impl<T> PCS<T> {
         Self {
             data: RwLock::new(PCSInner {
                 items: Vec::new(),
-                logical_id_map: HashMap::new(),
+                logical_id_map: Vec::new(),
             }),
         }
     }
 
     pub fn get(&self, logical_id: usize) -> Option<PCSGuard<'_, T>> {
         let lock = self.data.read();
-        let index = lock.logical_id_map.get(&logical_id).copied()?;
+        if logical_id >= lock.logical_id_map.len() {
+            return None;
+        }
+        let index = lock.logical_id_map[logical_id]?; // None => no entry
         let ptr = &lock.items[index] as *const T;
         Some(PCSGuard {
             _lock: lock,
@@ -96,7 +99,10 @@ impl<T> PCS<T> {
 
     pub fn get_mut(&self, logical_id: usize) -> Option<PCSWriteGuard<'_, T>> {
         let mut lock = self.data.write();
-        let index = lock.logical_id_map.get(&logical_id).copied()?;
+        if logical_id >= lock.logical_id_map.len() {
+            return None;
+        }
+        let index = lock.logical_id_map[logical_id]?;
         let ptr = &mut lock.items[index] as *mut T;
         Some(PCSWriteGuard {
             _lock: lock,
@@ -106,18 +112,24 @@ impl<T> PCS<T> {
 
     pub fn set(&self, logical_id: usize, value: T) -> PCSWriteGuard<'_, T> {
         let mut lock = self.data.write();
-        let index = match lock.logical_id_map.get(&logical_id) {
-            Some(&idx) => {
+
+        if logical_id >= lock.logical_id_map.len() {
+            lock.logical_id_map.resize_with(logical_id + 1, || None);
+        }
+
+        let index = match lock.logical_id_map[logical_id] {
+            Some(idx) => {
                 lock.items[idx] = value;
                 idx
             }
             None => {
                 let idx = lock.items.len();
                 lock.items.push(value);
-                lock.logical_id_map.insert(logical_id, idx);
+                lock.logical_id_map[logical_id] = Some(idx);
                 idx
             }
         };
+
         let ptr = &mut lock.items[index] as *mut T;
         PCSWriteGuard {
             _lock: lock,

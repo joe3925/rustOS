@@ -51,7 +51,7 @@ const PIT_MODE_PORT: u16 = 0x61;
 
 const TRAMPOLINE_BASE: u64 = 0x0000_8000;
 const TRAMPOLINE_STEP: u64 = 0x1000;
-const AP_STACK_SIZE: usize = 1 * 1024 * 1024;
+const AP_STACK_SIZE: usize = (2 * 1024 * 1024) - 0x1000;
 
 const PAGEMAP_OFF: usize = 0x08;
 const GDTR_LIMIT_OFF: usize = 0x10;

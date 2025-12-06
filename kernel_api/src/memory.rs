@@ -22,7 +22,7 @@ pub fn map_mmio_region(base: PhysAddr, size: u64) -> Result<VirtAddr, PageMapErr
     unsafe { kernel_sys::map_mmio_region(base, size) }
 }
 
-pub fn unmap_range(addr: VirtAddr, size: u64) {
+pub unsafe fn unmap_range(addr: VirtAddr, size: u64) {
     unsafe {
         kernel_sys::unmap_range(addr, size);
     }

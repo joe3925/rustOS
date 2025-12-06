@@ -94,7 +94,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             );
             let q = Arc::new(RwLock::new(q));
 
-            unsafe { pnp_send_request(&*id.volume_fdo, q.clone()) }?.await;
+            pnp_send_request(&*id.volume_fdo, q.clone())?.await;
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
@@ -150,8 +150,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     init.set_dev_ext_from(ext);
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
-                    let vol_ctrl =
-                        unsafe { pnp_create_control_device_with_init(vol_name.clone(), init) };
+                    let vol_ctrl = pnp_create_control_device_with_init(vol_name.clone(), init);
 
                     // Start per-volume worker thread that will run FATFS code
                     start_fs_worker_for_volume(vol_ctrl.clone());
@@ -181,7 +180,7 @@ pub extern "win64" fn fat_start(
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
-    unsafe { driver_set_evt_device_add(driver, fs_device_add) };
+    driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
@@ -192,8 +191,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();
-    let _ctrl =
-        unsafe { pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone()) };
+    let _ctrl = pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone());
 
     let reg = Arc::new(RwLock::new(
         Request::new(
@@ -202,13 +200,12 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    unsafe {
-        pnp_ioctl_via_symlink(
-            GLOBAL_CTRL_LINK.to_string(),
-            IOCTL_MOUNTMGR_REGISTER_FS,
-            reg.clone(),
-        )?;
-    }
+
+    pnp_ioctl_via_symlink(
+        GLOBAL_CTRL_LINK.to_string(),
+        IOCTL_MOUNTMGR_REGISTER_FS,
+        reg.clone(),
+    )?;
 
     DriverStatus::Success
 }
