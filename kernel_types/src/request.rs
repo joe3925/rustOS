@@ -151,7 +151,7 @@ impl Future for RequestFuture {
         }
         if req.waker_context.is_some() || req.waker_func.is_some() {
             panic!(
-                "In flight request can not be polled. Handlers should never poll or forward there parent request, consider creating a child request"
+                "In flight request can not be polled. Handlers should never poll there parent request, consider creating a child request"
             )
         }
         req.waker_func = Some(waker_trampoline);
