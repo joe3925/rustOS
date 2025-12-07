@@ -1,7 +1,7 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::run_stats_loop;
+use crate::benchmarking::BenchWindowConfig;
 use crate::boot_packages;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
@@ -65,6 +65,19 @@ pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
+static GLOBAL_WINDOW: BenchWindowConfig = BenchWindowConfig {
+    name: "global",
+    folder: "C:/system/logs",
+    log_samples: true,
+    log_spans: true,
+    log_scheduler: true,
+    log_mem_on_persist: true,
+    end_on_drop: true,
+    timeout_ms: None,
+    auto_persist_secs: Some(60),
+    sample_reserve: 256,
+    span_reserve: 256,
+};
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -141,9 +154,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
     });
-
     println!("");
-    nostd_runtime::spawn_blocking(run_stats_loop);
 }
 #[inline(always)]
 fn halt_loop() -> ! {
