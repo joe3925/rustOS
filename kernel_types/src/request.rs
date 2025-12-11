@@ -163,7 +163,7 @@ impl Future for RequestFuture {
 
 extern "win64" fn waker_trampoline(context: usize) {
     if context == 0 {
-        return;
+        panic!("Request waker was corrupted");
     }
 
     unsafe {

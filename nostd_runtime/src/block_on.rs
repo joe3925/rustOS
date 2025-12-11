@@ -51,11 +51,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Ready(output) => {
                 return output;
             }
-            Poll::Pending => {
-                while !notify.ready.swap(false, Ordering::Acquire) {
-                    //unsafe { task_yield() };
-                }
-            }
+            Poll::Pending => while !notify.ready.swap(false, Ordering::Acquire) {},
         }
     }
 }

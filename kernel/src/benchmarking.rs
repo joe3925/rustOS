@@ -8,103 +8,106 @@ use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
+use crate::println;
+use crate::syscalls::syscall_impl::list_dir;
 use crate::util::{boot_info, TOTAL_TIME};
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_types::fs::{FsSeekWhence, OpenFlags};
 use nostd_runtime::{block_on, spawn_blocking};
-use spin::Mutex;
+use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 const BENCH_ENABLED: bool = cfg!(debug_assertions);
 const MAX_STACK_DEPTH: usize = 8;
+const BENCH_RING_CAPACITY: usize = 8192;
 
 #[derive(Clone)]
 pub struct BenchWindowConfig {
     /// Logical name of the window.
     ///
-    /// This does not affect behavior, but is useful when inspecting logs
-    /// on the host side (e.g., choosing which window a CSV came from or
-    /// labeling plots).
+    /// Used to derive the per-window log directory. For example, a window
+    /// named "io_window" will write into a directory like:
+    ///   `<folder>\io_window`
+    /// or, if another window with the same name is created:
+    ///   `<folder>\io_window-1`, `<folder>\io_window-2`, etc.
     pub name: &'static str,
 
-    /// Directory on the target where this window writes its CSV files.
+    /// Root directory under which this window's subfolder will be created.
     ///
-    /// The window will create (if needed) and append to CSVs inside this
-    /// folder (e.g., `samples.csv`, `spans.csv`, `scheduler.csv`,
-    /// `memory.csv`) when `persist` is called.
+    /// For a window named "io_window" and `folder = "C:\system\logs"`,
+    /// the actual directory becomes:
+    ///   "C:\system\logs\io_window" (first instance),
+    ///   "C:\system\logs\io_window-1" (second instance with same name),
+    /// etc. All CSV files for the window are written into that subfolder.
     pub folder: &'static str,
 
     /// Enable recording of RIP/stack samples for this window.
     ///
-    /// When true, calls to `log_sample_*` while the window is running will
-    /// append `StackSample` entries and eventually export them to
-    /// `samples.csv` on `persist`.
+    /// When true, `persist` will export sampled RIP/stack data that falls
+    /// inside this window's time range into `samples.csv`.
     pub log_samples: bool,
 
     /// Enable recording of span timings for this window.
     ///
-    /// When true, `span_guard(...)` will track span begin/end pairs and
-    /// accumulate `SpanRecord` entries, which are exported to `spans.csv`
-    /// on `persist`.
+    /// When true, `persist` will reconstruct span lifetimes from the
+    /// global span stream and export completed spans that fall inside
+    /// this window’s time range into `spans.csv`.
     pub log_spans: bool,
 
     /// Enable collection of scheduler-level summary metrics.
     ///
-    /// When true, calls to `sample_scheduler()` while the window is running
-    /// will feed a `SchedulerAcc` accumulator, and `persist` will emit
-    /// summary rows to `scheduler.csv`.
+    /// When true, `sample_scheduler()` accumulates scheduler data for
+    /// this window, and `persist` emits a summary row for the run into
+    /// `scheduler.csv`.
     pub log_scheduler: bool,
 
     /// Enable recording of a memory snapshot on each `persist` call.
     ///
-    /// When true, `persist` will take a single memory usage sample for the
-    /// current run (used/total and heap usage) and append it to
-    /// `memory.csv`.
+    /// When true, `persist` will take a memory usage sample
+    /// (used/total and heap usage) and append it to `memory.csv`.
     pub log_mem_on_persist: bool,
 
     /// If true, dropping the `BenchWindow` will implicitly stop it.
     ///
-    /// This only affects the running state: the window is marked as stopped
-    /// when the last `BenchWindow` handle is dropped. It does *not*
-    /// automatically call `persist`; you must still call `persist`
-    /// explicitly if you want data flushed to disk.
+    /// This only affects the running state: when the last handle is
+    /// dropped and this is true, the window is marked as stopped at the
+    /// current timestamp. It does not call `persist` automatically.
     pub end_on_drop: bool,
 
-    /// Optional maximum lifetime for a single run of this window, in
-    /// milliseconds.
+    /// Optional maximum lifetime for a single run of this window,
+    /// in milliseconds.
     ///
-    /// When set, `start()` may spawn a blocking worker that sleeps for this
-    /// duration and then calls `stop()` for this window. If `None`, the
-    /// window runs until `stop()` is called or the handle is dropped (and
-    /// `end_on_drop` is true).
+    /// When set, `start()` spawns a blocking worker that sleeps for this
+    /// duration and then calls `stop()` on the window. When `None`, the
+    /// run ends only when `stop()` is called or the window is dropped
+    /// with `end_on_drop = true`.
     pub timeout_ms: Option<u64>,
 
     /// Optional auto-persist interval, in seconds.
     ///
-    /// When set, the intended behavior is that a worker thread periodically
-    /// calls `persist()` while the window is running, so large runs can
-    /// flush partial data to disk without manual intervention. If `None`,
-    /// `persist()` is only invoked when the caller explicitly calls it.
+    /// When set, `start()` spawns a worker that periodically calls
+    /// `persist()` while the window is running, so large runs can flush
+    /// partial data to disk. When `None`, `persist()` is only invoked
+    /// when the caller explicitly calls it.
     pub auto_persist_secs: Option<u64>,
 
-    /// Initial capacity for the per-window sample buffer.
+    /// Initial capacity hint for sample export.
     ///
-    /// This controls the `reserve` used for `Vec<StackSample>` when the
-    /// window is created. A larger value reduces reallocations (and their
-    /// noise) during heavy sampling at the cost of more upfront memory.
+    /// This is only a sizing hint for internal buffers and does not
+    /// change what is recorded in the global stream.
     pub sample_reserve: usize,
 
-    /// Initial capacity for the per-window span buffer.
+    /// Initial capacity hint for span export.
     ///
-    /// This controls the `reserve` used for `Vec<SpanRecord>` when the
-    /// window is created. A larger value reduces reallocations when many
-    /// spans are recorded in a single run.
+    /// This is only a sizing hint for internal buffers and does not
+    /// change what is recorded in the global stream.
     pub span_reserve: usize,
 }
 
@@ -112,7 +115,7 @@ impl Default for BenchWindowConfig {
     fn default() -> Self {
         BenchWindowConfig {
             name: "default",
-            folder: "C:\\system\\logs\\default",
+            folder: "C:\\system\\logs",
             log_samples: true,
             log_spans: true,
             log_scheduler: true,
@@ -126,33 +129,406 @@ impl Default for BenchWindowConfig {
     }
 }
 
+// ===== Global event stream (samples + spans) =====
+
 #[derive(Clone, Copy, Debug)]
-struct SpanBegin {
+struct BenchSampleEvent {
+    rip: u64,
+    depth: u8,
+    stack: [u64; MAX_STACK_DEPTH],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchSpanEvent {
+    span_id: u32,
     tag: &'static str,
     object_id: u64,
-    start_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchEventKind {
+    None,
+    Sample,
+    SpanBegin,
+    SpanEnd,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BenchEventData {
+    None,
+    Sample(BenchSampleEvent),
+    Span(BenchSpanEvent),
+}
+
+impl Default for BenchEventData {
+    fn default() -> Self {
+        BenchEventData::None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchEvent {
+    timestamp_ns: u64,
     core_id: u16,
+    kind: BenchEventKind,
+    data: BenchEventData,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct SpanRecord {
-    pub run_id: u32,
-    pub tag: &'static str,
-    pub object_id: u64,
-    pub core_id: u16,
-    pub start_ns: u64,
-    pub duration_ns: u64,
+impl Default for BenchEvent {
+    fn default() -> Self {
+        BenchEvent {
+            timestamp_ns: 0,
+            core_id: 0,
+            kind: BenchEventKind::None,
+            data: BenchEventData::None,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct StackSample {
-    pub run_id: u32,
-    pub timestamp_ns: u64,
-    pub core_id: u16,
-    pub rip: u64,
-    pub depth: u8,
-    pub stack: [u64; MAX_STACK_DEPTH],
+impl BenchEvent {
+    fn is_empty(&self) -> bool {
+        self.kind == BenchEventKind::None
+    }
 }
+
+struct BenchRing {
+    write_idx: usize,
+    buffer: Vec<BenchEvent>,
+}
+
+impl BenchRing {
+    fn new(capacity: usize) -> Self {
+        let mut buffer = Vec::with_capacity(capacity);
+        buffer.resize(capacity, BenchEvent::default());
+        BenchRing {
+            write_idx: 0,
+            buffer,
+        }
+    }
+
+    fn log(&mut self, event: BenchEvent) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let idx = self.write_idx % self.buffer.len();
+        self.buffer[idx] = event;
+        self.write_idx = self.write_idx.wrapping_add(1);
+    }
+}
+
+struct BenchState {
+    rings: Vec<Mutex<BenchRing>>,
+    next_span_id: AtomicU32,
+}
+
+impl BenchState {
+    fn new() -> Self {
+        let cores = TIMER_TIME_SCHED.iter().count().max(1);
+        let mut rings = Vec::with_capacity(cores);
+        for _ in 0..cores {
+            rings.push(Mutex::new(BenchRing::new(BENCH_RING_CAPACITY)));
+        }
+        BenchState {
+            rings,
+            next_span_id: AtomicU32::new(1),
+        }
+    }
+
+    fn ring_for_core(&self, core: usize) -> Option<&Mutex<BenchRing>> {
+        self.rings.get(core)
+    }
+
+    fn alloc_span_id(&self) -> u32 {
+        self.next_span_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+static BENCH_STATE: Once<BenchState> = Once::new();
+
+static WINDOW_DIR_REGISTRY: Once<Mutex<BTreeMap<String, u32>>> = Once::new();
+
+fn bench_state() -> Option<&'static BenchState> {
+    if !BENCH_ENABLED {
+        return None;
+    }
+    Some(BENCH_STATE.call_once(BenchState::new))
+}
+
+fn window_dir_registry() -> &'static Mutex<BTreeMap<String, u32>> {
+    WINDOW_DIR_REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
+}
+
+fn allocate_window_folder(root: &str, name: &str) -> String {
+    let registry = window_dir_registry();
+    let mut map = registry.lock();
+
+    let mut key = String::new();
+    key.push_str(root);
+    key.push('|');
+    key.push_str(name);
+
+    let mut base = String::new();
+    base.push_str(root);
+    if !root.ends_with('\\') && !root.ends_with('/') {
+        base.push('\\');
+    }
+    base.push_str(name);
+
+    let _ = block_on(File::make_dir(base.clone()));
+
+    let next_idx = match map.get(&key).copied() {
+        Some(n) => n,
+        None => {
+            let entries = block_on(File::list_dir(&base)).unwrap_or_else(|_| Vec::new());
+
+            let mut max_suffix: u32 = 0;
+
+            for entry in entries {
+                if entry.starts_with(name) {
+                    let rest = &entry[name.len()..];
+                    if rest.starts_with('-') {
+                        let suffix = &rest[1..];
+                        if !suffix.is_empty() {
+                            if let Ok(n) = suffix.parse::<u32>() {
+                                if n > max_suffix {
+                                    max_suffix = n;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            max_suffix.saturating_add(1)
+        }
+    };
+
+    let mut folder = base;
+    folder.push('\\');
+    folder.push_str(name);
+    folder.push('-');
+    folder.push_str(next_idx.to_string().as_str());
+
+    let _ = block_on(File::make_dir(folder.clone()));
+
+    map.insert(key, next_idx.saturating_add(1));
+
+    folder
+}
+
+fn bench_log_event_for_core(core_id: usize, event: BenchEvent) {
+    if let Some(state) = bench_state() {
+        if let Some(ring) = state.ring_for_core(core_id) {
+            let mut r = ring.lock();
+            r.log(event);
+        }
+    }
+}
+
+fn bench_now_ns() -> u64 {
+    TOTAL_TIME.wait().elapsed_millis() as u64 * 1_000_000
+}
+
+// Global sampling API (independent of windows)
+
+pub fn bench_log_sample(core_id: usize, timestamp_ns: u64, rip: u64, stack: &[u64]) {
+    if !BENCH_ENABLED {
+        return;
+    }
+
+    let mut sample = BenchSampleEvent {
+        rip,
+        depth: 0,
+        stack: [0; MAX_STACK_DEPTH],
+    };
+    let depth = stack.len().min(MAX_STACK_DEPTH);
+    sample.depth = depth as u8;
+    for i in 0..depth {
+        sample.stack[i] = stack[i];
+    }
+
+    let event = BenchEvent {
+        timestamp_ns,
+        core_id: core_id as u16,
+        kind: BenchEventKind::Sample,
+        data: BenchEventData::Sample(sample),
+    };
+    bench_log_event_for_core(core_id, event);
+}
+
+pub fn bench_log_sample_current_core(rip: u64, stack: &[u64]) {
+    if !BENCH_ENABLED {
+        return;
+    }
+    let core_id = interrupt_index::current_cpu_id() as usize;
+    let ts = bench_now_ns();
+    bench_log_sample(core_id, ts, rip, stack);
+}
+
+fn bench_alloc_span_id() -> Option<u32> {
+    bench_state().map(|s| s.alloc_span_id())
+}
+
+fn bench_log_span_begin(span_id: u32, tag: &'static str, object_id: u64) {
+    if !BENCH_ENABLED {
+        return;
+    }
+    let core_id = interrupt_index::current_cpu_id() as usize;
+    let event = BenchEvent {
+        timestamp_ns: bench_now_ns(),
+        core_id: core_id as u16,
+        kind: BenchEventKind::SpanBegin,
+        data: BenchEventData::Span(BenchSpanEvent {
+            span_id,
+            tag,
+            object_id,
+        }),
+    };
+    bench_log_event_for_core(core_id, event);
+}
+
+fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
+    if !BENCH_ENABLED {
+        return;
+    }
+    let core_id = interrupt_index::current_cpu_id() as usize;
+    let event = BenchEvent {
+        timestamp_ns: bench_now_ns(),
+        core_id: core_id as u16,
+        kind: BenchEventKind::SpanEnd,
+        data: BenchEventData::Span(BenchSpanEvent {
+            span_id,
+            tag,
+            object_id,
+        }),
+    };
+    bench_log_event_for_core(core_id, event);
+}
+
+pub struct BenchSpanGuard {
+    span_id: u32,
+    tag: &'static str,
+    object_id: u64,
+    enabled: bool,
+}
+
+impl BenchSpanGuard {
+    pub fn new(tag: &'static str, object_id: u64) -> Self {
+        if !BENCH_ENABLED {
+            return BenchSpanGuard {
+                span_id: 0,
+                tag,
+                object_id,
+                enabled: false,
+            };
+        }
+        if let Some(span_id) = bench_alloc_span_id() {
+            bench_log_span_begin(span_id, tag, object_id);
+            BenchSpanGuard {
+                span_id,
+                tag,
+                object_id,
+                enabled: true,
+            }
+        } else {
+            BenchSpanGuard {
+                span_id: 0,
+                tag,
+                object_id,
+                enabled: false,
+            }
+        }
+    }
+}
+
+impl Drop for BenchSpanGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            bench_log_span_end(self.span_id, self.tag, self.object_id);
+        }
+    }
+}
+
+pub fn bench_span_guard(tag: &'static str, object_id: u64) -> BenchSpanGuard {
+    BenchSpanGuard::new(tag, object_id)
+}
+
+fn snapshot_events_range(from_ns: u64, to_ns: u64) -> Vec<BenchEvent> {
+    let mut out = Vec::new();
+    if let Some(state) = bench_state() {
+        for ring in &state.rings {
+            let ring = ring.lock();
+            for ev in &ring.buffer {
+                if !ev.is_empty() && ev.timestamp_ns >= from_ns && ev.timestamp_ns <= to_ns {
+                    out.push(*ev);
+                }
+            }
+        }
+    }
+    out.sort_by_key(|e| e.timestamp_ns);
+    out
+}
+
+fn build_export_strings_for_window(
+    cfg: &BenchWindowConfig,
+    run_id: u32,
+    from_ns: u64,
+    to_ns: u64,
+) -> (String, String) {
+    let events = snapshot_events_range(from_ns, to_ns);
+
+    let mut samples_rows = String::new();
+    let mut spans_rows = String::new();
+
+    if events.is_empty() {
+        return (samples_rows, spans_rows);
+    }
+
+    let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)> = BTreeMap::new();
+
+    for ev in events {
+        match ev.kind {
+            BenchEventKind::Sample if cfg.log_samples => {
+                if let BenchEventData::Sample(s) = ev.data {
+                    samples_rows.push_str(&format!(
+                        "{},{},{},0x{:016x},{}",
+                        run_id, ev.timestamp_ns, ev.core_id, s.rip, s.depth
+                    ));
+                    let depth = s.depth as usize;
+                    for i in 0..MAX_STACK_DEPTH {
+                        samples_rows.push(',');
+                        if i < depth {
+                            samples_rows.push_str(&format!("0x{:016x}", s.stack[i]));
+                        }
+                    }
+                    samples_rows.push('\n');
+                }
+            }
+            BenchEventKind::SpanBegin if cfg.log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    open_spans.insert(span.span_id, (span, ev.timestamp_ns, ev.core_id));
+                }
+            }
+            BenchEventKind::SpanEnd if cfg.log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    if let Some((start_span, start_ts, core_id)) = open_spans.remove(&span.span_id)
+                    {
+                        let dur = ev.timestamp_ns.saturating_sub(start_ts);
+                        spans_rows.push_str(&format!(
+                            "{},{},0x{:016x},{},{},{}\n",
+                            run_id, start_span.tag, start_span.object_id, core_id, start_ts, dur
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (samples_rows, spans_rows)
+}
+
+// ===== Scheduler + memory summary rows =====
 
 #[derive(Clone, Debug)]
 pub struct SchedulerSummaryRow {
@@ -363,163 +739,45 @@ impl SchedulerAcc {
     }
 }
 
+// ===== BenchWindow: view over global stream =====
+
 struct BenchWindowInner {
     cfg: BenchWindowConfig,
 
     running: bool,
     start_ns: u64,
+    last_persist_ns: u64,
+    stop_ns: Option<u64>,
 
     run_id_counter: u32,
     current_run_id: u32,
 
-    next_span_id: u32,
-    open_spans: BTreeMap<u32, SpanBegin>,
-    spans: Vec<SpanRecord>,
-    samples: Vec<StackSample>,
     sched: Option<SchedulerAcc>,
-    sched_rows: Vec<SchedulerSummaryRow>,
-    mem_rows: Vec<MemSampleRow>,
+    wrote_sched_for_run: bool,
 
-    last_flushed_sample_idx: usize,
-    last_flushed_span_idx: usize,
-    last_flushed_sched_idx: usize,
-    last_flushed_mem_idx: usize,
+    samples_header_written: bool,
+    spans_header_written: bool,
+    sched_header_written: bool,
+    mem_header_written: bool,
 }
 
 impl BenchWindowInner {
     fn new(cfg: BenchWindowConfig) -> Self {
-        let mut spans = Vec::new();
-        let mut samples = Vec::new();
-        if cfg.log_spans {
-            spans.reserve(cfg.span_reserve);
-        }
-        if cfg.log_samples {
-            samples.reserve(cfg.sample_reserve);
-        }
-
-        let sched = if cfg.log_scheduler {
-            Some(SchedulerAcc::new())
-        } else {
-            None
-        };
-
         BenchWindowInner {
             cfg,
             running: false,
             start_ns: 0,
+            last_persist_ns: 0,
+            stop_ns: None,
             run_id_counter: 1,
             current_run_id: 0,
-            next_span_id: 1,
-            open_spans: BTreeMap::new(),
-            spans,
-            samples,
-            sched,
-            sched_rows: Vec::new(),
-            mem_rows: Vec::new(),
-            last_flushed_sample_idx: 0,
-            last_flushed_span_idx: 0,
-            last_flushed_sched_idx: 0,
-            last_flushed_mem_idx: 0,
+            sched: None,
+            wrote_sched_for_run: false,
+            samples_header_written: false,
+            spans_header_written: false,
+            sched_header_written: false,
+            mem_header_written: false,
         }
-    }
-
-    fn build_export_strings(&mut self) -> (String, String, String, String) {
-        let mut samples_out = String::new();
-        let mut spans_out = String::new();
-        let mut sched_out = String::new();
-        let mut mem_out = String::new();
-
-        if self.samples.len() > self.last_flushed_sample_idx {
-            if self.last_flushed_sample_idx == 0 {
-                samples_out.push_str(
-                    "run_id,timestamp_ns,core,rip,depth,\
-                     frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n",
-                );
-            }
-            for s in &self.samples[self.last_flushed_sample_idx..] {
-                samples_out.push_str(&format!(
-                    "{},{},{},0x{:016x},{}",
-                    s.run_id, s.timestamp_ns, s.core_id, s.rip, s.depth
-                ));
-                let depth = s.depth as usize;
-                for i in 0..MAX_STACK_DEPTH {
-                    samples_out.push(',');
-                    if i < depth {
-                        samples_out.push_str(&format!("0x{:016x}", s.stack[i]));
-                    }
-                }
-                samples_out.push('\n');
-            }
-            self.last_flushed_sample_idx = self.samples.len();
-        }
-
-        if self.spans.len() > self.last_flushed_span_idx {
-            if self.last_flushed_span_idx == 0 {
-                spans_out.push_str("run_id,tag,object_id,core,start_ns,duration_ns\n");
-            }
-            for s in &self.spans[self.last_flushed_span_idx..] {
-                spans_out.push_str(&format!(
-                    "{},{},0x{:016x},{},{},{}\n",
-                    s.run_id, s.tag, s.object_id, s.core_id, s.start_ns, s.duration_ns
-                ));
-            }
-            self.last_flushed_span_idx = self.spans.len();
-        }
-
-        if self.sched_rows.len() > self.last_flushed_sched_idx {
-            if self.last_flushed_sched_idx == 0 {
-                sched_out.push_str(
-                    "run_id,window_total_ms,ncores,avg_util_x100000,\
-                     total_ctx_per_sec,avg_ctx_per_sec_per_core,avg_ns_per_switch,\
-                     timer_overhead_x100000,mean_util_x1000,median_util_x1000,\
-                     stddev_util_x1000,mad_util_x1000,cv_util_x1000,\
-                     min_core_idx,max_core_idx,max_gap_x1000\n",
-                );
-            }
-            for r in &self.sched_rows[self.last_flushed_sched_idx..] {
-                sched_out.push_str(&format!(
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                    r.run_id,
-                    r.window_total_ms,
-                    r.ncores,
-                    r.avg_util_x100000,
-                    r.total_ctx_per_sec,
-                    r.avg_ctx_per_sec_per_core,
-                    r.avg_ns_per_switch,
-                    r.timer_overhead_x100000,
-                    r.mean_util_x1000,
-                    r.median_util_x1000,
-                    r.stddev_util_x1000,
-                    r.mad_util_x1000,
-                    r.cv_util_x1000,
-                    r.min_core_idx,
-                    r.max_core_idx,
-                    r.max_gap_x1000
-                ));
-            }
-            self.last_flushed_sched_idx = self.sched_rows.len();
-        }
-
-        if self.mem_rows.len() > self.last_flushed_mem_idx {
-            if self.last_flushed_mem_idx == 0 {
-                mem_out
-                    .push_str("run_id,timestamp_ns,used_mb,total_mb,heap_used_kb,heap_total_kb\n");
-            }
-            for r in &self.mem_rows[self.last_flushed_mem_idx..] {
-                mem_out.push_str(&format!(
-                    "{},{},{},{},{},{}\n",
-                    r.run_id,
-                    r.timestamp_ns,
-                    r.used_mb,
-                    r.total_mb,
-                    r.heap_used_kb,
-                    r.heap_total_kb
-                ));
-            }
-            self.last_flushed_mem_idx = self.mem_rows.len();
-        }
-
-        (samples_out, spans_out, sched_out, mem_out)
     }
 }
 
@@ -529,14 +787,22 @@ pub struct BenchWindow {
 }
 
 impl BenchWindow {
-    pub fn new(cfg: BenchWindowConfig) -> Self {
+    pub fn new(mut cfg: BenchWindowConfig) -> Self {
+        if BENCH_ENABLED {
+            let root = cfg.folder;
+            let name = cfg.name;
+            let folder_string = allocate_window_folder(root, name);
+            let leaked: &'static str = Box::leak(folder_string.into_boxed_str());
+            cfg.folder = leaked;
+        }
+
         let inner = BenchWindowInner::new(cfg);
         BenchWindow {
             inner: Arc::new(Mutex::new(inner)),
         }
     }
 
-    pub async fn start(&self) {
+    pub fn start(&self) {
         if !BENCH_ENABLED {
             return;
         }
@@ -552,11 +818,19 @@ impl BenchWindow {
 
             inner.running = true;
             inner.start_ns = bench_now_ns();
+            inner.last_persist_ns = inner.start_ns;
+            inner.stop_ns = None;
             inner.current_run_id = inner.run_id_counter;
             inner.run_id_counter = inner.run_id_counter.wrapping_add(1);
+            inner.wrote_sched_for_run = false;
 
-            if let Some(ref mut sched) = inner.sched {
-                sched.reset();
+            if inner.cfg.log_scheduler {
+                match inner.sched {
+                    Some(ref mut sched) => sched.reset(),
+                    None => {
+                        inner.sched = Some(SchedulerAcc::new());
+                    }
+                }
             }
 
             auto_persist_secs_opt = inner.cfg.auto_persist_secs;
@@ -586,7 +860,7 @@ impl BenchWindow {
                             break;
                         }
                     }
-                    this.persist();
+                    block_on(this.persist());
                 });
             }
         }
@@ -597,161 +871,189 @@ impl BenchWindow {
             return;
         }
         let mut inner = self.inner.lock();
+        if !inner.running {
+            return;
+        }
         inner.running = false;
+        inner.stop_ns = Some(bench_now_ns());
     }
 
-    pub fn persist(&self) {
+    pub async fn persist(&self) {
         if !BENCH_ENABLED {
             return;
         }
 
-        let (cfg_folder, samples, spans, sched, mem) = {
-            let mut inner = self.inner.lock();
+        let should_sample = {
+            let inner = self.inner.lock();
+            inner.running && inner.cfg.log_scheduler
+        };
+        if should_sample {
+            self.sample_scheduler();
+        }
 
-            if inner.cfg.log_scheduler {
+        let (
+            cfg,
+            run_id,
+            from_ns,
+            to_ns,
+            samples_header_written,
+            spans_header_written,
+            mut sched_csv,
+            mut mem_csv,
+        ) = {
+            let mut inner = self.inner.lock();
+            if inner.start_ns == 0 {
+                return;
+            }
+
+            let from_ns = if inner.last_persist_ns == 0 {
+                inner.start_ns
+            } else {
+                inner.last_persist_ns
+            };
+
+            let to_ns = match inner.stop_ns {
+                Some(stop) => stop,
+                None => bench_now_ns(),
+            };
+
+            if from_ns >= to_ns {
+                return;
+            }
+
+            inner.last_persist_ns = to_ns;
+
+            let cfg = inner.cfg.clone();
+            let run_id = inner.current_run_id;
+
+            let mut sched_csv_local = String::new();
+            if cfg.log_scheduler && !inner.wrote_sched_for_run {
                 if let Some(ref sched) = inner.sched {
-                    if let Some(row) = sched.build_summary(inner.current_run_id) {
-                        inner.sched_rows.push(row);
+                    if let Some(row) = sched.build_summary(run_id) {
+                        if !inner.sched_header_written {
+                            sched_csv_local.push_str(
+                                "run_id,window_total_ms,ncores,avg_util_x100000,\
+                                 total_ctx_per_sec,avg_ctx_per_sec_per_core,avg_ns_per_switch,\
+                                 timer_overhead_x100000,mean_util_x1000,median_util_x1000,\
+                                 stddev_util_x1000,mad_util_x1000,cv_util_x1000,\
+                                 min_core_idx,max_core_idx,max_gap_x1000\n",
+                            );
+                            inner.sched_header_written = true;
+                        }
+                        sched_csv_local.push_str(&format!(
+                            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                            row.run_id,
+                            row.window_total_ms,
+                            row.ncores,
+                            row.avg_util_x100000,
+                            row.total_ctx_per_sec,
+                            row.avg_ctx_per_sec_per_core,
+                            row.avg_ns_per_switch,
+                            row.timer_overhead_x100000,
+                            row.mean_util_x1000,
+                            row.median_util_x1000,
+                            row.stddev_util_x1000,
+                            row.mad_util_x1000,
+                            row.cv_util_x1000,
+                            row.min_core_idx,
+                            row.max_core_idx,
+                            row.max_gap_x1000
+                        ));
+                        inner.wrote_sched_for_run = true;
                     }
                 }
             }
 
-            if inner.cfg.log_mem_on_persist {
-                let mem_row = sample_memory(inner.current_run_id);
-                inner.mem_rows.push(mem_row);
+            let mut mem_csv_local = String::new();
+            if cfg.log_mem_on_persist {
+                let row = sample_memory(run_id);
+                if !inner.mem_header_written {
+                    mem_csv_local.push_str(
+                        "run_id,timestamp_ns,used_mb,total_mb,heap_used_kb,heap_total_kb\n",
+                    );
+                    inner.mem_header_written = true;
+                }
+                mem_csv_local.push_str(&format!(
+                    "{},{},{},{},{},{}\n",
+                    row.run_id,
+                    row.timestamp_ns,
+                    row.used_mb,
+                    row.total_mb,
+                    row.heap_used_kb,
+                    row.heap_total_kb
+                ));
             }
 
-            let (samples, spans, sched, mem) = inner.build_export_strings();
-            (inner.cfg.folder, samples, spans, sched, mem)
+            (
+                cfg,
+                run_id,
+                from_ns,
+                to_ns,
+                inner.samples_header_written,
+                inner.spans_header_written,
+                sched_csv_local,
+                mem_csv_local,
+            )
         };
 
-        if !samples.is_empty() {
-            let _ = block_on(append_named_file(
-                cfg_folder,
-                "samples.csv",
-                samples.as_bytes(),
-            ));
+        let (samples_rows, spans_rows) =
+            build_export_strings_for_window(&cfg, run_id, from_ns, to_ns);
+
+        let mut samples_csv = String::new();
+        if !samples_rows.is_empty() && cfg.log_samples {
+            if !samples_header_written {
+                samples_csv.push_str(
+                    "run_id,timestamp_ns,core,rip,depth,\
+                     frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n",
+                );
+            }
+            samples_csv.push_str(&samples_rows);
         }
-        if !spans.is_empty() {
-            let _ = block_on(append_named_file(cfg_folder, "spans.csv", spans.as_bytes()));
+
+        let mut spans_csv = String::new();
+        if !spans_rows.is_empty() && cfg.log_spans {
+            if !spans_header_written {
+                spans_csv.push_str("run_id,tag,object_id,core,start_ns,duration_ns\n");
+            }
+            spans_csv.push_str(&spans_rows);
         }
-        if !sched.is_empty() {
-            let _ = block_on(append_named_file(
-                cfg_folder,
-                "scheduler.csv",
-                sched.as_bytes(),
-            ));
+
+        {
+            let mut inner = self.inner.lock();
+            if !samples_rows.is_empty() && cfg.log_samples && !inner.samples_header_written {
+                inner.samples_header_written = true;
+            }
+            if !spans_rows.is_empty() && cfg.log_spans && !inner.spans_header_written {
+                inner.spans_header_written = true;
+            }
         }
-        if !mem.is_empty() {
-            let _ = block_on(append_named_file(cfg_folder, "memory.csv", mem.as_bytes()));
+
+        if !samples_csv.is_empty() {
+            let _ = append_named_file(cfg.folder, "samples.csv", samples_csv.as_bytes()).await;
+        }
+        if !spans_csv.is_empty() {
+            let _ = append_named_file(cfg.folder, "spans.csv", spans_csv.as_bytes()).await;
+        }
+        if !sched_csv.is_empty() {
+            let _ = append_named_file(cfg.folder, "scheduler.csv", sched_csv.as_bytes()).await;
+        }
+        if !mem_csv.is_empty() {
+            let _ = append_named_file(cfg.folder, "memory.csv", mem_csv.as_bytes()).await;
         }
     }
 
     pub fn span_guard(&self, tag: &'static str, object_id: u64) -> BenchSpanGuard {
-        if !BENCH_ENABLED {
-            return BenchSpanGuard {
-                window: self.clone(),
-                span_id: 0,
-                enabled: false,
-            };
-        }
-
-        let mut inner = self.inner.lock();
-        if !inner.running || !inner.cfg.log_spans {
-            return BenchSpanGuard {
-                window: self.clone(),
-                span_id: 0,
-                enabled: false,
-            };
-        }
-
-        let span_id = inner.next_span_id;
-        inner.next_span_id = inner.next_span_id.wrapping_add(1);
-
-        let start_ns = bench_now_ns();
-        let core_id = interrupt_index::current_cpu_id() as u16;
-
-        inner.open_spans.insert(
-            span_id,
-            SpanBegin {
-                tag,
-                object_id,
-                start_ns,
-                core_id,
-            },
-        );
-
-        BenchSpanGuard {
-            window: self.clone(),
-            span_id,
-            enabled: true,
-        }
-    }
-
-    fn finish_span(&self, span_id: u32) {
-        if !BENCH_ENABLED {
-            return;
-        }
-
-        let now_ns = bench_now_ns();
-        let mut inner = self.inner.lock();
-        if !inner.running || !inner.cfg.log_spans {
-            return;
-        }
-
-        if let Some(begin) = inner.open_spans.remove(&span_id) {
-            let dur = now_ns.saturating_sub(begin.start_ns);
-            let run_id = inner.current_run_id;
-            inner.spans.push(SpanRecord {
-                run_id,
-                tag: begin.tag,
-                object_id: begin.object_id,
-                core_id: begin.core_id,
-                start_ns: begin.start_ns,
-                duration_ns: dur,
-            });
-        }
+        BenchSpanGuard::new(tag, object_id)
     }
 
     pub fn log_sample_current_core(&self, rip: u64, stack: &[u64]) {
-        if !BENCH_ENABLED {
-            return;
-        }
-
-        let core_id = interrupt_index::current_cpu_id() as u16;
-        let ts = bench_now_ns();
-        self.log_sample_for_core(core_id, ts, rip, stack);
+        bench_log_sample_current_core(rip, stack);
     }
 
     pub fn log_sample_for_core(&self, core_id: u16, timestamp_ns: u64, rip: u64, stack: &[u64]) {
-        if !BENCH_ENABLED {
-            return;
-        }
-
-        let mut inner = self.inner.lock();
-        if !inner.running || !inner.cfg.log_samples {
-            return;
-        }
-
-        let mut sample = StackSample {
-            run_id: inner.current_run_id,
-            timestamp_ns,
-            core_id,
-            rip,
-            depth: 0,
-            stack: [0; MAX_STACK_DEPTH],
-        };
-
-        let depth = stack.len().min(MAX_STACK_DEPTH);
-        sample.depth = depth as u8;
-        for i in 0..depth {
-            sample.stack[i] = stack[i];
-        }
-
-        inner.samples.push(sample);
+        bench_log_sample(core_id as usize, timestamp_ns, rip, stack);
     }
 
-    // Intended to be called from your timer / scheduler path while the window is running.
     pub fn sample_scheduler(&self) {
         if !BENCH_ENABLED {
             return;
@@ -777,27 +1079,12 @@ impl Drop for BenchWindow {
         let mut inner = self.inner.lock();
         if inner.running && inner.cfg.end_on_drop {
             inner.running = false;
+            inner.stop_ns = Some(bench_now_ns());
         }
     }
 }
 
-pub struct BenchSpanGuard {
-    window: BenchWindow,
-    span_id: u32,
-    enabled: bool,
-}
-
-impl Drop for BenchSpanGuard {
-    fn drop(&mut self) {
-        if self.enabled {
-            self.window.finish_span(self.span_id);
-        }
-    }
-}
-
-fn bench_now_ns() -> u64 {
-    TOTAL_TIME.wait().elapsed_millis() as u64 * 1_000_000
-}
+// ===== Helpers: scheduler counters, stats, memory, file IO =====
 
 fn read_all_core_timer_ms() -> Vec<u128> {
     TIMER_TIME_SCHED

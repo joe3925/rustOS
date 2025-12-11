@@ -1,7 +1,7 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::BenchWindowConfig;
+use crate::benchmarking::{BenchWindow, BenchWindowConfig};
 use crate::boot_packages;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
@@ -21,6 +21,7 @@ use crate::file_system::file_provider::install_file_provider;
 use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
+use crate::lazy_static;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
@@ -52,7 +53,6 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
-
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -65,19 +65,21 @@ pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-static GLOBAL_WINDOW: BenchWindowConfig = BenchWindowConfig {
-    name: "global",
-    folder: "C:/system/logs",
-    log_samples: true,
-    log_spans: true,
-    log_scheduler: true,
-    log_mem_on_persist: true,
-    end_on_drop: true,
-    timeout_ms: None,
-    auto_persist_secs: Some(60),
-    sample_reserve: 256,
-    span_reserve: 256,
-};
+lazy_static! {
+    pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
+        name: "global",
+        folder: "C:/system/logs",
+        log_samples: true,
+        log_spans: true,
+        log_scheduler: true,
+        log_mem_on_persist: true,
+        end_on_drop: true,
+        timeout_ms: None,
+        auto_persist_secs: Some(60),
+        sample_reserve: 256,
+        span_reserve: 256,
+    });
+}
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -154,6 +156,8 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
     });
+    wait_millis_idle(25000);
+    GLOBAL_WINDOW.start();
     println!("");
 }
 #[inline(always)]

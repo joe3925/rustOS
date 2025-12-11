@@ -69,12 +69,14 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
     type Output = R;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        {
+            let mut w = self.inner.waker.lock();
+            *w = Some(cx.waker().clone());
+        }
         let mut result_guard = self.inner.result.lock();
         if let Some(res) = result_guard.take() {
             Poll::Ready(res)
         } else {
-            let mut w = self.inner.waker.lock();
-            *w = Some(cx.waker().clone());
             Poll::Pending
         }
     }
