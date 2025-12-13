@@ -134,40 +134,41 @@ impl Future for RequestFuture {
     type Output = DriverStatus;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut req = self.req.write();
+        let mut req = match self.req.try_write() {
+            Some(g) => g,
+            None => {
+                if let Some(r) = self.req.try_read() {
+                    if r.completed {
+                        return Poll::Ready(r.status);
+                    }
+                }
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        };
 
         if req.completed {
             return Poll::Ready(req.status);
         }
 
-        let waker = cx.waker().clone();
-
-        let waker_ptr = Box::into_raw(Box::new(waker)) as usize;
-
-        if let Some(context) = req.waker_context {
+        if let Some(ctx) = req.waker_context.take() {
             unsafe {
-                let _ = Box::from_raw(context as *mut Waker);
+                drop(Box::from_raw(ctx as *mut Waker));
             }
         }
-        if req.waker_context.is_some() || req.waker_func.is_some() {
-            panic!(
-                "In flight request can not be polled. Handlers should never poll there parent request, consider creating a child request"
-            )
-        }
+        req.waker_func = None;
+
+        let ctx = Box::into_raw(Box::new(cx.waker().clone())) as usize;
         req.waker_func = Some(waker_trampoline);
-        req.waker_context = Some(waker_ptr);
+        req.waker_context = Some(ctx);
 
         Poll::Pending
     }
 }
-
-extern "win64" fn waker_trampoline(context: usize) {
-    if context == 0 {
-        panic!("Request waker was corrupted");
+extern "win64" fn waker_trampoline(ctx: usize) {
+    if ctx == 0 {
+        return;
     }
-
-    unsafe {
-        let w = Box::from_raw(context as *mut Waker);
-        w.wake_by_ref();
-    }
+    let w = unsafe { Box::from_raw(ctx as *mut Waker) };
+    w.wake();
 }

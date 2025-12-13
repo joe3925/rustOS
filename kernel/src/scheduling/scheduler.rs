@@ -1,3 +1,5 @@
+// scheduling/scheduler.rs
+use crate::cpu;
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::timer_driver::PER_CORE_SWITCHES;
 use crate::executable::program::PROGRAM_MANAGER;
@@ -7,11 +9,12 @@ use crate::scheduling::state::State;
 use crate::scheduling::task::{idle_task, Task};
 use crate::static_handlers::task_yield;
 use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::arch::{asm, naked_asm};
+use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
@@ -46,6 +49,33 @@ pub struct Scheduler {
 
 lazy_static! {
     pub static ref SCHEDULER: Scheduler = Scheduler::new();
+}
+
+#[inline(always)]
+fn derive_tsc_hz() -> u64 {
+    let sw = TOTAL_TIME.get().unwrap();
+    let us = sw.elapsed_micros();
+    if us == 0 {
+        return 0;
+    }
+    let c = sw.elapsed_cycles();
+    ((c as u128) * 1_000_000u128 / (us as u128)) as u64
+}
+
+#[inline(always)]
+fn cycles_to_micros(cycles: u64, hz: u64) -> u64 {
+    if hz == 0 {
+        return 0;
+    }
+    ((cycles as u128) * 1_000_000u128 / (hz as u128)) as u64
+}
+
+#[inline(always)]
+fn cycles_to_millis(cycles: u64, hz: u64) -> u64 {
+    if hz == 0 {
+        return 0;
+    }
+    ((cycles as u128) * 1_000u128 / (hz as u128)) as u64
 }
 
 impl Scheduler {
@@ -100,6 +130,7 @@ impl Scheduler {
                     best = i;
                 }
             }
+
             let id = self.add_task_internal(task.clone());
             {
                 task.write().id = id;
@@ -122,6 +153,9 @@ impl Scheduler {
             return;
         }
 
+        let now_cycles = cpu::get_cycles();
+        let now_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
+
         if let Some(cur) = self.get_current_task(cpu_id) {
             if let Some(mut guard) = cur.try_write() {
                 guard.update_from_context(state);
@@ -130,13 +164,13 @@ impl Scheduler {
             }
         }
 
-        if (TOTAL_TIME.get().unwrap().elapsed_millis() % 500) == 0 {
+        if (now_ms % 500) == 0 {
             if let Some(_guard) = self.balance_lock.try_lock() {
                 self.balance();
             }
         }
 
-        let next = match self.schedule_next(cpu_id) {
+        let next = match self.schedule_next(cpu_id, now_cycles) {
             Some(task) => task,
             None => return,
         };
@@ -157,10 +191,11 @@ impl Scheduler {
             .get(cpu_id)
             .unwrap()
             .fetch_add(1, Ordering::Relaxed);
+
         unsafe { (*ctx_ptr).restore(state) };
     }
 
-    fn schedule_next(&self, cpu_id: usize) -> Option<TaskHandle> {
+    fn schedule_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         let core = &self.cores[cpu_id];
 
         let mut current_guard = core.current.write();
@@ -170,9 +205,10 @@ impl Scheduler {
         if let Some(ref previous_task) = previous {
             if !Arc::ptr_eq(previous_task, &core.idle_task) {
                 if let Some(t) = previous_task.try_read() {
+                    t.account_switched_out(now_cycles);
+
                     let terminated = t.terminated;
                     let sleeping = t.is_sleeping;
-                    drop(t);
 
                     if terminated {
                         previous_for_fallback = None;
@@ -206,15 +242,30 @@ impl Scheduler {
         drop(run_queue_guard);
 
         if let Some(n) = next {
+            if let Some(t) = n.try_read() {
+                t.mark_scheduled_in(cpu_id, now_cycles);
+            } else {
+                return None;
+            }
             *current_guard = Some(n.clone());
             return Some(n);
         }
 
         if let Some(prev) = previous_for_fallback {
+            if let Some(t) = prev.try_read() {
+                t.mark_scheduled_in(cpu_id, now_cycles);
+            } else {
+                return None;
+            }
             *current_guard = Some(prev.clone());
             return Some(prev);
         }
 
+        if let Some(t) = core.idle_task.try_read() {
+            t.mark_scheduled_in(cpu_id, now_cycles);
+        } else {
+            return None;
+        }
         *current_guard = Some(core.idle_task.clone());
         Some(core.idle_task.clone())
     }
@@ -315,10 +366,9 @@ impl Scheduler {
                 task.write().is_sleeping = true;
             }
         });
-        unsafe {
-            task_yield();
-        }
+        unsafe { task_yield() };
     }
+
     pub fn sleep(&self) {
         without_interrupts(|| {
             let cpu_id = current_cpu_id() as usize;
@@ -330,11 +380,10 @@ impl Scheduler {
 }
 
 #[no_mangle]
-pub extern "C" fn yield_handler_c(state: *mut State) {
+pub extern "win64" fn yield_handler_win64(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-
     let cpu_id = current_cpu_id() as usize;
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
@@ -348,12 +397,12 @@ pub extern "win64" fn yield_interrupt_entry() -> ! {
         "push rdi","push rsi","push rbp","push rbx",
         "push rdx","push rcx","push rax",
 
-        "mov  rdi, rsp",
+        "mov  rcx, rsp",
         "cld",
 
-        "sub  rsp, 8",
+        "sub  rsp, 40",
         "call {handler}",
-        "add  rsp, 8",
+        "add  rsp, 40",
 
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",
@@ -361,7 +410,7 @@ pub extern "win64" fn yield_interrupt_entry() -> ! {
         "pop  r13","pop  r14","pop  r15",
         "sti",
         "iretq",
-        handler = sym yield_handler_c,
+        handler = sym yield_handler_win64,
     );
 }
 
@@ -372,7 +421,7 @@ pub fn kernel_task_end() -> ! {
             .unwrap()
             .read()
             .id;
-        SCHEDULER.delete_task(id);
+        SCHEDULER.delete_task(id).ok();
     });
     loop {}
 }

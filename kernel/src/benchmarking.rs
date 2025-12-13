@@ -753,8 +753,6 @@ struct BenchWindowInner {
     current_run_id: u32,
 
     sched: Option<SchedulerAcc>,
-    wrote_sched_for_run: bool,
-
     samples_header_written: bool,
     spans_header_written: bool,
     sched_header_written: bool,
@@ -772,7 +770,6 @@ impl BenchWindowInner {
             run_id_counter: 1,
             current_run_id: 0,
             sched: None,
-            wrote_sched_for_run: false,
             samples_header_written: false,
             spans_header_written: false,
             sched_header_written: false,
@@ -822,7 +819,6 @@ impl BenchWindow {
             inner.stop_ns = None;
             inner.current_run_id = inner.run_id_counter;
             inner.run_id_counter = inner.run_id_counter.wrapping_add(1);
-            inner.wrote_sched_for_run = false;
 
             if inner.cfg.log_scheduler {
                 match inner.sched {
@@ -927,7 +923,7 @@ impl BenchWindow {
             let run_id = inner.current_run_id;
 
             let mut sched_csv_local = String::new();
-            if cfg.log_scheduler && !inner.wrote_sched_for_run {
+            if cfg.log_scheduler {
                 if let Some(ref sched) = inner.sched {
                     if let Some(row) = sched.build_summary(run_id) {
                         if !inner.sched_header_written {
@@ -959,7 +955,6 @@ impl BenchWindow {
                             row.max_core_idx,
                             row.max_gap_x1000
                         ));
-                        inner.wrote_sched_for_run = true;
                     }
                 }
             }

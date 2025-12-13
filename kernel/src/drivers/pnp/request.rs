@@ -103,39 +103,33 @@ impl PnpManager {
     }
 
     pub fn complete_request(&self, req_arc: &Arc<RwLock<Request>>) {
-        let (comp_routine_addr, comp_ctx, waker_func, waker_ctx) = {
-            let mut g = req_arc.write();
-            g.completed = true;
-
-            let cr = g.completion_routine.take().map(|fp| fp as usize);
-            let cc = g.completion_context;
-
-            let wf = g.waker_func.take();
-            let wc = g.waker_context;
-
-            g.waker_context = None;
-
-            (cr, cc, wf, wc)
-        };
-
-        if let Some(addr) = comp_routine_addr {
-            let f: CompletionRoutine = unsafe { core::mem::transmute(addr) };
-
-            let ref_req = &mut req_arc.write();
-            ref_req.status = f(ref_req, comp_ctx);
-        }
-
-        {
+        let (waker_func, waker_ctx) = {
             let mut req = req_arc.write();
+
+            if req.completed {
+                return;
+            }
+
+            if let Some(fp) = req.completion_routine.take() {
+                let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
+                let context = req.completion_context;
+                req.status = f(&mut *req, context);
+            }
+
             if req.status == DriverStatus::Continue {
                 req.status = DriverStatus::Success;
             }
-        }
 
-        if let Some(func) = waker_func {
-            func(waker_ctx.unwrap());
+            req.completed = true;
+
+            (req.waker_func.take(), req.waker_context.take())
+        };
+
+        if let (Some(func), Some(ctx)) = (waker_func, waker_ctx) {
+            func(ctx);
         }
     }
+
     pub fn spawn_device_handler(dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         nostd_runtime::spawn(PNP_MANAGER.call_device_handler(dev.clone(), req_arc.clone()));
     }
