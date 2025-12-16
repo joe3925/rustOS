@@ -1,5 +1,6 @@
 use crate::memory::paging::tables::kernel_cr3;
 use crate::println;
+use alloc::fmt;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
@@ -71,23 +72,25 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(
     stack_frame: InterruptStackFrame,
     error_code: u64,
 ) {
-    decode_gpf_error_code(error_code);
+    let decoded = decode_gpf_error_code(error_code);
     panic!(
-        "EXCEPTION: GENERAL PROTECTION FAULT ERROR CODE(0x{:X}) \n{:#?}",
-        error_code, stack_frame,
+        "EXCEPTION: GENERAL PROTECTION FAULT\nerror_code=0x{:X}\n{}\n{:#?}",
+        error_code, decoded, stack_frame,
     );
 }
 
-//TODO: properly handle page faults
+// TODO: properly handle page faults
 pub(crate) extern "x86-interrupt" fn page_fault(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
     unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
 
-    println!("page fault: {:?}", error_code);
-    println!("attempted to access: {:?}", Cr2::read());
-    panic!("{:#?}", stack_frame);
+    let cr2 = Cr2::read();
+    panic!(
+        "EXCEPTION: PAGE FAULT\nerror_code={:?}\ncr2={:?}\n{:#?}",
+        error_code, cr2, stack_frame
+    );
 }
 
 pub(crate) extern "x86-interrupt" fn x87_floating_point_exception(
@@ -118,24 +121,40 @@ pub(crate) extern "x86-interrupt" fn simd_floating_point_exception(
 pub(crate) extern "x86-interrupt" fn virtualization_exception(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: VIRTUALIZATION\n{:#?}", stack_frame);
 }
-fn decode_gpf_error_code(error_code: u64) {
-    let source = error_code & 0b111;
-    let table_indicator = (error_code >> 3) & 1;
-    let index = (error_code >> 4) & 0x1FFF; // Bits 4-15
+#[derive(Clone, Copy)]
+struct DecodedGpfErrorCode {
+    source_bits: u64,
+    table_indicator: u64,
+    index: u64,
+}
 
-    println!("Decoded GPF Error Code:");
-    match source {
-        0 => println!("Source: GDT"),
-        1 => println!("Source: IDT"),
-        2 => println!("Source: LDT"),
-        _ => println!("Source: Reserved"),
+impl fmt::Display for DecodedGpfErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source = match self.source_bits {
+            0 => "GDT",
+            1 => "IDT",
+            2 => "LDT",
+            _ => "Reserved",
+        };
+
+        let table = if self.table_indicator == 0 {
+            "GDT"
+        } else {
+            "LDT"
+        };
+
+        write!(
+            f,
+            "Decoded GPF error code:\nsource={}\ntable={}\nsegment_selector_index={}",
+            source, table, self.index
+        )
     }
+}
 
-    if table_indicator == 0 {
-        println!("Table: GDT");
-    } else {
-        println!("Table: LDT");
+fn decode_gpf_error_code(error_code: u64) -> DecodedGpfErrorCode {
+    DecodedGpfErrorCode {
+        source_bits: error_code & 0b111,
+        table_indicator: (error_code >> 3) & 1,
+        index: (error_code >> 4) & 0x1FFF,
     }
-
-    println!("Segment Selector Index: {}", index);
 }

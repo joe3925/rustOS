@@ -9,6 +9,7 @@ use spin::RwLock;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
+use crate::static_handlers::task_yield;
 
 pub type JobFn = extern "win64" fn(usize);
 
@@ -90,6 +91,7 @@ extern "win64" fn worker(args_ptr: usize) {
         if let Some(j) = job {
             (j.f)(j.a);
         } else {
+            //unsafe { task_yield() };
             spin_loop();
         }
     }

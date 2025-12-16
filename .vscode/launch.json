@@ -15,16 +15,16 @@
                 // acpi.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\acpi\\acpi.dll\"",
                 "target modules load --file \"acpi.dll\" .text 0xffff900003813000",
-                // pci.dll
+                // pci.dll 
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\pci\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff900003a10000",
+                "target modules load --file \"pci.dll\" .text 0xffff9000039da000",
                 // i8042.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\i8042\\i8042.dll\"",
-                "target modules load --file \"i8042.dll\" .text 0xffff9000039da000",
+                "target modules load --file \"i8042.dll\" .text 0xffff900003a25000",
                 // ide.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\ide\\ide.dll\"",
                 "target modules load --file \"ide.dll\" .text 0xffff900003a5b000",
-                // disk.dll
+                // disk.dll 
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\disk\\disk.dll\"",
                 "target modules load --file \"disk.dll\" .text 0xffff900003ab0000",
                 // partmgr.dll

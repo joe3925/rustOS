@@ -81,7 +81,7 @@ fn _start(boot_info_local: &'static mut BootInfo) -> ! {
     unsafe {
         BOOT_INFO = Some(boot_info_local);
     }
-    clear_screen();
+
     unsafe {
         util::init();
     }

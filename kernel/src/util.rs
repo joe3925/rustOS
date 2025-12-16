@@ -3,6 +3,7 @@ extern crate rand_xoshiro;
 use crate::alloc::format;
 use crate::benchmarking::{BenchWindow, BenchWindowConfig};
 use crate::boot_packages;
+use crate::console::clear_screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
@@ -95,6 +96,7 @@ pub unsafe fn init() {
         PICS.lock().initialize();
 
         load_idt();
+        clear_screen();
         syscall_init();
 
         // TSC calibration
