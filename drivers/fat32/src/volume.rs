@@ -7,7 +7,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_api::task::{create_kernel_task, sleep_self, sleep_self_and_yield, wake_task};
 
 use fatfs::{
@@ -50,6 +50,7 @@ pub struct VolCtrlDevExt {
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
     pub(crate) worker_task_id: AtomicU64,
+    pub(crate) worker_sleeping: AtomicBool,
 }
 
 pub struct CachedFile {
@@ -138,7 +139,6 @@ pub fn start_fs_worker_for_volume(dev: Arc<DeviceObject>) {
     let id = create_kernel_task(fs_worker_thread, raw_ctx, name);
     vdx.worker_task_id.store(id, Ordering::Release);
 }
-
 extern "win64" fn fs_worker_thread(ctx: usize) {
     let ctx_ref: &FsWorkerCtx = unsafe { &*(ctx as *const FsWorkerCtx) };
 
@@ -149,20 +149,31 @@ extern "win64" fn fs_worker_thread(ctx: usize) {
             q.pop_front()
         };
 
-        match req_opt {
-            Some(req) => {
-                let status = handle_fs_request(&ctx_ref.dev, &req);
-                {
-                    let mut r = req.write();
-                    r.status = status;
-                }
-
-                pnp_complete_request(&req);
+        if let Some(req) = req_opt {
+            let status = handle_fs_request(&ctx_ref.dev, &req);
+            {
+                let mut r = req.write();
+                r.status = status;
             }
-            None => unsafe {
-                sleep_self_and_yield();
-            },
+            pnp_complete_request(&req);
+            continue;
         }
+
+        let vdx = ext_mut::<VolCtrlDevExt>(&ctx_ref.dev);
+        vdx.worker_sleeping.store(true, Ordering::Release);
+
+        let empty = {
+            let q = vdx.queue.lock();
+            q.is_empty()
+        };
+
+        if empty && vdx.worker_sleeping.load(Ordering::Acquire) {
+            unsafe {
+                sleep_self_and_yield();
+            }
+        }
+
+        vdx.worker_sleeping.store(false, Ordering::Release);
     }
 }
 
@@ -681,19 +692,26 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
 
 #[request_handler]
 pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    let kind = { req.read().kind };
-
-    match kind {
-        RequestType::Fs(_) => {
-            let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-            {
-                let mut q = vdx.queue.lock();
-                q.push_back(req);
-                wake_task(vdx.worker_task_id.load(Ordering::Acquire));
-            }
-            DriverStatus::Pending
+    {
+        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+        if vdx.worker_task_id.load(Ordering::Acquire) == 0 {
+            start_fs_worker_for_volume(dev.clone());
         }
-        RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
-        _ => DriverStatus::InvalidParameter,
     }
+
+    let id = {
+        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+        {
+            let mut q = vdx.queue.lock();
+            q.push_back(req);
+        }
+        vdx.worker_sleeping.store(false, Ordering::Release);
+        vdx.worker_task_id.load(Ordering::Acquire)
+    };
+
+    if id != 0 {
+        wake_task(id);
+    }
+
+    DriverStatus::Pending
 }

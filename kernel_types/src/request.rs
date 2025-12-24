@@ -83,6 +83,35 @@ impl Request {
             }
         }
     }
+    #[inline]
+    fn complete_for_drop(&mut self) -> (Option<extern "win64" fn(usize)>, Option<usize>) {
+        if self.completed {
+            return (None, None);
+        }
+
+        if let Some(fp) = self.completion_routine.take() {
+            let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
+            let context = self.completion_context;
+            self.status = f(self, context);
+        }
+
+        if self.status == DriverStatus::Continue {
+            self.status = DriverStatus::Success;
+        }
+
+        self.completed = true;
+
+        (self.waker_func.take(), self.waker_context.take())
+    }
+}
+impl Drop for Request {
+    fn drop(&mut self) {
+        let (waker_func, waker_ctx) = self.complete_for_drop();
+
+        if let (Some(func), Some(ctx)) = (waker_func, waker_ctx) {
+            func(ctx);
+        }
+    }
 }
 struct CompletionNode {
     func: CompletionRoutine,
@@ -133,7 +162,7 @@ pub struct RequestFuture {
 impl Future for RequestFuture {
     type Output = DriverStatus;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<DriverStatus> {
         let mut req = match self.req.try_write() {
             Some(g) => g,
             None => {
@@ -151,12 +180,17 @@ impl Future for RequestFuture {
             return Poll::Ready(req.status);
         }
 
-        if let Some(ctx) = req.waker_context.take() {
-            unsafe {
-                drop(Box::from_raw(ctx as *mut Waker));
+        if let Some(ctx) = req.waker_context {
+            let existing = unsafe { &*(ctx as *const Waker) };
+            if existing.will_wake(cx.waker()) {
+                return Poll::Pending;
             }
+            let old = req.waker_context.take().unwrap();
+            unsafe {
+                drop(Box::from_raw(old as *mut Waker));
+            }
+            req.waker_func = None;
         }
-        req.waker_func = None;
 
         let ctx = Box::into_raw(Box::new(cx.waker().clone())) as usize;
         req.waker_func = Some(waker_trampoline);

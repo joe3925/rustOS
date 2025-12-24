@@ -45,6 +45,7 @@ use core::arch::asm;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::time::Duration;
 use kernel_types::memory::Module;
 use nostd_runtime::{block_on, spawn};
 use rand_core::{RngCore, SeedableRng};
@@ -76,7 +77,7 @@ lazy_static! {
         log_mem_on_persist: true,
         end_on_drop: true,
         timeout_ms: None,
-        auto_persist_secs: Some(60),
+        auto_persist_secs: Some(Duration::from_millis(1)),
         sample_reserve: 256,
         span_reserve: 256,
     });
@@ -181,7 +182,7 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
     crate::KERNEL_INITIALIZED.store(false, Ordering::SeqCst);
 
     let me = get_current_logical_id() as u32;
-    let i_am_owner = match PANIC_OWNER.try_lock() {
+    let is_owner = match PANIC_OWNER.try_lock() {
         Some(mut g) => {
             if g.is_none() {
                 *g = Some(me);
@@ -193,7 +194,7 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         None => false,
     };
 
-    if i_am_owner {
+    if is_owner {
         println!("\n=== KERNEL PANIC [{}] ===", mod_name);
         println!("\n{}", info);
         unsafe {

@@ -19,6 +19,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::time::Duration;
 use core::{mem, ptr};
 use pic8259::ChainedPics;
 use spin::Mutex;
@@ -173,7 +174,34 @@ pub fn calibrate_tsc(tsc_start: u64, tsc_end: u64, delay_ms: u64) {
     let tsc_freq = (tsc_end - tsc_start) * 1000 / delay_ms;
     TSC_HZ.store(tsc_freq, Ordering::SeqCst);
 }
+// TODO: depreciate the wait_millis and others
+pub fn wait_duration(d: Duration) {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
 
+    let nanos = d.as_nanos();
+    let hz = tsc_hz as u128;
+
+    let target_delta = nanos.saturating_mul(hz).saturating_add(999_999_999) / 1_000_000_000;
+
+    cpu::wait_cycle(target_delta);
+}
+
+pub fn wait_duration_idle(d: Duration) {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    let nanos = d.as_nanos();
+    let hz = tsc_hz as u128;
+
+    let target_delta = nanos.saturating_mul(hz).saturating_add(999_999_999) / 1_000_000_000;
+
+    cpu::wait_cycle_idle(target_delta);
+}
 pub fn wait_millis(ms: u64) {
     let tsc_freq = TSC_HZ.load(Ordering::SeqCst);
     if tsc_freq == 0 {

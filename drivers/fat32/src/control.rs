@@ -7,7 +7,11 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{future, mem::size_of, sync::atomic::AtomicU64};
+use core::{
+    future,
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicU64},
+};
 use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
@@ -144,6 +148,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         table: RwLock::new(BTreeMap::new()),
                         queue: Mutex::new(alloc::collections::VecDeque::new()),
                         worker_task_id: AtomicU64::new(0),
+                        worker_sleeping: AtomicBool::new(false),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);

@@ -19,6 +19,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
+use core::time::Duration;
 use kernel_types::fs::{FsSeekWhence, OpenFlags};
 use nostd_runtime::{block_on, spawn_blocking};
 use spin::{Mutex, Once};
@@ -81,22 +82,21 @@ pub struct BenchWindowConfig {
     /// current timestamp. It does not call `persist` automatically.
     pub end_on_drop: bool,
 
-    /// Optional maximum lifetime for a single run of this window,
-    /// in milliseconds.
+    /// Optional maximum lifetime for a single run of this window
     ///
     /// When set, `start()` spawns a blocking worker that sleeps for this
     /// duration and then calls `stop()` on the window. When `None`, the
     /// run ends only when `stop()` is called or the window is dropped
     /// with `end_on_drop = true`.
-    pub timeout_ms: Option<u64>,
+    pub timeout_ms: Option<Duration>,
 
-    /// Optional auto-persist interval, in seconds.
+    /// Optional auto-persist interval
     ///
     /// When set, `start()` spawns a worker that periodically calls
     /// `persist()` while the window is running, so large runs can flush
     /// partial data to disk. When `None`, `persist()` is only invoked
     /// when the caller explicitly calls it.
-    pub auto_persist_secs: Option<u64>,
+    pub auto_persist_secs: Option<Duration>,
 
     /// Initial capacity hint for sample export.
     ///
@@ -836,17 +836,17 @@ impl BenchWindow {
         if let Some(timeout_ms) = timeout_ms_opt {
             let this = self.clone();
             spawn_blocking(move || {
-                interrupt_index::wait_millis_idle(timeout_ms);
+                interrupt_index::wait_duration(timeout_ms);
                 this.stop();
             });
         }
 
         if let Some(secs) = auto_persist_secs_opt {
-            if secs > 0 {
+            if !secs.is_zero() {
                 let interval_ms = secs.saturating_mul(1000);
                 let this = self.clone();
                 spawn_blocking(move || loop {
-                    interrupt_index::wait_millis_idle(interval_ms);
+                    interrupt_index::wait_duration(interval_ms);
                     if !BENCH_ENABLED {
                         return;
                     }

@@ -39,19 +39,18 @@ impl Wake for ThreadNotify {
 /// It yields the CPU (via `hlt`) while waiting for interrupts/signals.
 ///
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let mut pinned_future = Box::pin(future);
+    let mut pinned = Box::pin(future);
 
     let notify = Arc::new(ThreadNotify::new());
     let waker = Waker::from(notify.clone());
-
     let mut cx = Context::from_waker(&waker);
 
     loop {
-        match pinned_future.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => {
-                return output;
-            }
-            Poll::Pending => while !notify.ready.swap(false, Ordering::Acquire) {},
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return out,
+            Poll::Pending => unsafe {
+                //task_yield();
+            },
         }
     }
 }

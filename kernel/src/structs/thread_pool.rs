@@ -87,7 +87,7 @@ extern "win64" fn worker(args_ptr: usize) {
     let pool = args.pool;
 
     loop {
-        let job = pool.queue.lock().pop_front();
+        let job = { pool.queue.lock().pop_front() };
         if let Some(j) = job {
             (j.f)(j.a);
         } else {
