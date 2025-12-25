@@ -5,7 +5,7 @@ use crate::{
     structs::thread_pool::ThreadPool,
 };
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(2);
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(6);
     pub static ref BLOCKING_POOL: Arc<ThreadPool> = ThreadPool::new(2);
 }
 #[no_mangle]

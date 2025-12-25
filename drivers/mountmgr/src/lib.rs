@@ -535,14 +535,9 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         return false;
     }
 
-    let res: FsOpenResult = unsafe { *bytes_to_box(core::mem::replace(&mut r.data, Box::new([]))) };
-
-    if res.error.is_none() {
-        println!("Boot check {}: OK", path);
-        true
-    } else {
-        false
-    }
+    unsafe { *bytes_to_box::<FsOpenResult>(core::mem::replace(&mut r.data, Box::new([]))) }
+        .error
+        .is_none()
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str) {
@@ -550,26 +545,28 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
     let inst = inst_path.to_string();
 
     spawn(async move {
-        let mod_ok = fs_check_open(&link, "system/mod").await;
-        let inf_ok = fs_check_open(&link, "system/toml").await;
-        let reg_ok = fs_check_open(&link, "system/registry.bin").await;
+        if !VFS_ACTIVE.load(Ordering::Acquire) {
+            let mod_ok = fs_check_open(&link, "system/mod").await;
+            let inf_ok = fs_check_open(&link, "system/toml").await;
+            let reg_ok = fs_check_open(&link, "system/registry.bin").await;
 
-        if mod_ok && inf_ok && reg_ok {
-            let _ = attempt_boot_bind(&inst, &link).await;
+            if mod_ok && inf_ok && reg_ok {
+                let _ = attempt_boot_bind(&inst, &link).await;
+            }
         }
     });
 }
 
-async fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> DriverStatus {
+async fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> Result<(), RegError> {
     if VFS_ACTIVE.load(Ordering::Acquire) {
-        return DriverStatus::Success;
+        return Ok(());
     }
-    assign_drive_letter(b'C', fs_mount_link).await;
+    assign_drive_letter(b'C', fs_mount_link).await?;
     match unsafe { switch_to_vfs_async().await } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
             println!("System volume mounted at '{}'", fs_mount_link);
-            DriverStatus::Success
+            Ok(())
         }
         Err(e) => {
             println!("Error: {:#?}", e);

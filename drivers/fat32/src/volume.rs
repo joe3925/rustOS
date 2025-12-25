@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_api::task::{create_kernel_task, sleep_self, sleep_self_and_yield, wake_task};
+use kernel_api::x86_64::instructions::hlt;
 
 use fatfs::{
     Dir as FatDirT, Error as FatError, File as FatFileT, FileSystem as FatFsT, IoBase,
@@ -139,6 +140,7 @@ pub fn start_fs_worker_for_volume(dev: Arc<DeviceObject>) {
     let id = create_kernel_task(fs_worker_thread, raw_ctx, name);
     vdx.worker_task_id.store(id, Ordering::Release);
 }
+
 extern "win64" fn fs_worker_thread(ctx: usize) {
     let ctx_ref: &FsWorkerCtx = unsafe { &*(ctx as *const FsWorkerCtx) };
 
@@ -159,21 +161,7 @@ extern "win64" fn fs_worker_thread(ctx: usize) {
             continue;
         }
 
-        let vdx = ext_mut::<VolCtrlDevExt>(&ctx_ref.dev);
-        vdx.worker_sleeping.store(true, Ordering::Release);
-
-        let empty = {
-            let q = vdx.queue.lock();
-            q.is_empty()
-        };
-
-        if empty && vdx.worker_sleeping.load(Ordering::Acquire) {
-            unsafe {
-                sleep_self_and_yield();
-            }
-        }
-
-        vdx.worker_sleeping.store(false, Ordering::Release);
+        core::hint::spin_loop();
     }
 }
 
@@ -699,18 +687,10 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
     }
 
-    let id = {
+    {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-        {
-            let mut q = vdx.queue.lock();
-            q.push_back(req);
-        }
-        vdx.worker_sleeping.store(false, Ordering::Release);
-        vdx.worker_task_id.load(Ordering::Acquire)
-    };
-
-    if id != 0 {
-        wake_task(id);
+        let mut q = vdx.queue.lock();
+        q.push_back(req);
     }
 
     DriverStatus::Pending

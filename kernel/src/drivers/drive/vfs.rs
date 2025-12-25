@@ -278,7 +278,11 @@ impl Vfs {
             Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
                 .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?.await?;
+        let status = pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?.await;
+        if status != DriverStatus::Success {
+            println!("Send request fail with status: {}", status);
+            return Err(status);
+        }
 
         let raw = core::mem::replace(&mut req.write().data, Box::new([]));
         let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };

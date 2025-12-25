@@ -23,12 +23,16 @@ impl FutureTask {
 pub extern "win64" fn poll_trampoline<T: 'static>(ctx: usize) {
     let raw = ctx as *const FutureTask;
     let task: Arc<FutureTask> = unsafe { Arc::from_raw(raw) };
-    let waker = TaskWaker::create_waker(task.clone());
-    let mut context = Context::from_waker(&waker);
 
-    let mut future_guard = task.future.lock();
-    match future_guard.as_mut().poll(&mut context) {
-        Poll::Ready(()) => {}
-        Poll::Pending => {}
+    let waker = TaskWaker::create_waker(task.clone());
+    let mut cx = core::task::Context::from_waker(&waker);
+
+    let poll_res = {
+        let mut fut = task.future.lock();
+        fut.as_mut().poll(&mut cx)
+    };
+
+    if let core::task::Poll::Pending = poll_res {
+        let _raw = Arc::into_raw(task);
     }
 }
