@@ -32,7 +32,7 @@ pub extern "win64" fn poll_trampoline<T: 'static>(ctx: usize) {
         fut.as_mut().poll(&mut cx)
     };
 
-    if let core::task::Poll::Pending = poll_res {
-        let _raw = Arc::into_raw(task);
+    if let core::task::Poll::Ready(()) = poll_res {
+    } else {
     }
 }

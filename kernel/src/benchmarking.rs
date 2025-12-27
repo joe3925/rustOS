@@ -1254,7 +1254,7 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
     }
 
     file.write(data).await.map_err(|_| ())?;
-
+    file.close().await;
     Ok(())
 }
 
