@@ -26,7 +26,6 @@ use crate::{
     file_system::file_provider::provider,
     registry::is_first_boot,
 };
-use nostd_runtime::block_on;
 
 #[derive(Debug)]
 pub struct File {

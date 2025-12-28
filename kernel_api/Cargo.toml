@@ -16,4 +16,3 @@ spin = "0.10.0"
 kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types" }
 kernel_sys = { path = "../kernel_sys" }
-nostd_runtime = { path = "../nostd_runtime" }

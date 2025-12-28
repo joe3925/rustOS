@@ -40,7 +40,8 @@ use kernel_api::{
     println,
     reg::{self, switch_to_vfs_async},
     request::{Request, RequestType, TraversalPolicy},
-    request_handler, spawn,
+    request_handler,
+    runtime::spawn,
     status::{Data, DriverStatus, RegError},
 };
 

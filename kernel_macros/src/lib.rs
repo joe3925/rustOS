@@ -20,9 +20,7 @@ pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
         return e.to_compile_error().into();
     }
 
-    let output = transform_function(&mut func);
-
-    output.into()
+    transform_function(&mut func).into()
 }
 
 fn validate_function(func: &ItemFn) -> syn::Result<()> {
@@ -95,11 +93,15 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
 
     Ok(())
 }
+
 fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let attrs = &func.attrs;
     let vis = &func.vis;
     let sig = &mut func.sig;
     let body = &func.block;
+
+    let fn_ident = sig.ident.clone();
+    let obj_expr = choose_object_id_expr(sig);
 
     let ret_ty: Type = match &sig.output {
         ReturnType::Type(_, ty) => (*ty.clone()),
@@ -116,6 +118,15 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
         {
             ::kernel_api::async_ffi::FutureExt::into_ffi(
                 async move {
+                    //#[cfg(debug_assertions)]
+                    let _bench_span = {
+                        let __obj: u64 = #obj_expr;
+                        ::kernel_api::benchmark::span(
+                            stringify!(#fn_ident),
+                            ::kernel_api::benchmark::object_id(__obj),
+                        )
+                    };
+
                     #(#original_stmts)*
                 }
             )
@@ -125,5 +136,37 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     quote! {
         #(#attrs)*
         #vis #sig #new_body
+    }
+}
+
+fn choose_object_id_expr(sig: &syn::Signature) -> TokenStream2 {
+    for arg in sig.inputs.iter() {
+        let FnArg::Typed(pat_ty) = arg else { continue };
+        let Pat::Ident(pat_ident) = &*pat_ty.pat else {
+            continue;
+        };
+        let ident = &pat_ident.ident;
+
+        if type_is_arc(&pat_ty.ty) {
+            return quote!(::alloc::sync::Arc::as_ptr(&#ident) as usize as u64);
+        }
+
+        return quote!(::core::ptr::addr_of!(#ident) as usize as u64);
+    }
+
+    quote!(0u64)
+}
+
+fn type_is_arc(ty: &Type) -> bool {
+    match ty {
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "Arc")
+            .unwrap_or(false),
+        Type::Paren(p) => type_is_arc(&p.elem),
+        Type::Group(g) => type_is_arc(&g.elem),
+        _ => false,
     }
 }

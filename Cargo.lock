@@ -409,7 +409,6 @@ dependencies = [
  "hashbrown",
  "kernel_types",
  "lazy_static",
- "nostd_runtime",
  "pc-keyboard",
  "pic8259",
  "rand_core",
@@ -430,7 +429,6 @@ dependencies = [
  "kernel_macros",
  "kernel_sys",
  "kernel_types",
- "nostd_runtime",
  "spin 0.10.0",
  "strum",
  "x86_64 0.15.2",
@@ -526,13 +524,6 @@ name = "mountmgr"
 version = "0.1.0"
 dependencies = [
  "kernel_api",
- "spin 0.10.0",
-]
-
-[[package]]
-name = "nostd_runtime"
-version = "0.1.0"
-dependencies = [
  "spin 0.10.0",
 ]
 

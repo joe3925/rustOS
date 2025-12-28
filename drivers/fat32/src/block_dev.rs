@@ -6,11 +6,12 @@ use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    RequestExt, block_on,
+    RequestExt,
     kernel_types::io::IoTarget,
     pnp::pnp_send_request,
     println,
     request::{Request, RequestType, TraversalPolicy},
+    runtime::block_on,
     status::DriverStatus,
 };
 

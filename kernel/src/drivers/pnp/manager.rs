@@ -7,6 +7,7 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
+use crate::scheduling::runtime::runtime::spawn;
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
@@ -778,7 +779,7 @@ impl PnpManager {
                     Err(status) => return status,
                 };
 
-                nostd_runtime::spawn(async move {
+                spawn(async move {
                     fut.await;
                 });
             }
@@ -814,7 +815,7 @@ impl PnpManager {
             .collect();
         for child_dn in children_to_start {
             let dn = child_dn.clone();
-            nostd_runtime::spawn(async move {
+            spawn(async move {
                 let status: Result<(), DriverError> = PNP_MANAGER.bind_and_start(&dn).await;
                 if let Some(err) = status.err() {
                     println!(

@@ -20,7 +20,6 @@ use kernel_types::device::ModuleHandle;
 use kernel_types::fs::OpenFlags;
 use kernel_types::memory::Module;
 use kernel_types::status::PageMapError;
-use nostd_runtime::block_on;
 use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;

@@ -1,7 +1,7 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::{BenchWindow, BenchWindowConfig};
+use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::clear_screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
@@ -30,6 +30,8 @@ use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAlloca
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::registry::is_first_boot;
+use crate::scheduling::global_async::GlobalAsyncExecutor;
+use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::static_handlers::wait_ms;
@@ -46,8 +48,8 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::time::Duration;
+use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::memory::Module;
-use nostd_runtime::{block_on, spawn};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
@@ -70,14 +72,13 @@ static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
 lazy_static! {
     pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
         name: "global",
-        folder: "C:/system/logs",
+        folder: "C:\\system\\logs",
         log_samples: true,
         log_spans: true,
-        log_scheduler: true,
         log_mem_on_persist: true,
         end_on_drop: true,
         timeout_ms: None,
-        auto_persist_secs: Some(Duration::from_millis(1)),
+        auto_persist_secs: Some(Duration::from_secs(30)),
         sample_reserve: 256,
         span_reserve: 256,
     });
@@ -134,6 +135,7 @@ pub unsafe fn init() {
 }
 
 pub extern "win64" fn kernel_main(ctx: usize) {
+    GlobalAsyncExecutor::global().set_parallelism(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(Box::new(BootstrapProvider::new(BOOTSET)));
 
     let mut program = Program::new(

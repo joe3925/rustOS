@@ -17,25 +17,25 @@
                 "target modules load --file \"acpi.dll\" .text 0xffff900003413000",
                 // pci.dll 
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\pci\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff900003610000",
+                "target modules load --file \"pci.dll\" .text 0xffff9000035da000",
                 // i8042.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\i8042\\i8042.dll\"",
-                "target modules load --file \"i8042.dll\" .text 0xffff9000035da000",
+                "target modules load --file \"i8042.dll\" .text 0xffff900003626000",
                 // ide.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\ide\\ide.dll\"",
-                "target modules load --file \"ide.dll\" .text 0xffff90000365b000",
+                "target modules load --file \"ide.dll\" .text 0xffff90000365c000",
                 // disk.dll 
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\disk\\disk.dll\"",
-                "target modules load --file \"disk.dll\" .text 0xffff9000036b0000",
+                "target modules load --file \"disk.dll\" .text 0xffff9000036b1000",
                 // partmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\partmgr\\partmgr.dll\"",
-                "target modules load --file \"partmgr.dll\" .text 0xffff90000370d000",
+                "target modules load --file \"partmgr.dll\" .text 0xffff90000370e000",
                 // volmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\volmgr\\volmgr.dll\"",
-                "target modules load --file \"volmgr.dll\" .text 0xffff900003758000",
+                "target modules load --file \"volmgr.dll\" .text 0xffff90000375a000",
                 // mountmgr.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\mountmgr\\mountmgr.dll\"",
-                "target modules load --file \"mountmgr.dll\" .text 0xffff9000037a1000",
+                "target modules load --file \"mountmgr.dll\" .text 0xffff9000037a3000",
                 // fat32.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\fat32\\fat32.dll\"",
                 "target modules load --file \"fat32.dll\" .text 0xffff900003837000"

@@ -20,7 +20,7 @@ use kernel_api::pnp::{
 use kernel_api::request::{Request, RequestType, TraversalPolicy};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::box_to_bytes;
-use kernel_api::{RequestExt, block_on, request_handler};
+use kernel_api::{RequestExt, request_handler};
 use spin::{Once, RwLock};
 
 use kernel_api::println;

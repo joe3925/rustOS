@@ -17,7 +17,7 @@ use dev_ext::{
 };
 
 use kernel_api::{
-    RequestExt, block_on,
+    RequestExt,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{io::IoVtable, pnp::DeviceIds},
     pnp::{
