@@ -301,8 +301,6 @@ pub async fn pci_pdo_query_resources(
 
 #[request_handler]
 pub async fn pci_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    let mut r = req.write();
-
     DriverStatus::Success
 }
 
@@ -311,6 +309,5 @@ pub async fn pci_pdo_query_devrels(
     _dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
 ) -> DriverStatus {
-    req.write().status = DriverStatus::Success;
     DriverStatus::Success
 }

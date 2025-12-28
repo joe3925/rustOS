@@ -1,6 +1,3 @@
-#![no_std]
-
-extern crate alloc;
 use crate::alloc::format;
 use crate::drivers::interrupt_index;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
@@ -12,7 +9,7 @@ use crate::memory::{
 };
 use crate::scheduling::runtime::runtime::{block_on, spawn_blocking};
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::vec;
+use crate::{print, vec};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -109,30 +106,20 @@ impl BenchEvent {
 struct BenchRing {
     next_seq: u64,
     buffer: Vec<BenchEvent>,
-    write_idx: usize,
 }
 
 impl BenchRing {
-    fn new(capacity: usize) -> Self {
-        let mut buffer = Vec::with_capacity(capacity);
-        buffer.resize(capacity, BenchEvent::default());
+    fn new(initial_capacity: usize) -> Self {
         BenchRing {
             next_seq: 1,
-            buffer,
-            write_idx: 0,
+            buffer: Vec::with_capacity(initial_capacity),
         }
     }
 
     fn log(&mut self, mut event: BenchEvent) {
-        if self.buffer.is_empty() {
-            return;
-        }
         event.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-
-        let idx = self.write_idx % self.buffer.len();
-        self.buffer[idx] = event;
-        self.write_idx = self.write_idx.wrapping_add(1);
+        self.buffer.push(event);
     }
 }
 
@@ -196,7 +183,7 @@ fn bench_ncores() -> usize {
 }
 
 fn bench_now_ns() -> u64 {
-    TOTAL_TIME.wait().elapsed_millis() as u64 * 1_000_000
+    TOTAL_TIME.wait().elapsed_nanos()
 }
 
 fn bench_log_event_for_core(core_id: usize, event: BenchEvent) {
@@ -442,7 +429,8 @@ pub fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
     bench_log_event_for_core(core_id, event);
     bench_capture_metrics(core_id, ts);
 }
-
+#[repr(C)]
+#[derive(Debug)]
 pub struct BenchSpanGuard {
     span_id: u32,
     tag: &'static str,
@@ -674,6 +662,7 @@ fn build_exports_for_window(
     to_ns: u64,
     last_export_seq: &[u64],
     ncores: usize,
+    open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
 ) -> ExportBundle {
     let mut samples_rows = Vec::with_capacity(ncores + 1);
     let mut spans_rows = Vec::with_capacity(ncores + 1);
@@ -708,9 +697,9 @@ fn build_exports_for_window(
         }
     };
 
-    let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)> = BTreeMap::new();
     let want_mem_stream = cfg.log_mem_on_persist;
 
+    let mut all_events: Vec<(usize, BenchEvent)> = Vec::new();
     for core in 0..ncores {
         let ring_m = match state.ring_for_core(core) {
             Some(r) => r,
@@ -727,91 +716,105 @@ fn build_exports_for_window(
             if ev.seq <= last_seq {
                 continue;
             }
-            if ev.timestamp_ns < start_ns || ev.timestamp_ns > to_ns {
-                continue;
-            }
+            all_events.push((core, *ev));
+        }
+    }
 
-            if ev.seq > max_seq_seen[core] {
-                max_seq_seen[core] = ev.seq;
-            }
+    all_events.sort_unstable_by(|a, b| {
+        let ea = &a.1;
+        let eb = &b.1;
+        ea.timestamp_ns
+            .cmp(&eb.timestamp_ns)
+            .then(ea.core_id.cmp(&eb.core_id))
+            .then(ea.seq.cmp(&eb.seq))
+    });
 
-            match ev.kind {
-                BenchEventKind::Sample if cfg.log_samples => {
-                    if let BenchEventData::Sample(s) = ev.data {
-                        let avg = ncores;
+    for (scan_core, ev) in all_events {
+        let ts = ev.timestamp_ns;
 
-                        samples_rows[core].push_str(&format!(
-                            "{},{},{},0x{:016x},{}",
-                            run_id, ev.timestamp_ns, ev.core_id, s.rip, s.depth
-                        ));
-                        samples_rows[avg].push_str(&format!(
-                            "{},{},{},0x{:016x},{}",
-                            run_id, ev.timestamp_ns, ev.core_id, s.rip, s.depth
-                        ));
+        if ts < start_ns || ts > to_ns {
+            continue;
+        }
 
-                        let depth = s.depth as usize;
-                        for i in 0..MAX_STACK_DEPTH {
-                            samples_rows[core].push(',');
-                            samples_rows[avg].push(',');
-                            if i < depth {
-                                let v = format!("0x{:016x}", s.stack[i]);
-                                samples_rows[core].push_str(&v);
-                                samples_rows[avg].push_str(&v);
-                            }
-                        }
-                        samples_rows[core].push('\n');
-                        samples_rows[avg].push('\n');
-                    }
-                }
-                BenchEventKind::SpanBegin if cfg.log_spans => {
-                    if let BenchEventData::Span(span) = ev.data {
-                        open_spans.insert(span.span_id, (span, ev.timestamp_ns, ev.core_id));
-                    }
-                }
-                BenchEventKind::SpanEnd if cfg.log_spans => {
-                    if let BenchEventData::Span(span) = ev.data {
-                        if let Some((start_span, start_ts, start_core)) =
-                            open_spans.remove(&span.span_id)
-                        {
-                            let dur = ev.timestamp_ns.saturating_sub(start_ts);
-                            let avg = ncores;
+        if scan_core < ncores && ev.seq > max_seq_seen[scan_core] {
+            max_seq_seen[scan_core] = ev.seq;
+        }
 
-                            let row = format!(
-                                "{},{},0x{:016x},{},{},{}\n",
-                                run_id,
-                                start_span.tag,
-                                start_span.object_id,
-                                start_core,
-                                start_ts,
-                                dur
-                            );
+        match ev.kind {
+            BenchEventKind::Sample if cfg.log_samples => {
+                if let BenchEventData::Sample(s) = ev.data {
+                    let avg = ncores;
 
-                            spans_rows[core].push_str(&row);
-                            spans_rows[avg].push_str(&row);
+                    samples_rows[scan_core].push_str(&format!(
+                        "{},{},{},0x{:016x},{}",
+                        run_id, ts, ev.core_id, s.rip, s.depth
+                    ));
+                    samples_rows[avg].push_str(&format!(
+                        "{},{},{},0x{:016x},{}",
+                        run_id, ts, ev.core_id, s.rip, s.depth
+                    ));
+
+                    let depth = s.depth as usize;
+                    for i in 0..MAX_STACK_DEPTH {
+                        samples_rows[scan_core].push(',');
+                        samples_rows[avg].push(',');
+                        if i < depth {
+                            let v = format!("0x{:016x}", s.stack[i]);
+                            samples_rows[scan_core].push_str(&v);
+                            samples_rows[avg].push_str(&v);
                         }
                     }
+                    samples_rows[scan_core].push('\n');
+                    samples_rows[avg].push('\n');
                 }
-                BenchEventKind::Metrics if want_mem_stream => {
-                    if let BenchEventData::Metrics(m) = ev.data {
+            }
+            BenchEventKind::SpanBegin if cfg.log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    open_spans.insert(span.span_id, (span, ts, ev.core_id));
+                }
+            }
+            BenchEventKind::SpanEnd if cfg.log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    if let Some((start_span, start_ts, start_core)) =
+                        open_spans.remove(&span.span_id)
+                    {
+                        let dur = ts.saturating_sub(start_ts);
                         let avg = ncores;
+
                         let row = format!(
-                            "{},{},{},{},{},{},{},{},{}\n",
-                            run_id,
-                            ev.timestamp_ns,
-                            ev.core_id,
-                            m.used_bytes,
-                            m.total_bytes,
-                            m.heap_used_bytes,
-                            m.heap_total_bytes,
-                            m.core_sched_ns,
-                            m.core_switches
+                            "{},{},0x{:016x},{},{},{}\n",
+                            run_id, start_span.tag, start_span.object_id, start_core, start_ts, dur
                         );
-                        mem_rows[core].push_str(&row);
-                        mem_rows[avg].push_str(&row);
+
+                        let start_idx = start_core as usize;
+                        if start_idx < ncores {
+                            spans_rows[start_idx].push_str(&row);
+                        }
+                        spans_rows[avg].push_str(&row);
                     }
                 }
-                _ => {}
             }
+            BenchEventKind::Metrics if want_mem_stream => {
+                if let BenchEventData::Metrics(m) = ev.data {
+                    let avg = ncores;
+                    let row = format!(
+                        "{},{},{},{},{},{},{},{},{}\n",
+                        run_id,
+                        ts,
+                        ev.core_id,
+                        m.used_bytes,
+                        m.total_bytes,
+                        m.heap_used_bytes,
+                        m.heap_total_bytes,
+                        m.core_sched_ns,
+                        m.core_switches
+                    );
+
+                    mem_rows[scan_core].push_str(&row);
+                    mem_rows[avg].push_str(&row);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -839,11 +842,13 @@ struct BenchWindowInner {
     run_id_counter: u32,
     current_run_id: u32,
 
-    last_export_seq: Vec<u64>, // per core, advanced on persist
+    last_export_seq: Vec<u64>,
 
-    samples_header_written: Vec<bool>, // [core0..coreN-1, avg]
-    spans_header_written: Vec<bool>,   // [core0..coreN-1, avg]
-    mem_header_written: Vec<bool>,     // [core0..coreN-1, avg]
+    samples_header_written: Vec<bool>,
+    spans_header_written: Vec<bool>,
+    mem_header_written: Vec<bool>,
+
+    open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
 }
 
 impl BenchWindowInner {
@@ -862,6 +867,7 @@ impl BenchWindowInner {
             samples_header_written: vec![false; ncores + 1],
             spans_header_written: vec![false; ncores + 1],
             mem_header_written: vec![false; ncores + 1],
+            open_spans: BTreeMap::new(),
         }
     }
 
@@ -876,6 +882,7 @@ impl BenchWindowInner {
         for v in &mut self.mem_header_written {
             *v = false;
         }
+        self.open_spans.clear();
     }
 }
 
@@ -1004,6 +1011,8 @@ impl BenchWindow {
         let mut spans_header_written: Vec<bool>;
         let mut mem_header_written: Vec<bool>;
 
+        let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>;
+
         {
             let inner = self.inner.lock();
             if inner.start_ns == 0 {
@@ -1027,14 +1036,23 @@ impl BenchWindow {
             samples_header_written = inner.samples_header_written.clone();
             spans_header_written = inner.spans_header_written.clone();
             mem_header_written = inner.mem_header_written.clone();
+
+            open_spans = inner.open_spans.clone();
         }
 
         if start_ns >= to_ns {
             return;
         }
 
-        let exports =
-            build_exports_for_window(&cfg, run_id, start_ns, to_ns, &last_export_seq, ncores);
+        let exports = build_exports_for_window(
+            &cfg,
+            run_id,
+            start_ns,
+            to_ns,
+            &last_export_seq,
+            ncores,
+            &mut open_spans,
+        );
 
         let mut ok = true;
 
@@ -1128,6 +1146,8 @@ impl BenchWindow {
             inner.samples_header_written = samples_header_written;
             inner.spans_header_written = spans_header_written;
             inner.mem_header_written = mem_header_written;
+
+            inner.open_spans = open_spans;
 
             for i in 0..ncores {
                 let max_seq = exports.max_seq_seen[i];

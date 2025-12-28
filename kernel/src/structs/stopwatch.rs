@@ -44,7 +44,6 @@ impl Stopwatch {
 
     #[inline(always)]
     pub fn elapsed_nanos(&self) -> u64 {
-        // cycles × 1 000 00 000 / Hz
         (self.elapsed_cycles() as u128 * 1_000_000_000 / self.tsc_hz as u128) as u64
     }
     #[inline(always)]
