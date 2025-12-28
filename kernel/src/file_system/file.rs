@@ -20,6 +20,7 @@ use crate::{
     file_system::file_provider::{self, install_file_provider, FileProvider},
     println,
     registry::reg::rebind_and_persist_after_provider_switch,
+    util::GLOBAL_WINDOW,
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
@@ -278,6 +279,7 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     if is_first_boot().await {
         //install_prepacked_drivers();
     }
+    GLOBAL_WINDOW.stop_and_persist().await;
     Ok(())
 }
 

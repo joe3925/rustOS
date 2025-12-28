@@ -156,13 +156,12 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
+    GLOBAL_WINDOW.start();
     spawn(async move {
         install_prepacked_drivers().await;
 
         PNP_MANAGER.init_from_registry().await;
     });
-    wait_millis_idle(25000);
-    GLOBAL_WINDOW.start();
     println!("");
 }
 #[inline(always)]

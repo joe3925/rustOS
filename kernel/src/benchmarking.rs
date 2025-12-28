@@ -940,6 +940,7 @@ impl BenchWindow {
             spawn_blocking(move || {
                 interrupt_index::wait_duration(timeout_ms);
                 this.stop();
+                block_on(this.persist());
             });
         }
 
@@ -963,7 +964,11 @@ impl BenchWindow {
             }
         }
     }
-
+    pub async fn stop_and_persist(&self) {
+        self.stop();
+        let this = self.clone();
+        this.persist().await
+    }
     pub fn stop(&self) {
         if !BENCH_ENABLED {
             return;
@@ -1140,6 +1145,7 @@ impl Drop for BenchWindow {
             return;
         }
 
+        let mut do_flush = false;
         let mut dec_metrics = false;
 
         {
@@ -1147,10 +1153,18 @@ impl Drop for BenchWindow {
             if inner.running && inner.cfg.end_on_drop {
                 inner.running = false;
                 inner.stop_ns = Some(bench_now_ns());
+                do_flush = true;
             }
             if inner.cfg.log_mem_on_persist {
                 dec_metrics = true;
             }
+        }
+
+        if do_flush {
+            let this = self.clone();
+            spawn_blocking(move || {
+                block_on(this.persist());
+            });
         }
 
         if dec_metrics {
