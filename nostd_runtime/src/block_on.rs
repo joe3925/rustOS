@@ -1,56 +1,54 @@
+// block_on.rs
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::task::Wake;
 use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use crate::task_yield;
+use crate::yield_now;
 
-#[repr(C)]
-struct ThreadNotify {
+pub struct ThreadNotify {
     ready: AtomicBool,
 }
 
 impl ThreadNotify {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ready: AtomicBool::new(false),
         }
     }
+
+    pub fn take_ready(&self) -> bool {
+        self.ready.swap(false, Ordering::AcqRel)
+    }
 }
 
-// We implement the standard Wake trait to easily create a Waker from an Arc.
 impl Wake for ThreadNotify {
     fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
+        self.ready.store(true, Ordering::Release);
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        // Signal that the future is ready to proceed.
-
         self.ready.store(true, Ordering::Release);
     }
 }
 
-/// Runs a future to completion on the current thread.
-///
-/// This function will block the caller until the given future has resolved.
-/// It yields the CPU (via `hlt`) while waiting for interrupts/signals.
-///
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut pinned = Box::pin(future);
-
     let notify = Arc::new(ThreadNotify::new());
     let waker = Waker::from(notify.clone());
     let mut cx = Context::from_waker(&waker);
 
     loop {
-        match pinned.as_mut().poll(&mut cx) {
+        match Pin::new(&mut pinned).as_mut().poll(&mut cx) {
             Poll::Ready(out) => return out,
-            Poll::Pending => unsafe {
-                //task_yield();
-            },
+            Poll::Pending => {
+                if !notify.take_ready() {
+                    yield_now();
+                }
+            }
         }
     }
 }
