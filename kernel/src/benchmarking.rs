@@ -506,24 +506,38 @@ fn join_path2(a: &str, b: &str) -> String {
     }
 }
 
-fn parse_session_suffix(entry: &str) -> Option<u32> {
-    if !entry.starts_with("session_") {
-        return None;
+fn basename(mut s: &str) -> &str {
+    loop {
+        match s.rfind(['\\', '/']) {
+            Some(i) => s = &s[i + 1..],
+            None => break,
+        }
     }
-    let rest = &entry[8..];
-    rest.parse::<u32>().ok()
+    while s.ends_with('\\') || s.ends_with('/') {
+        s = &s[..s.len() - 1];
+    }
+    s
 }
 
-fn ensure_session(root: &str) -> BenchSessionInfo {
-    let mut reg = session_registry().lock();
+fn parse_session_suffix(entry: &str) -> Option<u32> {
+    let name = basename(entry);
+    if !name.starts_with("session_") {
+        return None;
+    }
+    name[8..].parse::<u32>().ok()
+}
 
-    if let Some(info) = reg.get(root) {
-        return info.clone();
+async fn ensure_session_async(root: &str) -> BenchSessionInfo {
+    {
+        let reg = session_registry().lock();
+        if let Some(info) = reg.get(root) {
+            return info.clone();
+        }
     }
 
-    let _ = block_on(File::make_dir(root.to_string()));
+    let _ = File::make_dir(root.to_string()).await;
 
-    let entries = block_on(File::list_dir(root)).unwrap_or_else(|_| Vec::new());
+    let entries = File::list_dir(root).await.unwrap_or_else(|_| Vec::new());
     let mut max_id: u32 = 0;
     for e in entries {
         if let Some(id) = parse_session_suffix(&e) {
@@ -536,41 +550,44 @@ fn ensure_session(root: &str) -> BenchSessionInfo {
     let new_id = max_id.saturating_add(1);
     let session_dir = join_path2(root, &format!("session_{new_id}"));
 
-    let _ = block_on(File::make_dir(session_dir.clone()));
-    let _ = block_on(File::make_dir(join_path2(&session_dir, "cores")));
-    let _ = block_on(File::make_dir(join_path2(&session_dir, "avg")));
-    let _ = block_on(File::make_dir(join_path2(
-        &join_path2(&session_dir, "avg"),
-        "windows",
-    )));
+    let _ = File::make_dir(session_dir.clone()).await;
+    let _ = File::make_dir(join_path2(&session_dir, "cores")).await;
+    let _ = File::make_dir(join_path2(&session_dir, "avg")).await;
+    let _ = File::make_dir(join_path2(&join_path2(&session_dir, "avg"), "windows")).await;
 
     let ncores = bench_ncores();
     for i in 0..ncores {
         let core_dir = join_path2(&join_path2(&session_dir, "cores"), &format!("core-{i}"));
-        let _ = block_on(File::make_dir(core_dir.clone()));
-        let _ = block_on(File::make_dir(join_path2(&core_dir, "windows")));
+        let _ = File::make_dir(core_dir.clone()).await;
+        let _ = File::make_dir(join_path2(&core_dir, "windows")).await;
     }
 
     let info = BenchSessionInfo {
         session_dir,
         ncores,
     };
+
+    let mut reg = session_registry().lock();
     reg.insert(root.to_string(), info.clone());
     info
 }
 
-fn compute_next_window_suffix(windows_root_avg: &str, name: &str) -> u32 {
-    let entries = block_on(File::list_dir(windows_root_avg)).unwrap_or_else(|_| Vec::new());
+async fn compute_next_window_suffix_async(windows_root_avg: &str, name: &str) -> u32 {
+    let entries = File::list_dir(windows_root_avg)
+        .await
+        .unwrap_or_else(|_| Vec::new());
     let mut has_base = false;
     let mut max_suffix: u32 = 0;
 
     for entry in entries {
-        if entry == name {
+        let e = basename(&entry);
+
+        if e == name {
             has_base = true;
             continue;
         }
-        if entry.starts_with(name) {
-            let rest = &entry[name.len()..];
+        if e.starts_with(name) {
+            let rest = &e[name.len()..];
             if rest.starts_with('-') {
                 let suffix = &rest[1..];
                 if let Ok(n) = suffix.parse::<u32>() {
@@ -588,8 +605,7 @@ fn compute_next_window_suffix(windows_root_avg: &str, name: &str) -> u32 {
         max_suffix.saturating_add(1).max(1)
     }
 }
-
-fn allocate_window_name(session_dir: &str, name: &str, ncores: usize) -> String {
+async fn allocate_window_name_async(session_dir: &str, name: &str, ncores: usize) -> String {
     let windows_avg = join_path2(&join_path2(session_dir, "avg"), "windows");
 
     let mut reg = window_dir_registry().lock();
@@ -600,7 +616,7 @@ fn allocate_window_name(session_dir: &str, name: &str, ncores: usize) -> String 
 
     let suffix = match reg.get(&key).copied() {
         Some(v) => v,
-        None => compute_next_window_suffix(&windows_avg, name),
+        None => compute_next_window_suffix_async(&windows_avg, name).await,
     };
 
     let window_dir = if suffix == 0 {
@@ -610,9 +626,10 @@ fn allocate_window_name(session_dir: &str, name: &str, ncores: usize) -> String 
     };
 
     reg.insert(key, suffix.saturating_add(1));
+    drop(reg);
 
     let avg_win = join_path2(&windows_avg, &window_dir);
-    let _ = block_on(File::make_dir(avg_win));
+    let _ = File::make_dir(avg_win).await;
 
     for i in 0..ncores {
         let core_windows = join_path2(
@@ -620,12 +637,11 @@ fn allocate_window_name(session_dir: &str, name: &str, ncores: usize) -> String 
             "windows",
         );
         let core_win = join_path2(&core_windows, &window_dir);
-        let _ = block_on(File::make_dir(core_win));
+        let _ = File::make_dir(core_win).await;
     }
 
     window_dir
 }
-
 fn window_path_for_target(
     session_dir: &str,
     window_dir: &str,
@@ -885,10 +901,13 @@ impl BenchWindowInner {
         self.open_spans.clear();
     }
 }
-
+const INIT_UNINIT: u32 = 0;
+const INIT_IN_PROGRESS: u32 = 1;
+const INIT_READY: u32 = 2;
 #[derive(Clone)]
 pub struct BenchWindow {
     inner: Arc<Mutex<BenchWindowInner>>,
+    init_state: Arc<AtomicU32>,
 }
 
 impl BenchWindow {
@@ -897,6 +916,7 @@ impl BenchWindow {
             let inner = BenchWindowInner::new(cfg, String::new(), String::new(), 1);
             return BenchWindow {
                 inner: Arc::new(Mutex::new(inner)),
+                init_state: Arc::new(AtomicU32::new(INIT_READY)),
             };
         }
 
@@ -904,17 +924,53 @@ impl BenchWindow {
             METRICS_REFCOUNT.fetch_add(1, Ordering::Relaxed);
         }
 
-        let root = cfg.folder;
-        let session = ensure_session(root);
-        let window_dir = allocate_window_name(&session.session_dir, cfg.name, session.ncores);
-
-        let inner = BenchWindowInner::new(cfg, session.session_dir, window_dir, session.ncores);
+        let ncores = bench_ncores();
+        let inner = BenchWindowInner::new(cfg, String::new(), String::new(), ncores);
 
         BenchWindow {
             inner: Arc::new(Mutex::new(inner)),
+            init_state: Arc::new(AtomicU32::new(INIT_UNINIT)),
         }
     }
+    async fn ensure_fs_ready(&self) -> bool {
+        if self.init_state.load(Ordering::Acquire) == INIT_READY {
+            return true;
+        }
 
+        if self
+            .init_state
+            .compare_exchange(
+                INIT_UNINIT,
+                INIT_IN_PROGRESS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let (folder, name, ncores) = {
+            let inner = self.inner.lock();
+            (inner.cfg.folder, inner.cfg.name, inner.ncores)
+        };
+
+        let session = ensure_session_async(folder).await;
+        let window_dir =
+            allocate_window_name_async(&session.session_dir, name, session.ncores).await;
+
+        {
+            let mut inner = self.inner.lock();
+            if inner.session_dir.is_empty() {
+                inner.session_dir = session.session_dir;
+                inner.window_dir = window_dir;
+                inner.ncores = session.ncores;
+            }
+        }
+
+        self.init_state.store(INIT_READY, Ordering::Release);
+        true
+    }
     pub fn start(&self) {
         if !BENCH_ENABLED {
             return;
@@ -996,7 +1052,9 @@ impl BenchWindow {
         if !BENCH_ENABLED {
             return;
         }
-
+        if !self.ensure_fs_ready().await {
+            return;
+        }
         let cfg: BenchWindowConfig;
         let run_id: u32;
         let start_ns: u64;
