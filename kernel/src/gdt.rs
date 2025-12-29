@@ -10,7 +10,7 @@ use x86_64::VirtAddr;
 use crate::cpu::get_cpu_info;
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::memory::paging::paging::align_up_2mib;
-use crate::memory::paging::stack::allocate_kernel_stack;
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::structs::per_core_storage::PCS;
 
@@ -56,10 +56,10 @@ impl GDTTracker {
         let kernel_stack_size = align_up_2mib(KERNEL_STACK_SIZE);
         // Stacks
         let timer_stack =
-            allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc timer stack");
 
         let privilege_stack =
-            allocate_kernel_stack(kernel_stack_size).expect("Failed to alloc privilege stack ");
+            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc privilege stack ");
 
         let double_fault_stack = {
             let stack_end =

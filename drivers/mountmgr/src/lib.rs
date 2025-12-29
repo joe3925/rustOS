@@ -23,7 +23,7 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt, RequestResultExt,
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult},
     kernel_types::{
@@ -32,10 +32,10 @@ use kernel_api::{
         pnp::DeviceIds,
     },
     pnp::{
-        PnpMinorFunction, PnpVtable, driver_set_evt_device_add, pnp_create_control_device_and_link,
-        pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
-        pnp_create_symlink, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
-        pnp_send_request_via_symlink,
+        DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
+        pnp_create_control_device_and_link, pnp_create_device_symlink_top,
+        pnp_create_devnode_over_pdo_with_function, pnp_create_symlink, pnp_ioctl_via_symlink,
+        pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink,
     },
     println,
     reg::{self, switch_to_vfs_async},
@@ -115,7 +115,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "win64" fn volclass_device_add(
     _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStatus {
+) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, volclass_start);
 
@@ -134,18 +134,15 @@ pub extern "win64" fn volclass_device_add(
     dev_init.set_dev_ext_default::<VolFdoExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn volclass_start(
-    dev: Arc<DeviceObject>,
-    _request: Arc<RwLock<Request>>,
-) -> DriverStatus {
+pub async fn volclass_start(dev: Arc<DeviceObject>, _request: Arc<RwLock<Request>>) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
     spawn(mount_if_unmounted(dev));
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 
 #[request_handler]
@@ -153,8 +150,8 @@ pub async fn vol_fdo_read(
     _dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
     _buf_len: usize,
-) -> DriverStatus {
-    DriverStatus::Continue
+) -> DriverStep {
+    DriverStep::Continue
 }
 
 #[request_handler]
@@ -162,19 +159,19 @@ pub async fn vol_fdo_write(
     _dev: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
     _buf_len: usize,
-) -> DriverStatus {
-    DriverStatus::Continue
+) -> DriverStep {
+    DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let code = {
         let r = req.read();
         match r.kind {
             RequestType::DeviceControl(c) => c,
             _ => {
                 drop(r);
-                return DriverStatus::NotImplemented;
+                return DriverStep::complete(DriverStatus::NotImplemented);
             }
         }
     };
@@ -195,39 +192,36 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
-            DriverStatus::Success
+            DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
             w.data = build_status_blob(&dev);
-            DriverStatus::Success
+            DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev).await;
-            DriverStatus::Success
+            DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
             w.data = list_fs_blob();
-            DriverStatus::Success
+            DriverStep::complete(DriverStatus::Success)
         }
-        _ => DriverStatus::NotImplemented,
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }
 
 #[request_handler]
-pub async fn volclass_ctrl_ioctl(
-    _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+pub async fn volclass_ctrl_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let code = {
         let r = req.read();
         match r.kind {
             RequestType::DeviceControl(c) => c,
             _ => {
                 drop(r);
-                return DriverStatus::NotImplemented;
+                return DriverStep::complete(DriverStatus::NotImplemented);
             }
         }
     };
@@ -249,12 +243,12 @@ pub async fn volclass_ctrl_ioctl(
                         let _ = refresh_fs_registry_from_registry().await;
                         spawn(rescan_all_volumes());
                     }
-                    DriverStatus::Success
+                    DriverStep::complete(DriverStatus::Success)
                 }
-                _ => DriverStatus::InvalidParameter,
+                _ => DriverStep::complete(DriverStatus::InvalidParameter),
             }
         }
-        _ => DriverStatus::NotImplemented,
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -331,9 +325,9 @@ async fn try_bind_filesystems_for_parent_fdo(
     };
     let class = Some("FileSystem".to_string());
 
-    let vol_target = Arc::new(IoTarget {
+    let vol_target = IoTarget {
         target_device: parent_fdo.clone(),
-    });
+    };
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
@@ -353,9 +347,8 @@ async fn try_bind_filesystems_for_parent_fdo(
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        let err = pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone())
-            .resolve()
-            .await;
+        let err =
+            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone()).await;
         if err != DriverStatus::Success {
             return false;
         }
@@ -525,11 +518,7 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
-    let err = unsafe {
-        pnp_send_request_via_symlink(public_link.to_string(), req.clone())
-            .resolve()
-            .await
-    };
+    let err = unsafe { pnp_send_request_via_symlink(public_link.to_string(), req.clone()).await };
 
     let mut r = req.write();
     if r.status != DriverStatus::Success || r.data.len() != size_of::<FsOpenResult>() {

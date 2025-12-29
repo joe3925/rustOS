@@ -13,7 +13,7 @@ use kernel_api::kernel_types::io::{
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::pnp::{
-    DeviceRelationType, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
+    DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
     pnp_send_request_to_stack_top,
 };
@@ -50,7 +50,7 @@ pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverSt
 pub extern "win64" fn partmgr_device_add(
     _driver: Arc<DriverObject>,
     init: &mut DeviceInit,
-) -> DriverStatus {
+) -> DriverStep {
     init.set_dev_ext_default::<PartMgrExt>();
 
     let mut pnp = PnpVtable::new();
@@ -61,7 +61,7 @@ pub extern "win64" fn partmgr_device_add(
     );
     init.pnp_vtable = Some(pnp);
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[repr(C)]
@@ -88,10 +88,10 @@ struct PartDevExt {
 async fn partition_pdo_query_resources(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
-) -> DriverStatus {
+) -> DriverStep {
     let mut w = request.write();
     let Some(pnp) = w.pnp.as_mut() else {
-        return DriverStatus::Success;
+        return DriverStep::complete(DriverStatus::Success);
     };
 
     let dx = ext::<PartDevExt>(&device);
@@ -100,7 +100,7 @@ async fn partition_pdo_query_resources(
         pnp.blob_out = bytes.into_vec();
     }
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 async fn send_req_parent(
@@ -115,9 +115,10 @@ async fn send_req_parent(
             .unwrap()
             .parent
             .get()
-            .unwrap(),
+            .unwrap()
+            .clone(),
         req.clone(),
-    )?
+    )
     .await;
 
     let g = req.read();
@@ -132,59 +133,51 @@ pub async fn partition_pdo_read(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
     buf_len: usize,
-) -> DriverStatus {
+) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
-    let (off, want) = {
+
+    let off = {
         let r = request.read();
         match r.kind {
-            RequestType::Read { offset, len } => (offset, len),
-            _ => {
-                drop(r);
-                return DriverStatus::InvalidParameter;
+            RequestType::Read { offset, len } => {
+                if buf_len != len || (offset & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
+                if (offset as u64) + (buf_len as u64) > part_bytes {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                offset
             }
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
 
-    if buf_len != want || (off & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
-        return DriverStatus::InvalidParameter;
-    }
-    let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-    if (off as u64) + (buf_len as u64) > part_bytes {
-        return DriverStatus::InvalidParameter;
-    }
-
     let phys_off = off + ((start_lba as u64) << 9);
 
-    let buf = {
+    {
         let mut w = request.write();
-        mem::take(&mut w.data)
-    };
-
-    let child_req = Request::new(
-        RequestType::Read {
+        w.kind = RequestType::Read {
             offset: phys_off,
             len: buf_len,
-        },
-        buf,
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+        };
+    }
 
-    let child_req_arc = Arc::new(RwLock::new(child_req));
+    let status = send_req_parent(&device, request.clone()).await;
 
-    let res = send_req_parent(&device, child_req_arc.clone()).await;
+    {
+        let mut w = request.write();
+        w.kind = RequestType::Read {
+            offset: off,
+            len: buf_len,
+        };
+    }
 
-    let mut c = child_req_arc.write();
-    let returned_buf = mem::take(&mut c.data);
-    drop(c);
-
-    let mut w = request.write();
-    w.data = returned_buf;
-
-    match res {
-        Ok(()) => DriverStatus::Success,
-        Err(st) => st,
+    match status {
+        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Err(st) => DriverStep::complete(st),
     }
 }
 
@@ -193,51 +186,56 @@ pub async fn partition_pdo_write(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
     buf_len: usize,
-) -> DriverStatus {
+) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
-    let (off, want) = {
+
+    let off = {
         let r = request.read();
         match r.kind {
-            RequestType::Write { offset, len } => (offset, len),
-            _ => {
-                drop(r);
-                return DriverStatus::InvalidParameter;
+            RequestType::Write { offset, len } => {
+                if buf_len != len || (offset & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
+                if (offset as u64) + (buf_len as u64) > part_bytes {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                offset
             }
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
 
-    if buf_len != want || (off & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
-        return DriverStatus::InvalidParameter;
-    }
-    let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-    if (off as u64) + (buf_len as u64) > part_bytes {
-        return DriverStatus::InvalidParameter;
-    }
-
     let phys_off = off + ((start_lba as u64) << 9);
-    let moved = {
+
+    {
         let mut w = request.write();
-        mem::take(&mut w.data)
-    };
-    let child_req = Request::new(
-        RequestType::Write {
+        w.kind = RequestType::Write {
             offset: phys_off,
             len: buf_len,
-        },
-        moved,
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+        };
+    }
 
-    match send_req_parent(&device, Arc::new(RwLock::new(child_req))).await {
-        Ok(_) => DriverStatus::Success,
-        Err(st) => st,
+    let status = send_req_parent(&device, request.clone()).await;
+
+    {
+        let mut w = request.write();
+        w.kind = RequestType::Write {
+            offset: off,
+            len: buf_len,
+        };
+    }
+
+    match status {
+        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Err(st) => DriverStep::complete(st),
     }
 }
 
 #[request_handler]
-pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let mut dx = ext::<PartMgrExt>(&dev);
 
     let parent = Arc::new(RwLock::new(
@@ -247,7 +245,7 @@ pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) ->
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    pnp_forward_request_to_next_lower(&dev, parent.clone())?.await;
+    pnp_forward_request_to_next_lower(dev.clone(), parent.clone()).await;
 
     let (st, data) = {
         let g = parent.read();
@@ -258,7 +256,7 @@ pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) ->
         dx.disk_info.call_once(|| data.into_vec());
     }
 
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 
 async fn read_from_lower_async(
@@ -273,7 +271,7 @@ async fn read_from_lower_async(
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
-    pnp_forward_request_to_next_lower(dev, child.clone())?.await;
+    pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
     let g = child.read();
     if g.status == DriverStatus::Success {
         Ok(g.data.clone())
@@ -286,10 +284,10 @@ async fn read_from_lower_async(
 pub async fn partmgr_pnp_query_devrels(
     device: Arc<DeviceObject>,
     request: Arc<RwLock<Request>>,
-) -> DriverStatus {
+) -> DriverStep {
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != DeviceRelationType::BusRelations {
-        return DriverStatus::NotImplemented;
+        return DriverStep::complete(DriverStatus::NotImplemented);
     }
 
     let pmx = ext::<PartMgrExt>(&device);
@@ -298,42 +296,42 @@ pub async fn partmgr_pnp_query_devrels(
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
 
     let di = if let Some(ref buf) = pmx.disk_info.get() {
         if buf.len() == core::mem::size_of::<DiskInfo>() {
             unsafe { ptr::read_unaligned(buf.as_ptr() as *const DiskInfo) }
         } else {
-            return DriverStatus::Continue;
+            return DriverStep::Continue;
         }
     } else {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     };
 
     let sec_sz_u32 = di.logical_block_size;
     if sec_sz_u32 == 0 {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
     let sec_sz = sec_sz_u32 as usize;
     let hdr_bytes = match read_from_lower_async(&device, sec_sz as u64, sec_sz).await {
         Ok(b) => b,
         Err(st) => {
-            return st;
+            return DriverStep::complete(st);
         }
     };
 
     if hdr_bytes.len() < core::mem::size_of::<GptHeader>() {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
 
     let hdr: GptHeader = unsafe { ptr::read_unaligned(hdr_bytes.as_ptr() as *const GptHeader) };
 
     if &hdr.signature != b"EFI PART" {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
     if hdr.partition_entry_size != 128 || hdr.num_partition_entries == 0 {
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
 
     let total_bytes = (hdr.num_partition_entries as usize) * (hdr.partition_entry_size as usize);
@@ -347,14 +345,14 @@ pub async fn partmgr_pnp_query_devrels(
     {
         Ok(b) => b,
         Err(st) => {
-            return st;
+            return DriverStep::complete(st);
         }
     };
 
     let parent_dn = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return DriverStatus::DeviceNotReady;
+            return DriverStep::complete(DriverStatus::DeviceNotReady);
         }
     };
 
@@ -436,7 +434,7 @@ pub async fn partmgr_pnp_query_devrels(
 
         found_count += 1;
     }
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 
 #[inline]

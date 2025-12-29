@@ -11,6 +11,7 @@ use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32},
 };
+use kernel_api::pnp::DriverStep;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
@@ -247,7 +248,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "win64" fn disk_device_add(
     _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStatus {
+) -> DriverStep {
     dev_init
         .io_vtable
         .set(IoType::Read(disk_read), Synchronization::Sync, 0);
@@ -258,7 +259,7 @@ pub extern "win64" fn disk_device_add(
         .io_vtable
         .set(IoType::DeviceControl(disk_ioctl), Synchronization::Sync, 0);
     dev_init.set_dev_ext_default::<DiskExt>();
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 #[repr(C)]
 struct DiskReadCtx {
@@ -304,31 +305,31 @@ pub async fn disk_read(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
-) -> DriverStatus {
+) -> DriverStep {
     let (off, total) = {
         let g = parent.read();
         match g.kind {
             RequestType::Read { offset, len } => (offset, len),
             _ => {
                 drop(g);
-                return DriverStatus::InvalidParameter;
+                return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         }
     };
 
     if total == 0 {
-        return DriverStatus::Success;
+        return DriverStep::complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
-            return st;
+            return DriverStep::complete(st);
         }
     }
 
     if !rw_validate(&dx, off, total) {
-        return DriverStatus::InvalidParameter;
+        return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     {
@@ -336,7 +337,7 @@ pub async fn disk_read(
         let n = core::cmp::min(total, p.data.len());
         if n != 0 && cache_try_read(&dx, off, n, &mut p.data[..n]) {
             p.status = DriverStatus::Success;
-            return DriverStatus::Success;
+            return DriverStep::complete(DriverStatus::Success);
         }
 
         let ctx = Box::new(DiskReadCtx {
@@ -348,7 +349,7 @@ pub async fn disk_read(
         p.traversal_policy = TraversalPolicy::ForwardLower;
     }
 
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 
 #[request_handler]
@@ -356,31 +357,31 @@ pub async fn disk_write(
     dev: Arc<DeviceObject>,
     parent: Arc<RwLock<Request>>,
     _buf_len: usize,
-) -> DriverStatus {
+) -> DriverStep {
     let (off, total) = {
         let g = parent.read();
         match g.kind {
             RequestType::Write { offset, len } => (offset, len),
             _ => {
                 drop(g);
-                return DriverStatus::InvalidParameter;
+                return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         }
     };
 
     if total == 0 {
-        return DriverStatus::Success;
+        return DriverStep::complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
-            return st;
+            return DriverStep::complete(st);
         }
     }
 
     if !rw_validate(&dx, off, total) {
-        return DriverStatus::InvalidParameter;
+        return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     {
@@ -394,13 +395,13 @@ pub async fn disk_write(
         p.traversal_policy = TraversalPolicy::ForwardLower;
     }
 
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 #[request_handler]
-pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStep {
     let code = match parent.read().kind {
         RequestType::DeviceControl(c) => c,
-        _ => return DriverStatus::InvalidParameter,
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
     match code {
@@ -423,7 +424,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
 
             let ch = Arc::new(RwLock::new(ch));
 
-            pnp_forward_request_to_next_lower(&dev, ch.clone())?.await;
+            pnp_forward_request_to_next_lower(dev, ch.clone()).await;
 
             let blob = {
                 let r = ch.read();
@@ -435,7 +436,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
 
             let mut w = parent.write();
             w.data = blob.into_boxed_slice();
-            DriverStatus::Success
+            DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_BLOCK_FLUSH => {
             let dx = disk_ext(&dev);
@@ -445,15 +446,17 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
             let child = Arc::new(RwLock::new(req_child));
 
-            pnp_forward_request_to_next_lower(&dev, child.clone())?.await?;
-
+            let status = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
+            if status != DriverStatus::Success {
+                return DriverStep::complete(status);
+            }
             let st = child.read().status;
             if st == DriverStatus::Success {
                 cache_clear(&dx);
             }
-            st
+            DriverStep::complete(st)
         }
-        _ => DriverStatus::NotImplemented,
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -490,7 +493,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     );
     let ch = Arc::new(RwLock::new(ch));
 
-    pnp_forward_request_to_next_lower(dev, ch.clone())?.await;
+    pnp_forward_request_to_next_lower(dev.clone(), ch.clone()).await;
 
     let c = ch.read();
     if c.status != DriverStatus::Success {

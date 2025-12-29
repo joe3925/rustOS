@@ -1,5 +1,6 @@
 use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
+use crate::pnp::DriverStep;
 use crate::request::{Request, RequestType};
 use crate::status::DriverStatus;
 use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
@@ -54,7 +55,7 @@ pub struct PartitionInfo {
 
 #[repr(C)]
 pub struct FsIdentify {
-    pub volume_fdo: Arc<IoTarget>,
+    pub volume_fdo: IoTarget,
     pub mount_device: Option<Arc<DeviceObject>>,
     pub can_mount: bool,
 }
@@ -98,7 +99,7 @@ impl IoType {
     }
 
     #[inline]
-    pub async fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+    pub async fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
                 let len = req.read().data.len();

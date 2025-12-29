@@ -3,6 +3,7 @@ use crate::export;
 use crate::file_system::file::File;
 use crate::function;
 use crate::get_rva;
+use crate::idt::*;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::tables::virt_to_phys;
@@ -44,6 +45,17 @@ export! {
 
     kernel_alloc,
     kernel_free,
+    kernel_irq_register,
+    kernel_irq_signal,
+    kernel_irq_signal_n,
+    irq_handle_create,
+    irq_handle_clone,
+    irq_handle_drop,
+    irq_handle_unregister,
+    irq_handle_is_closed,
+    irq_handle_set_user_ctx,
+    irq_handle_get_user_ctx,
+    irq_handle_wait_ffi,
 
     file_open,
     fs_list_dir,
@@ -52,7 +64,6 @@ export! {
 
     pnp_create_pdo,
     pnp_bind_and_start,
-    pnp_forward_request_to_next_lower,
     pnp_get_device_target,
     pnp_complete_request,
     pnp_queue_dpc,
@@ -69,7 +80,8 @@ export! {
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
-    pnp_send_request_to_next_upper,
+    pnp_forward_request_to_next_lower,
+    pnp_forward_request_to_next_upper,
     pnp_send_request_to_stack_top,
     InvalidateDeviceRelations,
 

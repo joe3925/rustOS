@@ -1,10 +1,7 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
     arch::asm,
-    future::Future,
-    pin::Pin,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-    task::{Context, Poll, Waker},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use acpi::{AcpiTable, AcpiTables};
@@ -13,7 +10,6 @@ use alloc::{
     collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
-    task::Wake,
     vec::Vec,
 };
 use kernel_types::{
@@ -23,13 +19,13 @@ use kernel_types::{
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::OpenFlags,
+    irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
-    request::{Request, RequestFuture},
+    request::Request,
     status::{Data, DriverStatus, FileStatus, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once, RwLock};
-use x86_64::instructions::hlt;
 
 use crate::{
     benchmarking::{
@@ -37,24 +33,21 @@ use crate::{
     },
     console::CONSOLE,
     drivers::{
-        drive::vfs::Vfs,
         driver_install::DriverError,
         interrupt_index::{current_cpu_id, wait_millis},
         pnp::{
-            manager::{PnpManager, PNP_MANAGER},
+            manager::PNP_MANAGER,
             request::{DpcFn, IoTarget},
         },
-        ACPI::{ACPIImpl, ACPI, ACPI_TABLES},
+        ACPI::{ACPIImpl, ACPI_TABLES},
     },
-    file_system::{
-        file::{switch_to_vfs, File},
-        file_provider::install_file_provider,
+    file_system::file::{self, File},
+    idt::{irq_register, irq_signal, irq_signal_n},
+    memory::{
+        allocator::ALLOCATOR,
+        paging::{constants::KERNEL_STACK_SIZE, stack::StackSize},
     },
-    memory::{allocator::ALLOCATOR, paging::constants::KERNEL_STACK_SIZE},
-    registry::{
-        reg::{self, rebind_and_persist_after_provider_switch},
-        RegDelta,
-    },
+    registry::reg,
     scheduling::{
         self,
         global_async::GlobalAsyncExecutor,
@@ -72,7 +65,7 @@ pub extern "win64" fn create_kernel_task(
     ctx: usize,
     name: String,
 ) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, KERNEL_STACK_SIZE, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
     SCHEDULER.add_task(task)
 }
 
@@ -106,7 +99,20 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
         GlobalAlloc::dealloc(&ALLOCATOR, ptr, layout);
     };
 }
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+    unsafe { irq_register(vector, isr, ctx) }
+}
 
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
+    unsafe { irq_signal(handle, meta) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
+    unsafe { irq_signal_n(handle, meta, n) }
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn print(str: &str) {
     CONSOLE.lock().print(str.as_bytes());
@@ -234,22 +240,30 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_forward_request_to_next_lower(
-    from: &Arc<DeviceObject>,
+    from: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.send_request_to_next_lower(from, req)
+) -> FfiFuture<DriverStatus> {
+    PNP_MANAGER.send_request_to_next_lower(from, req).into_ffi()
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_forward_request_to_next_upper(
+    from: Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> FfiFuture<DriverStatus> {
+    PNP_MANAGER.send_request_to_next_upper(from, req).into_ffi()
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_send_request(
-    target: &IoTarget,
+    target: IoTarget,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.send_request(target, req)
+) -> FfiFuture<DriverStatus> {
+    PNP_MANAGER.send_request(target, req).into_ffi()
 }
 
-pub extern "win64" fn pnp_complete_request(req: &Arc<RwLock<Request>>) {
-    PNP_MANAGER.complete_request(req);
+pub extern "win64" fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus {
+    PNP_MANAGER.complete_request(&req)
 }
 
 pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
@@ -304,14 +318,21 @@ pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
 
 #[no_mangle]
 pub extern "win64" fn InvalidateDeviceRelations(
-    device: &Arc<DeviceObject>,
+    device: Arc<DeviceObject>,
     relation: DeviceRelationType,
-) -> Result<RequestFuture, DriverStatus> {
-    let mgr = &*PNP_MANAGER;
-    let Some(dn) = device.dev_node.get() else {
-        return Err(DriverStatus::NoSuchDevice);
-    };
-    mgr.invalidate_device_relations_for_node(&dn.upgrade().unwrap(), relation)
+) -> FfiFuture<DriverStatus> {
+    async move {
+        let Some(dn) = device.dev_node.get() else {
+            return DriverStatus::NoSuchDevice;
+        };
+        let Some(up) = dn.upgrade() else {
+            return DriverStatus::NoSuchDevice;
+        };
+        PNP_MANAGER
+            .invalidate_device_relations_for_node(&up, relation)
+            .await
+    }
+    .into_ffi()
 }
 
 #[inline]
@@ -358,8 +379,10 @@ pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
 pub extern "win64" fn pnp_send_request_via_symlink(
     link_path: String,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.send_request_via_symlink(link_path, req)
+) -> FfiFuture<DriverStatus> {
+    PNP_MANAGER
+        .send_request_via_symlink(link_path, req)
+        .into_ffi()
 }
 
 #[unsafe(no_mangle)]
@@ -367,8 +390,10 @@ pub extern "win64" fn pnp_ioctl_via_symlink(
     link_path: String,
     control_code: u32,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.ioctl_via_symlink(link_path, control_code, req)
+) -> FfiFuture<DriverStatus> {
+    PNP_MANAGER
+        .ioctl_via_symlink(link_path, control_code, req)
+        .into_ffi()
 }
 
 #[unsafe(no_mangle)]
@@ -414,12 +439,8 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
     init_pdo: DeviceInit,
 ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>> {
     let parent_dn = parent_dn.clone();
-    let instance_path = instance_path;
-    let ids = ids;
-    let class = class;
     let function_service = function_service.to_string();
     let function_fdo = function_fdo.clone();
-    let init_pdo = init_pdo;
 
     async move {
         PNP_MANAGER
@@ -437,20 +458,17 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
     .into_ffi()
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request_to_next_upper(
-    from: &Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.send_request_to_next_upper(from, req)
-}
-
 #[no_mangle]
 pub extern "win64" fn pnp_send_request_to_stack_top(
-    dev_node_weak: &alloc::sync::Weak<DevNode>,
+    dev_node_weak: alloc::sync::Weak<DevNode>,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    PNP_MANAGER.send_request_to_stack_top(dev_node_weak, req)
+) -> FfiFuture<DriverStatus> {
+    async move {
+        PNP_MANAGER
+            .send_request_to_stack_top(&dev_node_weak, req)
+            .await
+    }
+    .into_ffi()
 }
 
 #[no_mangle]
@@ -481,8 +499,9 @@ pub unsafe extern "win64" fn task_yield() {
 }
 
 pub unsafe extern "win64" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
-    switch_to_vfs().into_ffi()
+    file::switch_to_vfs().into_ffi()
 }
+
 #[no_mangle]
 pub extern "win64" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
     scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
@@ -594,6 +613,7 @@ pub extern "win64" fn bench_kernel_span_end(
 ) {
     bench_log_span_end(span_id.0, tag, object_id.0);
 }
+
 #[no_mangle]
 pub extern "win64" fn get_current_cpu_id() -> usize {
     current_cpu_id()

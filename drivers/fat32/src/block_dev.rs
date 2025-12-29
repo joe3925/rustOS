@@ -17,7 +17,7 @@ use kernel_api::{
 
 #[derive(Clone)]
 pub struct BlockDev {
-    volume: Arc<IoTarget>,
+    volume: IoTarget,
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
@@ -40,7 +40,7 @@ impl IoBase for BlockDev {
 }
 
 impl BlockDev {
-    pub fn new(volume: Arc<IoTarget>, sector_size: u16, total_sectors: u64) -> Self {
+    pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
         Self {
             volume,
             sector_size,
@@ -92,13 +92,13 @@ impl BlockDev {
             // Full-sector aligned read: read directly into dst (no temp buffer).
             let sectors_exact = to_read / bps;
             let buf = &mut dst[..to_read];
-            read_sectors_async(&self.volume, start_lba, sectors_exact, bps, buf)
+            read_sectors_async(self.volume.clone(), start_lba, sectors_exact, bps, buf)
                 .await
                 .map_err(BlkError::from)?;
         } else {
             // Unaligned: need a sector-sized buffer covering the entire span.
             let mut tmp = vec![0u8; n_sectors * bps];
-            read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut tmp[..])
+            read_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &mut tmp[..])
                 .await
                 .map_err(BlkError::from)?;
 
@@ -128,18 +128,18 @@ impl BlockDev {
         if head_off == 0 && tail_bytes == 0 {
             let sectors_exact = to_write / bps;
             let buf = &src[..to_write];
-            write_sectors_async(&self.volume, start_lba, sectors_exact, bps, buf)
+            write_sectors_async(self.volume.clone(), start_lba, sectors_exact, bps, buf)
                 .await
                 .map_err(BlkError::from)?;
         } else {
             let mut buf = vec![0u8; n_sectors * bps];
-            read_sectors_async(&self.volume, start_lba, n_sectors, bps, &mut buf[..])
+            read_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &mut buf[..])
                 .await
                 .map_err(BlkError::from)?;
 
             buf[head_off..head_off + to_write].copy_from_slice(&src[..to_write]);
 
-            write_sectors_async(&self.volume, start_lba, n_sectors, bps, &buf[..])
+            write_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &buf[..])
                 .await
                 .map_err(BlkError::from)?;
         }
@@ -193,7 +193,7 @@ impl Seek for BlockDev {
 }
 
 pub async fn read_sectors_async(
-    target: &Arc<IoTarget>,
+    target: IoTarget,
     lba: u64,
     sectors: usize,
     bps: usize,
@@ -219,7 +219,7 @@ pub async fn read_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    pnp_send_request(target.as_ref(), req.clone())?.await;
+    pnp_send_request(target, req.clone()).await;
     let r = req.read();
     if r.status != DriverStatus::Success {
         println!(
@@ -239,7 +239,7 @@ pub async fn read_sectors_async(
 }
 
 pub async fn write_sectors_async(
-    target: &Arc<IoTarget>,
+    target: IoTarget,
     lba: u64,
     sectors: usize,
     bps: usize,
@@ -265,7 +265,7 @@ pub async fn write_sectors_async(
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
 
-    pnp_send_request(&**target, req.clone())?.await;
+    pnp_send_request(target, req.clone()).await;
 
     let status = req.read().status;
     if status == DriverStatus::Success {

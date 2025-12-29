@@ -77,15 +77,15 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 sig,
-                "#[request_handler] function must return DriverStatus",
+                "#[request_handler] function must return DriverStep",
             ));
         }
         ReturnType::Type(_, ty) => {
             let type_str = quote::quote!(#ty).to_string();
-            if !type_str.contains("DriverStatus") {
+            if !type_str.contains("DriverStep") {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[request_handler] function must return DriverStatus",
+                    "#[request_handler] function must return DriverStep",
                 ));
             }
         }

@@ -1,7 +1,7 @@
 // scheduling/task.rs
 use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
-use crate::memory::paging::stack::{allocate_kernel_stack, KERNEL_STACK_ALLOCATOR};
+use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
@@ -28,6 +28,7 @@ pub struct Task {
     pub is_sleeping: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u16>,
+    pub stack_size: StackSize,
 
     sched_in_cycles: AtomicU64,
     last_quantum_cycles: AtomicU64,
@@ -89,6 +90,8 @@ impl Task {
             executer_id: None,
             is_sleeping: false,
 
+            stack_size: StackSize::default(),
+
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
             total_run_cycles: AtomicU64::new(0),
@@ -100,7 +103,7 @@ impl Task {
     pub fn new_kernel_mode(
         entry_point: TaskEntry,
         context: usize,
-        stack_size: u64,
+        stack_size: StackSize,
         name: String,
         parent_pid: u64,
     ) -> TaskHandle {
@@ -146,6 +149,7 @@ impl Task {
             parent_pid,
             executer_id: None,
             is_sleeping: false,
+            stack_size,
 
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
@@ -163,9 +167,7 @@ impl Task {
         if self.is_user_mode {
             todo!();
         } else {
-            KERNEL_STACK_ALLOCATOR
-                .lock()
-                .deallocate(VirtAddr::new(self.stack_start));
+            deallocate_kernel_stack(VirtAddr::new(self.stack_start), self.stack_size);
         }
     }
 

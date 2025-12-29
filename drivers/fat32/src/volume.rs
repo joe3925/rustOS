@@ -20,7 +20,7 @@ use fatfs::{
 use spin::{Mutex, RwLock};
 
 use kernel_api::device::DeviceObject;
-use kernel_api::pnp::pnp_complete_request;
+use kernel_api::pnp::{DriverStep, pnp_complete_request};
 use kernel_api::request::{Request, RequestType};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
@@ -638,14 +638,7 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    spawn_blocking(move || {
-        let status = handle_fs_request(&dev, &req);
-        {
-            let mut r = req.write();
-            r.status = status;
-        }
-        pnp_complete_request(&req);
-    });
-    return DriverStatus::Pending;
+pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+    let res = spawn_blocking(move || handle_fs_request(&dev, &req)).await;
+    return DriverStep::complete(res);
 }

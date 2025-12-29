@@ -5,7 +5,7 @@ pub extern crate alloc;
 use alloc::boxed::Box;
 use kernel_sys::{submit_blocking_internal, submit_runtime_internal};
 use kernel_types::pnp::PnpRequest;
-use kernel_types::request::{Request, RequestFuture, RequestType, TraversalPolicy};
+use kernel_types::request::{Request, RequestType, TraversalPolicy};
 use kernel_types::status::DriverStatus;
 pub use kernel_types::{async_ffi, device, request, status};
 
@@ -16,9 +16,9 @@ pub use x86_64;
 use crate::util::random_number;
 pub use acpi;
 pub use kernel_macros::request_handler;
-
 pub mod benchmark;
 pub mod fs;
+pub mod irq;
 pub mod memory;
 pub mod pnp;
 pub mod reg;
@@ -65,13 +65,13 @@ impl RequestExt for Request {
             kind,
             data,
             completed: false,
-            status: DriverStatus::Continue,
+            status: DriverStatus::ContinueStep,
             traversal_policy: TraversalPolicy::FailIfUnhandled,
             pnp: None,
             completion_routine: None,
             completion_context: 0,
-            waker_context: None,
-            waker_func: None,
+
+            waker: None,
         }
     }
 
@@ -82,26 +82,13 @@ impl RequestExt for Request {
             kind: RequestType::Pnp,
             data,
             completed: false,
-            status: DriverStatus::Continue,
+            status: DriverStatus::ContinueStep,
             traversal_policy: TraversalPolicy::ForwardLower,
             pnp: Some(pnp_request),
             completion_routine: None,
             completion_context: 0,
-            waker_context: None,
-            waker_func: None,
-        }
-    }
-}
-pub trait RequestResultExt {
-    async fn resolve(self) -> DriverStatus;
-}
 
-impl RequestResultExt for Result<RequestFuture, DriverStatus> {
-    #[inline(always)]
-    async fn resolve(self) -> DriverStatus {
-        match self {
-            Ok(future) => future.await,
-            Err(status) => status,
+            waker: None,
         }
     }
 }

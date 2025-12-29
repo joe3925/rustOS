@@ -7,6 +7,7 @@ use spin::Mutex;
 use spin::RwLock;
 
 use crate::memory::paging::constants::KERNEL_STACK_SIZE;
+use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::static_handlers::task_yield;
@@ -53,7 +54,7 @@ impl ThreadPool {
     fn spawn_worker(self: &Arc<Self>) {
         let args = Box::new(WorkerArgs { pool: self.clone() });
         let args_ptr = Box::into_raw(args) as usize;
-        let t = Task::new_kernel_mode(worker, args_ptr, KERNEL_STACK_SIZE, "".into(), 0);
+        let t = Task::new_kernel_mode(worker, args_ptr, StackSize::Huge2M, "".into(), 0);
         SCHEDULER.add_task(t);
     }
 

@@ -2,12 +2,12 @@ use super::driver_index::{self as idx, HwIndex};
 use super::request::IoTarget;
 use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
-use crate::drivers::pnp::request::{RequestExt, RequestResultExt};
+use crate::drivers::pnp::request::RequestExt;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
-use crate::scheduling::runtime::runtime::spawn;
+use crate::scheduling::runtime::runtime::{spawn, spawn_detached};
 use alloc::string::ToString;
 use alloc::vec;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
@@ -18,9 +18,9 @@ use kernel_types::device::{
 };
 use kernel_types::io::IoVtable;
 use kernel_types::pnp::{
-    BootType, DeviceIds, DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType,
+    BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
-use kernel_types::request::{Request, RequestFuture};
+use kernel_types::request::Request;
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -153,8 +153,14 @@ impl PnpManager {
 
     fn rescan_buses_started(&self, dn: &Arc<DevNode>) {
         if dn.get_state() == DevNodeState::Started {
-            let _ = self.invalidate_device_relations_for_node(dn, DeviceRelationType::BusRelations);
+            let dn2 = dn.clone();
+            spawn_detached(async move {
+                let _ = PNP_MANAGER
+                    .invalidate_device_relations_for_node(&dn2, DeviceRelationType::BusRelations)
+                    .await;
+            });
         }
+
         let kids: Vec<Arc<DevNode>> = {
             let g = dn.children.read();
             g.iter().cloned().collect()
@@ -565,7 +571,7 @@ impl PnpManager {
                 unsafe { core::mem::transmute((m.image_base.as_u64() + *rva as u64) as *const ()) };
             let st = unsafe { entry(drv) };
             match st {
-                DriverStatus::Success | DriverStatus::Continue => {
+                DriverStatus::Success | DriverStatus::ContinueStep => {
                     rt.set_state(DriverState::Started);
                     true
                 }
@@ -590,30 +596,39 @@ impl PnpManager {
         if !self.ensure_driver_entry(drv) {
             return None;
         }
-        if let Some(cb) = drv.evt_device_add {
-            let mut dev_init = DeviceInit::new(IoVtable::new(), None);
-            let st = cb(drv.clone(), &mut dev_init);
-            if st == DriverStatus::Success {
-                let devobj = DeviceObject::new(dev_init);
-                devobj.attach_devnode(&dn);
-                if let Some(lower) = below {
-                    DeviceObject::set_lower_upper(&devobj, lower);
-                }
 
-                let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
-                let _ = OBJECT_MANAGER.mkdir_p(stack_dir.clone());
-                let uniq = (Arc::as_ptr(&devobj) as usize) as u64;
-                let leaf = alloc::format!("{}-{:x}", drv.driver_name, uniq);
-                let obj = Object::with_name(
-                    ObjectTag::Device,
-                    leaf.clone(),
-                    ObjectPayload::Device(devobj.clone()),
-                );
-                let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", stack_dir, leaf), &obj);
-                return Some(devobj);
-            }
+        let Some(cb) = drv.evt_device_add else {
+            return None;
+        };
+
+        let mut dev_init = DeviceInit::new(IoVtable::new(), None);
+        let step = cb(drv.clone(), &mut dev_init);
+
+        match step {
+            DriverStep::Pending => return None,
+            DriverStep::Complete { status } if status != DriverStatus::Success => return None,
+            DriverStep::Complete { .. } | DriverStep::Continue => {}
         }
-        None
+
+        let devobj = DeviceObject::new(dev_init);
+        devobj.attach_devnode(&dn);
+
+        if let Some(lower) = below {
+            DeviceObject::set_lower_upper(&devobj, lower);
+        }
+
+        let stack_dir = alloc::format!("\\Device\\{}\\Stack", dn.instance_path);
+        let _ = OBJECT_MANAGER.mkdir_p(stack_dir.clone());
+        let uniq = (Arc::as_ptr(&devobj) as usize) as u64;
+        let leaf = alloc::format!("{}-{:x}", drv.driver_name, uniq);
+        let obj = Object::with_name(
+            ObjectTag::Device,
+            leaf.clone(),
+            ObjectPayload::Device(devobj.clone()),
+        );
+        let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", stack_dir, leaf), &obj);
+
+        Some(devobj)
     }
 
     async fn ensure_function_attached(&self, dn: &Arc<DevNode>, stk: &mut DeviceStack) -> bool {
@@ -736,7 +751,7 @@ impl PnpManager {
                 target_device: top_device,
             };
 
-            self.send_request(&target, req_arc).resolve().await;
+            self.send_request(target, req_arc).await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -750,6 +765,7 @@ impl PnpManager {
 
         if req.status == DriverStatus::Success {
             dev_node.set_state(DevNodeState::Started);
+
             if let Some(top_device) = dev_node
                 .stack
                 .read()
@@ -773,19 +789,14 @@ impl PnpManager {
                     target_device: top_device,
                 };
 
-                let send_res = (&*PNP_MANAGER).send_request(&target, req_arc);
-                let fut = match send_res {
-                    Ok(f) => f,
-                    Err(status) => return status,
-                };
-
-                spawn(async move {
-                    fut.await;
+                spawn_detached(async move {
+                    let _ = (&*PNP_MANAGER).send_request(target, req_arc).await;
                 });
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
         }
+
         DriverStatus::Success
     }
 
@@ -815,7 +826,7 @@ impl PnpManager {
             .collect();
         for child_dn in children_to_start {
             let dn = child_dn.clone();
-            spawn(async move {
+            spawn_detached(async move {
                 let status: Result<(), DriverError> = PNP_MANAGER.bind_and_start(&dn).await;
                 if let Some(err) = status.err() {
                     println!(
@@ -873,11 +884,11 @@ impl PnpManager {
         Ok(drv_obj)
     }
 
-    pub fn invalidate_device_relations_for_node(
+    pub async fn invalidate_device_relations_for_node(
         &self,
         dev_node: &Arc<DevNode>,
         relation: DeviceRelationType,
-    ) -> Result<RequestFuture, DriverStatus> {
+    ) -> DriverStatus {
         let Some(top) = dev_node
             .stack
             .read()
@@ -885,8 +896,9 @@ impl PnpManager {
             .and_then(|s| s.get_top_device_object())
             .or_else(|| dev_node.get_pdo())
         else {
-            return Err(DriverStatus::NoSuchDevice);
+            return DriverStatus::NoSuchDevice;
         };
+
         let pnp_payload = PnpRequest {
             minor_function: PnpMinorFunction::QueryDeviceRelations,
             relation,
@@ -894,11 +906,14 @@ impl PnpManager {
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         };
+
         let mut req = Request::new_pnp(pnp_payload, Box::new([]));
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.add_completion(Self::process_enumerated_children, ctx);
+
         let tgt = IoTarget { target_device: top };
-        self.send_request(&tgt, Arc::new(RwLock::new(req)))
+
+        self.send_request(tgt, Arc::new(RwLock::new(req))).await
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
@@ -950,29 +965,25 @@ impl PnpManager {
         None
     }
 
-    pub fn send_request_via_symlink(
+    pub async fn send_request_via_symlink(
         &self,
         link_path: String,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus> {
+    ) -> DriverStatus {
         match self.resolve_targetio_from_symlink(link_path) {
-            Some(tgt) => {
-                let _kind = { req.read().kind };
-
-                self.send_request(&tgt, req)
-            }
-            None => Err(DriverStatus::NoSuchDevice),
+            Some(tgt) => self.send_request(tgt, req).await,
+            None => DriverStatus::NoSuchDevice,
         }
     }
 
-    pub fn send_request_to_stack_top(
+    pub async fn send_request_to_stack_top(
         &self,
         dev_node_weak: &alloc::sync::Weak<DevNode>,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus> {
+    ) -> DriverStatus {
         let dev_node = match dev_node_weak.upgrade() {
             Some(dn) => dn,
-            None => return Err(DriverStatus::NoSuchDevice),
+            None => return DriverStatus::NoSuchDevice,
         };
 
         let target_device_opt = dev_node
@@ -984,19 +995,19 @@ impl PnpManager {
 
         if let Some(target_device) = target_device_opt {
             let target = IoTarget { target_device };
-            self.send_request(&target, req)
+            self.send_request(target, req).await
         } else {
-            Err(DriverStatus::NoSuchDevice)
+            DriverStatus::NoSuchDevice
         }
     }
 
-    pub fn ioctl_via_symlink(
+    pub async fn ioctl_via_symlink(
         &self,
         link_path: String,
         _control_code: u32,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus> {
-        self.send_request_via_symlink(link_path, req)
+    ) -> DriverStatus {
+        self.send_request_via_symlink(link_path, req).await
     }
 
     pub fn add_class_listener(
@@ -1234,6 +1245,7 @@ impl PnpManager {
                     prev = dobj;
                 }
             }
+
             function_fdo.attach_devnode(&dn);
             DeviceObject::set_lower_upper(&function_fdo, prev.clone());
             let uniq = (Arc::as_ptr(&function_fdo) as usize) as u64;
@@ -1282,8 +1294,8 @@ impl PnpManager {
         let tgt = IoTarget {
             target_device: top.clone(),
         };
-        self.send_request(&tgt, Arc::new(RwLock::new(start_request)))
-            .resolve()
+
+        self.send_request(tgt, Arc::new(RwLock::new(start_request)))
             .await;
 
         dn.set_state(DevNodeState::Started);
