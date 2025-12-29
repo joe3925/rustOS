@@ -19,7 +19,7 @@ use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::map_mmio_region;
 use kernel_api::pnp::{
-    PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
+    DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::Request;
@@ -48,7 +48,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "win64" fn bus_driver_device_add(
     _driver: Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
-) -> DriverStatus {
+) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
     pnp_vtable.set(PnpMinorFunction::QueryDeviceRelations, enumerate_bus);
@@ -56,14 +56,14 @@ pub extern "win64" fn bus_driver_device_add(
     dev_init_ptr.set_dev_ext_default::<DevExt>();
     dev_init_ptr.pnp_vtable = Some(pnp_vtable);
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 pub async fn bus_driver_prepare_hardware(
     device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+) -> DriverStep {
     let acpi_tables = get_acpi_tables();
     let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
 
@@ -81,13 +81,13 @@ pub async fn bus_driver_prepare_hardware(
     }
     if let Err(e) = aml_ctx.initialize_objects() {
         println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
-        return DriverStatus::Continue;
+        return DriverStep::Continue;
     }
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -108,7 +108,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 #[request_handler]
-pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = device
@@ -147,7 +147,7 @@ pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>
     }
     create_synthetic_i8042_pdo(&parent_dev_node);
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let ids = DeviceIds {

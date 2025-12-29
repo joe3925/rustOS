@@ -13,7 +13,7 @@ use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{io::IoVtable, pnp::DeviceIds},
     pnp::{
-        PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
+        DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
     },
     print, println,
@@ -55,7 +55,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "win64" fn ps2_device_add(
     _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
-) -> DriverStatus {
+) -> DriverStep {
     let mut pnp = PnpVtable::new();
     pnp.set(PnpMinorFunction::StartDevice, ps2_start);
     pnp.set(PnpMinorFunction::QueryDeviceRelations, ps2_query_devrels);
@@ -66,11 +66,11 @@ pub extern "win64" fn ps2_device_add(
         have_kbd: AtomicBool::new(false),
         have_mouse: AtomicBool::new(false),
     });
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
     if let Ok(mut ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -78,27 +78,24 @@ pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> Dr
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
-        return DriverStatus::NoSuchDevice;
+        return DriverStep::complete(DriverStatus::NoSuchDevice);
     }
-    DriverStatus::Continue
+    DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn ps2_query_devrels(
-    device: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+pub async fn ps2_query_devrels(device: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
-        return DriverStatus::NotImplemented;
+        return DriverStep::complete(DriverStatus::NotImplemented);
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
             req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStatus::NoSuchDevice;
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
         }
     };
 
@@ -106,7 +103,7 @@ pub async fn ps2_query_devrels(
         Ok(g) => g,
         Err(_) => {
             req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStatus::NoSuchDevice;
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
         }
     };
 
@@ -133,7 +130,7 @@ pub async fn ps2_query_devrels(
         );
     }
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 fn make_child_pdo(
@@ -177,12 +174,12 @@ fn make_child_pdo(
 }
 
 #[request_handler]
-async fn ps2_child_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+async fn ps2_child_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
         Err(_) => {
             req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStatus::Success;
+            return DriverStep::complete(DriverStatus::Success);
         }
     };
 
@@ -233,12 +230,12 @@ async fn ps2_child_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             r.status = DriverStatus::Success;
         }
     }
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn ps2_child_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    DriverStatus::Success
+async fn ps2_child_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }
 
 const I8042_DATA: u16 = 0x60;

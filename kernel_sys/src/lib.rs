@@ -22,7 +22,7 @@ use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fs::{File, OpenFlags};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
-use kernel_types::request::{Request, RequestFuture};
+use kernel_types::request::Request;
 use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
@@ -124,16 +124,19 @@ unsafe extern "win64" {
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
     pub fn pnp_forward_request_to_next_lower(
-        from: &Arc<DeviceObject>,
+        from: Arc<DeviceObject>,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
+    ) -> FfiFuture<DriverStatus>;
 
-    pub fn pnp_send_request(
-        target: &IoTarget,
+    pub fn pnp_forward_request_to_next_upper(
+        from: Arc<DeviceObject>,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
+    ) -> FfiFuture<DriverStatus>;
 
-    pub fn pnp_complete_request(req: &Arc<RwLock<Request>>);
+    pub fn pnp_send_request(target: IoTarget, req: Arc<RwLock<Request>>)
+    -> FfiFuture<DriverStatus>;
+
+    pub fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
@@ -143,13 +146,13 @@ unsafe extern "win64" {
     pub fn pnp_send_request_via_symlink(
         link_path: String,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
+    ) -> FfiFuture<DriverStatus>;
 
     pub fn pnp_ioctl_via_symlink(
         link_path: String,
         control_code: u32,
         request: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
+    ) -> FfiFuture<DriverStatus>;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
@@ -178,21 +181,15 @@ unsafe extern "win64" {
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
-    pub fn pnp_send_request_to_next_upper(
-        from: &Arc<DeviceObject>,
-        req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
-
     pub fn pnp_send_request_to_stack_top(
-        dev_node_weak: &Weak<DevNode>,
+        dev_node_weak: Weak<DevNode>,
         req: Arc<RwLock<Request>>,
-    ) -> Result<RequestFuture, DriverStatus>;
+    ) -> FfiFuture<DriverStatus>;
 
     pub fn InvalidateDeviceRelations(
-        device: &Arc<DeviceObject>,
+        device: Arc<DeviceObject>,
         relation: DeviceRelationType,
-    ) -> Result<RequestFuture, DriverStatus>;
-
+    ) -> FfiFuture<DriverStatus>;
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     // =========================================================================
     // Bench (drivers)

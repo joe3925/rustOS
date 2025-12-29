@@ -79,7 +79,57 @@ pub extern "win64" fn allocate_kernel_range_mapped(
     map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
     Ok(addr)
 }
+/// Allocate with specific alignment requirement
+pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<VirtAddr> {
+    let aligned_size = align_up_4k(size);
 
+    if alignment > 0x1000 {
+        let extra = alignment - 0x1000;
+        let total_request = aligned_size + extra;
+
+        let addr = KERNEL_RANGE_TRACKER.alloc_auto(total_request)?;
+
+        let aligned_addr = (addr.as_u64() + alignment - 1) & !(alignment - 1);
+
+        let wasted_before = aligned_addr - addr.as_u64();
+
+        if wasted_before > 0 {
+            KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), wasted_before);
+        }
+
+        let wasted_after = extra - wasted_before;
+        if wasted_after > 0 {
+            let suffix_start = aligned_addr + aligned_size;
+            KERNEL_RANGE_TRACKER.dealloc(suffix_start, wasted_after);
+        }
+
+        Some(VirtAddr::new(aligned_addr))
+    } else {
+        let addr = KERNEL_RANGE_TRACKER.alloc_auto(aligned_size)?;
+        debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
+        Some(addr)
+    }
+}
+
+pub fn allocate_auto_kernel_range_mapped_aligned(
+    size: u64,
+    alignment: u64,
+    flags: PageTableFlags,
+) -> Result<VirtAddr, PageMapError> {
+    let align_size = align_up_4k(size);
+    let addr =
+        allocate_auto_kernel_range_aligned(align_size, alignment).ok_or(PageMapError::NoMemory())?;
+
+    debug_assert_eq!(addr.as_u64() & (alignment - 1), 0, "Alignment violated");
+
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
+    Ok(addr)
+}
 pub extern "win64" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
     let aligned_size = align_up_4k(size);

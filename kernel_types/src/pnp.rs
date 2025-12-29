@@ -9,7 +9,20 @@ pub struct DeviceIds {
     pub hardware: Vec<String>,
     pub compatible: Vec<String>,
 }
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverStep {
+    Continue,
+    Pending,
+    Complete { status: DriverStatus },
+}
 
+impl DriverStep {
+    #[inline(always)]
+    pub fn complete(status: DriverStatus) -> Self {
+        DriverStep::Complete { status }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum DeviceRelationType {

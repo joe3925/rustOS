@@ -451,7 +451,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
     let req = Request::new_pnp(pnp, Vec::new().into_boxed_slice());
 
     let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
-    let down = pnp_forward_request_to_next_lower(device, req_arc.clone());
+    let down = pnp_forward_request_to_next_lower(device.clone(), req_arc.clone());
 
     let st = { req_arc.read().status };
     if st != DriverStatus::Success {

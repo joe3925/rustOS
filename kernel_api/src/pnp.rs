@@ -1,19 +1,17 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use core::ptr::NonNull;
 use kernel_sys::KernelAcpiHandler;
 use spin::RwLock;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::DeviceIds;
-use kernel_types::request::{Request, RequestFuture};
+use kernel_types::request::Request;
 use kernel_types::status::{DriverError, DriverStatus};
 use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
 
-use acpi::PhysicalMapping;
 pub use kernel_types::pnp::*;
-use x86_64::addr::{PhysAddr, VirtAddr};
+
 pub fn create_pdo(
     parent: &Arc<DevNode>,
     name: String,
@@ -68,6 +66,18 @@ pub fn pnp_create_symlink(link: String, target: String) -> DriverStatus {
     unsafe { kernel_sys::pnp_create_symlink(link, target) }
 }
 
+pub fn pnp_replace_symlink(link: String, target: String) -> DriverStatus {
+    unsafe { kernel_sys::pnp_replace_symlink(link, target) }
+}
+
+pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus {
+    unsafe { kernel_sys::pnp_create_device_symlink_top(instance_path, link_path) }
+}
+
+pub fn pnp_remove_symlink(link_path: String) -> DriverStatus {
+    unsafe { kernel_sys::pnp_remove_symlink(link_path) }
+}
+
 pub fn pnp_add_class_listener(
     class: String,
     callback: ClassAddCallback,
@@ -76,29 +86,48 @@ pub fn pnp_add_class_listener(
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }
 
-pub fn pnp_complete_request(req: &Arc<RwLock<Request>>) {
+pub fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus {
     unsafe { kernel_sys::pnp_complete_request(req) }
 }
 
-pub fn pnp_send_request(
-    target: &IoTarget,
-    req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    unsafe { kernel_sys::pnp_send_request(target, req) }
+pub async fn pnp_send_request(target: IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
+    unsafe { kernel_sys::pnp_send_request(target, req).await }
 }
 
-pub fn pnp_forward_request_to_next_lower(
-    from: &Arc<DeviceObject>,
+pub async fn pnp_forward_request_to_next_lower(
+    from: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req) }
+) -> DriverStatus {
+    unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req).await }
 }
-pub fn pnp_ioctl_via_symlink(
+
+pub async fn pnp_forward_request_to_next_upper(
+    from: Arc<DeviceObject>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    unsafe { kernel_sys::pnp_forward_request_to_next_upper(from, req).await }
+}
+
+pub async fn pnp_send_request_via_symlink(
+    link_path: String,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req).await }
+}
+
+pub async fn pnp_ioctl_via_symlink(
     link_path: String,
     control_code: u32,
     req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req) }
+) -> DriverStatus {
+    unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req).await }
+}
+
+pub async fn pnp_send_request_to_stack_top(
+    dev_node_weak: Weak<DevNode>,
+    req: Arc<RwLock<Request>>,
+) -> DriverStatus {
+    unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req).await }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,43 +153,11 @@ pub async fn pnp_create_devnode_over_pdo_with_function(
         .await
     }
 }
-pub fn pnp_create_device_symlink_top(
-    instance_path: String,
-    link_path: String,
-) -> Result<(), DriverStatus> {
-    let status = unsafe { kernel_sys::pnp_create_device_symlink_top(instance_path, link_path) };
 
-    if status == DriverStatus::Success {
-        Ok(())
-    } else {
-        Err(status)
-    }
-}
-
-pub fn pnp_remove_symlink(link_path: String) -> Result<(), DriverStatus> {
-    let status = unsafe { kernel_sys::pnp_remove_symlink(link_path) };
-
-    if status == DriverStatus::Success {
-        Ok(())
-    } else {
-        Err(status)
-    }
-}
-pub fn pnp_send_request_via_symlink(
-    link_path: String,
-    req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req) }
-}
-pub fn pnp_send_request_to_stack_top(
-    dev_node_weak: &Weak<DevNode>,
-    req: Arc<RwLock<Request>>,
-) -> Result<RequestFuture, DriverStatus> {
-    unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req) }
-}
 pub async fn pnp_load_service(name: String) -> Option<Arc<DriverObject>> {
     unsafe { kernel_sys::pnp_load_service(name).await }
 }
+
 pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd) {
     unsafe { kernel_sys::driver_set_evt_device_add(driver, callback) }
 }

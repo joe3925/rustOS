@@ -20,14 +20,14 @@ use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
     pnp::{
-        DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
-        pnp_create_control_device_and_link, pnp_create_control_device_with_init,
-        pnp_ioctl_via_symlink, pnp_send_request,
+        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
+        driver_set_evt_device_add, pnp_create_control_device_and_link,
+        pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
     println,
     request::{Request, RequestType, TraversalPolicy},
     request_handler,
-    runtime::spawn_blocking,
+    runtime::{spawn, spawn_blocking},
     status::DriverStatus,
     util::bytes_to_box,
 };
@@ -65,7 +65,7 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 }
 
 #[request_handler]
-pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let code = {
         let r = req.read();
         match r.kind {
@@ -73,7 +73,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             _ => {
                 drop(r);
                 req.write().status = DriverStatus::InvalidParameter;
-                return DriverStatus::NotImplemented;
+                return DriverStep::complete(DriverStatus::NotImplemented);
             }
         }
     };
@@ -82,7 +82,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         IOCTL_FS_IDENTIFY => {
             let mut r = req.write();
             if r.data.len() < core::mem::size_of::<FsIdentify>() {
-                return DriverStatus::InvalidParameter;
+                return DriverStep::complete(DriverStatus::InvalidParameter);
             }
 
             let id: &mut FsIdentify = unsafe { &mut *(r.data.as_mut_ptr() as *mut FsIdentify) };
@@ -99,7 +99,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
             );
             let q = Arc::new(RwLock::new(q));
 
-            pnp_send_request(&*id.volume_fdo, q.clone())?.await;
+            pnp_send_request(id.volume_fdo.clone(), q.clone()).await;
 
             let mut sector_size: u16 = 512;
             let mut total_sectors: u64 = 10_000;
@@ -122,7 +122,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                             } else {
                                 id.mount_device = None;
                                 id.can_mount = false;
-                                return DriverStatus::Success;
+                                return DriverStep::complete(DriverStatus::Success);
                             };
                         }
                     }
@@ -152,21 +152,21 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     let mut init = DeviceInit::new(io_vtable, None);
                     init.set_dev_ext_from(ext);
 
-                    let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
+                    let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &id.volume_fdo);
                     let vol_ctrl = pnp_create_control_device_with_init(vol_name.clone(), init);
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
-                    DriverStatus::Success
+                    DriverStep::complete(DriverStatus::Success)
                 }
                 Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    DriverStatus::Success
+                    DriverStep::complete(DriverStatus::Success)
                 }
             }
         }
-        _ => DriverStatus::NotImplemented,
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -174,8 +174,8 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 pub extern "win64" fn fat_start(
     _dev: &Arc<DeviceObject>,
     _req: Arc<spin::rwlock::RwLock<Request>>,
-) -> DriverStatus {
-    DriverStatus::Continue
+) -> DriverStep {
+    DriverStep::Continue
 }
 
 #[unsafe(no_mangle)]
@@ -201,11 +201,14 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
-    pnp_ioctl_via_symlink(
-        GLOBAL_CTRL_LINK.to_string(),
-        IOCTL_MOUNTMGR_REGISTER_FS,
-        reg.clone(),
-    )?;
+    spawn(async move {
+        pnp_ioctl_via_symlink(
+            GLOBAL_CTRL_LINK.to_string(),
+            IOCTL_MOUNTMGR_REGISTER_FS,
+            reg.clone(),
+        )
+        .await;
+    });
 
     DriverStatus::Success
 }
@@ -213,6 +216,6 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 pub extern "win64" fn fs_device_add(
     _driver: Arc<DriverObject>,
     _dev_init: &mut DeviceInit,
-) -> DriverStatus {
-    DriverStatus::Success
+) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }

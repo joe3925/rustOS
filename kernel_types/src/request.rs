@@ -41,8 +41,8 @@ pub struct Request {
     pub pnp: Option<PnpRequest>,
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
-    pub waker_func: Option<extern "win64" fn(context: usize)>,
-    pub waker_context: Option<usize>,
+
+    pub waker: Option<Waker>,
 }
 
 impl Request {
@@ -64,8 +64,8 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
-            waker_func: None,
-            waker_context: None,
+
+            waker: None,
         }
     }
 
@@ -84,33 +84,19 @@ impl Request {
         }
     }
     #[inline]
-    fn complete_for_drop(&mut self) -> (Option<extern "win64" fn(usize)>, Option<usize>) {
-        if self.completed {
-            return (None, None);
-        }
-
+    fn complete_for_drop(&mut self) {
         if let Some(fp) = self.completion_routine.take() {
             let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
             let context = self.completion_context;
             self.status = f(self, context);
         }
 
-        if self.status == DriverStatus::Continue {
-            self.status = DriverStatus::Success;
-        }
-
         self.completed = true;
-
-        (self.waker_func.take(), self.waker_context.take())
     }
 }
 impl Drop for Request {
     fn drop(&mut self) {
-        let (waker_func, waker_ctx) = self.complete_for_drop();
-
-        if let (Some(func), Some(ctx)) = (waker_func, waker_ctx) {
-            func(ctx);
-        }
+        self.complete_for_drop();
     }
 }
 struct CompletionNode {
@@ -138,71 +124,35 @@ fn store_prev_and_new(
 }
 
 extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverStatus {
-    let mut head = unsafe { Box::from_raw(ctx as *mut CompletionNode) };
+    let head = unsafe { Box::from_raw(ctx as *mut CompletionNode) };
 
-    let mut status = DriverStatus::Continue;
+    let mut status = DriverStatus::Success;
 
     let mut node_opt: Option<Box<CompletionNode>> = Some(head);
     while let Some(mut node) = node_opt {
         let st = (node.func)(req, node.ctx);
-        if st != DriverStatus::Continue {
-            status = st;
-        }
+        status = st;
         let next_raw = node.next.take();
         node_opt = next_raw.map(|p| unsafe { Box::from_raw(p) });
     }
 
     status
 }
-#[repr(transparent)]
-pub struct RequestFuture {
+pub struct RequestCompletion {
     pub req: Arc<RwLock<Request>>,
 }
 
-impl Future for RequestFuture {
+impl Future for RequestCompletion {
     type Output = DriverStatus;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<DriverStatus> {
-        let mut req = match self.req.try_write() {
-            Some(g) => g,
-            None => {
-                if let Some(r) = self.req.try_read() {
-                    if r.completed {
-                        return Poll::Ready(r.status);
-                    }
-                }
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-        };
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut guard = self.req.write();
 
-        if req.completed {
-            return Poll::Ready(req.status);
+        if guard.completed {
+            return Poll::Ready(guard.status);
         }
 
-        if let Some(ctx) = req.waker_context {
-            let existing = unsafe { &*(ctx as *const Waker) };
-            if existing.will_wake(cx.waker()) {
-                return Poll::Pending;
-            }
-            let old = req.waker_context.take().unwrap();
-            unsafe {
-                drop(Box::from_raw(old as *mut Waker));
-            }
-            req.waker_func = None;
-        }
-
-        let ctx = Box::into_raw(Box::new(cx.waker().clone())) as usize;
-        req.waker_func = Some(waker_trampoline);
-        req.waker_context = Some(ctx);
-
+        guard.waker = Some(cx.waker().clone());
         Poll::Pending
     }
-}
-extern "win64" fn waker_trampoline(ctx: usize) {
-    if ctx == 0 {
-        return;
-    }
-    let w = unsafe { Box::from_raw(ctx as *mut Waker) };
-    w.wake();
 }

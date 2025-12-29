@@ -19,6 +19,7 @@ use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::map_mmio_region;
 use kernel_api::memory::unmap_range;
+use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpMinorFunction;
 use kernel_api::pnp::PnpVtable;
 use kernel_api::pnp::QueryIdType;
@@ -773,7 +774,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 pub async fn acpi_pdo_query_resources(
     dev: Arc<DeviceObject>,
     req: Arc<RwLock<Request>>,
-) -> DriverStatus {
+) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ctx_lock = &pext.ctx;
@@ -790,11 +791,11 @@ pub async fn acpi_pdo_query_resources(
     if let Some(p) = w.pnp.as_mut() {
         p.blob_out = blob;
     }
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn acpi_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
+pub async fn acpi_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
@@ -821,7 +822,7 @@ pub async fn acpi_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>
                 p.ids_out.push(h);
             } else {
                 w.status = DriverStatus::NoSuchDevice;
-                return DriverStatus::NoSuchDevice;
+                return DriverStep::complete(DriverStatus::NoSuchDevice);
             }
         }
         QueryIdType::InstanceId => {
@@ -829,15 +830,15 @@ pub async fn acpi_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>
                 p.ids_out.push(dn.instance_path.clone());
             } else {
                 w.status = DriverStatus::NoSuchDevice;
-                return DriverStatus::NoSuchDevice;
+                return DriverStep::complete(DriverStatus::NoSuchDevice);
             }
         }
     }
 
-    DriverStatus::Success
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn acpi_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    DriverStatus::Success
+pub async fn acpi_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }

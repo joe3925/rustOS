@@ -130,7 +130,7 @@ impl Vfs {
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone())?.await;
+        pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()).await?;
 
         let r = req.read();
         if r.status != DriverStatus::Success {
@@ -278,7 +278,7 @@ impl Vfs {
             Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
                 .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        let status = pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone())?.await;
+        let status = pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()).await;
         if status != DriverStatus::Success {
             println!("Send request fail with status: {}", status);
             return Err(status);

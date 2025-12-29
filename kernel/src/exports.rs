@@ -52,7 +52,6 @@ export! {
 
     pnp_create_pdo,
     pnp_bind_and_start,
-    pnp_forward_request_to_next_lower,
     pnp_get_device_target,
     pnp_complete_request,
     pnp_queue_dpc,
@@ -69,7 +68,8 @@ export! {
     pnp_create_control_device_with_init,
     pnp_create_control_device_and_link,
     pnp_create_devnode_over_pdo_with_function,
-    pnp_send_request_to_next_upper,
+    pnp_forward_request_to_next_lower,
+    pnp_forward_request_to_next_upper,
     pnp_send_request_to_stack_top,
     InvalidateDeviceRelations,
 

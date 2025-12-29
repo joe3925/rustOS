@@ -10,8 +10,8 @@ use x86_64::structures::paging::{Size1GiB, Size2MiB, Size4KiB};
 #[derive(Display, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverStatus {
     Success = 0x0000_0000,
-    Pending = 0x0000_0103,
-    Continue = 0x0000_0203,
+    PendingStep = 0x0000_0103,
+    ContinueStep = 0x0000_0203,
     NotImplemented = 0xC000_0002u32 as i32,
     InvalidParameter = 0xC000_000Du32 as i32,
     InsufficientResources = 0xC000_009Au32 as i32,

@@ -8,7 +8,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::idt::IDT;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
-use crate::memory::paging::stack::allocate_kernel_stack;
+use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
 use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
@@ -584,7 +584,7 @@ impl ApicImpl {
 
                 ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, 0x7000u32);
 
-                let stack_top = allocate_kernel_stack(AP_STACK_SIZE as u64)
+                let stack_top = allocate_kernel_stack(StackSize::Huge2M)
                     .expect("AP stack")
                     .as_u64();
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
