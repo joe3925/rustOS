@@ -9,6 +9,7 @@ pub mod benchmark;
 pub mod device;
 pub mod fs;
 pub mod io;
+pub mod irq;
 pub mod memory;
 pub mod pnp;
 pub mod request;
@@ -17,6 +18,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
+pub use no_std_async;
 
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};

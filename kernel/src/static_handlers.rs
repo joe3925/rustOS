@@ -19,6 +19,7 @@ use kernel_types::{
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::OpenFlags,
+    irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::Request,
     status::{Data, DriverStatus, FileStatus, RegError},
@@ -41,6 +42,7 @@ use crate::{
         ACPI::{ACPIImpl, ACPI_TABLES},
     },
     file_system::file::{self, File},
+    idt::{irq_register, irq_signal, irq_signal_n},
     memory::{
         allocator::ALLOCATOR,
         paging::{constants::KERNEL_STACK_SIZE, stack::StackSize},
@@ -97,7 +99,20 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
         GlobalAlloc::dealloc(&ALLOCATOR, ptr, layout);
     };
 }
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+    unsafe { irq_register(vector, isr, ctx) }
+}
 
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
+    unsafe { irq_signal(handle, meta) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
+    unsafe { irq_signal_n(handle, meta, n) }
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn print(str: &str) {
     CONSOLE.lock().print(str.as_bytes());

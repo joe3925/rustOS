@@ -13,6 +13,7 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
+use kernel_types::irq::{DropHook, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult};
 use spin::RwLock;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
@@ -52,7 +53,24 @@ unsafe extern "win64" {
     pub unsafe fn sleep_self();
     pub unsafe fn sleep_self_and_yield();
     pub unsafe fn wake_task(id: u64);
+    // =========================================================================
+    // IRQ
+    // =========================================================================
+    pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
+    pub fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta);
+    pub fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32);
+    pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandlePtr;
 
+    pub fn irq_handle_clone(h: IrqHandlePtr) -> IrqHandlePtr;
+    pub fn irq_handle_drop(h: IrqHandlePtr);
+
+    pub fn irq_handle_unregister(h: IrqHandlePtr);
+    pub fn irq_handle_is_closed(h: IrqHandlePtr) -> bool;
+
+    pub fn irq_handle_set_user_ctx(h: IrqHandlePtr, v: usize);
+    pub fn irq_handle_get_user_ctx(h: IrqHandlePtr) -> usize;
+
+    pub fn irq_handle_wait_ffi(h: IrqHandlePtr, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     // =========================================================================
     // Paging / VMM
     // =========================================================================

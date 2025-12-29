@@ -3,6 +3,7 @@ use crate::export;
 use crate::file_system::file::File;
 use crate::function;
 use crate::get_rva;
+use crate::idt::*;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::tables::virt_to_phys;
@@ -44,6 +45,17 @@ export! {
 
     kernel_alloc,
     kernel_free,
+    kernel_irq_register,
+    kernel_irq_signal,
+    kernel_irq_signal_n,
+    irq_handle_create,
+    irq_handle_clone,
+    irq_handle_drop,
+    irq_handle_unregister,
+    irq_handle_is_closed,
+    irq_handle_set_user_ctx,
+    irq_handle_get_user_ctx,
+    irq_handle_wait_ffi,
 
     file_open,
     fs_list_dir,

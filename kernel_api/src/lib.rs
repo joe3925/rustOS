@@ -16,9 +16,9 @@ pub use x86_64;
 use crate::util::random_number;
 pub use acpi;
 pub use kernel_macros::request_handler;
-
 pub mod benchmark;
 pub mod fs;
+pub mod irq;
 pub mod memory;
 pub mod pnp;
 pub mod reg;
