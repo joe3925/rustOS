@@ -1,3 +1,4 @@
+use crate::benchmarking::bench_submit_rip_sample_current_core;
 use crate::cpu;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, send_eoi_timer, InterruptIndex,
@@ -57,7 +58,7 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let sw = Stopwatch::start();
 
     SCHEDULER.on_timer_tick(state, cpu_id);
-
+    unsafe { bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), 8) };
     let dt = sw.elapsed_nanos() as usize;
     add_time(&TIMER_TIME_SCHED, cpu_id, dt);
 }

@@ -10,6 +10,9 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use kernel_types::async_ffi::FfiFuture;
+use kernel_types::benchmark::{
+    BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
+};
 use spin::RwLock;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
@@ -37,7 +40,7 @@ unsafe extern "win64" {
     pub fn random_number() -> u64;
     pub fn wait_ms(ms: u64);
     pub fn get_rsdp() -> u64;
-
+    pub unsafe fn get_current_cpu_id() -> usize;
     // =========================================================================
     // Tasking
     // =========================================================================
@@ -191,6 +194,30 @@ unsafe extern "win64" {
     ) -> Result<RequestFuture, DriverStatus>;
 
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
+    // =========================================================================
+    // Bench (drivers)
+    // =========================================================================
+    pub fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle;
+    pub fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool;
+    pub fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool;
+    pub fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool;
+    pub fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool>;
+
+    pub fn bench_kernel_submit_rip_sample(
+        core: BenchCoreId,
+        rip: u64,
+        stack_ptr: *const u64,
+        stack_len: usize,
+    );
+    pub fn bench_kernel_span_begin(tag: BenchTag, object_id: BenchObjectId) -> BenchSpanGuard;
+    pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
+
+    // =========================================================================
+    // Async Runtime (global)
+    // =========================================================================
+    pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
+    pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
+
 }
 
 #[repr(C)]
@@ -225,6 +252,64 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
                 VirtAddr::new(region.virtual_start().as_ptr() as u64),
                 region.region_length() as u64,
             )
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct BenchSpanGuard {
+    span_id: BenchSpanId,
+    tag: BenchTag,
+    object_id: BenchObjectId,
+    enabled: bool,
+}
+
+impl BenchSpanGuard {
+    #[inline]
+    pub fn disabled(tag: BenchTag, object_id: BenchObjectId) -> Self {
+        BenchSpanGuard {
+            span_id: BenchSpanId(0),
+            tag,
+            object_id,
+            enabled: false,
+        }
+    }
+
+    #[inline]
+    pub fn enabled(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId) -> Self {
+        BenchSpanGuard {
+            span_id,
+            tag,
+            object_id,
+            enabled: true,
+        }
+    }
+
+    #[inline]
+    pub fn span_id(&self) -> BenchSpanId {
+        self.span_id
+    }
+
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[inline]
+    pub fn tag(&self) -> BenchTag {
+        self.tag
+    }
+
+    #[inline]
+    pub fn object_id(&self) -> BenchObjectId {
+        self.object_id
+    }
+}
+
+impl Drop for BenchSpanGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            unsafe { bench_kernel_span_end(self.span_id, self.tag, self.object_id) };
         }
     }
 }

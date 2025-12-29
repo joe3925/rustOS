@@ -8,6 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use kernel_api::runtime::spawn_blocking;
 use kernel_api::task::{create_kernel_task, sleep_self, sleep_self_and_yield, wake_task};
 use kernel_api::x86_64::instructions::hlt;
 
@@ -49,9 +50,6 @@ pub struct VolCtrlDevExt {
     pub fs: Mutex<Fs>,
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
-    pub(crate) queue: Mutex<VecDeque<Arc<RwLock<Request>>>>,
-    pub(crate) worker_task_id: AtomicU64,
-    pub(crate) worker_sleeping: AtomicBool,
 }
 
 pub struct CachedFile {
@@ -124,45 +122,6 @@ fn cached_file_len(file: &mut FatFile<'static>) -> Result<u64, FsError> {
     let end = file.seek(SeekFrom::End(0))?;
     let _ = file.seek(SeekFrom::Start(cur))?;
     Ok(end)
-}
-
-// Called from the control module after the per-volume device is created.
-pub fn start_fs_worker_for_volume(dev: Arc<DeviceObject>) {
-    let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-    let existing = vdx.worker_task_id.load(Ordering::Acquire);
-    if existing != 0 {
-        return;
-    }
-
-    let ctx = Box::new(FsWorkerCtx { dev: dev.clone() });
-    let raw_ctx = Box::into_raw(ctx) as usize;
-    let name = alloc::format!("fat32.fs.worker.{:p}", dev.as_ref());
-    let id = create_kernel_task(fs_worker_thread, raw_ctx, name);
-    vdx.worker_task_id.store(id, Ordering::Release);
-}
-
-extern "win64" fn fs_worker_thread(ctx: usize) {
-    let ctx_ref: &FsWorkerCtx = unsafe { &*(ctx as *const FsWorkerCtx) };
-
-    loop {
-        let req_opt = {
-            let vdx = ext_mut::<VolCtrlDevExt>(&ctx_ref.dev);
-            let mut q = vdx.queue.lock();
-            q.pop_front()
-        };
-
-        if let Some(req) = req_opt {
-            let status = handle_fs_request(&ctx_ref.dev, &req);
-            {
-                let mut r = req.write();
-                r.status = status;
-            }
-            pnp_complete_request(&req);
-            continue;
-        }
-
-        core::hint::spin_loop();
-    }
 }
 
 fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> DriverStatus {
@@ -680,18 +639,13 @@ fn handle_fs_request(dev: &Arc<DeviceObject>, req: &Arc<RwLock<Request>>) -> Dri
 
 #[request_handler]
 pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStatus {
-    {
-        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-        if vdx.worker_task_id.load(Ordering::Acquire) == 0 {
-            start_fs_worker_for_volume(dev.clone());
+    spawn_blocking(move || {
+        let status = handle_fs_request(&dev, &req);
+        {
+            let mut r = req.write();
+            r.status = status;
         }
-    }
-
-    {
-        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-        let mut q = vdx.queue.lock();
-        q.push_back(req);
-    }
-
-    DriverStatus::Pending
+        pnp_complete_request(&req);
+    });
+    return DriverStatus::Pending;
 }

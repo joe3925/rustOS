@@ -16,7 +16,7 @@ use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt, block_on,
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
     pnp::{
@@ -26,13 +26,14 @@ use kernel_api::{
     },
     println,
     request::{Request, RequestType, TraversalPolicy},
-    request_handler, spawn_blocking,
+    request_handler,
+    runtime::spawn_blocking,
     status::DriverStatus,
     util::bytes_to_box,
 };
 
 use crate::block_dev::BlockDev;
-use crate::volume::{VolCtrlDevExt, fs_op_dispatch, start_fs_worker_for_volume};
+use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
 use log::{Level, Metadata, Record};
 
 struct KernelLogger;
@@ -146,9 +147,6 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         fs: Mutex::new(fs),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
-                        queue: Mutex::new(alloc::collections::VecDeque::new()),
-                        worker_task_id: AtomicU64::new(0),
-                        worker_sleeping: AtomicBool::new(false),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);
@@ -156,9 +154,6 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &*id.volume_fdo);
                     let vol_ctrl = pnp_create_control_device_with_init(vol_name.clone(), init);
-
-                    // Start per-volume worker thread that will run FATFS code
-                    start_fs_worker_for_volume(vol_ctrl.clone());
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;

@@ -16,7 +16,10 @@ pub fn random_number() -> u64 {
 pub fn wait_ms(ms: u64) {
     unsafe { kernel_sys::wait_ms(ms) };
 }
-
+#[inline]
+pub fn get_current_cpu_id() -> usize {
+    unsafe { kernel_sys::get_current_cpu_id() }
+}
 #[inline]
 pub fn panic_common(mod_name: &'static str, info: &core::panic::PanicInfo) -> ! {
     unsafe { kernel_sys::panic_common(mod_name, info) }

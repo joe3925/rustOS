@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod async_ffi;
+pub mod benchmark;
 pub mod device;
 pub mod fs;
 pub mod io;

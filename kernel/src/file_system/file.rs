@@ -20,13 +20,13 @@ use crate::{
     file_system::file_provider::{self, install_file_provider, FileProvider},
     println,
     registry::reg::rebind_and_persist_after_provider_switch,
+    util::GLOBAL_WINDOW,
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
     file_system::file_provider::provider,
     registry::is_first_boot,
 };
-use nostd_runtime::block_on;
 
 #[derive(Debug)]
 pub struct File {
@@ -140,16 +140,55 @@ impl File {
     }
 
     pub async fn make_dir(path: String) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().make_dir_path(&path).await;
-        if st != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
+        if path.is_empty() {
+            return Err(FileStatus::BadPath);
         }
-        match r.error {
-            None => Ok(()),
-            Some(e) => Err(e),
-        }
-    }
 
+        let bytes = path.as_bytes();
+        let drive = Self::get_drive_letter(bytes);
+
+        let (base, rest) = if let Some(d) = drive {
+            if bytes.len() < 3 || bytes[2] != b'\\' {
+                return Err(FileStatus::BadPath);
+            }
+            (format!("{d}\\"), &path[2..])
+        } else if path.starts_with('\\') {
+            ("\\".to_string(), path.as_str())
+        } else {
+            ("".to_string(), path.as_str())
+        };
+
+        let trimmed = rest.trim_matches('\\');
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        let mut cur = base;
+
+        for comp in trimmed.split('\\') {
+            if comp.is_empty() {
+                continue;
+            }
+
+            if !cur.is_empty() && !cur.ends_with('\\') {
+                cur.push('\\');
+            }
+            cur.push_str(comp);
+
+            let (r, st) = file_provider::provider().make_dir_path(&cur).await;
+            if st != DriverStatus::Success {
+                return Err(FileStatus::UnknownFail);
+            }
+
+            if let Some(e) = r.error {
+                if e != FileStatus::FileAlreadyExist {
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
     pub async fn read(&self) -> Result<Vec<u8>, FileStatus> {
         let (gi, st1) = file_provider::provider().get_info(self.fs_file_id).await;
         if st1 != DriverStatus::Success {
@@ -279,6 +318,7 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     if is_first_boot().await {
         //install_prepacked_drivers();
     }
+    GLOBAL_WINDOW.stop_and_persist().await;
     Ok(())
 }
 

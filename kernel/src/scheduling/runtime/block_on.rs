@@ -1,4 +1,3 @@
-// block_on.rs
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::task::Wake;
@@ -7,7 +6,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use crate::yield_now;
+use crate::scheduling::runtime::runtime::yield_now;
 
 pub struct ThreadNotify {
     ready: AtomicBool,
@@ -46,7 +45,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Ready(out) => return out,
             Poll::Pending => {
                 if !notify.take_ready() {
-                    yield_now();
+                    //yield_now();
                 }
             }
         }

@@ -7,6 +7,7 @@ use crate::file_system::path::Path;
 use crate::format;
 use crate::memory::paging::constants::{KERNEL_SPACE_BASE, KERNEL_STACK_SIZE};
 use crate::println;
+use crate::scheduling::runtime::runtime::block_on;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
@@ -14,7 +15,6 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kernel_types::fs::OpenFlags;
-use nostd_runtime::block_on;
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};
@@ -305,7 +305,7 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         );
     };
     let task = Task::new_user_mode(
-        // TODO: check this 
+        // TODO: check this
         unsafe { *(entry as *const extern "win64" fn(usize)) },
         0,
         KERNEL_STACK_SIZE,

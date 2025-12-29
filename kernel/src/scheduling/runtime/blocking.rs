@@ -1,4 +1,3 @@
-// blocking.rs
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
@@ -6,7 +5,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
-use crate::submit_blocking;
+use crate::scheduling::runtime::runtime::submit_blocking;
 
 pub struct BlockingInner<R> {
     result: Mutex<Option<R>>,

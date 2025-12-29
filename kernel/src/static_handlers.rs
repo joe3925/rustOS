@@ -3,13 +3,14 @@ use core::{
     arch::asm,
     future::Future,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     task::{Context, Poll, Waker},
 };
 
 use acpi::{AcpiTable, AcpiTables};
 use alloc::{
     boxed::Box,
+    collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     task::Wake,
@@ -17,6 +18,9 @@ use alloc::{
 };
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
+    benchmark::{
+        BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
+    },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::OpenFlags,
     pnp::{DeviceIds, DeviceRelationType},
@@ -28,11 +32,14 @@ use spin::{Mutex, Once, RwLock};
 use x86_64::instructions::hlt;
 
 use crate::{
+    benchmarking::{
+        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
+    },
     console::CONSOLE,
     drivers::{
         drive::vfs::Vfs,
         driver_install::DriverError,
-        interrupt_index::wait_millis,
+        interrupt_index::{current_cpu_id, wait_millis},
         pnp::{
             manager::{PnpManager, PNP_MANAGER},
             request::{DpcFn, IoTarget},
@@ -49,7 +56,9 @@ use crate::{
         RegDelta,
     },
     scheduling::{
-        executer::{BLOCKING_POOL, RUNTIME_POOL},
+        self,
+        global_async::GlobalAsyncExecutor,
+        runtime::runtime::{BLOCKING_POOL, RUNTIME_POOL},
         scheduler::{TaskError, SCHEDULER},
         task::Task,
     },
@@ -473,4 +482,119 @@ pub unsafe extern "win64" fn task_yield() {
 
 pub unsafe extern "win64" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
     switch_to_vfs().into_ffi()
+}
+#[no_mangle]
+pub extern "win64" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
+    scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize) {
+    GlobalAsyncExecutor::global().submit(trampoline, ctx);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_async_set_parallelism(n: usize) {
+    GlobalAsyncExecutor::global().set_parallelism(n);
+}
+
+#[no_mangle]
+pub unsafe extern "win64" fn kernel_blocking_submit(
+    trampoline: extern "win64" fn(usize),
+    ctx: usize,
+) {
+    submit_blocking_internal(trampoline, ctx);
+}
+
+static BENCH_WINDOWS: Once<Mutex<BTreeMap<u32, BenchWindow>>> = Once::new();
+static NEXT_BENCH_WINDOW: AtomicU32 = AtomicU32::new(1);
+
+fn bench_windows() -> &'static Mutex<BTreeMap<u32, BenchWindow>> {
+    BENCH_WINDOWS.call_once(|| Mutex::new(BTreeMap::new()))
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle {
+    let w = BenchWindow::new(cfg);
+    let id = NEXT_BENCH_WINDOW.fetch_add(1, Ordering::Relaxed);
+    bench_windows().lock().insert(id, w);
+    BenchWindowHandle(id)
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool {
+    bench_windows().lock().remove(&handle.0).is_some()
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool {
+    let w = bench_windows().lock().get(&handle.0).cloned();
+    if let Some(w) = w {
+        w.start();
+        true
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_window_stop(handle: BenchWindowHandle) -> bool {
+    let w = bench_windows().lock().get(&handle.0).cloned();
+    if let Some(w) = w {
+        w.stop();
+        true
+    } else {
+        false
+    }
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_window_persist(handle: BenchWindowHandle) -> FfiFuture<bool> {
+    let w = bench_windows().lock().get(&handle.0).cloned();
+    async move {
+        if let Some(w) = w {
+            w.persist().await;
+            true
+        } else {
+            false
+        }
+    }
+    .into_ffi()
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_submit_rip_sample(
+    core: BenchCoreId,
+    rip: u64,
+    stack_ptr: *const u64,
+    stack_len: usize,
+) {
+    let stack = if stack_ptr.is_null() || stack_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stack_ptr, stack_len) }
+    };
+
+    bench_submit_rip_sample(core.0 as usize, rip, stack);
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_span_begin(
+    tag: BenchTag,
+    object_id: BenchObjectId,
+) -> BenchSpanGuard {
+    bench_span_guard(tag, object_id.0)
+}
+
+#[no_mangle]
+pub extern "win64" fn bench_kernel_span_end(
+    span_id: BenchSpanId,
+    tag: BenchTag,
+    object_id: BenchObjectId,
+) {
+    bench_log_span_end(span_id.0, tag, object_id.0);
+}
+#[no_mangle]
+pub extern "win64" fn get_current_cpu_id() -> usize {
+    current_cpu_id()
 }

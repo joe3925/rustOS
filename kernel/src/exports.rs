@@ -40,6 +40,7 @@ export! {
     identity_map_page,
     map_mmio_region,
     virt_to_phys,
+    get_current_cpu_id,
 
     kernel_alloc,
     kernel_free,
@@ -86,4 +87,15 @@ export! {
     reg_list_keys,
     reg_list_values,
 
+    kernel_spawn_ffi,
+    kernel_async_submit,
+
+    bench_kernel_span_end,
+    bench_kernel_span_begin,
+    bench_kernel_submit_rip_sample,
+    bench_kernel_window_persist,
+    bench_kernel_window_stop,
+    bench_kernel_window_start,
+    bench_kernel_window_destroy,
+    bench_kernel_window_create,
 }

@@ -1,5 +1,6 @@
 use crate::drivers::pnp::manager::{PnpManager, PNP_MANAGER};
 use crate::println;
+use crate::scheduling::runtime::runtime::spawn;
 use crate::static_handlers::create_kernel_task;
 use crate::structs::thread_pool::ThreadPool;
 use crate::util::random_number;
@@ -37,7 +38,7 @@ impl PnpManager {
     pub fn queue_dpc(&self, func: extern "win64" fn(usize), arg: usize) {
         GLOBAL_DPCQ.lock().push_back(Dpc { func, arg });
 
-        nostd_runtime::spawn(PNP_MANAGER.run_one_dpc());
+        spawn(PNP_MANAGER.run_one_dpc());
     }
 
     async fn run_one_dpc(&self) {
@@ -131,7 +132,7 @@ impl PnpManager {
     }
 
     pub fn spawn_device_handler(dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
-        nostd_runtime::spawn(PNP_MANAGER.call_device_handler(dev.clone(), req_arc.clone()));
+        spawn(PNP_MANAGER.call_device_handler(dev.clone(), req_arc.clone()));
     }
     async fn call_device_handler(&self, dev: Arc<DeviceObject>, req_arc: Arc<RwLock<Request>>) {
         let (kind, policy) = {
