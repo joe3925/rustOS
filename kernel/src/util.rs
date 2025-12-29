@@ -73,7 +73,7 @@ lazy_static! {
     pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
         name: "global",
         folder: "C:\\system\\logs",
-        log_samples: true,
+        log_samples: false,
         log_spans: true,
         log_mem_on_persist: true,
         end_on_drop: true,
