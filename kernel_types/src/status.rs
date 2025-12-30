@@ -19,6 +19,8 @@ pub enum DriverStatus {
     NoSuchFile = 0xC000_000Fu32 as i32,
     DeviceNotReady = 0xC000_00A3u32 as i32,
     Unsuccessful = 0xC000_0001u32 as i32,
+    DeviceError = 0xC000_002Fu32 as i32,
+    Timeout = 0xC000_001Fu32 as i32,
 }
 
 impl Try for DriverStatus {

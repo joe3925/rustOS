@@ -452,6 +452,28 @@ impl Ioapic {
     fn ptr(&self) -> *mut u32 {
         self.base_addr.as_mut_ptr()
     }
+    pub fn unmask_irq_any_cpu(&self, irq: u8, vector: u8, cpu_logical_mask: u8) {
+        let reg_low = 0x10 + (irq as u32) * 2;
+        let reg_high = reg_low + 1;
+
+        const IOAPIC_DELIVERY_LOWEST: u32 = 1 << 8;
+        const IOAPIC_DEST_LOGICAL: u32 = 1 << 11;
+        const IOAPIC_MASKED: u32 = 1 << 16;
+
+        let low = (vector as u32) | IOAPIC_DELIVERY_LOWEST | IOAPIC_DEST_LOGICAL;
+        let high = (cpu_logical_mask as u32) << 24;
+
+        unsafe {
+            let ioregsel = self.ptr();
+            let iowin = (self.base_addr.as_u64() + 0x10) as *mut u32;
+
+            ioregsel.write_volatile(reg_high);
+            iowin.write_volatile(high);
+
+            ioregsel.write_volatile(reg_low);
+            iowin.write_volatile(low & !IOAPIC_MASKED);
+        }
+    }
 }
 
 impl IoApic for Ioapic {

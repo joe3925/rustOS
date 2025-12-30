@@ -1,5 +1,3 @@
-#![no_std]
-
 use core::ptr::NonNull;
 
 use kernel_sys::{
@@ -13,7 +11,8 @@ use kernel_types::irq::{
     IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult, IRQ_WAIT_CLOSED,
     IRQ_WAIT_NULL, IRQ_WAIT_OK,
 };
-
+unsafe impl Send for IrqHandle {}
+unsafe impl Sync for IrqHandle {}
 pub struct IrqHandle {
     ptr: NonNull<IrqHandleOpaque>,
 }

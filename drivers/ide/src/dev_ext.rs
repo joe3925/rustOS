@@ -1,6 +1,8 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
+use kernel_api::irq::IrqHandle;
+use kernel_api::kernel_types::no_std_async::Mutex as AsyncMutex;
 use kernel_api::x86_64::instructions::port::Port;
-use spin::Mutex;
+use spin::Mutex as SpinMutex;
 
 #[repr(C)]
 pub struct Ports {
@@ -39,8 +41,13 @@ impl Ports {
 pub struct DevExt {
     pub present: AtomicBool,
     pub enumerated: AtomicBool,
-    pub ports: Mutex<Ports>,
-    pub busy: AtomicBool,
+    pub ports: SpinMutex<Ports>,
+    pub ctrl_lock: AsyncMutex<()>,
+    pub irq_handle: SpinMutex<Option<IrqHandle>>,
+    pub cmd_base: AtomicU16,
+    pub ctrl_base: AtomicU16,
+
+    pub irq_vector: AtomicU8,
 }
 
 impl DevExt {
@@ -48,8 +55,12 @@ impl DevExt {
         Self {
             present: AtomicBool::new(false),
             enumerated: AtomicBool::new(false),
-            ports: Mutex::new(Ports::new(io_base, ctrl_base)),
-            busy: AtomicBool::new(false),
+            ports: SpinMutex::new(Ports::new(io_base, ctrl_base)),
+            ctrl_lock: AsyncMutex::new(()),
+            irq_handle: SpinMutex::new(None),
+            cmd_base: AtomicU16::new(io_base),
+            ctrl_base: AtomicU16::new(ctrl_base),
+            irq_vector: AtomicU8::new(0x20 + 0x0E),
         }
     }
 

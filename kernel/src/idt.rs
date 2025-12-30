@@ -17,7 +17,7 @@ use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
 use crate::drivers;
-use crate::drivers::interrupt_index::{current_cpu_id, send_eoi};
+use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
@@ -454,10 +454,34 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
         return core::ptr::null_mut();
     }
 
+    let first_for_vector = {
+        let v = IRQ_MANAGER.vectors[vector as usize].read();
+        v.is_empty()
+    };
+
     IRQ_MANAGER.register(vector, isr, ctx, handle, id);
+
+    if first_for_vector {
+        if let Some(irq) = vector_to_irq(vector) {
+            APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
+                irq,
+                vector,
+                get_current_logical_id(),
+            );
+        }
+    }
+
     handle
 }
-
+fn vector_to_irq(vector: u8) -> Option<u8> {
+    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
+    let irq = vector.wrapping_sub(base);
+    if irq < 16 {
+        Some(irq)
+    } else {
+        None
+    }
+}
 pub fn irq_dispatch(vector: u8, frame: &mut InterruptStackFrame) {
     IRQ_MANAGER.dispatch(vector, frame);
 }

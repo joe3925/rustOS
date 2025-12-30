@@ -16,8 +16,8 @@ use crate::{
 use super::task::FutureTask;
 
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(4);
-    pub static ref BLOCKING_POOL: Arc<ThreadPool> = ThreadPool::new(4);
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(3);
+    pub static ref BLOCKING_POOL: Arc<ThreadPool> = ThreadPool::new(3);
 }
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
