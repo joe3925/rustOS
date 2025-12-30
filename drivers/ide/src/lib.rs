@@ -15,13 +15,10 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::mem::forget;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::irq::{IrqHandle, irq_register_isr, irq_wait_closed, irq_wait_null, irq_wait_ok};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
-use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
@@ -29,11 +26,10 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 use kernel_api::request::{Request, RequestType};
-use kernel_api::runtime::block_on;
+use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_ms;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::x86_64::structures::idt::InterruptStackFrame;
 use kernel_api::{RequestExt, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
@@ -64,7 +60,6 @@ const ATA_SR_DRQ: u8 = 1 << 3;
 const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 10000;
-const IDE_PRIMARY_IRQ_VECTOR: u8 = 0x20 + 0x0E;
 
 #[repr(C)]
 pub struct ChildExt {
@@ -129,28 +124,16 @@ async fn ide_pnp_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> Dr
         let ctl = bars.ctl as u16;
         let alt = ctl.wrapping_add(2);
 
-        dx.cmd_base.store(cb, Ordering::Release);
-        dx.ctrl_base.store(ctl, Ordering::Release);
-        let vec = match cb {
-            0x1F0 => 0x20 + 0x0E,
-            0x170 => 0x20 + 0x0F,
-            _ => 0x20 + 0x0E,
-        };
-        dx.irq_vector.store(vec, Ordering::Release);
         {
             let mut p = dx.ports.lock();
             *p = Ports::new(cb, alt);
-            unsafe { p.control.write(0x00) };
+            unsafe { p.control.write(0x02) };
         }
-
-        register_ide_irq(&dx);
 
         dx.present.store(true, Ordering::Release);
         dx.enumerated.store(false, Ordering::Release);
     } else {
         let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
-        enable_ide_interrupts(&dx);
-        register_ide_irq(&dx);
         dx.present.store(true, Ordering::Release);
         dx.enumerated.store(false, Ordering::Release);
     }
@@ -168,100 +151,35 @@ async fn ide_pnp_query_devrels(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>
     DriverStep::Continue
 }
 
-struct ControllerGuard<'a> {
-    _guard: kernel_api::kernel_types::no_std_async::mutex::Guard<'a, ()>,
+fn acquire_controller(dx: &DevExt) {
+    while dx
+        .busy
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        //unsafe { wait_ms(1) };
+    }
 }
+
+fn release_controller(dx: &DevExt) {
+    dx.busy.store(false, Ordering::Release);
+}
+
+struct ControllerGuard<'a>(&'a DevExt);
 
 impl<'a> ControllerGuard<'a> {
-    async fn new(dx: &'a DevExt) -> Self {
-        let guard = dx.ctrl_lock.lock().await;
-        Self { _guard: guard }
-    }
-
-    fn blocking(dx: &'a DevExt) -> Self {
-        let guard = block_on(dx.ctrl_lock.lock());
-        Self { _guard: guard }
+    fn new(dx: &'a DevExt) -> Self {
+        acquire_controller(dx);
+        Self(dx)
     }
 }
 
-fn register_ide_irq(dx: &DevExt) {
-    let mut slot = dx.irq_handle.lock();
-    if slot.is_some() {
-        return;
-    }
-    let vec = dx.irq_vector.load(Ordering::Acquire);
-    if let Some(handle) = irq_register_isr(vec, ide_primary_irq, dx as *const _ as usize) {
-        *slot = Some(handle);
-    } else {
-        println!("ide: failed to register irq handler");
+impl<'a> Drop for ControllerGuard<'a> {
+    fn drop(&mut self) {
+        release_controller(self.0);
     }
 }
 
-fn enable_ide_interrupts(dx: &DevExt) {
-    let mut p = dx.ports.lock();
-    unsafe { p.control.write(0x00) };
-}
-
-fn read_status(dx: &DevExt) -> u8 {
-    let mut p = dx.ports.lock();
-    unsafe { p.command.read() }
-}
-
-async fn wait_for_irq(dx: &DevExt) -> Result<IrqMeta, DriverStatus> {
-    let handle = dx.irq_handle.lock().clone();
-    let Some(handle) = handle else {
-        return Err(DriverStatus::DeviceNotReady);
-    };
-
-    let res = handle.wait(IrqMeta::new()).await;
-    if irq_wait_ok(res) {
-        Ok(res.meta)
-    } else if irq_wait_closed(res) || irq_wait_null(res) {
-        Err(DriverStatus::NoSuchDevice)
-    } else {
-        Err(DriverStatus::Unsuccessful)
-    }
-}
-
-fn status_from_meta_or_ports(dx: &DevExt, meta: IrqMeta) -> u8 {
-    let status = (meta.tag & 0xFF) as u8;
-    if status != 0 { status } else { read_status(dx) }
-}
-
-extern "win64" fn ide_primary_irq(
-    _vector: u8,
-    _cpu: u32,
-    _frame: *mut InterruptStackFrame,
-    handle: IrqHandlePtr,
-    ctx: usize,
-) -> bool {
-    if ctx == 0 {
-        return false;
-    }
-
-    let dx = unsafe { &*(ctx as *const DevExt) };
-
-    let cmd_base = dx.cmd_base.load(Ordering::Acquire);
-    let mut status_port: Port<u8> = unsafe { Port::new(cmd_base + 7) };
-    let status = unsafe { status_port.read() };
-
-    let hptr_usize = handle as usize;
-    let tag = status as u64;
-
-    kernel_api::runtime::spawn(async move {
-        let hptr = hptr_usize as IrqHandlePtr;
-        let meta = IrqMeta::with_tag(tag);
-
-        unsafe {
-            if let Some(h) = IrqHandle::from_raw(hptr) {
-                h.signal_one(meta);
-                core::mem::forget(h);
-            }
-        }
-    });
-
-    true
-}
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
     let dx = parent
         .try_devext::<DevExt>()
@@ -271,7 +189,7 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
         return;
     }
 
-    let _guard = ControllerGuard::blocking(&dx);
+    let _guard = ControllerGuard::new(&dx);
 
     if ata_probe_drive(&dx, 0xE0) {
         create_child_pdo(parent, 0, 0);
@@ -411,22 +329,32 @@ pub async fn ide_pdo_read(
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
-    let dx = match parent.try_devext::<DevExt>() {
-        Ok(dx) => dx,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
+    let parent_clone = parent.clone();
+    let req_clone = req.clone();
 
-    let _guard = ControllerGuard::new(&dx).await;
+    let result = spawn_blocking(move || {
+        let dx = match parent_clone.try_devext::<DevExt>() {
+            Ok(dx) => dx,
+            Err(_) => return Err(DriverStatus::NoSuchDevice),
+        };
 
-    enable_ide_interrupts(&dx);
+        let _guard = ControllerGuard::new(&dx);
 
-    let status = {
-        let mut w = req.write();
+        let mut w = req_clone.write();
         let buf = &mut w.data[..len];
-        ata_pio_read_async(&dx, dh, lba as u32, sectors, buf).await
-    };
 
-    DriverStep::complete(status)
+        if ata_pio_read(&dx, dh, lba as u32, sectors, buf) {
+            Ok(())
+        } else {
+            Err(DriverStatus::Unsuccessful)
+        }
+    })
+    .await;
+
+    match result {
+        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Err(status) => DriverStep::complete(status),
+    }
 }
 
 #[request_handler]
@@ -484,22 +412,32 @@ pub async fn ide_pdo_write(
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
-    let dx = match parent.try_devext::<DevExt>() {
-        Ok(dx) => dx,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
+    let parent_clone = parent.clone();
+    let req_clone = req.clone();
 
-    let _guard = ControllerGuard::new(&dx).await;
+    let result = spawn_blocking(move || {
+        let dx = match parent_clone.try_devext::<DevExt>() {
+            Ok(dx) => dx,
+            Err(_) => return Err(DriverStatus::NoSuchDevice),
+        };
 
-    enable_ide_interrupts(&dx);
+        let _guard = ControllerGuard::new(&dx);
 
-    let status = {
-        let r = req.read();
+        let r = req_clone.read();
         let buf = &r.data[..len];
-        ata_pio_write_async(&dx, dh, lba as u32, sectors, buf).await
-    };
 
-    DriverStep::complete(status)
+        if ata_pio_write(&dx, dh, lba as u32, sectors, buf) {
+            Ok(())
+        } else {
+            Err(DriverStatus::Unsuccessful)
+        }
+    })
+    .await;
+
+    match result {
+        Ok(()) => DriverStep::complete(DriverStatus::Success),
+        Err(status) => DriverStep::complete(status),
+    }
 }
 
 #[request_handler]
@@ -535,27 +473,16 @@ pub async fn ide_pdo_internal_ioctl(
 
     match code {
         IOCTL_BLOCK_FLUSH => {
-            let _guard = ControllerGuard::new(&dx).await;
-
-            enable_ide_interrupts(&dx);
+            let _guard = ControllerGuard::new(&dx);
 
             {
                 let mut p = dx.ports.lock();
                 unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
             }
 
-            let status = match wait_for_irq(&dx).await {
-                Ok(meta) => status_from_meta_or_ports(&dx, meta),
-                Err(_) => {
-                    if wait_not_busy(&dx.ports, TIMEOUT_MS) {
-                        read_status(&dx)
-                    } else {
-                        return DriverStep::complete(DriverStatus::Unsuccessful);
-                    }
-                }
-            };
+            let ok = wait_not_busy(&dx.ports, TIMEOUT_MS);
 
-            if (status & ATA_SR_ERR) == 0 {
+            if ok {
                 DriverStep::complete(DriverStatus::Success)
             } else {
                 DriverStep::complete(DriverStatus::Unsuccessful)
@@ -713,138 +640,136 @@ fn ata_probe_drive(dx: &DevExt, dh: u8) -> bool {
     ata_identify_words(dx, dh).is_some()
 }
 
-async fn ata_pio_read_async(
-    dx: &DevExt,
-    dh: u8,
-    lba: u32,
-    sectors: u32,
-    out: &mut [u8],
-) -> DriverStatus {
+fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
     let mut off = 0usize;
-    let mut cur_lba = lba;
 
-    for _ in 0..sectors {
+    let total_sectors = sectors;
+    let bps = if total_sectors != 0 {
+        out.len() / total_sectors as usize
+    } else {
+        512
+    };
+
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
         if !wait_ready(&dx.ports, TIMEOUT_MS) {
-            return DriverStatus::DeviceNotReady;
+            return false;
         }
 
         {
             let mut p = dx.ports.lock();
-            let devsel = (dh & 0xF0) | ((cur_lba >> 24) as u8 & 0x0F);
+            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+            unsafe { p.drive_head.write(devsel) };
+            io_wait_400ns(&mut p.control);
+        }
+
+        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+            return false;
+        }
+
+        {
+            let mut p = dx.ports.lock();
             unsafe {
-                p.drive_head.write(devsel);
-                io_wait_400ns(&mut p.control);
-                p.sector_count.write(1);
-                p.lba_lo.write((cur_lba & 0xFF) as u8);
-                p.lba_mid.write(((cur_lba >> 8) & 0xFF) as u8);
-                p.lba_hi.write(((cur_lba >> 16) & 0xFF) as u8);
+                p.sector_count.write(sc);
+                p.lba_lo.write((lba & 0xFF) as u8);
+                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
                 p.command.write(ATA_CMD_READ_SECTORS);
             }
         }
 
-        let _status = loop {
-            let status = match wait_for_irq(dx).await {
-                Ok(meta) => status_from_meta_or_ports(dx, meta),
-                Err(_) => {
-                    if wait_drq_set(&dx.ports, TIMEOUT_MS) {
-                        read_status(dx)
-                    } else {
-                        return DriverStatus::Unsuccessful;
-                    }
+        for _ in 0..chunk {
+            if !wait_drq_set(&dx.ports, TIMEOUT_MS) {
+                return false;
+            }
+            {
+                let mut p = dx.ports.lock();
+                let st = unsafe { p.command.read() };
+                if (st & ATA_SR_DRQ) == 0 {
+                    return false;
                 }
-            };
-
-            if (status & ATA_SR_ERR) != 0 {
-                return DriverStatus::Unsuccessful;
-            }
-
-            if (status & ATA_SR_DRQ) != 0 {
-                break status;
-            }
-        };
-
-        {
-            let mut p = dx.ports.lock();
-            if off + 512 > out.len() {
-                return DriverStatus::InvalidParameter;
-            }
-            for _ in 0..256 {
-                let w: u16 = unsafe { p.data.read() };
-                out[off] = (w & 0xFF) as u8;
-                out[off + 1] = (w >> 8) as u8;
-                off += 2;
+                if off + 512 > out.len() {
+                    return false;
+                }
+                for _ in 0..256 {
+                    let w: u16 = unsafe { p.data.read() };
+                    out[off] = (w & 0xFF) as u8;
+                    out[off + 1] = (w >> 8) as u8;
+                    off += 2;
+                }
             }
         }
 
-        cur_lba = cur_lba.wrapping_add(1);
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
     }
 
-    DriverStatus::Success
+    true
 }
 
-async fn ata_pio_write_async(
-    dx: &DevExt,
-    dh: u8,
-    lba: u32,
-    sectors: u32,
-    data: &[u8],
-) -> DriverStatus {
+fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
     let mut off = 0usize;
-    let mut cur_lba = lba;
 
-    for _ in 0..sectors {
+    let total_sectors = sectors;
+    let bps = if total_sectors != 0 {
+        data.len() / total_sectors as usize
+    } else {
+        512
+    };
+
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
         if !wait_ready(&dx.ports, TIMEOUT_MS) {
-            return DriverStatus::DeviceNotReady;
+            return false;
         }
 
         {
             let mut p = dx.ports.lock();
-            let devsel = (dh & 0xF0) | ((cur_lba >> 24) as u8 & 0x0F);
+            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+            unsafe { p.drive_head.write(devsel) };
+            io_wait_400ns(&mut p.control);
+        }
+
+        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+            return false;
+        }
+
+        {
+            let mut p = dx.ports.lock();
             unsafe {
-                p.drive_head.write(devsel);
-                io_wait_400ns(&mut p.control);
-                p.sector_count.write(1);
-                p.lba_lo.write((cur_lba & 0xFF) as u8);
-                p.lba_mid.write(((cur_lba >> 8) & 0xFF) as u8);
-                p.lba_hi.write(((cur_lba >> 16) & 0xFF) as u8);
+                p.sector_count.write(sc);
+                p.lba_lo.write((lba & 0xFF) as u8);
+                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
                 p.command.write(ATA_CMD_WRITE_SECTORS);
             }
         }
 
-        let _status = loop {
-            let status = match wait_for_irq(dx).await {
-                Ok(meta) => status_from_meta_or_ports(dx, meta),
-                Err(_) => {
-                    if wait_drq_set(&dx.ports, TIMEOUT_MS) {
-                        read_status(dx)
-                    } else {
-                        return DriverStatus::Unsuccessful;
-                    }
+        for _ in 0..chunk {
+            if !wait_drq_set(&dx.ports, TIMEOUT_MS) {
+                return false;
+            }
+            {
+                let mut p = dx.ports.lock();
+                for _ in 0..256 {
+                    let lo = data[off] as u16;
+                    let hi = data[off + 1] as u16;
+                    unsafe { p.data.write(lo | (hi << 8)) };
+                    off += 2;
                 }
-            };
-            if (status & ATA_SR_ERR) != 0 {
-                return DriverStatus::Unsuccessful;
-            }
-
-            if (status & ATA_SR_DRQ) != 0 {
-                break status;
-            }
-        };
-
-        {
-            let mut p = dx.ports.lock();
-            if off + 512 > data.len() {
-                return DriverStatus::InvalidParameter;
-            }
-            for _ in 0..256 {
-                let lo = data[off] as u16;
-                let hi = data[off + 1] as u16;
-                unsafe { p.data.write(lo | (hi << 8)) };
-                off += 2;
             }
         }
 
-        cur_lba = cur_lba.wrapping_add(1);
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
+    }
+
+    if !wait_not_busy(&dx.ports, TIMEOUT_MS) {
+        return false;
     }
 
     {
@@ -852,21 +777,7 @@ async fn ata_pio_write_async(
         unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
     }
 
-    match wait_for_irq(dx).await {
-        Ok(meta) => {
-            let status = status_from_meta_or_ports(dx, meta);
-            if (status & ATA_SR_ERR) != 0 {
-                return DriverStatus::Unsuccessful;
-            }
-        }
-        Err(_) => {
-            if !wait_not_busy(&dx.ports, TIMEOUT_MS) {
-                return DriverStatus::Unsuccessful;
-            }
-        }
-    }
-
-    DriverStatus::Success
+    wait_not_busy(&dx.ports, TIMEOUT_MS)
 }
 
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {

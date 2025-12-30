@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod async_ffi;
+pub mod async_types;
 pub mod benchmark;
 pub mod device;
 pub mod fs;
@@ -18,7 +19,6 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-pub use no_std_async;
 
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};

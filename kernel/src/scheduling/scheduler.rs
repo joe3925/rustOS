@@ -121,14 +121,25 @@ impl Scheduler {
     pub fn add_task(&self, task: TaskHandle) -> u64 {
         without_interrupts(|| {
             let n = self.num_cores.load(Ordering::Relaxed);
-            let mut best = 0usize;
-            let mut best_len = usize::MAX;
+            if n == 0 {
+                return 0;
+            }
 
-            for i in 0..n {
-                let len = self.cores[i].run_queue.lock().len();
-                if len < best_len {
-                    best_len = len;
+            let start = (self.next_task_id.load(Ordering::Relaxed) as usize) % n;
+
+            let mut best = start;
+            let mut best_load = usize::MAX;
+
+            for k in 0..n {
+                let i = (start + k) % n;
+                let load = self.core_effective_load(i);
+
+                if load < best_load {
+                    best_load = load;
                     best = i;
+                    if best_load == 0 {
+                        break;
+                    }
                 }
             }
 
@@ -167,7 +178,7 @@ impl Scheduler {
 
         if (now_ms % 500) == 0 {
             if let Some(_guard) = self.balance_lock.try_lock() {
-                self.balance();
+                //self.balance();
             }
         }
 
@@ -195,7 +206,22 @@ impl Scheduler {
 
         unsafe { (*ctx_ptr).restore(state) };
     }
+    #[inline(always)]
+    fn core_effective_load(&self, i: usize) -> usize {
+        let core = &self.cores[i];
 
+        let rq_len = core.run_queue.lock().len();
+
+        let running = {
+            let g = core.current.read();
+            match g.as_ref() {
+                Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
+                _ => 0,
+            }
+        };
+
+        rq_len + running
+    }
     fn schedule_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         let core = &self.cores[cpu_id];
 

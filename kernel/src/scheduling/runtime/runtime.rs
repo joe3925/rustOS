@@ -1,4 +1,6 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
@@ -37,7 +39,9 @@ pub(crate) fn yield_now() {
         task_yield();
     }
 }
-
+pub extern "win64" fn try_steal_blocking_one() -> bool {
+    BLOCKING_POOL.try_execute_one()
+}
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
@@ -111,4 +115,73 @@ where
 {
     let task = Arc::new(FutureTask::new(future));
     task.enqueue();
+}
+pub struct JoinAll<F>
+where
+    F: Future,
+{
+    futures: Vec<Pin<Box<F>>>,
+    done: Vec<Option<F::Output>>,
+    remaining: usize,
+}
+
+impl<F> JoinAll<F>
+where
+    F: Future,
+{
+    pub fn new(fs: Vec<F>) -> Self {
+        let remaining = fs.len();
+        let mut futures = Vec::with_capacity(remaining);
+        for f in fs {
+            futures.push(Box::pin(f));
+        }
+        Self {
+            futures,
+            done: (0..remaining).map(|_| None).collect(),
+            remaining,
+        }
+    }
+}
+
+impl<F> Future for JoinAll<F>
+where
+    F: Future,
+{
+    type Output = Vec<F::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.remaining == 0 {
+            let mut out = Vec::with_capacity(this.done.len());
+            for v in this.done.iter_mut() {
+                out.push(v.take().unwrap());
+            }
+            return Poll::Ready(out);
+        }
+
+        for i in 0..this.futures.len() {
+            if this.done[i].is_some() {
+                continue;
+            }
+
+            match this.futures[i].as_mut().poll(cx) {
+                Poll::Ready(v) => {
+                    this.done[i] = Some(v);
+                    this.remaining -= 1;
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if this.remaining == 0 {
+            let mut out = Vec::with_capacity(this.done.len());
+            for v in this.done.iter_mut() {
+                out.push(v.take().unwrap());
+            }
+            Poll::Ready(out)
+        } else {
+            Poll::Pending
+        }
+    }
 }

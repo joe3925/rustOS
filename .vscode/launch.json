@@ -38,7 +38,7 @@
                 "target modules load --file \"mountmgr.dll\" .text 0xffff900006fa5000",
                 // fat32.dll
                 "target modules add \"${workspaceRoot}\\target\\DRIVERS\\fat32\\fat32.dll\"",
-                "target modules load --file \"fat32.dll\" .text 0xffff900007037000"
+                "target modules load --file \"fat32.dll\" .text 0xffff900007c2e000"
             ],
             "sourceLanguages": [
                 "rust"

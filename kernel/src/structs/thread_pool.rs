@@ -3,7 +3,6 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
-use core::sync::atomic::AtomicUsize;
 use spin::Mutex;
 use spin::RwLock;
 
@@ -12,19 +11,17 @@ use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::static_handlers::task_yield;
-use crate::structs::mpmc::LockFreeQueue;
 
 pub type JobFn = extern "win64" fn(usize);
 
 #[derive(Clone, Copy)]
-pub struct Job {
-    pub f: JobFn,
-    pub a: usize,
+struct Job {
+    f: JobFn,
+    a: usize,
 }
 
 pub struct ThreadPool {
-    queue: LockFreeQueue,
-    worker_count: AtomicUsize,
+    queue: Mutex<VecDeque<Job>>,
     workers: RwLock<Vec<()>>,
 }
 
@@ -35,8 +32,7 @@ struct WorkerArgs {
 impl ThreadPool {
     pub fn new(threads: usize) -> Arc<Self> {
         let pool = Arc::new(Self {
-            queue: LockFreeQueue::new(),
-            worker_count: AtomicUsize::new(threads),
+            queue: Mutex::new(VecDeque::new()),
             workers: RwLock::new(Vec::new()),
         });
 
@@ -64,13 +60,12 @@ impl ThreadPool {
 
     pub fn enable_dynamic(&self, _max_threads: usize) {}
 
-    /// Lock-free submit - multiple threads can call concurrently without blocking
     pub fn submit(&self, function: JobFn, context: usize) {
         let job = Job {
             f: function,
             a: context,
         };
-        self.queue.push(job);
+        self.queue.lock().push_back(job);
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
@@ -79,15 +74,12 @@ impl ThreadPool {
     }
 
     pub fn try_execute_one(&self) -> bool {
-        if let Some(j) = self.queue.pop() {
+        let job = self.queue.lock().pop_front();
+        if let Some(j) = job {
             (j.f)(j.a);
             return true;
         }
         false
-    }
-
-    pub fn pending_jobs(&self) -> usize {
-        self.queue.len()
     }
 }
 
@@ -96,9 +88,11 @@ extern "win64" fn worker(args_ptr: usize) {
     let pool = args.pool;
 
     loop {
-        if let Some(j) = pool.queue.pop() {
+        let job = { pool.queue.lock().pop_front() };
+        if let Some(j) = job {
             (j.f)(j.a);
         } else {
+            //unsafe { task_yield() };
             spin_loop();
         }
     }

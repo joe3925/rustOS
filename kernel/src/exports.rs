@@ -11,6 +11,7 @@ use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
 use crate::memory::paging::virt_tracker::unmap_range;
+use crate::scheduling::runtime::runtime::try_steal_blocking_one;
 use crate::static_handlers::*;
 use crate::util::panic_common;
 use crate::util::random_number;
@@ -31,6 +32,7 @@ export! {
     panic_common,
     submit_runtime_internal,
     submit_blocking_internal,
+    try_steal_blocking_one,
     get_rsdp,
     get_acpi_tables,
     task_yield,

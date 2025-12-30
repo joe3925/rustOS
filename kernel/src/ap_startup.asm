@@ -1,5 +1,5 @@
 
-;Ripped straight from redox
+; Ripped straight from redox
 ORG 0x8000
 SECTION .text
 USE16

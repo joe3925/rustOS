@@ -18,7 +18,10 @@ use spin::{Mutex, RwLock};
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+    kernel_types::{
+        async_types::AsyncMutex,
+        io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+    },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
         driver_set_evt_device_add, pnp_create_control_device_and_link,
@@ -144,7 +147,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
 
                     let ext = VolCtrlDevExt {
-                        fs: Mutex::new(fs),
+                        fs: Arc::new(AsyncMutex::new(fs)),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
                     };

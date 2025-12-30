@@ -7,15 +7,18 @@ use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
-use crate::scheduling::runtime::runtime::{block_on, spawn_blocking};
+use crate::scheduling::runtime::runtime::{
+    block_on, spawn, spawn_blocking, spawn_detached, JoinAll,
+};
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{print, vec};
+use crate::{print, println, vec};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
@@ -250,7 +253,7 @@ pub fn bench_submit_rip_sample(core_id: usize, rip: u64, stack: &[u64]) {
     if !BENCH_ENABLED {
         return;
     }
-
+    return;
     let ts = bench_now_ns();
 
     let mut sample = BenchSampleEvent {
@@ -673,15 +676,16 @@ struct ExportBundle {
     max_seq_seen: Vec<u64>, // per core
 }
 
-fn build_exports_for_window(
-    cfg: &BenchWindowConfig,
-    run_id: u32,
-    start_ns: u64,
-    to_ns: u64,
-    last_export_seq: &[u64],
-    ncores: usize,
-    open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
-) -> ExportBundle {
+#[derive(Clone, Copy)]
+struct SpanRowRec {
+    tag: &'static str,
+    object_id: u64,
+    start_core: u16,
+    start_ts: u64,
+    dur: u64,
+}
+
+fn make_empty_bundle(ncores: usize) -> ExportBundle {
     let mut samples_rows = Vec::with_capacity(ncores + 1);
     let mut spans_rows = Vec::with_capacity(ncores + 1);
     let mut mem_rows = Vec::with_capacity(ncores + 1);
@@ -692,156 +696,374 @@ fn build_exports_for_window(
         mem_rows.push(String::new());
     }
 
-    let mut max_seq_seen = vec![0u64; ncores];
-
-    if !BENCH_ENABLED {
-        return ExportBundle {
-            samples_rows,
-            spans_rows,
-            mem_rows,
-            max_seq_seen,
-        };
-    }
-
-    let state = match bench_state() {
-        Some(s) => s,
-        None => {
-            return ExportBundle {
-                samples_rows,
-                spans_rows,
-                mem_rows,
-                max_seq_seen,
-            }
-        }
-    };
-
-    let want_mem_stream = cfg.log_mem_on_persist;
-
-    let mut all_events: Vec<(usize, BenchEvent)> = Vec::new();
-    for core in 0..ncores {
-        let ring_m = match state.ring_for_core(core) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let ring = ring_m.lock();
-        let last_seq = *last_export_seq.get(core).unwrap_or(&0);
-
-        for ev in ring.buffer.iter() {
-            if ev.is_empty() {
-                continue;
-            }
-            if ev.seq <= last_seq {
-                continue;
-            }
-            all_events.push((core, *ev));
-        }
-    }
-
-    all_events.sort_unstable_by(|a, b| {
-        let ea = &a.1;
-        let eb = &b.1;
-        ea.timestamp_ns
-            .cmp(&eb.timestamp_ns)
-            .then(ea.core_id.cmp(&eb.core_id))
-            .then(ea.seq.cmp(&eb.seq))
-    });
-
-    for (scan_core, ev) in all_events {
-        let ts = ev.timestamp_ns;
-
-        if ts < start_ns || ts > to_ns {
-            continue;
-        }
-
-        if scan_core < ncores && ev.seq > max_seq_seen[scan_core] {
-            max_seq_seen[scan_core] = ev.seq;
-        }
-
-        match ev.kind {
-            BenchEventKind::Sample if cfg.log_samples => {
-                if let BenchEventData::Sample(s) = ev.data {
-                    let avg = ncores;
-
-                    samples_rows[scan_core].push_str(&format!(
-                        "{},{},{},0x{:016x},{}",
-                        run_id, ts, ev.core_id, s.rip, s.depth
-                    ));
-                    samples_rows[avg].push_str(&format!(
-                        "{},{},{},0x{:016x},{}",
-                        run_id, ts, ev.core_id, s.rip, s.depth
-                    ));
-
-                    let depth = s.depth as usize;
-                    for i in 0..MAX_STACK_DEPTH {
-                        samples_rows[scan_core].push(',');
-                        samples_rows[avg].push(',');
-                        if i < depth {
-                            let v = format!("0x{:016x}", s.stack[i]);
-                            samples_rows[scan_core].push_str(&v);
-                            samples_rows[avg].push_str(&v);
-                        }
-                    }
-                    samples_rows[scan_core].push('\n');
-                    samples_rows[avg].push('\n');
-                }
-            }
-            BenchEventKind::SpanBegin if cfg.log_spans => {
-                if let BenchEventData::Span(span) = ev.data {
-                    open_spans.insert(span.span_id, (span, ts, ev.core_id));
-                }
-            }
-            BenchEventKind::SpanEnd if cfg.log_spans => {
-                if let BenchEventData::Span(span) = ev.data {
-                    if let Some((start_span, start_ts, start_core)) =
-                        open_spans.remove(&span.span_id)
-                    {
-                        let dur = ts.saturating_sub(start_ts);
-                        let avg = ncores;
-
-                        let row = format!(
-                            "{},{},0x{:016x},{},{},{}\n",
-                            run_id, start_span.tag, start_span.object_id, start_core, start_ts, dur
-                        );
-
-                        let start_idx = start_core as usize;
-                        if start_idx < ncores {
-                            spans_rows[start_idx].push_str(&row);
-                        }
-                        spans_rows[avg].push_str(&row);
-                    }
-                }
-            }
-            BenchEventKind::Metrics if want_mem_stream => {
-                if let BenchEventData::Metrics(m) = ev.data {
-                    let avg = ncores;
-                    let row = format!(
-                        "{},{},{},{},{},{},{},{},{}\n",
-                        run_id,
-                        ts,
-                        ev.core_id,
-                        m.used_bytes,
-                        m.total_bytes,
-                        m.heap_used_bytes,
-                        m.heap_total_bytes,
-                        m.core_sched_ns,
-                        m.core_switches
-                    );
-
-                    mem_rows[scan_core].push_str(&row);
-                    mem_rows[avg].push_str(&row);
-                }
-            }
-            _ => {}
-        }
-    }
-
     ExportBundle {
         samples_rows,
         spans_rows,
         mem_rows,
-        max_seq_seen,
+        max_seq_seen: vec![0u64; ncores],
     }
+}
+
+fn heap_sift_down(heap: &mut [(u64, u16, u64, usize)], mut idx: usize) {
+    let len = heap.len();
+    loop {
+        let left = 2 * idx + 1;
+        let right = 2 * idx + 2;
+        let mut smallest = idx;
+
+        if left < len && heap[left] < heap[smallest] {
+            smallest = left;
+        }
+        if right < len && heap[right] < heap[smallest] {
+            smallest = right;
+        }
+
+        if smallest == idx {
+            break;
+        }
+
+        heap.swap(idx, smallest);
+        idx = smallest;
+    }
+}
+
+fn heap_build(heap: &mut [(u64, u16, u64, usize)]) {
+    for i in (0..(heap.len() / 2)).rev() {
+        heap_sift_down(heap, i);
+    }
+}
+
+fn write_sample_row(
+    row: &mut String,
+    run_id: u32,
+    ts: u64,
+    core_id: u16,
+    rip: u64,
+    depth: u16,
+    stack: &[u64; MAX_STACK_DEPTH],
+) {
+    let _ = core::write!(
+        row,
+        "{},{},{},0x{:016x},{}",
+        run_id,
+        ts,
+        core_id,
+        rip,
+        depth
+    );
+
+    let depth = depth as usize;
+    for di in 0..MAX_STACK_DEPTH {
+        if di < depth {
+            let v = stack[di];
+            let _ = core::write!(row, ",0x{:016x}", v);
+        } else {
+            row.push(',');
+        }
+    }
+
+    row.push('\n');
+}
+
+fn write_metrics_row(row: &mut String, run_id: u32, ts: u64, core_id: u16, m: &BenchMetricsEvent) {
+    let _ = core::write!(
+        row,
+        "{},{},{},{},{},{},{},{},{}\n",
+        run_id,
+        ts,
+        core_id,
+        m.used_bytes,
+        m.total_bytes,
+        m.heap_used_bytes,
+        m.heap_total_bytes,
+        m.core_sched_ns,
+        m.core_switches
+    );
+}
+
+fn write_span_row(
+    row: &mut String,
+    run_id: u32,
+    tag: &'static str,
+    object_id: u64,
+    start_core: u16,
+    start_ts: u64,
+    dur: u64,
+) {
+    let _ = core::write!(
+        row,
+        "{},{},0x{:016x},{},{},{}\n",
+        run_id,
+        tag,
+        object_id,
+        start_core,
+        start_ts,
+        dur
+    );
+}
+pub async fn build_exports_for_window(
+    cfg: &BenchWindowConfig,
+    run_id: u32,
+    start_ns: u64,
+    to_ns: u64,
+    last_export_seq: &[u64],
+    ncores: usize,
+    open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
+) -> Vec<ExportBundle> {
+    if !BENCH_ENABLED {
+        return vec![make_empty_bundle(ncores)];
+    }
+
+    let state = match bench_state() {
+        Some(s) => s,
+        None => return vec![make_empty_bundle(ncores)],
+    };
+
+    let log_samples = cfg.log_samples;
+    let log_spans = cfg.log_spans;
+    let want_mem_stream = cfg.log_mem_on_persist;
+
+    struct CoreIterator {
+        events: Vec<BenchEvent>,
+        index: usize,
+        core: usize,
+    }
+
+    impl CoreIterator {
+        fn peek(&self) -> Option<&BenchEvent> {
+            self.events.get(self.index)
+        }
+
+        fn pop(&mut self) -> Option<BenchEvent> {
+            if self.index < self.events.len() {
+                let idx = self.index;
+                self.index += 1;
+                Some(self.events[idx])
+            } else {
+                None
+            }
+        }
+
+        fn shrink_consumed(&mut self) {
+            if self.index > 1024 && self.index > self.events.len() / 2 {
+                self.events.drain(0..self.index);
+                self.index = 0;
+                self.events.shrink_to_fit();
+            }
+        }
+    }
+
+    let mut gather_joins = Vec::with_capacity(ncores);
+    for core in 0..ncores {
+        let st = state.clone();
+        let last_seq = *last_export_seq.get(core).unwrap_or(&0);
+
+        gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
+            move || -> Vec<BenchEvent> {
+                let ring_m = match st.ring_for_core(core) {
+                    Some(r) => r,
+                    None => return Vec::new(),
+                };
+
+                let mut ring = ring_m.lock();
+                let mut out = Vec::new();
+
+                for ev in ring.buffer.iter() {
+                    if ev.is_empty() {
+                        continue;
+                    }
+                    if ev.seq <= last_seq {
+                        continue;
+                    }
+
+                    let ts = ev.timestamp_ns;
+                    if ts < start_ns || ts > to_ns {
+                        continue;
+                    }
+
+                    out.push(*ev);
+                }
+
+                ring.buffer.clear();
+
+                out.sort_unstable_by(|a, b| {
+                    a.timestamp_ns
+                        .cmp(&b.timestamp_ns)
+                        .then(a.core_id.cmp(&b.core_id))
+                        .then(a.seq.cmp(&b.seq))
+                });
+
+                out
+            },
+        ));
+    }
+
+    let mut iterators: Vec<CoreIterator> = Vec::with_capacity(ncores);
+    let mut total_events = 0usize;
+
+    for (core, j) in gather_joins.into_iter().enumerate() {
+        let events = j.await;
+        total_events += events.len();
+        if !events.is_empty() {
+            iterators.push(CoreIterator {
+                events,
+                index: 0,
+                core,
+            });
+        }
+    }
+
+    if total_events == 0 || iterators.is_empty() {
+        return vec![make_empty_bundle(ncores)];
+    }
+
+    let desired_chunks = ncores.max(4);
+    let min_chunk_size = 256usize;
+    let chunks = core::cmp::min(
+        desired_chunks,
+        (total_events + min_chunk_size - 1) / min_chunk_size,
+    )
+    .max(1);
+    let chunk_size = (total_events + chunks - 1) / chunks;
+
+    let mut out = Vec::with_capacity(chunks);
+    for _ in 0..chunks {
+        out.push(make_empty_bundle(ncores));
+    }
+
+    let k = iterators.len();
+    let mut heap: Vec<(u64, u16, u64, usize)> = Vec::with_capacity(k);
+
+    for (iter_idx, iter) in iterators.iter().enumerate() {
+        if let Some(ev) = iter.peek() {
+            heap.push((ev.timestamp_ns, ev.core_id, ev.seq, iter_idx));
+        }
+    }
+    heap_build(&mut heap);
+
+    let avg = ncores;
+    let mut global_idx = 0usize;
+    let shrink_interval = 2048usize;
+
+    while !heap.is_empty() {
+        let (_, _, _, iter_idx) = heap[0];
+
+        let iter = &mut iterators[iter_idx];
+        let scan_core = iter.core;
+        let ev = iter.pop().unwrap();
+
+        if global_idx % shrink_interval == 0 {
+            iter.shrink_consumed();
+        }
+
+        let chunk_idx = core::cmp::min(global_idx / chunk_size, chunks - 1);
+        let bundle = &mut out[chunk_idx];
+
+        if scan_core < ncores && ev.seq > bundle.max_seq_seen[scan_core] {
+            bundle.max_seq_seen[scan_core] = ev.seq;
+        }
+
+        match ev.kind {
+            BenchEventKind::Sample if log_samples => {
+                if let BenchEventData::Sample(s) = ev.data {
+                    write_sample_row(
+                        &mut bundle.samples_rows[scan_core],
+                        run_id,
+                        ev.timestamp_ns,
+                        ev.core_id,
+                        s.rip,
+                        s.depth.into(),
+                        &s.stack,
+                    );
+                    write_sample_row(
+                        &mut bundle.samples_rows[avg],
+                        run_id,
+                        ev.timestamp_ns,
+                        ev.core_id,
+                        s.rip,
+                        s.depth.into(),
+                        &s.stack,
+                    );
+                }
+            }
+            BenchEventKind::Metrics if want_mem_stream => {
+                if let BenchEventData::Metrics(m) = ev.data {
+                    write_metrics_row(
+                        &mut bundle.mem_rows[scan_core],
+                        run_id,
+                        ev.timestamp_ns,
+                        ev.core_id,
+                        &m,
+                    );
+                    write_metrics_row(
+                        &mut bundle.mem_rows[avg],
+                        run_id,
+                        ev.timestamp_ns,
+                        ev.core_id,
+                        &m,
+                    );
+                }
+            }
+            BenchEventKind::SpanBegin if log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    open_spans.insert(span.span_id, (span, ev.timestamp_ns, ev.core_id));
+                }
+            }
+            BenchEventKind::SpanEnd if log_spans => {
+                if let BenchEventData::Span(span) = ev.data {
+                    if let Some((start_span, start_ts, start_core)) =
+                        open_spans.remove(&span.span_id)
+                    {
+                        let dur = ev.timestamp_ns.saturating_sub(start_ts);
+
+                        write_span_row(
+                            &mut bundle.spans_rows[avg],
+                            run_id,
+                            start_span.tag,
+                            start_span.object_id,
+                            start_core,
+                            start_ts,
+                            dur,
+                        );
+
+                        let start_idx = start_core as usize;
+                        if start_idx < ncores {
+                            write_span_row(
+                                &mut bundle.spans_rows[start_idx],
+                                run_id,
+                                start_span.tag,
+                                start_span.object_id,
+                                start_core,
+                                start_ts,
+                                dur,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        global_idx += 1;
+
+        if let Some(next_ev) = iterators[iter_idx].peek() {
+            heap[0] = (next_ev.timestamp_ns, next_ev.core_id, next_ev.seq, iter_idx);
+            heap_sift_down(&mut heap, 0);
+        } else {
+            let last = heap.len() - 1;
+            heap.swap(0, last);
+            heap.pop();
+            if !heap.is_empty() {
+                heap_sift_down(&mut heap, 0);
+            }
+
+            iterators[iter_idx].events = Vec::new();
+        }
+    }
+
+    iterators.clear();
+
+    out
 }
 
 // ===== BenchWindow =====
@@ -1005,7 +1227,9 @@ impl BenchWindow {
             spawn_blocking(move || {
                 interrupt_index::wait_duration(timeout_ms);
                 this.stop();
+                println!("starting timeout persist");
                 block_on(this.persist());
+                println!("timeout done");
             });
         }
 
@@ -1013,18 +1237,25 @@ impl BenchWindow {
             if !secs.is_zero() {
                 let interval = secs;
                 let this = self.clone();
+                let this_arc = Arc::new(self.clone());
                 spawn_blocking(move || loop {
                     interrupt_index::wait_duration(interval);
+
                     if !BENCH_ENABLED {
                         return;
                     }
+
                     {
-                        let inner = this.inner.lock();
+                        let inner = this_arc.inner.lock();
                         if !inner.running {
                             break;
                         }
                     }
-                    block_on(this.persist());
+
+                    let moved = Arc::clone(&this_arc);
+                    block_on(spawn(async move {
+                        moved.persist().await;
+                    }));
                 });
             }
         }
@@ -1051,12 +1282,15 @@ impl BenchWindow {
     }
 
     pub async fn persist(&self) {
+        use alloc::sync::Arc;
+
         if !BENCH_ENABLED {
             return;
         }
         if !self.ensure_fs_ready().await {
             return;
         }
+
         let cfg: BenchWindowConfig;
         let run_id: u32;
         let start_ns: u64;
@@ -1104,7 +1338,7 @@ impl BenchWindow {
             return;
         }
 
-        let exports = build_exports_for_window(
+        let exports_vec = build_exports_for_window(
             &cfg,
             run_id,
             start_ns,
@@ -1112,108 +1346,197 @@ impl BenchWindow {
             &last_export_seq,
             ncores,
             &mut open_spans,
-        );
+        )
+        .await;
 
-        let mut ok = true;
+        if exports_vec.is_empty() {
+            return;
+        }
+
+        let exports = Arc::new(exports_vec);
+
+        let mut joins = Vec::new();
 
         if cfg.log_samples {
-            let header =
-                "run_id,timestamp_ns,core,rip,depth,frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n";
+            let header: &'static str = "run_id,timestamp_ns,core,rip,depth,frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n";
 
             for target in 0..(ncores + 1) {
-                let rows = &exports.samples_rows[target];
-                if rows.is_empty() {
-                    continue;
-                }
+                let ex = exports.clone();
+                let session_dir = session_dir.clone();
+                let window_dir = window_dir.clone();
+                let mut header_written = samples_header_written[target];
 
-                let mut csv = String::new();
-                if !samples_header_written[target] {
-                    csv.push_str(header);
-                }
-                csv.push_str(rows);
+                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
+                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
+                    let file_name = format!("run_{run_id}_samples.csv");
 
-                let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                let file_name = format!("run_{run_id}_samples.csv");
-                if append_named_file(&path, &file_name, csv.as_bytes())
-                    .await
-                    .is_err()
-                {
-                    ok = false;
-                } else {
-                    samples_header_written[target] = true;
-                }
+                    for b in ex.iter() {
+                        let rows = &b.samples_rows[target];
+                        if rows.is_empty() {
+                            continue;
+                        }
+
+                        if !header_written {
+                            let mut csv = String::new();
+                            csv.push_str(header);
+                            csv.push_str(rows);
+                            if append_named_file(&path, &file_name, csv.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                            header_written = true;
+                        } else {
+                            if append_named_file(&path, &file_name, rows.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                        }
+                    }
+
+                    (true, target, header_written)
+                }));
             }
         }
 
         if cfg.log_spans {
-            let header = "run_id,tag,object_id,core,start_ns,duration_ns\n";
+            let header: &'static str = "run_id,tag,object_id,core,start_ns,duration_ns\n";
 
             for target in 0..(ncores + 1) {
-                let rows = &exports.spans_rows[target];
-                if rows.is_empty() {
-                    continue;
-                }
+                let ex = exports.clone();
+                let session_dir = session_dir.clone();
+                let window_dir = window_dir.clone();
+                let mut header_written = spans_header_written[target];
 
-                let mut csv = String::new();
-                if !spans_header_written[target] {
-                    csv.push_str(header);
-                }
-                csv.push_str(rows);
+                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
+                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
+                    let file_name = format!("run_{run_id}_spans.csv");
 
-                let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                let file_name = format!("run_{run_id}_spans.csv");
-                if append_named_file(&path, &file_name, csv.as_bytes())
-                    .await
-                    .is_err()
-                {
-                    ok = false;
-                } else {
-                    spans_header_written[target] = true;
-                }
+                    for b in ex.iter() {
+                        let rows = &b.spans_rows[target];
+                        if rows.is_empty() {
+                            continue;
+                        }
+
+                        if !header_written {
+                            let mut csv = String::new();
+                            csv.push_str(header);
+                            csv.push_str(rows);
+                            if append_named_file(&path, &file_name, csv.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                            header_written = true;
+                        } else {
+                            if append_named_file(&path, &file_name, rows.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                        }
+                    }
+
+                    (true, target, header_written)
+                }));
             }
         }
 
         if cfg.log_mem_on_persist {
-            let header = "run_id,timestamp_ns,core,used_bytes,total_bytes,heap_used_bytes,heap_total_bytes,core_sched_ns,core_switches\n";
+            let header: &'static str = "run_id,timestamp_ns,core,used_bytes,total_bytes,heap_used_bytes,heap_total_bytes,core_sched_ns,core_switches\n";
 
             for target in 0..(ncores + 1) {
-                let rows = &exports.mem_rows[target];
-                if rows.is_empty() {
-                    continue;
-                }
+                let ex = exports.clone();
+                let session_dir = session_dir.clone();
+                let window_dir = window_dir.clone();
+                let mut header_written = mem_header_written[target];
 
-                let mut csv = String::new();
-                if !mem_header_written[target] {
-                    csv.push_str(header);
-                }
-                csv.push_str(rows);
+                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
+                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
+                    let file_name = format!("run_{run_id}_memory.csv");
 
-                let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                let file_name = format!("run_{run_id}_memory.csv");
-                if append_named_file(&path, &file_name, csv.as_bytes())
-                    .await
-                    .is_err()
-                {
-                    ok = false;
-                } else {
-                    mem_header_written[target] = true;
+                    for b in ex.iter() {
+                        let rows = &b.mem_rows[target];
+                        if rows.is_empty() {
+                            continue;
+                        }
+
+                        if !header_written {
+                            let mut csv = String::new();
+                            csv.push_str(header);
+                            csv.push_str(rows);
+                            if append_named_file(&path, &file_name, csv.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                            header_written = true;
+                        } else {
+                            if append_named_file(&path, &file_name, rows.as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                return (false, target, header_written);
+                            }
+                        }
+                    }
+
+                    (true, target, header_written)
+                }));
+            }
+        }
+
+        let mut ok = true;
+        let results = JoinAll::new(joins).await;
+
+        for (this_ok, target, header_written) in results {
+            if !this_ok {
+                ok = false;
+                continue;
+            }
+
+            if cfg.log_samples {
+                samples_header_written[target] = header_written;
+            }
+            if cfg.log_spans {
+                spans_header_written[target] = header_written;
+            }
+            if cfg.log_mem_on_persist {
+                mem_header_written[target] = header_written;
+            }
+        }
+
+        if !ok {
+            return;
+        }
+
+        let mut merged_max_seq = vec![0u64; ncores];
+        for b in exports.iter() {
+            for i in 0..ncores {
+                let s = b.max_seq_seen[i];
+                if s > merged_max_seq[i] {
+                    merged_max_seq[i] = s;
                 }
             }
         }
 
-        if ok {
-            let mut inner = self.inner.lock();
-            inner.samples_header_written = samples_header_written;
-            inner.spans_header_written = spans_header_written;
-            inner.mem_header_written = mem_header_written;
+        let mut inner = self.inner.lock();
+        inner.samples_header_written = samples_header_written;
+        inner.spans_header_written = spans_header_written;
+        inner.mem_header_written = mem_header_written;
 
-            inner.open_spans = open_spans;
+        inner.open_spans = open_spans;
 
-            for i in 0..ncores {
-                let max_seq = exports.max_seq_seen[i];
-                if max_seq != 0 && max_seq > inner.last_export_seq[i] {
-                    inner.last_export_seq[i] = max_seq;
-                }
+        for i in 0..ncores {
+            let max_seq = merged_max_seq[i];
+            if max_seq != 0 && max_seq > inner.last_export_seq[i] {
+                inner.last_export_seq[i] = max_seq;
             }
         }
     }

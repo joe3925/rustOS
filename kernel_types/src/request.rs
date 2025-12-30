@@ -85,13 +85,28 @@ impl Request {
     }
     #[inline]
     fn complete_for_drop(&mut self) {
-        if let Some(fp) = self.completion_routine.take() {
-            let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
-            let context = self.completion_context;
-            self.status = f(self, context);
-        }
+        let (status, waker) = {
+            if self.completed {
+                return;
+            }
 
-        self.completed = true;
+            if let Some(fp) = self.completion_routine.take() {
+                let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
+                let context = self.completion_context;
+                self.status = f(&mut *self, context);
+            }
+
+            if self.status == DriverStatus::ContinueStep {
+                self.status = DriverStatus::Success;
+            }
+
+            self.completed = true;
+            (self.status, self.waker.take())
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
     }
 }
 impl Drop for Request {

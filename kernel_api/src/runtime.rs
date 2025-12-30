@@ -8,7 +8,9 @@ use core::{
 
 use alloc::{boxed::Box, sync::Arc, task::Wake};
 
-use kernel_sys::{kernel_async_submit, kernel_spawn_ffi, submit_blocking_internal};
+use kernel_sys::{
+    kernel_async_submit, kernel_spawn_ffi, submit_blocking_internal, try_steal_blocking_one,
+};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use spin::Mutex;
 
@@ -67,7 +69,11 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     loop {
         match Pin::new(&mut pinned).as_mut().poll(&mut cx) {
             Poll::Ready(out) => return out,
-            Poll::Pending => if !notify.take_ready() {},
+            Poll::Pending => {
+                if !notify.take_ready() {
+                    if !unsafe { try_steal_blocking_one() } {}
+                }
+            }
         }
     }
 }
