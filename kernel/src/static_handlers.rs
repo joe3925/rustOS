@@ -23,10 +23,11 @@ use kernel_types::{
     irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::Request,
-    status::{Data, DriverStatus, FileStatus, RegError},
+    status::{Data, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once, RwLock};
+use x86_64::VirtAddr;
 
 use crate::{
     benchmarking::{
@@ -46,7 +47,7 @@ use crate::{
     idt::{irq_register, irq_signal, irq_signal_n},
     memory::{
         allocator::ALLOCATOR,
-        paging::{constants::KERNEL_STACK_SIZE, stack::StackSize},
+        paging::{mmio, stack::StackSize},
     },
     registry::reg,
     scheduling::{
@@ -65,7 +66,7 @@ pub extern "win64" fn create_kernel_task(
     ctx: usize,
     name: String,
 ) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Medium, name, 0);
     SCHEDULER.add_task(task)
 }
 
@@ -617,4 +618,8 @@ pub extern "win64" fn bench_kernel_span_end(
 #[no_mangle]
 pub extern "win64" fn get_current_cpu_id() -> usize {
     current_cpu_id()
+}
+#[no_mangle]
+pub extern "win64" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    mmio::unmap_mmio_region(base, size)
 }

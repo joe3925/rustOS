@@ -23,8 +23,6 @@ use kernel_api::{
 };
 use spin::RwLock;
 
-mod msvc_shims;
-
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
 #[cfg(not(test))]

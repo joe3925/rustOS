@@ -48,8 +48,6 @@ use kernel_api::util::bytes_to_box;
 use spin::Once;
 use spin::RwLock;
 
-mod msvc_shims;
-
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]

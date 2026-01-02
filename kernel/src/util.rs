@@ -8,7 +8,7 @@ use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
     calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
-    wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
+    wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -25,8 +25,8 @@ use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
+use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::registry::is_first_boot;
@@ -105,6 +105,7 @@ pub unsafe fn init() {
         wait_using_pit_50ms();
         let tsc_end = cpu::get_cycles();
         calibrate_tsc(tsc_start, tsc_end, 50);
+        TOTAL_TIME.call_once(Stopwatch::start);
 
         match ApicImpl::init_apic_full() {
             Ok(_) => {
@@ -118,15 +119,21 @@ pub unsafe fn init() {
                 println!("APIC transition failed {}!", err.to_str());
             }
         }
-
-        println!("Init Done");
     }
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
-    TOTAL_TIME.call_once(Stopwatch::start);
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
     SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
+    SCHEDULER.add_task(Task::new_kernel_mode(
+        kernel_main,
+        0,
+        StackSize::Tiny,
+        "kernel".into(),
+        0,
+    ));
+
     x86_64::instructions::interrupts::enable();
+    println!("Init Done");
     KERNEL_INITIALIZED.store(true, Ordering::SeqCst);
     loop {
         asm!("hlt");
@@ -163,6 +170,24 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         PNP_MANAGER.init_from_registry().await;
     });
     println!("");
+}
+#[no_mangle]
+#[inline(never)]
+pub extern "win64" fn trigger_guard_page_overflow() -> ! {
+    let task = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .expect("no current task");
+    let guard = task.read().guard_page;
+    let target = (guard + 0x800) & !0xFu64;
+
+    unsafe {
+        asm!(
+            "mov rsp, {0}",
+            "mov qword ptr [rsp], 0",
+            in(reg) target,
+            options(noreturn)
+        );
+    }
 }
 #[inline(always)]
 fn halt_loop() -> ! {

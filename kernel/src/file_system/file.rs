@@ -18,9 +18,11 @@ use kernel_types::{
 use crate::{
     drivers::drive::vfs::Vfs,
     file_system::file_provider::{self, install_file_provider, FileProvider},
+    memory::paging::frame_alloc::USED_MEMORY,
     println,
     registry::reg::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,
+    util::TOTAL_TIME,
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
@@ -314,13 +316,22 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     let vfs_toml = "C:\\system\\toml";
     ensure_dir(vfs_mod).await;
     ensure_dir(vfs_toml).await;
-    if is_first_boot().await {
-        //install_prepacked_drivers();
-    }
-    //GLOBAL_WINDOW.stop_and_persist().await;
+
+    let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
+    let secs = boot_ms / 1000;
+    let frac = boot_ms % 1000;
+
+    let used_bytes = USED_MEMORY.load(core::sync::atomic::Ordering::Acquire);
+    let used_mib = used_bytes / (1024 * 1024);
+    let used_mib_frac = (used_bytes % (1024 * 1024)) * 1000 / (1024 * 1024);
+
+    println!(
+        "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
+        secs, frac, used_mib, used_mib_frac
+    );
+
     Ok(())
 }
-
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {
     path.trim_start_matches('\\').split('\\').collect()
 }

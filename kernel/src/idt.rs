@@ -20,12 +20,8 @@ use crate::drivers;
 use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
-use crate::gdt::{DOUBLE_FAULT_IST_INDEX, TIMER_IST_INDEX};
+use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX};
 use crate::scheduling::scheduler::yield_interrupt_entry;
-
-// =============================================================================
-// IRQ HANDLE IMPLEMENTATION
-// =============================================================================
 
 /// Internal representation of an IRQ handle
 struct IrqHandleInner {
@@ -565,7 +561,8 @@ lazy_static! {
         idt.general_protection_fault
             .set_handler_fn(exception_handlers::general_protection_fault);
         idt.page_fault
-            .set_handler_fn(exception_handlers::page_fault);
+            .set_handler_fn(exception_handlers::page_fault)
+            .set_stack_index(PAGE_FAULT_IST_INDEX);
         idt.x87_floating_point
             .set_handler_fn(exception_handlers::x87_floating_point_exception);
         idt.alignment_check

@@ -8,7 +8,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::RequestExt;
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_range};
+use kernel_api::memory::{map_mmio_region, unmap_mmio_region, unmap_range};
 use kernel_api::request::Request;
 use kernel_api::status::{DriverStatus, PageMapError};
 
@@ -117,7 +117,7 @@ fn map_cfg_page(
 
 #[inline]
 unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
-    unsafe { unmap_range(va, size) };
+    unsafe { unmap_mmio_region(va, size) };
 }
 
 #[inline]

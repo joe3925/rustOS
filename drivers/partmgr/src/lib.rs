@@ -37,7 +37,6 @@ fn panic(info: &PanicInfo) -> ! {
         panic_common(MOD_NAME, info)
     }
 }
-mod msvc_shims;
 
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 

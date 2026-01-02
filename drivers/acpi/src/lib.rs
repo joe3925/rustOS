@@ -6,7 +6,6 @@
 extern crate alloc;
 mod aml;
 mod dev_ext;
-mod msvc_shims;
 mod pdo;
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};

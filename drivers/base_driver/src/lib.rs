@@ -1,7 +1,6 @@
 #![no_std]
 #![no_main]
 extern crate alloc;
-mod msvc_shims;
 use core::panic::PanicInfo;
 
 use alloc::sync::Arc;

@@ -22,6 +22,10 @@ pub static MEMORY_BITMAP: Mutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
 
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
 
+static NEXT_WORD_4K: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WORD_2M: AtomicUsize = AtomicUsize::new(0);
+static NEXT_WORD_1G: AtomicUsize = AtomicUsize::new(0);
+
 pub fn total_usable_bytes() -> u64 {
     boot_info()
         .memory_regions
@@ -30,68 +34,44 @@ pub fn total_usable_bytes() -> u64 {
         .map(|r| r.end - r.start)
         .sum()
 }
-#[derive(Clone)]
 
-// This struct doesnt do anything anymore but remains so old code still works
+#[derive(Clone)]
 pub struct BootInfoFrameAllocator {}
 
 impl BootInfoFrameAllocator {
-    pub fn init_start(memory_regions: &'static [MemoryRegion]) {
-        let mut memory_map = MEMORY_BITMAP.lock();
+    pub fn init_start(_memory_regions: &'static [MemoryRegion]) {
+        let mut bm = MEMORY_BITMAP.lock();
 
-        let words = (LOW_FRAMES + 63) / 64;
-        for w in 0..words.min(memory_map.len()) {
-            memory_map[w] = !0u64; // mark every bit in the word
+        for w in bm.iter_mut() {
+            *w = 0;
         }
 
-        for region in memory_regions {
-            if region.kind == MemoryRegionKind::Usable {
-                continue;
-            }
-
-            let start_frame = (region.start >> 12) as usize;
-            let end_frame = ((region.end + 0xFFF) >> 12) as usize - 1;
-
-            if start_frame / 64 >= memory_map.len() {
-                continue; // outside our bitmap
-            }
-
-            let first_word = start_frame / 64;
-            let last_word = end_frame / 64;
-
-            let first_mask = !0u64 << (start_frame & 63);
-            let last_mask = !0u64 >> (63 - (end_frame & 63));
-
-            if first_word == last_word {
-                memory_map[first_word] |= first_mask & last_mask;
-                continue;
-            }
-
-            memory_map[first_word] |= first_mask; // partial first word
-
-            for w in (first_word + 1)..last_word {
-                // full words in the middle
-                memory_map[w] = !0u64;
-            }
-
-            memory_map[last_word] |= last_mask; // partial last word
+        if LOW_FRAMES != 0 {
+            set_range(bm.as_mut_slice(), 0, LOW_FRAMES);
         }
+
+        NEXT_WORD_4K.store(0, Ordering::Release);
+        NEXT_WORD_2M.store(0, Ordering::Release);
+        NEXT_WORD_1G.store(0, Ordering::Release);
     }
-    pub fn init(memory_regions: &'static [MemoryRegion]) -> Self {
+
+    pub fn init(_memory_regions: &'static [MemoryRegion]) -> Self {
         BootInfoFrameAllocator {}
     }
+
     pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
         let base_idx = (frame.start_address().as_u64() >> 12) as usize;
-        let (len, bytes) = match S::SIZE {
-            Size4KiB::SIZE => (1, 0x1000),
-            Size2MiB::SIZE => (FRAMES_PER_2M, 0x20_0000),
-            Size1GiB::SIZE => (FRAMES_PER_1G, 0x4000_0000),
+        let (len, bytes_u64) = match S::SIZE {
+            Size4KiB::SIZE => (1usize, 0x1000u64),
+            Size2MiB::SIZE => (FRAMES_PER_2M, 0x20_0000u64),
+            Size1GiB::SIZE => (FRAMES_PER_1G, 0x4000_0000u64),
             _ => return,
         };
 
         let mut bm = MEMORY_BITMAP.lock();
         clear_range(bm.as_mut_slice(), base_idx, len);
-        USED_MEMORY.fetch_sub(bytes, Ordering::SeqCst);
+
+        USED_MEMORY.fetch_sub(bytes_u64 as usize, Ordering::SeqCst);
     }
 }
 
@@ -99,19 +79,40 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     #[inline]
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
         let mut bm = MEMORY_BITMAP.lock();
+        let words = bm.len();
+        if words == 0 {
+            return None;
+        }
 
-        for (word_idx, word) in bm.iter_mut().enumerate() {
-            if *word == u64::MAX {
+        let start = NEXT_WORD_4K.load(Ordering::Relaxed) % words;
+        for step in 0..words {
+            let word_idx = (start + step) % words;
+            let word = bm[word_idx];
+            if word == u64::MAX {
                 continue;
             }
 
-            let free_bit = (!*word).trailing_zeros() as usize;
-            *word |= 1u64 << free_bit;
-
+            let free_bit = (!word).trailing_zeros() as usize;
             let frame_idx = word_idx * 64 + free_bit;
+
+            if frame_idx < LOW_FRAMES {
+                set_bit(bm.as_mut_slice(), frame_idx);
+                continue;
+            }
+
+            if !frame_range_is_usable(frame_idx, 1) {
+                set_bit(bm.as_mut_slice(), frame_idx);
+                continue;
+            }
+
+            set_bit(bm.as_mut_slice(), frame_idx);
+            NEXT_WORD_4K.store(word_idx, Ordering::Relaxed);
+
+            USED_MEMORY.fetch_add(0x1000, Ordering::SeqCst);
             let phys = (frame_idx as u64) << 12;
             return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
+
         None
     }
 }
@@ -120,34 +121,56 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size2MiB>> {
         let mut bm = MEMORY_BITMAP.lock();
         let words = bm.len();
+        if words == 0 {
+            return None;
+        }
 
-        for (word_idx, word) in bm.iter().enumerate() {
-            if *word == u64::MAX {
-                continue; // no free bit here
+        let start = NEXT_WORD_2M.load(Ordering::Relaxed) % words;
+        for step in 0..words {
+            let word_idx = (start + step) % words;
+            let word = bm[word_idx];
+            if word == u64::MAX {
+                continue;
             }
 
-            // any zero‑bit in this word gives us a candidate index
-            let bit = (!*word).trailing_zeros() as usize;
-            let idx = word_idx * 64 + bit; // frame index
-            let base = idx & !(FRAMES_PER_2M - 1); // align down to 512
+            let bit = (!word).trailing_zeros() as usize;
+            let idx = word_idx * 64 + bit;
+            let base = idx & !(FRAMES_PER_2M - 1);
 
-            // check whole 2 MiB block
+            if base < LOW_FRAMES {
+                set_bit(bm.as_mut_slice(), idx);
+                continue;
+            }
+
+            if !frame_range_is_usable(base, FRAMES_PER_2M) {
+                set_bit(bm.as_mut_slice(), idx);
+                continue;
+            }
+
             let start_w = base / 64;
             if start_w + WORDS_PER_2M > words {
-                break; // out of bitmap
+                break;
             }
-            let all_free = bm[start_w..start_w + WORDS_PER_2M].iter().all(|w| *w == 0);
+
+            let mut all_free = true;
+            for w in &bm[start_w..start_w + WORDS_PER_2M] {
+                if *w != 0 {
+                    all_free = false;
+                    break;
+                }
+            }
             if !all_free {
                 continue;
             }
 
-            // mark 512 bits allocated
             for w in &mut bm[start_w..start_w + WORDS_PER_2M] {
                 *w = u64::MAX;
             }
 
+            NEXT_WORD_2M.store(word_idx, Ordering::Relaxed);
+
+            USED_MEMORY.fetch_add(0x20_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;
-            USED_MEMORY.fetch_add(FRAMES_PER_2M * 4 * 1024, Ordering::SeqCst);
             return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
         None
@@ -158,21 +181,44 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size1GiB>> {
         let mut bm = MEMORY_BITMAP.lock();
         let words = bm.len();
+        if words == 0 {
+            return None;
+        }
 
-        for (word_idx, word) in bm.iter().enumerate() {
-            if *word == u64::MAX {
+        let start = NEXT_WORD_1G.load(Ordering::Relaxed) % words;
+        for step in 0..words {
+            let word_idx = (start + step) % words;
+            let word = bm[word_idx];
+            if word == u64::MAX {
                 continue;
             }
 
-            let bit = (!*word).trailing_zeros() as usize;
+            let bit = (!word).trailing_zeros() as usize;
             let idx = word_idx * 64 + bit;
-            let base = idx & !(FRAMES_PER_1G - 1); // align 1 GiB
+            let base = idx & !(FRAMES_PER_1G - 1);
+
+            if base < LOW_FRAMES {
+                set_bit(bm.as_mut_slice(), idx);
+                continue;
+            }
+
+            if !frame_range_is_usable(base, FRAMES_PER_1G) {
+                set_bit(bm.as_mut_slice(), idx);
+                continue;
+            }
 
             let start_w = base / 64;
             if start_w + WORDS_PER_1G > words {
                 break;
             }
-            let all_free = bm[start_w..start_w + WORDS_PER_1G].iter().all(|w| *w == 0);
+
+            let mut all_free = true;
+            for w in &bm[start_w..start_w + WORDS_PER_1G] {
+                if *w != 0 {
+                    all_free = false;
+                    break;
+                }
+            }
             if !all_free {
                 continue;
             }
@@ -180,31 +226,99 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
             for w in &mut bm[start_w..start_w + WORDS_PER_1G] {
                 *w = u64::MAX;
             }
+
+            NEXT_WORD_1G.store(word_idx, Ordering::Relaxed);
+
+            USED_MEMORY.fetch_add(0x4000_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;
-            USED_MEMORY.fetch_add(FRAMES_PER_1G * 4 * 1024, Ordering::SeqCst);
             return Some(PhysFrame::containing_address(PhysAddr::new(phys)));
         }
         None
     }
 }
+
+fn frame_range_is_usable(base_idx: usize, len: usize) -> bool {
+    let base = (base_idx as u64) << 12;
+    let end_excl = ((base_idx.saturating_add(len) as u64) << 12);
+
+    boot_info().memory_regions.iter().any(|r| {
+        if r.kind != MemoryRegionKind::Usable {
+            return false;
+        }
+        let rs = r.start;
+        let re = r.end;
+        base >= rs && end_excl <= re
+    })
+}
+
+fn set_bit(bitmap: &mut [u64], idx: usize) {
+    let w = idx / 64;
+    let b = idx & 63;
+    if w >= bitmap.len() {
+        return;
+    }
+    bitmap[w] |= 1u64 << b;
+}
+
+fn set_range(bitmap: &mut [u64], start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+
+    let words = bitmap.len();
+    if words == 0 {
+        return;
+    }
+
+    if start / 64 >= words {
+        return;
+    }
+
+    let end_incl = start + len - 1;
+    let max_bit = words * 64 - 1;
+    let end_incl = core::cmp::min(end_incl, max_bit);
+
+    let first_word = start / 64;
+    let last_word = end_incl / 64;
+
+    if first_word == last_word {
+        let mask = ((!0u64) << (start & 63)) & ((!0u64) >> (63 - (end_incl & 63)));
+        bitmap[first_word] |= mask;
+        return;
+    }
+
+    bitmap[first_word] |= !0u64 << (start & 63);
+
+    for w in (first_word + 1)..last_word {
+        bitmap[w] = !0u64;
+    }
+
+    bitmap[last_word] |= !0u64 >> (63 - (end_incl & 63));
+}
+
 fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
     if len == 0 {
         return;
     }
 
-    let end = start + len - 1;
     let words = bitmap.len();
+    if words == 0 {
+        return;
+    }
+
     if start / 64 >= words {
         return;
     }
 
-    let end = core::cmp::min(end, words * 64 - 1);
+    let end_incl = start + len - 1;
+    let max_bit = words * 64 - 1;
+    let end_incl = core::cmp::min(end_incl, max_bit);
 
     let first_word = start / 64;
-    let last_word = end / 64;
+    let last_word = end_incl / 64;
 
     if first_word == last_word {
-        let mask = ((!0u64) << (start & 63)) & ((!0u64) >> (63 - (end & 63)));
+        let mask = ((!0u64) << (start & 63)) & ((!0u64) >> (63 - (end_incl & 63)));
         bitmap[first_word] &= !mask;
         return;
     }
@@ -215,5 +329,5 @@ fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
         bitmap[w] = 0;
     }
 
-    bitmap[last_word] &= !(!0u64 >> (63 - (end & 63)));
+    bitmap[last_word] &= !(!0u64 >> (63 - (end_incl & 63)));
 }

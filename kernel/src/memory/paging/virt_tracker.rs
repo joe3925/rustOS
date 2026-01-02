@@ -56,7 +56,9 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
+    unsafe {
+        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+    }?;
     Ok(addr)
 }
 
@@ -76,7 +78,9 @@ pub extern "win64" fn allocate_kernel_range_mapped(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
+    unsafe {
+        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+    }?;
     Ok(addr)
 }
 /// Allocate with specific alignment requirement
@@ -127,7 +131,9 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)?;
+    unsafe {
+        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+    }?;
     Ok(addr)
 }
 pub extern "win64" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {

@@ -27,8 +27,6 @@ use kernel_api::{
     status::DriverStatus,
 };
 
-mod msvc_shims;
-
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[panic_handler]

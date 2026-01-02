@@ -18,6 +18,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::map_mmio_region;
+use kernel_api::memory::unmap_mmio_region;
 use kernel_api::memory::unmap_range;
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpMinorFunction;
@@ -66,7 +67,7 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
 
 #[inline]
 unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
-    unsafe { unmap_range(va, size as u64) };
+    unsafe { unmap_mmio_region(va, size as u64) };
 }
 
 #[inline]

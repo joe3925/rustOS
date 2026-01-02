@@ -8,7 +8,6 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::memory::paging::paging::align_up_2mib;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
@@ -18,7 +17,7 @@ use x86_64::instructions::segmentation::{Segment, CS, SS};
 use x86_64::instructions::tables::load_tss;
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;
-
+pub const PAGE_FAULT_IST_INDEX: u16 = 2;
 lazy_static! {
     pub static ref PER_CPU_GDT: Mutex<(GDTTracker)> = Mutex::new(GDTTracker::new());
 }
@@ -46,33 +45,26 @@ impl GDTTracker {
         }
     }
     pub unsafe fn init_gdt(&mut self) {
-        static mut DOUBLE_FAULT_STACK: [u8; KERNEL_STACK_SIZE as usize] =
-            [0; KERNEL_STACK_SIZE as usize];
-
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let tss_ptr = self.base.add(self.size) as *mut TaskStateSegment;
         ptr::write(tss_ptr, TaskStateSegment::new());
         let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
-        let kernel_stack_size = align_up_2mib(KERNEL_STACK_SIZE);
         // Stacks
         let timer_stack =
-            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
 
         let privilege_stack =
-            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc privilege stack ");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack ");
 
-        let double_fault_stack = {
-            let stack_end =
-                VirtAddr::new(DOUBLE_FAULT_STACK.as_mut_ptr() as u64 + KERNEL_STACK_SIZE as u64);
-            let stack_start = stack_end - KERNEL_STACK_SIZE;
-            stack_end
-        };
+        let double_fault_stack =
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack ");
 
+        let page_stack =
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack ");
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
-        tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            double_fault_stack + KERNEL_STACK_SIZE;
+        tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack;
         tss_static.privilege_stack_table[0] = privilege_stack;
-
+        tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack;
         let tss_size = core::mem::size_of::<TaskStateSegment>();
         let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct
         let gdt_size_bytes = gdt_max_entries * mem::size_of::<u64>();

@@ -5,7 +5,6 @@
 extern crate alloc;
 
 mod dev_ext;
-mod msvc_shims;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(not(test))]

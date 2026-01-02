@@ -5,7 +5,6 @@
 extern crate alloc;
 
 mod dev_ext;
-mod msvc_shims;
 
 use alloc::sync::Weak;
 use alloc::vec;

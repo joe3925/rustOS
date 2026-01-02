@@ -574,7 +574,6 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
     let dev2 = dev.clone();
     let req2 = req.clone();
-    println!("Request kind: {:#?}", req2.read().kind);
     let res = spawn_blocking(move || {
         let fs: &mut Fs = &mut *fs_guard;
         handle_fs_request(&dev2, &req2, fs)

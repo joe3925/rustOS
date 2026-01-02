@@ -3,7 +3,6 @@ use crate::cpu;
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::timer_driver::PER_CORE_SWITCHES;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::memory::paging::constants::KERNEL_STACK_SIZE;
 use crate::memory::paging::stack::StackSize;
 use crate::println;
 use crate::scheduling::state::State;
@@ -95,7 +94,7 @@ impl Scheduler {
 
         let mut cores_vec: Vec<CoreScheduler> = Vec::with_capacity(num_cores);
         for _ in 0..num_cores {
-            let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Huge2M, "".into(), 0);
+            let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
             let idle_handle = idle;
             let idle_id = self.add_task_internal(idle_handle.clone());
             {
@@ -113,9 +112,6 @@ impl Scheduler {
         let cores_box = cores_vec.into_boxed_slice();
         let ptr = &self.cores as *const _ as *mut Box<[CoreScheduler]>;
         unsafe { ptr.write(cores_box) };
-
-        let kernel = Task::new_kernel_mode(kernel_main, 0, StackSize::Huge2M, "kernel".into(), 0);
-        self.add_task(kernel);
     }
 
     pub fn add_task(&self, task: TaskHandle) -> u64 {

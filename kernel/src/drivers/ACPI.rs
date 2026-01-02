@@ -1,4 +1,4 @@
-use crate::memory::paging::mmio::map_mmio_region;
+use crate::memory::paging::mmio::{map_mmio_region, unmap_mmio_region};
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::util::boot_info;
 use acpi;
@@ -90,9 +90,9 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        unmap_range(
+        unmap_mmio_region(
             VirtAddr::new(region.virtual_start().as_ptr() as u64),
             region.region_length() as u64,
-        )
+        );
     }
 }

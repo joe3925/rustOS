@@ -8,7 +8,7 @@ use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
-pub const HEAP_SIZE: usize = 4 * 1024 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
     let heap_size = align_up_4k(HEAP_SIZE as u64);
@@ -21,14 +21,16 @@ pub(crate) fn init_heap() {
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-    map_range_with_huge_pages(
-        &mut mapper,
-        heap_start,
-        heap_size,
-        &mut frame_allocator,
-        flags,
-    )
-    .expect("Heap creation failed, can't recover");
+    unsafe {
+        map_range_with_huge_pages(
+            &mut mapper,
+            heap_start,
+            heap_size,
+            &mut frame_allocator,
+            flags,
+        )
+        .expect("Heap creation failed, can't recover")
+    };
 
     let heap_node = heap_start.as_mut_ptr() as *mut ListNode;
     unsafe {

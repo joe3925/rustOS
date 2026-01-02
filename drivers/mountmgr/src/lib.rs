@@ -5,8 +5,6 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
-mod msvc_shims;
-
 use alloc::{
     boxed::Box,
     string::{String, ToString},

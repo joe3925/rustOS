@@ -493,7 +493,6 @@ pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
         }
     }
 
-    PNP_MANAGER.recheck_all_devices().await;
     Ok(())
 }
 
@@ -549,6 +548,7 @@ pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
         //     }
         // }
     }
+    PNP_MANAGER.recheck_all_devices().await;
 
     Ok(())
 }

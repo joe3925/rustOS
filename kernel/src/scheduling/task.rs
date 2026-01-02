@@ -1,7 +1,12 @@
 // scheduling/task.rs
 use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
+use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::paging::{map_kernel_range, map_range_with_huge_pages};
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
+use crate::memory::paging::virt_tracker::{
+    allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
+};
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
@@ -9,26 +14,31 @@ use crate::scheduling::state::State;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use kernel_types::status::PageMapError;
 use spin::RwLock;
 use x86_64::instructions::hlt;
+use x86_64::structures::paging::{Mapper, PageSize, PageTableFlags, Size1GiB, Size2MiB, Size4KiB};
 use x86_64::VirtAddr;
 
 use super::scheduler::TaskHandle;
 
 pub type TaskEntry = extern "win64" fn(usize);
 
+const PAGE_SIZE: u64 = 4096;
+
 #[derive(Debug)]
 pub struct Task {
     pub name: String,
     pub context: State,
-    pub stack_start: u64,
+    pub stack_start: u64, // top (exclusive)
+    pub guard_page: u64,  // current unmapped guard page (below the mapped stack)
     pub id: u64,
     pub terminated: bool,
     pub is_user_mode: bool,
     pub is_sleeping: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u16>,
-    pub stack_size: StackSize,
+    pub stack_size: u64,
 
     sched_in_cycles: AtomicU64,
     last_quantum_cycles: AtomicU64,
@@ -53,6 +63,7 @@ impl Task {
             .initial_local_apic_id();
 
         let stack_top = stack_pointer.as_u64();
+        let guard_page = initial_guard_page(stack_top, stack_size);
 
         let mut state = State::new(0);
         state.rip = entry_point as u64;
@@ -83,14 +94,14 @@ impl Task {
             name,
             context: state,
             stack_start: stack_top,
+            guard_page,
             id: 0,
             terminated: false,
             is_user_mode: true,
             parent_pid,
             executer_id: None,
             is_sleeping: false,
-
-            stack_size: StackSize::default(),
+            stack_size,
 
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
@@ -116,10 +127,13 @@ impl Task {
         let stack_top =
             allocate_kernel_stack(stack_size).expect("Failed to allocate kernel-mode stack");
 
+        let stack_top_u64 = stack_top.as_u64();
+        let guard_page = initial_guard_page(stack_top_u64, stack_size.as_bytes());
+
         let mut state = State::new(0);
         state.rip = entry_point as u64;
         state.rcx = context as u64;
-        state.rsp = stack_top.as_u64() - 8;
+        state.rsp = stack_top_u64 - 8;
         state.rflags = 0x0000_0202;
 
         unsafe {
@@ -142,14 +156,15 @@ impl Task {
         Arc::new(RwLock::new(Self {
             name,
             context: state,
-            stack_start: stack_top.as_u64(),
+            stack_start: stack_top_u64,
+            guard_page,
             id: 0,
             terminated: false,
             is_user_mode: false,
             parent_pid,
             executer_id: None,
             is_sleeping: false,
-            stack_size,
+            stack_size: stack_size.as_bytes(),
 
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
@@ -167,7 +182,7 @@ impl Task {
         if self.is_user_mode {
             todo!();
         } else {
-            deallocate_kernel_stack(VirtAddr::new(self.stack_start), self.stack_size);
+            deallocate_kernel_range(VirtAddr::new(self.stack_start), self.stack_size);
         }
     }
 
@@ -189,7 +204,23 @@ impl Task {
     pub fn is_sleeping(&self) -> bool {
         self.is_sleeping
     }
+    // TODO: get this to work for user mode
+    pub fn grow_stack(&mut self, flags: PageTableFlags) -> Result<bool, PageMapError> {
+        if self.is_user_mode || self.guard_page == 0 {
+            return Ok(false);
+        }
 
+        let base = self.guard_page;
+        let next_guard = match base.checked_sub(PAGE_SIZE) {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+
+        let mapped = unsafe { map_kernel_range(VirtAddr::new(base), PAGE_SIZE, flags) }?;
+
+        self.guard_page = next_guard;
+        Ok(true)
+    }
     #[inline(always)]
     pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
         self.last_cpu.store(cpu_id, Ordering::Relaxed);
@@ -241,5 +272,21 @@ impl Task {
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
     loop {
         hlt();
+    }
+}
+
+fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
+    if stack_top == 0 || stack_size == 0 {
+        return 0;
+    }
+
+    let bottom = match stack_top.checked_sub(stack_size) {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    match bottom.checked_sub(PAGE_SIZE) {
+        Some(v) => v,
+        None => 0,
     }
 }

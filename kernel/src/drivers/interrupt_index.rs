@@ -533,12 +533,14 @@ impl ApicImpl {
     }
 
     pub fn start_aps(&self) {
-        identity_map_page(
-            PhysAddr::new(0x6000),
-            0x3000,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
-        )
-        .expect("map low RAM");
+        unsafe {
+            identity_map_page(
+                PhysAddr::new(0x6000),
+                0x3000,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+            )
+            .expect("map low RAM")
+        };
 
         const GDT_PHYS: u64 = 0x6000;
         static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00AF_9200_0000_FFFF];
@@ -585,7 +587,7 @@ impl ApicImpl {
 
                 ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, 0x7000u32);
 
-                let stack_top = allocate_kernel_stack(StackSize::Huge2M)
+                let stack_top = allocate_kernel_stack(StackSize::Small)
                     .expect("AP stack")
                     .as_u64();
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);

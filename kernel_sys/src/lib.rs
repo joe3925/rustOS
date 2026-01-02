@@ -89,6 +89,7 @@ unsafe extern "win64" {
     pub fn unmap_range(virtual_addr: VirtAddr, size: u64);
     pub fn identity_map_page(frame_addr: PhysAddr, flags: PageTableFlags);
     pub fn map_mmio_region(mmio_base: PhysAddr, mmio_size: u64) -> Result<VirtAddr, PageMapError>;
+    pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
     pub fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr>;
 
     // =========================================================================

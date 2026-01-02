@@ -4,26 +4,21 @@ use spin::Mutex;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
 use crate::memory::paging::{
-    paging::align_up_4k,
-    virt_tracker::{
-        allocate_auto_kernel_range_mapped, allocate_auto_kernel_range_mapped_aligned, unmap_range,
-    },
+    frame_alloc::BootInfoFrameAllocator,
+    paging::{align_up_4k, map_kernel_range},
+    tables::init_mapper,
+    virt_tracker::{allocate_auto_kernel_range_aligned, unmap_range},
 };
+use crate::util::boot_info;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
 pub enum StackSize {
-    /// 4 KiB - Single standard page (minimal stack)
     Tiny = 4 * 1024,
-    /// 8 KiB - Two standard pages (typical kernel stack)
     Small = 8 * 1024,
-    /// 16 KiB - Four standard pages
     Medium = 16 * 1024,
-    /// 64 KiB - Sixteen standard pages
     Large = 64 * 1024,
-    /// 2 MiB - Single huge page (requires 2MiB alignment)
     Huge2M = 2 * 1024 * 1024,
-    /// 1 GiB - Single gigantic page (requires 1GiB alignment)
     Huge1G = 1024 * 1024 * 1024,
 }
 
@@ -33,15 +28,11 @@ impl StackSize {
         self as u64
     }
 
-    /// Total allocation size including 4KiB guard page
     #[inline]
     pub const fn total_size_with_guard(self) -> u64 {
         self.as_bytes() + 0x1000
     }
 
-    /// Required alignment for efficient huge page mapping.
-    /// For huge page sizes, alignment must match page size.
-    /// For smaller sizes, 4KiB is sufficient.
     #[inline]
     pub const fn required_alignment(self) -> u64 {
         match self {
@@ -49,12 +40,6 @@ impl StackSize {
             StackSize::Huge2M => 2 * 1024 * 1024,
             StackSize::Huge1G => 1024 * 1024 * 1024,
         }
-    }
-
-    /// Whether this size benefits from huge page mapping
-    #[inline]
-    pub const fn uses_huge_pages(self) -> bool {
-        matches!(self, StackSize::Huge2M | StackSize::Huge1G)
     }
 }
 
@@ -64,27 +49,43 @@ impl Default for StackSize {
     }
 }
 
+const GUARD_4K: u64 = 0x1000;
+
 pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> {
-    let stack_bytes = size.as_bytes();
-    let guard_page = 0x1000u64;
-    let total_size = stack_bytes + guard_page;
-    let alignment = size.required_alignment();
+    let max_stack = StackSize::Huge2M.as_bytes();
+    let reserve_total = max_stack + GUARD_4K;
+
+    let map_bytes = {
+        let b = align_up_4k(size.as_bytes());
+        if b > max_stack {
+            max_stack
+        } else {
+            b
+        }
+    };
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
 
-    let stack_base = if size.uses_huge_pages() {
-        allocate_auto_kernel_range_mapped_aligned(total_size, alignment, flags)?
-    } else {
-        allocate_auto_kernel_range_mapped(total_size, flags)?
-    };
+    // Reserve a full 2MiB stack window (+4KiB hard guard) but do NOT map it yet.
+    let region_base =
+        allocate_auto_kernel_range_aligned(reserve_total, StackSize::Huge2M.required_alignment())
+            .ok_or(PageMapError::NoMemory())?;
+    let stack_top = region_base + reserve_total;
 
-    let stack_top = (stack_base + total_size) - guard_page;
+    // Map only the requested initial stack bytes at the *top* of the 2MiB window.
+    // Layout (low -> high):
+    //   [region_base .. region_base+4K)                 unmapped hard guard
+    //   [region_base+4K .. stack_top-map_bytes)         unmapped reserve (for growth)
+    //   [stack_top-map_bytes .. stack_top)             mapped initial stack
+    let map_start = stack_top - map_bytes;
+
+    unsafe { map_kernel_range(map_start, map_bytes, flags) }?;
 
     Ok(stack_top)
 }
 
-pub fn deallocate_kernel_stack(stack_top: VirtAddr, size: StackSize) {
-    let total_size = size.total_size_with_guard();
-    let stack_base = stack_top - total_size;
-    unmap_range(stack_base, total_size);
+pub fn deallocate_kernel_stack(stack_top: VirtAddr, _size: StackSize) {
+    let reserve_total = StackSize::Huge2M.as_bytes() + GUARD_4K;
+    let region_base = stack_top - reserve_total;
+    unmap_range(region_base, reserve_total);
 }

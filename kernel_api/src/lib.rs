@@ -1,5 +1,6 @@
 #![no_std]
-
+#![cfg(target_env = "msvc")]
+#![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
 use alloc::boxed::Box;
@@ -105,4 +106,70 @@ pub unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
     ctx: usize,
 ) {
     submit_blocking_internal(trampoline, ctx);
+}
+
+#[unsafe(export_name = "_fltused")]
+static _FLTUSED: i32 = 0;
+
+#[unsafe(no_mangle)]
+pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8) -> i32 {
+    unimplemented!()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fma(_x: f64, _y: f64, z: f64) -> f64 {
+    z
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fmaf(_x: f32, _y: f32, z: f32) -> f32 {
+    z
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn __chkstk() {
+    core::arch::naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        "mov rax, rcx",
+        "2:",
+        "mov r10, rax",
+        "mov r11, rsp",
+        "cmp r10, 0x1000",
+        "jb 4f",
+        "3:",
+        "sub r11, 0x1000",
+        "test byte ptr [r11], 0",
+        "sub r10, 0x1000",
+        "cmp r10, 0x1000",
+        "jae 3b",
+        "4:",
+        "sub r11, r10",
+        "test byte ptr [r11], 0",
+        "ret"
+    );
+}
+
+#[unsafe(naked)]
+#[no_mangle]
+pub unsafe extern "C" fn __chkstk_ms() {
+    core::arch::naked_asm!(
+        "test rax, rax",
+        "jnz 2f",
+        "mov rax, rcx",
+        "2:",
+        "mov r10, rax",
+        "mov r11, rsp",
+        "cmp r10, 0x1000",
+        "jb 4f",
+        "3:",
+        "sub r11, 0x1000",
+        "test byte ptr [r11], 0",
+        "sub r10, 0x1000",
+        "cmp r10, 0x1000",
+        "jae 3b",
+        "4:",
+        "sub r11, r10",
+        "test byte ptr [r11], 0",
+        "ret"
+    );
 }

@@ -5,7 +5,8 @@ use crate::executable::program::{
 use crate::file_system::file::File;
 use crate::file_system::path::Path;
 use crate::format;
-use crate::memory::paging::constants::{KERNEL_SPACE_BASE, KERNEL_STACK_SIZE};
+use crate::memory::paging::constants::KERNEL_SPACE_BASE;
+use crate::memory::paging::stack::StackSize;
 use crate::println;
 use crate::scheduling::runtime::runtime::block_on;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -274,6 +275,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
 }
 
 pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
+    let stack_size = StackSize::Medium.as_bytes();
     let caller_pid = SCHEDULER
         .get_current_task(current_cpu_id())
         .unwrap()
@@ -290,25 +292,21 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
         }
     };
     let managed = { caller.read().managed_threads.lock().len() };
-    let stack = if let Some(range) = caller.write().tracker.alloc_auto(KERNEL_STACK_SIZE) {
-        unsafe {
-            caller
-                .write()
-                .virtual_map(range, KERNEL_STACK_SIZE as usize)
-        };
-        range + KERNEL_STACK_SIZE
+    let stack = if let Some(range) = caller.write().tracker.alloc_auto(stack_size) {
+        unsafe { caller.write().virtual_map(range, stack_size as usize) };
+        range + stack_size
     } else {
         return make_err(
             ErrClass::Memory,
             MemErr::AllocFailed as u16,
-            KERNEL_STACK_SIZE as u32,
+            stack_size as u32,
         );
     };
     let task = Task::new_user_mode(
         // TODO: check this
         unsafe { *(entry as *const extern "win64" fn(usize)) },
         0,
-        KERNEL_STACK_SIZE,
+        stack_size,
         format!("{} Worker {}", caller.read().title, managed),
         stack,
         caller_pid,

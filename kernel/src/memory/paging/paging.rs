@@ -17,7 +17,12 @@ pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
 }
 
-pub fn map_range_with_huge_pages<M>(
+// TODO: it is possible to remove all this unsafe, not urgent.
+
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
+pub unsafe fn map_range_with_huge_pages<M>(
     mapper: &mut M,
     addr: VirtAddr,
     size: u64,
@@ -39,7 +44,7 @@ where
 
     while remaining > 0 {
         if supports_1g && remaining >= gib && (cur.as_u64() & (gib - 1)) == 0 {
-            match map_1gib_page(mapper, cur, flags, fa) {
+            match unsafe { map_1gib_page(mapper, cur, flags, fa) } {
                 Ok(_) => {
                     cur += gib;
                     remaining -= gib;
@@ -53,7 +58,7 @@ where
         }
 
         if remaining >= mib2 && (cur.as_u64() & (mib2 - 1)) == 0 {
-            match map_2mib_page(mapper, cur, flags, fa) {
+            match unsafe { map_2mib_page(mapper, cur, flags, fa) } {
                 Ok(_) => {
                     cur += mib2;
                     remaining -= mib2;
@@ -67,18 +72,19 @@ where
         }
 
         let page4k = Page::<Size4KiB>::containing_address(cur);
-        map_page(mapper, page4k, fa, flags)?;
+        unsafe { map_page(mapper, page4k, fa, flags) }?;
         cur += 0x1000;
         remaining -= 0x1000;
     }
 
     Ok(())
 }
-
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
 pub unsafe fn unmap_range_unchecked(virtual_addr: VirtAddr, size: u64) {
     unmap_range_impl(virtual_addr, size)
 }
-
 pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(
@@ -139,7 +145,7 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
         Ok((frame, flush)) => {
             flush.flush();
             // SAFETY: the frame is no longer mapped
-            //unsafe { frame_allocator.deallocate_frame(frame) };
+            frame_allocator.deallocate_frame(frame);
             true
         }
         Err(_) => false,
@@ -154,7 +160,10 @@ pub const fn align_up_2mib(x: u64) -> u64 {
     const TWO_MIB: u64 = 2 * 1024 * 1024; // 2 MiB
     (x + (TWO_MIB - 1)) & !(TWO_MIB - 1)
 }
-pub extern "win64" fn identity_map_page(
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
+pub unsafe extern "win64" fn identity_map_page(
     phys_addr: PhysAddr,
     range: usize,
     flags: PageTableFlags,
@@ -190,7 +199,10 @@ pub extern "win64" fn identity_map_page(
 
     Ok(())
 }
-pub fn map_page(
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
+pub unsafe fn map_page(
     mapper: &mut impl Mapper<Size4KiB>,
     page: Page<Size4KiB>,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
@@ -204,8 +216,11 @@ pub fn map_page(
     }
     Ok(())
 }
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
 #[inline(always)]
-fn map_1gib_page<M, FA>(
+unsafe fn map_1gib_page<M, FA>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
@@ -220,7 +235,6 @@ where
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
 
-    // ── ensure HUGE_PAGE flag ─────────────────────────────────────────────
     let effective_flags = if flags.contains(PageTableFlags::HUGE_PAGE) {
         flags
     } else {
@@ -232,9 +246,11 @@ where
     }
     Ok(())
 }
-
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
 #[inline(always)]
-fn map_2mib_page<M, FA>(
+unsafe fn map_2mib_page<M, FA>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
@@ -260,4 +276,19 @@ where
         mapper.map_to(page, frame, effective_flags, fa)?.flush();
     }
     Ok(())
+}
+/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
+/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
+/// The best way to do this is to reserve the range you want to map manually.
+pub unsafe fn map_kernel_range(
+    addr: VirtAddr,
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<(), PageMapError> {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    map_range_with_huge_pages(&mut mapper, addr, size, &mut frame_allocator, flags)
 }

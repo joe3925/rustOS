@@ -17,7 +17,6 @@ fn panic(info: &PanicInfo) -> ! {
         panic_common(MOD_NAME, info)
     }
 }
-mod msvc_shims;
 
 mod control;
 mod volume;

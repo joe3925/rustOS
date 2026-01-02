@@ -1,8 +1,12 @@
 use crate::memory::paging::tables::kernel_cr3;
 use crate::println;
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::task::Task;
+use crate::static_handlers::get_current_cpu_id;
 use alloc::fmt;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
+use x86_64::structures::paging::PageTableFlags;
 
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
@@ -79,17 +83,54 @@ pub(crate) extern "x86-interrupt" fn general_protection_fault(
     );
 }
 
-// TODO: properly handle page faults
 pub(crate) extern "x86-interrupt" fn page_fault(
     stack_frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    const PAGE_SIZE: u64 = 4096;
+    let fault = Cr2::read_raw();
+
+    let is_protection = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+    let is_user = error_code.contains(PageFaultErrorCode::USER_MODE);
+
+    if !is_protection {
+        if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
+            let mut t = task.write();
+
+            if !t.is_user_mode && !is_user && t.guard_page != 0 {
+                let gp = t.guard_page;
+
+                if fault >= gp && fault < gp + PAGE_SIZE {
+                    let flags = PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::NO_EXECUTE;
+                    let status = t.grow_stack(flags);
+                    match status {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(_) => {}
+                    }
+                }
+
+                if fault < gp {
+                    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+                    panic!(
+                        "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
+                        error_code,
+                        fault,
+                        gp,
+                        stack_frame
+                    );
+                }
+            }
+        }
+    }
+
     unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
 
-    let cr2 = Cr2::read();
     panic!(
-        "EXCEPTION: PAGE FAULT\nerror_code={:?}\ncr2={:?}\n{:#?}",
-        error_code, cr2, stack_frame
+        "EXCEPTION: PAGE FAULT\nerror_code={:?}\ncr2={:#x}\n{:#?}",
+        error_code, fault, stack_frame
     );
 }
 

@@ -217,13 +217,15 @@ impl Program {
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;
 
-            map_range_with_huge_pages(
-                &mut mapper,
-                start,
-                end.as_u64() - start.as_u64(),
-                &mut frame_alloc,
-                flags,
-            )?;
+            unsafe {
+                map_range_with_huge_pages(
+                    &mut mapper,
+                    start,
+                    end.as_u64() - start.as_u64(),
+                    &mut frame_alloc,
+                    flags,
+                )
+            }?;
             Ok(())
         })();
 
