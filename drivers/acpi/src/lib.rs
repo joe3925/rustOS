@@ -23,6 +23,7 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init,
 };
 use kernel_api::request::Request;
+use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
 use kernel_api::{println, request_handler};
@@ -64,27 +65,53 @@ pub async fn bus_driver_prepare_hardware(
     device: Arc<DeviceObject>,
     _req: Arc<RwLock<Request>>,
 ) -> DriverStep {
-    let acpi_tables = get_acpi_tables();
-    let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
+    let (dsdt, ssdts) = {
+        let acpi_tables = get_acpi_tables();
 
-    if let Ok(dsdt) = acpi_tables.dsdt() {
-        let bytes = unsafe { map_aml(dsdt.address, dsdt.length as usize) };
-        if let Err(e) = aml_ctx.parse_table(bytes) {
-            println!("[ACPI] ERROR: parse DSDT: {:?}", e);
+        let dsdt = acpi_tables
+            .dsdt()
+            .ok()
+            .map(|t| (t.address, t.length as usize));
+
+        let mut ssdts = Vec::new();
+        for t in acpi_tables.ssdts() {
+            ssdts.push((t.address, t.length as usize));
         }
-    }
-    for ssdt in acpi_tables.ssdts() {
-        let bytes = unsafe { map_aml(ssdt.address, ssdt.length as usize) };
-        if let Err(e) = aml_ctx.parse_table(bytes) {
-            println!("[ACPI] ERROR: parse SSDT: {:?}", e);
+
+        (dsdt, ssdts)
+    };
+
+    let parsed = spawn_blocking(move || -> Result<AmlContext, ()> {
+        let mut aml_ctx = AmlContext::new(Box::new(KernelAmlHandler), DebugVerbosity::All);
+
+        if let Some((addr, len)) = dsdt {
+            let bytes = unsafe { map_aml(addr, len) };
+            if let Err(e) = aml_ctx.parse_table(bytes) {
+                println!("[ACPI] ERROR: parse DSDT: {:?}", e);
+            }
         }
-    }
-    if let Err(e) = aml_ctx.initialize_objects() {
-        println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
+
+        for (addr, len) in ssdts {
+            let bytes = unsafe { map_aml(addr, len) };
+            if let Err(e) = aml_ctx.parse_table(bytes) {
+                println!("[ACPI] ERROR: parse SSDT: {:?}", e);
+            }
+        }
+
+        if let Err(e) = aml_ctx.initialize_objects() {
+            println!("[ACPI] ERROR: initialize AML objects: {:?}", e);
+            return Err(());
+        }
+
+        Ok(aml_ctx)
+    })
+    .await;
+
+    let Ok(aml_ctx) = parsed else {
         return DriverStep::Continue;
-    }
-    let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
+    };
 
+    let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
     DriverStep::Continue
