@@ -17,6 +17,7 @@ use alloc::{
 };
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -817,7 +818,7 @@ fn wait_not_busy(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        wait_ms(1);
+        wait_duration(Duration::from_millis(1));
     }
     false
 }
@@ -831,7 +832,7 @@ fn wait_ready(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        wait_ms(1);
+        wait_duration(Duration::from_millis(1));
     }
     false
 }
