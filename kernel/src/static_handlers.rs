@@ -2,6 +2,7 @@ use core::{
     alloc::{GlobalAlloc, Layout},
     arch::asm,
     sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
 };
 
 use acpi::{AcpiTable, AcpiTables};
@@ -34,7 +35,7 @@ use crate::{
     console::CONSOLE,
     drivers::{
         driver_install::DriverError,
-        interrupt_index::{current_cpu_id, wait_millis},
+        interrupt_index::{self, current_cpu_id},
         pnp::{
             manager::PNP_MANAGER,
             request::{DpcFn, IoTarget},
@@ -58,7 +59,6 @@ use crate::{
     util::boot_info,
 };
 
-// TODO: block on needs to be removed from this file
 #[unsafe(no_mangle)]
 pub extern "win64" fn create_kernel_task(
     entry: extern "win64" fn(usize),
@@ -119,8 +119,8 @@ pub extern "win64" fn print(str: &str) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn wait_ms(ms: u64) {
-    wait_millis(ms);
+pub extern "win64" fn wait_duration(time: Duration) {
+    interrupt_index::wait_duration(time);
 }
 
 #[no_mangle]

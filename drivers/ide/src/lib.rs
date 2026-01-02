@@ -28,7 +28,7 @@ use kernel_api::pnp::{
 use kernel_api::request::{Request, RequestType};
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
-use kernel_api::util::wait_ms;
+use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
 use kernel_api::{RequestExt, println, request_handler};
 use spin::Mutex;
@@ -848,7 +848,7 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
                 return true;
             }
         }
-        wait_ms(1);
+        wait_duration(Duration::from_millis(1));
     }
     false
 }

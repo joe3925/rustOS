@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
+use core::time::Duration;
 use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
@@ -39,7 +40,7 @@ unsafe extern "win64" {
     pub fn print(s: &str);
     pub fn panic_common(mod_name: &'static str, info: &PanicInfo) -> !;
     pub fn random_number() -> u64;
-    pub fn wait_ms(ms: u64);
+    pub fn wait_duration(time: Duration);
     pub fn get_rsdp() -> u64;
     pub unsafe fn get_current_cpu_id() -> usize;
     // =========================================================================

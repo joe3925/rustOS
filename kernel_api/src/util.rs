@@ -1,4 +1,4 @@
-use core::arch::asm;
+use core::{arch::asm, time::Duration};
 
 use alloc::boxed::Box;
 
@@ -13,8 +13,8 @@ pub fn random_number() -> u64 {
 }
 
 #[inline]
-pub fn wait_ms(ms: u64) {
-    unsafe { kernel_sys::wait_ms(ms) };
+pub fn wait_duration(time: Duration) {
+    unsafe { kernel_sys::wait_duration(time) };
 }
 #[inline]
 pub fn get_current_cpu_id() -> usize {

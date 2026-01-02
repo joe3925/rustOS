@@ -20,6 +20,7 @@ use crate::{
     file_system::file_provider::{self, install_file_provider, FileProvider},
     println,
     registry::reg::rebind_and_persist_after_provider_switch,
+    scheduling::runtime::runtime::spawn_detached,
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
@@ -266,15 +267,14 @@ impl File {
 }
 impl Drop for File {
     fn drop(&mut self) {
-        // TODO: there probably is a way to just call self.close I don't care to figure it out
-        if self.fs_file_id == 0 {
+        let id = core::mem::take(&mut self.fs_file_id);
+        if id == 0 {
             return;
         }
 
-        let id = self.fs_file_id;
-        self.fs_file_id = 0;
-
-        let _ = provider().close_handle(id);
+        spawn_detached(async move {
+            let _ = file_provider::provider().close_handle(id).await;
+        });
     }
 }
 

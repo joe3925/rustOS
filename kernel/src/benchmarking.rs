@@ -27,7 +27,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -343,7 +343,7 @@ pub fn bench_submit_rip_sample_current_core(rip: u64, stack_ptr: *const u64, sta
     if !BENCH_ENABLED {
         return;
     }
-
+    return;
     if !BENCH_READY.load(Ordering::Acquire) {
         return;
     }

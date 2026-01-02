@@ -8,7 +8,7 @@ use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
     calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
-    wait_millis_idle, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
+    wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -34,7 +34,6 @@ use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::{spawn, spawn_detached};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
-use crate::static_handlers::wait_ms;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use crate::{cpu, println, BOOT_INFO};
@@ -77,8 +76,8 @@ lazy_static! {
         log_spans: true,
         log_mem_on_persist: true,
         end_on_drop: false,
-        timeout_ms: Some(Duration::from_hours(1)),
-        auto_persist_secs: Some(Duration::from_secs(30)),
+        timeout_ms: Some(Duration::from_hours(2)),
+        auto_persist_secs: Some(Duration::from_mins(2)),
         sample_reserve: 256,
         span_reserve: 256,
     });
@@ -157,6 +156,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
     GLOBAL_WINDOW.start();
+
     spawn_detached(async move {
         install_prepacked_drivers().await;
 

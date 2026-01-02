@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 export! {
     function,
     print,
-    wait_ms,
+    wait_duration,
     create_kernel_task,
     kill_kernel_task_by_id,
     sleep_self,
