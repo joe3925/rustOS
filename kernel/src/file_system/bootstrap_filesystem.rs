@@ -24,7 +24,9 @@ use kernel_types::{
 };
 
 const C_PREFIX: &str = "C:\\";
-const REG_PATH: &str = "C:\\system\\registry.bin";
+const REG_DIR: &str = "C:\\system\\registry";
+const REG_SNAP_PATH: &str = "C:\\system\\registry\\registry.snap";
+const REG_WAL_PATH: &str = "C:\\system\\registry\\registry.wal";
 const DRIVER_ROOT: &str = "C:\\install\\drivers";
 
 fn norm_upcase(p: &str) -> String {
@@ -123,17 +125,33 @@ impl<'a> BootstrapProvider<'a> {
             "C:\\system",
             "C:\\system\\toml",
             "C:\\system\\mod",
+            REG_DIR,
         ] {
             let dk = norm_upcase(d);
             n.entry(dk.clone()).or_insert_with(Node::dir);
         }
 
-        let reg_key = norm_upcase(REG_PATH);
-        n.insert(reg_key.clone(), Node::file(DataRef::Ram(Vec::new())));
+        // Add registry directory to system's children
         n.get_mut(&norm_upcase("C:\\system"))
             .unwrap()
             .children
-            .insert("registry.bin".into(), reg_key);
+            .insert("registry".into(), norm_upcase(REG_DIR));
+
+        // Create registry.snap file (RAM-backed)
+        let snap_key = norm_upcase(REG_SNAP_PATH);
+        n.insert(snap_key.clone(), Node::file(DataRef::Ram(Vec::new())));
+        n.get_mut(&norm_upcase(REG_DIR))
+            .unwrap()
+            .children
+            .insert("registry.snap".into(), snap_key);
+
+        // Create registry.wal file (RAM-backed)
+        let wal_key = norm_upcase(REG_WAL_PATH);
+        n.insert(wal_key.clone(), Node::file(DataRef::Ram(Vec::new())));
+        n.get_mut(&norm_upcase(REG_DIR))
+            .unwrap()
+            .children
+            .insert("registry.wal".into(), wal_key);
 
         for bp in boot {
             let ddir = norm_upcase(&alloc::format!("{}\\{}", DRIVER_ROOT, bp.name));
@@ -205,6 +223,12 @@ impl<'a> BootstrapProvider<'a> {
             }
         }
     }
+
+    fn is_registry_file(path: &str) -> bool {
+        let p = norm_upcase(path);
+        p == norm_upcase(REG_SNAP_PATH) || p == norm_upcase(REG_WAL_PATH)
+    }
+
     fn seek_handle_sync(
         &self,
         file_id: u64,
@@ -243,6 +267,7 @@ impl<'a> BootstrapProvider<'a> {
             DriverStatus::Success,
         )
     }
+
     fn read_slice(&self, path: &str, offset: u64, len: u32) -> Result<Vec<u8>, FileStatus> {
         let mut cur = path.to_string();
 
@@ -315,10 +340,39 @@ impl<'a> BootstrapProvider<'a> {
             .insert(leaf_of(&p).to_string(), p);
         Ok(())
     }
+
+    fn create_file_if_missing(&self, path: &str) -> Result<(), FileStatus> {
+        let p = norm_upcase(path);
+        if !p.starts_with(C_PREFIX) {
+            return Err(FileStatus::PathNotFound);
+        }
+
+        let mut map = self.nodes.write();
+
+        // Already exists
+        if map.contains_key(&p) {
+            return Ok(());
+        }
+
+        // Check parent exists and is a directory
+        let parent = parent_of(&p).to_string();
+        match map.get(&parent) {
+            Some(n) if n.is_dir => {}
+            Some(_) => return Err(FileStatus::BadPath),
+            None => return Err(FileStatus::PathNotFound),
+        }
+
+        // Create empty RAM-backed file
+        let leaf = leaf_of(&p).to_string();
+        map.insert(p.clone(), Node::file(DataRef::Ram(Vec::new())));
+        map.get_mut(&parent).unwrap().children.insert(leaf, p);
+
+        Ok(())
+    }
 }
 
 impl<'a> BootstrapProvider<'a> {
-    fn open_path_sync(&self, path: &str, _flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
+    fn open_path_sync(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => {
@@ -334,6 +388,10 @@ impl<'a> BootstrapProvider<'a> {
             }
         };
 
+        // Check create flags (order in slice does not matter)
+        let wants_create_new = flags.iter().any(|f| matches!(f, OpenFlags::CreateNew));
+        let wants_create = wants_create_new || flags.iter().any(|f| matches!(f, OpenFlags::Create));
+
         let (exists, is_dir) = {
             let map = self.nodes.read();
             match map.get(&p) {
@@ -341,13 +399,39 @@ impl<'a> BootstrapProvider<'a> {
                 None => (false, false),
             }
         };
+
         if !exists {
+            if wants_create {
+                // Try to create the file
+                if let Err(e) = self.create_file_if_missing(&p) {
+                    return (
+                        FsOpenResult {
+                            fs_file_id: 0,
+                            is_dir: false,
+                            size: 0,
+                            error: Some(e),
+                        },
+                        DriverStatus::Success,
+                    );
+                }
+            } else {
+                return (
+                    FsOpenResult {
+                        fs_file_id: 0,
+                        is_dir: false,
+                        size: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                );
+            }
+        } else if wants_create_new {
             return (
                 FsOpenResult {
                     fs_file_id: 0,
                     is_dir: false,
                     size: 0,
-                    error: Some(FileStatus::PathNotFound),
+                    error: Some(FileStatus::FileAlreadyExist),
                 },
                 DriverStatus::Success,
             );
@@ -356,11 +440,20 @@ impl<'a> BootstrapProvider<'a> {
         let id = self.next_id.fetch_add(1, Ordering::AcqRel).max(1);
         self.handles.write().insert(id, p.clone());
 
+        // Re-check after potential creation
+        let (is_dir, size) = {
+            let map = self.nodes.read();
+            match map.get(&p) {
+                Some(n) => (n.is_dir, n.size(self, &p)),
+                None => (false, 0),
+            }
+        };
+
         (
             FsOpenResult {
                 fs_file_id: id,
                 is_dir,
-                size: self.size_of(&p) as u64,
+                size,
                 error: None,
             },
             DriverStatus::Success,
@@ -643,7 +736,9 @@ impl<'a> BootstrapProvider<'a> {
             Ok(p) => p,
             Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
         };
-        if norm_upcase(&p) == REG_PATH {
+
+        // Handle registry files specially - clear content instead of deleting
+        if Self::is_registry_file(&p) {
             let mut map = self.nodes.write();
             if let Some(Node {
                 data: Some(DataRef::Ram(v)),
@@ -654,12 +749,42 @@ impl<'a> BootstrapProvider<'a> {
                 return (FsCreateResult { error: None }, DriverStatus::Success);
             }
         }
-        (
-            FsCreateResult {
-                error: Some(FileStatus::UnknownFail),
-            },
-            DriverStatus::Success,
-        )
+
+        // For other files, attempt actual deletion
+        let mut map = self.nodes.write();
+
+        // Check if file exists and is not a directory
+        match map.get(&p) {
+            Some(n) if !n.is_dir => {}
+            Some(_) => {
+                return (
+                    FsCreateResult {
+                        error: Some(FileStatus::BadPath),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+            None => {
+                return (
+                    FsCreateResult {
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        }
+
+        // Remove from parent's children
+        let parent = parent_of(&p).to_string();
+        let leaf = leaf_of(&p).to_string();
+        if let Some(parent_node) = map.get_mut(&parent) {
+            parent_node.children.remove(&leaf);
+        }
+
+        // Remove the node itself
+        map.remove(&p);
+
+        (FsCreateResult { error: None }, DriverStatus::Success)
     }
 }
 
@@ -741,3 +866,4 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         async move { res }.into_ffi()
     }
 }
+

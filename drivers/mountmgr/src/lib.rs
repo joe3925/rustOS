@@ -536,9 +536,9 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
         if !VFS_ACTIVE.load(Ordering::Acquire) {
             let mod_ok = fs_check_open(&link, "system/mod").await;
             let inf_ok = fs_check_open(&link, "system/toml").await;
-            let reg_ok = fs_check_open(&link, "system/registry.bin").await;
+            let reg_dir_ok = fs_check_open(&link, "system/registry").await;
 
-            if mod_ok && inf_ok && reg_ok {
+            if mod_ok && inf_ok && reg_dir_ok {
                 let _ = attempt_boot_bind(&inst, &link).await;
             }
         }

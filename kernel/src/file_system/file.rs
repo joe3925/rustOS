@@ -20,7 +20,7 @@ use crate::{
     file_system::file_provider::{self, install_file_provider, FileProvider},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
-    registry::reg::rebind_and_persist_after_provider_switch,
+    registry::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,
     util::TOTAL_TIME,
 };

@@ -761,8 +761,15 @@ impl FileProvider for Vfs {
         path: &str,
         flags: &[OpenFlags],
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
+        // TODO: Very temporary fix to this issue. All open flags should be passed.
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-        let f = *flags.get(0).unwrap_or(&OpenFlags::Open);
+        let f = if flags.iter().any(|f| matches!(f, OpenFlags::CreateNew)) {
+            OpenFlags::CreateNew
+        } else if flags.iter().any(|f| matches!(f, OpenFlags::Create)) {
+            OpenFlags::Create
+        } else {
+            *flags.get(0).unwrap_or(&OpenFlags::Open)
+        };
 
         this.open(FsOpenParams {
             flags: f,
