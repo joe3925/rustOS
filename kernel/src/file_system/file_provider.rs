@@ -1,18 +1,25 @@
-
-
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use spin::RwLock;
+use core::sync::atomic::{AtomicU8, Ordering};
+use spin::Lazy;
 
 use kernel_types::{
     async_ffi::FfiFuture,
-    fs::{*, Path},
+    fs::{Path, *},
     request::Request,
     status::{DriverStatus, FileStatus},
 };
 
+// These must exist somewhere in your crate and implement `FileProvider`.
+use crate::{
+    drivers::drive::vfs::Vfs, file_system::bootstrap_filesystem::BootstrapProvider, util::BOOTSET,
+};
+
 pub trait FileProvider: Send + Sync {
-    fn open_path(&self, path: &Path, flags: &[OpenFlags])
-        -> FfiFuture<(FsOpenResult, DriverStatus)>;
+    fn open_path(
+        &self,
+        path: &Path,
+        flags: &[OpenFlags],
+    ) -> FfiFuture<(FsOpenResult, DriverStatus)>;
 
     fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)>;
     fn seek_handle(
@@ -61,15 +68,27 @@ pub trait FileProvider: Send + Sync {
     ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)>;
 }
 
-static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProviderKind {
+    Bootstrap = 0,
+    Vfs = 1,
+}
 
-pub fn install_file_provider(p: Box<dyn FileProvider>) {
-    *CURRENT_PROVIDER.write() = Some(p);
+pub static BOOTSTRAP_PROVIDER: Lazy<BootstrapProvider> =
+    Lazy::new(|| BootstrapProvider::new(BOOTSET));
+pub static VFS_PROVIDER: Lazy<Vfs> = Lazy::new(Vfs::new);
+
+static CURRENT_PROVIDER: AtomicU8 = AtomicU8::new(ProviderKind::Bootstrap as u8);
+
+pub fn install_file_provider(kind: ProviderKind) {
+    CURRENT_PROVIDER.store(kind as u8, Ordering::Release);
 }
 
 #[inline]
 pub(crate) fn provider() -> &'static dyn FileProvider {
-    let guard = CURRENT_PROVIDER.read();
-    let p = guard.as_ref().expect("FileProvider not installed");
-    unsafe { &*(&**p as *const dyn FileProvider) }
+    match CURRENT_PROVIDER.load(Ordering::Acquire) {
+        x if x == ProviderKind::Vfs as u8 => &*VFS_PROVIDER as &dyn FileProvider,
+        _ => &*BOOTSTRAP_PROVIDER as &dyn FileProvider,
+    }
 }

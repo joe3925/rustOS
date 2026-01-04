@@ -11,7 +11,6 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
-use crate::static_handlers::pnp_send_request_via_symlink;
 use kernel_types::{
     fs::{Path, *},
     request::RequestData,
@@ -57,135 +56,18 @@ impl Vfs {
     }
 
     pub async fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
-        let mounts = self.enumerate_mount_symlinks();
+        let labels = self.label_map.read();
+        let mut out: Vec<MountedVolume> = Vec::with_capacity(labels.len());
 
-        let mut out: Vec<MountedVolume> = Vec::new();
-        let mut labels = self.label_map.write();
-
-        for m in mounts {
-            let (public, label_link, object_name) = match self.query_volume_status(&m).await {
-                Ok(t) => t,
-                Err(_) => continue,
-            };
-
-            let mut label = self.try_label_from_link(&label_link);
-            if label.is_none() {
-                if let Some(persist) = self.query_persistent_label(&m) {
-                    label = Some(persist);
-                }
-            }
-
-            let label = match label {
-                Some(l) => l,
-                None => {
-                    let assigned = self.assign_free_drive_label(&labels);
-                    let _ = self.send_set_label_ioctl(&m, &assigned);
-                    assigned
-                }
-            };
-
-            labels.insert(label.clone(), m.clone());
-
-            let obj = if !public.is_empty() {
-                public.clone()
-            } else {
-                m.clone()
-            };
+        for (label, mount_symlink) in labels.iter() {
             out.push(MountedVolume {
-                label,
-                mount_symlink: m,
-                object_name: obj,
+                label: label.clone(),
+                mount_symlink: mount_symlink.clone(),
+                object_name: mount_symlink.clone(),
             });
         }
 
         (out, DriverStatus::Success)
-    }
-
-    fn enumerate_mount_symlinks(&self) -> Vec<String> {
-        Vec::new()
-    }
-
-    async fn query_volume_status(
-        &self,
-        mount_symlink: &str,
-    ) -> Result<(String, String, String), DriverStatus> {
-        const IOCTL_MOUNTMGR_QUERY: u32 = 0x4D4D_0003;
-
-        let req = Arc::new(RwLock::new(
-            Request::new(
-                RequestType::DeviceControl(IOCTL_MOUNTMGR_QUERY),
-                RequestData::empty(),
-            )
-            .set_traversal_policy(TraversalPolicy::ForwardLower),
-        ));
-        PNP_MANAGER
-            .send_request_via_symlink(mount_symlink.to_string(), req.clone())
-            .await?;
-
-        let r = req.read();
-        if r.status != DriverStatus::Success {
-            return Err(r.status);
-        }
-
-        let s = core::str::from_utf8(r.data_slice()).unwrap_or_default();
-        let mut public = String::new();
-        let mut label = String::new();
-        let mut object_name = String::new();
-
-        for part in s.split(';') {
-            if let Some((k, v)) = part.split_once('=') {
-                match k.trim() {
-                    "public" => public = v.trim().to_string(),
-                    "label" => label = v.trim().to_string(),
-                    "claimed" => {}
-                    _ => {}
-                }
-            }
-        }
-
-        if object_name.is_empty() {
-            object_name = if !public.is_empty() {
-                public.clone()
-            } else {
-                mount_symlink.to_string()
-            };
-        }
-
-        Ok((public, label, object_name))
-    }
-
-    fn try_label_from_link(&self, label_link: &str) -> Option<String> {
-        if label_link.is_empty() {
-            return None;
-        }
-        if let Some((_, leaf)) = label_link.rsplit_once('\\') {
-            if leaf.is_empty() {
-                return None;
-            }
-            if leaf.chars().all(|c| c.is_ascii_digit()) {
-                return Some(alloc::format!("VOL{:0>4}:", leaf));
-            }
-            return Some(alloc::format!("{}:", leaf));
-        }
-        None
-    }
-
-    fn assign_free_drive_label(&self, map: &BTreeMap<String, String>) -> String {
-        for ch in b'C'..=b'Z' {
-            let cand = alloc::format!("{}:", ch as char);
-            if !map.contains_key(&cand) {
-                return cand;
-            }
-        }
-        alloc::format!("VOL{}:", map.len() + 1)
-    }
-
-    fn query_persistent_label(&self, _mount_symlink: &str) -> Option<String> {
-        None
-    }
-
-    fn send_set_label_ioctl(&self, _mount_symlink: &str, _label: &str) -> Result<(), DriverStatus> {
-        Ok(())
     }
 
     #[inline]

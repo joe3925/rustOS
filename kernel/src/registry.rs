@@ -892,9 +892,6 @@ fn merge_missing_registry(src: &Registry, dst: &mut Registry) -> Vec<RegDelta> {
 /// Called after provider switch - rebase on disk (authoritative) and only persist missing boot defaults.
 pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
     ensure_loaded().await;
-
-    let _ = File::make_dir(&Path::from_string("C:\\system\\registry")).await;
-
     let boot_view = (**REGISTRY.read()).clone();
 
     let mut disk_reg = load_snapshot().await.unwrap_or_else(Registry::empty);
@@ -902,12 +899,12 @@ pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> 
     WAL_SEQ.store(max_seq, Ordering::Release);
 
     let deltas = merge_missing_registry(&boot_view, &mut disk_reg);
-
     if !deltas.is_empty() {
-        append_wal_many(&deltas).await?;
-        DELTAS_SINCE_SNAPSHOT.fetch_add(deltas.len() as u64, Ordering::SeqCst);
+        for delta in deltas {
+            apply_delta(&mut disk_reg, &delta);
+        }
+        save_snapshot(&disk_reg).await?;
     }
-
     *REGISTRY.write() = Arc::new(disk_reg);
 
     Ok(())

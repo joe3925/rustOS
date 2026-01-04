@@ -7,12 +7,14 @@ extern crate alloc;
 
 use alloc::{
     boxed::Box,
+    collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
 use core::{
     panic::PanicInfo,
+    ptr,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use spin::{Once, RwLock};
@@ -20,7 +22,7 @@ use spin::{Once, RwLock};
 use kernel_api::{
     GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    fs::{FsOp, FsOpenParams, FsOpenResult},
+    fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
         io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
@@ -59,6 +61,7 @@ static FS_REGISTERED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 static VFS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOLUMES: RwLock<Vec<Arc<DeviceObject>>> = RwLock::new(Vec::new());
 const MP_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/MountPoints";
+const DL_ROOT: &str = "SYSTEM/CurrentControlSet/MountMgr/DriveLetters";
 
 #[repr(C)]
 #[derive(Default)]
@@ -68,6 +71,11 @@ struct VolFdoExt {
     fs_link: Once<String>,
     fs_attached: AtomicBool,
     vid: Once<u32>,
+    /// Stable identifier derived from GPT partition GUID (e.g., "GPT.XXXX...")
+    /// None if the volume lacks a valid GPT GUID.
+    stable_id: Once<Option<String>>,
+    /// Assigned drive label (e.g., "C:") - only set after successful assignment
+    assigned_label: RwLock<Option<String>>,
 }
 
 #[inline]
@@ -199,6 +207,8 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev).await;
+            // Enumerate all volumes and assign labels on-demand
+            enumerate_and_assign_all_labels().await;
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_LIST_FS => {
@@ -293,10 +303,88 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
     if try_bind_filesystems_for_parent_fdo(&dev, &public).await {
         let link = dx.fs_link.get().cloned().unwrap_or_else(|| public.clone());
         let inst = dx.inst_path.get().cloned().unwrap_or_default();
-        start_boot_probe_async(&link, &inst);
+        // Get stable_id - must exist after successful bind
+        let stable_id = dx.stable_id.get().cloned().flatten().unwrap_or_default();
+        start_boot_probe_async(&link, &inst, &stable_id);
+
+        // If the system is already running on VFS, assign a drive label immediately.
+        if VFS_ACTIVE.load(Ordering::Acquire) && dx.assigned_label.read().is_none() {
+            let published_label = if !stable_id.is_empty() {
+                PUBLISHED_LABELS
+                    .read()
+                    .iter()
+                    .find_map(|(lbl, sid)| (sid == &stable_id).then(|| lbl.clone()))
+            } else {
+                None
+            };
+
+            if let Some(lbl) = published_label {
+                *dx.assigned_label.write() = Some(lbl);
+            } else {
+                let _ = assign_label_on_demand(&dev).await;
+            }
+        }
     } else {
         dx.fs_attached.store(false, Ordering::Release);
     }
+}
+
+/// Compute stable identifier from GPT partition GUID.
+/// Returns None if the volume lacks a valid GPT GUID.
+async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
+    let vol_target = IoTarget {
+        target_device: parent_fdo.clone(),
+    };
+
+    let req = Arc::new(RwLock::new(
+        Request::new_pnp(
+            PnpRequest {
+                minor_function: PnpMinorFunction::QueryResources,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: QueryIdType::CompatibleIds,
+                ids_out: Vec::new(),
+                blob_out: Vec::new(),
+            },
+            RequestData::empty(),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+
+    kernel_api::pnp::pnp_send_request(vol_target, req.clone()).await;
+
+    let mut w = req.write();
+    if w.status != DriverStatus::Success {
+        return None;
+    }
+
+    // PartitionInfo is returned in the PnP payload blob_out for QueryResources
+    let pi = {
+        let pnp = w.pnp.as_ref()?;
+        let blob = &pnp.blob_out;
+        if blob.len() != core::mem::size_of::<kernel_api::kernel_types::io::PartitionInfo>() {
+            return None;
+        }
+        unsafe {
+            ptr::read_unaligned(blob.as_ptr() as *const kernel_api::kernel_types::io::PartitionInfo)
+        }
+    };
+    let ge = pi.gpt_entry?;
+    let guid = ge.unique_partition_guid;
+
+    // Check for all-zero GUID
+    if guid.iter().all(|&b| b == 0) {
+        return None;
+    }
+
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut id = String::new();
+    id.push_str("GPT.");
+    for &b in &guid {
+        id.push(HEX[(b >> 4) as usize] as char);
+        id.push(HEX[(b & 0xF) as usize] as char);
+    }
+
+    Some(id)
 }
 
 async fn try_bind_filesystems_for_parent_fdo(
@@ -313,65 +401,26 @@ async fn try_bind_filesystems_for_parent_fdo(
         None => return false,
     };
 
-    let stable_link = {
-        let vol_target = IoTarget {
-            target_device: parent_fdo.clone(),
-        };
-
-        let req = Arc::new(RwLock::new(
-            Request::new_pnp(
-                PnpRequest {
-                    minor_function: PnpMinorFunction::QueryResources,
-                    relation: DeviceRelationType::TargetDeviceRelation,
-                    id_type: QueryIdType::CompatibleIds,
-                    ids_out: Vec::new(),
-                    blob_out: Vec::new(),
-                },
-                RequestData::empty(),
-            )
-            .set_traversal_policy(TraversalPolicy::ForwardLower),
-        ));
-
-        kernel_api::pnp::pnp_send_request(vol_target, req.clone()).await;
-
-        let mut w = req.write();
-        if w.status != DriverStatus::Success {
-            return false;
+    // Compute and store stable_id if not already set
+    let stable_id = match dx_vol.stable_id.get() {
+        Some(id) => id.clone(),
+        None => {
+            let id = compute_stable_id(parent_fdo).await;
+            dx_vol.stable_id.call_once(|| id.clone());
+            id
         }
-
-        let pi = match w.take_data::<kernel_api::kernel_types::io::PartitionInfo>() {
-            Some(v) => v,
-            None => return false,
-        };
-
-        let ge = match pi.gpt_entry {
-            Some(e) => e,
-            None => return false,
-        };
-
-        let guid = ge.unique_partition_guid;
-
-        let mut any_nonzero = false;
-        for &b in &guid {
-            if b != 0 {
-                any_nonzero = true;
-                break;
-            }
-        }
-        if !any_nonzero {
-            return false;
-        }
-
-        const HEX: &[u8; 16] = b"0123456789ABCDEF";
-        let mut id = String::new();
-        id.push_str("GPT.");
-        for &b in &guid {
-            id.push(HEX[(b >> 4) as usize] as char);
-            id.push(HEX[(b & 0xF) as usize] as char);
-        }
-
-        alloc::format!("\\GLOBAL\\Volumes\\{}", id)
     };
+
+    // Require valid stable_id for mounting
+    let stable_id = match stable_id {
+        Some(id) => id,
+        None => {
+            println!("Volume {} has no stable_id, skipping mount", public_link);
+            return false;
+        }
+    };
+
+    let stable_link = alloc::format!("\\GLOBAL\\Volumes\\{}", stable_id);
 
     let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
     let parent_inst = parent_dn.instance_path.clone();
@@ -575,9 +624,10 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn start_boot_probe_async(public_link: &str, inst_path: &str) {
+fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {
     let link = public_link.to_string();
     let inst = inst_path.to_string();
+    let sid = stable_id.to_string();
 
     spawn(async move {
         if !VFS_ACTIVE.load(Ordering::Acquire) {
@@ -586,21 +636,36 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str) {
             let reg_dir_ok = fs_check_open(&link, "system/registry").await;
 
             if mod_ok && inf_ok && reg_dir_ok {
-                let _ = attempt_boot_bind(&inst, &link).await;
+                let _ = attempt_boot_bind(&inst, &link, &sid).await;
             }
         }
     });
 }
 
-async fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> Result<(), RegError> {
+async fn attempt_boot_bind(
+    _dev_inst_path: &str,
+    fs_mount_link: &str,
+    stable_id: &str,
+) -> Result<(), RegError> {
     if VFS_ACTIVE.load(Ordering::Acquire) {
         return Ok(());
     }
-    assign_drive_letter(b'C', fs_mount_link).await?;
+
+    // Boot path: assign C: only, write registry only on first-boot/change
+    if stable_id.is_empty() {
+        println!("System volume has no stable_id, cannot assign C:");
+        return Err(RegError::KeyNotFound);
+    }
+
+    assign_boot_drive_letter(b'C', stable_id, fs_mount_link).await?;
+
     match unsafe { switch_to_vfs_async().await } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
-            println!("System volume mounted at '{}'", fs_mount_link);
+            println!("System volume mounted at '{}')", fs_mount_link);
+            // Now that the VFS provider is active, trigger a resync so all volumes
+            // get mounted and labeled without waiting for an external RESYNC request.
+            rescan_all_volumes().await;
             Ok(())
         }
         Err(e) => {
@@ -610,14 +675,31 @@ async fn attempt_boot_bind(_dev_inst_path: &str, fs_mount_link: &str) -> Result<
     }
 }
 
-async fn assign_drive_letter(letter: u8, fs_mount_link: &str) -> Result<(), RegError> {
-    let ch = (letter as char).to_ascii_uppercase();
-    if ch < 'A' || ch > 'Z' {
-        return Ok(());
-    }
+/// Tracking structure for currently published labels at runtime.
+/// Maps label (e.g., "C:") to stable_id of the volume holding it.
+static PUBLISHED_LABELS: RwLock<BTreeMap<String, String>> = RwLock::new(BTreeMap::new());
 
-    set_label_for_link(fs_mount_link, ch as u8).await?;
+/// Read preferred label for a stable_id from registry.
+/// Returns None if no preference exists.
+async fn read_preferred_label(stable_id: &str) -> Option<String> {
+    reg::get_value(DL_ROOT, stable_id)
+        .await
+        .and_then(|d| match d {
+            Data::Str(s) if !s.is_empty() => Some(s),
+            _ => None,
+        })
+}
 
+/// Write preferred label for a stable_id to registry.
+async fn write_preferred_label(stable_id: &str, label: &str) -> Result<(), RegError> {
+    let _ = reg::create_key(DL_ROOT).await;
+    reg::set_value(DL_ROOT, stable_id, Data::Str(label.to_string())).await
+}
+
+/// Publish a drive letter symlink pointing to the volume's stable mount symlink.
+/// Updates the PUBLISHED_LABELS map.
+fn publish_label(label: &str, stable_id: &str, fs_mount_link: &str) {
+    let ch = label.chars().next().unwrap_or('?');
     let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
     let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
 
@@ -626,34 +708,154 @@ async fn assign_drive_letter(letter: u8, fs_mount_link: &str) -> Result<(), RegE
 
     pnp_create_symlink(link_nocolon, fs_mount_link.to_string());
     pnp_create_symlink(link_colon, fs_mount_link.to_string());
+
+    PUBLISHED_LABELS
+        .write()
+        .insert(label.to_string(), stable_id.to_string());
+
+    notify_label_published(label, fs_mount_link);
+}
+
+/// Unpublish a drive letter symlink.
+fn unpublish_label(label: &str) {
+    let ch = label.chars().next().unwrap_or('?');
+    let link_nocolon = alloc::format!("\\GLOBAL\\StorageDevices\\{}", ch);
+    let link_colon = alloc::format!("\\GLOBAL\\StorageDevices\\{}:", ch);
+
+    pnp_remove_symlink(link_nocolon);
+    pnp_remove_symlink(link_colon);
+
+    PUBLISHED_LABELS.write().remove(label);
+
+    notify_label_unpublished(label);
+}
+
+/// Check if a label is currently published.
+fn is_label_published(label: &str) -> bool {
+    PUBLISHED_LABELS.read().contains_key(label)
+}
+
+/// Find the first free label starting from D: (or C: if allow_c is true).
+fn find_free_label(allow_c: bool) -> Option<String> {
+    let published = PUBLISHED_LABELS.read();
+    let start = if allow_c { b'C' } else { b'D' };
+    for ch in start..=b'Z' {
+        let label = alloc::format!("{}:", ch as char);
+        if !published.contains_key(&label) {
+            return Some(label);
+        }
+    }
+    None
+}
+
+/// Assign a specific drive letter to a volume (boot path for C:).
+/// Only writes to registry if this is first assignment or the mapping changed.
+async fn assign_boot_drive_letter(
+    letter: u8,
+    stable_id: &str,
+    fs_mount_link: &str,
+) -> Result<(), RegError> {
+    let ch = (letter as char).to_ascii_uppercase();
+    if ch < 'A' || ch > 'Z' {
+        return Ok(());
+    }
+
+    let label = alloc::format!("{}:", ch);
+
+    // Check if we need to write to registry
+    let current_pref = read_preferred_label(stable_id).await;
+    if current_pref.as_ref() != Some(&label) {
+        // First boot or mapping changed - write registry
+        write_preferred_label(stable_id, &label).await?;
+    }
+
+    // Publish the runtime symlink
+    publish_label(&label, stable_id, fs_mount_link);
+
     Ok(())
 }
 
+/// On-demand label assignment for a volume.
+/// Uses Policy A: existing mapping wins (newcomers get new labels).
+async fn assign_label_on_demand(dev: &Arc<DeviceObject>) -> Option<String> {
+    let dx = ext::<VolFdoExt>(dev);
+
+    // Get stable_id - required for assignment
+    let stable_id = match dx.stable_id.get() {
+        Some(Some(id)) => id.clone(),
+        _ => return None,
+    };
+
+    // Get fs_link for the volume
+    let fs_link = match dx.fs_link.get() {
+        Some(link) => link.clone(),
+        None => match dx.public_link.get() {
+            Some(link) => link.clone(),
+            None => return None,
+        },
+    };
+
+    // Check if already assigned
+    if let Some(existing) = dx.assigned_label.read().clone() {
+        return Some(existing);
+    }
+
+    // Check registry for preferred label (single read)
+    let preferred = read_preferred_label(&stable_id).await;
+
+    let label = if let Some(pref) = preferred {
+        // Has preference - check if free
+        if is_label_published(&pref) {
+            // Conflict - Policy A: existing wins, we get a new label
+            match find_free_label(false) {
+                Some(new_label) => {
+                    // Don't persist conflict resolution to avoid future fights
+                    new_label
+                }
+                None => return None, // No free labels
+            }
+        } else {
+            pref
+        }
+    } else {
+        // No preference - find a free label and persist it
+        match find_free_label(false) {
+            Some(new_label) => {
+                // Persist new assignment
+                let _ = write_preferred_label(&stable_id, &new_label).await;
+                new_label
+            }
+            None => return None,
+        }
+    };
+
+    // Publish the symlink
+    publish_label(&label, &stable_id, &fs_link);
+
+    // Store assignment in device extension
+    *dx.assigned_label.write() = Some(label.clone());
+
+    Some(label)
+}
+
 async fn rescan_all_volumes() {
-    let vols = VOLUMES.read();
-    for dev in vols.clone() {
+    let vols = VOLUMES.read().clone();
+    for dev in vols {
         mount_if_unmounted(dev.clone()).await;
     }
 }
 
-async fn set_label_for_link(public_link: &str, label: u8) -> Result<(), RegError> {
-    reg::create_key(MP_ROOT).await;
-    if let Ok(vals) = reg::list_values(MP_ROOT).await {
-        for name in vals {
-            if let Some(Data::Str(s)) = reg::get_value(MP_ROOT, &name).await {
-                if s == public_link {
-                    let _ = reg::delete_value(MP_ROOT, &name).await;
-                }
-            }
+/// Enumerate all volumes and assign labels on-demand.
+/// Called during RESYNC or when VFS needs to refresh labels.
+async fn enumerate_and_assign_all_labels() {
+    let vols = VOLUMES.read().clone();
+    for dev in vols {
+        let dx = ext::<VolFdoExt>(&dev);
+        // Only process mounted volumes
+        if dx.fs_attached.load(Ordering::Acquire) {
+            let _ = assign_label_on_demand(&dev).await;
         }
     }
-    let _ = reg::delete_value(MP_ROOT, &dev_name_for(label)).await;
-    reg::set_value(
-        MP_ROOT,
-        &dev_name_for(label),
-        Data::Str(public_link.to_string()),
-    )
-    .await
 }
 
 fn dev_name_for(label: u8) -> String {

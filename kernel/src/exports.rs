@@ -28,6 +28,8 @@ export! {
     park_self_and_yield,
     wake_task,
     switch_to_vfs_async,
+    vfs_notify_label_published,
+    vfs_notify_label_unpublished,
     panic_common,
     submit_runtime_internal,
     submit_blocking_internal,

@@ -114,7 +114,14 @@ unsafe extern "win64" {
     pub fn file_read(file: &File) -> FfiFuture<Result<Vec<u8>, FileStatus>>;
     pub fn file_write(file: &mut File, data: &[u8]) -> FfiFuture<Result<(), FileStatus>>;
     pub fn file_delete(file: &mut File) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn vfs_notify_label_published(
+        label_ptr: *const u8,
+        label_len: usize,
+        symlink_ptr: *const u8,
+        symlink_len: usize,
+    );
 
+    pub fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize);
     // =========================================================================
     // PnP / Device Management
     // =========================================================================

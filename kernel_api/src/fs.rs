@@ -19,3 +19,18 @@ pub async fn make_dir(path: &Path) -> Result<(), FileStatus> {
 pub async fn remove_dir(path: &Path) -> Result<(), FileStatus> {
     unsafe { ffi::fs_remove_dir(path).await }
 }
+
+pub fn notify_label_published(label: &str, symlink: &str) {
+    unsafe {
+        ffi::vfs_notify_label_published(
+            label.as_ptr(),
+            label.len(),
+            symlink.as_ptr(),
+            symlink.len(),
+        );
+    }
+}
+
+pub fn notify_label_unpublished(label: &str) {
+    unsafe { ffi::vfs_notify_label_unpublished(label.as_ptr(), label.len()) }
+}

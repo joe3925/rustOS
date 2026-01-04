@@ -18,7 +18,7 @@ use crate::drivers::timer_driver::{
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
 use crate::file_system::file::File;
-use crate::file_system::file_provider::install_file_provider;
+use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
@@ -142,7 +142,7 @@ pub unsafe fn init() {
 
 pub extern "win64" fn kernel_main(ctx: usize) {
     GlobalAsyncExecutor::global().set_parallelism(NUM_CORES.load(Ordering::Acquire));
-    install_file_provider(Box::new(BootstrapProvider::new(BOOTSET)));
+    install_file_provider(ProviderKind::Bootstrap);
 
     let mut program = Program::new(
         "KRNL".to_string(),

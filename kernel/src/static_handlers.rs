@@ -43,7 +43,10 @@ use crate::{
         },
         ACPI::{ACPIImpl, ACPI_TABLES},
     },
-    file_system::file::{self, File},
+    file_system::{
+        file::{self, File},
+        file_provider::{self, VFS_PROVIDER},
+    },
     idt::{irq_register, irq_signal, irq_signal_n},
     memory::{
         allocator::ALLOCATOR,
@@ -497,6 +500,47 @@ pub unsafe extern "win64" fn task_yield() {
 
 pub unsafe extern "win64" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
     file::switch_to_vfs().into_ffi()
+}
+
+/// Notify VFS that a drive label has been published.
+/// Called by mount manager when a new label symlink is created.
+#[no_mangle]
+pub extern "win64" fn vfs_notify_label_published(
+    label_ptr: *const u8,
+    label_len: usize,
+    symlink_ptr: *const u8,
+    symlink_len: usize,
+) {
+    if label_ptr.is_null() || symlink_ptr.is_null() {
+        return;
+    }
+    let label = unsafe { core::slice::from_raw_parts(label_ptr, label_len) };
+    let symlink = unsafe { core::slice::from_raw_parts(symlink_ptr, symlink_len) };
+
+    let Ok(label_str) = core::str::from_utf8(label) else {
+        return;
+    };
+    let Ok(symlink_str) = core::str::from_utf8(symlink) else {
+        return;
+    };
+
+    VFS_PROVIDER.set_label(label_str.to_string(), symlink_str.to_string());
+}
+
+/// Notify VFS that a drive label has been unpublished.
+/// Called by mount manager when a label symlink is removed.
+#[no_mangle]
+pub extern "win64" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize) {
+    if label_ptr.is_null() {
+        return;
+    }
+    let label = unsafe { core::slice::from_raw_parts(label_ptr, label_len) };
+
+    let Ok(label_str) = core::str::from_utf8(label) else {
+        return;
+    };
+
+    VFS_PROVIDER.remove_label(label_str);
 }
 
 #[no_mangle]

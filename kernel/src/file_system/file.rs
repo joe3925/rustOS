@@ -13,7 +13,7 @@ use kernel_types::{
 
 use crate::{
     drivers::drive::vfs::Vfs,
-    file_system::file_provider::{self, install_file_provider, FileProvider},
+    file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
     registry::rebind_and_persist_after_provider_switch,
@@ -339,7 +339,7 @@ async fn file_exists(path: &Path) -> bool {
 }
 
 pub async fn switch_to_vfs() -> Result<(), RegError> {
-    install_file_provider(Box::new(Vfs::new()));
+    install_file_provider(ProviderKind::Vfs);
 
     rebind_and_persist_after_provider_switch().await?;
 
