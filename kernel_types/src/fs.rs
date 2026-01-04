@@ -266,7 +266,7 @@ pub struct FsGetInfoResult {
     pub attrs: u32,
     pub error: Option<FileStatus>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub struct Path {
     pub symlink: Option<char>,

@@ -6,16 +6,15 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::size_of;
+use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::runtime::spawn_blocking;
-use kernel_api::{print, println};
 
 use fatfs::{
-    Dir as FatDirT, Error as FatError, File as FatFileT, FileSystem as FatFsT, IoBase,
-    LossyOemCpConverter, NullTimeProvider, Read, Seek, SeekFrom, Write,
+    Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
+    NullTimeProvider, Read, Seek, SeekFrom, Write,
 };
 
 use spin::RwLock;
@@ -42,7 +41,6 @@ type TP = NullTimeProvider;
 type OCC = LossyOemCpConverter;
 
 type Fs = FatFsT<FatDev, TP, OCC>;
-type FatFile<'a> = FatFileT<'a, FatDev, TP, OCC>;
 type FatDir<'a> = FatDirT<'a, FatDev, TP, OCC>;
 type FsError = FatError<<FatDev as IoBase>::Error>;
 
@@ -59,15 +57,29 @@ pub struct FileCtx {
     pos: u64,
 }
 
-fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
+pub(crate) fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
     let len = size_of::<T>();
     let p = Box::into_raw(b) as *mut u8;
     unsafe { Box::from_raw(core::slice::from_raw_parts_mut(p, len)) }
 }
 
-unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
-    let p = Box::into_raw(b) as *mut u8 as *mut T;
-    Box::from_raw(p)
+fn take_params<T>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
+    let mut r = req.write();
+    if r.data.len() != size_of::<T>() {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let data = core::mem::replace(&mut r.data, Box::new([]));
+    let ptr = data.as_ptr();
+    if (ptr as usize) % align_of::<T>() != 0 {
+        drop(data);
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    // SAFETY: length and alignment checked, ownership moved out of the request buffer.
+    let val = unsafe { (ptr as *const T).read() };
+    drop(data);
+    Ok(val)
 }
 
 fn map_fatfs_err(e: &FsError) -> FileStatus {
@@ -76,7 +88,7 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         NotFound => FileStatus::PathNotFound,
         AlreadyExists => FileStatus::FileAlreadyExist,
         InvalidInput => FileStatus::BadPath,
-        NoSpace => FileStatus::UnknownFail,
+        NoSpace => FileStatus::NoSpace,
         CorruptedFileSystem => FileStatus::CorruptFilesystem,
     }
 }
@@ -126,12 +138,9 @@ fn handle_fs_request(
 
             match op {
                 FsOp::Open => {
-                    let params: FsOpenParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsOpenParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsOpenParams = match take_params::<FsOpenParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let path_str = params.path.to_string();
@@ -192,12 +201,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::Close => {
-                    let params: FsCloseParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsCloseParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsCloseParams = match take_params::<FsCloseParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -216,12 +222,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::Read => {
-                    let params: FsReadParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsReadParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsReadParams = match take_params::<FsReadParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let (path, is_dir) = {
@@ -240,43 +243,41 @@ fn handle_fs_request(
                     };
 
                     let data_or_err = if is_dir {
-                        Ok(Vec::new())
+                        Err(FileStatus::AccessDenied)
                     } else {
                         match fs.root_dir().open_file(&path.to_string()) {
                             Ok(mut file) => {
-                                match file.seek(SeekFrom::Start(params.offset as u64)) {
-                                    Err(e) => Err(e),
-                                    Ok(_) => {
-                                        let mut buf = vec![0u8; params.len];
-                                        match file.read(&mut buf) {
-                                            Ok(n) => {
-                                                buf.truncate(n);
-                                                Ok(buf)
-                                            }
-                                            Err(e) => Err(e),
+                                if let Err(e) = file.seek(SeekFrom::Start(params.offset)) {
+                                    Err(map_fatfs_err(&e))
+                                } else {
+                                    let mut buf = vec![0u8; params.len];
+                                    match file.read(&mut buf) {
+                                        Ok(n) => {
+                                            buf.truncate(n);
+                                            Ok(buf)
                                         }
+                                        Err(e) => Err(map_fatfs_err(&e)),
                                     }
                                 }
                             }
-                            Err(e) => Err(e),
+                            Err(e) => Err(map_fatfs_err(&e)),
                         }
                     };
 
                     let mut r = req.write();
                     match data_or_err {
                         Ok(v) => {
+                            let new_pos = params.offset.saturating_add(v.len() as u64);
+                            let mut tbl = vdx.table.write();
+                            if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
+                                ctx.pos = new_pos;
+                            }
                             r.data = box_to_bytes(Box::new(FsReadResult {
                                 data: v,
                                 error: None,
                             }))
                         }
-                        Err(e) => {
-                            let status = if matches!(e, FatError::NotFound) {
-                                FileStatus::PathNotFound
-                            } else {
-                                map_fatfs_err(&e)
-                            };
-
+                        Err(status) => {
                             r.data = box_to_bytes(Box::new(FsReadResult {
                                 data: Vec::new(),
                                 error: Some(status),
@@ -287,18 +288,15 @@ fn handle_fs_request(
                 }
 
                 FsOp::Write => {
-                    let params: FsWriteParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsWriteParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsWriteParams = match take_params::<FsWriteParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
-                    let (path, is_dir, pos) = {
+                    let (path, is_dir) = {
                         let tbl = vdx.table.read();
                         match tbl.get(&params.fs_file_id) {
-                            Some(ctx) => (ctx.path.clone(), ctx.is_dir, ctx.pos),
+                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
                             None => {
                                 let mut r = req.write();
                                 r.data = box_to_bytes(Box::new(FsWriteResult {
@@ -311,24 +309,24 @@ fn handle_fs_request(
                     };
 
                     let write_res = if is_dir {
-                        Ok(0usize)
+                        Err(FileStatus::AccessDenied)
                     } else {
                         match fs.root_dir().open_file(&path.to_string()) {
                             Ok(mut file) => {
                                 let n = params.data.len();
-                                if let Err(e) = file.seek(SeekFrom::Start(pos)) {
-                                    Err(e)
+                                if let Err(e) = file.seek(SeekFrom::Start(params.offset)) {
+                                    Err(map_fatfs_err(&e))
                                 } else {
                                     match file.write_all(&params.data) {
                                         Ok(()) => match file.flush() {
                                             Ok(()) => Ok(n),
-                                            Err(e) => Err(e),
+                                            Err(e) => Err(map_fatfs_err(&e)),
                                         },
-                                        Err(e) => Err(e),
+                                        Err(e) => Err(map_fatfs_err(&e)),
                                     }
                                 }
                             }
-                            Err(e) => Err(e),
+                            Err(e) => Err(map_fatfs_err(&e)),
                         }
                     };
 
@@ -336,7 +334,7 @@ fn handle_fs_request(
                     if let Ok(written) = write_res {
                         let mut tbl = vdx.table.write();
                         if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
-                            ctx.pos = ctx.pos.saturating_add(written as u64);
+                            ctx.pos = params.offset.saturating_add(written as u64);
                         }
                     }
 
@@ -348,12 +346,7 @@ fn handle_fs_request(
                                 error: None,
                             }))
                         }
-                        Err(e) => {
-                            let status = if matches!(e, FatError::NotFound) {
-                                FileStatus::PathNotFound
-                            } else {
-                                map_fatfs_err(&e)
-                            };
+                        Err(status) => {
                             r.data = box_to_bytes(Box::new(FsWriteResult {
                                 written: 0,
                                 error: Some(status),
@@ -365,12 +358,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::Seek => {
-                    let params: FsSeekParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsSeekParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsSeekParams = match take_params::<FsSeekParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let result = {
@@ -414,21 +404,20 @@ fn handle_fs_request(
                 }
 
                 FsOp::Flush => {
-                    let params: FsFlushParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsFlushParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsFlushParams = match take_params::<FsFlushParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let err = {
                         let tbl = vdx.table.read();
-                        if tbl.contains_key(&params.fs_file_id) {
-                            // No cached file to flush, just verify the handle exists
-                            None
-                        } else {
-                            Some(FileStatus::PathNotFound)
+                        match tbl.get(&params.fs_file_id) {
+                            None => Some(FileStatus::PathNotFound),
+                            Some(ctx) if ctx.is_dir => None,
+                            Some(ctx) => match fs.root_dir().open_file(&ctx.path.to_string()) {
+                                Ok(mut f) => f.flush().err().map(|e| map_fatfs_err(&e)),
+                                Err(e) => Some(map_fatfs_err(&e)),
+                            },
                         }
                     };
 
@@ -438,12 +427,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::Create => {
-                    let params: FsCreateParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsCreateParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsCreateParams = match take_params::<FsCreateParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -459,19 +445,22 @@ fn handle_fs_request(
                 }
 
                 FsOp::Rename => {
-                    let params: FsRenameParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsRenameParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsRenameParams = match take_params::<FsRenameParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
-                    let err = {
-                        match rename_entry(&mut *fs, &params.src, &params.dst) {
-                            Ok(()) => None,
-                            Err(e) => Some(map_fatfs_err(&e)),
+                    let err = match rename_entry(&mut *fs, &params.src, &params.dst) {
+                        Ok(()) => {
+                            let mut tbl = vdx.table.write();
+                            for ctx in tbl.values_mut() {
+                                if ctx.path == params.src {
+                                    ctx.path = params.dst.clone();
+                                }
+                            }
+                            None
                         }
+                        Err(e) => Some(map_fatfs_err(&e)),
                     };
 
                     let mut r = req.write();
@@ -480,12 +469,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::ReadDir => {
-                    let params: FsListDirParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsListDirParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsListDirParams = match take_params::<FsListDirParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let names_or_err = { list_names(&mut *fs, &params.path) };
@@ -506,12 +492,9 @@ fn handle_fs_request(
                 }
 
                 FsOp::GetInfo => {
-                    let params: FsGetInfoParams = unsafe {
-                        let mut r = req.write();
-                        if r.data.len() != size_of::<FsGetInfoParams>() {
-                            return DriverStatus::InvalidParameter;
-                        }
-                        *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
+                    let params: FsGetInfoParams = match take_params::<FsGetInfoParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
                     };
 
                     let (path, is_dir) = {

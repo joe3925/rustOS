@@ -7,11 +7,8 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use core::{
-    future,
-    mem::size_of,
-    sync::atomic::{AtomicBool, AtomicU64},
-};
+use core::mem::{align_of, size_of};
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
@@ -32,7 +29,6 @@ use kernel_api::{
     request_handler,
     runtime::{spawn, spawn_blocking},
     status::DriverStatus,
-    util::bytes_to_box,
 };
 
 use crate::block_dev::BlockDev;
@@ -67,6 +63,40 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
+fn take_req<T>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
+    let mut r = req.write();
+    if r.data.len() != size_of::<T>() {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    let data = core::mem::replace(&mut r.data, Box::new([]));
+    let ptr = data.as_ptr();
+    if (ptr as usize) % align_of::<T>() != 0 {
+        drop(data);
+        return Err(DriverStatus::InvalidParameter);
+    }
+
+    // SAFETY: size and alignment checked; ownership of the buffer is moved out.
+    let val = unsafe { (ptr as *const T).read() };
+    drop(data);
+    Ok(val)
+}
+
+fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
+    if bytes.len() != size_of::<T>() {
+        return Err(DriverStatus::InvalidParameter);
+    }
+    let ptr = bytes.as_ptr();
+    if (ptr as usize) % align_of::<T>() != 0 {
+        drop(bytes);
+        return Err(DriverStatus::InvalidParameter);
+    }
+    // SAFETY: same rationale as take_req.
+    let val = unsafe { (ptr as *const T).read() };
+    drop(bytes);
+    Ok(val)
+}
+
 #[request_handler]
 pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let code = {
@@ -83,12 +113,10 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
     match code {
         IOCTL_FS_IDENTIFY => {
-            let mut r = req.write();
-            if r.data.len() < core::mem::size_of::<FsIdentify>() {
-                return DriverStep::complete(DriverStatus::InvalidParameter);
-            }
-
-            let id: &mut FsIdentify = unsafe { &mut *(r.data.as_mut_ptr() as *mut FsIdentify) };
+            let mut id = match take_req::<FsIdentify>(&req) {
+                Ok(v) => v,
+                Err(st) => return DriverStep::complete(st),
+            };
 
             let q = Request::new_pnp(
                 PnpRequest {
@@ -104,33 +132,39 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
             pnp_send_request(id.volume_fdo.clone(), q.clone()).await;
 
-            let mut sector_size: u16 = 512;
-            let mut total_sectors: u64 = 10_000;
-            {
-                let mut w = q.write();
-                if w.status == DriverStatus::Success {
-                    if let Some(pnp) = w.pnp.as_mut() {
-                        let buf = core::mem::take(&mut pnp.blob_out);
-                        if buf.len() == core::mem::size_of::<PartitionInfo>() {
-                            let boxed: Box<[u8]> = buf.into_boxed_slice();
-                            let pi: Box<PartitionInfo> = unsafe { bytes_to_box(boxed) };
-                            sector_size = if pi.disk.logical_block_size != 0 {
-                                pi.disk.logical_block_size as u16
-                            } else {
-                                512
-                            };
+            let mut sector_size: Option<u16> = None;
+            let mut total_sectors: Option<u64> = None;
+            let mut w = q.write();
+            if w.status == DriverStatus::Success {
+                if let Some(pnp) = w.pnp.as_mut() {
+                    let buf = core::mem::take(&mut pnp.blob_out);
+                    if let Ok(pi) = from_boxed_bytes::<PartitionInfo>(buf.into_boxed_slice()) {
+                        sector_size = Some(if pi.disk.logical_block_size != 0 {
+                            pi.disk.logical_block_size as u16
+                        } else {
+                            512
+                        });
 
-                            total_sectors = if let Some(ent) = pi.gpt_entry {
-                                ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
-                            } else {
-                                id.mount_device = None;
-                                id.can_mount = false;
-                                return DriverStep::complete(DriverStatus::Success);
-                            };
-                        }
+                        total_sectors = pi.gpt_entry.map(|ent| {
+                            ent.last_lba
+                                .saturating_sub(ent.first_lba)
+                                .saturating_add(1)
+                        });
                     }
                 }
             }
+            drop(w);
+
+            let (sector_size, total_sectors) = match (sector_size, total_sectors) {
+                (Some(sz), Some(ts)) => (sz, ts),
+                _ => {
+                    id.mount_device = None;
+                    id.can_mount = false;
+                    let mut r = req.write();
+                    r.data = crate::volume::box_to_bytes(Box::new(id));
+                    return DriverStep::complete(DriverStatus::Success);
+                }
+            };
 
             let options = FsOptions::new();
             let target_clone = id.volume_fdo.clone();
@@ -160,11 +194,15 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
+                    let mut r = req.write();
+                    r.data = crate::volume::box_to_bytes(Box::new(id));
                     DriverStep::complete(DriverStatus::Success)
                 }
                 Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
+                    let mut r = req.write();
+                    r.data = crate::volume::box_to_bytes(Box::new(id));
                     DriverStep::complete(DriverStatus::Success)
                 }
             }
