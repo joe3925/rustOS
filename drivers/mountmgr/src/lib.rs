@@ -508,7 +508,7 @@ unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
 
 async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
-        flags: OpenFlags::Open,
+        flags: OpenFlags::Open.into(),
         path: path.to_string(),
     };
     let req = Arc::new(RwLock::new(

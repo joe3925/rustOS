@@ -26,39 +26,12 @@ pub type TaskEntry = extern "win64" fn(usize);
 
 const PAGE_SIZE: u64 = 4096;
 
-/// Park state machine for safe task parking/unparking.
-///
-/// This solves the "lost wakeup" problem by using a state machine that
-/// tracks pending wakeups. The key insight is that a wake can arrive
-/// at any point during the parking process, and we need to handle all cases.
-///
-/// State transitions:
-/// ```text
-///                    park_begin()
-///     Running ─────────────────────► ParkRequested
-///        ▲                                │
-///        │                                │ park_commit()
-///        │ unpark()                       ▼
-///        │◄─────────────────────────── Parked
-///        │
-///        │            unpark()
-///        │◄──────────────────────── UnparkPending
-///        │                               ▲
-///        │                               │ unpark()
-///        │                               │
-///     Running ◄── park_begin() ─── ParkRequested
-///     (consumed)   (sees pending)
-/// ```
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkState {
-    /// Task is running normally
     Running = 0,
-    /// Task has requested to park but scheduler hasn't committed yet
     ParkRequested = 1,
-    /// Task is actually parked in the sleep queue
     Parked = 2,
-    /// A wakeup was issued before/during parking - must not actually park
     UnparkPending = 3,
 }
 
@@ -240,23 +213,12 @@ impl Task {
         );
     }
 
-    // =========================================================================
-    // Park/Unpark API - Safe against lost wakeups
-    // =========================================================================
-
-    /// Begin the parking process. Call this before yielding.
-    ///
-    /// Returns `true` if the task should actually yield to the scheduler.
-    /// Returns `false` if an unpark was already pending (wake arrived early).
-    ///
-    /// This handles the case where `unpark()` was called before `park_begin()`.
     #[inline]
     pub fn park_begin(&self) -> bool {
         loop {
             let current = self.park_state.load(Ordering::Acquire);
             match ParkState::from(current) {
                 ParkState::Running => {
-                    // Normal case: transition to ParkRequested
                     if self
                         .park_state
                         .compare_exchange(
@@ -267,13 +229,10 @@ impl Task {
                         )
                         .is_ok()
                     {
-                        return true; // Should yield
+                        return true;
                     }
-                    // CAS failed, another thread changed state, retry
                 }
                 ParkState::UnparkPending => {
-                    // An unpark arrived before we even started parking.
-                    // Consume it and stay running.
                     if self
                         .park_state
                         .compare_exchange(
@@ -284,25 +243,16 @@ impl Task {
                         )
                         .is_ok()
                     {
-                        return false; // Don't yield, already woken
+                        return false;
                     }
-                    // CAS failed, retry
                 }
                 ParkState::ParkRequested | ParkState::Parked => {
-                    // Already in parking process or parked - shouldn't happen
-                    // but handle gracefully
                     return false;
                 }
             }
         }
     }
 
-    /// Commit the parking. Called by scheduler when moving task to sleep queue.
-    ///
-    /// Returns `true` if task should actually be parked (moved to sleep queue).
-    /// Returns `false` if a wake arrived during the parking window.
-    ///
-    /// This is the critical function that catches late-arriving wakes.
     #[inline]
     pub fn park_commit(&self) -> bool {
         loop {
@@ -320,13 +270,10 @@ impl Task {
                         )
                         .is_ok()
                     {
-                        return true; // Successfully parked
+                        return true;
                     }
-                    // CAS failed, state changed, retry
                 }
                 ParkState::UnparkPending => {
-                    // Wake arrived between park_begin and park_commit!
-                    // Abort the park and go back to running.
                     if self
                         .park_state
                         .compare_exchange(
@@ -337,23 +284,19 @@ impl Task {
                         )
                         .is_ok()
                     {
-                        return false; // Don't park, was woken
+                        return false;
                     }
-                    // CAS failed, retry
                 }
                 ParkState::Running => {
-                    // Park was already aborted (maybe by unpark consuming UnparkPending)
                     return false;
                 }
                 ParkState::Parked => {
-                    // Already parked - shouldn't happen but handle gracefully
                     return true;
                 }
             }
         }
     }
 
-    /// Abort a park request. Call if you decide not to yield after park_begin().
     #[inline]
     pub fn park_abort(&self) {
         loop {
@@ -378,15 +321,6 @@ impl Task {
         }
     }
 
-    /// Unpark (wake) the task. Can be called from any context, any CPU.
-    ///
-    /// Returns `true` if the task needs to be moved from sleep queue to run queue.
-    /// Returns `false` if:
-    ///   - Task was already running
-    ///   - Task was in the process of parking (we set UnparkPending, scheduler will handle it)
-    ///   - There was already a pending unpark
-    ///
-    /// This is safe to call multiple times - extra calls are no-ops.
     #[inline]
     pub fn unpark(&self) -> bool {
         loop {
@@ -457,32 +391,6 @@ impl Task {
     #[inline]
     pub fn park_state(&self) -> ParkState {
         ParkState::from(self.park_state.load(Ordering::Acquire))
-    }
-
-    // =========================================================================
-    // Legacy API - kept for compatibility, implemented using park/unpark
-    // =========================================================================
-
-    /// Legacy sleep function. Prefer park_begin() + yield for new code.
-    #[deprecated(note = "Use park_begin() followed by yield instead")]
-    pub fn sleep(&self) {
-        self.park_begin();
-    }
-
-    /// Legacy wake function. Use unpark() instead.
-    #[deprecated(note = "Use unpark() instead")]
-    pub fn wake(&self) {
-        self.unpark();
-    }
-
-    /// Legacy is_sleeping check. Use is_parked() or is_park_requested() instead.
-    #[deprecated(note = "Use is_parked() or is_park_requested() instead")]
-    pub fn is_sleeping(&self) -> bool {
-        let state = ParkState::from(self.park_state.load(Ordering::Acquire));
-        matches!(
-            state,
-            ParkState::ParkRequested | ParkState::Parked | ParkState::UnparkPending
-        )
     }
 
     // =========================================================================

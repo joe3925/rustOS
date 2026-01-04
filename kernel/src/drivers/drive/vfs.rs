@@ -305,7 +305,7 @@ impl Vfs {
             }
         };
 
-        let call_open = async |this: &Self, link: &String, path: String, flags: OpenFlags| {
+        let call_open = async |this: &Self, link: &String, path: String, flags: OpenFlagsMask| {
             let inner = FsOpenParams { flags, path };
             match this
                 .call_fs::<FsOpenParams, FsOpenResult>(link, FsOp::Open, inner)
@@ -329,27 +329,113 @@ impl Vfs {
             }
         };
 
-        match p.flags {
-            OpenFlags::CreateNew => {
+        let has_create_new = p.flags.contains(OpenFlags::CreateNew);
+        let has_create = p.flags.contains(OpenFlags::Create);
+
+        if has_create_new {
+            let creq = FsCreateParams {
+                path: fs_path.clone(),
+                dir: false,
+                flags: OpenFlags::CreateNew,
+            };
+            let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq).await {
+                Ok(r) => r,
+                Err(st) => {
+                    return (
+                        FsOpenResult {
+                            fs_file_id: 0,
+                            is_dir: false,
+                            size: 0,
+                            error: Some(FileStatus::UnknownFail),
+                        },
+                        st,
+                    )
+                }
+            };
+            if let Some(e) = cres.error {
+                if e != FileStatus::Success {
+                    return (
+                        FsOpenResult {
+                            fs_file_id: 0,
+                            is_dir: false,
+                            size: 0,
+                            error: Some(e),
+                        },
+                        DriverStatus::Success,
+                    );
+                }
+            }
+
+            let (inner_res, st) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
+            if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
+                return (inner_res, st);
+            }
+
+            let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
+            self.handles.write().insert(
+                vhid,
+                VfsHandle {
+                    volume_symlink: symlink,
+                    inner_id: inner_res.fs_file_id,
+                    is_dir: inner_res.is_dir,
+                },
+            );
+            (
+                FsOpenResult {
+                    fs_file_id: vhid,
+                    is_dir: inner_res.is_dir,
+                    size: inner_res.size,
+                    error: None,
+                },
+                DriverStatus::Success,
+            )
+        } else if has_create {
+            let (try_open, st) =
+                call_open(self, &symlink, fs_path.clone(), p.flags.clone()).await;
+            if st != DriverStatus::Success {
+                return (try_open, st);
+            }
+            if try_open.error.is_none() {
+                let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
+                self.handles.write().insert(
+                    vhid,
+                    VfsHandle {
+                        volume_symlink: symlink,
+                        inner_id: try_open.fs_file_id,
+                        is_dir: try_open.is_dir,
+                    },
+                );
+                return (
+                    FsOpenResult {
+                        fs_file_id: vhid,
+                        is_dir: try_open.is_dir,
+                        size: try_open.size,
+                        error: None,
+                    },
+                    DriverStatus::Success,
+                );
+            }
+            if try_open.error == Some(FileStatus::PathNotFound) {
                 let creq = FsCreateParams {
                     path: fs_path.clone(),
                     dir: false,
-                    flags: OpenFlags::CreateNew,
+                    flags: OpenFlags::Create,
                 };
-                let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq).await {
-                    Ok(r) => r,
-                    Err(st) => {
-                        return (
-                            FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(FileStatus::UnknownFail),
-                            },
-                            st,
-                        )
-                    }
-                };
+                let cres: FsCreateResult =
+                    match self.call_fs(&symlink, FsOp::Create, creq).await {
+                        Ok(r) => r,
+                        Err(st) => {
+                            return (
+                                FsOpenResult {
+                                    fs_file_id: 0,
+                                    is_dir: false,
+                                    size: 0,
+                                    error: Some(FileStatus::UnknownFail),
+                                },
+                                st,
+                            )
+                        }
+                    };
                 if let Some(e) = cres.error {
                     if e != FileStatus::Success {
                         return (
@@ -364,9 +450,10 @@ impl Vfs {
                     }
                 }
 
-                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open).await;
+                let (inner_res, st2) =
+                    call_open(self, &symlink, fs_path, p.flags.clone()).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                    return (inner_res, st);
+                    return (inner_res, st2);
                 }
 
                 let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
@@ -388,120 +475,31 @@ impl Vfs {
                     DriverStatus::Success,
                 );
             }
-
-            OpenFlags::Create => {
-                let (try_open, st) =
-                    call_open(self, &symlink, fs_path.clone(), OpenFlags::Open).await;
-                if st != DriverStatus::Success {
-                    return (try_open, st);
-                }
-                if try_open.error.is_none() {
-                    let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                    self.handles.write().insert(
-                        vhid,
-                        VfsHandle {
-                            volume_symlink: symlink,
-                            inner_id: try_open.fs_file_id,
-                            is_dir: try_open.is_dir,
-                        },
-                    );
-                    return (
-                        FsOpenResult {
-                            fs_file_id: vhid,
-                            is_dir: try_open.is_dir,
-                            size: try_open.size,
-                            error: None,
-                        },
-                        DriverStatus::Success,
-                    );
-                }
-                if try_open.error == Some(FileStatus::PathNotFound) {
-                    let creq = FsCreateParams {
-                        path: fs_path.clone(),
-                        dir: false,
-                        flags: OpenFlags::Create,
-                    };
-                    let cres: FsCreateResult =
-                        match self.call_fs(&symlink, FsOp::Create, creq).await {
-                            Ok(r) => r,
-                            Err(st) => {
-                                return (
-                                    FsOpenResult {
-                                        fs_file_id: 0,
-                                        is_dir: false,
-                                        size: 0,
-                                        error: Some(FileStatus::UnknownFail),
-                                    },
-                                    st,
-                                )
-                            }
-                        };
-                    if let Some(e) = cres.error {
-                        if e != FileStatus::Success {
-                            return (
-                                FsOpenResult {
-                                    fs_file_id: 0,
-                                    is_dir: false,
-                                    size: 0,
-                                    error: Some(e),
-                                },
-                                DriverStatus::Success,
-                            );
-                        }
-                    }
-
-                    let (inner_res, st2) =
-                        call_open(self, &symlink, fs_path, OpenFlags::Open).await;
-                    if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                        return (inner_res, st2);
-                    }
-
-                    let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                    self.handles.write().insert(
-                        vhid,
-                        VfsHandle {
-                            volume_symlink: symlink,
-                            inner_id: inner_res.fs_file_id,
-                            is_dir: inner_res.is_dir,
-                        },
-                    );
-                    return (
-                        FsOpenResult {
-                            fs_file_id: vhid,
-                            is_dir: inner_res.is_dir,
-                            size: inner_res.size,
-                            error: None,
-                        },
-                        DriverStatus::Success,
-                    );
-                }
-                return (try_open, DriverStatus::Success);
+            (try_open, DriverStatus::Success)
+        } else {
+            // Open, ReadOnly, WriteOnly, ReadWrite - just open
+            let (inner_res, st) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
+            if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
+                return (inner_res, st);
             }
-
-            OpenFlags::Open | OpenFlags::ReadOnly | OpenFlags::WriteOnly | OpenFlags::ReadWrite => {
-                let (inner_res, st) = call_open(self, &symlink, fs_path, OpenFlags::Open).await;
-                if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
-                    return (inner_res, st);
-                }
-                let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                self.handles.write().insert(
-                    vhid,
-                    VfsHandle {
-                        volume_symlink: symlink,
-                        inner_id: inner_res.fs_file_id,
-                        is_dir: inner_res.is_dir,
-                    },
-                );
-                (
-                    FsOpenResult {
-                        fs_file_id: vhid,
-                        is_dir: inner_res.is_dir,
-                        size: inner_res.size,
-                        error: None,
-                    },
-                    DriverStatus::Success,
-                )
-            }
+            let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
+            self.handles.write().insert(
+                vhid,
+                VfsHandle {
+                    volume_symlink: symlink,
+                    inner_id: inner_res.fs_file_id,
+                    is_dir: inner_res.is_dir,
+                },
+            );
+            (
+                FsOpenResult {
+                    fs_file_id: vhid,
+                    is_dir: inner_res.is_dir,
+                    size: inner_res.size,
+                    error: None,
+                },
+                DriverStatus::Success,
+            )
         }
     }
 
@@ -761,18 +759,10 @@ impl FileProvider for Vfs {
         path: &str,
         flags: &[OpenFlags],
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
-        // TODO: Very temporary fix to this issue. All open flags should be passed.
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-        let f = if flags.iter().any(|f| matches!(f, OpenFlags::CreateNew)) {
-            OpenFlags::CreateNew
-        } else if flags.iter().any(|f| matches!(f, OpenFlags::Create)) {
-            OpenFlags::Create
-        } else {
-            *flags.get(0).unwrap_or(&OpenFlags::Open)
-        };
 
         this.open(FsOpenParams {
-            flags: f,
+            flags: OpenFlagsMask::from(flags),
             path: path.to_string(),
         })
         .into_ffi()

@@ -41,12 +41,65 @@ impl TryFrom<u8> for FileAttribute {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum OpenFlags {
-    ReadOnly,
-    WriteOnly,
-    ReadWrite,
-    Create,
-    CreateNew,
-    Open,
+    ReadOnly = 1 << 0,
+    WriteOnly = 1 << 1,
+    ReadWrite = 1 << 2,
+    Create = 1 << 3,
+    CreateNew = 1 << 4,
+    Open = 1 << 5,
+}
+
+/// A bitmask of `OpenFlags` for passing multiple flags efficiently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct OpenFlagsMask(pub u32);
+
+impl OpenFlagsMask {
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    pub const fn with(self, flag: OpenFlags) -> Self {
+        Self(self.0 | flag as u32)
+    }
+
+    pub const fn contains(self, flag: OpenFlags) -> bool {
+        (self.0 & flag as u32) != 0
+    }
+
+    pub const fn from_flag(flag: OpenFlags) -> Self {
+        Self(flag as u32)
+    }
+}
+
+impl From<OpenFlags> for OpenFlagsMask {
+    fn from(flag: OpenFlags) -> Self {
+        Self::from_flag(flag)
+    }
+}
+
+impl From<&[OpenFlags]> for OpenFlagsMask {
+    fn from(flags: &[OpenFlags]) -> Self {
+        let mut mask = Self::new();
+        for &f in flags {
+            mask = mask.with(f);
+        }
+        mask
+    }
+}
+
+impl core::ops::BitOr for OpenFlags {
+    type Output = OpenFlagsMask;
+    fn bitor(self, rhs: Self) -> OpenFlagsMask {
+        OpenFlagsMask::from_flag(self).with(rhs)
+    }
+}
+
+impl core::ops::BitOr<OpenFlags> for OpenFlagsMask {
+    type Output = OpenFlagsMask;
+    fn bitor(self, rhs: OpenFlags) -> OpenFlagsMask {
+        self.with(rhs)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,7 +122,7 @@ pub enum FsOp {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsOpenParams {
-    pub flags: OpenFlags,
+    pub flags: OpenFlagsMask,
     pub path: String,
 }
 

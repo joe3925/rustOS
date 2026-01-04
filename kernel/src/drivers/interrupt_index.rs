@@ -174,7 +174,6 @@ pub fn calibrate_tsc(tsc_start: u64, tsc_end: u64, delay_ms: u64) {
     let tsc_freq = (tsc_end - tsc_start) * 1000 / delay_ms;
     TSC_HZ.store(tsc_freq, Ordering::SeqCst);
 }
-// TODO: depreciate the wait_millis and others
 pub fn wait_duration(d: Duration) {
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
     if tsc_hz == 0 {
