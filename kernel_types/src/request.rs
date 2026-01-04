@@ -5,10 +5,141 @@ use crate::status::DriverStatus;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::{
+    mem::size_of,
     pin::Pin,
     task::{Context, Poll, Waker},
 };
 use spin::RwLock;
+
+fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
+    let len = size_of::<T>();
+    let ptr = Box::into_raw(b) as *mut u8;
+    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) }
+}
+
+unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
+    debug_assert_eq!(b.len(), size_of::<T>());
+    let ptr = Box::into_raw(b) as *mut u8 as *mut T;
+    Box::from_raw(ptr)
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct RequestData {
+    bytes: Box<[u8]>,
+    tag: Option<u64>,
+    dropper: fn(Box<[u8]>),
+    size: usize,
+}
+// TODO: better hashing is probably possible to reduce the case where 2 types have the same name.
+#[inline]
+pub const fn type_tag<T: 'static>() -> u64 {
+    const fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0x817776954A86F58E;
+        let mut i = 0;
+        while i < bytes.len() {
+            hash ^= bytes[i] as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+            i += 1;
+        }
+        hash
+    }
+
+    fnv1a(core::any::type_name::<T>().as_bytes())
+}
+
+impl RequestData {
+    pub fn empty() -> Self {
+        Self {
+            bytes: Box::new([]),
+            tag: None,
+            dropper: |b| drop(b),
+            size: 0,
+        }
+    }
+
+    pub fn from_boxed_bytes(bytes: Box<[u8]>) -> Self {
+        let size = bytes.len();
+        Self {
+            bytes,
+            tag: None,
+            dropper: |b| drop(b),
+            size,
+        }
+    }
+
+    pub fn from_t<T: 'static>(value: T) -> Self {
+        let size = size_of::<T>();
+        let bytes = box_to_bytes(Box::new(value));
+        Self {
+            bytes,
+            tag: Some(type_tag::<T>()),
+            size,
+            dropper: |b| {
+                let _ = unsafe { bytes_to_box::<T>(b) };
+            },
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    fn matches<T: 'static>(&self) -> bool {
+        self.tag == Some(type_tag::<T>()) && self.size == size_of::<T>()
+    }
+
+    pub fn view<T: 'static>(&self) -> Option<&T> {
+        if !self.matches::<T>() {
+            return None;
+        }
+        Some(unsafe { &*(self.bytes.as_ptr() as *const T) })
+    }
+
+    pub fn view_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        if !self.matches::<T>() {
+            return None;
+        }
+        Some(unsafe { &mut *(self.bytes.as_mut_ptr() as *mut T) })
+    }
+
+    pub fn try_take<T: 'static>(&mut self) -> Option<T> {
+        if !self.matches::<T>() {
+            return None;
+        }
+        let raw = core::mem::replace(&mut self.bytes, Box::new([]));
+        self.tag = None;
+        self.size = 0;
+        self.dropper = |b| drop(b);
+        Some(*unsafe { bytes_to_box::<T>(raw) })
+    }
+
+    pub fn take_bytes(&mut self) -> Box<[u8]> {
+        let raw = core::mem::replace(&mut self.bytes, Box::new([]));
+        self.tag = None;
+        self.size = 0;
+        self.dropper = |b| drop(b);
+        raw
+    }
+}
+
+impl Drop for RequestData {
+    fn drop(&mut self) {
+        let raw = core::mem::replace(&mut self.bytes, Box::new([]));
+        (self.dropper)(raw);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
@@ -34,7 +165,7 @@ pub enum TraversalPolicy {
 pub struct Request {
     pub id: u64,
     pub kind: RequestType,
-    pub data: Box<[u8]>,
+    pub data: RequestData,
     pub completed: bool,
     pub status: DriverStatus,
     pub traversal_policy: TraversalPolicy,
@@ -53,11 +184,61 @@ impl Request {
     }
 
     #[inline]
+    pub fn set_data(&mut self, data: RequestData) {
+        self.data = data;
+    }
+
+    #[inline]
+    pub fn set_data_t<T: 'static>(&mut self, data: T) {
+        self.data = RequestData::from_t(data);
+    }
+
+    #[inline]
+    pub fn set_data_bytes(&mut self, data: Box<[u8]>) {
+        self.data = RequestData::from_boxed_bytes(data);
+    }
+
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[inline]
+    pub fn data_slice(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    #[inline]
+    pub fn data_slice_mut(&mut self) -> &mut [u8] {
+        self.data.as_mut_slice()
+    }
+
+    #[inline]
+    pub fn view_data<T: 'static>(&self) -> Option<&T> {
+        self.data.view::<T>()
+    }
+
+    #[inline]
+    pub fn view_data_mut<T: 'static>(&mut self) -> Option<&mut T> {
+        self.data.view_mut::<T>()
+    }
+
+    #[inline]
+    pub fn take_data<T: 'static>(&mut self) -> Option<T> {
+        self.data.try_take::<T>()
+    }
+
+    #[inline]
+    pub fn take_data_bytes(&mut self) -> Box<[u8]> {
+        self.data.take_bytes()
+    }
+
+    #[inline]
     pub fn empty() -> Self {
         Self {
             id: 0,
             kind: RequestType::Dummy,
-            data: Box::new([]),
+            data: RequestData::empty(),
             completed: true,
             status: DriverStatus::Success,
             traversal_policy: TraversalPolicy::FailIfUnhandled,

@@ -20,6 +20,7 @@ use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -103,7 +104,7 @@ async fn ide_pnp_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> Dr
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
-        Box::new([]),
+        RequestData::empty(),
     );
     let child = Arc::new(RwLock::new(child));
     let st = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
@@ -323,7 +324,7 @@ pub async fn ide_pdo_read(
 
     {
         let r = req.read();
-        if r.data.len() < len {
+        if r.data_len() < len {
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
     }
@@ -341,7 +342,7 @@ pub async fn ide_pdo_read(
         let _guard = ControllerGuard::new(&dx);
 
         let mut w = req_clone.write();
-        let buf = &mut w.data[..len];
+        let buf = &mut w.data_slice_mut()[..len];
 
         if ata_pio_read(&dx, dh, lba as u32, sectors, buf) {
             Ok(())
@@ -406,7 +407,7 @@ pub async fn ide_pdo_write(
 
     {
         let r = req.read();
-        if r.data.len() < len {
+        if r.data_len() < len {
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
     }
@@ -424,7 +425,7 @@ pub async fn ide_pdo_write(
         let _guard = ControllerGuard::new(&dx);
 
         let r = req_clone.read();
-        let buf = &r.data[..len];
+        let buf = &r.data_slice()[..len];
 
         if ata_pio_write(&dx, dh, lba as u32, sectors, buf) {
             Ok(())

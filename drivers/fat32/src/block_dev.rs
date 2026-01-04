@@ -7,7 +7,7 @@ use spin::RwLock;
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     RequestExt,
-    kernel_types::io::IoTarget,
+    kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
     println,
     request::{Request, RequestType, TraversalPolicy},
@@ -21,6 +21,7 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
+    scratch: alloc::vec::Vec<u8>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -41,11 +42,14 @@ impl IoBase for BlockDev {
 
 impl BlockDev {
     pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
+        let bps = sector_size as usize;
+
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
+            scratch: alloc::vec![0u8; bps],
         }
     }
 
@@ -53,7 +57,11 @@ impl BlockDev {
     fn capacity_bytes(&self) -> u64 {
         self.total_sectors.saturating_mul(self.sector_size as u64)
     }
-
+    #[inline(always)]
+    fn scratch(&mut self) -> &mut [u8] {
+        debug_assert_eq!(self.scratch.len(), self.sector_size as usize);
+        &mut self.scratch[..]
+    }
     #[inline]
     fn clamp_len(&self, want: usize) -> usize {
         let cap = self.capacity_bytes();
@@ -214,7 +222,7 @@ pub async fn read_sectors_async(
     };
     let mut req_owned = Request::new(
         RequestType::Read { offset, len: bytes },
-        alloc::vec![0u8; bytes].into_boxed_slice(),
+        RequestData::from_boxed_bytes(alloc::vec![0u8; bytes].into_boxed_slice()),
     );
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));
@@ -229,12 +237,12 @@ pub async fn read_sectors_async(
         return Err(r.status);
     }
 
-    if r.data.len() < bytes {
-        println!("Read incomplete: expected {} got {}", bytes, r.data.len());
+    if r.data_len() < bytes {
+        println!("Read incomplete: expected {} got {}", bytes, r.data_len());
         return Err(DriverStatus::Unsuccessful);
     }
 
-    out[..bytes].copy_from_slice(&r.data[..bytes]);
+    out[..bytes].copy_from_slice(&r.data_slice()[..bytes]);
     Ok(())
 }
 
@@ -260,7 +268,7 @@ pub async fn write_sectors_async(
     };
     let mut req_owned = Request::new(
         RequestType::Write { offset, len: bytes },
-        data[..bytes].to_vec().into_boxed_slice(),
+        RequestData::from_boxed_bytes(data[..bytes].to_vec().into_boxed_slice()),
     );
     req_owned.traversal_policy = TraversalPolicy::ForwardLower;
     let req = Arc::new(RwLock::new(req_owned));

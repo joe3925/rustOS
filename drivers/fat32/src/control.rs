@@ -18,6 +18,7 @@ use kernel_api::{
     kernel_types::{
         async_types::AsyncMutex,
         io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+        request::RequestData,
     },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
@@ -63,25 +64,6 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
-fn take_req<T>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
-    let mut r = req.write();
-    if r.data.len() != size_of::<T>() {
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    let data = core::mem::replace(&mut r.data, Box::new([]));
-    let ptr = data.as_ptr();
-    if (ptr as usize) % align_of::<T>() != 0 {
-        drop(data);
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    // SAFETY: size and alignment checked; ownership of the buffer is moved out.
-    let val = unsafe { (ptr as *const T).read() };
-    drop(data);
-    Ok(val)
-}
-
 fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
     if bytes.len() != size_of::<T>() {
         return Err(DriverStatus::InvalidParameter);
@@ -113,9 +95,12 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
     match code {
         IOCTL_FS_IDENTIFY => {
-            let mut id = match take_req::<FsIdentify>(&req) {
-                Ok(v) => v,
-                Err(st) => return DriverStep::complete(st),
+            let mut id = {
+                let mut r = req.write();
+                match r.take_data::<FsIdentify>() {
+                    Some(v) => v,
+                    None => return DriverStep::complete(DriverStatus::InvalidParameter),
+                }
             };
 
             let q = Request::new_pnp(
@@ -126,7 +111,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     ids_out: Vec::new(),
                     blob_out: Vec::new(),
                 },
-                Box::new([]),
+                RequestData::empty(),
             );
             let q = Arc::new(RwLock::new(q));
 
@@ -160,8 +145,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                 _ => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    let mut r = req.write();
-                    r.data = crate::volume::box_to_bytes(Box::new(id));
+                    req.write().set_data_t(id);
                     return DriverStep::complete(DriverStatus::Success);
                 }
             };
@@ -194,15 +178,13 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
-                    let mut r = req.write();
-                    r.data = crate::volume::box_to_bytes(Box::new(id));
+                    req.write().set_data_t(id);
                     DriverStep::complete(DriverStatus::Success)
                 }
                 Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    let mut r = req.write();
-                    r.data = crate::volume::box_to_bytes(Box::new(id));
+                    req.write().set_data_t(id);
                     DriverStep::complete(DriverStatus::Success)
                 }
             }
@@ -237,7 +219,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let reg = Arc::new(RwLock::new(
         Request::new(
             RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-            ctrl_link.clone().into_bytes().into_boxed_slice(),
+            RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));

@@ -1,12 +1,10 @@
 #![no_std]
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
@@ -57,29 +55,9 @@ pub struct FileCtx {
     pos: u64,
 }
 
-pub(crate) fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
-    let len = size_of::<T>();
-    let p = Box::into_raw(b) as *mut u8;
-    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(p, len)) }
-}
-
-fn take_params<T>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
+fn take_typed_params<T: 'static>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
     let mut r = req.write();
-    if r.data.len() != size_of::<T>() {
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    let data = core::mem::replace(&mut r.data, Box::new([]));
-    let ptr = data.as_ptr();
-    if (ptr as usize) % align_of::<T>() != 0 {
-        drop(data);
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    // SAFETY: length and alignment checked, ownership moved out of the request buffer.
-    let val = unsafe { (ptr as *const T).read() };
-    drop(data);
-    Ok(val)
+    r.take_data::<T>().ok_or(DriverStatus::InvalidParameter)
 }
 
 fn map_fatfs_err(e: &FsError) -> FileStatus {
@@ -138,7 +116,7 @@ fn handle_fs_request(
 
             match op {
                 FsOp::Open => {
-                    let params: FsOpenParams = match take_params::<FsOpenParams>(req) {
+                    let params: FsOpenParams = match take_typed_params::<FsOpenParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -180,28 +158,28 @@ fn handle_fs_request(
                         }
                         Err(e) => {
                             let mut r = req.write();
-                            r.data = box_to_bytes(Box::new(FsOpenResult {
+                            r.set_data_t(FsOpenResult {
                                 fs_file_id: 0,
                                 is_dir: false,
                                 size: 0,
                                 error: Some(map_fatfs_err(&e)),
-                            }));
+                            });
                             return DriverStatus::Success;
                         }
                     };
 
                     let mut r = req.write();
-                    r.data = box_to_bytes(Box::new(FsOpenResult {
+                    r.set_data_t(FsOpenResult {
                         fs_file_id,
                         is_dir,
                         size,
                         error: None,
-                    }));
+                    });
                     DriverStatus::Success
                 }
 
                 FsOp::Close => {
-                    let params: FsCloseParams = match take_params::<FsCloseParams>(req) {
+                    let params: FsCloseParams = match take_typed_params::<FsCloseParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -217,12 +195,12 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     let res = FsCloseResult { error: err };
-                    r.data = box_to_bytes(Box::new(res));
+                    r.set_data_t(res);
                     DriverStatus::Success
                 }
 
                 FsOp::Read => {
-                    let params: FsReadParams = match take_params::<FsReadParams>(req) {
+                    let params: FsReadParams = match take_typed_params::<FsReadParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -233,10 +211,10 @@ fn handle_fs_request(
                             Some(ctx) => (ctx.path.clone() as Path, ctx.is_dir),
                             None => {
                                 let mut r = req.write();
-                                r.data = box_to_bytes(Box::new(FsReadResult {
-                                    data: Vec::new(),
-                                    error: Some(FileStatus::PathNotFound),
-                                }));
+                            r.set_data_t(FsReadResult {
+                                data: Vec::new(),
+                                error: Some(FileStatus::PathNotFound),
+                            });
                                 return DriverStatus::Success;
                             }
                         }
@@ -272,23 +250,23 @@ fn handle_fs_request(
                             if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
                                 ctx.pos = new_pos;
                             }
-                            r.data = box_to_bytes(Box::new(FsReadResult {
+                            r.set_data_t(FsReadResult {
                                 data: v,
                                 error: None,
-                            }))
+                            })
                         }
                         Err(status) => {
-                            r.data = box_to_bytes(Box::new(FsReadResult {
+                            r.set_data_t(FsReadResult {
                                 data: Vec::new(),
                                 error: Some(status),
-                            }))
+                            })
                         }
                     }
                     DriverStatus::Success
                 }
 
                 FsOp::Write => {
-                    let params: FsWriteParams = match take_params::<FsWriteParams>(req) {
+                    let params: FsWriteParams = match take_typed_params::<FsWriteParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -299,10 +277,10 @@ fn handle_fs_request(
                             Some(ctx) => (ctx.path.clone(), ctx.is_dir),
                             None => {
                                 let mut r = req.write();
-                                r.data = box_to_bytes(Box::new(FsWriteResult {
+                                r.set_data_t(FsWriteResult {
                                     written: 0,
                                     error: Some(FileStatus::PathNotFound),
-                                }));
+                                });
                                 return DriverStatus::Success;
                             }
                         }
@@ -341,16 +319,16 @@ fn handle_fs_request(
                     let mut r = req.write();
                     match write_res {
                         Ok(written) => {
-                            r.data = box_to_bytes(Box::new(FsWriteResult {
+                            r.set_data_t(FsWriteResult {
                                 written,
                                 error: None,
-                            }))
+                            })
                         }
                         Err(status) => {
-                            r.data = box_to_bytes(Box::new(FsWriteResult {
+                            r.set_data_t(FsWriteResult {
                                 written: 0,
                                 error: Some(status),
-                            }))
+                            })
                         }
                     }
 
@@ -358,7 +336,7 @@ fn handle_fs_request(
                 }
 
                 FsOp::Seek => {
-                    let params: FsSeekParams = match take_params::<FsSeekParams>(req) {
+                    let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -391,20 +369,20 @@ fn handle_fs_request(
                     let mut r = req.write();
                     match result {
                         Ok(pos) => {
-                            r.data = box_to_bytes(Box::new(FsSeekResult { pos, error: None }))
+                            r.set_data_t(FsSeekResult { pos, error: None })
                         }
                         Err(e) => {
-                            r.data = box_to_bytes(Box::new(FsSeekResult {
+                            r.set_data_t(FsSeekResult {
                                 pos: 0,
                                 error: Some(e),
-                            }))
+                            })
                         }
                     }
                     DriverStatus::Success
                 }
 
                 FsOp::Flush => {
-                    let params: FsFlushParams = match take_params::<FsFlushParams>(req) {
+                    let params: FsFlushParams = match take_typed_params::<FsFlushParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -422,12 +400,12 @@ fn handle_fs_request(
                     };
 
                     let mut r = req.write();
-                    r.data = box_to_bytes(Box::new(FsFlushResult { error: err }));
+                    r.set_data_t(FsFlushResult { error: err });
                     DriverStatus::Success
                 }
 
                 FsOp::Create => {
-                    let params: FsCreateParams = match take_params::<FsCreateParams>(req) {
+                    let params: FsCreateParams = match take_typed_params::<FsCreateParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -440,12 +418,12 @@ fn handle_fs_request(
                     };
 
                     let mut r = req.write();
-                    r.data = box_to_bytes(Box::new(FsCreateResult { error: err }));
+                    r.set_data_t(FsCreateResult { error: err });
                     DriverStatus::Success
                 }
 
                 FsOp::Rename => {
-                    let params: FsRenameParams = match take_params::<FsRenameParams>(req) {
+                    let params: FsRenameParams = match take_typed_params::<FsRenameParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -464,12 +442,12 @@ fn handle_fs_request(
                     };
 
                     let mut r = req.write();
-                    r.data = box_to_bytes(Box::new(FsRenameResult { error: err }));
+                    r.set_data_t(FsRenameResult { error: err });
                     DriverStatus::Success
                 }
 
                 FsOp::ReadDir => {
-                    let params: FsListDirParams = match take_params::<FsListDirParams>(req) {
+                    let params: FsListDirParams = match take_typed_params::<FsListDirParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -479,20 +457,20 @@ fn handle_fs_request(
                     let mut r = req.write();
                     match names_or_err {
                         Ok(names) => {
-                            r.data = box_to_bytes(Box::new(FsListDirResult { names, error: None }))
+                            r.set_data_t(FsListDirResult { names, error: None })
                         }
                         Err(e) => {
-                            r.data = box_to_bytes(Box::new(FsListDirResult {
+                            r.set_data_t(FsListDirResult {
                                 names: Vec::new(),
                                 error: Some(map_fatfs_err(&e)),
-                            }))
+                            })
                         }
                     }
                     DriverStatus::Success
                 }
 
                 FsOp::GetInfo => {
-                    let params: FsGetInfoParams = match take_params::<FsGetInfoParams>(req) {
+                    let params: FsGetInfoParams = match take_typed_params::<FsGetInfoParams>(req) {
                         Ok(p) => p,
                         Err(st) => return st,
                     };
@@ -503,12 +481,12 @@ fn handle_fs_request(
                             Some(ctx) => (ctx.path.clone(), ctx.is_dir),
                             None => {
                                 let mut r = req.write();
-                                r.data = box_to_bytes(Box::new(FsGetInfoResult {
+                                r.set_data_t(FsGetInfoResult {
                                     size: 0,
                                     is_dir: false,
                                     attrs: 0,
                                     error: Some(FileStatus::PathNotFound),
-                                }));
+                                });
                                 return DriverStatus::Success;
                             }
                         }
@@ -524,20 +502,20 @@ fn handle_fs_request(
                     let mut r = req.write();
                     match result {
                         Ok((is_dir, size, attrs)) => {
-                            r.data = box_to_bytes(Box::new(FsGetInfoResult {
-                                size,
-                                is_dir,
-                                attrs: attrs as u32,
-                                error: None,
-                            }));
+                                r.set_data_t(FsGetInfoResult {
+                                    size,
+                                    is_dir,
+                                    attrs: attrs as u32,
+                                    error: None,
+                                });
                         }
                         Err(e) => {
-                            r.data = box_to_bytes(Box::new(FsGetInfoResult {
+                            r.set_data_t(FsGetInfoResult {
                                 size: 0,
                                 is_dir: false,
                                 attrs: 0,
                                 error: Some(e),
-                            }));
+                            });
                         }
                     }
                     DriverStatus::Success

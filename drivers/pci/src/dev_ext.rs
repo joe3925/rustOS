@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::RequestExt;
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region, unmap_range};
-use kernel_api::request::Request;
+use kernel_api::request::{Request, RequestData};
 use kernel_api::status::{DriverStatus, PageMapError};
 
 use kernel_api::pnp::{
@@ -448,7 +448,7 @@ pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment>
         blob_out: alloc::vec::Vec::new(),
     };
 
-    let req = Request::new_pnp(pnp, Vec::new().into_boxed_slice());
+    let req = Request::new_pnp(pnp, RequestData::empty());
 
     let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
     let down = pnp_forward_request_to_next_lower(device.clone(), req_arc.clone());

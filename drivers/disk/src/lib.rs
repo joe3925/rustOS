@@ -17,7 +17,10 @@ use spin::{Mutex, RwLock};
 use kernel_api::{
     RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::io::{DiskInfo, IoType, Synchronization},
+    kernel_types::{
+        io::{DiskInfo, IoType, Synchronization},
+        request::RequestData,
+    },
     pnp::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, QueryIdType, driver_set_evt_device_add,
         pnp_forward_request_to_next_lower,
@@ -278,9 +281,9 @@ extern "win64" fn disk_read_complete(req: &mut Request, ctx: usize) -> DriverSta
     let st = req.status;
     if st == DriverStatus::Success {
         let dx = disk_ext(&boxed.dev);
-        let n = core::cmp::min(boxed.len, req.data.len());
+        let n = core::cmp::min(boxed.len, req.data_len());
         if n != 0 {
-            cache_store_read(&dx, boxed.offset, &req.data[..n]);
+            cache_store_read(&dx, boxed.offset, &req.data_slice()[..n]);
         }
     }
     st
@@ -291,9 +294,9 @@ extern "win64" fn disk_write_complete(req: &mut Request, ctx: usize) -> DriverSt
     let st = req.status;
     if st == DriverStatus::Success {
         let dx = disk_ext(&boxed.dev);
-        let n = core::cmp::min(boxed.len, req.data.len());
+        let n = core::cmp::min(boxed.len, req.data_len());
         if n != 0 {
-            cache_update_write(&dx, boxed.offset, &req.data[..n]);
+            cache_update_write(&dx, boxed.offset, &req.data_slice()[..n]);
         }
     }
     st
@@ -332,8 +335,8 @@ pub async fn disk_read(
 
     {
         let mut p = parent.write();
-        let n = core::cmp::min(total, p.data.len());
-        if n != 0 && cache_try_read(&dx, off, n, &mut p.data[..n]) {
+        let n = core::cmp::min(total, p.data_len());
+        if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
             p.status = DriverStatus::Success;
             return DriverStep::complete(DriverStatus::Success);
         }
@@ -412,7 +415,7 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
                     ids_out: alloc::vec::Vec::new(),
                     blob_out: alloc::vec::Vec::new(),
                 },
-                Box::new([]),
+                RequestData::empty(),
             );
 
             if let Some(pnp) = ch.pnp.as_mut() {
@@ -433,14 +436,16 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
             };
 
             let mut w = parent.write();
-            w.data = blob.into_boxed_slice();
+            w.set_data_bytes(blob.into_boxed_slice());
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_BLOCK_FLUSH => {
             let dx = disk_ext(&dev);
 
-            let mut req_child =
-                Request::new(RequestType::DeviceControl(IOCTL_BLOCK_FLUSH), Box::new([]));
+            let mut req_child = Request::new(
+                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
+                RequestData::empty(),
+            );
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
             let child = Arc::new(RwLock::new(req_child));
 
@@ -487,7 +492,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
-        Box::new([]),
+        RequestData::empty(),
     );
     let ch = Arc::new(RwLock::new(ch));
 

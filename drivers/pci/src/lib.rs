@@ -18,7 +18,7 @@ use dev_ext::{
 use kernel_api::{
     RequestExt,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::{io::IoVtable, pnp::DeviceIds},
+    kernel_types::{io::IoVtable, pnp::DeviceIds, request::RequestData},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -76,7 +76,7 @@ pub async fn pci_bus_pnp_start(device: Arc<DeviceObject>, req: Arc<RwLock<Reques
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
-        Box::new([]),
+        RequestData::empty(),
     );
 
     let child = Arc::new(RwLock::new(query));

@@ -5,18 +5,21 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::request::{Request, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
 
+use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
 use crate::static_handlers::pnp_send_request_via_symlink;
-use kernel_types::fs::{Path, *};
+use kernel_types::{
+    fs::{Path, *},
+    request::RequestData,
+};
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
@@ -115,18 +118,20 @@ impl Vfs {
         let req = Arc::new(RwLock::new(
             Request::new(
                 RequestType::DeviceControl(IOCTL_MOUNTMGR_QUERY),
-                Box::new([]),
+                RequestData::empty(),
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        pnp_send_request_via_symlink(mount_symlink.to_string(), req.clone()).await?;
+        PNP_MANAGER
+            .send_request_via_symlink(mount_symlink.to_string(), req.clone())
+            .await?;
 
         let r = req.read();
         if r.status != DriverStatus::Success {
             return Err(r.status);
         }
 
-        let s = core::str::from_utf8(&r.data).unwrap_or_default();
+        let s = core::str::from_utf8(r.data_slice()).unwrap_or_default();
         let mut public = String::new();
         let mut label = String::new();
         let mut object_name = String::new();
@@ -223,17 +228,6 @@ impl Vfs {
         Err(FileStatus::BadPath)
     }
 
-    fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
-        let len = size_of::<T>();
-        let ptr = Box::into_raw(b) as *mut u8;
-        unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) }
-    }
-    unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
-        debug_assert_eq!(b.len(), size_of::<T>());
-        let ptr = Box::into_raw(b) as *mut u8 as *mut T;
-        Box::from_raw(ptr)
-    }
-
     async fn call_fs<TParam, TResult>(
         &self,
         volume_symlink: &str,
@@ -245,18 +239,22 @@ impl Vfs {
         TResult: 'static,
     {
         let req = Arc::new(RwLock::new(
-            Request::new(RequestType::Fs(op), Vfs::box_to_bytes(Box::new(param)))
+            Request::new(RequestType::Fs(op), RequestData::from_t(param))
                 .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
-        let status = pnp_send_request_via_symlink(volume_symlink.to_string(), req.clone()).await;
+        let status = PNP_MANAGER
+            .send_request_via_symlink(volume_symlink.to_string(), req.clone())
+            .await;
         if status != DriverStatus::Success {
             println!("Send request fail with status: {}", status);
             return Err(status);
         }
 
-        let raw = core::mem::replace(&mut req.write().data, Box::new([]));
-        let out: Box<TResult> = unsafe { Self::bytes_to_box(raw) };
-        Ok(*out)
+        let ret = req
+            .write()
+            .take_data::<TResult>()
+            .ok_or(DriverStatus::InvalidParameter);
+        ret
     }
 
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {

@@ -12,6 +12,7 @@ use kernel_api::kernel_types::io::{
     DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo, Synchronization,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
@@ -240,15 +241,15 @@ pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) ->
     let parent = Arc::new(RwLock::new(
         Request::new(
             RequestType::DeviceControl(IOCTL_DRIVE_IDENTIFY),
-            Box::new([]),
+            RequestData::empty(),
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
     pnp_forward_request_to_next_lower(dev.clone(), parent.clone()).await;
 
     let (st, data) = {
-        let g = parent.read();
-        (g.status, g.data.clone())
+        let mut g = parent.write();
+        (g.status, g.take_data_bytes())
     };
 
     if st == DriverStatus::Success && data.len() == core::mem::size_of::<DiskInfo>() {
@@ -266,14 +267,14 @@ async fn read_from_lower_async(
     let child = Arc::new(RwLock::new(
         Request::new(
             RequestType::Read { offset, len },
-            vec![0u8; len].into_boxed_slice(),
+            RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
     pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
-    let g = child.read();
+    let mut g = child.write();
     if g.status == DriverStatus::Success {
-        Ok(g.data.clone())
+        Ok(g.take_data_bytes())
     } else {
         Err(g.status)
     }

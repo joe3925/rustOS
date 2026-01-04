@@ -1,7 +1,10 @@
 #![no_std]
 #![feature(variant_count)]
 #![feature(try_trait_v2)]
-
+#![feature(negative_impls)]
+#![feature(auto_traits)]
+#![feature(specialization)]
+#![feature(const_type_name)]
 extern crate alloc;
 
 pub mod async_ffi;

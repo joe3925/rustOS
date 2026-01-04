@@ -20,7 +20,7 @@ use kernel_types::io::IoVtable;
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
-use kernel_types::request::Request;
+use kernel_types::request::{Request, RequestData};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -740,7 +740,7 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 blob_out: Vec::new(),
             };
-            let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
+            let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.add_completion(Self::start_io, ctx);
@@ -779,7 +779,7 @@ impl PnpManager {
                     ids_out: Vec::new(),
                     blob_out: Vec::new(),
                 };
-                let mut bus_enum_request = Request::new_pnp(pnp_payload, Box::new([]));
+                let mut bus_enum_request = Request::new_pnp(pnp_payload, RequestData::empty());
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
                 bus_enum_request.add_completion(Self::process_enumerated_children, ctx);
 
@@ -907,7 +907,7 @@ impl PnpManager {
             blob_out: Vec::new(),
         };
 
-        let mut req = Request::new_pnp(pnp_payload, Box::new([]));
+        let mut req = Request::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.add_completion(Self::process_enumerated_children, ctx);
 
@@ -1287,7 +1287,7 @@ impl PnpManager {
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         };
-        let mut start_request = Request::new_pnp(pnp_payload, Box::new([]));
+        let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dn.clone()) as usize;
         start_request.add_completion(Self::start_io, ctx);
 

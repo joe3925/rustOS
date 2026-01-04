@@ -182,7 +182,8 @@ impl DeviceObject {
             in_queue: AtomicBool::new(false),
         })
     }
-
+    // TODO: This being exclusive the binary is currently done on purpose but it may be changed.
+    /// Note because of the use of TypeId devext is only accessible from the driver binary who created it.
     pub fn try_devext<'a, T: 'static>(&'a self) -> Result<DevExtRef<'a, T>, DevExtError> {
         if !self.dev_ext.present {
             return Err(DevExtError::NotPresent);

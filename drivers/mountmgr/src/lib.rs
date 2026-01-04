@@ -12,10 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    mem::size_of,
     panic::PanicInfo,
-    ptr::addr_of,
-    slice,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use spin::{Once, RwLock};
@@ -28,6 +25,7 @@ use kernel_api::{
         fs::{OpenFlags, Path},
         io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
         pnp::DeviceIds,
+        request::RequestData,
     },
     pnp::{
         DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
@@ -194,7 +192,7 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
-            w.data = build_status_blob(&dev);
+            w.set_data_bytes(build_status_blob(&dev));
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_RESYNC => {
@@ -204,7 +202,7 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
         IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
-            w.data = list_fs_blob();
+            w.set_data_bytes(list_fs_blob());
             DriverStep::complete(DriverStatus::Success)
         }
         _ => DriverStep::complete(DriverStatus::NotImplemented),
@@ -329,19 +327,14 @@ async fn try_bind_filesystems_for_parent_fdo(
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
-        let id_box = Box::new(FsIdentify {
-            volume_fdo: vol_target.clone(),
-            mount_device: None,
-            can_mount: false,
-        });
-        let len = core::mem::size_of::<FsIdentify>();
-        let ptr = Box::into_raw(id_box) as *mut u8;
-        let data: Box<[u8]> = unsafe { Box::from_raw(slice::from_raw_parts_mut(ptr, len)) };
-
         let req = Arc::new(RwLock::new(
             Request::new(
                 RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
-                data,
+                RequestData::from_t(FsIdentify {
+                    volume_fdo: vol_target.clone(),
+                    mount_device: None,
+                    can_mount: false,
+                }),
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
@@ -352,15 +345,17 @@ async fn try_bind_filesystems_for_parent_fdo(
         }
 
         let mut w = req.write();
-        if w.status != DriverStatus::Success || w.data.len() < len {
+        if w.status != DriverStatus::Success {
             continue;
         }
 
-        let id_ref: &FsIdentify = unsafe { &*(w.data.as_ptr() as *const FsIdentify) };
-        if !id_ref.can_mount {
+        let Some(id) = w.take_data::<FsIdentify>() else {
+            continue;
+        };
+        if !id.can_mount {
             continue;
         }
-        let Some(function_fdo) = id_ref.mount_device.as_ref() else {
+        let Some(function_fdo) = id.mount_device else {
             continue;
         };
 
@@ -424,7 +419,7 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
 }
 
 fn string_from_req(req: &Request) -> Option<String> {
-    core::str::from_utf8(&req.data)
+    core::str::from_utf8(req.data_slice())
         .ok()
         .map(|s| s.trim_matches(core::char::from_u32(0).unwrap()).to_string())
 }
@@ -494,38 +489,26 @@ async fn refresh_fs_registry_from_registry() -> usize {
     guard.len()
 }
 
-fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
-    let len = core::mem::size_of::<T>();
-    let p = Box::into_raw(b) as *mut u8;
-    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(p, len)) }
-}
-
-unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
-    assert_eq!(b.len(), core::mem::size_of::<T>());
-    let p = Box::into_raw(b) as *mut u8 as *mut T;
-    Box::from_raw(p)
-}
-
 async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
         flags: OpenFlags::Open.into(),
         path: Path::from_string(path),
     };
     let req = Arc::new(RwLock::new(
-        Request::new(RequestType::Fs(FsOp::Open), box_to_bytes(Box::new(params)))
+        Request::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params))
             .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
     let err = unsafe { pnp_send_request_via_symlink(public_link.to_string(), req.clone()).await };
 
     let mut r = req.write();
-    if r.status != DriverStatus::Success || r.data.len() != size_of::<FsOpenResult>() {
+    if r.status != DriverStatus::Success {
         return false;
     }
 
-    unsafe { *bytes_to_box::<FsOpenResult>(core::mem::replace(&mut r.data, Box::new([]))) }
-        .error
-        .is_none()
+    r.take_data::<FsOpenResult>()
+        .map(|res| res.error.is_none())
+        .unwrap_or(false)
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str) {

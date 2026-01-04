@@ -6,7 +6,7 @@ pub extern crate alloc;
 use alloc::boxed::Box;
 use kernel_sys::{submit_blocking_internal, submit_runtime_internal};
 use kernel_types::pnp::PnpRequest;
-use kernel_types::request::{Request, RequestType, TraversalPolicy};
+use kernel_types::request::{Request, RequestData, RequestType, TraversalPolicy};
 use kernel_types::status::DriverStatus;
 pub use kernel_types::{async_ffi, device, request, status};
 
@@ -51,12 +51,40 @@ macro_rules! println {
     ($($arg:tt)*) => ($crate::print!("{}\n", $crate::alloc::format!($($arg)*)));
 }
 pub trait RequestExt {
-    fn new(kind: RequestType, data: Box<[u8]>) -> Self;
-    fn new_pnp(pnp: PnpRequest, data: Box<[u8]>) -> Self;
+    fn new(kind: RequestType, data: RequestData) -> Self;
+    fn new_pnp(pnp: PnpRequest, data: RequestData) -> Self;
+    #[inline]
+    fn new_t<T: 'static>(kind: RequestType, data: T) -> Self
+    where
+        Self: Sized,
+    {
+        Self::new(kind, RequestData::from_t(data))
+    }
+    #[inline]
+    fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self
+    where
+        Self: Sized,
+    {
+        Self::new_pnp(pnp, RequestData::from_t(data))
+    }
+    #[inline]
+    fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self
+    where
+        Self: Sized,
+    {
+        Self::new(kind, RequestData::from_boxed_bytes(data))
+    }
+    #[inline]
+    fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self
+    where
+        Self: Sized,
+    {
+        Self::new_pnp(pnp, RequestData::from_boxed_bytes(data))
+    }
 }
 
 impl RequestExt for Request {
-    fn new(kind: RequestType, data: Box<[u8]>) -> Self {
+    fn new(kind: RequestType, data: RequestData) -> Self {
         if matches!(kind, RequestType::Pnp) {
             panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
         }
@@ -77,7 +105,7 @@ impl RequestExt for Request {
     }
 
     #[inline]
-    fn new_pnp(pnp_request: PnpRequest, data: Box<[u8]>) -> Self {
+    fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
         Self {
             id: random_number(),
             kind: RequestType::Pnp,

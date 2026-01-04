@@ -26,6 +26,7 @@ use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::io::Synchronization;
 use kernel_api::kernel_types::pnp::DeviceIds;
+use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::DeviceRelationType;
 use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpMinorFunction;
@@ -132,7 +133,7 @@ pub async fn vol_prepare_hardware(
             ids_out: Vec::new(),
             blob_out: Vec::new(),
         },
-        Box::new([]),
+        RequestData::empty(),
     );
 
     let req_lock = Arc::new(RwLock::new(req));
