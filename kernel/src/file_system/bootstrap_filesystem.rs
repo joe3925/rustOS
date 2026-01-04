@@ -1,8 +1,3 @@
-// bootstrap_file.rs
-#![no_std]
-
-extern crate alloc;
-
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
@@ -18,7 +13,7 @@ use crate::file_system::file_provider::FileProvider;
 use crate::util::BootPkg;
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
-    fs::{*, Path},
+    fs::{Path, *},
     request::Request,
     status::{DriverStatus, FileStatus},
 };
@@ -118,7 +113,15 @@ impl<'a> BootstrapProvider<'a> {
     fn init_tree(&self, boot: &'a [BootPkg]) {
         let mut n = self.nodes.write();
 
-        for d in ["C:/", "C:/install", DRIVER_ROOT, "C:/system", "C:/system/toml", "C:/system/mod", REG_DIR] {
+        for d in [
+            "C:/",
+            "C:/install",
+            DRIVER_ROOT,
+            "C:/system",
+            "C:/system/toml",
+            "C:/system/mod",
+            REG_DIR,
+        ] {
             let dk = norm_upcase(d);
             n.entry(dk.clone()).or_insert_with(Node::dir);
         }
@@ -858,4 +861,3 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         async move { res }.into_ffi()
     }
 }
-

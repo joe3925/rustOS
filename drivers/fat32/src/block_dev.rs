@@ -1,7 +1,5 @@
-#![no_std]
-
 use alloc::{sync::Arc, vec, vec::Vec};
-use core::cmp::min;
+use core::{cmp::min, mem};
 use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
@@ -9,11 +7,12 @@ use kernel_api::{
     RequestExt,
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
-    println,
     request::{Request, RequestType, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
+
+const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct BlockDev {
@@ -21,7 +20,7 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
-    scratch: alloc::vec::Vec<u8>,
+    scratch: Vec<u8>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -30,9 +29,10 @@ pub enum BlkError {
     Io,
     Driver(DriverStatus),
 }
+
 impl From<DriverStatus> for BlkError {
-    fn from(_v: DriverStatus) -> Self {
-        Self::Driver(_v)
+    fn from(v: DriverStatus) -> Self {
+        Self::Driver(v)
     }
 }
 
@@ -43,25 +43,25 @@ impl IoBase for BlockDev {
 impl BlockDev {
     pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
         let bps = sector_size as usize;
-
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
-            scratch: alloc::vec![0u8; bps],
+            scratch: vec![0u8; bps],
         }
+    }
+
+    #[inline]
+    fn bps(&self) -> usize {
+        self.sector_size as usize
     }
 
     #[inline]
     fn capacity_bytes(&self) -> u64 {
         self.total_sectors.saturating_mul(self.sector_size as u64)
     }
-    #[inline(always)]
-    fn scratch(&mut self) -> &mut [u8] {
-        debug_assert_eq!(self.scratch.len(), self.sector_size as usize);
-        &mut self.scratch[..]
-    }
+
     #[inline]
     fn clamp_len(&self, want: usize) -> usize {
         let cap = self.capacity_bytes();
@@ -76,9 +76,77 @@ impl BlockDev {
     fn lba_of(&self, byte_off: u64) -> u64 {
         byte_off / self.sector_size as u64
     }
+
     #[inline]
     fn in_sector_off(&self, byte_off: u64) -> usize {
         (byte_off % self.sector_size as u64) as usize
+    }
+
+    #[inline]
+    fn ensure_scratch(&mut self, need: usize) {
+        if self.scratch.len() < need {
+            self.scratch.resize(need, 0);
+        }
+    }
+
+    async fn pnp_read_into_scratch(&mut self, offset: u64, len: usize) -> Result<(), DriverStatus> {
+        self.ensure_scratch(len);
+
+        let mut buf = mem::take(&mut self.scratch);
+        buf.truncate(len);
+
+        let mut req_owned = Request::new(
+            RequestType::Read { offset, len },
+            RequestData::from_boxed_bytes(buf.into_boxed_slice()),
+        );
+        req_owned.traversal_policy = TraversalPolicy::ForwardLower;
+        let req = Arc::new(RwLock::new(req_owned));
+
+        pnp_send_request(self.volume.clone(), req.clone()).await;
+
+        let mut g = req.write();
+        let st = g.status;
+        let boxed = g.take_data_bytes();
+        self.scratch = boxed.into_vec();
+
+        if st == DriverStatus::Success {
+            Ok(())
+        } else {
+            Err(st)
+        }
+    }
+
+    async fn pnp_write_from_scratch(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), DriverStatus> {
+        let len = data.len();
+        self.ensure_scratch(len);
+        self.scratch[..len].copy_from_slice(data);
+
+        let mut buf = mem::take(&mut self.scratch);
+        buf.truncate(len);
+
+        let mut req_owned = Request::new(
+            RequestType::Write { offset, len },
+            RequestData::from_boxed_bytes(buf.into_boxed_slice()),
+        );
+        req_owned.traversal_policy = TraversalPolicy::ForwardLower;
+        let req = Arc::new(RwLock::new(req_owned));
+
+        pnp_send_request(self.volume.clone(), req.clone()).await;
+
+        let mut g = req.write();
+        let st = g.status;
+        let boxed = g.take_data_bytes();
+        self.scratch = boxed.into_vec();
+
+        if st == DriverStatus::Success {
+            Ok(())
+        } else {
+            Err(st)
+        }
     }
 
     async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, BlkError> {
@@ -87,34 +155,45 @@ impl BlockDev {
             return Ok(0);
         }
 
-        let bps = self.sector_size as usize;
-        let start_lba = self.lba_of(self.pos);
-        let end_byte = self.pos + to_read as u64;
-        let end_lba = self.lba_of(end_byte - 1) + 1;
-        let n_sectors = (end_lba - start_lba) as usize;
+        let bps = self.bps();
+        let mut remaining = to_read;
+        let mut out_off = 0usize;
 
-        let head_off = self.in_sector_off(self.pos);
-        let tail_bytes = (head_off + to_read) % bps;
+        while remaining != 0 {
+            let pos = self.pos;
+            let lba = self.lba_of(pos);
+            let in_off = self.in_sector_off(pos);
+            let room = bps - in_off;
 
-        if head_off == 0 && tail_bytes == 0 {
-            // Full-sector aligned read: read directly into dst (no temp buffer).
-            let sectors_exact = to_read / bps;
-            let buf = &mut dst[..to_read];
-            read_sectors_async(self.volume.clone(), start_lba, sectors_exact, bps, buf)
+            if in_off != 0 || remaining < bps {
+                let sector_off = lba * bps as u64;
+                self.pnp_read_into_scratch(sector_off, bps)
+                    .await
+                    .map_err(BlkError::from)?;
+                let take = min(remaining, room);
+                dst[out_off..out_off + take].copy_from_slice(&self.scratch[in_off..in_off + take]);
+                self.pos += take as u64;
+                out_off += take;
+                remaining -= take;
+                continue;
+            }
+
+            let full_sectors = remaining / bps;
+            let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
+            let chunk_sectors = min(full_sectors, max_sectors);
+            let chunk_bytes = chunk_sectors * bps;
+
+            let byte_off = lba * bps as u64;
+            self.pnp_read_into_scratch(byte_off, chunk_bytes)
                 .await
                 .map_err(BlkError::from)?;
-        } else {
-            // Unaligned: need a sector-sized buffer covering the entire span.
-            let mut tmp = vec![0u8; n_sectors * bps];
-            read_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &mut tmp[..])
-                .await
-                .map_err(BlkError::from)?;
+            dst[out_off..out_off + chunk_bytes].copy_from_slice(&self.scratch[..chunk_bytes]);
 
-            let in_off = self.in_sector_off(self.pos);
-            dst[..to_read].copy_from_slice(&tmp[in_off..in_off + to_read]);
+            self.pos += chunk_bytes as u64;
+            out_off += chunk_bytes;
+            remaining -= chunk_bytes;
         }
 
-        self.pos += to_read as u64;
         Ok(to_read)
     }
 
@@ -124,35 +203,58 @@ impl BlockDev {
             return Ok(0);
         }
 
-        let bps = self.sector_size as usize;
-        let start_lba = self.lba_of(self.pos);
-        let end_byte = self.pos + to_write as u64;
-        let end_lba = self.lba_of(end_byte - 1) + 1;
-        let n_sectors = (end_lba - start_lba) as usize;
+        let bps = self.bps();
+        let mut remaining = to_write;
+        let mut in_off_src = 0usize;
 
-        let head_off = self.in_sector_off(self.pos);
-        let tail_bytes = (head_off + to_write) % bps;
+        while remaining != 0 {
+            let pos = self.pos;
+            let lba = self.lba_of(pos);
+            let in_off = self.in_sector_off(pos);
+            let room = bps - in_off;
 
-        if head_off == 0 && tail_bytes == 0 {
-            let sectors_exact = to_write / bps;
-            let buf = &src[..to_write];
-            write_sectors_async(self.volume.clone(), start_lba, sectors_exact, bps, buf)
+            if in_off != 0 || remaining < bps {
+                let sector_off = lba * bps as u64;
+
+                self.pnp_read_into_scratch(sector_off, bps)
+                    .await
+                    .map_err(BlkError::from)?;
+
+                let take = min(remaining, room);
+                self.scratch[in_off..in_off + take]
+                    .copy_from_slice(&src[in_off_src..in_off_src + take]);
+
+                let mut tmp = core::mem::take(&mut self.scratch);
+                tmp.truncate(bps);
+
+                let st = self.pnp_write_from_scratch(sector_off, &tmp[..]).await;
+
+                self.scratch = tmp;
+
+                st.map_err(BlkError::from)?;
+
+                self.pos += take as u64;
+                in_off_src += take;
+                remaining -= take;
+                continue;
+            }
+
+            let full_sectors = remaining / bps;
+            let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
+            let chunk_sectors = min(full_sectors, max_sectors);
+            let chunk_bytes = chunk_sectors * bps;
+
+            let byte_off = lba * bps as u64;
+
+            self.pnp_write_from_scratch(byte_off, &src[in_off_src..in_off_src + chunk_bytes])
                 .await
                 .map_err(BlkError::from)?;
-        } else {
-            let mut buf = vec![0u8; n_sectors * bps];
-            read_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &mut buf[..])
-                .await
-                .map_err(BlkError::from)?;
 
-            buf[head_off..head_off + to_write].copy_from_slice(&src[..to_write]);
-
-            write_sectors_async(self.volume.clone(), start_lba, n_sectors, bps, &buf[..])
-                .await
-                .map_err(BlkError::from)?;
+            self.pos += chunk_bytes as u64;
+            in_off_src += chunk_bytes;
+            remaining -= chunk_bytes;
         }
 
-        self.pos += to_write as u64;
         Ok(to_write)
     }
 }
@@ -167,6 +269,7 @@ impl Write for BlockDev {
     fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         block_on(self.write_bytes(buf)).map_err(|_| ())
     }
+
     fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -192,97 +295,11 @@ impl Seek for BlockDev {
                 base as u64
             }
         };
+
         if new > cap {
             return Err(());
         }
         self.pos = new;
         Ok(self.pos)
-    }
-}
-
-pub async fn read_sectors_async(
-    target: IoTarget,
-    lba: u64,
-    sectors: usize,
-    bps: usize,
-    out: &mut [u8],
-) -> Result<(), DriverStatus> {
-    let bytes = match sectors.checked_mul(bps) {
-        Some(b) => b,
-        None => return Err(DriverStatus::InvalidParameter),
-    };
-
-    if out.len() < bytes {
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    let offset = match lba.checked_mul(bps as u64) {
-        Some(o) => o,
-        None => return Err(DriverStatus::InvalidParameter),
-    };
-    let mut req_owned = Request::new(
-        RequestType::Read { offset, len: bytes },
-        RequestData::from_boxed_bytes(alloc::vec![0u8; bytes].into_boxed_slice()),
-    );
-    req_owned.traversal_policy = TraversalPolicy::ForwardLower;
-    let req = Arc::new(RwLock::new(req_owned));
-
-    pnp_send_request(target, req.clone()).await;
-    let r = req.read();
-    if r.status != DriverStatus::Success {
-        println!(
-            "Read failed: LBA={} Count={} Status={:?}",
-            lba, sectors, r.status
-        );
-        return Err(r.status);
-    }
-
-    if r.data_len() < bytes {
-        println!("Read incomplete: expected {} got {}", bytes, r.data_len());
-        return Err(DriverStatus::Unsuccessful);
-    }
-
-    out[..bytes].copy_from_slice(&r.data_slice()[..bytes]);
-    Ok(())
-}
-
-pub async fn write_sectors_async(
-    target: IoTarget,
-    lba: u64,
-    sectors: usize,
-    bps: usize,
-    data: &[u8],
-) -> Result<(), DriverStatus> {
-    let bytes = match sectors.checked_mul(bps) {
-        Some(b) => b,
-        None => return Err(DriverStatus::InvalidParameter),
-    };
-
-    if data.len() < bytes {
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    let offset = match lba.checked_mul(bps as u64) {
-        Some(o) => o,
-        None => return Err(DriverStatus::InvalidParameter),
-    };
-    let mut req_owned = Request::new(
-        RequestType::Write { offset, len: bytes },
-        RequestData::from_boxed_bytes(data[..bytes].to_vec().into_boxed_slice()),
-    );
-    req_owned.traversal_policy = TraversalPolicy::ForwardLower;
-    let req = Arc::new(RwLock::new(req_owned));
-
-    pnp_send_request(target, req.clone()).await;
-
-    let status = req.read().status;
-    if status == DriverStatus::Success {
-        Ok(())
-    } else {
-        println!(
-            "Write failed: LBA={} Count={} Status={:?}",
-            lba, sectors, status
-        );
-        Err(status)
     }
 }

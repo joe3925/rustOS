@@ -1,5 +1,3 @@
-#![no_std]
-
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -211,10 +209,10 @@ fn handle_fs_request(
                             Some(ctx) => (ctx.path.clone() as Path, ctx.is_dir),
                             None => {
                                 let mut r = req.write();
-                            r.set_data_t(FsReadResult {
-                                data: Vec::new(),
-                                error: Some(FileStatus::PathNotFound),
-                            });
+                                r.set_data_t(FsReadResult {
+                                    data: Vec::new(),
+                                    error: Some(FileStatus::PathNotFound),
+                                });
                                 return DriverStatus::Success;
                             }
                         }
@@ -255,12 +253,10 @@ fn handle_fs_request(
                                 error: None,
                             })
                         }
-                        Err(status) => {
-                            r.set_data_t(FsReadResult {
-                                data: Vec::new(),
-                                error: Some(status),
-                            })
-                        }
+                        Err(status) => r.set_data_t(FsReadResult {
+                            data: Vec::new(),
+                            error: Some(status),
+                        }),
                     }
                     DriverStatus::Success
                 }
@@ -318,18 +314,14 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     match write_res {
-                        Ok(written) => {
-                            r.set_data_t(FsWriteResult {
-                                written,
-                                error: None,
-                            })
-                        }
-                        Err(status) => {
-                            r.set_data_t(FsWriteResult {
-                                written: 0,
-                                error: Some(status),
-                            })
-                        }
+                        Ok(written) => r.set_data_t(FsWriteResult {
+                            written,
+                            error: None,
+                        }),
+                        Err(status) => r.set_data_t(FsWriteResult {
+                            written: 0,
+                            error: Some(status),
+                        }),
                     }
 
                     DriverStatus::Success
@@ -368,15 +360,11 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     match result {
-                        Ok(pos) => {
-                            r.set_data_t(FsSeekResult { pos, error: None })
-                        }
-                        Err(e) => {
-                            r.set_data_t(FsSeekResult {
-                                pos: 0,
-                                error: Some(e),
-                            })
-                        }
+                        Ok(pos) => r.set_data_t(FsSeekResult { pos, error: None }),
+                        Err(e) => r.set_data_t(FsSeekResult {
+                            pos: 0,
+                            error: Some(e),
+                        }),
                     }
                     DriverStatus::Success
                 }
@@ -456,15 +444,11 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     match names_or_err {
-                        Ok(names) => {
-                            r.set_data_t(FsListDirResult { names, error: None })
-                        }
-                        Err(e) => {
-                            r.set_data_t(FsListDirResult {
-                                names: Vec::new(),
-                                error: Some(map_fatfs_err(&e)),
-                            })
-                        }
+                        Ok(names) => r.set_data_t(FsListDirResult { names, error: None }),
+                        Err(e) => r.set_data_t(FsListDirResult {
+                            names: Vec::new(),
+                            error: Some(map_fatfs_err(&e)),
+                        }),
                     }
                     DriverStatus::Success
                 }
@@ -502,12 +486,12 @@ fn handle_fs_request(
                     let mut r = req.write();
                     match result {
                         Ok((is_dir, size, attrs)) => {
-                                r.set_data_t(FsGetInfoResult {
-                                    size,
-                                    is_dir,
-                                    attrs: attrs as u32,
-                                    error: None,
-                                });
+                            r.set_data_t(FsGetInfoResult {
+                                size,
+                                is_dir,
+                                attrs: attrs as u32,
+                                error: None,
+                            });
                         }
                         Err(e) => {
                             r.set_data_t(FsGetInfoResult {

@@ -1,7 +1,3 @@
-#![no_std]
-
-extern crate alloc;
-
 use alloc::{
     borrow::Cow,
     boxed::Box,

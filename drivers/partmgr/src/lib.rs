@@ -142,7 +142,7 @@ pub async fn partition_pdo_read(
         let r = request.read();
         match r.kind {
             RequestType::Read { offset, len } => {
-                if buf_len != len || (offset & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
+                if buf_len != len {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
                 let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
@@ -195,7 +195,7 @@ pub async fn partition_pdo_write(
         let r = request.read();
         match r.kind {
             RequestType::Write { offset, len } => {
-                if buf_len != len || (offset & 0x1FF) != 0 || (buf_len & 0x1FF) != 0 {
+                if buf_len != len {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
                 let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
@@ -233,7 +233,6 @@ pub async fn partition_pdo_write(
         Err(st) => DriverStep::complete(st),
     }
 }
-
 #[request_handler]
 pub async fn partmgr_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let mut dx = ext::<PartMgrExt>(&dev);

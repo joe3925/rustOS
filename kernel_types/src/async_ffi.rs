@@ -21,8 +21,6 @@
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-extern crate alloc;
-
 use alloc::boxed::Box;
 use core::{
     convert::{TryFrom, TryInto},

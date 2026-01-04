@@ -1,7 +1,3 @@
-#![no_std]
-
-extern crate alloc;
-
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};

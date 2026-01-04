@@ -1,6 +1,4 @@
-#![no_std]
 
-extern crate alloc;
 
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use spin::RwLock;

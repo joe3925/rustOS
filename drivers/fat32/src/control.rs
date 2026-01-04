@@ -1,5 +1,3 @@
-#![no_std]
-
 use alloc::{
     boxed::Box,
     collections::btree_map::BTreeMap,
@@ -131,9 +129,7 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                         });
 
                         total_sectors = pi.gpt_entry.map(|ent| {
-                            ent.last_lba
-                                .saturating_sub(ent.first_lba)
-                                .saturating_add(1)
+                            ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
                         });
                     }
                 }

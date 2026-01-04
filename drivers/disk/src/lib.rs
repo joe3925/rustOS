@@ -9,7 +9,7 @@ use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::{
     mem::size_of,
     panic::PanicInfo,
-    sync::atomic::{AtomicBool, AtomicU32},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use kernel_api::pnp::DriverStep;
 use spin::{Mutex, RwLock};
@@ -56,6 +56,9 @@ fn put_req(r: &Arc<RwLock<Request>>, req: Request) {
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
+const CACHE_BYTES: usize = 20 * 1024 * 1024usize;
+const MAX_CHUNK_BYTES: usize = 256 * 1024usize;
+
 /// Simple per-disk sector cache (~20 MiB worth of sectors).
 struct SectorCache {
     sector_size: usize,
@@ -85,10 +88,7 @@ impl SectorCache {
             return;
         }
         self.sector_size = bs;
-
-        let bytes = 20 * 1024 * 1024usize;
-        let cap = (bytes / bs).max(1);
-        self.capacity_sectors = cap;
+        self.capacity_sectors = (CACHE_BYTES / bs).max(1);
     }
 
     fn clear(&mut self) {
@@ -141,8 +141,7 @@ impl SectorCache {
         if self.sector_size != block_size as usize {
             self.clear();
             self.sector_size = block_size as usize;
-            let bytes = 20 * 1024 * 1024usize;
-            self.capacity_sectors = (bytes / self.sector_size).max(1);
+            self.capacity_sectors = (CACHE_BYTES / self.sector_size).max(1);
         }
 
         let start_sector = offset / bs;
@@ -198,16 +197,27 @@ impl SectorCache {
 }
 
 #[repr(C)]
-#[derive(Default)]
 struct DiskExt {
     block_size: AtomicU32,
     props_ready: AtomicBool,
     cache: Mutex<SectorCache>,
+    rmw_lock: Mutex<()>,
+}
+
+impl Default for DiskExt {
+    fn default() -> Self {
+        Self {
+            block_size: AtomicU32::new(0),
+            props_ready: AtomicBool::new(false),
+            cache: Mutex::new(SectorCache::default()),
+            rmw_lock: Mutex::new(()),
+        }
+    }
 }
 
 #[inline]
 fn cache_try_read(dx: &DiskExt, off: u64, total: usize, dst: &mut [u8]) -> bool {
-    let bs = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
+    let bs = dx.block_size.load(Ordering::Acquire);
     if bs == 0 {
         return false;
     }
@@ -219,7 +229,7 @@ fn cache_try_read(dx: &DiskExt, off: u64, total: usize, dst: &mut [u8]) -> bool 
 
 #[inline]
 fn cache_store_read(dx: &DiskExt, off: u64, data: &[u8]) {
-    let bs = dx.block_size.load(core::sync::atomic::Ordering::Acquire);
+    let bs = dx.block_size.load(Ordering::Acquire);
     if bs == 0 {
         return;
     }
@@ -262,6 +272,7 @@ pub extern "win64" fn disk_device_add(
     dev_init.set_dev_ext_default::<DiskExt>();
     DriverStep::complete(DriverStatus::Success)
 }
+
 #[repr(C)]
 struct DiskReadCtx {
     dev: Arc<DeviceObject>,
@@ -301,6 +312,7 @@ extern "win64" fn disk_write_complete(req: &mut Request, ctx: usize) -> DriverSt
     }
     st
 }
+
 #[request_handler]
 pub async fn disk_read(
     dev: Arc<DeviceObject>,
@@ -311,10 +323,7 @@ pub async fn disk_read(
         let g = parent.read();
         match g.kind {
             RequestType::Read { offset, len } => (offset, len),
-            _ => {
-                drop(g);
-                return DriverStep::complete(DriverStatus::InvalidParameter);
-            }
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
 
@@ -323,17 +332,26 @@ pub async fn disk_read(
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
+    if !dx.props_ready.load(Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
             return DriverStep::complete(st);
         }
     }
 
-    if !rw_validate(&dx, off, total) {
+    let bs = dx.block_size.load(Ordering::Acquire) as u64;
+    if bs == 0 {
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     {
+        let p = parent.read();
+        if p.data_len() < total {
+            return DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+    }
+
+    let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
+    if aligned {
         let mut p = parent.write();
         let n = core::cmp::min(total, p.data_len());
         if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
@@ -348,9 +366,86 @@ pub async fn disk_read(
         });
         p.add_completion(disk_read_complete, Box::into_raw(ctx) as usize);
         p.traversal_policy = TraversalPolicy::ForwardLower;
+        return DriverStep::Continue;
     }
 
-    DriverStep::Continue
+    let end = match off.checked_add(total as u64) {
+        Some(v) => v,
+        None => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
+
+    let start_sector = off / bs;
+    let last_sector = (end - 1) / bs;
+
+    let mut out_off = 0usize;
+    {
+        let mut p = parent.write();
+        let out = &mut p.data_slice_mut()[..total];
+
+        let head_off = (off % bs) as usize;
+        let head_lba = start_sector * bs;
+        let first = match read_from_lower(&dev, head_lba, bs as usize).await {
+            Ok(b) => b,
+            Err(st) => {
+                p.status = st;
+                return DriverStep::complete(st);
+            }
+        };
+        cache_store_read(&dx, head_lba, &first);
+
+        if start_sector == last_sector {
+            out.copy_from_slice(&first[head_off..head_off + total]);
+            p.status = DriverStatus::Success;
+            return DriverStep::complete(DriverStatus::Success);
+        }
+
+        let head_take = core::cmp::min(total, (bs as usize).saturating_sub(head_off));
+        out[..head_take].copy_from_slice(&first[head_off..head_off + head_take]);
+        out_off += head_take;
+
+        let mid_start_sector = start_sector + 1;
+        let mid_end_sector = last_sector;
+
+        let mut cur_sector = mid_start_sector;
+        while cur_sector < mid_end_sector {
+            let remaining_sectors = (mid_end_sector - cur_sector) as usize;
+            let max_sectors = (MAX_CHUNK_BYTES / (bs as usize)).max(1);
+            let take_sectors = core::cmp::min(remaining_sectors, max_sectors);
+
+            let chunk_off = cur_sector * bs;
+            let chunk_len = take_sectors * (bs as usize);
+
+            let chunk = match read_from_lower(&dev, chunk_off, chunk_len).await {
+                Ok(b) => b,
+                Err(st) => {
+                    p.status = st;
+                    return DriverStep::complete(st);
+                }
+            };
+
+            out[out_off..out_off + chunk_len].copy_from_slice(&chunk[..chunk_len]);
+            cache_store_read(&dx, chunk_off, &chunk[..chunk_len]);
+
+            out_off += chunk_len;
+            cur_sector += take_sectors as u64;
+        }
+
+        let tail_len = total - out_off;
+        let tail_lba = last_sector * bs;
+        let last = match read_from_lower(&dev, tail_lba, bs as usize).await {
+            Ok(b) => b,
+            Err(st) => {
+                p.status = st;
+                return DriverStep::complete(st);
+            }
+        };
+        cache_store_read(&dx, tail_lba, &last);
+        out[out_off..].copy_from_slice(&last[..tail_len]);
+
+        p.status = DriverStatus::Success;
+    }
+
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
@@ -363,10 +458,7 @@ pub async fn disk_write(
         let g = parent.read();
         match g.kind {
             RequestType::Write { offset, len } => (offset, len),
-            _ => {
-                drop(g);
-                return DriverStep::complete(DriverStatus::InvalidParameter);
-            }
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
 
@@ -375,17 +467,26 @@ pub async fn disk_write(
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(core::sync::atomic::Ordering::Acquire) {
+    if !dx.props_ready.load(Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
             return DriverStep::complete(st);
         }
     }
 
-    if !rw_validate(&dx, off, total) {
+    let bs = dx.block_size.load(Ordering::Acquire) as u64;
+    if bs == 0 {
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     {
+        let p = parent.read();
+        if p.data_len() < total {
+            return DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+    }
+
+    let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
+    if aligned {
         let mut p = parent.write();
         let ctx = Box::new(DiskWriteCtx {
             dev: dev.clone(),
@@ -394,10 +495,159 @@ pub async fn disk_write(
         });
         p.add_completion(disk_write_complete, Box::into_raw(ctx) as usize);
         p.traversal_policy = TraversalPolicy::ForwardLower;
+        return DriverStep::Continue;
     }
 
-    DriverStep::Continue
+    let _rmw = dx.rmw_lock.lock();
+
+    let end = match off.checked_add(total as u64) {
+        Some(v) => v,
+        None => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
+
+    let start_sector = off / bs;
+    let last_sector = (end - 1) / bs;
+
+    let head_off = (off % bs) as usize;
+    let tail_off = (end % bs) as usize;
+
+    let payload = {
+        let g = parent.read();
+        g.data_slice()[..total].to_vec()
+    };
+    let payload = &payload[..];
+
+    if start_sector == last_sector {
+        let lba = start_sector * bs;
+        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
+            Ok(b) => b,
+            Err(st) => {
+                let mut p = parent.write();
+                p.status = st;
+                return DriverStep::complete(st);
+            }
+        };
+
+        sec[head_off..head_off + total].copy_from_slice(payload);
+
+        let st = write_to_lower(&dev, lba, &sec).await;
+        {
+            let mut p = parent.write();
+            p.status = st;
+        }
+        if st == DriverStatus::Success {
+            cache_update_write(&dx, lba, &sec);
+        }
+        return DriverStep::complete(st);
+    }
+
+    let mut consumed = 0usize;
+
+    if head_off != 0 {
+        let lba = start_sector * bs;
+        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
+            Ok(b) => b,
+            Err(st) => {
+                let mut p = parent.write();
+                p.status = st;
+                return DriverStep::complete(st);
+            }
+        };
+
+        let take = core::cmp::min(total, (bs as usize).saturating_sub(head_off));
+        sec[head_off..head_off + take].copy_from_slice(&payload[..take]);
+
+        let st = write_to_lower(&dev, lba, &sec).await;
+        if st != DriverStatus::Success {
+            let mut p = parent.write();
+            p.status = st;
+            return DriverStep::complete(st);
+        }
+        cache_update_write(&dx, lba, &sec);
+
+        consumed += take;
+    }
+
+    let mut mid_sector = start_sector;
+    if head_off != 0 {
+        mid_sector = start_sector + 1;
+    }
+
+    let mut mid_end = last_sector;
+    if tail_off != 0 {
+        mid_end = last_sector;
+    } else {
+        mid_end = last_sector + 1;
+    }
+
+    let mut cur = mid_sector;
+    while cur < mid_end {
+        let remaining_bytes = total.saturating_sub(consumed);
+        if remaining_bytes < bs as usize {
+            break;
+        }
+
+        let remaining_sectors = (mid_end - cur) as usize;
+        let max_sectors = (MAX_CHUNK_BYTES / (bs as usize)).max(1);
+        let mut take_sectors = core::cmp::min(remaining_sectors, max_sectors);
+
+        let max_bytes = take_sectors * (bs as usize);
+        let avail = total - consumed;
+        if max_bytes > avail {
+            take_sectors = (avail / (bs as usize)).max(1);
+        }
+
+        let bytes = take_sectors * (bs as usize);
+        if bytes == 0 {
+            break;
+        }
+
+        let lba = cur * bs;
+        let st = write_to_lower(&dev, lba, &payload[consumed..consumed + bytes]).await;
+        if st != DriverStatus::Success {
+            let mut p = parent.write();
+            p.status = st;
+            return DriverStep::complete(st);
+        }
+
+        cache_update_write(&dx, lba, &payload[consumed..consumed + bytes]);
+
+        consumed += bytes;
+        cur += take_sectors as u64;
+    }
+
+    if tail_off != 0 {
+        let lba = last_sector * bs;
+        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
+            Ok(b) => b,
+            Err(st) => {
+                let mut p = parent.write();
+                p.status = st;
+                return DriverStep::complete(st);
+            }
+        };
+
+        let tail_len = total - consumed;
+        sec[..tail_len].copy_from_slice(&payload[consumed..consumed + tail_len]);
+
+        let st = write_to_lower(&dev, lba, &sec).await;
+        {
+            let mut p = parent.write();
+            p.status = st;
+        }
+        if st == DriverStatus::Success {
+            cache_update_write(&dx, lba, &sec);
+        }
+        return DriverStep::complete(st);
+    }
+
+    {
+        let mut p = parent.write();
+        p.status = DriverStatus::Success;
+    }
+    DriverStep::complete(DriverStatus::Success)
 }
+
 #[request_handler]
 pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStep {
     let code = match parent.read().kind {
@@ -468,19 +718,45 @@ pub fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
     dev.try_devext::<DiskExt>().expect("disk dev ext missing")
 }
 
-#[inline]
-fn rw_validate(dx: &DiskExt, off: u64, total: usize) -> bool {
-    let bs = dx.block_size.load(core::sync::atomic::Ordering::Acquire) as u64;
-    if bs == 0 {
-        return false;
+async fn read_from_lower(
+    dev: &Arc<DeviceObject>,
+    offset: u64,
+    len: usize,
+) -> Result<Box<[u8]>, DriverStatus> {
+    let child = Arc::new(RwLock::new(
+        Request::new(
+            RequestType::Read { offset, len },
+            RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+    let st = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
+    if st != DriverStatus::Success {
+        return Err(st);
     }
-    if off % bs != 0 {
-        return false;
+    let mut g = child.write();
+    if g.status != DriverStatus::Success {
+        return Err(g.status);
     }
-    if (total as u64) % bs != 0 {
-        return false;
+    Ok(g.take_data_bytes())
+}
+
+async fn write_to_lower(dev: &Arc<DeviceObject>, offset: u64, data: &[u8]) -> DriverStatus {
+    let child = Arc::new(RwLock::new(
+        Request::new(
+            RequestType::Write {
+                offset,
+                len: data.len(),
+            },
+            RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower),
+    ));
+    let st = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
+    if st != DriverStatus::Success {
+        return st;
     }
-    true
+    child.read().status
 }
 
 async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
@@ -515,12 +791,9 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     let di = unsafe { *(pnp.blob_out.as_ptr() as *const DiskInfo) };
 
     let dx = disk_ext(dev);
-    dx.block_size.store(
-        di.logical_block_size.max(1),
-        core::sync::atomic::Ordering::Release,
-    );
-    dx.props_ready
-        .store(true, core::sync::atomic::Ordering::Release);
+    dx.block_size
+        .store(di.logical_block_size.max(1), Ordering::Release);
+    dx.props_ready.store(true, Ordering::Release);
 
     {
         let mut cache = dx.cache.lock();
