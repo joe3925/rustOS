@@ -5,6 +5,7 @@ use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use kernel_types::device::DriverPackage;
+use kernel_types::fs::Path;
 use kernel_types::pnp::BootType;
 use kernel_types::status::{Data, RegError};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,7 +126,7 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
             _ => BootType::Demand,
         };
 
-        let dt = match driver_install::parse_driver_toml(&toml_path).await {
+        let dt = match driver_install::parse_driver_toml(&Path::from_string(&toml_path)).await {
             Ok(d) => d,
             Err(_) => continue,
         };

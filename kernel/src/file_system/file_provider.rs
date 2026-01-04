@@ -7,13 +7,13 @@ use spin::RwLock;
 
 use kernel_types::{
     async_ffi::FfiFuture,
-    fs::*,
+    fs::{*, Path},
     request::Request,
     status::{DriverStatus, FileStatus},
 };
 
 pub trait FileProvider: Send + Sync {
-    fn open_path(&self, path: &str, flags: &[OpenFlags])
+    fn open_path(&self, path: &Path, flags: &[OpenFlags])
         -> FfiFuture<(FsOpenResult, DriverStatus)>;
 
     fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)>;
@@ -41,15 +41,15 @@ pub trait FileProvider: Send + Sync {
 
     fn get_info(&self, file_id: u64) -> FfiFuture<(FsGetInfoResult, DriverStatus)>;
 
-    fn list_dir_path(&self, path: &str) -> FfiFuture<(FsListDirResult, DriverStatus)>;
+    fn list_dir_path(&self, path: &Path) -> FfiFuture<(FsListDirResult, DriverStatus)>;
 
-    fn make_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+    fn make_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)>;
 
-    fn remove_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+    fn remove_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)>;
 
-    fn rename_path(&self, src: &str, dst: &str) -> FfiFuture<(FsRenameResult, DriverStatus)>;
+    fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)>;
 
-    fn delete_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+    fn delete_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)>;
 }
 
 static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);

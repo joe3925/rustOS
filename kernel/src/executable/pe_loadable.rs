@@ -17,7 +17,7 @@ use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
 use goblin::Object;
 use kernel_types::device::ModuleHandle;
-use kernel_types::fs::OpenFlags;
+use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::Module;
 use kernel_types::status::PageMapError;
 use spin::mutex::Mutex;
@@ -41,7 +41,8 @@ impl PELoader {
     /// Opens and prepares a PE loader from the given path.
     pub async fn new(path: &str) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
-        let file_handle = File::open(path, &open_flags).await.ok()?;
+        let fs_path = Path::from_string(path);
+        let file_handle = File::open(&fs_path, &open_flags).await.ok()?;
         let file_data: Vec<u8> = file_handle.read().await.ok()?;
 
         let boxed: Box<[u8]> = file_data.into_boxed_slice();

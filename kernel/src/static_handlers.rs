@@ -19,7 +19,7 @@ use kernel_types::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    fs::OpenFlags,
+    fs::{OpenFlags, Path},
     irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::Request,
@@ -122,34 +122,34 @@ pub extern "win64" fn wait_duration(time: Duration) {
 
 #[no_mangle]
 pub extern "win64" fn file_open(
-    path: &str,
+    path: &Path,
     flags: &[OpenFlags],
 ) -> FfiFuture<Result<File, FileStatus>> {
-    let path = path.to_string();
+    let path = path.clone();
     let flags_vec: Vec<OpenFlags> = flags.to_vec();
 
-    async move { File::open(path.as_str(), &flags_vec).await }.into_ffi()
+    async move { File::open(&path, &flags_vec).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_list_dir(path: &str) -> FfiFuture<Result<Vec<String>, FileStatus>> {
-    let path = path.to_string();
+pub extern "win64" fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>> {
+    let path = path.clone();
 
-    async move { File::list_dir(path.as_str()).await }.into_ffi()
+    async move { File::list_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_remove_dir(path: &str) -> FfiFuture<Result<(), FileStatus>> {
-    let path = path.to_string();
+pub extern "win64" fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+    let path = path.clone();
 
-    async move { File::remove_dir(path).await }.into_ffi()
+    async move { File::remove_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]
-pub extern "win64" fn fs_make_dir(path: &str) -> FfiFuture<Result<(), FileStatus>> {
-    let path = path.to_string();
+pub extern "win64" fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>> {
+    let path = path.clone();
 
-    async move { File::make_dir(path).await }.into_ffi()
+    async move { File::make_dir(&path).await }.into_ffi()
 }
 
 #[no_mangle]

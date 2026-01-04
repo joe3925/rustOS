@@ -16,7 +16,7 @@ use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
 use crate::static_handlers::pnp_send_request_via_symlink;
-use kernel_types::fs::*;
+use kernel_types::fs::{Path, *};
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
@@ -30,17 +30,6 @@ struct VfsHandle {
     pub volume_symlink: String,
     pub inner_id: u64,
     pub is_dir: bool,
-}
-#[inline]
-fn normalize_rel(mut s: &str) -> String {
-    while s.starts_with('\\') || s.starts_with('/') {
-        s = &s[1..];
-    }
-    let mut t = s.replace('\\', "/");
-    while t.contains("//") {
-        t = t.replace("//", "/");
-    }
-    t
 }
 
 /// Resolves labels to mount symlinks and forwards FsOps to FS drivers.
@@ -208,43 +197,24 @@ impl Vfs {
         }
     }
 
-    fn resolve_path(&self, user_path: &str) -> Result<(String, String), FileStatus> {
-        if user_path.is_empty() {
+    fn resolve_path(&self, user_path: &Path) -> Result<(String, Path), FileStatus> {
+        if user_path.symlink.is_none() && user_path.components.is_empty() {
             return Err(FileStatus::BadPath);
         }
 
-        const VOL_PREFIX: &str = "\\GLOBAL\\Volumes\\";
-        if user_path.starts_with(VOL_PREFIX) {
-            let mut parts = user_path.splitn(4, '\\');
-            let _ = parts.next(); // ""
-            let g = parts.next().unwrap_or("");
-            let v = parts.next().unwrap_or("");
-            let rest = parts.next().unwrap_or("");
-            if g != "GLOBAL" || v != "Volumes" {
-                return Err(FileStatus::BadPath);
-            }
-            let (mount, tail) = match rest.split_once('\\') {
-                Some((a, b)) => (a, b),
-                None => (rest, ""),
-            };
-            if mount.is_empty() {
-                return Err(FileStatus::BadPath);
-            }
-            let symlink = alloc::format!("{}{}", VOL_PREFIX, mount);
-            let fs_path = normalize_rel(tail);
-            return Ok((symlink, fs_path));
-        }
+        // Build the fs_path from components (without drive)
+        let fs_path = Path {
+            symlink: None,
+            components: user_path.components.clone(),
+        };
 
-        if let Some(colon_pos) = user_path.find(':') {
-            let (label, tail0) = user_path.split_at(colon_pos + 1);
-            let after_colon = if tail0.len() > 1 { &tail0[1..] } else { "" };
-            let fs_path = normalize_rel(after_colon);
-
-            let symlink = match self.label_map.read().get(label) {
+        // Resolve drive letter to symlink
+        if let Some(d) = user_path.symlink {
+            let label = alloc::format!("{}:", d);
+            let symlink = match self.label_map.read().get(&label) {
                 Some(s) => s.clone(),
                 None => {
-                    let base = label.trim_end_matches(':');
-                    alloc::format!("\\GLOBAL\\StorageDevices\\{}", base)
+                    alloc::format!("\\GLOBAL\\StorageDevices\\{}", d)
                 }
             };
             return Ok((symlink, fs_path));
@@ -305,7 +275,7 @@ impl Vfs {
             }
         };
 
-        let call_open = async |this: &Self, link: &String, path: String, flags: OpenFlagsMask| {
+        let call_open = async |this: &Self, link: &String, path: Path, flags: OpenFlagsMask| {
             let inner = FsOpenParams { flags, path };
             match this
                 .call_fs::<FsOpenParams, FsOpenResult>(link, FsOp::Open, inner)
@@ -390,8 +360,7 @@ impl Vfs {
                 DriverStatus::Success,
             )
         } else if has_create {
-            let (try_open, st) =
-                call_open(self, &symlink, fs_path.clone(), p.flags.clone()).await;
+            let (try_open, st) = call_open(self, &symlink, fs_path.clone(), p.flags.clone()).await;
             if st != DriverStatus::Success {
                 return (try_open, st);
             }
@@ -421,21 +390,20 @@ impl Vfs {
                     dir: false,
                     flags: OpenFlags::Create,
                 };
-                let cres: FsCreateResult =
-                    match self.call_fs(&symlink, FsOp::Create, creq).await {
-                        Ok(r) => r,
-                        Err(st) => {
-                            return (
-                                FsOpenResult {
-                                    fs_file_id: 0,
-                                    is_dir: false,
-                                    size: 0,
-                                    error: Some(FileStatus::UnknownFail),
-                                },
-                                st,
-                            )
-                        }
-                    };
+                let cres: FsCreateResult = match self.call_fs(&symlink, FsOp::Create, creq).await {
+                    Ok(r) => r,
+                    Err(st) => {
+                        return (
+                            FsOpenResult {
+                                fs_file_id: 0,
+                                is_dir: false,
+                                size: 0,
+                                error: Some(FileStatus::UnknownFail),
+                            },
+                            st,
+                        )
+                    }
+                };
                 if let Some(e) = cres.error {
                     if e != FileStatus::Success {
                         return (
@@ -450,8 +418,7 @@ impl Vfs {
                     }
                 }
 
-                let (inner_res, st2) =
-                    call_open(self, &symlink, fs_path, p.flags.clone()).await;
+                let (inner_res, st2) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st2);
                 }
@@ -756,14 +723,14 @@ impl Vfs {
 impl FileProvider for Vfs {
     fn open_path(
         &self,
-        path: &str,
+        path: &Path,
         flags: &[OpenFlags],
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
         this.open(FsOpenParams {
             flags: OpenFlagsMask::from(flags),
-            path: path.to_string(),
+            path: path.clone(),
         })
         .into_ffi()
     }
@@ -842,27 +809,25 @@ impl FileProvider for Vfs {
         .into_ffi()
     }
 
-    fn list_dir_path(&self, path: &str) -> FfiFuture<(FsListDirResult, DriverStatus)> {
+    fn list_dir_path(&self, path: &Path) -> FfiFuture<(FsListDirResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
-        this.list_dir(FsListDirParams {
-            path: path.to_string(),
-        })
-        .into_ffi()
+        this.list_dir(FsListDirParams { path: path.clone() })
+            .into_ffi()
     }
 
-    fn make_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+    fn make_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
         this.create(FsCreateParams {
-            path: path.to_string(),
+            path: path.clone(),
             dir: true,
             flags: OpenFlags::Create,
         })
         .into_ffi()
     }
 
-    fn remove_dir_path(&self, _path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+    fn remove_dir_path(&self, _path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
         async {
             (
                 FsCreateResult {
@@ -874,17 +839,17 @@ impl FileProvider for Vfs {
         .into_ffi()
     }
 
-    fn rename_path(&self, src: &str, dst: &str) -> FfiFuture<(FsRenameResult, DriverStatus)> {
+    fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
         this.rename(FsRenameParams {
-            src: src.to_string(),
-            dst: dst.to_string(),
+            src: src.clone(),
+            dst: dst.clone(),
         })
         .into_ffi()
     }
 
-    fn delete_path(&self, _path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+    fn delete_path(&self, _path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
         async {
             (
                 FsCreateResult {

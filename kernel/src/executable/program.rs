@@ -6,7 +6,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::{device::ModuleHandle, status::PageMapError};
+use kernel_types::{device::ModuleHandle, fs::Path, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
@@ -18,7 +18,6 @@ use x86_64::{
 
 use crate::{
     executable::pe_loadable::PELoader,
-    file_system::path::Path,
     memory::paging::paging::{map_page, map_range_with_huge_pages},
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
     scheduling::scheduler::{self, Scheduler, TaskHandle},

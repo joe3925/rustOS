@@ -25,7 +25,7 @@ use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult},
     kernel_types::{
-        fs::OpenFlags,
+        fs::{OpenFlags, Path},
         io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
         pnp::DeviceIds,
     },
@@ -509,7 +509,7 @@ unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
 async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
         flags: OpenFlags::Open.into(),
-        path: path.to_string(),
+        path: Path::from_string(path),
     };
     let req = Arc::new(RwLock::new(
         Request::new(RequestType::Fs(FsOp::Open), box_to_bytes(Box::new(params)))

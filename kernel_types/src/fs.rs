@@ -1,5 +1,5 @@
 use crate::status::FileStatus;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 #[repr(C)]
@@ -123,7 +123,7 @@ pub enum FsOp {
 #[derive(Debug, Clone)]
 pub struct FsOpenParams {
     pub flags: OpenFlagsMask,
-    pub path: String,
+    pub path: Path,
 }
 
 #[repr(C)]
@@ -215,7 +215,7 @@ pub struct FsFlushResult {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsCreateParams {
-    pub path: String,
+    pub path: Path,
     pub dir: bool,
     pub flags: OpenFlags,
 }
@@ -229,8 +229,8 @@ pub struct FsCreateResult {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsRenameParams {
-    pub src: String,
-    pub dst: String,
+    pub src: Path,
+    pub dst: Path,
 }
 
 #[repr(C)]
@@ -242,7 +242,7 @@ pub struct FsRenameResult {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct FsListDirParams {
-    pub path: String,
+    pub path: Path,
 }
 
 #[repr(C)]
@@ -265,4 +265,154 @@ pub struct FsGetInfoResult {
     pub is_dir: bool,
     pub attrs: u32,
     pub error: Option<FileStatus>,
+}
+#[derive(Debug, Clone)]
+#[repr(C)]
+pub struct Path {
+    pub symlink: Option<char>,
+    pub components: Vec<String>,
+}
+
+impl Path {
+    pub fn from_string(raw: &str) -> Self {
+        let b = raw.as_bytes();
+        let mut drive = None;
+        let mut start = 0;
+
+        if b.len() >= 2 && b[1] == b':' && (b[0] as char).is_ascii_alphabetic() {
+            drive = Some(b[0] as char);
+            start = 2;
+        }
+
+        if b.get(start) == Some(&b'\\') || b.get(start) == Some(&b'/') {
+            start += 1;
+        }
+
+        let comps = raw[start..]
+            .split(['\\', '/'])
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        Self {
+            symlink: drive,
+            components: comps,
+        }
+    }
+    pub fn parse(raw: &str, base: Option<&Self>) -> Self {
+        let b = raw.as_bytes();
+
+        if b.len() >= 2 && b[1] == b':' && (b[0] as char).is_ascii_alphabetic() {
+            let d = b[0] as char;
+            if b.len() == 2 {
+                return Self {
+                    symlink: Some(d),
+                    components: Vec::new(),
+                };
+            }
+            if b.get(2) == Some(&b'\\') || b.get(2) == Some(&b'/') {
+                return Self::from_string(raw);
+            } else {
+                if let Some(base) = base {
+                    let mut out = base.clone();
+                    out.symlink = Some(d);
+                    out.join(&raw[2..])
+                } else {
+                    panic!("Relative path {} given with no base", raw);
+                }
+            }
+        } else if b.first() == Some(&b'\\') || b.first() == Some(&b'/') {
+            if let Some(base) = base {
+                let mut out = Self {
+                    symlink: base.symlink,
+                    components: Vec::new(),
+                };
+                out.join(&raw[1..])
+            } else {
+                panic!("Root-relative {} given with no base drive", raw);
+            }
+        } else {
+            if let Some(base) = base {
+                base.clone().join(raw)
+            } else {
+                panic!("Relative path {} given with no base", raw);
+            }
+        }
+    }
+
+    pub fn join(mut self, rel: &str) -> Self {
+        for comp in rel.split(['\\', '/']) {
+            if comp.is_empty() || comp == "." {
+                continue;
+            } else if comp == ".." {
+                if !self.components.is_empty() {
+                    self.components.pop();
+                }
+            } else {
+                self.components.push(comp.to_string());
+            }
+        }
+        self
+    }
+
+    pub fn push(&mut self, comp: &str) {
+        if comp.is_empty() {
+            return;
+        }
+        self.components.push(comp.to_string());
+    }
+
+    pub fn pop(&mut self) -> Option<String> {
+        self.components.pop()
+    }
+
+    pub fn parent(&self) -> Option<Self> {
+        if self.components.is_empty() {
+            return None;
+        }
+        let mut out = self.clone();
+        out.components.pop();
+        Some(out)
+    }
+
+    pub fn file_name(&self) -> Option<&str> {
+        self.components.last().map(|s| s.as_str())
+    }
+
+    pub fn with_symlink(mut self, symlink: Option<char>) -> Self {
+        self.symlink = symlink;
+        self
+    }
+
+    pub fn normalize(&mut self) {
+        let mut new_comps = Vec::new();
+        for comp in &self.components {
+            if comp == "." {
+                continue;
+            } else if comp == ".." {
+                if !new_comps.is_empty() {
+                    new_comps.pop();
+                }
+            } else {
+                new_comps.push(comp.clone());
+            }
+        }
+        self.components = new_comps;
+    }
+
+    pub fn to_string(&self) -> String {
+        match self.symlink {
+            Some(d) => {
+                let mut s = String::new();
+                s.push(d);
+                s.push(':');
+                s.push('/');
+                if !self.components.is_empty() {
+                    s.push_str(&self.components.join("/"));
+                }
+                s
+            }
+            None => self.components.join("/"),
+        }
+    }
 }

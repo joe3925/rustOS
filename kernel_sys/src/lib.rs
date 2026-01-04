@@ -21,7 +21,7 @@ use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::PageTableFlags;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
-use kernel_types::fs::{File, OpenFlags};
+use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
 use kernel_types::request::Request;
@@ -107,10 +107,10 @@ unsafe extern "win64" {
     // =========================================================================
     // File System (async FFI)
     // =========================================================================
-    pub fn file_open(path: &str, flags: &[OpenFlags]) -> FfiFuture<Result<File, FileStatus>>;
-    pub fn fs_list_dir(path: &str) -> FfiFuture<Result<Vec<String>, FileStatus>>;
-    pub fn fs_remove_dir(path: &str) -> FfiFuture<Result<(), FileStatus>>;
-    pub fn fs_make_dir(path: &str) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn file_open(path: &Path, flags: &[OpenFlags]) -> FfiFuture<Result<File, FileStatus>>;
+    pub fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>>;
+    pub fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>>;
+    pub fn fs_make_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>>;
     pub fn file_read(file: &File) -> FfiFuture<Result<Vec<u8>, FileStatus>>;
     pub fn file_write(file: &mut File, data: &[u8]) -> FfiFuture<Result<(), FileStatus>>;
     pub fn file_delete(file: &mut File) -> FfiFuture<Result<(), FileStatus>>;

@@ -18,28 +18,28 @@ use crate::file_system::file_provider::FileProvider;
 use crate::util::BootPkg;
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
-    fs::*,
+    fs::{*, Path},
     request::Request,
     status::{DriverStatus, FileStatus},
 };
 
-const C_PREFIX: &str = "C:\\";
-const REG_DIR: &str = "C:\\system\\registry";
-const REG_SNAP_PATH: &str = "C:\\system\\registry\\registry.snap";
-const REG_WAL_PATH: &str = "C:\\system\\registry\\registry.wal";
-const DRIVER_ROOT: &str = "C:\\install\\drivers";
+const C_PREFIX: &str = "C:/";
+const REG_DIR: &str = "C:/system/registry";
+const REG_SNAP_PATH: &str = "C:/system/registry/registry.snap";
+const REG_WAL_PATH: &str = "C:/system/registry/registry.wal";
+const DRIVER_ROOT: &str = "C:/install/drivers";
 
 fn norm_upcase(p: &str) -> String {
-    let s = p.replace('/', "\\");
+    let s = p.replace('\\', "/");
     if !s.starts_with(C_PREFIX) {
         return s.to_uppercase();
     }
-    let mut out = String::from("C:\\");
+    let mut out = String::from("C:/");
     let mut last_was_slash = true;
-    for ch in s["C:\\".len()..].chars() {
-        if ch == '\\' {
+    for ch in s["C:/".len()..].chars() {
+        if ch == '/' {
             if !last_was_slash {
-                out.push('\\');
+                out.push('/');
             }
             last_was_slash = true;
         } else {
@@ -47,16 +47,16 @@ fn norm_upcase(p: &str) -> String {
             last_was_slash = false;
         }
     }
-    if out.ends_with('\\') && out.len() > 3 {
+    if out.ends_with('/') && out.len() > 3 {
         out.pop();
     }
     out
 }
 fn parent_of(path: &str) -> &str {
-    path.rsplit_once('\\').map(|(a, _)| a).unwrap_or("C:\\")
+    path.rsplit_once('/').map(|(a, _)| a).unwrap_or("C:/")
 }
 fn leaf_of(path: &str) -> &str {
-    path.rsplit_once('\\').map(|(_, b)| b).unwrap_or(path)
+    path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path)
 }
 
 enum DataRef<'a> {
@@ -118,21 +118,13 @@ impl<'a> BootstrapProvider<'a> {
     fn init_tree(&self, boot: &'a [BootPkg]) {
         let mut n = self.nodes.write();
 
-        for d in [
-            "C:\\",
-            "C:\\install",
-            DRIVER_ROOT,
-            "C:\\system",
-            "C:\\system\\toml",
-            "C:\\system\\mod",
-            REG_DIR,
-        ] {
+        for d in ["C:/", "C:/install", DRIVER_ROOT, "C:/system", "C:/system/toml", "C:/system/mod", REG_DIR] {
             let dk = norm_upcase(d);
             n.entry(dk.clone()).or_insert_with(Node::dir);
         }
 
         // Add registry directory to system's children
-        n.get_mut(&norm_upcase("C:\\system"))
+        n.get_mut(&norm_upcase("C:/system"))
             .unwrap()
             .children
             .insert("registry".into(), norm_upcase(REG_DIR));
@@ -154,7 +146,7 @@ impl<'a> BootstrapProvider<'a> {
             .insert("registry.wal".into(), wal_key);
 
         for bp in boot {
-            let ddir = norm_upcase(&alloc::format!("{}\\{}", DRIVER_ROOT, bp.name));
+            let ddir = norm_upcase(&alloc::format!("{}/{}", DRIVER_ROOT, bp.name));
             n.entry(ddir.clone()).or_insert_with(Node::dir);
 
             n.get_mut(&norm_upcase(DRIVER_ROOT))
@@ -165,8 +157,8 @@ impl<'a> BootstrapProvider<'a> {
             let toml_name = alloc::format!("{}.toml", bp.name);
             let dll_name = alloc::format!("{}.dll", bp.name);
 
-            let toml_src = norm_upcase(&alloc::format!("{}\\{}", ddir, toml_name));
-            let dll_src = norm_upcase(&alloc::format!("{}\\{}", ddir, dll_name));
+            let toml_src = norm_upcase(&alloc::format!("{}/{}", ddir, toml_name));
+            let dll_src = norm_upcase(&alloc::format!("{}/{}", ddir, dll_name));
 
             n.insert(toml_src.clone(), Node::file(DataRef::Static(bp.toml)));
             n.insert(dll_src.clone(), Node::file(DataRef::Static(bp.image)));
@@ -180,18 +172,18 @@ impl<'a> BootstrapProvider<'a> {
                 .children
                 .insert(dll_name.clone(), dll_src.clone());
 
-            let toml_target = norm_upcase(&alloc::format!("C:\\system\\toml\\{}", toml_name));
-            let dll_target = norm_upcase(&alloc::format!("C:\\system\\mod\\{}", dll_name));
+            let toml_target = norm_upcase(&alloc::format!("C:/system/toml/{}", toml_name));
+            let dll_target = norm_upcase(&alloc::format!("C:/system/mod/{}", dll_name));
 
             n.insert(toml_target.clone(), Node::file(DataRef::Alias(toml_src)));
             n.insert(dll_target.clone(), Node::file(DataRef::Alias(dll_src)));
 
-            n.get_mut(&norm_upcase("C:\\system\\toml"))
+            n.get_mut(&norm_upcase("C:/system/toml"))
                 .unwrap()
                 .children
                 .insert(toml_name, toml_target);
 
-            n.get_mut(&norm_upcase("C:\\system\\mod"))
+            n.get_mut(&norm_upcase("C:/system/mod"))
                 .unwrap()
                 .children
                 .insert(dll_name, dll_target);
@@ -791,10 +783,10 @@ impl<'a> BootstrapProvider<'a> {
 impl<'a> FileProvider for BootstrapProvider<'a> {
     fn open_path(
         &self,
-        path: &str,
+        path: &Path,
         flags: &[OpenFlags],
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
-        let res = self.open_path_sync(path, flags);
+        let res = self.open_path_sync(&path.to_string(), flags);
         async move { res }.into_ffi()
     }
 
@@ -841,28 +833,28 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         async move { res }.into_ffi()
     }
 
-    fn list_dir_path(&self, path: &str) -> FfiFuture<(FsListDirResult, DriverStatus)> {
-        let res = self.list_dir_path_sync(path);
+    fn list_dir_path(&self, path: &Path) -> FfiFuture<(FsListDirResult, DriverStatus)> {
+        let res = self.list_dir_path_sync(&path.to_string());
         async move { res }.into_ffi()
     }
 
-    fn make_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.make_dir_path_sync(path);
+    fn make_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        let res = self.make_dir_path_sync(&path.to_string());
         async move { res }.into_ffi()
     }
 
-    fn remove_dir_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.remove_dir_path_sync(path);
+    fn remove_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        let res = self.remove_dir_path_sync(&path.to_string());
         async move { res }.into_ffi()
     }
 
-    fn rename_path(&self, src: &str, dst: &str) -> FfiFuture<(FsRenameResult, DriverStatus)> {
-        let res = self.rename_path_sync(src, dst);
+    fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)> {
+        let res = self.rename_path_sync(&src.to_string(), &dst.to_string());
         async move { res }.into_ffi()
     }
 
-    fn delete_path(&self, path: &str) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.delete_path_sync(path);
+    fn delete_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
+        let res = self.delete_path_sync(&path.to_string());
         async move { res }.into_ffi()
     }
 }

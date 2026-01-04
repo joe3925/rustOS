@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_api::kernel_types::fs::Path;
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::{print, println};
 
@@ -53,7 +54,7 @@ pub struct VolCtrlDevExt {
 }
 
 pub struct FileCtx {
-    path: String,
+    path: Path,
     is_dir: bool,
     pos: u64,
 }
@@ -80,22 +81,24 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
     }
 }
 
-fn create_entry(fs: &mut Fs, path: &str, dir: bool) -> Result<(), FsError> {
+fn create_entry(fs: &mut Fs, path: &Path, dir: bool) -> Result<(), FsError> {
+    let path_str = path.to_string();
     if dir {
-        let _ = fs.root_dir().create_dir(path)?;
+        let _ = fs.root_dir().create_dir(&path_str)?;
     } else {
-        let _ = fs.root_dir().create_file(path)?;
+        let _ = fs.root_dir().create_file(&path_str)?;
     }
     Ok(())
 }
 
-fn rename_entry(fs: &mut Fs, src: &str, dst: &str) -> Result<(), FsError> {
+fn rename_entry(fs: &mut Fs, src: &Path, dst: &Path) -> Result<(), FsError> {
     let dst_dir = fs.root_dir();
-    fs.root_dir().rename(src, &dst_dir, dst)
+    fs.root_dir()
+        .rename(&src.to_string(), &dst_dir, &dst.to_string())
 }
 
-fn list_names(fs: &mut Fs, path: &str) -> Result<Vec<String>, FsError> {
-    let dir: FatDir = fs.root_dir().open_dir(path)?;
+fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
+    let dir: FatDir = fs.root_dir().open_dir(&path.to_string())?;
     let mut out = Vec::new();
     for r in dir.iter() {
         let e = r?;
@@ -105,8 +108,8 @@ fn list_names(fs: &mut Fs, path: &str) -> Result<Vec<String>, FsError> {
     Ok(out)
 }
 
-fn get_file_len(fs: &mut Fs, path: &str) -> Result<u64, FsError> {
-    let mut file = fs.root_dir().open_file(path)?;
+fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
+    let mut file = fs.root_dir().open_file(&path.to_string())?;
     file.seek(SeekFrom::End(0))
 }
 
@@ -131,16 +134,17 @@ fn handle_fs_request(
                         *bytes_to_box(core::mem::replace(&mut r.data, Box::new([])))
                     };
 
+                    let path_str = params.path.to_string();
                     let open_res = {
                         let root = fs.root_dir();
 
-                        match root.open_file(&params.path) {
+                        match root.open_file(&path_str) {
                             Ok(mut f) => match f.seek(SeekFrom::End(0)) {
                                 Ok(end) => Ok((false, end)),
                                 Err(e) => Err(e),
                             },
                             Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
-                                match root.open_dir(&params.path) {
+                                match root.open_dir(&path_str) {
                                     Ok(_d) => Ok((true, 0)),
                                     Err(e) => Err(e),
                                 }
@@ -223,7 +227,7 @@ fn handle_fs_request(
                     let (path, is_dir) = {
                         let tbl = vdx.table.read();
                         match tbl.get(&params.fs_file_id) {
-                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
+                            Some(ctx) => (ctx.path.clone() as Path, ctx.is_dir),
                             None => {
                                 let mut r = req.write();
                                 r.data = box_to_bytes(Box::new(FsReadResult {
@@ -238,7 +242,7 @@ fn handle_fs_request(
                     let data_or_err = if is_dir {
                         Ok(Vec::new())
                     } else {
-                        match fs.root_dir().open_file(&path) {
+                        match fs.root_dir().open_file(&path.to_string()) {
                             Ok(mut file) => {
                                 match file.seek(SeekFrom::Start(params.offset as u64)) {
                                     Err(e) => Err(e),
@@ -309,7 +313,7 @@ fn handle_fs_request(
                     let write_res = if is_dir {
                         Ok(0usize)
                     } else {
-                        match fs.root_dir().open_file(&path) {
+                        match fs.root_dir().open_file(&path.to_string()) {
                             Ok(mut file) => {
                                 let n = params.data.len();
                                 if let Err(e) = file.seek(SeekFrom::Start(pos)) {

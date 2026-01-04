@@ -2,7 +2,7 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::pe_loadable::LoadError;
 use crate::{format, println};
 use alloc::{string::String, vec::Vec};
-use kernel_types::fs::OpenFlags;
+use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::pnp::BootType;
 use kernel_types::status::{Data, FileStatus, RegError};
 use toml::de::{DeInteger, DeTable};
@@ -108,7 +108,7 @@ fn inner<'a, T>(s: &'a Spanned<T>) -> &'a T {
     s.get_ref()
 }
 
-pub async fn parse_driver_toml(path: &str) -> Result<DriverToml, FileStatus> {
+pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
     let mut f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     let bytes = f.read().await?;
     let src = core::str::from_utf8(&bytes).map_err(|_| FileStatus::InternalError)?;
@@ -376,7 +376,7 @@ fn service_name_from_image(image: &str) -> &str {
     image.rsplit_once('.').map(|(n, _)| n).unwrap_or(image)
 }
 
-pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
+pub async fn install_driver_toml(toml_path: Path) -> Result<(), DriverError> {
     let driver = parse_driver_toml(&toml_path)
         .await
         .map_err(|_| DriverError::TomlParse)?;
@@ -384,15 +384,16 @@ pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
 
     let key_path = alloc::format!("SYSTEM/CurrentControlSet/Services/{}/", driver_name);
 
-    let toml_target_path = alloc::format!("C:\\system\\toml\\{}.toml", driver_name);
-    let img_target_path = alloc::format!("C:\\system\\mod\\{}", driver.image);
+    let toml_target_path =
+        Path::from_string(&alloc::format!("C:/system/toml/{}.toml", driver_name));
+    let img_target_path = Path::from_string(&alloc::format!("C:/system/mod/{}", driver.image));
 
-    let img_src_dir = toml_path.rsplit_once('\\').map(|(p, _)| p).unwrap_or("");
-    let img_src_full = alloc::format!("{}\\{}", img_src_dir, driver.image);
+    let toml_dir = toml_path.parent().ok_or(DriverError::NoParent)?;
+    let img_src_full = toml_dir.clone().join(&driver.image);
 
-    let _ = File::make_dir("C:\\system".to_string()).await;
-    let _ = File::make_dir("C:\\system\\toml".to_string()).await;
-    let _ = File::make_dir("C:\\system\\mod".to_string()).await;
+    let _ = File::make_dir(&Path::from_string("C:/system")).await;
+    let _ = File::make_dir(&Path::from_string("C:/system/toml")).await;
+    let _ = File::make_dir(&Path::from_string("C:/system/mod")).await;
 
     let img_src = File::open(&img_src_full, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     img_src.move_no_copy(&img_target_path).await?;
@@ -497,16 +498,16 @@ pub async fn install_driver_toml(toml_path: String) -> Result<(), DriverError> {
 }
 
 pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
-    let driver_root: &str = "C:\\INSTALL\\DRIVERS";
+    let driver_root: &str = "C:/INSTALL/DRIVERS";
 
-    let packages = File::list_dir(driver_root)
+    let packages = File::list_dir(&Path::from_string(driver_root))
         .await
         .map_err(DriverError::File)?;
 
     for pkg in packages {
-        let pkg_path = alloc::format!("{driver_root}\\{pkg}");
+        let pkg_path = alloc::format!("{driver_root}/{pkg}");
 
-        let entries = match File::list_dir(&pkg_path).await {
+        let entries = match File::list_dir(&Path::from_string(&pkg_path)).await {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -524,7 +525,7 @@ pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
             continue;
         };
 
-        let toml_path = alloc::format!("{pkg_path}\\{toml_name}");
+        let toml_path = Path::from_string(&alloc::format!("{pkg_path}/{toml_name}"));
         install_driver_toml(toml_path).await;
         // match install_driver_toml(&toml_path).await {
         //     Ok(_) => {

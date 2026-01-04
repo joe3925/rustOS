@@ -9,7 +9,7 @@ use alloc::{
 use bincode::{Decode, Encode};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_types::{
-    fs::{FsSeekWhence, OpenFlags},
+    fs::{FsSeekWhence, OpenFlags, Path},
     status::{Data, RegError},
 };
 use lazy_static::lazy_static;
@@ -18,6 +18,14 @@ use spin::{Mutex, RwLock};
 // File paths
 const SNAP_PATH: &str = "C:/system/registry/registry.snap";
 const WAL_PATH: &str = "C:/system/registry/registry.wal";
+
+fn snap_path() -> Path {
+    Path::from_string(SNAP_PATH)
+}
+
+fn wal_path() -> Path {
+    Path::from_string(WAL_PATH)
+}
 
 // WAL configuration
 const WAL_MAGIC: u32 = 0x57414C52; // "WALR"
@@ -212,7 +220,8 @@ fn apply_delta(reg: &mut Registry, delta: &RegDelta) {
 
 /// Load snapshot from disk
 async fn load_snapshot() -> Option<Registry> {
-    let mut f = File::open(SNAP_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open])
+    let snap_path = snap_path();
+    let mut f = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Open])
         .await
         .ok()?;
     let buf = f.read().await.ok()?;
@@ -228,7 +237,8 @@ async fn save_snapshot(reg: &Registry) -> Result<(), kernel_types::status::RegEr
     let bytes = bincode::encode_to_vec(reg, bincode::config::standard())
         .map_err(|_| RegError::EncodingFailed)?;
 
-    let mut file = File::open(SNAP_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let snap_path = snap_path();
+    let mut file = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
     file.write(&bytes)
         .await
         .map_err(|_| RegError::EncodingFailed)?;
@@ -291,7 +301,8 @@ fn parse_wal_record(data: &[u8]) -> Option<(WalRecordHeader, RegDelta, usize)> {
 
 /// Load and replay WAL records, returning the highest sequence number seen
 async fn replay_wal(reg: &mut Registry) -> u64 {
-    let f = match File::open(WAL_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
+    let wal_path = wal_path();
+    let f = match File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
         Ok(f) => f,
         Err(_) => return 0,
     };
@@ -350,7 +361,8 @@ async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegErr
     let seq = WAL_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     let record = encode_wal_record(seq, delta).map_err(|_| RegError::EncodingFailed)?;
 
-    let mut file = File::open(WAL_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let wal_path = wal_path();
+    let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
 
     file.seek(0, FsSeekWhence::End)
         .await
@@ -364,11 +376,12 @@ async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegErr
 }
 /// Clear the WAL file
 async fn clear_wal() -> Result<(), kernel_types::status::RegError> {
-    if let Ok(mut file) = File::open(WAL_PATH, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
+    let wal_path = wal_path();
+    if let Ok(mut file) = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
         let _ = file.delete().await;
     }
 
-    let _ = File::open(WAL_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let _ = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
     Ok(())
 }
 
@@ -807,7 +820,8 @@ async fn append_wal_many(deltas: &[RegDelta]) -> Result<(), RegError> {
         buf.extend_from_slice(&rec);
     }
 
-    let mut file = File::open(WAL_PATH, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let wal_path = wal_path();
+    let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
     file.seek(0, FsSeekWhence::End)
         .await
         .map_err(|_| RegError::EncodingFailed)?;
@@ -820,7 +834,7 @@ async fn append_wal_many(deltas: &[RegDelta]) -> Result<(), RegError> {
 pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
     ensure_loaded().await;
 
-    let _ = File::make_dir("C:\\system\\registry".to_string()).await;
+    let _ = File::make_dir(&Path::from_string("C:\\system\\registry")).await;
 
     let current = (**REGISTRY.read()).clone();
 

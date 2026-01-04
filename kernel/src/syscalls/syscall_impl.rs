@@ -3,7 +3,6 @@ use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::file_system::file::File;
-use crate::file_system::path::Path;
 use crate::format;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
@@ -15,7 +14,7 @@ use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use kernel_types::fs::OpenFlags;
+use kernel_types::fs::{OpenFlags, Path};
 use x86_64::instructions::{hlt, interrupts};
 
 use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};
@@ -113,10 +112,9 @@ fn u64_to_str_ptr(value: *const u8) -> Option<String> {
     }
 }
 #[inline]
-fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> String {
+fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> Path {
     let base = caller.read().working_dir.clone();
-    let p = Path::parse(raw, Some(&base));
-    p.to_string()
+    Path::parse(raw, Some(&base))
 }
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
@@ -832,15 +830,14 @@ pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
         Ok(s) if !s.is_empty() => s,
         _ => return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0),
     };
-    let abs_str = {
+    let abs_path = {
         let base = caller.read().working_dir.clone();
-        let newp = Path::parse(raw, Some(&base));
-        newp.to_string()
+        Path::parse(raw, Some(&base))
     };
-    if block_on(File::list_dir(&abs_str)).is_err() {
+    if block_on(File::list_dir(&abs_path)).is_err() {
         return make_err(ErrClass::File, FileErr::PathInvalid as u16, 1);
     }
-    caller.write().working_dir = Path::parse(&abs_str, None);
+    caller.write().working_dir = abs_path;
     0
 }
 

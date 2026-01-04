@@ -22,7 +22,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
-use kernel_types::fs::{FsSeekWhence, OpenFlags};
+use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
@@ -540,9 +540,12 @@ async fn ensure_session_async(root: &str) -> BenchSessionInfo {
         }
     }
 
-    let _ = File::make_dir(root.to_string()).await;
+    let root_path = Path::from_string(root);
+    let _ = File::make_dir(&root_path).await;
 
-    let entries = File::list_dir(root).await.unwrap_or_else(|_| Vec::new());
+    let entries = File::list_dir(&root_path)
+        .await
+        .unwrap_or_else(|_| Vec::new());
     let mut max_id: u32 = 0;
     for e in entries {
         if let Some(id) = parse_session_suffix(&e) {
@@ -555,16 +558,19 @@ async fn ensure_session_async(root: &str) -> BenchSessionInfo {
     let new_id = max_id.saturating_add(1);
     let session_dir = join_path2(root, &format!("session_{new_id}"));
 
-    let _ = File::make_dir(session_dir.clone()).await;
-    let _ = File::make_dir(join_path2(&session_dir, "cores")).await;
-    let _ = File::make_dir(join_path2(&session_dir, "avg")).await;
-    let _ = File::make_dir(join_path2(&join_path2(&session_dir, "avg"), "windows")).await;
+    let _ = File::make_dir(&Path::from_string(&session_dir)).await;
+    let cores_dir = join_path2(&session_dir, "cores");
+    let avg_dir = join_path2(&session_dir, "avg");
+    let avg_windows_dir = join_path2(&avg_dir, "windows");
+    let _ = File::make_dir(&Path::from_string(&cores_dir)).await;
+    let _ = File::make_dir(&Path::from_string(&avg_dir)).await;
+    let _ = File::make_dir(&Path::from_string(&avg_windows_dir)).await;
 
     let ncores = bench_ncores();
     for i in 0..ncores {
-        let core_dir = join_path2(&join_path2(&session_dir, "cores"), &format!("core-{i}"));
-        let _ = File::make_dir(core_dir.clone()).await;
-        let _ = File::make_dir(join_path2(&core_dir, "windows")).await;
+        let core_dir = join_path2(&cores_dir, &format!("core-{i}"));
+        let _ = File::make_dir(&Path::from_string(&core_dir)).await;
+        let _ = File::make_dir(&Path::from_string(&join_path2(&core_dir, "windows"))).await;
     }
 
     let info = BenchSessionInfo {
@@ -578,7 +584,7 @@ async fn ensure_session_async(root: &str) -> BenchSessionInfo {
 }
 
 async fn compute_next_window_suffix_async(windows_root_avg: &str, name: &str) -> u32 {
-    let entries = File::list_dir(windows_root_avg)
+    let entries = File::list_dir(&Path::from_string(windows_root_avg))
         .await
         .unwrap_or_else(|_| Vec::new());
     let mut has_base = false;
@@ -634,7 +640,7 @@ async fn allocate_window_name_async(session_dir: &str, name: &str, ncores: usize
     drop(reg);
 
     let avg_win = join_path2(&windows_avg, &window_dir);
-    let _ = File::make_dir(avg_win).await;
+    let _ = File::make_dir(&Path::from_string(&avg_win)).await;
 
     for i in 0..ncores {
         let core_windows = join_path2(
@@ -642,7 +648,7 @@ async fn allocate_window_name_async(session_dir: &str, name: &str, ncores: usize
             "windows",
         );
         let core_win = join_path2(&core_windows, &window_dir);
-        let _ = File::make_dir(core_win).await;
+        let _ = File::make_dir(&Path::from_string(&core_win)).await;
     }
 
     window_dir
@@ -1579,9 +1585,10 @@ impl Drop for BenchWindow {
 // ===== File IO + heap =====
 
 pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Result<(), ()> {
-    File::make_dir(path.to_string()).await;
+    let dir_path = Path::from_string(path);
+    let _ = File::make_dir(&dir_path).await;
 
-    let file_path = format!("{path}\\{file_name}");
+    let file_path = Path::from_string(&format!("{path}\\{file_name}"));
 
     let mut file = match File::open(&file_path, &[OpenFlags::Create]).await {
         Ok(f) => f,

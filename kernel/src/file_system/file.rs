@@ -11,7 +11,7 @@ use alloc::{
 };
 use core::cmp::PartialEq;
 use kernel_types::{
-    fs::OpenFlags,
+    fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
 };
 
@@ -33,7 +33,7 @@ use crate::{
 #[derive(Debug)]
 pub struct File {
     fs_file_id: u64,
-    path: String,
+    path: Path,
     pub(crate) size: u64,
     is_dir: bool,
 }
@@ -92,7 +92,7 @@ impl File {
         Ok(())
     }
 
-    pub async fn open(path: &str, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
+    pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
         let (res, st) = file_provider::provider().open_path(path, flags).await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -102,7 +102,7 @@ impl File {
         }
         Ok(Self {
             fs_file_id: res.fs_file_id,
-            path: path.to_string(),
+            path: path.clone(),
             size: res.size,
             is_dir: res.is_dir,
         })
@@ -119,7 +119,7 @@ impl File {
         }
     }
 
-    pub async fn list_dir(path: &str) -> Result<Vec<String>, FileStatus> {
+    pub async fn list_dir(path: &Path) -> Result<Vec<String>, FileStatus> {
         let (r, st) = file_provider::provider().list_dir_path(path).await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -130,8 +130,8 @@ impl File {
         }
     }
 
-    pub async fn remove_dir(path: String) -> Result<(), FileStatus> {
-        let (r, st) = file_provider::provider().remove_dir_path(&path).await;
+    pub async fn remove_dir(path: &Path) -> Result<(), FileStatus> {
+        let (r, st) = file_provider::provider().remove_dir_path(path).await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
@@ -141,43 +141,25 @@ impl File {
         }
     }
 
-    pub async fn make_dir(path: String) -> Result<(), FileStatus> {
-        if path.is_empty() {
+    pub async fn make_dir(path: &Path) -> Result<(), FileStatus> {
+        if path.symlink.is_none() && path.components.is_empty() {
             return Err(FileStatus::BadPath);
         }
 
-        let bytes = path.as_bytes();
-        let drive = Self::get_drive_letter(bytes);
-
-        let (base, rest) = if let Some(d) = drive {
-            if bytes.len() < 3 || bytes[2] != b'\\' {
-                return Err(FileStatus::BadPath);
-            }
-            (format!("{d}\\"), &path[2..])
-        } else if path.starts_with('\\') {
-            ("\\".to_string(), path.as_str())
-        } else {
-            ("".to_string(), path.as_str())
-        };
-
-        let trimmed = rest.trim_matches('\\');
-        if trimmed.is_empty() {
+        if path.components.is_empty() {
             return Ok(());
         }
 
-        let mut cur = base;
+        // Create each directory in the path incrementally
+        let mut cur_path = Path {
+            symlink: path.symlink,
+            components: Vec::new(),
+        };
 
-        for comp in trimmed.split('\\') {
-            if comp.is_empty() {
-                continue;
-            }
+        for comp in &path.components {
+            cur_path.components.push(comp.clone());
 
-            if !cur.is_empty() && !cur.ends_with('\\') {
-                cur.push('\\');
-            }
-            cur.push_str(comp);
-
-            let (r, st) = file_provider::provider().make_dir_path(&cur).await;
+            let (r, st) = file_provider::provider().make_dir_path(&cur_path).await;
             if st != DriverStatus::Success {
                 return Err(FileStatus::UnknownFail);
             }
@@ -225,7 +207,7 @@ impl File {
         }
     }
 
-    pub async fn move_no_copy(&self, dst: &str) -> Result<(), FileStatus> {
+    pub async fn move_no_copy(&self, dst: &Path) -> Result<(), FileStatus> {
         let (r, st) = file_provider::provider().rename_path(&self.path, dst).await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -280,7 +262,7 @@ impl Drop for File {
     }
 }
 
-async fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
+async fn list(dir: &Path) -> alloc::vec::Vec<alloc::string::String> {
     let (res, _) = provider().list_dir_path(dir).await;
     if res.error.is_none() {
         res.names
@@ -289,18 +271,18 @@ async fn list(dir: &str) -> alloc::vec::Vec<alloc::string::String> {
     }
 }
 
-async fn read_all(path: &str) -> Option<alloc::vec::Vec<u8>> {
+async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
     match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
         Ok(f) => f.read().await.ok(),
         Err(_) => None,
     }
 }
 
-async fn ensure_dir(path: &str) {
+async fn ensure_dir(path: &Path) {
     let _ = provider().make_dir_path(path);
 }
 
-async fn file_exists(path: &str) -> bool {
+async fn file_exists(path: &Path) -> bool {
     match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
         Ok(_) => true,
         Err(_) => false,
@@ -312,10 +294,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     rebind_and_persist_after_provider_switch().await?;
 
-    let vfs_mod = "C:\\system\\mod";
-    let vfs_toml = "C:\\system\\toml";
-    ensure_dir(vfs_mod).await;
-    ensure_dir(vfs_toml).await;
+    let vfs_mod = Path::from_string("C:\\system\\mod");
+    let vfs_toml = Path::from_string("C:\\system\\toml");
+    ensure_dir(&vfs_mod).await;
+    ensure_dir(&vfs_toml).await;
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
     let secs = boot_ms / 1000;
