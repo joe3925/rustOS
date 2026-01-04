@@ -48,6 +48,17 @@ pub trait FileProvider: Send + Sync {
     fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)>;
 
     fn delete_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)>;
+
+    fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)>;
+
+    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)>;
+
+    fn zero_range(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u64,
+    ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)>;
 }
 
 static CURRENT_PROVIDER: RwLock<Option<Box<dyn FileProvider>>> = RwLock::new(None);

@@ -239,12 +239,22 @@ async fn save_snapshot(reg: &Registry) -> Result<(), kernel_types::status::RegEr
 
     let snap_path = snap_path();
     let mut file = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+
+    file.set_len(0)
+        .await
+        .map_err(|_| RegError::EncodingFailed)?;
+    file.seek(0, FsSeekWhence::Set)
+        .await
+        .map_err(|_| RegError::EncodingFailed)?;
+
     file.write(&bytes)
         .await
         .map_err(|_| RegError::EncodingFailed)?;
+
+    clear_wal().await?;
+    DELTAS_SINCE_SNAPSHOT.store(0, Ordering::Release);
     Ok(())
 }
-
 /// Parse a single WAL record from bytes, returning (header, delta, bytes_consumed) or None
 fn parse_wal_record(data: &[u8]) -> Option<(WalRecordHeader, RegDelta, usize)> {
     if data.len() < WalRecordHeader::SIZE {
@@ -355,7 +365,6 @@ fn encode_wal_record(seq: u64, delta: &RegDelta) -> Result<Vec<u8>, ()> {
 
 /// Append a delta to the WAL
 async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegError> {
-    use kernel_types::fs::FsSeekWhence;
     use kernel_types::status::RegError;
 
     let seq = WAL_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
@@ -364,11 +373,7 @@ async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegErr
     let wal_path = wal_path();
     let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
 
-    file.seek(0, FsSeekWhence::End)
-        .await
-        .map_err(|_| RegError::EncodingFailed)?;
-
-    file.write(&record)
+    file.append(&record)
         .await
         .map_err(|_| RegError::EncodingFailed)?;
 
@@ -376,12 +381,16 @@ async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegErr
 }
 /// Clear the WAL file
 async fn clear_wal() -> Result<(), kernel_types::status::RegError> {
-    let wal_path = wal_path();
-    if let Ok(mut file) = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
-        let _ = file.delete().await;
-    }
+    use kernel_types::status::RegError;
 
-    let _ = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let wal_path = wal_path();
+    let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    file.set_len(0)
+        .await
+        .map_err(|_| RegError::EncodingFailed)?;
+    file.seek(0, FsSeekWhence::Set)
+        .await
+        .map_err(|_| RegError::EncodingFailed)?;
     Ok(())
 }
 
@@ -390,8 +399,6 @@ async fn maybe_snapshot(reg: &Registry) -> Result<(), kernel_types::status::RegE
     let count = DELTAS_SINCE_SNAPSHOT.load(Ordering::Acquire);
     if count >= SNAPSHOT_DELTA_THRESHOLD {
         save_snapshot(reg).await?;
-        clear_wal().await?;
-        DELTAS_SINCE_SNAPSHOT.store(0, Ordering::Release);
     }
     Ok(())
 }
@@ -665,8 +672,6 @@ pub mod reg {
         ensure_loaded().await;
         let reg = REGISTRY.read();
         save_snapshot(&reg).await?;
-        clear_wal().await?;
-        DELTAS_SINCE_SNAPSHOT.store(0, Ordering::Release);
         Ok(())
     }
 
@@ -804,7 +809,6 @@ pub async fn is_first_boot() -> bool {
         Some(Data::Bool(true))
     )
 }
-
 async fn append_wal_many(deltas: &[RegDelta]) -> Result<(), RegError> {
     if deltas.is_empty() {
         return Ok(());
@@ -822,32 +826,89 @@ async fn append_wal_many(deltas: &[RegDelta]) -> Result<(), RegError> {
 
     let wal_path = wal_path();
     let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
-    file.seek(0, FsSeekWhence::End)
-        .await
-        .map_err(|_| RegError::EncodingFailed)?;
-    file.write(&buf)
+    file.append(&buf)
         .await
         .map_err(|_| RegError::EncodingFailed)?;
     Ok(())
 }
-/// Called after provider switch - replay in-memory WAL to disk, snapshot, clear WAL
+fn join_path(base: &str, seg: &str) -> String {
+    if base.is_empty() {
+        seg.to_string()
+    } else {
+        alloc::format!("{}/{}", base, seg)
+    }
+}
+
+fn merge_missing_key(base_path: &str, src: &Key, dst: &mut Key, out: &mut Vec<RegDelta>) {
+    for (name, data) in &src.values {
+        if !dst.values.contains_key(name) {
+            dst.values.insert(name.clone(), data.clone());
+            out.push(RegDelta::SetValue {
+                key_path: base_path.to_string(),
+                name: name.clone(),
+                data: data.clone(),
+            });
+        }
+    }
+
+    for (sub_name, sub_src) in &src.sub_keys {
+        let child_path = join_path(base_path, sub_name);
+
+        let existed = dst.sub_keys.contains_key(sub_name);
+        let sub_dst = dst
+            .sub_keys
+            .entry(sub_name.clone())
+            .or_insert_with(Key::empty);
+
+        if !existed {
+            out.push(RegDelta::CreateKey {
+                path: child_path.clone(),
+            });
+        }
+
+        merge_missing_key(&child_path, sub_src, sub_dst, out);
+    }
+}
+
+fn merge_missing_registry(src: &Registry, dst: &mut Registry) -> Vec<RegDelta> {
+    let mut out = Vec::new();
+
+    for (root_name, root_src) in &src.root {
+        let existed = dst.root.contains_key(root_name);
+        let root_dst = dst.root.entry(root_name.clone()).or_insert_with(Key::empty);
+
+        if !existed {
+            out.push(RegDelta::CreateKey {
+                path: root_name.clone(),
+            });
+        }
+
+        merge_missing_key(root_name, root_src, root_dst, &mut out);
+    }
+
+    out
+}
+
+/// Called after provider switch - rebase on disk (authoritative) and only persist missing boot defaults.
 pub async fn rebind_and_persist_after_provider_switch() -> Result<(), RegError> {
     ensure_loaded().await;
 
     let _ = File::make_dir(&Path::from_string("C:\\system\\registry")).await;
 
-    let current = (**REGISTRY.read()).clone();
+    let boot_view = (**REGISTRY.read()).clone();
 
     let mut disk_reg = load_snapshot().await.unwrap_or_else(Registry::empty);
-    let _ = replay_wal(&mut disk_reg).await;
+    let max_seq = replay_wal(&mut disk_reg).await;
+    WAL_SEQ.store(max_seq, Ordering::Release);
 
-    let deltas = reg::diff_registry(&disk_reg, &current);
+    let deltas = merge_missing_registry(&boot_view, &mut disk_reg);
 
-    append_wal_many(&deltas).await?;
+    if !deltas.is_empty() {
+        append_wal_many(&deltas).await?;
+        DELTAS_SINCE_SNAPSHOT.fetch_add(deltas.len() as u64, Ordering::SeqCst);
+    }
 
-    save_snapshot(&current).await?;
-    clear_wal().await?;
-    DELTAS_SINCE_SNAPSHOT.store(0, Ordering::Release);
+    *REGISTRY.write() = Arc::new(disk_reg);
 
     Ok(())
 }

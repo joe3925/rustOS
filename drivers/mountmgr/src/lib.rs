@@ -28,10 +28,11 @@ use kernel_api::{
         request::RequestData,
     },
     pnp::{
-        DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add,
-        pnp_create_control_device_and_link, pnp_create_device_symlink_top,
-        pnp_create_devnode_over_pdo_with_function, pnp_create_symlink, pnp_ioctl_via_symlink,
-        pnp_load_service, pnp_remove_symlink, pnp_send_request_via_symlink,
+        DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
+        driver_set_evt_device_add, pnp_create_control_device_and_link,
+        pnp_create_device_symlink_top, pnp_create_devnode_over_pdo_with_function,
+        pnp_create_symlink, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
+        pnp_send_request_via_symlink,
     },
     println,
     reg::{self, switch_to_vfs_async},
@@ -303,15 +304,76 @@ async fn try_bind_filesystems_for_parent_fdo(
     public_link: &str,
 ) -> bool {
     let _ = refresh_fs_registry_from_registry().await;
+
     let dx_vol = ext::<VolFdoExt>(parent_fdo);
     let vid = dx_vol.vid.get().copied().unwrap_or(0);
-    let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
+
     let parent_dn = match parent_fdo.dev_node.get().unwrap().upgrade() {
         Some(x) => x,
-        None => {
+        None => return false,
+    };
+
+    let stable_link = {
+        let vol_target = IoTarget {
+            target_device: parent_fdo.clone(),
+        };
+
+        let req = Arc::new(RwLock::new(
+            Request::new_pnp(
+                PnpRequest {
+                    minor_function: PnpMinorFunction::QueryResources,
+                    relation: DeviceRelationType::TargetDeviceRelation,
+                    id_type: QueryIdType::CompatibleIds,
+                    ids_out: Vec::new(),
+                    blob_out: Vec::new(),
+                },
+                RequestData::empty(),
+            )
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+        ));
+
+        kernel_api::pnp::pnp_send_request(vol_target, req.clone()).await;
+
+        let mut w = req.write();
+        if w.status != DriverStatus::Success {
             return false;
         }
+
+        let pi = match w.take_data::<kernel_api::kernel_types::io::PartitionInfo>() {
+            Some(v) => v,
+            None => return false,
+        };
+
+        let ge = match pi.gpt_entry {
+            Some(e) => e,
+            None => return false,
+        };
+
+        let guid = ge.unique_partition_guid;
+
+        let mut any_nonzero = false;
+        for &b in &guid {
+            if b != 0 {
+                any_nonzero = true;
+                break;
+            }
+        }
+        if !any_nonzero {
+            return false;
+        }
+
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        let mut id = String::new();
+        id.push_str("GPT.");
+        for &b in &guid {
+            id.push(HEX[(b >> 4) as usize] as char);
+            id.push(HEX[(b & 0xF) as usize] as char);
+        }
+
+        alloc::format!("\\GLOBAL\\Volumes\\{}", id)
     };
+
+    let inst_suffix = alloc::format!("FSINST.{:04X}", vid);
     let parent_inst = parent_dn.instance_path.clone();
     let fs_inst = alloc::format!("{}\\{}", parent_inst, inst_suffix);
 
@@ -324,6 +386,7 @@ async fn try_bind_filesystems_for_parent_fdo(
     let vol_target = IoTarget {
         target_device: parent_fdo.clone(),
     };
+
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
@@ -338,10 +401,11 @@ async fn try_bind_filesystems_for_parent_fdo(
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
         ));
+
         let err =
             pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone()).await;
         if err != DriverStatus::Success {
-            return false;
+            continue;
         }
 
         let mut w = req.write();
@@ -381,16 +445,16 @@ async fn try_bind_filesystems_for_parent_fdo(
 
             let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
             let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
+            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), stable_link.clone());
 
             let dx = ext::<VolFdoExt>(parent_fdo);
-            dx.fs_link.call_once(|| primary_link);
+            dx.fs_link.call_once(|| stable_link);
             return true;
         }
     }
 
     false
 }
-
 fn svc_for_tag(tag: &str) -> Option<String> {
     unsafe {
         FS_REGISTRY

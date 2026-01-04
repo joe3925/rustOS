@@ -712,6 +712,82 @@ impl Vfs {
             ),
         }
     }
+
+    pub async fn set_len(&self, mut p: FsSetLenParams) -> (FsSetLenResult, DriverStatus) {
+        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+            return (
+                FsSetLenResult {
+                    error: Some(FileStatus::PathNotFound),
+                },
+                DriverStatus::Success,
+            );
+        };
+        p.fs_file_id = h.inner_id;
+        match self
+            .call_fs::<FsSetLenParams, FsSetLenResult>(&h.volume_symlink, FsOp::SetLen, p)
+            .await
+        {
+            Ok(r) => (r, DriverStatus::Success),
+            Err(st) => (
+                FsSetLenResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                st,
+            ),
+        }
+    }
+
+    pub async fn append(&self, mut p: FsAppendParams) -> (FsAppendResult, DriverStatus) {
+        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+            return (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::PathNotFound),
+                },
+                DriverStatus::Success,
+            );
+        };
+        p.fs_file_id = h.inner_id;
+        match self
+            .call_fs::<FsAppendParams, FsAppendResult>(&h.volume_symlink, FsOp::Append, p)
+            .await
+        {
+            Ok(r) => (r, DriverStatus::Success),
+            Err(st) => (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::UnknownFail),
+                },
+                st,
+            ),
+        }
+    }
+
+    pub async fn zero_range(&self, mut p: FsZeroRangeParams) -> (FsZeroRangeResult, DriverStatus) {
+        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+            return (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::PathNotFound),
+                },
+                DriverStatus::Success,
+            );
+        };
+        p.fs_file_id = h.inner_id;
+        match self
+            .call_fs::<FsZeroRangeParams, FsZeroRangeResult>(&h.volume_symlink, FsOp::ZeroRange, p)
+            .await
+        {
+            Ok(r) => (r, DriverStatus::Success),
+            Err(st) => (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                st,
+            ),
+        }
+    }
 }
 
 impl FileProvider for Vfs {
@@ -852,6 +928,43 @@ impl FileProvider for Vfs {
                 DriverStatus::Success,
             )
         }
+        .into_ffi()
+    }
+
+    fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.set_len(FsSetLenParams {
+            fs_file_id: file_id,
+            new_size,
+        })
+        .into_ffi()
+    }
+
+    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+        let data = data.to_vec();
+
+        this.append(FsAppendParams {
+            fs_file_id: file_id,
+            data,
+        })
+        .into_ffi()
+    }
+
+    fn zero_range(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u64,
+    ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)> {
+        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
+
+        this.zero_range(FsZeroRangeParams {
+            fs_file_id: file_id,
+            offset,
+            len,
+        })
         .into_ffi()
     }
 }

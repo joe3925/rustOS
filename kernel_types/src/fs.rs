@@ -117,6 +117,9 @@ pub enum FsOp {
     SetInfo,
     Delete,
     Rename,
+    SetLen,
+    Append,
+    ZeroRange,
 }
 
 #[repr(C)]
@@ -266,6 +269,49 @@ pub struct FsGetInfoResult {
     pub attrs: u32,
     pub error: Option<FileStatus>,
 }
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsSetLenParams {
+    pub fs_file_id: u64,
+    pub new_size: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsSetLenResult {
+    pub error: Option<FileStatus>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsAppendParams {
+    pub fs_file_id: u64,
+    pub data: Vec<u8>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsAppendResult {
+    pub written: usize,
+    pub new_size: u64,
+    pub error: Option<FileStatus>,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsZeroRangeParams {
+    pub fs_file_id: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FsZeroRangeResult {
+    pub error: Option<FileStatus>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[repr(C)]
 pub struct Path {

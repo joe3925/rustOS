@@ -244,6 +244,59 @@ impl File {
             Some(e) => Err(e),
         }
     }
+
+    /// Sets the file length to the specified size.
+    /// If `new_size` is less than the current size, the file is truncated.
+    /// If `new_size` is greater than the current size, the file is extended
+    /// with zero bytes for reads in the extended region.
+    pub async fn set_len(&mut self, new_size: u64) -> Result<(), FileStatus> {
+        let (res, st) = file_provider::provider()
+            .set_len(self.fs_file_id, new_size)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = res.error {
+            return Err(e);
+        }
+        self.size = new_size;
+        Ok(())
+    }
+
+    /// Appends data to the end of the file atomically.
+    /// Returns the number of bytes written and updates the cached file size.
+    pub async fn append(&mut self, data: &[u8]) -> Result<usize, FileStatus> {
+        let (res, st) = file_provider::provider()
+            .append(self.fs_file_id, data)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        if let Some(e) = res.error {
+            return Err(e);
+        }
+        self.size = res.new_size;
+        Ok(res.written)
+    }
+
+    /// Zeros the specified byte range within the file.
+    /// The range must be within the current file bounds (offset <= file_len).
+    /// If the range extends past EOF, only bytes up to EOF are zeroed.
+    pub async fn zero_range(&mut self, offset: u64, len: u64) -> Result<(), FileStatus> {
+        let (res, st) = file_provider::provider()
+            .zero_range(self.fs_file_id, offset, len)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match res.error {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
 }
 impl Drop for File {
     fn drop(&mut self) {

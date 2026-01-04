@@ -21,10 +21,12 @@ use kernel_api::request::{Request, RequestType};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
-        FileAttribute, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult, FsFlushParams,
-        FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp,
-        FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams, FsRenameResult,
-        FsSeekParams, FsSeekResult, FsSeekWhence, FsWriteParams, FsWriteResult,
+        FileAttribute, FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult,
+        FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams,
+        FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult,
+        FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
+        FsSeekWhence, FsSetLenParams, FsSetLenResult, FsWriteParams, FsWriteResult,
+        FsZeroRangeParams, FsZeroRangeResult,
     },
     request_handler,
 };
@@ -502,6 +504,185 @@ fn handle_fs_request(
                             });
                         }
                     }
+                    DriverStatus::Success
+                }
+
+                FsOp::SetLen => {
+                    let params: FsSetLenParams = match take_typed_params::<FsSetLenParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
+                    };
+
+                    let (path, is_dir) = {
+                        let tbl = vdx.table.read();
+                        match tbl.get(&params.fs_file_id) {
+                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
+                            None => {
+                                let mut r = req.write();
+                                r.set_data_t(FsSetLenResult {
+                                    error: Some(FileStatus::PathNotFound),
+                                });
+                                return DriverStatus::Success;
+                            }
+                        }
+                    };
+
+                    let err = if is_dir {
+                        Some(FileStatus::AccessDenied)
+                    } else {
+                        match fs.root_dir().open_file(&path.to_string()) {
+                            Ok(mut file) => {
+                                match file.seek(SeekFrom::Start(params.new_size)) {
+                                    Ok(_) => match file.truncate() {
+                                        Ok(()) => match file.flush() {
+                                            Ok(()) => None,
+                                            Err(e) => Some(map_fatfs_err(&e)),
+                                        },
+                                        Err(e) => Some(map_fatfs_err(&e)),
+                                    },
+                                    Err(e) => Some(map_fatfs_err(&e)),
+                                }
+                            }
+                            Err(e) => Some(map_fatfs_err(&e)),
+                        }
+                    };
+
+                    let mut r = req.write();
+                    r.set_data_t(FsSetLenResult { error: err });
+                    DriverStatus::Success
+                }
+
+                FsOp::Append => {
+                    let params: FsAppendParams = match take_typed_params::<FsAppendParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
+                    };
+
+                    let (path, is_dir) = {
+                        let tbl = vdx.table.read();
+                        match tbl.get(&params.fs_file_id) {
+                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
+                            None => {
+                                let mut r = req.write();
+                                r.set_data_t(FsAppendResult {
+                                    written: 0,
+                                    new_size: 0,
+                                    error: Some(FileStatus::PathNotFound),
+                                });
+                                return DriverStatus::Success;
+                            }
+                        }
+                    };
+
+                    let result = if is_dir {
+                        Err(FileStatus::AccessDenied)
+                    } else {
+                        match fs.root_dir().open_file(&path.to_string()) {
+                            Ok(mut file) => {
+                                match file.seek(SeekFrom::End(0)) {
+                                    Ok(_) => {
+                                        let n = params.data.len();
+                                        match file.write_all(&params.data) {
+                                            Ok(()) => match file.flush() {
+                                                Ok(()) => {
+                                                    let new_size =
+                                                        file.seek(SeekFrom::End(0)).unwrap_or(0);
+                                                    Ok((n, new_size))
+                                                }
+                                                Err(e) => Err(map_fatfs_err(&e)),
+                                            },
+                                            Err(e) => Err(map_fatfs_err(&e)),
+                                        }
+                                    }
+                                    Err(e) => Err(map_fatfs_err(&e)),
+                                }
+                            }
+                            Err(e) => Err(map_fatfs_err(&e)),
+                        }
+                    };
+
+                    // Update position on success
+                    if let Ok((_, new_size)) = result {
+                        let mut tbl = vdx.table.write();
+                        if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
+                            ctx.pos = new_size;
+                        }
+                    }
+
+                    let mut r = req.write();
+                    match result {
+                        Ok((written, new_size)) => r.set_data_t(FsAppendResult {
+                            written,
+                            new_size,
+                            error: None,
+                        }),
+                        Err(status) => r.set_data_t(FsAppendResult {
+                            written: 0,
+                            new_size: 0,
+                            error: Some(status),
+                        }),
+                    }
+                    DriverStatus::Success
+                }
+
+                FsOp::ZeroRange => {
+                    let params: FsZeroRangeParams =
+                        match take_typed_params::<FsZeroRangeParams>(req) {
+                            Ok(p) => p,
+                            Err(st) => return st,
+                        };
+
+                    let (path, is_dir) = {
+                        let tbl = vdx.table.read();
+                        match tbl.get(&params.fs_file_id) {
+                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
+                            None => {
+                                let mut r = req.write();
+                                r.set_data_t(FsZeroRangeResult {
+                                    error: Some(FileStatus::PathNotFound),
+                                });
+                                return DriverStatus::Success;
+                            }
+                        }
+                    };
+
+                    let err = if is_dir {
+                        Some(FileStatus::AccessDenied)
+                    } else {
+                        match fs.root_dir().open_file(&path.to_string()) {
+                            Ok(mut file) => {
+                                let file_len = file.seek(SeekFrom::End(0)).unwrap_or(0);
+                                let end = params.offset.saturating_add(params.len);
+                                if params.offset > file_len {
+                                    Some(FileStatus::BadPath)
+                                } else {
+                                    let actual_end = end.min(file_len);
+                                    let zero_len = actual_end.saturating_sub(params.offset);
+                                    if zero_len == 0 {
+                                        None
+                                    } else {
+                                        match file.seek(SeekFrom::Start(params.offset)) {
+                                            Ok(_) => {
+                                                let zeros = vec![0u8; zero_len as usize];
+                                                match file.write_all(&zeros) {
+                                                    Ok(()) => match file.flush() {
+                                                        Ok(()) => None,
+                                                        Err(e) => Some(map_fatfs_err(&e)),
+                                                    },
+                                                    Err(e) => Some(map_fatfs_err(&e)),
+                                                }
+                                            }
+                                            Err(e) => Some(map_fatfs_err(&e)),
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => Some(map_fatfs_err(&e)),
+                        }
+                    };
+
+                    let mut r = req.write();
+                    r.set_data_t(FsZeroRangeResult { error: err });
                     DriverStatus::Success
                 }
 

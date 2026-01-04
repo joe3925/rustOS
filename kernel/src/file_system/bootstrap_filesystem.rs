@@ -781,6 +781,230 @@ impl<'a> BootstrapProvider<'a> {
 
         (FsCreateResult { error: None }, DriverStatus::Success)
     }
+
+    fn set_len_sync(&self, file_id: u64, new_size: u64) -> (FsSetLenResult, DriverStatus) {
+        let path = match self.handles.read().get(&file_id) {
+            Some(p) => p.clone(),
+            None => {
+                return (
+                    FsSetLenResult {
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        let mut map = self.nodes.write();
+        let node = match map.get_mut(&path) {
+            Some(n) => n,
+            None => {
+                return (
+                    FsSetLenResult {
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        if node.is_dir {
+            return (
+                FsSetLenResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            );
+        }
+
+        match node.data.as_mut() {
+            Some(DataRef::Ram(v)) => {
+                v.resize(new_size as usize, 0);
+                (FsSetLenResult { error: None }, DriverStatus::Success)
+            }
+            Some(DataRef::Static(_)) => (
+                FsSetLenResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            Some(DataRef::Alias(_)) => (
+                FsSetLenResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            None => (
+                FsSetLenResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::Success,
+            ),
+        }
+    }
+
+    fn append_sync(&self, file_id: u64, data: &[u8]) -> (FsAppendResult, DriverStatus) {
+        let path = match self.handles.read().get(&file_id) {
+            Some(p) => p.clone(),
+            None => {
+                return (
+                    FsAppendResult {
+                        written: 0,
+                        new_size: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        let mut map = self.nodes.write();
+        let node = match map.get_mut(&path) {
+            Some(n) => n,
+            None => {
+                return (
+                    FsAppendResult {
+                        written: 0,
+                        new_size: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        if node.is_dir {
+            return (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            );
+        }
+
+        match node.data.as_mut() {
+            Some(DataRef::Ram(v)) => {
+                v.extend_from_slice(data);
+                let new_size = v.len() as u64;
+                (
+                    FsAppendResult {
+                        written: data.len(),
+                        new_size,
+                        error: None,
+                    },
+                    DriverStatus::Success,
+                )
+            }
+            Some(DataRef::Static(_)) => (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            Some(DataRef::Alias(_)) => (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            None => (
+                FsAppendResult {
+                    written: 0,
+                    new_size: 0,
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::Success,
+            ),
+        }
+    }
+
+    fn zero_range_sync(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u64,
+    ) -> (FsZeroRangeResult, DriverStatus) {
+        let path = match self.handles.read().get(&file_id) {
+            Some(p) => p.clone(),
+            None => {
+                return (
+                    FsZeroRangeResult {
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        let mut map = self.nodes.write();
+        let node = match map.get_mut(&path) {
+            Some(n) => n,
+            None => {
+                return (
+                    FsZeroRangeResult {
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                )
+            }
+        };
+
+        if node.is_dir {
+            return (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            );
+        }
+
+        match node.data.as_mut() {
+            Some(DataRef::Ram(v)) => {
+                let file_len = v.len() as u64;
+                if offset > file_len {
+                    return (
+                        FsZeroRangeResult {
+                            error: Some(FileStatus::BadPath),
+                        },
+                        DriverStatus::Success,
+                    );
+                }
+                let end = (offset.saturating_add(len)).min(file_len);
+                let zero_len = end.saturating_sub(offset) as usize;
+                if zero_len > 0 {
+                    let start = offset as usize;
+                    for i in start..start + zero_len {
+                        v[i] = 0;
+                    }
+                }
+                (FsZeroRangeResult { error: None }, DriverStatus::Success)
+            }
+            Some(DataRef::Static(_)) => (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            Some(DataRef::Alias(_)) => (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::AccessDenied),
+                },
+                DriverStatus::Success,
+            ),
+            None => (
+                FsZeroRangeResult {
+                    error: Some(FileStatus::UnknownFail),
+                },
+                DriverStatus::Success,
+            ),
+        }
+    }
 }
 
 impl<'a> FileProvider for BootstrapProvider<'a> {
@@ -858,6 +1082,26 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
 
     fn delete_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
         let res = self.delete_path_sync(&path.to_string());
+        async move { res }.into_ffi()
+    }
+
+    fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)> {
+        let res = self.set_len_sync(file_id, new_size);
+        async move { res }.into_ffi()
+    }
+
+    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)> {
+        let res = self.append_sync(file_id, data);
+        async move { res }.into_ffi()
+    }
+
+    fn zero_range(
+        &self,
+        file_id: u64,
+        offset: u64,
+        len: u64,
+    ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)> {
+        let res = self.zero_range_sync(file_id, offset, len);
         async move { res }.into_ffi()
     }
 }
