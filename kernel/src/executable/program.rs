@@ -440,9 +440,6 @@ impl Program {
                 if task.terminated {
                     return;
                 }
-                if task.is_sleeping {
-                    task.is_sleeping = false;
-                }
             }
         }
     }

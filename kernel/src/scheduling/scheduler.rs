@@ -1,4 +1,5 @@
 // scheduling/scheduler.rs
+
 use crate::cpu;
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::timer_driver::PER_CORE_SWITCHES;
@@ -6,10 +7,9 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::stack::StackSize;
 use crate::println;
 use crate::scheduling::state::State;
-use crate::scheduling::task::{idle_task, Task};
+use crate::scheduling::task::{idle_task, ParkState, Task};
 use crate::static_handlers::task_yield;
 use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
-
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -122,14 +122,12 @@ impl Scheduler {
             }
 
             let start = (self.next_task_id.load(Ordering::Relaxed) as usize) % n;
-
             let mut best = start;
             let mut best_load = usize::MAX;
 
             for k in 0..n {
                 let i = (start + k) % n;
                 let load = self.core_effective_load(i);
-
                 if load < best_load {
                     best_load = load;
                     best = i;
@@ -172,12 +170,14 @@ impl Scheduler {
             }
         }
 
+        // Periodic load balancing
         if (now_ms % 500) == 0 {
             if let Some(_guard) = self.balance_lock.try_lock() {
-                //self.balance();
+                // self.balance();
             }
         }
 
+        // Schedule next task
         let next = match self.schedule_next(cpu_id, now_cycles) {
             Some(task) => task,
             None => return,
@@ -202,12 +202,11 @@ impl Scheduler {
 
         unsafe { (*ctx_ptr).restore(state) };
     }
+
     #[inline(always)]
     fn core_effective_load(&self, i: usize) -> usize {
         let core = &self.cores[i];
-
         let rq_len = core.run_queue.lock().len();
-
         let running = {
             let g = core.current.read();
             match g.as_ref() {
@@ -215,13 +214,13 @@ impl Scheduler {
                 _ => 0,
             }
         };
-
         rq_len + running
     }
+
     fn schedule_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
         let core = &self.cores[cpu_id];
-
         let mut current_guard = core.current.write();
+
         let previous = current_guard.take();
         let mut previous_for_fallback = previous.clone();
 
@@ -229,15 +228,24 @@ impl Scheduler {
             if !Arc::ptr_eq(previous_task, &core.idle_task) {
                 if let Some(t) = previous_task.try_read() {
                     t.account_switched_out(now_cycles);
-
                     let terminated = t.terminated;
-                    let sleeping = t.is_sleeping;
+                    let park_state = t.park_state();
+
+                    drop(t);
 
                     if terminated {
                         previous_for_fallback = None;
-                    } else if sleeping {
-                        core.sleep_queue.lock().push(previous_task.clone());
-                        previous_for_fallback = None;
+                    } else if park_state == ParkState::ParkRequested
+                        || park_state == ParkState::UnparkPending
+                    {
+                        let actually_park = previous_task.read().park_commit();
+
+                        if actually_park {
+                            core.sleep_queue.lock().push(previous_task.clone());
+                            previous_for_fallback = None;
+                        } else {
+                            core.run_queue.lock().push_back(previous_task.clone());
+                        }
                     } else {
                         core.run_queue.lock().push_back(previous_task.clone());
                     }
@@ -248,6 +256,7 @@ impl Scheduler {
             }
         }
 
+        // Try to find a runnable task from the run queue
         let mut run_queue_guard = core.run_queue.lock();
         let len = run_queue_guard.len();
         let mut next: Option<TaskHandle> = None;
@@ -264,6 +273,7 @@ impl Scheduler {
         }
         drop(run_queue_guard);
 
+        // If we found a task, schedule it
         if let Some(n) = next {
             if let Some(t) = n.try_read() {
                 t.mark_scheduled_in(cpu_id, now_cycles);
@@ -274,44 +284,64 @@ impl Scheduler {
             return Some(n);
         }
 
+        // No task in run queue - try to continue with previous if it's still runnable
         if let Some(prev) = previous_for_fallback {
             if let Some(t) = prev.try_read() {
-                t.mark_scheduled_in(cpu_id, now_cycles);
-            } else {
-                return None;
+                if t.park_state() == ParkState::Running {
+                    t.mark_scheduled_in(cpu_id, now_cycles);
+                    drop(t);
+                    *current_guard = Some(prev.clone());
+                    return Some(prev.clone());
+                }
             }
-            *current_guard = Some(prev.clone());
-            return Some(prev);
         }
 
+        // Fall back to idle task
         if let Some(t) = core.idle_task.try_read() {
             t.mark_scheduled_in(cpu_id, now_cycles);
         } else {
             return None;
         }
+
         *current_guard = Some(core.idle_task.clone());
         Some(core.idle_task.clone())
     }
 
     pub fn wake_task(&self, task_handle: &TaskHandle) {
         without_interrupts(|| {
-            task_handle.write().is_sleeping = false;
+            let needs_queue_move = task_handle.read().unpark();
 
-            let n = self.num_cores.load(Ordering::Relaxed);
-            for i in 0..n {
-                let mut sleep_lock = self.cores[i].sleep_queue.lock();
-                if let Some(idx) = sleep_lock.iter().position(|t| Arc::ptr_eq(t, task_handle)) {
-                    sleep_lock.swap_remove(idx);
-                    drop(sleep_lock);
-
-                    self.cores[i]
-                        .run_queue
-                        .lock()
-                        .push_back(task_handle.clone());
-                    return;
+            if needs_queue_move {
+                let n = self.num_cores.load(Ordering::Relaxed);
+                for i in 0..n {
+                    let mut sleep_lock = self.cores[i].sleep_queue.lock();
+                    if let Some(idx) = sleep_lock.iter().position(|t| Arc::ptr_eq(t, task_handle)) {
+                        sleep_lock.swap_remove(idx);
+                        drop(sleep_lock);
+                        self.cores[i]
+                            .run_queue
+                            .lock()
+                            .push_back(task_handle.clone());
+                        return;
+                    }
                 }
+
+                self.cores[0]
+                    .run_queue
+                    .lock()
+                    .push_back(task_handle.clone());
             }
         });
+    }
+
+    /// Wake a task by its ID.
+    pub fn wake_task_by_id(&self, task_id: u64) -> Result<(), TaskError> {
+        if let Some(handle) = self.get_task_by_id(task_id) {
+            self.wake_task(&handle);
+            Ok(())
+        } else {
+            Err(TaskError::NotFound(task_id))
+        }
     }
 
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
@@ -320,7 +350,6 @@ impl Scheduler {
 
     pub fn balance(&self) {
         let n = self.num_cores.load(Ordering::Relaxed);
-
         let mut busiest = 0usize;
         let mut least = 0usize;
         let mut max_len = 0usize;
@@ -328,7 +357,6 @@ impl Scheduler {
 
         for i in 0..n {
             let len = self.cores[i].run_queue.lock().len();
-
             if len > max_len {
                 max_len = len;
                 busiest = i;
@@ -340,14 +368,9 @@ impl Scheduler {
         }
 
         if n >= 2 && busiest != least && max_len > min_len + 1 {
-            let moved = {
-                let mut q = self.cores[busiest].run_queue.lock();
-                q.pop_back()
-            };
-
+            let moved = { self.cores[busiest].run_queue.lock().pop_back() };
             if let Some(task) = moved {
-                let mut q = self.cores[least].run_queue.lock();
-                q.push_front(task);
+                self.cores[least].run_queue.lock().push_front(task);
             }
         }
     }
@@ -359,7 +382,8 @@ impl Scheduler {
     pub fn delete_task(&self, id: u64) -> Result<(), TaskError> {
         if let Some(h) = self.get_task_by_id(id) {
             h.write().terminated = true;
-            if h.read().is_sleeping {
+            let is_parked = h.read().is_parked();
+            if is_parked {
                 self.wake_task(&h);
             }
             Ok(())
@@ -373,6 +397,7 @@ impl Scheduler {
         if t.parent_pid == 0 {
             return;
         }
+
         if let Some(program) = PROGRAM_MANAGER.get(t.parent_pid) {
             unsafe { Cr3::write(program.read().cr3, Cr3::read().1) };
         } else {
@@ -382,23 +407,53 @@ impl Scheduler {
         }
     }
 
-    pub fn sleep_and_yield(&self) {
-        without_interrupts(|| {
+    pub fn park_and_yield(&self) {
+        let should_yield = without_interrupts(|| {
             let cpu_id = current_cpu_id() as usize;
             if let Some(task) = self.get_current_task(cpu_id) {
-                task.write().is_sleeping = true;
+                // park_begin() returns false if an unpark is already pending
+                task.read().park_begin()
+            } else {
+                false
             }
         });
-        unsafe { task_yield() };
+
+        if should_yield {
+            unsafe { task_yield() };
+        }
     }
 
-    pub fn sleep(&self) {
-        without_interrupts(|| {
+    /// Park with a condition check. Only parks if the condition is true.
+    ///
+    /// This is useful for patterns like:
+    /// ```
+    /// while !condition_met() {
+    ///     scheduler.park_while(|| !condition_met());
+    /// }
+    /// ```
+    ///
+    /// The condition is checked with interrupts disabled, preventing races.
+    pub fn park_while<F>(&self, should_park: F)
+    where
+        F: FnOnce() -> bool,
+    {
+        let should_yield = without_interrupts(|| {
+            // Check condition first
+            if !should_park() {
+                return false;
+            }
+
             let cpu_id = current_cpu_id() as usize;
             if let Some(task) = self.get_current_task(cpu_id) {
-                task.write().sleep();
+                task.read().park_begin()
+            } else {
+                false
             }
         });
+
+        if should_yield {
+            unsafe { task_yield() };
+        }
     }
 }
 
@@ -415,22 +470,41 @@ pub extern "win64" fn yield_handler_win64(state: *mut State) {
 pub extern "win64" fn yield_interrupt_entry() -> ! {
     naked_asm!(
         "cli",
-        "push r15","push r14","push r13","push r12",
-        "push r11","push r10","push r9","push r8",
-        "push rdi","push rsi","push rbp","push rbx",
-        "push rdx","push rcx","push rax",
-
-        "mov  rcx, rsp",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rbx",
+        "push rdx",
+        "push rcx",
+        "push rax",
+        "mov rcx, rsp",
         "cld",
-
-        "sub  rsp, 40",
+        "sub rsp, 40",
         "call {handler}",
-        "add  rsp, 40",
-
-        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
-        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
-        "pop  r9","pop  r10","pop  r11","pop  r12",
-        "pop  r13","pop  r14","pop  r15",
+        "add rsp, 40",
+        "pop rax",
+        "pop rcx",
+        "pop rdx",
+        "pop rbx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
         "sti",
         "iretq",
         handler = sym yield_handler_win64,

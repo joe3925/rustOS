@@ -70,12 +70,8 @@ pub extern "win64" fn create_kernel_task(
     SCHEDULER.add_task(task)
 }
 
-pub unsafe extern "win64" fn sleep_self() {
-    SCHEDULER.sleep();
-}
-
-pub unsafe extern "win64" fn sleep_self_and_yield() {
-    SCHEDULER.sleep_and_yield();
+pub unsafe extern "win64" fn park_self_and_yield() {
+    SCHEDULER.park_and_yield();
 }
 
 pub extern "win64" fn wake_task(id: u64) {

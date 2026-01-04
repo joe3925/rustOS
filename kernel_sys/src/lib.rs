@@ -52,8 +52,7 @@ unsafe extern "win64" {
     pub fn submit_runtime_internal(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn submit_blocking_internal(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn try_steal_blocking_one() -> bool;
-    pub unsafe fn sleep_self();
-    pub unsafe fn sleep_self_and_yield();
+    pub unsafe fn park_self_and_yield();
     pub unsafe fn wake_task(id: u64);
     // =========================================================================
     // IRQ
