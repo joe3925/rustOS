@@ -50,3 +50,19 @@ pub fn set_fs_base(base: u64) {
     const IA32_FS_BASE: u32 = 0xC000_0100;
     write_msr(IA32_FS_BASE, base);
 }
+
+#[inline(always)]
+pub fn read_msr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+    ((high as u64) << 32) | (low as u64)
+}

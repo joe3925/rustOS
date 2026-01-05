@@ -642,11 +642,15 @@ extern "C" fn ap_startup() -> ! {
         CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();
 
+        // TLS must be initialized before GDT/heap usage
+        let cpu_slot = CPU_ID.fetch_add(1, Ordering::Acquire) as u32;
+        unsafe { crate::memory::tls::init_cpu_tls(cpu_slot) };
+
         unsafe { PER_CPU_GDT.lock().init_gdt() };
         IDT.load();
 
         let lapic_id = get_current_logical_id() as u32;
-        init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+        init_percpu_gs(cpu_slot);
 
         unsafe {
             let mut guard = APIC.lock();

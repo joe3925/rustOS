@@ -98,13 +98,6 @@ fn main() {
     let mut b = cc::Build::new();
     b.cpp(true);
 
-    let target = env::var("TARGET").unwrap();
-
-    let elf_triple = match target.as_str() {
-        "x86_64-unknown-none" => "x86_64-unknown-none-elf",
-        _ => target.as_str(),
-    };
-
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 

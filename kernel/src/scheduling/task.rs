@@ -8,6 +8,7 @@ use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stac
 use crate::memory::paging::virt_tracker::{
     allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
 };
+use crate::memory::tls::TlsBlock;
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
@@ -46,7 +47,6 @@ impl From<u8> for ParkState {
         }
     }
 }
-
 #[derive(Debug)]
 pub struct Task {
     pub name: String,
@@ -59,6 +59,9 @@ pub struct Task {
     pub parent_pid: u64,
     pub executer_id: Option<u64>,
     pub stack_size: u64,
+
+    /// TLS block for this task (None for boot CPU tasks using bootstrap arena)
+    pub tls_block: Option<TlsBlock>,
 
     /// Atomic park state - replaces the old `is_sleeping` bool
     park_state: AtomicU8,
@@ -113,6 +116,14 @@ impl Task {
             .0 as u64
             | 3;
 
+        // Allocate TLS block for this task
+        let tls_block = crate::memory::tls::alloc_heap_tls_block();
+        if let Some(ref block) = tls_block {
+            unsafe {
+                crate::memory::tls::init_task_tls(block, 0);
+            }
+        }
+
         Arc::new(RwLock::new(Self {
             name,
             context: state,
@@ -124,6 +135,7 @@ impl Task {
             parent_pid,
             executer_id: None,
             stack_size,
+            tls_block,
             park_state: AtomicU8::new(ParkState::Running as u8),
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
@@ -174,6 +186,14 @@ impl Task {
             .kernel_data_selector
             .0 as u64;
 
+        // Allocate TLS block for this task
+        let tls_block = crate::memory::tls::alloc_heap_tls_block();
+        if let Some(ref block) = tls_block {
+            unsafe {
+                crate::memory::tls::init_task_tls(block, 0);
+            }
+        }
+
         Arc::new(RwLock::new(Self {
             name,
             context: state,
@@ -185,6 +205,7 @@ impl Task {
             parent_pid,
             executer_id: None,
             stack_size: stack_size.as_bytes(),
+            tls_block,
             park_state: AtomicU8::new(ParkState::Running as u8),
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
@@ -199,6 +220,13 @@ impl Task {
     }
 
     pub fn destroy(&mut self) {
+        // Free TLS block if present
+        if let Some(block) = self.tls_block.take() {
+            unsafe {
+                crate::memory::tls::free_heap_tls_block(block);
+            }
+        }
+
         if self.is_user_mode {
             todo!();
         } else {

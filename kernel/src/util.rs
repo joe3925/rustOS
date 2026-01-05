@@ -29,6 +29,7 @@ use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAlloca
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
+use crate::memory::tls;
 use crate::registry::is_first_boot;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::{spawn, spawn_detached};
@@ -83,6 +84,11 @@ lazy_static! {
     });
 }
 pub unsafe fn init() {
+    tls::extract_tls_template(boot_info());
+    tls::validate_bootstrap_size(&tls::TLS_TEMPLATE)
+        .expect("TLS template too large for bootstrap arena");
+    tls::init_cpu_tls(0); // BSP = CPU 0
+
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);

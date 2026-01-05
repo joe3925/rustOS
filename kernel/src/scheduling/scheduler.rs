@@ -467,7 +467,7 @@ pub extern "win64" fn yield_handler_win64(state: *mut State) {
 }
 
 #[unsafe(naked)]
-pub extern "win64" fn yield_interrupt_entry() -> ! {
+pub extern "win64" fn yield_interrupt_entry() {
     naked_asm!(
         "cli",
         "push r15",

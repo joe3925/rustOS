@@ -1,6 +1,7 @@
 #![feature(trusted_random_access)]
 #![feature(abi_x86_interrupt)]
 #![feature(ascii_char)]
+#![feature(thread_local)]
 #![no_std]
 #![no_main]
 #![allow(unused_parens)]
