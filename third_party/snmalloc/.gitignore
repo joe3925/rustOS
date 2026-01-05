@@ -1,0 +1,26 @@
+# conventional build dirs
+/release*/
+/debug*/
+/build*/
+/cmake-build-*/
+/out*/
+/dist/
+
+/tidy.fail
+
+# cmake intermediate files
+/CMakeFiles/
+
+# vscode dirs
+.vscode/
+.vs/
+
+# jetbrains IDE dirs
+.idea/
+
+# special endings
+*~
+*.sw?
+
+# cache dirs
+.cache
