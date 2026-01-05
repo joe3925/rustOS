@@ -55,7 +55,7 @@ impl BootInfoFrameAllocator {
         NEXT_WORD_1G.store(0, Ordering::Release);
     }
 
-    pub fn init(_memory_regions: &'static [MemoryRegion]) -> Self {
+    pub fn init() -> Self {
         BootInfoFrameAllocator {}
     }
 

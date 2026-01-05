@@ -31,3 +31,22 @@ pub fn get_cpu_info() -> CpuId<CpuIdReaderNative> {
     let info = CpuId::new();
     info
 }
+
+#[inline(always)]
+pub fn write_msr(msr: u32, val: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") val as u32,
+            in("edx") (val >> 32) as u32,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[inline(always)]
+pub fn set_fs_base(base: u64) {
+    const IA32_FS_BASE: u32 = 0xC000_0100;
+    write_msr(IA32_FS_BASE, base);
+}

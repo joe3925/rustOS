@@ -31,7 +31,7 @@ pub extern "win64" fn map_mmio_region(
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     for i in 0..num_pages {
         let page = Page::containing_address(virtual_addr + i * 4096);

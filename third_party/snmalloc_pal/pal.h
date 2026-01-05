@@ -2,6 +2,16 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
+#include <time.h>
+
+// Stubs for functions snmalloc references but we don't use on x86_64 freestanding
+// (the code paths using these are compile-time dead on x86_64, but still parsed)
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 0
+#endif
+inline int clock_gettime(int, struct timespec*) { return -1; }
+[[noreturn]] inline void abort() { while(1); }
 
 #include "snmalloc/aal/aal.h"
 #include "snmalloc/ds_core/ds_core.h"

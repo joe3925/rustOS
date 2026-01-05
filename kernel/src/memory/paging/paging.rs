@@ -95,7 +95,7 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
     );
 
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     // Constants
     const GiB: u64 = 1 << 30;
@@ -176,7 +176,7 @@ pub unsafe extern "win64" fn identity_map_page(
             .ok_or(MapToError::FrameAllocationFailed)?,
     );
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
     let page_size = 0x1000;
 
     let num_pages = (range + 0xFFF) / page_size;
@@ -288,7 +288,7 @@ pub unsafe fn map_kernel_range(
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     map_range_with_huge_pages(&mut mapper, addr, size, &mut frame_allocator, flags)
 }

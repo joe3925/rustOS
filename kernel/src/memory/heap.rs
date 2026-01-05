@@ -17,7 +17,7 @@ pub(crate) fn init_heap() {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 

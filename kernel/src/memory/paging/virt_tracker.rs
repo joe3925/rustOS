@@ -54,7 +54,7 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     unsafe {
         map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
@@ -76,7 +76,7 @@ pub extern "win64" fn allocate_kernel_range_mapped(
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     unsafe {
         map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
@@ -129,7 +129,7 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
 
     unsafe {
         map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)

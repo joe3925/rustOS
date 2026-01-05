@@ -211,7 +211,7 @@ impl Program {
                     .expect("phys mem off missing"),
             );
             let mut mapper = init_mapper(phys_mem_offset);
-            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+            let mut frame_alloc = BootInfoFrameAllocator::init();
             let flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;
@@ -248,7 +248,7 @@ impl Program {
                     .expect("phys mem off missing"),
             );
             let mut mapper = init_mapper(phys_mem_offset);
-            let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+            let mut frame_alloc = BootInfoFrameAllocator::init();
             let flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;

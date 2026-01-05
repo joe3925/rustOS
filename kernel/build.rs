@@ -117,6 +117,9 @@ fn main() {
     let mut b = cc::Build::new();
     b.cpp(true);
 
+    // Don't link against libstdc++ - we're freestanding
+    b.cpp_link_stdlib(None);
+
     // Force clang++, not cl.exe
     b.compiler("clang++");
 
@@ -139,16 +142,26 @@ fn main() {
     b.flag("-mno-red-zone");
     b.flag("-msse2");
     b.flag("-mcx16");
-    // b.flag("-mcmodel=kernel"); // only if your Rust side uses it
+    b.flag("-mcmodel=large"); // Place code/data anywhere in high-half kernel
 
     b.define("_HAS_EXCEPTIONS", "0");
     b.define("SNMALLOC_USE_WAIT_ON_ADDRESS", "1");
     b.define("SNMALLOC_USE_SELF_VENDORED_STL", "1");
+    // Tell snmalloc we provide entropy via PAL (avoids <random> include)
+    b.define("SNMALLOC_PLATFORM_HAS_GETENTROPY", "1");
+    // Define to prevent <chrono> include. On x86_64, the clock_gettime code path
+    // is never taken (if constexpr checks NoCpuCycleCounters), so it's safe.
+    b.define("SNMALLOC_TICK_USE_CLOCK_GETTIME", "1");
+
+    // Newlib headers for freestanding C library support
+    let newlib_inc = repo_root.join("third_party/newlib/newlib/libc/include");
+    b.include(&newlib_inc);
 
     b.include(&snmalloc_inc);
     b.include(&repo_root);
 
     b.file(&pal_cc);
+    b.file(pal_dir.join("clock_shim.c"));
     b.compile("snmalloc_myos");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

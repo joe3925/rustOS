@@ -105,35 +105,24 @@ pub unsafe extern "C" fn krnl_snmalloc_wake_all_u8(addr: *const u8) {
     todo!();
 }
 
-// freestanding libc-ish exports that C++ may pull in
-#[no_mangle]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    ptr::copy_nonoverlapping(src, dst, n);
-    dst
-}
+// C runtime stubs required by snmalloc in freestanding environment
 
+/// Thread-local destructor registration - not supported in kernel, just ignore
 #[no_mangle]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    ptr::copy(src, dst, n);
-    dst
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memset(dst: *mut u8, c: i32, n: usize) -> *mut u8 {
-    ptr::write_bytes(dst, c as u8, n);
-    dst
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
-    let mut i = 0usize;
-    while i < n {
-        let av = *a.add(i);
-        let bv = *b.add(i);
-        if av != bv {
-            return av as i32 - bv as i32;
-        }
-        i += 1;
-    }
+pub unsafe extern "C" fn __cxa_thread_atexit(
+    _dtor: extern "C" fn(*mut core::ffi::c_void),
+    _obj: *mut core::ffi::c_void,
+    _dso_symbol: *mut core::ffi::c_void,
+) -> i32 {
+    // In a kernel without thread-local storage cleanup, we just return success
+    // and don't actually register anything. The destructor won't be called.
     0
+}
+
+/// errno location for newlib - returns pointer to a static errno variable
+static mut ERRNO_VALUE: i32 = 0;
+
+#[no_mangle]
+pub unsafe extern "C" fn __errno() -> *mut i32 {
+    core::ptr::addr_of_mut!(ERRNO_VALUE)
 }
