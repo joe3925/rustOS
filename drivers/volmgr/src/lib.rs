@@ -296,11 +296,11 @@ pub async fn vol_pdo_write(
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match binding.backing.get() {
-        Some(t) => t.clone(),
+        Some(t) => t,
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let status = pnp_send_request(tgt, req).await;
+    let status = pnp_send_request(tgt.clone(), req).await;
     DriverStep::complete(status)
 }
 #[request_handler]

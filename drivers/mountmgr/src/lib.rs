@@ -124,12 +124,6 @@ pub extern "win64" fn volclass_device_add(
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, volclass_start);
 
-    dev_init
-        .io_vtable
-        .set(IoType::Read(vol_fdo_read), Synchronization::Sync, 0);
-    dev_init
-        .io_vtable
-        .set(IoType::Write(vol_fdo_write), Synchronization::Sync, 0);
     dev_init.io_vtable.set(
         IoType::DeviceControl(volclass_ioctl),
         Synchronization::Sync,
@@ -147,24 +141,6 @@ pub async fn volclass_start(dev: Arc<DeviceObject>, _request: Arc<RwLock<Request
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
     spawn(mount_if_unmounted(dev));
-    DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn vol_fdo_read(
-    _dev: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-    _buf_len: usize,
-) -> DriverStep {
-    DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn vol_fdo_write(
-    _dev: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-    _buf_len: usize,
-) -> DriverStep {
     DriverStep::Continue
 }
 
@@ -332,10 +308,7 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
 /// Compute stable identifier from GPT partition GUID.
 /// Returns None if the volume lacks a valid GPT GUID.
 async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
-    let vol_target = IoTarget {
-        target_device: parent_fdo.clone(),
-    };
-
+    let vol_target = parent_fdo.clone();
     let req = Arc::new(RwLock::new(
         Request::new_pnp(
             PnpRequest {
@@ -432,10 +405,6 @@ async fn try_bind_filesystems_for_parent_fdo(
     };
     let class = Some("FileSystem".to_string());
 
-    let vol_target = IoTarget {
-        target_device: parent_fdo.clone(),
-    };
-
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
@@ -443,7 +412,7 @@ async fn try_bind_filesystems_for_parent_fdo(
             Request::new(
                 RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
                 RequestData::from_t(FsIdentify {
-                    volume_fdo: vol_target.clone(),
+                    volume_fdo: parent_fdo.clone(),
                     mount_device: None,
                     can_mount: false,
                 }),

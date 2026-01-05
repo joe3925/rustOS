@@ -77,54 +77,51 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
         }
     }
 }
-pub struct BlockingInner<R> {
+pub struct BlockingState<F, R> {
+    func: Mutex<Option<F>>,
     result: Mutex<Option<R>>,
     waker: Mutex<Option<Waker>>,
 }
 
-impl<R> BlockingInner<R> {
-    pub fn new() -> Self {
+impl<F, R> BlockingState<F, R> {
+    pub fn new(func: F) -> Self {
         Self {
+            func: Mutex::new(Some(func)),
             result: Mutex::new(None),
             waker: Mutex::new(None),
         }
     }
 }
 
-pub struct BlockingJoin<R> {
-    inner: Arc<BlockingInner<R>>,
+pub struct BlockingJoin<F, R> {
+    state: Arc<BlockingState<F, R>>,
 }
 
-impl<R> BlockingJoin<R> {
-    pub fn new(inner: Arc<BlockingInner<R>>) -> Self {
-        Self { inner }
+impl<F, R> BlockingJoin<F, R> {
+    pub fn new(state: Arc<BlockingState<F, R>>) -> Self {
+        Self { state }
     }
 }
 
-impl<R: Send + 'static> Future for BlockingJoin<R> {
-    type Output = R;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
-        {
-            let mut w = self.inner.waker.lock();
-            *w = Some(cx.waker().clone());
-        }
-
-        let mut result_guard = self.inner.result.lock();
-        match result_guard.take() {
-            Some(res) => Poll::Ready(res),
-            None => Poll::Pending,
-        }
-    }
-}
-
-pub struct BlockingTask<F, R>
+impl<F, R> Future for BlockingJoin<F, R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    func: Option<F>,
-    inner: Arc<BlockingInner<R>>,
+    type Output = R;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        {
+            let mut w = self.state.waker.lock();
+            *w = Some(cx.waker().clone());
+        }
+
+        let mut g = self.state.result.lock();
+        match g.take() {
+            Some(r) => Poll::Ready(r),
+            None => Poll::Pending,
+        }
+    }
 }
 
 pub extern "win64" fn blocking_trampoline<F, R>(ctx: usize)
@@ -136,39 +133,39 @@ where
         panic!("blocking ctx passed is null ptr");
     }
 
-    let mut task = unsafe { Box::from_raw(ctx as *mut BlockingTask<F, R>) };
+    let state = unsafe { Arc::from_raw(ctx as *const BlockingState<F, R>) };
 
-    let f = task.func.take().expect("blocking func missing");
+    let f = {
+        let mut g = state.func.lock();
+        g.take().expect("blocking func missing")
+    };
+
     let result = f();
 
     {
-        let mut g = task.inner.result.lock();
+        let mut g = state.result.lock();
         *g = Some(result);
     }
 
-    let waker_opt = {
-        let mut w = task.inner.waker.lock();
-        w.take()
+    let w = {
+        let mut g = state.waker.lock();
+        g.take()
     };
 
-    if let Some(w) = waker_opt {
+    if let Some(w) = w {
         w.wake();
     }
 }
 
-pub fn spawn_blocking<F, R>(func: F) -> BlockingJoin<R>
+pub fn spawn_blocking<F, R>(func: F) -> BlockingJoin<F, R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let inner = Arc::new(BlockingInner::<R>::new());
-    let task = BlockingTask::<F, R> {
-        func: Some(func),
-        inner: inner.clone(),
-    };
+    let state = Arc::new(BlockingState::<F, R>::new(func));
 
-    let ptr = Box::into_raw(Box::new(task)) as usize;
+    let ptr = Arc::into_raw(state.clone()) as usize;
     submit_blocking(blocking_trampoline::<F, R>, ptr);
 
-    BlockingJoin::new(inner)
+    BlockingJoin::new(state)
 }

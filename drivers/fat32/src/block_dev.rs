@@ -21,6 +21,8 @@ pub struct BlockDev {
     total_sectors: u64,
     pos: u64,
     scratch: Vec<u8>,
+    read_req: Arc<RwLock<Request>>,
+    write_req: Arc<RwLock<Request>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -43,12 +45,33 @@ impl IoBase for BlockDev {
 impl BlockDev {
     pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
         let bps = sector_size as usize;
+
+        let mut r = Request::new(
+            RequestType::Read {
+                offset: 0,
+                len: bps,
+            },
+            RequestData::from_boxed_bytes(vec![0u8; bps].into_boxed_slice()),
+        );
+        r.traversal_policy = TraversalPolicy::ForwardLower;
+
+        let mut w = Request::new(
+            RequestType::Write {
+                offset: 0,
+                len: bps,
+            },
+            RequestData::from_boxed_bytes(vec![0u8; bps].into_boxed_slice()),
+        );
+        w.traversal_policy = TraversalPolicy::ForwardLower;
+
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
             scratch: vec![0u8; bps],
+            read_req: Arc::new(RwLock::new(r)),
+            write_req: Arc::new(RwLock::new(w)),
         }
     }
 
@@ -89,38 +112,72 @@ impl BlockDev {
         }
     }
 
-    async fn pnp_read_into_scratch(&mut self, offset: u64, len: usize) -> Result<(), DriverStatus> {
-        self.ensure_scratch(len);
-
-        let mut buf = mem::take(&mut self.scratch);
+    async fn pnp_read_owned(
+        &mut self,
+        offset: u64,
+        mut buf: Vec<u8>,
+        len: usize,
+    ) -> Result<Vec<u8>, DriverStatus> {
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
         buf.truncate(len);
 
-        let mut req_owned = Request::new(
-            RequestType::Read { offset, len },
-            RequestData::from_boxed_bytes(buf.into_boxed_slice()),
-        );
-        req_owned.traversal_policy = TraversalPolicy::ForwardLower;
-        let req = Arc::new(RwLock::new(req_owned));
+        {
+            let mut g = self.read_req.write();
+            g.kind = RequestType::Read { offset, len };
+            g.data = RequestData::from_boxed_bytes(buf.into_boxed_slice());
+        }
 
-        pnp_send_request(self.volume.clone(), req.clone()).await;
+        pnp_send_request(self.volume.clone(), self.read_req.clone()).await;
 
-        let mut g = req.write();
+        let mut g = self.read_req.write();
         let st = g.status;
         let boxed = g.take_data_bytes();
-        self.scratch = boxed.into_vec();
+        let out = boxed.into_vec();
 
         if st == DriverStatus::Success {
-            Ok(())
+            Ok(out)
         } else {
             Err(st)
         }
     }
 
-    async fn pnp_write_from_scratch(
+    async fn pnp_write_owned(
         &mut self,
         offset: u64,
-        data: &[u8],
-    ) -> Result<(), DriverStatus> {
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>, DriverStatus> {
+        let len = buf.len();
+
+        {
+            let mut g = self.write_req.write();
+            g.kind = RequestType::Write { offset, len };
+            g.data = RequestData::from_boxed_bytes(buf.into_boxed_slice());
+        }
+
+        pnp_send_request(self.volume.clone(), self.write_req.clone()).await;
+
+        let mut g = self.write_req.write();
+        let st = g.status;
+        let boxed = g.take_data_bytes();
+        let out = boxed.into_vec();
+
+        if st == DriverStatus::Success {
+            Ok(out)
+        } else {
+            Err(st)
+        }
+    }
+
+    async fn pnp_read_into_scratch(&mut self, offset: u64, len: usize) -> Result<(), DriverStatus> {
+        self.ensure_scratch(len);
+        let buf = mem::take(&mut self.scratch);
+        self.scratch = self.pnp_read_owned(offset, buf, len).await?;
+        Ok(())
+    }
+
+    async fn pnp_write_from_slice(&mut self, offset: u64, data: &[u8]) -> Result<(), DriverStatus> {
         let len = data.len();
         self.ensure_scratch(len);
         self.scratch[..len].copy_from_slice(data);
@@ -128,25 +185,8 @@ impl BlockDev {
         let mut buf = mem::take(&mut self.scratch);
         buf.truncate(len);
 
-        let mut req_owned = Request::new(
-            RequestType::Write { offset, len },
-            RequestData::from_boxed_bytes(buf.into_boxed_slice()),
-        );
-        req_owned.traversal_policy = TraversalPolicy::ForwardLower;
-        let req = Arc::new(RwLock::new(req_owned));
-
-        pnp_send_request(self.volume.clone(), req.clone()).await;
-
-        let mut g = req.write();
-        let st = g.status;
-        let boxed = g.take_data_bytes();
-        self.scratch = boxed.into_vec();
-
-        if st == DriverStatus::Success {
-            Ok(())
-        } else {
-            Err(st)
-        }
+        self.scratch = self.pnp_write_owned(offset, buf).await?;
+        Ok(())
     }
 
     async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, BlkError> {
@@ -224,14 +264,13 @@ impl BlockDev {
                 self.scratch[in_off..in_off + take]
                     .copy_from_slice(&src[in_off_src..in_off_src + take]);
 
-                let mut tmp = core::mem::take(&mut self.scratch);
-                tmp.truncate(bps);
+                let mut buf = mem::take(&mut self.scratch);
+                buf.truncate(bps);
 
-                let st = self.pnp_write_from_scratch(sector_off, &tmp[..]).await;
-
-                self.scratch = tmp;
-
-                st.map_err(BlkError::from)?;
+                self.scratch = self
+                    .pnp_write_owned(sector_off, buf)
+                    .await
+                    .map_err(BlkError::from)?;
 
                 self.pos += take as u64;
                 in_off_src += take;
@@ -246,7 +285,7 @@ impl BlockDev {
 
             let byte_off = lba * bps as u64;
 
-            self.pnp_write_from_scratch(byte_off, &src[in_off_src..in_off_src + chunk_bytes])
+            self.pnp_write_from_slice(byte_off, &src[in_off_src..in_off_src + chunk_bytes])
                 .await
                 .map_err(BlkError::from)?;
 

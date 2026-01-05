@@ -8,12 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use spin::RwLock;
-
-#[repr(C)]
-#[derive(Clone)]
-pub struct IoTarget {
-    pub target_device: Arc<DeviceObject>,
-}
+pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]

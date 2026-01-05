@@ -333,7 +333,7 @@ pub async fn ide_pdo_read(
     let parent_clone = parent.clone();
     let req_clone = req.clone();
 
-    let result = spawn_blocking(move || {
+    let result = (move || {
         let dx = match parent_clone.try_devext::<DevExt>() {
             Ok(dx) => dx,
             Err(_) => return Err(DriverStatus::NoSuchDevice),
@@ -349,8 +349,7 @@ pub async fn ide_pdo_read(
         } else {
             Err(DriverStatus::Unsuccessful)
         }
-    })
-    .await;
+    })();
 
     match result {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
@@ -416,7 +415,7 @@ pub async fn ide_pdo_write(
     let parent_clone = parent.clone();
     let req_clone = req.clone();
 
-    let result = spawn_blocking(move || {
+    let result = (move || {
         let dx = match parent_clone.try_devext::<DevExt>() {
             Ok(dx) => dx,
             Err(_) => return Err(DriverStatus::NoSuchDevice),
@@ -432,8 +431,7 @@ pub async fn ide_pdo_write(
         } else {
             Err(DriverStatus::Unsuccessful)
         }
-    })
-    .await;
+    })();
 
     match result {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
