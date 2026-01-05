@@ -136,7 +136,7 @@ fn main() {
     b.flag("-msse2");
     b.flag("-mcx16");
     b.flag("-mcmodel=large"); // Place code/data anywhere in high-half kernel
-
+    b.flag("-fPIC");
     b.define("_HAS_EXCEPTIONS", "0");
     b.define("SNMALLOC_USE_WAIT_ON_ADDRESS", "1");
     b.define("SNMALLOC_USE_SELF_VENDORED_STL", "1");

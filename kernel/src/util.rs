@@ -87,7 +87,7 @@ pub unsafe fn init() {
     tls::extract_tls_template(boot_info());
     tls::validate_bootstrap_size(&tls::TLS_TEMPLATE)
         .expect("TLS template too large for bootstrap arena");
-    tls::init_cpu_tls(0); // BSP = CPU 0
+    tls::init_cpu_tls(0);
 
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;

@@ -3,8 +3,19 @@ target = "targets/kernel-elf-winfamily.json"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
+
 [env]
 CC_x86_64_unknown_none = "clang"
 CXX_x86_64_unknown_none = "clang++"
 AR_x86_64_unknown_none = "llvm-ar"
 RANLIB_x86_64_unknown_none = "llvm-ranlib"
+
+[target."targets/kernel-elf-winfamily.json"]
+rustflags = [
+    "-C",
+    "link-args=--image-base=0xFFFF850000000000",
+    "-C",
+    "relocation-model=static",
+    "-C",
+    "code-model=large",
+]

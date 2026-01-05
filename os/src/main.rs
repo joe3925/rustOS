@@ -59,7 +59,7 @@ fn main() {
                 "-drive",
                 "file=boot.img,format=raw",
                 "-drive",
-                "file=rustOS.vhdx,if=ide",
+                "file=..\\..\\rustOS.vhdx,if=ide",
             ],
         );
 

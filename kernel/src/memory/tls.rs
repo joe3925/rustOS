@@ -13,9 +13,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use raw_cpuid::CpuId;
 
-// =============================================================================
-// Constants
-// =============================================================================
+use crate::println;
 
 /// Maximum CPUs supported for bootstrap TLS blocks
 pub const MAX_BOOTSTRAP_CPUS: usize = 256;
@@ -28,10 +26,6 @@ pub const BOOTSTRAP_ARENA_SIZE: usize = MAX_BOOTSTRAP_CPUS * BOOTSTRAP_BLOCK_SIZ
 
 /// MSR addresses
 const IA32_FS_BASE: u32 = 0xC000_0100;
-
-// =============================================================================
-// TLS Template - Cached bootloader info in .bss
-// =============================================================================
 
 /// Cached copy of bootloader's TLS template info.
 /// Stored in .bss so it's available before heap initialization.
@@ -63,10 +57,6 @@ impl TlsTemplate {
 
 /// Global TLS template - extracted from boot_info early in init
 pub static mut TLS_TEMPLATE: TlsTemplate = TlsTemplate::empty();
-
-// =============================================================================
-// Thread Control Block (TCB)
-// =============================================================================
 
 /// Thread Control Block - placed at %fs:0 per System V ABI.
 /// The self-pointer at offset 0 is mandatory for TLS variable access.
@@ -103,10 +93,6 @@ impl Tcb {
     pub const SIZE: usize = core::mem::size_of::<Tcb>();
 }
 
-// =============================================================================
-// TLS Block - Represents an allocated TLS region
-// =============================================================================
-
 /// Represents an allocated TLS block (TCB + TLS data)
 unsafe impl Send for TlsBlock {}
 unsafe impl Sync for TlsBlock {}
@@ -129,10 +115,6 @@ impl TlsBlock {
     }
 }
 
-// =============================================================================
-// Bootstrap Arena - Static memory for early boot TLS
-// =============================================================================
-
 /// Static bootstrap arena in .bss.
 /// This memory is available before heap initialization.
 #[repr(C, align(4096))]
@@ -149,10 +131,6 @@ static NEXT_BOOTSTRAP_SLOT: AtomicUsize = AtomicUsize::new(0);
 
 /// Whether FSGSBASE is supported (cached after first check)
 static mut FSGSBASE_SUPPORTED: Option<bool> = None;
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
 
 /// Align value up to the given alignment
 #[inline]
@@ -181,8 +159,6 @@ pub fn validate_bootstrap_size(template: &TlsTemplate) -> Result<(), &'static st
     Ok(())
 }
 
-/// Generate stack canary using TSC for entropy
-
 fn generate_canary() -> u64 {
     unsafe {
         let lo: u32;
@@ -199,11 +175,6 @@ fn generate_canary() -> u64 {
     }
 }
 
-// =============================================================================
-// FSGSBASE Support
-// =============================================================================
-
-/// Check if FSGSBASE instructions are supported
 pub fn has_fsgsbase() -> bool {
     unsafe {
         if let Some(supported) = FSGSBASE_SUPPORTED {
@@ -221,11 +192,6 @@ pub fn has_fsgsbase() -> bool {
     }
 }
 
-/// Enable FSGSBASE instructions (set CR4.FSGSBASE bit).
-/// Must be called once per CPU before using WRFSBASE.
-///
-/// # Safety
-/// Requires ring 0, modifies CR4.
 pub unsafe fn enable_fsgsbase() {
     if has_fsgsbase() {
         use x86_64::registers::control::{Cr4, Cr4Flags};
@@ -236,15 +202,6 @@ pub unsafe fn enable_fsgsbase() {
     }
 }
 
-// =============================================================================
-// FS Base Register Operations
-// =============================================================================
-
-/// Set FS base register.
-/// Uses WRFSBASE if available, falls back to WRMSR.
-///
-/// # Safety
-/// base must point to valid TCB.
 #[inline]
 pub unsafe fn set_fs_base_impl(base: u64) {
     if has_fsgsbase() {
@@ -276,15 +233,6 @@ pub unsafe fn get_fs_base() -> u64 {
     }
 }
 
-// =============================================================================
-// TLS Template Extraction
-// =============================================================================
-
-/// Extract TLS template from boot info into static storage.
-/// MUST be called before init_heap() on BSP.
-///
-/// # Safety
-/// Must be called exactly once, on BSP, with interrupts disabled.
 pub unsafe fn extract_tls_template(boot_info: &BootInfo) {
     if let Some(tls) = boot_info.tls_template.into_option() {
         TLS_TEMPLATE = TlsTemplate {
@@ -298,15 +246,6 @@ pub unsafe fn extract_tls_template(boot_info: &BootInfo) {
     // If no TLS template, TLS_TEMPLATE remains empty/invalid
 }
 
-// =============================================================================
-// Bootstrap TLS Block Allocation
-// =============================================================================
-
-/// Allocate a TLS block from the bootstrap arena.
-/// Returns pointer to TCB, or None if arena exhausted.
-///
-/// # Safety
-/// Arena access must be synchronized (uses atomic slot allocation).
 pub unsafe fn alloc_bootstrap_tls_block() -> Option<*mut Tcb> {
     let slot = NEXT_BOOTSTRAP_SLOT.fetch_add(1, Ordering::AcqRel);
     if slot >= MAX_BOOTSTRAP_CPUS {
@@ -318,19 +257,6 @@ pub unsafe fn alloc_bootstrap_tls_block() -> Option<*mut Tcb> {
 
     Some(block_ptr as *mut Tcb)
 }
-
-// =============================================================================
-// TLS Block Materialization
-// =============================================================================
-
-/// Materialize a TLS block: initialize TCB, copy .tdata, zero .tbss.
-///
-/// # Arguments
-/// * `tcb_ptr` - Pointer to allocated TCB location
-/// * `cpu_id` - CPU ID to store in TCB
-///
-/// # Safety
-/// tcb_ptr must point to valid, properly aligned memory.
 pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
     // Initialize TCB
     let tcb = &mut *tcb_ptr;
@@ -347,7 +273,8 @@ pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
 
     // TLS data starts immediately after TCB
     let tls_data = (tcb_ptr as *mut u8).add(Tcb::SIZE);
-
+    println!("{:#x}", tls_data as usize);
+    unsafe { println!("{:#x}", *tls_data) };
     // Copy .tdata (initialized data)
     if template.file_size > 0 {
         core::ptr::copy_nonoverlapping(
@@ -368,21 +295,6 @@ pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
     }
 }
 
-// =============================================================================
-// High-Level Per-CPU TLS Initialization
-// =============================================================================
-
-/// Initialize TLS for the current CPU (BSP or AP).
-/// MUST be called before any heap allocation or allocator use.
-///
-/// # Arguments
-/// * `cpu_id` - Logical CPU ID for this processor
-///
-/// # Returns
-/// The initialized TlsBlock info.
-///
-/// # Safety
-/// Must be called once per CPU during early initialization.
 pub unsafe fn init_cpu_tls(cpu_id: u32) -> TlsBlock {
     // Enable FSGSBASE if supported (idempotent, safe to call multiple times)
     enable_fsgsbase();
@@ -403,12 +315,6 @@ pub unsafe fn init_cpu_tls(cpu_id: u32) -> TlsBlock {
     }
 }
 
-// =============================================================================
-// Heap-Based TLS for Tasks/Threads (post-heap initialization)
-// =============================================================================
-
-/// Allocate a TLS block from the heap for a new task.
-/// Called after heap is available, for user tasks.
 pub fn alloc_heap_tls_block() -> Option<TlsBlock> {
     let template = unsafe { &TLS_TEMPLATE };
     let block_size = actual_block_size(template);
@@ -428,24 +334,11 @@ pub fn alloc_heap_tls_block() -> Option<TlsBlock> {
         from_bootstrap: false,
     })
 }
-
-/// Initialize a heap-allocated TLS block for a task.
-///
-/// # Arguments
-/// * `block` - The allocated TlsBlock
-/// * `task_ptr` - Pointer to associated Task struct
-///
-/// # Safety
-/// block.tcb must point to valid allocated memory.
 pub unsafe fn init_task_tls(block: &TlsBlock, task_ptr: u64) {
     materialize_tls_block(block.tcb, 0); // cpu_id set dynamically on schedule
     (*block.tcb).task_ptr = task_ptr;
 }
 
-/// Free a heap-allocated TLS block.
-///
-/// # Safety
-/// block must have been allocated via alloc_heap_tls_block() and not already freed.
 pub unsafe fn free_heap_tls_block(block: TlsBlock) {
     if block.from_bootstrap {
         return; // Bootstrap blocks are never freed
@@ -459,14 +352,6 @@ pub unsafe fn free_heap_tls_block(block: TlsBlock) {
     alloc::alloc::dealloc(block.tcb as *mut u8, layout);
 }
 
-/// Load a task's TLS block for context switch.
-///
-/// # Arguments
-/// * `block` - The task's TLS block
-/// * `cpu_id` - Current CPU ID to update in TCB
-///
-/// # Safety
-/// block.tcb must point to valid TLS block.
 pub unsafe fn load_task_tls(block: &TlsBlock, cpu_id: u32) {
     (*block.tcb).cpu_id = cpu_id;
     set_fs_base_impl(block.tcb as u64);

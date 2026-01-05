@@ -13,7 +13,6 @@
     ],
     "linker-flavor": "ld.lld",
     "linker": "rust-lld",
-    "executables": true,
     "panic-strategy": "abort",
     "disable-redzone": true,
     "features": "+sse2",
