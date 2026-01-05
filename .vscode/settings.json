@@ -130,5 +130,6 @@
         "xoshiro",
         "Xoshiro"
     ],
-    "git.untrackedChanges": "separate"
+    "git.untrackedChanges": "separate",
+    "cmake.sourceDirectory": "C:/Users/Boden/Documents/rustOS/third_party/snmalloc"
 }

@@ -1,10 +1,10 @@
 use crate::memory::heap::{HEAP_SIZE, HEAP_START};
+use crate::memory::snmalloc::SnMalloc;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
-use snmalloc_rs::SnMalloc;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::{align_up, VirtAddr};
 
