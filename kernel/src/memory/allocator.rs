@@ -1,18 +1,15 @@
 use crate::memory::heap::{HEAP_SIZE, HEAP_START};
 use crate::structs::linked_list::{LinkedList, ListNode};
-use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
+use snmalloc_rs::SnMalloc;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::{align_up, VirtAddr};
 
-// #[global_allocator]
-// pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
-// TODO: write my own buddy alloc when I have time
 #[global_allocator]
-pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
+pub static ALLOCATOR: SnMalloc = SnMalloc;
 pub struct Locked<A> {
     inner: spin::Mutex<A>,
 }
@@ -187,54 +184,3 @@ impl Allocator {
 //         });
 //     }
 // }
-pub struct BuddyLocked {
-    inner: LockedHeap<32>,
-    init: AtomicBool,
-}
-
-impl BuddyLocked {
-    pub const fn new() -> Self {
-        Self {
-            inner: LockedHeap::<32>::empty(),
-            init: AtomicBool::new(false),
-        }
-    }
-    #[inline(always)]
-    unsafe fn ensure_init(&self) {
-        if !self.init.load(Ordering::Acquire) {
-            without_interrupts(|| {
-                if !self.init.load(Ordering::Acquire) {
-                    let heap_start = HEAP_START as usize;
-                    let heap_size = HEAP_SIZE as usize;
-                    self.inner.lock().init(heap_start, heap_size);
-                    self.init.store(true, Ordering::Release);
-                }
-            });
-        }
-    }
-    pub fn free_memory(&self) -> usize {
-        without_interrupts(|| {
-            let inner = self.inner.lock();
-            inner.stats_total_bytes() - inner.stats_alloc_actual()
-        })
-    }
-}
-
-unsafe impl GlobalAlloc for BuddyLocked {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.ensure_init();
-        without_interrupts(|| self.inner.lock().alloc(layout))
-            .expect("kernel heap overflow")
-            .as_ptr()
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.ensure_init();
-        without_interrupts(|| {
-            self.inner.lock().dealloc(
-                NonNull::new(ptr).expect("Null ptr passed to kernel heap dealloc"),
-                layout,
-            )
-        })
-    }
-}

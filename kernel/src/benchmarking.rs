@@ -1607,5 +1607,6 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
 }
 
 pub fn used_memory() -> usize {
-    HEAP_SIZE - ALLOCATOR.free_memory()
+    //HEAP_SIZE - ALLOCATOR.free_memory()
+    0
 }

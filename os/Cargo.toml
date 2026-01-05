@@ -9,3 +9,4 @@ build = "build.rs"
 kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
 bootloader = { version = "0.11", default-features = false, features = ["uefi"] }
 [dependencies]
+cmake = "0.1.57"

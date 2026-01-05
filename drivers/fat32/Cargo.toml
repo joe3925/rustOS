@@ -22,7 +22,6 @@ panic = "abort"
 codegen-units = 1
 lto = true
 opt-level = "z"
-
 [dependencies]
 kernel_api = { path = "../../kernel_api" }
 bitflags = "2.6.0"

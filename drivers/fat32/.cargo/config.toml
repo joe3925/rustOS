@@ -26,6 +26,6 @@ rustflags = [
     "link-arg=/EXPORT:DriverEntry",
 ]
 [unstable]
-build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
+# build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
 
 build-std-features = ["compiler-builtins-mem"]

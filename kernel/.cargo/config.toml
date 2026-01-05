@@ -1,6 +1,5 @@
 [build]
-target = "x86_64-unknown-none"
+target = "targets/kernel-elf-winfamily.json"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
-
