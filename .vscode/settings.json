@@ -132,4 +132,18 @@
     ],
     "git.untrackedChanges": "separate",
     "cmake.sourceDirectory": "third_party/snmalloc",
+    "rust-analyzer.linkedProjects": [
+        "kernel/Cargo.toml",
+        "os/Cargo.toml",
+        "drivers/base_driver/Cargo.toml",
+        "drivers/acpi/Cargo.toml",
+        "drivers/pci/Cargo.toml",
+        "drivers/ide/Cargo.toml",
+        "drivers/disk/Cargo.toml",
+        "drivers/partmgr/Cargo.toml",
+        "drivers/volmgr/Cargo.toml",
+        "drivers/mountmgr/Cargo.toml",
+        "drivers/fat32/Cargo.toml",
+        "drivers/i8042/Cargo.toml"
+    ],
 }
