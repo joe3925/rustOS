@@ -145,7 +145,7 @@ extern "win64" fn worker(args_ptr: usize) {
             return;
         }
 
-        let job = pool.queue.lock().pop_front();
+        let job = { pool.queue.lock().pop_front() };
 
         if let Some(j) = job {
             (j.f)(j.a);
