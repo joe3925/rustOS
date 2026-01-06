@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "acpi",
+    "base_driver",
+    "disk",
+    "fat32",
+    "i8042",
+    "ide",
+    "mountmgr",
+    "partmgr",
+    "pci",
+    "volmgr",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+kernel_api = { path = "../kernel_api" }
+spin = { version = "0.10", default-features = false, features = ["mutex"] }
+bitflags = "2.6.0"
+aml = "0.16.4"
+fatfs = { default-features = false, git = "https://github.com/rafalh/rust-fatfs", features = ["alloc", "lfn", "unicode"] }
+log = "0.4.28"
+
+[profile.dev]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"

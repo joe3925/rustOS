@@ -132,6 +132,7 @@
     ],
     "git.untrackedChanges": "separate",
     "cmake.sourceDirectory": "third_party/snmalloc",
+    // TODO: move these to there own workspaces have like 2 workspaces 
     "rust-analyzer.linkedProjects": [
         "kernel/Cargo.toml",
         "os/Cargo.toml",

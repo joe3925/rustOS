@@ -1,5 +1,5 @@
 [build]
-target = "targets/kernel-elf-winfamily.json"
+target = "x86_64-unknown-none"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
@@ -18,4 +18,6 @@ rustflags = [
     "relocation-model=static",
     "-C",
     "code-model=large",
+    "-C",
+    "link-arg=-no-pie",
 ]

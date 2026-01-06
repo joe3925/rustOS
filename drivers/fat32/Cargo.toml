@@ -1,8 +1,7 @@
-
 [package]
 name = "fat32"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 autotests = false
 
 [lib]
@@ -11,24 +10,9 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
 
-[profile.dev]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
 [dependencies]
-kernel_api = { path = "../../kernel_api" }
-bitflags = "2.6.0"
-spin = { version = "0.10", default-features = false, features = ["mutex"] }
-fatfs = { default-features = false, git = "https://github.com/rafalh/rust-fatfs", features = [
-    "alloc",
-    "lfn",
-    "unicode",
-] }
-log = "0.4.28"
+kernel_api.workspace = true
+spin.workspace = true
+bitflags.workspace = true
+fatfs.workspace = true
+log.workspace = true

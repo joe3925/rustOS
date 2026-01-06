@@ -109,6 +109,7 @@ fn main() {
 
     let mut b = cc::Build::new();
     b.cpp(true);
+    b.debug(true);
 
     // Don't link against libstdc++ - we're freestanding
     b.cpp_link_stdlib(None);
@@ -124,6 +125,9 @@ fn main() {
 
     // Your freestanding/kernel flags
     b.flag("-std=c++20");
+    b.flag("-g");
+    b.flag("-gdwarf-4");
+    b.flag("-fno-omit-frame-pointer");
     b.flag("-ffreestanding");
     b.flag("-fno-exceptions");
     b.flag("-fno-rtti");
@@ -135,7 +139,7 @@ fn main() {
     b.flag("-mno-red-zone");
     b.flag("-msse2");
     b.flag("-mcx16");
-    b.flag("-mcmodel=large"); // Place code/data anywhere in high-half kernel
+    b.flag("-mcmodel=large");
     b.flag("-fPIC");
     b.define("_HAS_EXCEPTIONS", "0");
     b.define("SNMALLOC_USE_WAIT_ON_ADDRESS", "1");

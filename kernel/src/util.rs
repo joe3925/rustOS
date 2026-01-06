@@ -24,7 +24,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::allocator::ALLOCATOR;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::heap::HEAP_SIZE;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -84,17 +84,17 @@ lazy_static! {
     });
 }
 pub unsafe fn init() {
+    init_kernel_cr3();
+    let memory_map = &boot_info().memory_regions;
+    BootInfoFrameAllocator::init_start(memory_map);
     tls::extract_tls_template(boot_info());
     tls::validate_bootstrap_size(&tls::TLS_TEMPLATE)
         .expect("TLS template too large for bootstrap arena");
     tls::init_cpu_tls(0);
+    crate::memory::snmalloc::init();
 
-    init_kernel_cr3();
-    let memory_map = &boot_info().memory_regions;
-    BootInfoFrameAllocator::init_start(memory_map);
     {
         let _init_lock = INIT_LOCK.lock();
-        init_heap();
         //test_full_heap();
 
         init_kernel_cr3();
@@ -105,7 +105,6 @@ pub unsafe fn init() {
         load_idt();
         clear_screen();
         syscall_init();
-
         // TSC calibration
         let tsc_start = cpu::get_cycles();
         wait_using_pit_50ms();
@@ -340,13 +339,11 @@ macro_rules! boot_packages {
                     name: $name,
                     toml: include_bytes!(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../target/DRIVERS/",
-                        $name, "/", $name, ".toml"
+                        "/../drivers/", $name, "/src/", $name, ".toml"
                     )),
                     image: include_bytes!(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../target/DRIVERS/",
-                        $name, "/", $name, ".dll"
+                        "/../drivers/target/debug/", $name, ".dll"
                     )),
                 },
             )+

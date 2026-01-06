@@ -20,6 +20,7 @@
 #![feature(adt_const_params)]
 #![feature(pointer_is_aligned_to)]
 #![feature(linked_list_cursors)]
+#![feature(maybe_uninit_array_assume_init)]
 extern crate alloc;
 
 pub mod gdt;

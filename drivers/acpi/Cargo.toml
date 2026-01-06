@@ -1,8 +1,7 @@
-
 [package]
 name = "acpi"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 autotests = false
 
 [lib]
@@ -11,20 +10,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false
 
-[profile.dev]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "z"
-
 [dependencies]
-kernel_api = { path = "../../kernel_api" }
-aml = "0.16.4"
-
-spin = { version = "0.10", default-features = false, features = ["mutex"] }
+kernel_api.workspace = true
+spin.workspace = true
+aml.workspace = true

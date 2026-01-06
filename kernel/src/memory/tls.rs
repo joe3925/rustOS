@@ -4,7 +4,14 @@
 // Provides TLS support for BSP, APs, and tasks using a static bootstrap arena
 // for early boot (before heap) and heap allocation for tasks.
 //
-// Layout follows System V ABI: %fs:0 points to TCB with self-pointer at offset 0.
+// Layout follows System V x86-64 ABI:
+//   - TLS data is placed BEFORE the TCB (at negative offsets from FS base)
+//   - FS base points to the TCB (which has self-pointer at offset 0)
+//   - TLS variables are accessed as fs:[negative_offset]
+//
+// Memory layout:
+//   [.tdata (initialized)] [.tbss (zeroed)] [TCB]
+//                                            ^-- FS base points here
 
 #![allow(static_mut_refs)]
 
@@ -98,6 +105,7 @@ unsafe impl Send for TlsBlock {}
 unsafe impl Sync for TlsBlock {}
 
 #[derive(Debug)]
+#[repr(C, packed)]
 pub struct TlsBlock {
     /// Pointer to the TCB at the start of this block
     pub tcb: *mut Tcb,
@@ -108,10 +116,15 @@ pub struct TlsBlock {
 }
 
 impl TlsBlock {
-    /// Get the TLS data region pointer (immediately after TCB)
+    /// Get the TLS data region pointer (immediately BEFORE TCB per System V ABI)
     #[allow(dead_code)]
     pub fn tls_data_ptr(&self) -> *mut u8 {
-        unsafe { (self.tcb as *mut u8).add(Tcb::SIZE) }
+        let template = unsafe { &TLS_TEMPLATE };
+        if !template.valid || template.mem_size == 0 {
+            return core::ptr::null_mut();
+        }
+        // TLS data is at negative offset from TCB
+        unsafe { (self.tcb as *mut u8).sub(template.mem_size as usize) }
     }
 }
 
@@ -246,6 +259,8 @@ pub unsafe fn extract_tls_template(boot_info: &BootInfo) {
     // If no TLS template, TLS_TEMPLATE remains empty/invalid
 }
 
+/// Allocate a bootstrap TLS block and return pointer to where TCB should be placed.
+/// The TCB is placed at the END of the block (after TLS data) per System V ABI.
 pub unsafe fn alloc_bootstrap_tls_block() -> Option<*mut Tcb> {
     let slot = NEXT_BOOTSTRAP_SLOT.fetch_add(1, Ordering::AcqRel);
     if slot >= MAX_BOOTSTRAP_CPUS {
@@ -253,9 +268,21 @@ pub unsafe fn alloc_bootstrap_tls_block() -> Option<*mut Tcb> {
     }
 
     let block_offset = slot * BOOTSTRAP_BLOCK_SIZE;
-    let block_ptr = BOOTSTRAP_ARENA.data.as_mut_ptr().add(block_offset);
+    let block_start = BOOTSTRAP_ARENA.data.as_mut_ptr().add(block_offset);
 
-    Some(block_ptr as *mut Tcb)
+    // Calculate where TCB goes: at the end of the block, after TLS data
+    // Layout: [TLS data] [TCB]
+    //                     ^-- return this pointer
+    let template = &TLS_TEMPLATE;
+    let tls_size = if template.valid {
+        template.mem_size as usize
+    } else {
+        0
+    };
+    let tls_aligned = align_up(tls_size as u64, 16) as usize;
+
+    let tcb_ptr = block_start.add(tls_aligned) as *mut Tcb;
+    Some(tcb_ptr)
 }
 pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
     // Initialize TCB
@@ -271,11 +298,12 @@ pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
         return; // No TLS data to copy
     }
 
-    // TLS data starts immediately after TCB
-    let tls_data = (tcb_ptr as *mut u8).add(Tcb::SIZE);
-    println!("{:#x}", tls_data as usize);
-    unsafe { println!("{:#x}", *tls_data) };
-    // Copy .tdata (initialized data)
+    // TLS data is placed BEFORE the TCB (at negative offsets from FS base)
+    // Layout: [.tdata] [.tbss] [TCB]
+    //                          ^-- tcb_ptr points here
+    let tls_data = (tcb_ptr as *mut u8).sub(template.mem_size as usize);
+
+    // Copy .tdata (initialized data) at the start of TLS region
     if template.file_size > 0 {
         core::ptr::copy_nonoverlapping(
             template.start_addr as *const u8,
@@ -284,7 +312,7 @@ pub unsafe fn materialize_tls_block(tcb_ptr: *mut Tcb, cpu_id: u32) {
         );
     }
 
-    // Zero .tbss (uninitialized data)
+    // Zero .tbss (uninitialized data) after .tdata
     let bss_size = template.mem_size - template.file_size;
     if bss_size > 0 {
         core::ptr::write_bytes(
@@ -322,14 +350,24 @@ pub fn alloc_heap_tls_block() -> Option<TlsBlock> {
 
     // Allocate from heap with proper alignment
     let layout = core::alloc::Layout::from_size_align(block_size, align).ok()?;
-    let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    let block_start = unsafe { alloc::alloc::alloc_zeroed(layout) };
 
-    if ptr.is_null() {
+    if block_start.is_null() {
         return None;
     }
 
+    // TCB is at the END of the block (after TLS data) per System V ABI
+    // Layout: [TLS data] [TCB]
+    let tls_size = if template.valid {
+        template.mem_size as usize
+    } else {
+        0
+    };
+    let tls_aligned = align_up(tls_size as u64, 16) as usize;
+    let tcb_ptr = unsafe { block_start.add(tls_aligned) as *mut Tcb };
+
     Some(TlsBlock {
-        tcb: ptr as *mut Tcb,
+        tcb: tcb_ptr,
         size: block_size,
         from_bootstrap: false,
     })
@@ -349,7 +387,18 @@ pub unsafe fn free_heap_tls_block(block: TlsBlock) {
     let layout =
         core::alloc::Layout::from_size_align(block.size, align).expect("Invalid TLS layout");
 
-    alloc::alloc::dealloc(block.tcb as *mut u8, layout);
+    // TCB is at the end of the block, so we need to compute the block start
+    // Layout: [TLS data] [TCB]
+    //         ^-- block_start    ^-- block.tcb
+    let tls_size = if template.valid {
+        template.mem_size as usize
+    } else {
+        0
+    };
+    let tls_aligned = align_up(tls_size as u64, 16) as usize;
+    let block_start = (block.tcb as *mut u8).sub(tls_aligned);
+
+    alloc::alloc::dealloc(block_start, layout);
 }
 
 pub unsafe fn load_task_tls(block: &TlsBlock, cpu_id: u32) {
