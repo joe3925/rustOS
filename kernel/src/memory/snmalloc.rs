@@ -7,15 +7,15 @@ use alloc::sync::Arc;
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
 
-use crate::cpu;
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::heap::{HEAP_SIZE, HEAP_START};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::memory::paging::paging::{map_page, map_range_with_huge_pages, unmap_range_unchecked};
+use crate::memory::paging::paging::{decommit_range, map_page, map_range_with_huge_pages, unmap_range_unchecked};
 use crate::memory::paging::tables::init_mapper;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::static_handlers::task_yield;
 use crate::util::TOTAL_TIME;
+use crate::{cpu, println};
 use core::alloc::{GlobalAlloc, Layout};
 use core::array;
 use core::ffi::CStr;
@@ -175,13 +175,16 @@ pub unsafe extern "C" fn krnl_snmalloc_commit(base: *mut u8, size: usize, zero: 
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn krnl_snmalloc_decommit(_base: *mut u8, _size: usize) {
-    if _base.is_null() || _size == 0 {
+pub unsafe extern "C" fn krnl_snmalloc_decommit(base: *mut u8, size: usize) {
+    if base.is_null() || size == 0 {
         return;
     }
-    let start = align_down(_base as usize, 0x1000);
-    let end = align_up(start + _size, 0x1000);
-    unmap_range_unchecked(VirtAddr::new(start as u64), (end - start) as u64);
+    // Decommit frees physical frames but keeps virtual address space reserved.
+    // This is different from release/unmap which also frees the virtual range.
+    // snmalloc will call commit() to re-map frames when the memory is needed again.
+    let start = align_down(base as usize, 0x1000);
+    let end = align_up(start + size, 0x1000);
+    decommit_range(VirtAddr::new(start as u64), (end - start) as u64);
 }
 
 #[no_mangle]
@@ -199,7 +202,7 @@ pub unsafe extern "C" fn krnl_snmalloc_message_cstr(s: *const u8) {
 pub unsafe extern "C" fn krnl_snmalloc_error_cstr(s: *const u8) -> ! {
     if !s.is_null() {
         if let Ok(msg) = CStr::from_ptr(s as *const i8).to_str() {
-            //println!("[snmalloc error] {}", msg);
+            println!("[snmalloc error] {}", msg);
         }
     }
 

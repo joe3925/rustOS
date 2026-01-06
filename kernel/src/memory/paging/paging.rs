@@ -151,6 +151,70 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
         Err(_) => false,
     }
 }
+
+/// Decommit a range of virtual memory: free the physical frames but keep the
+/// virtual address space reserved. The pages will fault on access until recommitted.
+///
+/// This is different from unmap_range which also releases the virtual address space.
+/// Decommit is used by allocators like snmalloc that want to release physical memory
+/// while keeping the virtual address range reserved for future use.
+///
+/// # Safety
+/// The caller must ensure the range is currently mapped and that no code will
+/// access this memory until it is recommitted.
+pub unsafe fn decommit_range(virtual_addr: VirtAddr, size: u64) {
+    decommit_range_impl(virtual_addr, size)
+}
+
+pub(crate) unsafe fn decommit_range_impl(virtual_addr: VirtAddr, size: u64) {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(
+        boot_info
+            .physical_memory_offset
+            .into_option()
+            .expect("missing phys‑mem offset"),
+    );
+
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init();
+
+    const KiB4: u64 = 4 * 1024;
+
+    let mut cur = virtual_addr;
+    let mut remaining = align_up_4k(size);
+
+    // For decommit, we only handle 4KiB pages to avoid complexity with huge pages.
+    // If a huge page is encountered, we skip it (it stays committed).
+    // This is acceptable because snmalloc typically works with 4KiB granularity
+    // for decommit operations.
+    while remaining > 0 {
+        if decommit_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {
+            // Successfully decommitted
+        }
+        // Even if decommit failed (page not present or huge page), advance
+        cur += KiB4;
+        remaining -= KiB4;
+    }
+}
+
+/// Decommit a single page: unmap it and free the frame, but the virtual address
+/// remains reserved (not returned to the range tracker).
+fn decommit_page<S: x86_64::structures::paging::page::PageSize>(
+    mapper: &mut impl Mapper<S>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    addr: VirtAddr,
+) -> bool {
+    let page = Page::<S>::containing_address(addr);
+    match mapper.unmap(page) {
+        Ok((frame, flush)) => {
+            flush.flush();
+            // Free the physical frame
+            frame_allocator.deallocate_frame(frame);
+            true
+        }
+        Err(_) => false,
+    }
+}
 #[inline(always)]
 pub const fn align_up_4k(x: u64) -> u64 {
     (x + 0xFFF) & !0xFFF
