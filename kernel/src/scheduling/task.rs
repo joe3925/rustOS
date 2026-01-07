@@ -5,6 +5,8 @@ use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::{map_kernel_range, map_range_with_huge_pages};
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
+use crate::memory::snmalloc::snmalloc_mark_core_ready;
+use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::virt_tracker::{
     allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
 };
@@ -494,6 +496,8 @@ impl Task {
 }
 
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
+    // Mark this core as ready for snmalloc task parking
+    snmalloc_mark_core_ready(current_cpu_id());
     loop {
         hlt();
     }

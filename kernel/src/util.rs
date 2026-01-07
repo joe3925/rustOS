@@ -95,7 +95,7 @@ pub unsafe fn init() {
 
     {
         let _init_lock = INIT_LOCK.lock();
-        //test_full_heap();
+        test_full_heap();
 
         init_kernel_cr3();
 
@@ -132,7 +132,7 @@ pub unsafe fn init() {
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,
-        StackSize::Tiny,
+        StackSize::Huge1G,
         "kernel".into(),
         0,
     ));
@@ -253,7 +253,7 @@ pub fn trigger_breakpoint() {
 }
 
 pub fn test_full_heap() {
-    let element_count = (HEAP_SIZE / 4) / size_of::<u64>();
+    let element_count = (HEAP_SIZE / 0x100000) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
     for i in 0..element_count {

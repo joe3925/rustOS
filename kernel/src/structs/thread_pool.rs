@@ -49,7 +49,7 @@ impl ThreadPool {
     fn spawn_worker(self: &Arc<Self>) {
         let args = Box::new(WorkerArgs { pool: self.clone() });
         let args_ptr = Box::into_raw(args) as usize;
-        let t = Task::new_kernel_mode(worker, args_ptr, StackSize::Tiny, "".into(), 0);
+        let t = Task::new_kernel_mode(worker, args_ptr, StackSize::Huge1G, "".into(), 0);
         SCHEDULER.add_task(t);
     }
 

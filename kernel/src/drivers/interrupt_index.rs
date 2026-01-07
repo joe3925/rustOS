@@ -11,7 +11,9 @@ use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::util::{
+    test_full_heap, APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK,
+};
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
@@ -132,7 +134,9 @@ pub fn alloc_or_get_percpu_for(cpu_id: u32) -> &'static PerCpu {
     // Initialize the slot
     unsafe {
         let slot = PERCPU_ARENA.slots[idx].get();
-        (*slot).write(PerCpu { cpu_id: cpu_id as u64 });
+        (*slot).write(PerCpu {
+            cpu_id: cpu_id as u64,
+        });
     }
     PERCPU_INIT[idx].store(true, Ordering::Release);
 
@@ -661,18 +665,36 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
     set_gs_bases(ptr);
     p
 }
+pub fn enable_sse() {
+    use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
+    let mut flags = Cr0::read();
+    flags.remove(Cr0Flags::EMULATE_COPROCESSOR);
+    flags.insert(Cr0Flags::MONITOR_COPROCESSOR);
+    unsafe {
+        Cr0::write(flags);
+    }
 
+    let mut flags = Cr4::read();
+    flags.insert(Cr4Flags::OSFXSR);
+    flags.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
+    unsafe {
+        Cr4::write(flags);
+    }
+}
 extern "C" fn ap_startup() -> ! {
     {
+        enable_sse();
         CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();
-
         // TLS must be initialized before GDT/heap usage
         let cpu_slot = CPU_ID.fetch_add(1, Ordering::Acquire) as u32;
         unsafe { crate::memory::tls::init_cpu_tls(cpu_slot) };
         init_percpu_gs(cpu_slot);
-        unsafe { PER_CPU_GDT.lock().init_gdt() };
+        // TODO: the idt functions for drivers wont work until i change this to the correct idt load
         IDT.load();
+        test_full_heap();
+
+        unsafe { PER_CPU_GDT.lock().init_gdt() };
 
         let lapic_id = get_current_logical_id() as u32;
 

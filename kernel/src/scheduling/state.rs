@@ -1,8 +1,25 @@
 use core::arch::asm;
 
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FxState {
+    pub data: [u8; 512],
+}
+
+impl core::fmt::Debug for FxState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FxState").finish_non_exhaustive()
+    }
+}
+
+impl Default for FxState {
+    fn default() -> Self {
+        Self { data: [0u8; 512] }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-#[repr(C)]
 pub struct State {
     pub rax: u64,
     pub rcx: u64,
@@ -25,6 +42,8 @@ pub struct State {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
+
+    pub fx_state: FxState,
 }
 impl State {
     #[inline(always)]
@@ -50,6 +69,7 @@ impl State {
             rflags: 0,
             cs: 0, // Initialize with zero
             ss: 0, // Initialize with zero
+            fx_state: FxState::default(),
         };
         state.update(rax);
         state
@@ -104,6 +124,16 @@ impl State {
         }
         self.rax = rax;
     }
+    #[inline(always)]
+    pub unsafe fn save_fx(&mut self) {
+        asm!("fxsave [{}]", in(reg) self.fx_state.data.as_mut_ptr(), options(nostack));
+    }
+
+    #[inline(always)]
+    pub unsafe fn restore_fx(&self) {
+        asm!("fxrstor [{}]", in(reg) self.fx_state.data.as_ptr(), options(nostack));
+    }
+
     #[inline(always)]
     pub unsafe extern "C" fn restore(&self, state: *mut State) {
         core::ptr::write(state, *self);

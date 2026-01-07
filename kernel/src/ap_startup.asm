@@ -34,7 +34,6 @@ startup_ap:
     mov cr0, eax
 
     mov eax, cr4
-    or  eax, 1 << 9 | 1 << 7 | 1 << 5 | 1 << 4                    ; CR4.PAE
     mov cr4, eax
 
     fninit
@@ -63,12 +62,12 @@ long_mode_entry:
     mov ss, rax
 
 
-    mov rsp, [trampoline.start_stack]      
+    mov rsp, [trampoline.start_stack]
 
     lgdt [trampoline.longmode_limit]
 
-    mov rax, [trampoline.start_address]    
-    jmp rax                               
+    mov rax, [trampoline.start_address]
+    call rax                               
 
 struc GDTEntry
     .limitl resw 1

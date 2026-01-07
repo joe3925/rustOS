@@ -172,6 +172,7 @@ impl Scheduler {
         if let Some(cur) = self.get_current_task(cpu_id) {
             if let Some(mut guard) = cur.try_write() {
                 guard.update_from_context(state);
+                unsafe { guard.context.save_fx() };
             } else {
                 return;
             }
@@ -207,7 +208,10 @@ impl Scheduler {
             .unwrap()
             .fetch_add(1, Ordering::Relaxed);
 
-        unsafe { (*ctx_ptr).restore(state) };
+        unsafe {
+            (*ctx_ptr).restore_fx();
+            (*ctx_ptr).restore(state);
+        };
     }
 
     #[inline(always)]

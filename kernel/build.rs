@@ -141,6 +141,7 @@ fn main() {
     b.flag("-mcx16");
     b.flag("-mcmodel=large");
     b.flag("-fPIC");
+    b.flag("-fstack-clash-protection");
     b.define("_HAS_EXCEPTIONS", "0");
     b.define("SNMALLOC_USE_WAIT_ON_ADDRESS", "1");
     b.define("SNMALLOC_USE_SELF_VENDORED_STL", "1");

@@ -20,7 +20,7 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::array;
 use core::ffi::CStr;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
 use x86_64::structures::paging::{mapper::MapToError, Page, PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
@@ -30,6 +30,25 @@ use x86_64::VirtAddr;
 /// Memory is never actually freed back (bump allocator), but snmalloc
 /// manages its own free lists on top of this.
 static HEAP_BUMP: AtomicUsize = AtomicUsize::new(HEAP_START);
+
+/// Maximum CPUs supported (must match interrupt_index::MAX_CPUS)
+const MAX_CPUS: usize = 256;
+
+/// Per-core boot mode flags. When true, snmalloc wait-on-address will spin
+/// instead of parking tasks. Each core's idle task sets its flag to false
+/// when it starts, indicating the scheduler is ready for that core.
+pub static SNMALLOC_CORE_BOOT_MODE: [AtomicBool; MAX_CPUS] = {
+    const INIT: AtomicBool = AtomicBool::new(true);
+    [INIT; MAX_CPUS]
+};
+
+/// Mark a core as ready for task parking (called by idle task on first run)
+#[inline]
+pub fn snmalloc_mark_core_ready(cpu_id: usize) {
+    if cpu_id < MAX_CPUS {
+        SNMALLOC_CORE_BOOT_MODE[cpu_id].store(false, Ordering::Release);
+    }
+}
 const MAX_WAITERS: usize = 512;
 unsafe impl Send for Waiter {}
 unsafe impl Sync for Waiter {}
@@ -230,6 +249,15 @@ pub unsafe extern "C" fn krnl_snmalloc_wait_on_u8(addr: *const u8, expected: u8)
             return;
         }
         core::hint::spin_loop();
+    }
+
+    // During boot mode for this core, just spin - no task parking available yet
+    let cpu = current_cpu_id();
+    if cpu < MAX_CPUS && SNMALLOC_CORE_BOOT_MODE[cpu].load(Ordering::Relaxed) {
+        while ptr::read_volatile(addr) == expected {
+            core::hint::spin_loop();
+        }
+        return;
     }
 
     loop {
