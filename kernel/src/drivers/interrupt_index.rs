@@ -15,8 +15,6 @@ use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LO
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
@@ -92,26 +90,53 @@ pub fn get_current_logical_id() -> u8 {
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
-static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
 
-pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
-    let idx = lapic_id as usize;
-    let mut v = PERCPU_SLOTS.lock();
-    if v.len() <= idx {
-        v.resize_with(idx + 1, || None);
-    }
-    if let Some(p) = v[idx] {
-        return p;
-    }
-    let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
-        cpu_id: lapic_id as u64,
-    }));
-    v[idx] = Some(p);
-    p
-}
+/// Maximum CPUs supported (matches TLS bootstrap arena)
+const MAX_CPUS: usize = 256;
+
 #[repr(C, align(64))]
 pub struct PerCpu {
     pub cpu_id: u64,
+}
+
+/// Static storage for PerCpu structures in .bss
+/// Each slot is cache-line aligned (64 bytes) to prevent false sharing
+#[repr(C, align(4096))]
+struct PerCpuArena {
+    slots: [UnsafeCell<MaybeUninit<PerCpu>>; MAX_CPUS],
+}
+
+unsafe impl Sync for PerCpuArena {}
+
+static PERCPU_ARENA: PerCpuArena = PerCpuArena {
+    slots: unsafe { MaybeUninit::uninit().assume_init() },
+};
+
+/// Tracks which slots have been initialized
+static PERCPU_INIT: [AtomicBool; MAX_CPUS] = {
+    const INIT: AtomicBool = AtomicBool::new(false);
+    [INIT; MAX_CPUS]
+};
+
+pub fn alloc_or_get_percpu_for(cpu_id: u32) -> &'static PerCpu {
+    let idx = cpu_id as usize;
+    assert!(idx < MAX_CPUS, "CPU ID {} exceeds MAX_CPUS", cpu_id);
+
+    // Check if already initialized
+    if PERCPU_INIT[idx].load(Ordering::Acquire) {
+        return unsafe { (*PERCPU_ARENA.slots[idx].get()).assume_init_ref() };
+    }
+
+    // Initialize the slot
+    unsafe {
+        let slot = PERCPU_ARENA.slots[idx].get();
+        (*slot).write(PerCpu { cpu_id: cpu_id as u64 });
+    }
+    PERCPU_INIT[idx].store(true, Ordering::Release);
+
+    unsafe { (*PERCPU_ARENA.slots[idx].get()).assume_init_ref() }
 }
 
 pub const PERCPU_CPU_ID_OFF: u64 = 0;
@@ -645,12 +670,11 @@ extern "C" fn ap_startup() -> ! {
         // TLS must be initialized before GDT/heap usage
         let cpu_slot = CPU_ID.fetch_add(1, Ordering::Acquire) as u32;
         unsafe { crate::memory::tls::init_cpu_tls(cpu_slot) };
-
+        init_percpu_gs(cpu_slot);
         unsafe { PER_CPU_GDT.lock().init_gdt() };
         IDT.load();
 
         let lapic_id = get_current_logical_id() as u32;
-        init_percpu_gs(cpu_slot);
 
         unsafe {
             let mut guard = APIC.lock();
