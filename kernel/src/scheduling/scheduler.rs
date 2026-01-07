@@ -140,7 +140,14 @@ impl Scheduler {
             let id = self.add_task_internal(task.clone());
             {
                 task.write().id = id;
-                self.cores[best].run_queue.lock().push_back(task);
+                let mut rq = self.cores[best].run_queue.lock();
+                let mut sq = self.cores[best].sleep_queue.lock();
+
+                // Reserve capacity in both queues so schedule_next never allocates
+                rq.reserve(1);
+                sq.reserve(1);
+
+                rq.push_back(task);
             }
             id
         })
