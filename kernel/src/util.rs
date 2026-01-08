@@ -98,12 +98,12 @@ pub unsafe fn init() {
         test_full_heap();
 
         init_kernel_cr3();
+        clear_screen();
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
 
         load_idt();
-        clear_screen();
         syscall_init();
         // TSC calibration
         let tsc_start = cpu::get_cycles();

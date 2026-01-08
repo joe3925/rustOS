@@ -91,7 +91,7 @@ impl Task {
             .initial_local_apic_id();
 
         let stack_top = stack_pointer.as_u64();
-        let guard_page = initial_guard_page(stack_top, stack_size);
+        let guard_page = initial_guard_page_user(stack_top, stack_size);
 
         let mut state = State::new(0);
         state.rip = entry_point as u64;
@@ -163,7 +163,7 @@ impl Task {
         let stack_top =
             allocate_kernel_stack(stack_size).expect("Failed to allocate kernel-mode stack");
         let stack_top_u64 = stack_top.as_u64();
-        let guard_page = initial_guard_page(stack_top_u64, stack_size.as_bytes());
+        let guard_page = initial_guard_page_kernel(stack_top_u64);
 
         let mut state = State::new(0);
         state.rip = entry_point as u64;
@@ -503,7 +503,8 @@ pub(crate) extern "win64" fn idle_task(_ctx: usize) {
     }
 }
 
-fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
+/// Calculate initial guard page for user-mode stacks (variable size allocation).
+fn initial_guard_page_user(stack_top: u64, stack_size: u64) -> u64 {
     if stack_top == 0 || stack_size == 0 {
         return 0;
     }
@@ -515,4 +516,12 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
         Some(v) => v,
         None => 0,
     }
+}
+
+/// Calculate initial guard page for kernel-mode stacks.
+/// The kernel stack allocator always reserves 2 MiB + 4 KiB, with the guard page
+/// at the bottom of the reserved region (region_base = stack_top - RESERVE_TOTAL).
+fn initial_guard_page_kernel(stack_top: u64) -> u64 {
+    const RESERVE_TOTAL: u64 = 2 * 1024 * 1024 + 0x1000; // 2 MiB + 4 KiB guard
+    stack_top.checked_sub(RESERVE_TOTAL).unwrap_or(0)
 }

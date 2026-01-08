@@ -11,6 +11,7 @@ use crate::cpu::get_cpu_info;
 use crate::memory::paging::paging::align_up_2mib;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
+use crate::println;
 use crate::structs::per_core_storage::PCS;
 
 use x86_64::instructions::segmentation::{Segment, CS, SS};
@@ -51,10 +52,16 @@ impl GDTTracker {
         let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
         // Stacks
         let timer_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(StackSize::Huge1G).expect("Failed to alloc timer stack");
+
+        println!(
+            "Timer stack start: {:#x}, Timer stack end: {:#x}",
+            timer_stack.as_u64(),
+            timer_stack.as_u64() + StackSize::Huge1G.as_bytes()
+        );
 
         let privilege_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack ");
+            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc privilege stack ");
 
         let double_fault_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack ");
