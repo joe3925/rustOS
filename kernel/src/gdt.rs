@@ -52,16 +52,10 @@ impl GDTTracker {
         let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
         // Stacks
         let timer_stack =
-            allocate_kernel_stack(StackSize::Huge1G).expect("Failed to alloc timer stack");
-
-        println!(
-            "Timer stack start: {:#x}, Timer stack end: {:#x}",
-            timer_stack.as_u64(),
-            timer_stack.as_u64() + StackSize::Huge1G.as_bytes()
-        );
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
 
         let privilege_stack =
-            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc privilege stack ");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack ");
 
         let double_fault_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack ");

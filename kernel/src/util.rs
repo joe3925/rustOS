@@ -129,6 +129,7 @@ pub unsafe fn init() {
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
     SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
+    // TODO: fix this
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,

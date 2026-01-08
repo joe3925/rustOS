@@ -1,19 +1,19 @@
 // scheduling/task.rs
 
 use crate::cpu::get_cpu_info;
+use crate::drivers::interrupt_index::current_cpu_id;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::{map_kernel_range, map_range_with_huge_pages};
 use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
-use crate::memory::snmalloc::snmalloc_mark_core_ready;
-use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::paging::virt_tracker::{
     allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
 };
+use crate::memory::snmalloc::snmalloc_mark_core_ready;
 use crate::memory::tls::TlsBlock;
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
-use crate::scheduling::state::State;
+use crate::scheduling::state::{FxState, State};
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -53,6 +53,7 @@ impl From<u8> for ParkState {
 pub struct Task {
     pub name: String,
     pub context: State,
+    pub fx_state: FxState,
     pub stack_start: u64,
     pub guard_page: u64,
     pub id: u64,
@@ -129,6 +130,7 @@ impl Task {
         Arc::new(RwLock::new(Self {
             name,
             context: state,
+            fx_state: FxState::default(),
             stack_start: stack_top,
             guard_page,
             id: 0,
@@ -199,6 +201,7 @@ impl Task {
         Arc::new(RwLock::new(Self {
             name,
             context: state,
+            fx_state: FxState::default(),
             stack_start: stack_top_u64,
             guard_page,
             id: 0,

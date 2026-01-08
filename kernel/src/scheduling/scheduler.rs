@@ -6,7 +6,7 @@ use crate::drivers::timer_driver::PER_CORE_SWITCHES;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::stack::StackSize;
 use crate::println;
-use crate::scheduling::state::State;
+use crate::scheduling::state::{FxState, State};
 use crate::scheduling::task::{idle_task, ParkState, Task};
 use crate::static_handlers::task_yield;
 use crate::util::{kernel_main, KERNEL_INITIALIZED, TOTAL_TIME};
@@ -172,7 +172,7 @@ impl Scheduler {
         if let Some(cur) = self.get_current_task(cpu_id) {
             if let Some(mut guard) = cur.try_write() {
                 guard.update_from_context(state);
-                unsafe { guard.context.save_fx() };
+                unsafe { guard.fx_state.save_fx() };
             } else {
                 return;
             }
@@ -191,9 +191,13 @@ impl Scheduler {
             None => return,
         };
 
-        let (needs_restore, ctx_ptr) = {
+        let (needs_restore, ctx_ptr, fx_ptr) = {
             if let Some(t) = next.try_read() {
-                (t.parent_pid != 0, &t.context as *const _ as *mut State)
+                (
+                    t.parent_pid != 0,
+                    &t.context as *const _ as *mut State,
+                    &t.fx_state as *const _ as *mut FxState,
+                )
             } else {
                 return;
             }
@@ -209,7 +213,7 @@ impl Scheduler {
             .fetch_add(1, Ordering::Relaxed);
 
         unsafe {
-            (*ctx_ptr).restore_fx();
+            (*fx_ptr).restore_fx();
             (*ctx_ptr).restore(state);
         };
     }

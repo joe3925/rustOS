@@ -5,7 +5,17 @@ use core::arch::asm;
 pub struct FxState {
     pub data: [u8; 512],
 }
+impl FxState {
+    #[inline(always)]
+    pub unsafe fn save_fx(&mut self) {
+        asm!("fxsave [{}]", in(reg) self.data.as_mut_ptr(), options(nostack));
+    }
 
+    #[inline(always)]
+    pub unsafe fn restore_fx(&self) {
+        asm!("fxrstor [{}]", in(reg) self.data.as_ptr(), options(nostack));
+    }
+}
 impl core::fmt::Debug for FxState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("FxState").finish_non_exhaustive()
@@ -42,8 +52,6 @@ pub struct State {
     pub rflags: u64,
     pub rsp: u64,
     pub ss: u64,
-
-    pub fx_state: FxState,
 }
 impl State {
     #[inline(always)]
@@ -69,7 +77,6 @@ impl State {
             rflags: 0,
             cs: 0, // Initialize with zero
             ss: 0, // Initialize with zero
-            fx_state: FxState::default(),
         };
         state.update(rax);
         state
@@ -123,15 +130,6 @@ impl State {
             );
         }
         self.rax = rax;
-    }
-    #[inline(always)]
-    pub unsafe fn save_fx(&mut self) {
-        asm!("fxsave [{}]", in(reg) self.fx_state.data.as_mut_ptr(), options(nostack));
-    }
-
-    #[inline(always)]
-    pub unsafe fn restore_fx(&self) {
-        asm!("fxrstor [{}]", in(reg) self.fx_state.data.as_ptr(), options(nostack));
     }
 
     #[inline(always)]

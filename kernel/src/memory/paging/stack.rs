@@ -52,13 +52,13 @@ impl Default for StackSize {
 const GUARD_4K: u64 = 0x1000;
 
 pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> {
-    let max_stack = StackSize::Huge2M.as_bytes();
-    let reserve_total = max_stack + GUARD_4K;
+    let max_stack = StackSize::Huge1G;
+    let reserve_total = max_stack.as_bytes() + GUARD_4K;
 
     let map_bytes = {
         let b = align_up_4k(size.as_bytes());
-        if b > max_stack {
-            max_stack
+        if b > max_stack.as_bytes() {
+            max_stack.as_bytes()
         } else {
             b
         }
@@ -68,7 +68,7 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
 
     // Reserve a full 2MiB stack window (+4KiB hard guard) but do NOT map it yet.
     let region_base =
-        allocate_auto_kernel_range_aligned(reserve_total, StackSize::Huge2M.required_alignment())
+        allocate_auto_kernel_range_aligned(reserve_total, max_stack.required_alignment())
             .ok_or(PageMapError::NoMemory())?;
     let stack_top = region_base + reserve_total;
 
