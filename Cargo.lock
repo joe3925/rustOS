@@ -334,7 +334,6 @@ dependencies = [
  "bitflags 2.9.0",
  "bootloader_api",
  "buddy_system_allocator",
- "cc",
  "crc-any",
  "embedded-crc32c",
  "embedded-graphics",

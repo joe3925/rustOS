@@ -11,9 +11,7 @@ use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{
-    test_full_heap, APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK,
-};
+use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
@@ -692,7 +690,6 @@ extern "C" fn ap_startup() -> ! {
         init_percpu_gs(cpu_slot);
         // TODO: the idt functions for drivers wont work until i change this to the correct idt load
         IDT.load();
-        test_full_heap();
 
         unsafe { PER_CPU_GDT.lock().init_gdt() };
 

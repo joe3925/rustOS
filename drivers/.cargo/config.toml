@@ -1,8 +1,5 @@
 [build]
-target = "../../targets/x86_64-rustos-pe.json"
-
-[lib]
-crate-type = ["cdylib"]
+target = "targets/x86_64-rustos-pe.json"
 
 [target.x86_64-rustos-pe]
 rustflags = [
@@ -25,7 +22,8 @@ rustflags = [
     "-C",
     "link-arg=/EXPORT:DriverEntry",
 ]
+
 [unstable]
-# build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
+build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
 
 build-std-features = ["compiler-builtins-mem"]

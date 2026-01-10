@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(core_intrinsics)]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
 extern crate alloc;
@@ -11,7 +10,7 @@ use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use core::sync::atomic::Ordering;
-use core::{intrinsics::size_of, mem, ptr};
+use core::{mem, ptr};
 use dev_ext::DevExt;
 use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::IoVtable;
@@ -124,8 +123,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let va = match map_mmio_region(PhysAddr::new(base_pa as u64), size_rounded as u64) {
         Ok(va) => va,
         Err(e) => {
-            kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
-            core::intrinsics::abort();
+            panic!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
         }
     };
 

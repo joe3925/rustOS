@@ -1,10 +1,10 @@
 [build]
-target = "x86_64-pc-windows-msvc"
+target = "../../targets/x86_64-rustos-pe.json"
 
 [lib]
 crate-type = ["cdylib"]
 
-[target.x86_64-pc-windows-msvc]
+[target.x86_64-rustos-pe]
 rustflags = [
     "-C",
     "panic=abort",

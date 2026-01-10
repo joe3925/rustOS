@@ -9,7 +9,6 @@ use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stac
 use crate::memory::paging::virt_tracker::{
     allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
 };
-use crate::memory::snmalloc::snmalloc_mark_core_ready;
 use crate::memory::tls::TlsBlock;
 use crate::println;
 use crate::scheduling::scheduler::kernel_task_end;
@@ -499,8 +498,6 @@ impl Task {
 }
 
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
-    // Mark this core as ready for snmalloc task parking
-    snmalloc_mark_core_ready(current_cpu_id());
     loop {
         hlt();
     }

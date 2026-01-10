@@ -23,8 +23,7 @@ use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider}
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
-use crate::memory::allocator::ALLOCATOR;
-use crate::memory::heap::HEAP_SIZE;
+use crate::memory::allocator::HEAP_SIZE;
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -91,11 +90,10 @@ pub unsafe fn init() {
     tls::validate_bootstrap_size(&tls::TLS_TEMPLATE)
         .expect("TLS template too large for bootstrap arena");
     tls::init_cpu_tls(0);
-    crate::memory::snmalloc::init();
+    crate::memory::allocator::init();
 
     {
         let _init_lock = INIT_LOCK.lock();
-        test_full_heap();
 
         init_kernel_cr3();
         clear_screen();
@@ -251,25 +249,6 @@ pub fn trigger_breakpoint() {
     unsafe {
         asm!("int 3");
     }
-}
-
-pub fn test_full_heap() {
-    let element_count = (HEAP_SIZE / 0x100000) / size_of::<u64>();
-
-    let mut vec: Vec<u64> = Vec::with_capacity(1);
-    for i in 0..element_count {
-        vec.push(i as u64);
-    }
-    for i in 0..element_count {
-        if i != vec[i] as usize {
-            println!("Heap data verification failed at index {}", i);
-        }
-    }
-
-    println!(
-        "Heap test passed: allocated and verified {} elements in the heap",
-        element_count
-    );
 }
 
 pub extern "win64" fn random_number() -> u64 {

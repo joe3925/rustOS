@@ -3,6 +3,9 @@
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
+use core::cmp::Ordering;
+use core::ffi::c_void;
+
 use alloc::boxed::Box;
 use kernel_sys::{submit_blocking_internal, submit_runtime_internal};
 use kernel_types::pnp::PnpRequest;
@@ -140,10 +143,6 @@ pub unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
 static _FLTUSED: i32 = 0;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8) -> i32 {
-    unimplemented!()
-}
-#[unsafe(no_mangle)]
 pub extern "C" fn fma(_x: f64, _y: f64, z: f64) -> f64 {
     z
 }
@@ -200,4 +199,76 @@ pub unsafe extern "C" fn __chkstk_ms() {
         "test byte ptr [r11], 0",
         "ret"
     );
+}
+#[no_mangle]
+pub extern "C" fn memcpy(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    unsafe {
+        let mut i = 0;
+        while i < n {
+            let byte = (src as *const u8).add(i).read();
+            (dst as *mut u8).add(i).write(byte);
+            i += 1;
+        }
+    }
+    dst
+}
+
+#[no_mangle]
+pub extern "C" fn memmove(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    unsafe {
+        // Copy forwards or backwards depending on overlap.
+        if (dst as usize) < (src as usize) {
+            let mut i = 0;
+            while i < n {
+                let byte = (src as *const u8).add(i).read();
+                (dst as *mut u8).add(i).write(byte);
+                i += 1;
+            }
+        } else {
+            let mut i = n;
+            while i != 0 {
+                i -= 1;
+                let byte = (src as *const u8).add(i).read();
+                (dst as *mut u8).add(i).write(byte);
+            }
+        }
+    }
+    dst
+}
+
+#[no_mangle]
+pub extern "C" fn memset(dst: *mut c_void, val: i32, n: usize) -> *mut c_void {
+    unsafe {
+        let mut i = 0;
+        let byte = val as u8;
+        while i < n {
+            (dst as *mut u8).add(i).write(byte);
+            i += 1;
+        }
+    }
+    dst
+}
+
+#[no_mangle]
+pub extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
+    let lhs = unsafe { core::slice::from_raw_parts(a as *const u8, n) };
+    let rhs = unsafe { core::slice::from_raw_parts(b as *const u8, n) };
+    match lhs.cmp(rhs) {
+        Ordering::Less => -1,
+        Ordering::Equal => 0,
+        Ordering::Greater => 1,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn strlen(s: *const u8) -> usize {
+    let mut len = 0usize;
+    unsafe {
+        let mut p = s;
+        while p.read() != 0 {
+            len += 1;
+            p = p.add(1);
+        }
+    }
+    len
 }

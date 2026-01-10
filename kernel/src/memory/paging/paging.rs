@@ -154,14 +154,7 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
 
 /// Decommit a range of virtual memory: free the physical frames but keep the
 /// virtual address space reserved. The pages will fault on access until recommitted.
-///
-/// This is different from unmap_range which also releases the virtual address space.
-/// Decommit is used by allocators like snmalloc that want to release physical memory
-/// while keeping the virtual address range reserved for future use.
-///
-/// # Safety
-/// The caller must ensure the range is currently mapped and that no code will
-/// access this memory until it is recommitted.
+
 pub unsafe fn decommit_range(virtual_addr: VirtAddr, size: u64) {
     decommit_range_impl(virtual_addr, size)
 }

@@ -7,8 +7,6 @@ edition = "2021"
 [[bin]]
 name = "kernel"
 path = "src/main.rs"
-[build-dependencies]
-cc = "1.2.51"
 [dependencies]
 bootloader_api = "0.11.10"
 x86_64 = "=0.15.2"

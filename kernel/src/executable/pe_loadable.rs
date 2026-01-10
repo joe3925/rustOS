@@ -450,12 +450,15 @@ impl PELoader {
             let dll_name = imp.dll.to_ascii_lowercase();
             let symbol_name = &imp.name;
 
-            let abs_addr = program
+            let abs_addr_result = program
                 .find_import(dll_name.as_str(), symbol_name.to_string().as_str())
-                .ok_or(LoadError::NoSuchSymbol)?;
-
-            let slot_va = self.current_base.as_u64() + imp.offset as u64;
-            unsafe { (slot_va as *mut u64).write(abs_addr.as_u64()) };
+                .ok_or(LoadError::NoSuchSymbol);
+            if let Some(abs_addr) = abs_addr_result.as_ref().ok() {
+                let slot_va = self.current_base.as_u64() + imp.offset as u64;
+                unsafe { (slot_va as *mut u64).write(abs_addr.as_u64()) };
+            } else {
+                abs_addr_result?;
+            }
         }
         Ok(())
     }

@@ -2,9 +2,9 @@ use crate::alloc::format;
 use crate::drivers::interrupt_index;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::file_system::file::File;
+use crate::memory::allocator::HEAP_SIZE;
 use crate::memory::{
     allocator::ALLOCATOR,
-    heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
 use crate::scheduling::runtime::runtime::{

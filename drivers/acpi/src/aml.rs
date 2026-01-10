@@ -58,8 +58,7 @@ unsafe fn map_phys_window(paddr: usize, bytes: usize) -> (VirtAddr, usize, usize
     let base = paddr - off;
     let size = round_up(off + bytes, PAGE_SIZE);
     let va = map_mmio_region(PhysAddr::new(base as u64), size as u64).unwrap_or_else(|e| {
-        kernel_api::println!("[ACPI] map_phys_window failed: {:?}", e);
-        core::intrinsics::abort();
+        panic!("[ACPI] map_phys_window failed: {:?}", e);
     });
 
     (va, off, size)

@@ -1,10 +1,10 @@
 [build]
-target = "x86_64-pc-windows-msvc"
+target = "../targets/x86_64-rustos-pe.json"
 
 [lib]
 crate-type = ["cdylib"]
 
-[target.x86_64-pc-windows-msvc]
+[target.x86_64-rustos-pe]
 rustflags = [
     "-C",
     "panic=abort",
@@ -15,17 +15,15 @@ rustflags = [
     "-C",
     "link-arg=/SUBSYSTEM:NATIVE",
     "-C",
-    "link-arg=/ENTRY:DriverEntry",
-    "-C",
     "link-arg=/NODEFAULTLIB",
     "-C",
     "link-arg=/DYNAMICBASE",
     "-C",
     "link-arg=/FIXED:NO",
     "-C",
-    "link-arg=/INCLUDE:DriverEntry",
-    "-C",
     "link-arg=/EXPORT:DriverEntry",
+    "-C",
+    "target-feature=+crt-static",
 ]
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
