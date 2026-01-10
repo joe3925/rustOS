@@ -68,6 +68,7 @@ long_mode_entry:
     lgdt [trampoline.longmode_limit]
 
     mov rax, [trampoline.start_address]
+    sub rsp, 8 
     jmp rax                               
 
 struc GDTEntry

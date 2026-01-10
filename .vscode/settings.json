@@ -147,4 +147,22 @@
         "drivers/fat32/Cargo.toml",
         "drivers/i8042/Cargo.toml"
     ],
+    "cmake.ignoreCMakeListsMissing": true,
+    "files.associations": {
+        "chrono": "cpp",
+        "deque": "cpp",
+        "execution": "cpp",
+        "functional": "cpp",
+        "list": "cpp",
+        "memory": "cpp",
+        "sstream": "cpp",
+        "vector": "cpp",
+        "xhash": "cpp",
+        "xiosbase": "cpp",
+        "xlocale": "cpp",
+        "xmemory": "cpp",
+        "xstring": "cpp",
+        "xtree": "cpp",
+        "xutility": "cpp"
+    },
 }
