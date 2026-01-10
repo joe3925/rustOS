@@ -32,30 +32,6 @@ use kernel_api::{
 
 use crate::block_dev::BlockDev;
 use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
-use log::{Level, Metadata, Record};
-
-struct KernelLogger;
-
-impl log::Log for KernelLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Debug
-    }
-
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            println!("FAT32 [{}]: {}", record.level(), record.args());
-        }
-    }
-
-    fn flush(&self) {}
-}
-
-static LOGGER: KernelLogger = KernelLogger;
-
-fn init_logger() {
-    let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Debug);
-}
 
 #[inline]
 pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
@@ -200,7 +176,6 @@ pub extern "win64" fn fat_start(
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
-    init_logger();
     let mut io_vtable = IoVtable::new();
     io_vtable.set(
         IoType::DeviceControl(fs_root_ioctl),

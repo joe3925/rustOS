@@ -15,4 +15,3 @@ kernel_api.workspace = true
 spin.workspace = true
 bitflags.workspace = true
 fatfs.workspace = true
-log.workspace = true

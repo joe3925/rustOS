@@ -336,6 +336,9 @@ impl PELoader {
                 if present.contains(&dll) {
                     continue;
                 }
+                if dll.to_lowercase() == "kernel32.dll" {
+                    continue;
+                }
                 let path = alloc::format!(r"C:\BIN\MOD\{}", dll);
                 program.load_module(path).await?;
                 added = true;
@@ -449,7 +452,9 @@ impl PELoader {
         for imp in &self.pe.imports {
             let dll_name = imp.dll.to_ascii_lowercase();
             let symbol_name = &imp.name;
-
+            if dll_name.to_lowercase() == "kernel32.dll" {
+                continue;
+            }
             let abs_addr_result = program
                 .find_import(dll_name.as_str(), symbol_name.to_string().as_str())
                 .ok_or(LoadError::NoSuchSymbol);

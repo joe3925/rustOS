@@ -282,6 +282,9 @@ impl Program {
             for dll in loader.list_import_dlls() {
                 // TODO: Add more dll search locations
                 let dep_path = alloc::format!(r"C:\BIN\MOD\{}", dll);
+                if dll.to_lowercase() == "kernel32.dll" {
+                    continue;
+                }
                 if !self.has_module(&dll) {
                     queue.push(dep_path);
                 }
