@@ -87,26 +87,10 @@ namespace snmalloc
             return false;
         }
 
-        template <bool page_aligned = false, ZeroMem zero_mem = NoZero>
+        template <bool page_aligned = false>
         static void zero(void *p, size_t size) noexcept
         {
-            if constexpr (zero_mem == YesZero)
-            {
-                if constexpr (page_aligned)
-                {
-                    SNMALLOC_ASSERT(is_aligned_block<page_size>(p, size));
-                    notify_not_using(p, size);
-                    (void)notify_using<YesZero>(p, size);
-                }
-                else
-                {
-                    memset(p, 0, size);
-                }
-            }
-            else
-            {
-                UNUSED(p, size);
-            }
+            memset(p, 0, size);
         }
 
         static void *reserve(size_t size) noexcept

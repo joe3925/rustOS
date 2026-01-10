@@ -178,20 +178,37 @@ pub(crate) unsafe fn decommit_range_impl(virtual_addr: VirtAddr, size: u64) {
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init();
 
+    const GiB: u64 = 1 << 30;
+    const MiB2: u64 = 2 * 1024 * 1024;
     const KiB4: u64 = 4 * 1024;
 
     let mut cur = virtual_addr;
     let mut remaining = align_up_4k(size);
 
-    // For decommit, we only handle 4KiB pages to avoid complexity with huge pages.
-    // If a huge page is encountered, we skip it (it stays committed).
-    // This is acceptable because snmalloc typically works with 4KiB granularity
-    // for decommit operations.
+    // Handle all page sizes: 1GiB, 2MiB, and 4KiB
     while remaining > 0 {
+        // Try 1 GiB page first
+        if remaining >= GiB && (cur.as_u64() & (GiB - 1)) == 0 {
+            if decommit_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur) {
+                cur += GiB;
+                remaining -= GiB;
+                continue;
+            }
+        }
+
+        // Try 2 MiB page
+        if remaining >= MiB2 && (cur.as_u64() & (MiB2 - 1)) == 0 {
+            if decommit_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur) {
+                cur += MiB2;
+                remaining -= MiB2;
+                continue;
+            }
+        }
+
+        // Fall back to 4 KiB page
         if decommit_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {
             // Successfully decommitted
         }
-        // Even if decommit failed (page not present or huge page), advance
         cur += KiB4;
         remaining -= KiB4;
     }

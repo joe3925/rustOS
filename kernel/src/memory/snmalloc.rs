@@ -10,7 +10,7 @@ use x86_64::instructions::interrupts::without_interrupts;
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::memory::heap::{HEAP_SIZE, HEAP_START};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::memory::paging::paging::{decommit_range, map_page, map_range_with_huge_pages, unmap_range_unchecked};
+use crate::memory::paging::paging::{decommit_range, map_range_with_huge_pages, unmap_range_unchecked};
 use crate::memory::paging::tables::init_mapper;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
 use crate::static_handlers::task_yield;
@@ -22,7 +22,7 @@ use core::ffi::CStr;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use lazy_static::lazy_static;
-use x86_64::structures::paging::{mapper::MapToError, Page, PageTableFlags, Size4KiB};
+use x86_64::structures::paging::{PageTableFlags, Size4KiB};
 use x86_64::VirtAddr;
 
 /// Simple bump allocator for snmalloc's backend memory requests.
@@ -178,14 +178,19 @@ pub unsafe extern "C" fn krnl_snmalloc_commit(base: *mut u8, size: usize, zero: 
     let mut frame_alloc = BootInfoFrameAllocator::init();
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-    map_range_with_huge_pages(
+    // Use huge pages for efficiency. Decommit now properly handles them.
+    if map_range_with_huge_pages(
         &mut mapper,
         VirtAddr::new(base as u64),
-        size.try_into().unwrap(),
+        size as u64,
         &mut frame_alloc,
         flags,
     )
-    .expect("Failed to commit memory for snmalloc ");
+    .is_err()
+    {
+        return false;
+    }
+
     if zero {
         ptr::write_bytes(base, 0, size);
     }
