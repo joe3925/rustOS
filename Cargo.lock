@@ -68,6 +68,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 
 [[package]]
+name = "baby-mimalloc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88ed2b00c57c2899f23c8dbf1d30c3eb4fde5e98dd113e278d7677b4c8d290bf"
+dependencies = [
+ "spin 0.9.8",
+]
+
+[[package]]
 name = "base_driver"
 version = "0.1.0"
 dependencies = [
@@ -398,6 +407,7 @@ name = "kernel"
 version = "0.1.0"
 dependencies = [
  "acpi 5.2.0",
+ "baby-mimalloc",
  "bincode",
  "bitflags 2.9.0",
  "bootloader_api",

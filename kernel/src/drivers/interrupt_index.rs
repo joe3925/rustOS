@@ -5,7 +5,7 @@ use crate::drivers::interrupt_index::ApicErrors::{
 use crate::drivers::timer_driver::{set_num_cores, NUM_CORES};
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
-use crate::idt::IDT;
+use crate::idt::load_idt;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
@@ -643,7 +643,7 @@ extern "C" fn ap_startup() -> ! {
         let _g = INIT_LOCK.lock();
 
         unsafe { PER_CPU_GDT.lock().init_gdt() };
-        IDT.load();
+        load_idt();
 
         let lapic_id = get_current_logical_id() as u32;
         init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);

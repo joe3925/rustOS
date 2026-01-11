@@ -3,7 +3,6 @@ use crate::drivers::interrupt_index;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::file_system::file::File;
 use crate::memory::{
-    allocator::ALLOCATOR,
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
@@ -1607,5 +1606,6 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
 }
 
 pub fn used_memory() -> usize {
-    HEAP_SIZE - ALLOCATOR.free_memory()
+    // HEAP_SIZE - ALLOCATOR.free_memory()
+    0
 }

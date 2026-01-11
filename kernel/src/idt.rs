@@ -3,10 +3,9 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Waker;
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
@@ -342,6 +341,10 @@ impl IrqHandleRaw {
     }
 }
 
+const MAX_HANDLERS_PER_VECTOR: usize = 4;
+const MAX_TOTAL_REGISTRATIONS: usize = 64;
+
+#[derive(Clone, Copy)]
 struct IrqReg {
     id: usize,
     isr: IrqIsrFn,
@@ -349,21 +352,68 @@ struct IrqReg {
     handle: IrqHandleRaw,
 }
 
+impl IrqReg {
+    const EMPTY: Self = Self {
+        id: 0,
+        isr: dummy_isr,
+        ctx: 0,
+        handle: IrqHandleRaw(core::ptr::null_mut()),
+    };
+}
+
+extern "win64" fn dummy_isr(
+    _: u8,
+    _: u32,
+    _: *mut InterruptStackFrame,
+    _: IrqHandlePtr,
+    _: usize,
+) -> bool {
+    false
+}
+
+struct VectorSlot {
+    regs: [IrqReg; MAX_HANDLERS_PER_VECTOR],
+    count: AtomicUsize,
+    lock: spin::RwLock<()>,
+}
+
+impl VectorSlot {
+    const fn new() -> Self {
+        Self {
+            regs: [IrqReg::EMPTY; MAX_HANDLERS_PER_VECTOR],
+            count: AtomicUsize::new(0),
+            lock: spin::RwLock::new(()),
+        }
+    }
+}
+
+struct IdMapEntry {
+    id: AtomicUsize,
+    vector: AtomicU8,
+}
+
+impl IdMapEntry {
+    const fn new() -> Self {
+        Self {
+            id: AtomicUsize::new(0),
+            vector: AtomicU8::new(0),
+        }
+    }
+}
+
 pub struct IrqManager {
-    vectors: Vec<RwLock<Vec<IrqReg>>>,
-    id_to_vec: Mutex<BTreeMap<usize, u8>>,
+    vectors: [VectorSlot; 256],
+    id_map: [IdMapEntry; MAX_TOTAL_REGISTRATIONS],
     next_id: AtomicUsize,
 }
 
 impl IrqManager {
-    fn new() -> Self {
-        let mut vectors = Vec::with_capacity(256);
-        for _ in 0..256 {
-            vectors.push(RwLock::new(Vec::new()));
-        }
+    const fn new() -> Self {
+        const SLOT: VectorSlot = VectorSlot::new();
+        const ENTRY: IdMapEntry = IdMapEntry::new();
         Self {
-            vectors,
-            id_to_vec: Mutex::new(BTreeMap::new()),
+            vectors: [SLOT; 256],
+            id_map: [ENTRY; MAX_TOTAL_REGISTRATIONS],
             next_id: AtomicUsize::new(1),
         }
     }
@@ -373,47 +423,80 @@ impl IrqManager {
     }
 
     fn register(&self, vector: u8, isr: IrqIsrFn, ctx: usize, handle: IrqHandlePtr, id: usize) {
-        {
-            let mut m = self.id_to_vec.lock();
-            m.insert(id, vector);
+        // Store id -> vector mapping
+        for entry in &self.id_map {
+            if entry
+                .id
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                entry.vector.store(vector, Ordering::Release);
+                break;
+            }
         }
 
-        let mut slot = self.vectors[vector as usize].write();
-        slot.push(IrqReg {
-            id,
-            isr,
-            ctx,
-            handle: IrqHandleRaw(handle),
-        });
+        let slot = &self.vectors[vector as usize];
+        let _guard = slot.lock.write();
+        let count = slot.count.load(Ordering::Acquire);
+        if count < MAX_HANDLERS_PER_VECTOR {
+            // SAFETY: We hold the write lock and count < MAX
+            unsafe {
+                let regs = &slot.regs as *const _ as *mut [IrqReg; MAX_HANDLERS_PER_VECTOR];
+                (*regs)[count] = IrqReg {
+                    id,
+                    isr,
+                    ctx,
+                    handle: IrqHandleRaw(handle),
+                };
+            }
+            slot.count.store(count + 1, Ordering::Release);
+        }
     }
 
     fn unregister_id(&self, id: usize) {
-        let vector = {
-            let mut m = self.id_to_vec.lock();
-            m.remove(&id)
-        };
-
-        let Some(vector) = vector else {
-            return;
-        };
-
-        let mut v = self.vectors[vector as usize].write();
-        let mut i = 0usize;
-        while i < v.len() {
-            if v[i].id == id {
-                v.swap_remove(i);
+        // Find and clear id -> vector mapping
+        let mut vector = None;
+        for entry in &self.id_map {
+            if entry.id.load(Ordering::Acquire) == id {
+                vector = Some(entry.vector.load(Ordering::Acquire));
+                entry.id.store(0, Ordering::Release);
                 break;
             }
-            i += 1;
+        }
+
+        let Some(vec) = vector else { return };
+
+        let slot = &self.vectors[vec as usize];
+        let _guard = slot.lock.write();
+        let count = slot.count.load(Ordering::Acquire);
+
+        // SAFETY: We hold the write lock
+        unsafe {
+            let regs = &slot.regs as *const _ as *mut [IrqReg; MAX_HANDLERS_PER_VECTOR];
+            for i in 0..count {
+                if (*regs)[i].id == id {
+                    // Swap remove
+                    if i < count - 1 {
+                        (*regs)[i] = (*regs)[count - 1];
+                    }
+                    (*regs)[count - 1] = IrqReg::EMPTY;
+                    slot.count.store(count - 1, Ordering::Release);
+                    break;
+                }
+            }
         }
     }
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
         let cpu = current_cpu_id() as u32;
 
-        {
-            let v = self.vectors[vector as usize].read();
-            for r in v.iter() {
+        let slot = &self.vectors[vector as usize];
+        let _guard = slot.lock.read();
+        let count = slot.count.load(Ordering::Acquire);
+
+        for i in 0..count {
+            let r = &slot.regs[i];
+            if r.id != 0 {
                 let frame_ptr: *mut InterruptStackFrame = frame as *mut InterruptStackFrame;
                 let claimed = (r.isr)(vector, cpu, frame_ptr, r.handle.as_ptr(), r.ctx);
                 if claimed {
@@ -426,15 +509,7 @@ impl IrqManager {
     }
 }
 
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref IRQ_MANAGER: IrqManager = IrqManager::new();
-}
-
-pub fn irq_init() {
-    let _ = &*IRQ_MANAGER;
-}
+static IRQ_MANAGER: IrqManager = IrqManager::new();
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn irq_unregister_thunk(id: usize) {
@@ -451,7 +526,8 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
     }
 
     let first_for_vector = {
-        let v = IRQ_MANAGER.vectors[vector as usize].read();
+        let _lock = IRQ_MANAGER.vectors[vector as usize].lock.read();
+        let v = IRQ_MANAGER.vectors[vector as usize].regs;
         v.is_empty()
     };
 
@@ -528,81 +604,88 @@ gen_irq_stub!(irq_vec_47, 47);
 // IDT SETUP
 // =============================================================================
 
-lazy_static! {
-    pub static ref IDT: InterruptDescriptorTable = unsafe {
-        let mut idt = InterruptDescriptorTable::new();
+static IDT: spin::Once<InterruptDescriptorTable> = spin::Once::new();
 
-        idt.divide_error
-            .set_handler_fn(exception_handlers::divide_by_zero_fault);
-        idt.debug
-            .set_handler_fn(exception_handlers::debug_exception);
-        idt.non_maskable_interrupt
-            .set_handler_fn(exception_handlers::non_maskable_interrupt);
-        idt.breakpoint
-            .set_handler_fn(exception_handlers::breakpoint_exception)
-            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
-        idt.overflow
-            .set_handler_fn(exception_handlers::overflow_exception);
-        idt.bound_range_exceeded
-            .set_handler_fn(exception_handlers::bound_range_exceeded_exception);
-        idt.invalid_opcode
-            .set_handler_fn(exception_handlers::invalid_opcode_exception);
-        idt.device_not_available
-            .set_handler_fn(exception_handlers::device_not_available_exception);
+fn init_idt() -> InterruptDescriptorTable {
+    let mut idt = InterruptDescriptorTable::new();
+
+    idt.divide_error
+        .set_handler_fn(exception_handlers::divide_by_zero_fault);
+    idt.debug
+        .set_handler_fn(exception_handlers::debug_exception);
+    idt.non_maskable_interrupt
+        .set_handler_fn(exception_handlers::non_maskable_interrupt);
+    idt.breakpoint
+        .set_handler_fn(exception_handlers::breakpoint_exception)
+        .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+    idt.overflow
+        .set_handler_fn(exception_handlers::overflow_exception);
+    idt.bound_range_exceeded
+        .set_handler_fn(exception_handlers::bound_range_exceeded_exception);
+    idt.invalid_opcode
+        .set_handler_fn(exception_handlers::invalid_opcode_exception);
+    idt.device_not_available
+        .set_handler_fn(exception_handlers::device_not_available_exception);
+    unsafe {
         idt.double_fault
             .set_handler_fn(exception_handlers::double_fault)
             .set_stack_index(DOUBLE_FAULT_IST_INDEX);
-        idt.invalid_tss
-            .set_handler_fn(exception_handlers::invalid_tss_exception);
-        idt.segment_not_present
-            .set_handler_fn(exception_handlers::segment_not_present_exception);
-        idt.stack_segment_fault
-            .set_handler_fn(exception_handlers::stack_segment_fault);
-        idt.general_protection_fault
-            .set_handler_fn(exception_handlers::general_protection_fault);
+    }
+    idt.invalid_tss
+        .set_handler_fn(exception_handlers::invalid_tss_exception);
+    idt.segment_not_present
+        .set_handler_fn(exception_handlers::segment_not_present_exception);
+    idt.stack_segment_fault
+        .set_handler_fn(exception_handlers::stack_segment_fault);
+    idt.general_protection_fault
+        .set_handler_fn(exception_handlers::general_protection_fault);
+    unsafe {
         idt.page_fault
             .set_handler_fn(exception_handlers::page_fault)
             .set_stack_index(PAGE_FAULT_IST_INDEX);
-        idt.x87_floating_point
-            .set_handler_fn(exception_handlers::x87_floating_point_exception);
-        idt.alignment_check
-            .set_handler_fn(exception_handlers::alignment_check_exception);
-        idt.machine_check
-            .set_handler_fn(exception_handlers::machine_check_exception);
-        idt.simd_floating_point
-            .set_handler_fn(exception_handlers::simd_floating_point_exception);
-        idt.virtualization
-            .set_handler_fn(exception_handlers::virtualization_exception);
+    }
+    idt.x87_floating_point
+        .set_handler_fn(exception_handlers::x87_floating_point_exception);
+    idt.alignment_check
+        .set_handler_fn(exception_handlers::alignment_check_exception);
+    idt.machine_check
+        .set_handler_fn(exception_handlers::machine_check_exception);
+    idt.simd_floating_point
+        .set_handler_fn(exception_handlers::simd_floating_point_exception);
+    idt.virtualization
+        .set_handler_fn(exception_handlers::virtualization_exception);
 
-        let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
+    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
 
+    unsafe {
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()]
             .set_handler_addr(VirtAddr::new(timer_interrupt_entry as u64))
             .set_stack_index(TIMER_IST_INDEX);
-        idt[base + 1].set_handler_fn(irq_vec_33);
-        idt[base + 2].set_handler_fn(irq_vec_34);
-        idt[base + 3].set_handler_fn(irq_vec_35);
-        idt[base + 4].set_handler_fn(irq_vec_36);
-        idt[base + 5].set_handler_fn(irq_vec_37);
-        idt[base + 6].set_handler_fn(irq_vec_38);
-        idt[base + 7].set_handler_fn(irq_vec_39);
-        idt[base + 8].set_handler_fn(irq_vec_40);
-        idt[base + 9].set_handler_fn(irq_vec_41);
-        idt[base + 10].set_handler_fn(irq_vec_42);
-        idt[base + 11].set_handler_fn(irq_vec_43);
-        idt[base + 12].set_handler_fn(irq_vec_44);
-        idt[base + 13].set_handler_fn(irq_vec_45);
-        idt[base + 14].set_handler_fn(irq_vec_46);
-        idt[base + 15].set_handler_fn(irq_vec_47);
+    }
+    idt[base + 1].set_handler_fn(irq_vec_33);
+    idt[base + 2].set_handler_fn(irq_vec_34);
+    idt[base + 3].set_handler_fn(irq_vec_35);
+    idt[base + 4].set_handler_fn(irq_vec_36);
+    idt[base + 5].set_handler_fn(irq_vec_37);
+    idt[base + 6].set_handler_fn(irq_vec_38);
+    idt[base + 7].set_handler_fn(irq_vec_39);
+    idt[base + 8].set_handler_fn(irq_vec_40);
+    idt[base + 9].set_handler_fn(irq_vec_41);
+    idt[base + 10].set_handler_fn(irq_vec_42);
+    idt[base + 11].set_handler_fn(irq_vec_43);
+    idt[base + 12].set_handler_fn(irq_vec_44);
+    idt[base + 13].set_handler_fn(irq_vec_45);
+    idt[base + 14].set_handler_fn(irq_vec_46);
+    idt[base + 15].set_handler_fn(irq_vec_47);
 
+    unsafe {
         idt[0x80].set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64));
+    }
 
-        idt
-    };
+    idt
 }
 
 pub fn load_idt() {
-    irq_init();
-    IDT.load();
+    IDT.call_once(init_idt).load();
     x86_64::instructions::interrupts::enable();
 }

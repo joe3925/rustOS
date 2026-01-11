@@ -102,8 +102,8 @@ impl Scheduler {
                 t.id = idle_id;
             }
             cores_vec.push(CoreScheduler {
-                run_queue: Mutex::new(VecDeque::new()),
-                sleep_queue: Mutex::new(Vec::new()),
+                run_queue: Mutex::new(VecDeque::with_capacity(16)),
+                sleep_queue: Mutex::new(Vec::with_capacity(16)),
                 current: RwLock::new(None),
                 idle_task: self.get_task_by_id(idle_id).expect("idle missing"),
             });
@@ -140,7 +140,25 @@ impl Scheduler {
             let id = self.add_task_internal(task.clone());
             {
                 task.write().id = id;
-                self.cores[best].run_queue.lock().push_back(task);
+
+                let core = &self.cores[best];
+
+                // Ensure sleep_queue has capacity (task may park later in IRQ context)
+                {
+                    let mut sq = core.sleep_queue.lock();
+                    if sq.capacity() == sq.len() {
+                        sq.reserve(1);
+                    }
+                }
+
+                // Ensure run_queue has capacity and add task
+                {
+                    let mut rq = core.run_queue.lock();
+                    if rq.capacity() == rq.len() {
+                        rq.reserve(1);
+                    }
+                    rq.push_back(task);
+                }
             }
             id
         })
@@ -467,7 +485,7 @@ pub extern "win64" fn yield_handler_win64(state: *mut State) {
 }
 
 #[unsafe(naked)]
-pub extern "win64" fn yield_interrupt_entry() -> ! {
+pub extern "win64" fn yield_interrupt_entry() {
     naked_asm!(
         "cli",
         "push r15",

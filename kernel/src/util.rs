@@ -23,7 +23,6 @@ use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider}
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
-use crate::memory::allocator::ALLOCATOR;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
 use crate::memory::paging::stack::StackSize;
@@ -88,15 +87,14 @@ pub unsafe fn init() {
     BootInfoFrameAllocator::init_start(memory_map);
     {
         let _init_lock = INIT_LOCK.lock();
-        init_heap();
-        //test_full_heap();
+        //init_heap();
+        load_idt();
 
         init_kernel_cr3();
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
 
-        load_idt();
         clear_screen();
         syscall_init();
 
