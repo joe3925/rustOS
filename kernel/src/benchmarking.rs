@@ -1258,9 +1258,7 @@ impl BenchWindow {
                     }
 
                     let moved = Arc::clone(&this_arc);
-                    block_on(spawn(async move {
-                        moved.persist().await;
-                    }));
+                    block_on(moved.persist());
                 });
             }
         }

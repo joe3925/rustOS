@@ -1,10 +1,8 @@
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::task::{Context, Poll, Waker};
-use spin::Mutex;
+use core::task::{Context, Poll};
 
 pub use super::block_on::block_on;
 pub use super::blocking::{spawn_blocking, BlockingJoin};
@@ -15,7 +13,7 @@ use crate::{
     structs::thread_pool::ThreadPool,
 };
 
-use super::task::FutureTask;
+use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 lazy_static::lazy_static! {
     pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(3);
@@ -42,34 +40,17 @@ pub(crate) fn yield_now() {
 pub extern "win64" fn try_steal_blocking_one() -> bool {
     BLOCKING_POOL.try_execute_one()
 }
+
+/// Spawns a future and returns a JoinHandle to await its result.
+/// Uses a single Arc allocation for both the task and result storage.
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let inner = Arc::new(Mutex::new(JoinInner {
-        result: None,
-        waker: None,
-    }));
-
-    let inner_clone = inner.clone();
-
-    let wrapped = async move {
-        let result = future.await;
-        let waker = {
-            let mut guard = inner_clone.lock();
-            guard.result = Some(result);
-            guard.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
-    };
-
-    let task = Arc::new(FutureTask::new(wrapped));
+    let task = Arc::new(JoinableTask::new(future));
     task.enqueue();
-
-    JoinHandle { inner }
+    JoinHandle { task }
 }
 
 #[no_mangle]
@@ -87,28 +68,29 @@ unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
 ) {
     submit_blocking_internal(trampoline, ctx);
 }
-struct JoinInner<T> {
-    result: Option<T>,
-    waker: Option<Waker>,
+
+pub struct JoinHandle<T: Send + 'static> {
+    task: Arc<JoinableTask<T>>,
 }
 
-pub struct JoinHandle<T> {
-    inner: Arc<Mutex<JoinInner<T>>>,
-}
-
-impl<T> Future for JoinHandle<T> {
+impl<T: Send + 'static> Future for JoinHandle<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        let mut guard = self.inner.lock();
-        if let Some(result) = guard.result.take() {
+        if let Some(result) = self.task.take_result() {
             Poll::Ready(result)
         } else {
-            guard.waker = Some(cx.waker().clone());
-            Poll::Pending
+            self.task.set_waker(cx.waker().clone());
+            // Check again in case result arrived between take_result and set_waker
+            if let Some(result) = self.task.take_result() {
+                Poll::Ready(result)
+            } else {
+                Poll::Pending
+            }
         }
     }
 }
+
 pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -116,68 +98,66 @@ where
     let task = Arc::new(FutureTask::new(future));
     task.enqueue();
 }
-pub struct JoinAll<F>
-where
-    F: Future,
-{
-    futures: Vec<Pin<Box<F>>>,
-    done: Vec<Option<F::Output>>,
+/// State of each future in JoinAll - either still running or completed with result.
+enum FutureSlot<F: Future> {
+    Running(F),
+    Done(Option<F::Output>),
+}
+
+/// Joins multiple futures of the same type, returning their results in order.
+/// Stores futures inline without boxing, saving one heap allocation per future.
+pub struct JoinAll<F: Future> {
+    slots: Vec<FutureSlot<F>>,
     remaining: usize,
 }
 
-impl<F> JoinAll<F>
-where
-    F: Future,
-{
+impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
         let remaining = fs.len();
-        let mut futures = Vec::with_capacity(remaining);
-        for f in fs {
-            futures.push(Box::pin(f));
-        }
-        Self {
-            futures,
-            done: (0..remaining).map(|_| None).collect(),
-            remaining,
-        }
+        let slots = fs.into_iter().map(FutureSlot::Running).collect();
+        Self { slots, remaining }
     }
 }
 
-impl<F> Future for JoinAll<F>
-where
-    F: Future,
-{
+impl<F: Future> Future for JoinAll<F> {
     type Output = Vec<F::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: We never move the futures out of the Vec, only poll them in place.
+        // The Vec itself may reallocate but we don't add elements after construction.
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.remaining == 0 {
-            let mut out = Vec::with_capacity(this.done.len());
-            for v in this.done.iter_mut() {
-                out.push(v.take().unwrap());
+            let mut out = Vec::with_capacity(this.slots.len());
+            for slot in this.slots.iter_mut() {
+                if let FutureSlot::Done(result) = slot {
+                    out.push(result.take().expect("result already taken"));
+                }
             }
             return Poll::Ready(out);
         }
 
-        for i in 0..this.futures.len() {
-            if this.done[i].is_some() {
-                continue;
-            }
-
-            match this.futures[i].as_mut().poll(cx) {
-                Poll::Ready(v) => {
-                    this.done[i] = Some(v);
-                    this.remaining -= 1;
+        for slot in this.slots.iter_mut() {
+            if let FutureSlot::Running(fut) = slot {
+                // SAFETY: The future is stored inline in the Vec which is pinned.
+                // We don't move it, we just poll it in place.
+                let pinned = unsafe { Pin::new_unchecked(fut) };
+                match pinned.poll(cx) {
+                    Poll::Ready(result) => {
+                        *slot = FutureSlot::Done(Some(result));
+                        this.remaining -= 1;
+                    }
+                    Poll::Pending => {}
                 }
-                Poll::Pending => {}
             }
         }
 
         if this.remaining == 0 {
-            let mut out = Vec::with_capacity(this.done.len());
-            for v in this.done.iter_mut() {
-                out.push(v.take().unwrap());
+            let mut out = Vec::with_capacity(this.slots.len());
+            for slot in this.slots.iter_mut() {
+                if let FutureSlot::Done(result) = slot {
+                    out.push(result.take().expect("result already taken"));
+                }
             }
             Poll::Ready(out)
         } else {
