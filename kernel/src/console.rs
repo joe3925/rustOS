@@ -42,6 +42,14 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// Zero the entire framebuffer if available. Safe to call before creating a `Screen`.
+    pub fn clear_framebuffer() {
+        let boot = boot_info();
+        if let Some(fb) = boot.framebuffer.as_mut() {
+            fb.buffer_mut().fill(0);
+        }
+    }
+
     pub fn new() -> Option<Self> {
         let boot = boot_info();
         let fb = boot.framebuffer.as_mut()?;
@@ -258,13 +266,6 @@ impl Console {
         }
     }
 
-    pub fn clear_screen(&mut self) {
-        self.screen.clear_all();
-        self.cursor_pose.x = 0;
-        self.cursor_pose.y = 0;
-        self.pending.clear();
-    }
-
     pub(crate) fn print(&mut self, bytes: &[u8]) {
         self.push_bytes(bytes);
         self.flush_pending();
@@ -473,10 +474,6 @@ impl<'a, T> Drop for IrqSafeMutexGuard<'a, T> {
 
 lazy_static! {
     pub static ref CONSOLE: IrqSafeMutex<Console> = IrqSafeMutex::new(Console::new());
-}
-
-pub fn clear_screen() {
-    CONSOLE.lock().clear_screen();
 }
 
 #[macro_export]

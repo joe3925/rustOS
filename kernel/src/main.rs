@@ -40,7 +40,6 @@ mod static_handlers;
 mod structs;
 mod syscalls;
 mod util;
-use crate::console::clear_screen;
 use crate::memory::paging::tables::kernel_cr3;
 use crate::util::{panic_common, KERNEL_INITIALIZED};
 

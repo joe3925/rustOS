@@ -957,7 +957,7 @@ impl PnpManager {
                     p = alloc::format!("{}\\Top", p);
                 }
                 ObjectPayload::Symlink(target) => {
-                    p = target.clone().target;
+                    p = target.clone().target.to_string();
                 }
                 _ => return None,
             }

@@ -1,9 +1,9 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::BenchWindow;
+use crate::benchmarking::{bench_async_vs_sync_call_latency, BenchWindow};
 use crate::boot_packages;
-use crate::console::clear_screen;
+use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
@@ -42,9 +42,13 @@ use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use bootloader_api::BootInfo;
 use core::arch::asm;
+use core::future::Future;
+use core::hint::black_box;
 use core::mem::size_of;
 use core::panic::PanicInfo;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::memory::Module;
@@ -88,14 +92,13 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         //init_heap();
+        Screen::clear_framebuffer();
         load_idt();
 
         init_kernel_cr3();
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
-
-        clear_screen();
         syscall_init();
 
         // TSC calibration
@@ -167,6 +170,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
     });
+    bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]

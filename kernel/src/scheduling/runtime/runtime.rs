@@ -13,6 +13,7 @@ use crate::{
     structs::thread_pool::ThreadPool,
 };
 
+use super::slab::get_task_slab;
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 lazy_static::lazy_static! {
@@ -91,12 +92,25 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
+/// Spawns a detached future that runs to completion without a JoinHandle.
+///
+/// This function tries to allocate from the task slab first for better performance.
+/// If the slab is full, it falls back to Arc-based allocation.
 pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let task = Arc::new(FutureTask::new(future));
-    task.enqueue();
+    let slab = get_task_slab();
+
+    // Try slab allocation first
+    if let Some(slot_handle) = slab.allocate() {
+        slot_handle.init_and_enqueue(future);
+    } else {
+        // Fallback to Arc-based allocation
+        slab.record_fallback();
+        let task = Arc::new(FutureTask::new(future));
+        task.enqueue();
+    }
 }
 /// State of each future in JoinAll - either still running or completed with result.
 enum FutureSlot<F: Future> {

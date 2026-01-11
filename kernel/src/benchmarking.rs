@@ -9,8 +9,9 @@ use crate::memory::{
 use crate::scheduling::runtime::runtime::{
     block_on, spawn, spawn_blocking, spawn_detached, JoinAll,
 };
+use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{print, println, vec};
+use crate::{cpu, print, println, vec};
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -18,7 +19,11 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::future::Future;
+use core::hint::black_box;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
@@ -1606,4 +1611,125 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
 pub fn used_memory() -> usize {
     // HEAP_SIZE - ALLOCATOR.free_memory()
     0
+}
+const DEPTH: usize = 100;
+const ITERS: usize = 50_000;
+
+pub fn bench_async_vs_sync_call_latency() {
+    spawn_detached(async {
+        bench_async_vs_sync_call_latency_async().await;
+    });
+}
+
+#[inline(never)]
+fn sync_leaf(x: u64) -> u64 {
+    x.wrapping_add(1)
+}
+
+#[inline(never)]
+fn sync_chain(mut x: u64) -> u64 {
+    let mut i = 0usize;
+    while i < DEPTH {
+        x = sync_leaf(x);
+        i += 1;
+    }
+    x
+}
+
+struct Ready;
+
+impl Future for Ready {
+    type Output = ();
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        Poll::Ready(())
+    }
+}
+
+#[inline(always)]
+fn ready() -> Ready {
+    Ready
+}
+
+#[inline(never)]
+async fn async_leaf(x: u64) -> u64 {
+    ready().await;
+    x.wrapping_add(1)
+}
+
+#[inline(never)]
+async fn async_chain(mut x: u64) -> u64 {
+    let mut i = 0usize;
+    while i < DEPTH {
+        x = async_leaf(x).await;
+        i += 1;
+    }
+    x
+}
+
+#[inline(always)]
+fn ms_fixed_3(micros: u64) -> (u64, u16) {
+    let ms = micros / 1_000;
+    let frac = ((micros % 1_000) as u16);
+    (ms, frac)
+}
+
+#[inline(always)]
+fn div_u64_round(n: u64, d: u64) -> u64 {
+    if d == 0 {
+        return 0;
+    }
+    n / d
+}
+
+async fn bench_async_vs_sync_call_latency_async() {
+    let mut warm = 0u64;
+    let mut i = 0usize;
+    while i < 10_000 {
+        warm = sync_chain(warm);
+        i += 1;
+    }
+    black_box(warm);
+
+    let mut s = 0u64;
+    let sw_sync = Stopwatch::start();
+    let mut k = 0usize;
+    while k < ITERS {
+        s = sync_chain(s);
+        k += 1;
+    }
+    let sync_us = sw_sync.elapsed_micros();
+    black_box(s);
+
+    let mut a = 0u64;
+    let sw_async = Stopwatch::start();
+    let mut m = 0usize;
+    while m < ITERS {
+        a = async_chain(a).await;
+        m += 1;
+    }
+    let async_us = sw_async.elapsed_micros();
+    black_box(a);
+
+    let iters_u64 = ITERS as u64;
+    let inner_calls_u64 = (ITERS * DEPTH) as u64;
+
+    let sync_us_per_chain = div_u64_round(sync_us, iters_u64);
+    let async_us_per_chain = div_u64_round(async_us, iters_u64);
+
+    let sync_us_per_inner = div_u64_round(sync_us, inner_calls_u64);
+    let async_us_per_inner = div_u64_round(async_us, inner_calls_u64);
+
+    let (sync_ms, sync_ms_frac) = ms_fixed_3(sync_us);
+    let (async_ms, async_ms_frac) = ms_fixed_3(async_us);
+
+    println!("[bench] iters={} depth={}", ITERS, DEPTH);
+    println!(
+        "[bench] sync:  total={} .{:03} ms  us/chain={}  us/inner_call={}",
+        sync_ms, sync_ms_frac, sync_us_per_chain, sync_us_per_inner
+    );
+    println!(
+        "[bench] async: total={} .{:03} ms  us/chain={}  us/inner_call={}",
+        async_ms, async_ms_frac, async_us_per_chain, async_us_per_inner
+    );
 }
