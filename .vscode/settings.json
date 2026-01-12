@@ -130,5 +130,11 @@
         "xoshiro",
         "Xoshiro"
     ],
-    "git.untrackedChanges": "separate"
+    "git.untrackedChanges": "separate",
+    "rust-analyzer.check.command": "check",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+        "drivers/Cargo.toml"
+    ]
 }

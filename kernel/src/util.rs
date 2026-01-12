@@ -332,18 +332,34 @@ macro_rules! boot_packages {
     ($($name:literal),+ $(,)?) => {{
         &[
             $(
-                $crate::util::BootPkg {
-                    name: $name,
-                    toml: include_bytes!(concat!(
+                {
+                    #[cfg(debug_assertions)]
+                    const IMAGE: &[u8] = include_bytes!(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../target/DRIVERS/",
-                        $name, "/", $name, ".toml"
-                    )),
-                    image: include_bytes!(concat!(
+                        "/../drivers/target/x86_64-rustos-driver/debug/",
+                        $name,
+                        ".dll"
+                    ));
+                    #[cfg(not(debug_assertions))]
+                    const IMAGE: &[u8] = include_bytes!(concat!(
                         env!("CARGO_MANIFEST_DIR"),
-                        "/../target/DRIVERS/",
-                        $name, "/", $name, ".dll"
-                    )),
+                        "/../drivers/target/x86_64-rustos-driver/release/",
+                        $name,
+                        ".dll"
+                    ));
+
+                    $crate::util::BootPkg {
+                        name: $name,
+                        toml: include_bytes!(concat!(
+                            env!("CARGO_MANIFEST_DIR"),
+                            "/../drivers/",
+                            $name,
+                            "/src/",
+                            $name,
+                            ".toml"
+                        )),
+                        image: IMAGE,
+                    }
                 },
             )+
         ] as &[ $crate::util::BootPkg ]

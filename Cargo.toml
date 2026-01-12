@@ -5,16 +5,6 @@ cargo-features = ["profile-rustflags"]
 members = [
     "os",
     "kernel",
-    "drivers/base_driver",
-    "drivers/acpi",
-    "drivers/pci",
-    "drivers/ide",
-    "drivers/disk",
-    "drivers/partmgr",
-    "drivers/volmgr",
-    "drivers/mountmgr",
-    "drivers/fat32",
-    "drivers/i8042",
 ]
 exclude = ["rustos-api"]
 resolver = "2"

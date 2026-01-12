@@ -1,0 +1,68 @@
+{
+  "arch": "x86_64",
+  "llvm-target": "x86_64-pc-windows-msvc",
+  "os": "windows",
+  "env": "msvc",
+  "vendor": "pc",
+  "linker-flavor": "msvc",
+  "linker-is-gnu": false,
+  "lld-flavor": "link",
+  "is-like-msvc": true,
+  "is-like-windows": true,
+  "cpu": "x86-64",
+  "data-layout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+  "target-pointer-width": 64,
+  "target-endian": "little",
+  "target-family": [
+    "windows"
+  ],
+  "features": "+cmpxchg16b,+sse3,+lahfsahf",
+  "has-thread-local": true,
+  "max-atomic-width": 128,
+  "dynamic-linking": true,
+  "dll-prefix": "",
+  "dll-suffix": ".dll",
+  "exe-suffix": ".exe",
+  "binary-format": "coff",
+  "archive-format": "coff",
+  "debuginfo-kind": "pdb",
+  "emit-debug-gdb-scripts": false,
+  "panic-strategy": "abort",
+  "relocation-model": "pic",
+  "code-model": "large",
+  "executables": true,
+  "no-default-libraries": true,
+  "pre-link-args": {
+    "msvc": [
+      "/NOLOGO",
+      "/NODEFAULTLIB",
+      "/SUBSYSTEM:NATIVE",
+      "/ENTRY:DriverEntry",
+      "/DYNAMICBASE",
+      "/FIXED:NO",
+      "/EXPORT:DriverEntry"
+    ],
+    "msvc-lld": [
+      "/NOLOGO",
+      "/NODEFAULTLIB",
+      "/SUBSYSTEM:NATIVE",
+      "/ENTRY:DriverEntry",
+      "/DYNAMICBASE",
+      "/FIXED:NO",
+      "/EXPORT:DriverEntry"
+    ]
+  },
+  "requires-uwtable": true,
+  "crt-static-respected": true,
+  "crt-static-allows-dylibs": true,
+  "supported-sanitizers": [
+    "address"
+  ],
+  "supported-split-debuginfo": [
+    "packed"
+  ],
+  "split-debuginfo": "packed",
+  "plt-by-default": false,
+  "staticlib-prefix": "",
+  "staticlib-suffix": ".lib"
+}

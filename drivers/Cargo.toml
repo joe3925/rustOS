@@ -1,0 +1,15 @@
+cargo-features = ["profile-rustflags"]
+[workspace]
+members = [
+    "acpi",
+    "base_driver",
+    "disk",
+    "fat32",
+    "i8042",
+    "ide",
+    "mountmgr",
+    "partmgr",
+    "pci",
+    "volmgr",
+]
+resolver = "2"
