@@ -1612,8 +1612,12 @@ pub fn used_memory() -> usize {
     // HEAP_SIZE - ALLOCATOR.free_memory()
     0
 }
+
 const DEPTH: usize = 100;
 const ITERS: usize = 50_000;
+
+// Queue pressure test: number of blocking tasks submitted at once.
+const BLOCK_TASKS: usize = 50_000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -1667,10 +1671,35 @@ async fn async_chain(mut x: u64) -> u64 {
     x
 }
 
+#[inline(never)]
+async fn blocking_chain(x: u64) -> u64 {
+    spawn_blocking(move || sync_chain(x)).await
+}
+
+#[inline(never)]
+async fn blocking_queue_stress(seed: u64) -> u64 {
+    let mut joins = Vec::with_capacity(BLOCK_TASKS);
+
+    let mut i = 0usize;
+    while i < BLOCK_TASKS {
+        let x = seed.wrapping_add(i as u64);
+        joins.push(spawn_blocking(move || sync_chain(x)));
+        i += 1;
+    }
+
+    let results = JoinAll::new(joins).await;
+
+    let mut acc = 0u64;
+    for r in results {
+        acc ^= r;
+    }
+    acc
+}
+
 #[inline(always)]
 fn ms_fixed_3(micros: u64) -> (u64, u16) {
     let ms = micros / 1_000;
-    let frac = ((micros % 1_000) as u16);
+    let frac = (micros % 1_000) as u16;
     (ms, frac)
 }
 
@@ -1682,46 +1711,83 @@ fn div_u64_round(n: u64, d: u64) -> u64 {
     n / d
 }
 
+#[inline(always)]
+fn sub_i64(a: u64, b: u64) -> i64 {
+    a as i64 - b as i64
+}
+
+#[inline(always)]
+fn pct_1e3(part: i64, whole: u64) -> i64 {
+    if whole == 0 {
+        return 0;
+    }
+    (part * 1000) / (whole as i64)
+}
+
 async fn bench_async_vs_sync_call_latency_async() {
     let mut warm = 0u64;
-    let mut i = 0usize;
-    while i < 10_000 {
+    for _ in 0..10000 {
         warm = sync_chain(warm);
-        i += 1;
     }
-    black_box(warm);
+
+    let mut warm_async = 0u64;
+    for _ in 0..10000 {
+        warm_async = async_chain(warm_async).await;
+    }
+    black_box(warm_async);
+
+    let mut warm_blk = 0u64;
+    for _ in 0..2000 {
+        warm_blk = blocking_chain(warm_blk).await;
+    }
+    black_box(warm_blk);
 
     let mut s = 0u64;
     let sw_sync = Stopwatch::start();
-    let mut k = 0usize;
-    while k < ITERS {
+    for _ in 0..ITERS {
         s = sync_chain(s);
-        k += 1;
     }
     let sync_us = sw_sync.elapsed_micros();
     black_box(s);
 
     let mut a = 0u64;
     let sw_async = Stopwatch::start();
-    let mut m = 0usize;
-    while m < ITERS {
+    for _ in 0..ITERS {
         a = async_chain(a).await;
-        m += 1;
     }
     let async_us = sw_async.elapsed_micros();
     black_box(a);
+
+    let mut b = 0u64;
+    let sw_blk = Stopwatch::start();
+    for _ in 0..ITERS {
+        b = blocking_chain(b).await;
+    }
+    let blk_us = sw_blk.elapsed_micros();
+    black_box(b);
+
+    let mut q = 0u64;
+    let sw_q = Stopwatch::start();
+    q = blocking_queue_stress(q).await;
+    let q_us = sw_q.elapsed_micros();
+    black_box(q);
 
     let iters_u64 = ITERS as u64;
     let inner_calls_u64 = (ITERS * DEPTH) as u64;
 
     let sync_us_per_chain = div_u64_round(sync_us, iters_u64);
     let async_us_per_chain = div_u64_round(async_us, iters_u64);
+    let blk_us_per_chain = div_u64_round(blk_us, iters_u64);
 
     let sync_us_per_inner = div_u64_round(sync_us, inner_calls_u64);
     let async_us_per_inner = div_u64_round(async_us, inner_calls_u64);
 
     let (sync_ms, sync_ms_frac) = ms_fixed_3(sync_us);
     let (async_ms, async_ms_frac) = ms_fixed_3(async_us);
+    let (blk_ms, blk_ms_frac) = ms_fixed_3(blk_us);
+
+    let (q_ms, q_ms_frac) = ms_fixed_3(q_us);
+    let q_us_per_task = div_u64_round(q_us, BLOCK_TASKS as u64);
 
     println!("[bench] iters={} depth={}", ITERS, DEPTH);
     println!(
@@ -1731,5 +1797,34 @@ async fn bench_async_vs_sync_call_latency_async() {
     println!(
         "[bench] async: total={} .{:03} ms  us/chain={}  us/inner_call={}",
         async_ms, async_ms_frac, async_us_per_chain, async_us_per_inner
+    );
+    println!(
+        "[bench] blk:   total={} .{:03} ms  us/chain={}",
+        blk_ms, blk_ms_frac, blk_us_per_chain
+    );
+    println!(
+        "[bench] blkq:  tasks={} total={} .{:03} ms  us/task={}",
+        BLOCK_TASKS, q_ms, q_ms_frac, q_us_per_task
+    );
+
+    let sm_over_us_per_chain = sub_i64(async_us_per_chain, sync_us_per_chain);
+    let sm_over_us_per_inner = sub_i64(async_us_per_inner, sync_us_per_inner);
+    let pending_over_us_per_chain = sub_i64(blk_us_per_chain, async_us_per_chain);
+
+    let sm_over_pct_1e3 = pct_1e3(sm_over_us_per_chain, sync_us_per_chain);
+    let pending_over_pct_1e3 = pct_1e3(pending_over_us_per_chain, async_us_per_chain);
+
+    println!(
+        "[bench] overhead: state_machine: {} us/chain ({}.{:03}x sync)  {} us/inner_call",
+        sm_over_us_per_chain,
+        sm_over_pct_1e3 / 1000,
+        (sm_over_pct_1e3 % 1000).abs(),
+        sm_over_us_per_inner
+    );
+    println!(
+        "[bench] overhead: pending+wake:  {} us/chain ({}.{:03}x async_ready)",
+        pending_over_us_per_chain,
+        pending_over_pct_1e3 / 1000,
+        (pending_over_pct_1e3 % 1000).abs()
     );
 }

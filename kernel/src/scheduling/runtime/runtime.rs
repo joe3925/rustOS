@@ -17,20 +17,16 @@ use super::slab::get_task_slab;
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(3);
-    pub static ref BLOCKING_POOL: Arc<ThreadPool> = ThreadPool::new(3);
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = ThreadPool::new(2);
+    pub static ref BLOCKING_POOL: Arc<ThreadPool> = ThreadPool::new(4);
 }
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
-    unsafe {
-        _driver_runtime_submit_task(trampoline, ctx);
-    }
+    RUNTIME_POOL.submit(trampoline, ctx);
 }
 
 pub(crate) fn submit_blocking(trampoline: extern "win64" fn(usize), ctx: usize) {
-    unsafe {
-        _driver_runtime_submit_blocking_task(trampoline, ctx);
-    }
+    BLOCKING_POOL.submit(trampoline, ctx);
 }
 
 pub(crate) fn yield_now() {
@@ -52,22 +48,6 @@ where
     let task = Arc::new(JoinableTask::new(future));
     task.enqueue();
     JoinHandle { task }
-}
-
-#[no_mangle]
-unsafe extern "win64" fn _driver_runtime_submit_task(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    submit_runtime_internal(trampoline, ctx);
-}
-
-#[no_mangle]
-unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    submit_blocking_internal(trampoline, ctx);
 }
 
 pub struct JoinHandle<T: Send + 'static> {

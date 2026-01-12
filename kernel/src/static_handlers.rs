@@ -558,14 +558,6 @@ pub extern "win64" fn kernel_async_set_parallelism(n: usize) {
     GlobalAsyncExecutor::global().set_parallelism(n);
 }
 
-#[no_mangle]
-pub unsafe extern "win64" fn kernel_blocking_submit(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    submit_blocking_internal(trampoline, ctx);
-}
-
 static BENCH_WINDOWS: Once<Mutex<BTreeMap<u32, BenchWindow>>> = Once::new();
 static NEXT_BENCH_WINDOW: AtomicU32 = AtomicU32::new(1);
 

@@ -170,7 +170,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
     });
-    bench_async_vs_sync_call_latency();
+    //bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]
