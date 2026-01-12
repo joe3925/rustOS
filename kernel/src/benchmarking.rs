@@ -1673,7 +1673,14 @@ async fn async_chain(mut x: u64) -> u64 {
 
 #[inline(never)]
 async fn blocking_chain(x: u64) -> u64 {
-    spawn_blocking(move || sync_chain(x)).await
+    spawn_blocking(move || {
+        let ret = sync_chain(x);
+        if (ret % 10_000 == 0) {
+            println!("blocking done num: {}", ret / 100);
+        }
+        ret
+    })
+    .await
 }
 
 #[inline(never)]

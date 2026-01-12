@@ -9,6 +9,7 @@ use crate::memory::paging::virt_tracker::{
     allocate_kernel_range, allocate_kernel_range_mapped, deallocate_kernel_range,
 };
 use crate::println;
+use crate::scheduling::runtime::runtime::{BLOCKING_POOL, RUNTIME_POOL};
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
 use alloc::string::String;
@@ -466,6 +467,10 @@ impl Task {
 }
 
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
+    let runtime = &RUNTIME_POOL;
+    let blocking = &BLOCKING_POOL;
+    println!("keep alive: {}", runtime.is_shutdown());
+    println!("keep alive: {}", blocking.is_shutdown());
     loop {
         hlt();
     }
