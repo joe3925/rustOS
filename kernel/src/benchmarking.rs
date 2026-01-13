@@ -1690,7 +1690,13 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
     let mut i = 0usize;
     while i < BLOCK_TASKS {
         let x = seed.wrapping_add(i as u64);
-        joins.push(spawn_blocking(move || sync_chain(x)));
+        joins.push(spawn_blocking(move || {
+            let ret = sync_chain(x);
+            if (ret % 10_000 == 0) {
+                println!("blocking done num: {}", ret / 100);
+            }
+            ret
+        }));
         i += 1;
     }
 

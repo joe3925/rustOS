@@ -140,7 +140,6 @@ extern "win64" fn worker(args_ptr: usize) {
     let pool = args.pool;
 
     loop {
-        // Check for shutdown
         if pool.shutdown.load(Ordering::Acquire) {
             return;
         }
@@ -150,28 +149,38 @@ extern "win64" fn worker(args_ptr: usize) {
         if let Some(j) = job {
             (j.f)(j.a);
         } else {
-            // No job available - park this worker
-
             let current_task = {
                 let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
                 SCHEDULER.get_current_task(cpu_id)
             };
 
             if let Some(task_handle) = current_task {
-                SCHEDULER.park_while(|| {
+                let should_yield = x86_64::instructions::interrupts::without_interrupts(|| {
                     if pool.shutdown.load(Ordering::Acquire) {
                         return false;
                     }
 
                     let is_empty = pool.queue.lock().is_empty();
-
-                    if is_empty {
-                        pool.parked_workers.lock().push(task_handle.clone());
-                        true
-                    } else {
-                        false
+                    if !is_empty {
+                        return false;
                     }
+
+                    let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
+                    if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
+                        if !task.read().park_begin() {
+                            return false;
+                        }
+                    } else {
+                        return false;
+                    }
+
+                    pool.parked_workers.lock().push(task_handle.clone());
+                    true
                 });
+                // TODO: This can possibly yield once when it is uneeded not a huge slow down but maybe measurable
+                if should_yield {
+                    unsafe { crate::static_handlers::task_yield() };
+                }
             }
         }
     }
