@@ -12,8 +12,10 @@ use crate::println;
 use crate::scheduling::runtime::runtime::{BLOCKING_POOL, RUNTIME_POOL};
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::State;
+use crate::structs::thread_pool::ThreadPool;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::hint::black_box;
 use core::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use spin::RwLock;
@@ -394,10 +396,6 @@ impl Task {
         ParkState::from(self.park_state.load(Ordering::Acquire))
     }
 
-    // =========================================================================
-    // Stack management
-    // =========================================================================
-
     pub fn grow_stack(&mut self, flags: PageTableFlags) -> Result<bool, PageMapError> {
         if self.is_user_mode || self.guard_page == 0 {
             return Ok(false);
@@ -413,10 +411,6 @@ impl Task {
         self.guard_page = next_guard;
         Ok(true)
     }
-
-    // =========================================================================
-    // CPU accounting
-    // =========================================================================
 
     #[inline(always)]
     pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
@@ -467,11 +461,16 @@ impl Task {
 }
 
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
-    let runtime = &RUNTIME_POOL;
-    let blocking = &BLOCKING_POOL;
-    println!("keep alive: {}", runtime.is_shutdown());
-    println!("keep alive: {}", blocking.is_shutdown());
+    let runtime = RUNTIME_POOL.as_ref() as *const ThreadPool;
+    let blocking = BLOCKING_POOL.as_ref() as *const ThreadPool;
+
     loop {
+        unsafe {
+            let runtime_var = (*runtime).is_shutdown();
+            let blocking_var = (*blocking).is_shutdown();
+            black_box(runtime_var);
+            black_box(blocking_var);
+        }
         hlt();
     }
 }

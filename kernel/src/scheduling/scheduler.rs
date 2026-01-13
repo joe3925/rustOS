@@ -450,13 +450,12 @@ impl Scheduler {
     /// }
     /// ```
     ///
-    /// The condition is checked with interrupts disabled, preventing races.
+    /// The condition is checked with interrupts disabled.
     pub fn park_while<F>(&self, should_park: F)
     where
         F: FnOnce() -> bool,
     {
         let should_yield = without_interrupts(|| {
-            // Check condition first
             if !should_park() {
                 return false;
             }
