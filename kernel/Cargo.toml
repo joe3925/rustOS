@@ -43,6 +43,9 @@ buddy_system_allocator = "0.11.0"
 baby-mimalloc = { version = "*", features = ["spin_mutex", "deferred_free"] }
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
 kernel_types = { path = "../kernel_types" }
+crossbeam-queue = { version = "0.3.12", default-features = false, features = [
+    "alloc",
+] }
 [dependencies.lazy_static]
 version = "1.0"
 features = ["spin_no_std"]

@@ -8,7 +8,8 @@ use crate::memory::{
 };
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
-use baby_mimalloc::{Mimalloc, MimallocMutexWrapper};
+use crate::static_handlers::task_yield;
+use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::{align_of, size_of};
@@ -16,15 +17,57 @@ use core::ptr::{self, null_mut, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::paging::{mapper::MapToError, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
-use x86_64::{instructions::interrupts::without_interrupts, structures::paging::FrameAllocator};
+use x86_64::{
+    instructions::interrupts::{self, without_interrupts},
+    structures::paging::FrameAllocator,
+};
 
 // #[global_allocator]
 // pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
 // #[global_allocator]
 // pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
 #[global_allocator]
-pub static ALLOCATOR: MimallocMutexWrapper<KernelSegAlloc> =
-    MimallocMutexWrapper::with_os_allocator(KernelSegAlloc);
+pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
+
+/// Global allocator wrapper that yields if another CPU is holding the lock
+/// instead of spinning with interrupts off.
+pub struct YieldingMimalloc {
+    inner: spin::Mutex<Mimalloc<KernelSegAlloc>>,
+}
+
+impl YieldingMimalloc {
+    pub const fn new() -> Self {
+        Self {
+            inner: spin::Mutex::new(Mimalloc::with_os_allocator(KernelSegAlloc)),
+        }
+    }
+
+    #[inline(always)]
+    fn lock(&self) -> spin::MutexGuard<'_, Mimalloc<KernelSegAlloc>> {
+        loop {
+            if let Some(g) = self.inner.try_lock() {
+                return g;
+            }
+
+            if interrupts::are_enabled() {
+                unsafe { task_yield() };
+            } else {
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for YieldingMimalloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.lock().alloc(layout)
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        self.lock().dealloc(ptr, layout)
+    }
+}
+
 pub struct KernelSegAlloc;
 
 const PAGE_SIZE: usize = 4096;

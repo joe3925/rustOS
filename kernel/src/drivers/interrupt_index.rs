@@ -10,7 +10,9 @@ use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
+use crate::structs::per_core_storage::PCS;
 use crate::syscalls::syscall::syscall_init;
+use lazy_static::lazy_static;
 use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
 use crate::{println, KERNEL_INITIALIZED};
 use acpi::platform::interrupt::Apic;
@@ -41,7 +43,9 @@ pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
 
-pub static APIC_TICKS_PER_NS_FP32: AtomicU64 = AtomicU64::new(0);
+lazy_static! {
+    pub static ref APIC_TICKS_PER_NS: PCS<AtomicU64> = PCS::new();
+}
 
 pub const TIMER_FREQ: u64 = 300;
 
@@ -260,7 +264,8 @@ pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
         (((dec as u128) << 32) / elapsed_ns) as u64
     };
 
-    APIC_TICKS_PER_NS_FP32.store(q32, Ordering::SeqCst);
+    let cpu_id = current_cpu_id();
+    APIC_TICKS_PER_NS.set(cpu_id, AtomicU64::new(q32));
 
     wr(APICOffset::Ticr, saved_ticr);
     wr(APICOffset::LvtT, saved_lvt);
@@ -270,7 +275,12 @@ pub fn apic_calibrate_ticks_per_ns_via_wait(window_ms: u64) -> u64 {
 
 #[inline]
 pub fn apic_ticr_for_ns(ns: u64) -> u32 {
-    let fp = APIC_TICKS_PER_NS_FP32.load(Ordering::SeqCst);
+    let cpu_id = current_cpu_id();
+    let fp = match APIC_TICKS_PER_NS.get(cpu_id) {
+        Some(guard) => guard.load(Ordering::Relaxed),
+        None => 0,
+    };
+
     if fp == 0 || ns == 0 {
         return 0;
     }

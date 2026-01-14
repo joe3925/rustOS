@@ -66,7 +66,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 106_800;
+pub const APIC_START_PERIOD: u64 = 52_400;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -113,8 +113,6 @@ pub unsafe fn init() {
                 println!("APIC transition successful!");
                 x86_64::instructions::interrupts::disable();
                 APIC.lock().as_ref().unwrap().start_aps();
-                apic_calibrate_ticks_per_ns_via_wait(10);
-                apic_program_period_ns(APIC_START_PERIOD);
             }
             Err(err) => {
                 println!("APIC transition failed {}!", err.to_str());
@@ -124,6 +122,11 @@ pub unsafe fn init() {
     while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
+
+    // BSP APIC calibration (moved here so current_cpu_id() works)
+    apic_calibrate_ticks_per_ns_via_wait(10);
+    apic_program_period_ns(APIC_START_PERIOD);
+
     SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,

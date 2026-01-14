@@ -1,11 +1,10 @@
 // thread_pool.rs
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use spin::Mutex;
+use crossbeam_queue::SegQueue;
+use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::{TaskHandle, SCHEDULER};
@@ -20,10 +19,13 @@ struct Job {
 }
 
 pub struct ThreadPool {
-    queue: Mutex<VecDeque<Job>>,
-    parked_workers: Mutex<Vec<TaskHandle>>,
+    queue: SegQueue<Job>,
+    parked_workers: SegQueue<TaskHandle>,
     num_workers: AtomicUsize,
     shutdown: AtomicBool,
+
+    job_count: AtomicUsize,
+    parked_count: AtomicUsize,
 }
 
 struct WorkerArgs {
@@ -33,10 +35,12 @@ struct WorkerArgs {
 impl ThreadPool {
     pub fn new(threads: usize) -> Arc<Self> {
         let pool = Arc::new(Self {
-            queue: Mutex::new(VecDeque::new()),
-            parked_workers: Mutex::new(Vec::with_capacity(threads)),
+            queue: SegQueue::new(),
+            parked_workers: SegQueue::new(),
             num_workers: AtomicUsize::new(threads),
             shutdown: AtomicBool::new(false),
+            job_count: AtomicUsize::new(0),
+            parked_count: AtomicUsize::new(0),
         });
 
         for _ in 0..threads {
@@ -55,20 +59,18 @@ impl ThreadPool {
 
     pub fn enable_dynamic(&self, _max_threads: usize) {}
 
-    /// Submit a job to the thread pool.
-    /// Wakes a parked worker if one is available.
     pub fn submit(&self, function: JobFn, context: usize) {
         let job = Job {
             f: function,
             a: context,
         };
 
-        self.queue.lock().push_back(job);
+        self.queue.push(job);
+        self.job_count.fetch_add(1, Ordering::Relaxed);
 
         self.wake_one_worker();
     }
 
-    /// Submit a job if the pool is able to run it.
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) -> bool {
         if self.shutdown.load(Ordering::Acquire) {
             return false;
@@ -77,55 +79,48 @@ impl ThreadPool {
         true
     }
 
-    /// Try to execute one job from the queue (for external callers).
     pub fn try_execute_one(&self) -> bool {
-        let job = self.queue.lock().pop_front();
-        if let Some(j) = job {
+        if let Some(j) = self.queue.pop() {
+            self.job_count.fetch_sub(1, Ordering::Relaxed);
             (j.f)(j.a);
             return true;
         }
         false
     }
 
-    /// Wake one parked worker to process jobs.
     fn wake_one_worker(&self) {
-        let worker = self.parked_workers.lock().pop();
-        if let Some(task_handle) = worker {
-            SCHEDULER.wake_task(&task_handle);
-        }
+        without_interrupts(|| {
+            if let Some(task_handle) = self.parked_workers.pop() {
+                self.parked_count.fetch_sub(1, Ordering::Relaxed);
+                SCHEDULER.wake_task(&task_handle);
+            }
+        });
     }
 
-    /// Wake all parked workers (used for shutdown or bulk wakeup).
     fn wake_all_workers(&self) {
-        let workers: Vec<TaskHandle> = {
-            let mut parked = self.parked_workers.lock();
-            parked.drain(..).collect()
-        };
-
-        for task_handle in workers {
-            SCHEDULER.wake_task(&task_handle);
-        }
+        without_interrupts(|| {
+            while let Some(task_handle) = self.parked_workers.pop() {
+                self.parked_count.fetch_sub(1, Ordering::Relaxed);
+                SCHEDULER.wake_task(&task_handle);
+            }
+        });
     }
 
-    /// Shutdown the thread pool.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         self.wake_all_workers();
     }
 
-    /// Check if the pool is shutting down.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown.load(Ordering::Acquire)
     }
 
-    /// Get the number of pending jobs.
     pub fn pending_jobs(&self) -> usize {
-        self.queue.lock().len()
+        self.job_count.load(Ordering::Acquire)
     }
 
-    /// Get the number of parked workers.
     pub fn parked_worker_count(&self) -> usize {
-        self.parked_workers.lock().len()
+        self.parked_count.load(Ordering::Acquire)
     }
 }
 
@@ -144,44 +139,64 @@ extern "win64" fn worker(args_ptr: usize) {
             return;
         }
 
-        let job = { pool.queue.lock().pop_front() };
-
-        if let Some(j) = job {
+        if let Some(j) = pool.queue.pop() {
+            pool.job_count.fetch_sub(1, Ordering::Relaxed);
             (j.f)(j.a);
-        } else {
-            let current_task = {
-                let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
-                SCHEDULER.get_current_task(cpu_id)
+            continue;
+        }
+
+        let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
+        let current_task = SCHEDULER.get_current_task(cpu_id);
+        let Some(task_handle) = current_task else {
+            continue;
+        };
+
+        let mut inline_job: Option<Job> = None;
+
+        let should_yield = x86_64::instructions::interrupts::without_interrupts(|| {
+            if pool.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+
+            if let Some(j) = pool.queue.pop() {
+                pool.job_count.fetch_sub(1, Ordering::Relaxed);
+                inline_job = Some(j);
+                return false;
+            }
+
+            let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
+            let Some(task) = SCHEDULER.get_current_task(cpu_id) else {
+                return false;
             };
 
-            if let Some(task_handle) = current_task {
-                let should_yield = x86_64::instructions::interrupts::without_interrupts(|| {
-                    if pool.shutdown.load(Ordering::Acquire) {
-                        return false;
-                    }
-
-                    let is_empty = pool.queue.lock().is_empty();
-                    if !is_empty {
-                        return false;
-                    }
-
-                    let cpu_id = crate::drivers::interrupt_index::current_cpu_id() as usize;
-                    if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
-                        if !task.read().park_begin() {
-                            return false;
-                        }
-                    } else {
-                        return false;
-                    }
-
-                    pool.parked_workers.lock().push(task_handle.clone());
-                    true
-                });
-                // TODO: This can possibly yield once when it is uneeded not a huge slow down but maybe measurable
-                if should_yield {
-                    unsafe { crate::static_handlers::task_yield() };
-                }
+            if !task.read().park_begin() {
+                return false;
             }
+
+            pool.parked_workers.push(task_handle.clone());
+            pool.parked_count.fetch_add(1, Ordering::Relaxed);
+
+            // Re-check queue after parking to prevent lost wakeup.
+            // If a job was submitted between our first check and parking,
+            // we must handle it instead of yielding.
+            if let Some(j) = pool.queue.pop() {
+                pool.job_count.fetch_sub(1, Ordering::Relaxed);
+                pool.parked_count.fetch_sub(1, Ordering::Relaxed);
+                task.read().park_abort();
+                inline_job = Some(j);
+                return false;
+            }
+
+            true
+        });
+
+        if let Some(j) = inline_job {
+            (j.f)(j.a);
+            continue;
+        }
+
+        if should_yield {
+            unsafe { crate::static_handlers::task_yield() };
         }
     }
 }

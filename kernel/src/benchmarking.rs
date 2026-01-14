@@ -1676,6 +1676,7 @@ async fn blocking_chain(x: u64) -> u64 {
     spawn_blocking(move || {
         let ret = sync_chain(x);
         if (ret % 10_000 == 0) {
+            // Why is this off by x100?????
             println!("blocking done num: {}", ret / 100);
         }
         ret
@@ -1693,7 +1694,7 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
         joins.push(spawn_blocking(move || {
             let ret = sync_chain(x);
             if (ret % 10_000 == 0) {
-                println!("blocking done num: {}", ret / 100);
+                println!("blocking done num: {}", ret);
             }
             ret
         }));
