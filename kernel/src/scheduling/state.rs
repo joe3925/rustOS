@@ -5,16 +5,16 @@ use core::arch::asm;
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedState {
-/// Task is in a run queue and eligible to be scheduled
-Runnable = 0,
-/// Task is currently executing on a CPU
-Running = 1,
-/// Task is in the process of parking; still running on CPU
-Parking = 2,
-/// Task is blocked waiting for an event (mutex, channel, condvar, sleep)
-Blocked = 3,
-/// Task has finished execution and can be cleaned up
-Terminated = 4,
+    /// Task is in a run queue and eligible to be scheduled
+    Runnable = 0,
+    /// Task is currently executing on a CPU
+    Running = 1,
+    /// Task is in the process of parking; still running on CPU
+    Parking = 2,
+    /// Task is blocked waiting for an event (mutex, channel, condvar, sleep)
+    Blocked = 3,
+    /// Task has finished execution and can be cleaned up
+    Terminated = 4,
 }
 
 impl SchedState {
@@ -130,7 +130,6 @@ impl State {
             cs: 0, // Initialize with zero
             ss: 0, // Initialize with zero
         };
-        state.update(rax);
         state
     }
     pub fn update_from_interrupt(&mut self, rip: u64, rsp: u64, rflags: u64, cs: u64, ss: u64) {

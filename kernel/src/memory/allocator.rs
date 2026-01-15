@@ -1,14 +1,17 @@
-use crate::memory::{
-    heap::{HEAP_SIZE, HEAP_START},
-    paging::{
-        frame_alloc::BootInfoFrameAllocator,
-        paging::{map_range_with_huge_pages, unmap_range_impl},
-        tables::init_mapper,
-    },
-};
 use crate::static_handlers::task_yield;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
+use crate::{
+    memory::{
+        heap::{HEAP_SIZE, HEAP_START},
+        paging::{
+            frame_alloc::BootInfoFrameAllocator,
+            paging::{map_range_with_huge_pages, unmap_range_impl},
+            tables::init_mapper,
+        },
+    },
+    scheduling::runtime::runtime::yield_now,
+};
 use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
@@ -50,7 +53,7 @@ impl YieldingMimalloc {
             }
 
             if interrupts::are_enabled() {
-                unsafe { task_yield() };
+                yield_now();
             } else {
                 core::hint::spin_loop();
             }
