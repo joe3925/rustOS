@@ -396,6 +396,6 @@ pub(crate) extern "win64" fn idle_task(_ctx: usize) {
             // black_box(cores);
         }
         yield_now();
-        // hlt();
+        //hlt();
     }
 }

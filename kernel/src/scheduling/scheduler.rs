@@ -3,9 +3,9 @@ use crate::drivers::interrupt_index::current_cpu_id;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::stack::StackSize;
+use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::{idle_task, Task, TaskRef};
-use crate::static_handlers::task_yield;
 use crate::util::KERNEL_INITIALIZED;
 
 pub use crate::scheduling::task::TaskHandle;
@@ -352,44 +352,56 @@ impl Scheduler {
     pub fn unpark(&self, task: &TaskHandle) {
         task.grant_permit();
 
-        match task.sched_state() {
-            SchedState::Blocked => {
-                if task
-                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            SchedState::Parking => {
-                return;
-            }
-            SchedState::Runnable | SchedState::Running | SchedState::Terminated => {
-                return;
-            }
-        }
-
-        task.set_block_reason(BlockReason::None);
-
         let n = self.num_cores.load(Ordering::Acquire);
         if n == 0 {
             return;
         }
 
-        let target = task.target_cpu();
-        let best_cpu = if target < n {
-            let target_load = self.core_effective_load(target);
-            if target_load == 0 {
-                target
-            } else {
-                self.find_least_loaded_cpu(n, target)
-            }
-        } else {
-            self.find_least_loaded_cpu(n, 0)
-        };
+        let mut spins: u32 = 0;
 
-        task.set_target_cpu(best_cpu);
-        self.enqueue_to_core(best_cpu, task.clone());
+        loop {
+            match task.sched_state() {
+                SchedState::Blocked => {
+                    if task
+                        .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    task.set_block_reason(BlockReason::None);
+
+                    let target = task.target_cpu();
+                    let best_cpu = if target < n {
+                        let target_load = self.core_effective_load(target);
+                        if target_load == 0 {
+                            target
+                        } else {
+                            self.find_least_loaded_cpu(n, target)
+                        }
+                    } else {
+                        self.find_least_loaded_cpu(n, 0)
+                    };
+
+                    task.set_target_cpu(best_cpu);
+                    self.enqueue_to_core(best_cpu, task.clone());
+                    return;
+                }
+
+                SchedState::Parking => {
+                    spins += 1;
+                    if spins <= 64 {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    return;
+                }
+
+                SchedState::Runnable | SchedState::Running | SchedState::Terminated => {
+                    return;
+                }
+            }
+        }
     }
 
     fn find_least_loaded_cpu(&self, n: usize, hint: usize) -> usize {
@@ -442,7 +454,7 @@ impl Scheduler {
             current.set_sched_state(SchedState::Parking);
         }
 
-        unsafe { task_yield() };
+        yield_now();
         // unsafe {
         //     hlt();
         // };
@@ -485,7 +497,7 @@ impl Scheduler {
         // unsafe {
         //     hlt();
         // };
-        unsafe { task_yield() };
+        yield_now();
     }
     // TODO: there is a bug somewhere in somewhere on "on_timer_tick" that is causing garbage to be lef on the sack
     // not high prio but will be an issue if decided the timer and yield shouldn't be on there own IST or if yield shouldn't be on int 0x80
@@ -504,6 +516,7 @@ impl Scheduler {
         {
             let sched_state = self.cores[cpu_id].sched_lock.lock();
             if let Some(ref cur) = sched_state.current {
+                // TODO: maybe causes a lost waker, investigate
                 let Some(mut guard) = cur.inner.try_write() else {
                     // Can't save context - don't switch, try again next tick
                     return;
@@ -562,20 +575,34 @@ impl Scheduler {
                         );
                     }
                     SchedState::Parking => {
-                        // Task is in the process of parking - it called park_current()
-                        // and is about to yield. We must NOT re-queue it here even if
-                        // a permit arrived, because the task is still executing on this
-                        // CPU (it's in the middle of park_current -> task_yield).
-                        //
-                        // If we re-queued it, another CPU could pick it up and try to
-                        // run it while this CPU is still executing it = stack corruption.
-                        //
-                        // Instead, just transition to Blocked. The permit (if any) remains
-                        // set, and when the task is eventually unparked, it will be
-                        // properly scheduled. If a permit was already granted, the
-                        // unpark() that granted it will transition Blocked->Runnable
-                        // and enqueue the task.
-                        prev.set_sched_state(SchedState::Blocked);
+                        if prev.consume_permit() {
+                            prev.set_sched_state(SchedState::Runnable);
+                            prev.set_block_reason(BlockReason::None);
+                            Self::push_runqueue_or_panic(
+                                cpu_id,
+                                &mut sched_state.run_queue,
+                                prev.clone(),
+                            );
+                        } else {
+                            if prev
+                                .cas_sched_state(SchedState::Parking, SchedState::Blocked)
+                                .is_ok()
+                            {
+                                if prev.consume_permit() {
+                                    if prev
+                                        .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
+                                        .is_ok()
+                                    {
+                                        prev.set_block_reason(BlockReason::None);
+                                        Self::push_runqueue_or_panic(
+                                            cpu_id,
+                                            &mut sched_state.run_queue,
+                                            prev.clone(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                     SchedState::Blocked => {}
                     SchedState::Terminated => {}
@@ -612,7 +639,7 @@ impl Scheduler {
         // TODO: Temp fix for lost wakeups - scan for stranded tasks when going idle.
         // This should be removed once the root cause of lost wakeups is fixed.
         drop(sched_state);
-        self.rescue_stranded_tasks(cpu_id);
+        //self.rescue_stranded_tasks(cpu_id);
         let mut sched_state = core.sched_lock.lock();
 
         // Check again after rescue - a task may have been enqueued
@@ -732,9 +759,6 @@ impl Scheduler {
         self.num_cores.load(Ordering::Relaxed)
     }
 
-    /// Scans all tasks for blocked ones that have a pending permit but weren't woken.
-    /// This is a defensive check to catch any lost wakeups due to race conditions.
-    /// Should be called periodically (e.g., from timer tick on one core).
     pub fn rescue_stranded_tasks(&self, caller_cpu: usize) {
         let n = self.num_cores.load(Ordering::Acquire);
         if n == 0 {
@@ -743,24 +767,23 @@ impl Scheduler {
 
         let max_id = self.next_task_id.load(Ordering::Relaxed);
 
-        // Scan all task slots
         for id in 1..max_id {
             let Some(task) = self.all_tasks.get(id) else {
                 continue;
             };
 
-            // Check if task is blocked but has a permit waiting
-            if task.sched_state() == SchedState::Blocked && task.has_permit() {
-                // Try to transition it back to runnable
+            // Only rescue tasks that are assigned to this core
+            if task.target_cpu() != caller_cpu {
+                continue;
+            }
+
+            if task.sched_state() == SchedState::Blocked && task.consume_permit() {
                 if task
                     .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
                     .is_ok()
                 {
                     task.set_block_reason(BlockReason::None);
-                    // Enqueue to its target CPU
-                    let target = task.target_cpu();
-                    let target_cpu = if target < n { target } else { caller_cpu };
-                    self.enqueue_to_core(target_cpu, task);
+                    self.enqueue_to_core(caller_cpu, task);
                 }
             }
         }
@@ -808,6 +831,6 @@ pub fn kernel_task_end() -> ! {
         task.terminate();
     });
     loop {
-        unsafe { task_yield() };
+        yield_now();
     }
 }
