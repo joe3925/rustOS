@@ -20,7 +20,10 @@ use crate::{
     executable::pe_loadable::PELoader,
     memory::paging::paging::{map_page, map_range_with_huge_pages},
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
-    scheduling::scheduler::{self, Scheduler, TaskHandle},
+    scheduling::{
+        scheduler::{self, Scheduler},
+        task::TaskHandle,
+    },
     util::{generate_guid, random_number},
 };
 use crate::{
@@ -293,7 +296,7 @@ impl Program {
 
     pub fn kill(&mut self) -> Result<(), LoadError> {
         let main_tid = match &self.main_thread {
-            Some(handle) => handle.read().id,
+            Some(handle) => handle.inner.read().executer_id.unwrap(),
             None => return Err(LoadError::NoMainThread),
         };
 
@@ -308,7 +311,10 @@ impl Program {
                 running -= 1;
             }
             for tid in &*managed {
-                if SCHEDULER.get_task_by_id(tid.read().id).is_none() {
+                if SCHEDULER
+                    .get_task_by_id(tid.inner.read().executer_id.unwrap())
+                    .is_none()
+                {
                     running -= 1;
                 }
             }
@@ -435,8 +441,8 @@ impl Program {
                     self.default_queue.write().queue.push_back(msg);
                 }
 
-                let mut task = th.write();
-                if task.terminated {
+                let mut task = th;
+                if task.is_terminated() {
                     return;
                 }
             }
@@ -462,7 +468,7 @@ impl ProgramManager {
         prog.pid = pid;
         if let Some(ref mut task) = prog.main_thread {
             x86_64::instructions::interrupts::without_interrupts(move || {
-                task.write().parent_pid = pid;
+                task.inner.write().parent_pid = pid;
             });
         }
 
@@ -500,7 +506,7 @@ impl ProgramManager {
             let prog = handle.write();
             Arc::clone(prog.main_thread.as_ref()?)
         };
-        let tid = task_arc.read().id;
+        let tid = task_arc.task_id();
         SCHEDULER.add_task(task_arc);
         SCHEDULER.get_task_by_id(tid)
     }

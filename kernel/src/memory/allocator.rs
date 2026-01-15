@@ -6,9 +6,9 @@ use crate::memory::{
         tables::init_mapper,
     },
 };
+use crate::static_handlers::task_yield;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
-use crate::static_handlers::task_yield;
 use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};

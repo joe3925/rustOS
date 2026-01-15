@@ -1686,7 +1686,7 @@ async fn blocking_chain(x: u64) -> u64 {
 
 #[inline(never)]
 async fn blocking_queue_stress(seed: u64) -> u64 {
-    let mut joins = Vec::with_capacity(BLOCK_TASKS);
+    let mut joins = Vec::with_capacity(50_000);
 
     let mut i = 0usize;
     while i < BLOCK_TASKS {
@@ -1702,12 +1702,7 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
     }
 
     let results = JoinAll::new(joins).await;
-
-    let mut acc = 0u64;
-    for r in results {
-        acc ^= r;
-    }
-    acc
+    i.try_into().unwrap()
 }
 
 #[inline(always)]
@@ -1782,7 +1777,11 @@ async fn bench_async_vs_sync_call_latency_async() {
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
-    q = blocking_queue_stress(q).await;
+    for index in 1..2 {
+        q = 0;
+        q = blocking_queue_stress(q).await;
+        println!("blocking num: {}", index * q);
+    }
     let q_us = sw_q.elapsed_micros();
     black_box(q);
 

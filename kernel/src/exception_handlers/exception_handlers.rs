@@ -95,7 +95,7 @@ pub(crate) extern "x86-interrupt" fn page_fault(
 
     if !is_protection {
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            let mut t = task.write();
+            let mut t = task.inner.write();
             if !t.is_user_mode && !is_user && t.guard_page != 0 {
                 let max_depth = t
                     .stack_start

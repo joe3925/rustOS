@@ -66,7 +66,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 52_400;
+pub const APIC_START_PERIOD: u64 = 25_000;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
 static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -182,7 +182,7 @@ pub extern "win64" fn trigger_guard_page_overflow() -> ! {
     let task = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("no current task");
-    let guard = task.read().guard_page;
+    let guard = task.inner.read().guard_page;
     let target = (guard + 0x800) & !0xFu64;
 
     unsafe {

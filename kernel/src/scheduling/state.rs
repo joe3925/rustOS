@@ -1,5 +1,84 @@
 use core::arch::asm;
 
+/// Scheduling state for a task - stored atomically outside the Task RwLock
+/// to allow lock-free checks in the scheduler hot path.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchedState {
+/// Task is in a run queue and eligible to be scheduled
+Runnable = 0,
+/// Task is currently executing on a CPU
+Running = 1,
+/// Task is in the process of parking; still running on CPU
+Parking = 2,
+/// Task is blocked waiting for an event (mutex, channel, condvar, sleep)
+Blocked = 3,
+/// Task has finished execution and can be cleaned up
+Terminated = 4,
+}
+
+impl SchedState {
+    /// Convert from raw u8 value
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => SchedState::Runnable,
+            1 => SchedState::Running,
+            2 => SchedState::Parking,
+            3 => SchedState::Blocked,
+            4 => SchedState::Terminated,
+            _ => SchedState::Terminated, // Invalid values treated as terminated
+        }
+    }
+}
+
+/// Reason why a task is blocked - for diagnostics and debugging.
+/// Stored as AtomicU32 for efficient atomic access.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    /// Not blocked
+    None = 0,
+    /// Waiting to acquire a mutex
+    MutexLock = 1,
+    /// Waiting to receive from a channel
+    ChannelRecv = 2,
+    /// Waiting to send to a channel (backpressure)
+    ChannelSend = 3,
+    /// Waiting on a condition variable
+    CondvarWait = 4,
+    /// Sleeping for a duration
+    Sleep = 5,
+    /// Waiting for I/O completion
+    IoWait = 6,
+    /// Waiting for a futex
+    FutexWait = 7,
+    /// Waiting to join another task
+    TaskJoin = 8,
+    /// Waiting for an IRQ/interrupt
+    IrqWait = 9,
+}
+
+impl BlockReason {
+    /// Convert from raw u32 value
+    #[inline]
+    pub fn from_u32(v: u32) -> Self {
+        match v {
+            0 => BlockReason::None,
+            1 => BlockReason::MutexLock,
+            2 => BlockReason::ChannelRecv,
+            3 => BlockReason::ChannelSend,
+            4 => BlockReason::CondvarWait,
+            5 => BlockReason::Sleep,
+            6 => BlockReason::IoWait,
+            7 => BlockReason::FutexWait,
+            8 => BlockReason::TaskJoin,
+            9 => BlockReason::IrqWait,
+            _ => BlockReason::None,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]

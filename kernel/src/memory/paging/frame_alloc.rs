@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use kernel_types::irq::IrqSafeMutex;
 use spin::Mutex;
 use x86_64::{
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
@@ -17,8 +18,8 @@ use crate::{
     util::boot_info,
 };
 
-pub static MEMORY_BITMAP: Mutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
-    Mutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
+pub static MEMORY_BITMAP: IrqSafeMutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
+    IrqSafeMutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
 
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
 

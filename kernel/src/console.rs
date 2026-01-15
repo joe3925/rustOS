@@ -9,6 +9,7 @@ use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{
     Dimensions, DrawTarget, OriginDimensions, PixelColor, Point, RgbColor, Size,
 };
+use kernel_types::irq::IrqSafeMutex;
 
 use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text, TextStyle, TextStyleBuilder};
@@ -403,72 +404,6 @@ impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.push_bytes(s.as_bytes());
         Ok(())
-    }
-}
-
-pub struct IrqSafeMutex<T> {
-    inner: Mutex<T>,
-}
-
-pub struct IrqSafeMutexGuard<'a, T> {
-    guard: MutexGuard<'a, T>,
-    restore_interrupts: bool,
-}
-
-impl<T> IrqSafeMutex<T> {
-    pub fn new(value: T) -> Self {
-        Self {
-            inner: Mutex::new(value),
-        }
-    }
-
-    pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
-        let restore_interrupts = interrupts::are_enabled();
-        interrupts::disable();
-        let guard = self.inner.lock();
-        IrqSafeMutexGuard {
-            guard,
-            restore_interrupts,
-        }
-    }
-
-    pub fn try_lock(&self) -> Option<IrqSafeMutexGuard<'_, T>> {
-        let restore_interrupts = interrupts::are_enabled();
-        interrupts::disable();
-        let guard = self.inner.try_lock();
-        match guard {
-            Some(g) => Some(IrqSafeMutexGuard {
-                guard: g,
-                restore_interrupts,
-            }),
-            None => {
-                if restore_interrupts {
-                    interrupts::enable();
-                }
-                None
-            }
-        }
-    }
-}
-
-impl<'a, T> Deref for IrqSafeMutexGuard<'a, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.guard
-    }
-}
-
-impl<'a, T> DerefMut for IrqSafeMutexGuard<'a, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.guard
-    }
-}
-
-impl<'a, T> Drop for IrqSafeMutexGuard<'a, T> {
-    fn drop(&mut self) {
-        if self.restore_interrupts {
-            interrupts::enable();
-        }
     }
 }
 

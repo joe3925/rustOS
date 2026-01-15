@@ -1,8 +1,3 @@
-// kernel/src/drivers/irq.rs
-#![no_std]
-
-extern crate alloc;
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -19,7 +14,7 @@ use crate::drivers;
 use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
-use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX};
+use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
 use crate::scheduling::scheduler::yield_interrupt_entry;
 
 /// Internal representation of an IRQ handle
@@ -679,7 +674,9 @@ fn init_idt() -> InterruptDescriptorTable {
     idt[base + 15].set_handler_fn(irq_vec_47);
 
     unsafe {
-        idt[0x80].set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64));
+        idt[0x80]
+            .set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64))
+            .set_stack_index(YIELD_IST_INDEX);
     }
 
     idt

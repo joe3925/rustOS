@@ -73,6 +73,7 @@ pub fn set_num_cores(n: usize) {
         let _ = PER_CORE_SWITCHES.set(id, AtomicUsize::new(0));
     }
 }
+
 #[unsafe(naked)]
 pub extern "win64" fn timer_interrupt_entry() {
     naked_asm!(

@@ -1,6 +1,10 @@
 pub(crate) mod aligned_buffer;
+pub mod channel;
+pub mod condvar;
 pub(crate) mod linked_list;
 pub(crate) mod per_core_storage;
 pub mod range_tracker;
+pub mod sleep_mutex;
 pub(crate) mod stopwatch;
 pub(crate) mod thread_pool;
+pub mod wait_queue;

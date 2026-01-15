@@ -74,12 +74,13 @@ pub extern "win64" fn create_kernel_task(
 }
 
 pub unsafe extern "win64" fn park_self_and_yield() {
-    SCHEDULER.park_and_yield();
+    // TODO:
+    todo!()
 }
 
 pub extern "win64" fn wake_task(id: u64) {
     if let Some(task) = SCHEDULER.get_task_by_id(id) {
-        SCHEDULER.wake_task(&task);
+        SCHEDULER.unpark(&task);
     }
 }
 
@@ -486,10 +487,6 @@ pub unsafe extern "win64" fn submit_blocking_internal(
     trampoline: extern "win64" fn(usize),
     ctx: usize,
 ) {
-    BLOCKING_INIT.call_once(|| {
-        BLOCKING_POOL.enable_dynamic(16);
-    });
-
     BLOCKING_POOL.submit(trampoline, ctx);
 }
 
