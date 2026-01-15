@@ -1,5 +1,5 @@
 use crate::cpu;
-use crate::drivers::interrupt_index::current_cpu_id;
+use crate::drivers::interrupt_index::{current_cpu_id, IpiDest, IpiKind, LocalApic, APIC};
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::memory::paging::stack::StackSize;
@@ -13,6 +13,9 @@ pub use crate::scheduling::task::TaskHandle;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use crossbeam_queue::ArrayQueue;
+use goblin::mach::constants::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS;
+use x86_64::instructions::interrupts::without_interrupts;
 
 use core::arch::naked_asm;
 use core::mem::MaybeUninit;
@@ -35,78 +38,6 @@ const MAX_TASKS: usize = 65_536;
 #[repr(u32)]
 pub enum TaskError {
     NotFound(u64),
-}
-
-struct FixedRunQueue {
-    buf: Box<[MaybeUninit<TaskHandle>]>,
-    head: usize,
-    tail: usize,
-    len: usize,
-}
-
-impl FixedRunQueue {
-    fn new() -> Self {
-        let mut v: Vec<MaybeUninit<TaskHandle>> = Vec::with_capacity(RUNQ_CAP);
-        unsafe { v.set_len(RUNQ_CAP) };
-        Self {
-            buf: v.into_boxed_slice(),
-            head: 0,
-            tail: 0,
-            len: 0,
-        }
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    fn is_full(&self) -> bool {
-        self.len == RUNQ_CAP
-    }
-
-    #[inline(always)]
-    fn push_back(&mut self, t: TaskHandle) -> bool {
-        if self.is_full() {
-            return false;
-        }
-        self.buf[self.tail].write(t);
-        self.tail += 1;
-        if self.tail == RUNQ_CAP {
-            self.tail = 0;
-        }
-        self.len += 1;
-        true
-    }
-
-    #[inline(always)]
-    fn pop_front(&mut self) -> Option<TaskHandle> {
-        if self.len == 0 {
-            return None;
-        }
-        let v = unsafe { self.buf[self.head].assume_init_read() };
-        self.head += 1;
-        if self.head == RUNQ_CAP {
-            self.head = 0;
-        }
-        self.len -= 1;
-        Some(v)
-    }
-
-    #[inline(always)]
-    fn pop_back(&mut self) -> Option<TaskHandle> {
-        if self.len == 0 {
-            return None;
-        }
-        if self.tail == 0 {
-            self.tail = RUNQ_CAP;
-        }
-        self.tail -= 1;
-        let v = unsafe { self.buf[self.tail].assume_init_read() };
-        self.len -= 1;
-        Some(v)
-    }
 }
 
 struct TaskTable {
@@ -172,12 +103,12 @@ impl TaskTable {
 /// Per-core scheduler state
 pub struct CoreScheduler {
     sched_lock: IrqSafeMutex<SchedulerState>,
+    run_queue: ArrayQueue<TaskHandle>,
     idle_task: TaskHandle,
     current_ptr: AtomicPtr<TaskRef>,
 }
 
 struct SchedulerState {
-    run_queue: FixedRunQueue,
     current: Option<TaskHandle>,
 }
 
@@ -221,10 +152,8 @@ impl Scheduler {
             let idle_ptr = Arc::as_ptr(&idle) as *mut TaskRef;
 
             cores_vec.push(CoreScheduler {
-                sched_lock: IrqSafeMutex::new(SchedulerState {
-                    run_queue: FixedRunQueue::new(),
-                    current: None,
-                }),
+                sched_lock: IrqSafeMutex::new(SchedulerState { current: None }),
+                run_queue: ArrayQueue::new(RUNQ_CAP),
                 idle_task: idle,
                 current_ptr: AtomicPtr::new(idle_ptr),
             });
@@ -273,13 +202,13 @@ impl Scheduler {
 
     fn enqueue_to_core(&self, cpu: usize, task: TaskHandle) {
         let core = &self.cores[cpu];
-        let mut state = core.sched_lock.lock();
-        Self::push_runqueue_or_panic(cpu, &mut state.run_queue, task);
+        Self::push_runqueue_or_panic(cpu, &core.run_queue, task);
     }
 
     #[inline(always)]
-    fn push_runqueue_or_panic(cpu: usize, queue: &mut FixedRunQueue, task: TaskHandle) {
-        if !queue.push_back(task) {
+    fn push_runqueue_or_panic(cpu: usize, queue: &ArrayQueue<TaskHandle>, task: TaskHandle) {
+        //queue.force_push(task);
+        if let Some(err) = queue.push(task).err() {
             panic!("run queue overflow on cpu {cpu}");
         }
     }
@@ -307,7 +236,7 @@ impl Scheduler {
     fn core_load_unlocked(&self, i: usize) -> usize {
         let core = &self.cores[i];
         if let Some(state) = core.sched_lock.try_lock() {
-            let rq_len = state.run_queue.len();
+            let rq_len = core.run_queue.len();
             let running = match state.current.as_ref() {
                 Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
                 _ => 0,
@@ -385,6 +314,14 @@ impl Scheduler {
 
                     task.set_target_cpu(best_cpu);
                     self.enqueue_to_core(best_cpu, task.clone());
+
+                    if best_cpu != current_cpu_id() {
+                        unsafe {
+                            APIC.lock()
+                                .as_ref()
+                                .map(|a| a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi));
+                        }
+                    }
                     return;
                 }
 
@@ -499,7 +436,23 @@ impl Scheduler {
         // };
         yield_now();
     }
-    // TODO: there is a bug somewhere in somewhere on "on_timer_tick" that is causing garbage to be lef on the sack
+    #[inline(always)]
+    pub fn on_ipi(&self) {
+        if !interrupts::are_enabled() {
+            // Interrupts being disabled breaks some of our assumptions
+            // (state doesn't need to be preserved, sched_lock will be available), just return
+            return;
+        }
+        let cpu_id = current_cpu_id() as usize;
+        let core = &self.cores[cpu_id];
+        if let Some(current) = &core.sched_lock.lock().current {
+            if Arc::ptr_eq(&current, &core.idle_task) {
+                // idle task by design doesn't need its state preserved
+                self.schedule_next(cpu_id, cpu::get_cycles());
+            }
+        }
+    }
+    // TODO: there is a bug somewhere in somewhere on "on_timer_tick" that is causing garbage to be left on the sack
     // not high prio but will be an issue if decided the timer and yield shouldn't be on there own IST or if yield shouldn't be on int 0x80
     #[inline(always)]
     pub fn on_timer_tick(&self, state: *mut State, cpu_id: usize) {
@@ -568,21 +521,13 @@ impl Scheduler {
                 match prev_sched_state {
                     SchedState::Running | SchedState::Runnable => {
                         prev.set_sched_state(SchedState::Runnable);
-                        Self::push_runqueue_or_panic(
-                            cpu_id,
-                            &mut sched_state.run_queue,
-                            prev.clone(),
-                        );
+                        Self::push_runqueue_or_panic(cpu_id, &core.run_queue, prev.clone());
                     }
                     SchedState::Parking => {
                         if prev.consume_permit() {
                             prev.set_sched_state(SchedState::Runnable);
                             prev.set_block_reason(BlockReason::None);
-                            Self::push_runqueue_or_panic(
-                                cpu_id,
-                                &mut sched_state.run_queue,
-                                prev.clone(),
-                            );
+                            Self::push_runqueue_or_panic(cpu_id, &core.run_queue, prev.clone());
                         } else {
                             if prev
                                 .cas_sched_state(SchedState::Parking, SchedState::Blocked)
@@ -596,7 +541,7 @@ impl Scheduler {
                                         prev.set_block_reason(BlockReason::None);
                                         Self::push_runqueue_or_panic(
                                             cpu_id,
-                                            &mut sched_state.run_queue,
+                                            &core.run_queue,
                                             prev.clone(),
                                         );
                                     }
@@ -611,7 +556,7 @@ impl Scheduler {
         }
 
         loop {
-            let Some(cand) = sched_state.run_queue.pop_front() else {
+            let Some(cand) = core.run_queue.pop() else {
                 break;
             };
 
@@ -643,7 +588,7 @@ impl Scheduler {
         let mut sched_state = core.sched_lock.lock();
 
         // Check again after rescue - a task may have been enqueued
-        if let Some(cand) = sched_state.run_queue.pop_front() {
+        if let Some(cand) = core.run_queue.pop() {
             if matches!(
                 cand.sched_state(),
                 SchedState::Runnable | SchedState::Running
@@ -734,10 +679,7 @@ impl Scheduler {
                 break;
             }
 
-            let task = {
-                let mut state = self.cores[max_idx].sched_lock.lock();
-                state.run_queue.pop_back()
-            };
+            let task = { self.cores[max_idx].run_queue.pop() };
 
             let Some(task) = task else {
                 loads[max_idx] = 0;
@@ -746,8 +688,7 @@ impl Scheduler {
 
             task.set_target_cpu(min_idx);
             {
-                let mut state = self.cores[min_idx].sched_lock.lock();
-                Self::push_runqueue_or_panic(min_idx, &mut state.run_queue, task);
+                Self::push_runqueue_or_panic(min_idx, &self.cores[min_idx].run_queue, task);
             }
 
             loads[max_idx] = loads[max_idx].saturating_sub(1);

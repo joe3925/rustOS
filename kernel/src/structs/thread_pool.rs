@@ -22,6 +22,11 @@ pub struct Job {
     pub f: JobFn,
     pub a: usize,
 }
+impl From<(extern "win64" fn(usize), usize)> for Job {
+    fn from(job: (extern "win64" fn(usize), usize)) -> Self {
+        Job { f: job.0, a: job.1 }
+    }
+}
 
 struct Shared {
     queue: SleepMutex<VecDeque<Job>>,

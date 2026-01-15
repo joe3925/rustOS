@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::arch::naked_asm;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
@@ -8,6 +9,7 @@ pub use super::block_on::block_on;
 pub use super::blocking::{spawn_blocking, BlockingJoin};
 
 use crate::static_handlers::task_yield;
+use crate::structs::thread_pool::Job;
 use crate::{
     static_handlers::{submit_blocking_internal, submit_runtime_internal},
     structs::thread_pool::ThreadPool,
@@ -18,7 +20,7 @@ use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 lazy_static::lazy_static! {
     pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(2));
-    pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(4));
+    pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(6));
 }
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
@@ -28,11 +30,12 @@ pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
 pub(crate) fn submit_blocking(trampoline: extern "win64" fn(usize), ctx: usize) {
     BLOCKING_POOL.submit(trampoline, ctx);
 }
-
-pub(crate) fn yield_now() {
-    unsafe {
-        task_yield();
-    }
+pub(crate) fn submit_blocking_many(jobs: &[Job]) {
+    BLOCKING_POOL.submit_many(jobs);
+}
+#[unsafe(naked)]
+pub(crate) extern "C" fn yield_now() {
+    naked_asm!("int 0x80; ret")
 }
 pub extern "win64" fn try_steal_blocking_one() -> bool {
     BLOCKING_POOL.try_execute_one()

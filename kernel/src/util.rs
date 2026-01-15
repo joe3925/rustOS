@@ -50,6 +50,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
+use crossbeam_queue::ArrayQueue;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::memory::Module;
 use rand_core::{RngCore, SeedableRng};
@@ -69,7 +70,7 @@ pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 100_000;
 pub static BOOTSET: &[BootPkg] =
     boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
-static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
+pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
 lazy_static! {
     pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
@@ -126,6 +127,7 @@ pub unsafe fn init() {
     // BSP APIC calibration (moved here so current_cpu_id() works)
     apic_calibrate_ticks_per_ns_via_wait(10);
     apic_program_period_ns(APIC_START_PERIOD);
+    let task = Task::new_kernel_mode(kernel_main, 0, StackSize::Tiny, "kernel".into(), 0);
 
     SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
     SCHEDULER.add_task(Task::new_kernel_mode(

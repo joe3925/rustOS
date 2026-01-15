@@ -3,6 +3,7 @@ use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::static_handlers::get_current_cpu_id;
+use crate::util::PANIC_ACTIVE;
 use alloc::fmt;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
@@ -17,7 +18,10 @@ pub(crate) extern "x86-interrupt" fn debug_exception(stack_frame: InterruptStack
 }
 
 pub(crate) extern "x86-interrupt" fn non_maskable_interrupt(stack_frame: InterruptStackFrame) {
-    panic!("EXCEPTION: NON MASKABLE INTERRUPT\n{:#?}", stack_frame);
+    if PANIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
+        loop {}
+    }
+    SCHEDULER.on_ipi();
 }
 
 pub(crate) extern "x86-interrupt" fn breakpoint_exception(stack_frame: InterruptStackFrame) {
@@ -97,9 +101,7 @@ pub(crate) extern "x86-interrupt" fn page_fault(
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
             let mut t = task.inner.write();
             if !t.is_user_mode && !is_user && t.guard_page != 0 {
-                let max_depth = t
-                    .stack_start
-                    .saturating_sub(KERNEL_STACK_MAX_BYTES);
+                let max_depth = t.stack_start.saturating_sub(KERNEL_STACK_MAX_BYTES);
                 let gp = t.guard_page;
 
                 // Allow growth for faults anywhere within the 2MiB reserved window below stack_start.

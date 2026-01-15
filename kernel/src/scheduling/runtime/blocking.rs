@@ -99,6 +99,5 @@ where
     let ptr = Box::into_raw(Box::new(task)) as usize;
 
     submit_blocking(blocking_trampoline::<F, R>, ptr);
-
     BlockingJoin::new(inner)
 }
