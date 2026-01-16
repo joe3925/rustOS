@@ -10,8 +10,9 @@ use crate::static_handlers::task_yield;
 use crate::structs::thread_pool::ThreadPool;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::arch::naked_asm;
 use core::hint::black_box;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use spin::RwLock;
 use x86_64::instructions::hlt;
@@ -22,6 +23,8 @@ pub type TaskEntry = extern "win64" fn(usize);
 
 const PAGE_SIZE: u64 = 4096;
 
+pub const IDLE_UUID_UPPER: u64 = 0x1c82f35548bcbe24;
+pub const IDLE_MAGIC_LOWER: u64 = 0x890189d70ecaca7f;
 /// Sentinel value indicating no task in wait queue
 pub const WAIT_QUEUE_NONE: u64 = 0;
 #[derive(Debug)]
@@ -58,6 +61,9 @@ pub struct TaskRef {
 
     /// The inner task data (context, stack, etc.) - requires lock for access
     pub inner: RwLock<Task>,
+
+    /// Fast path for kernel mode check
+    pub is_kernel_mode: AtomicBool,
 }
 
 /// Handle type used throughout the scheduler
@@ -247,6 +253,7 @@ impl Task {
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inner: RwLock::new(inner_task),
+            is_kernel_mode: AtomicBool::new(false),
         })
     }
 
@@ -314,6 +321,7 @@ impl Task {
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inner: RwLock::new(inner_task),
+            is_kernel_mode: AtomicBool::new(true),
         })
     }
 
@@ -381,21 +389,7 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
         None => 0,
     }
 }
-
+#[unsafe(naked)]
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
-    // let runtime = RUNTIME_POOL.as_ref() as *const ThreadPool;
-    // let blocking = BLOCKING_POOL.as_ref() as *const ThreadPool;
-
-    loop {
-        unsafe {
-            // let runtime_var = (*runtime).is_shutdown();
-            // let blocking_var = (*blocking).is_shutdown();
-            // let cores = SCHEDULER.num_cores();
-            // black_box(runtime_var);
-            // black_box(blocking_var);
-            // black_box(cores);
-        }
-        yield_now();
-        //hlt();
-    }
+    naked_asm!("3:", "hlt", "jmp 3b",);
 }

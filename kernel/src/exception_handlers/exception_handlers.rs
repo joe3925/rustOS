@@ -21,7 +21,6 @@ pub(crate) extern "x86-interrupt" fn non_maskable_interrupt(stack_frame: Interru
     if PANIC_ACTIVE.load(core::sync::atomic::Ordering::Acquire) {
         loop {}
     }
-    SCHEDULER.on_ipi();
 }
 
 pub(crate) extern "x86-interrupt" fn breakpoint_exception(stack_frame: InterruptStackFrame) {

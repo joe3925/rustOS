@@ -66,48 +66,25 @@ impl Condvar {
     /// This function will atomically unlock the mutex and block the current task.
     /// When this function returns, the mutex will be re-acquired.
     ///
-    /// # Algorithm
-    ///
-    /// 1. Enqueue current task into wait queue (while still holding mutex)
-    /// 2. Release the mutex
-    /// 3. Park (block) until woken by notify
-    /// 4. Re-acquire the mutex
-    /// 5. Return
-    ///
-    /// The ordering of steps 1 and 2 is critical: by enqueueing before releasing
-    /// the mutex, we ensure that any notify_one/notify_all that happens after
-    /// the condition was checked (which required holding the mutex) will see
-    /// our task in the wait queue.
+    /// The current task is enqueued before the mutex is released to avoid lost
+    /// wakeups, then the task parks until a notification arrives and re-locks
+    /// the mutex before returning.
     pub fn wait<'a, T>(&self, guard: SleepMutexGuard<'a, T>) -> SleepMutexGuard<'a, T> {
-        // Get the mutex reference before dropping the guard
         let mutex = guard.mutex();
 
-        // Step 1: Enqueue current task BEFORE releasing mutex
-        // This ensures no notification is missed between releasing mutex and parking.
-        // If enqueue fails (task already queued elsewhere), we have a bug - but
-        // we'll handle it gracefully by just releasing and re-acquiring.
+        // Enqueue before unlocking to avoid missing notifications.
         let enqueued = self.waiters.enqueue_current();
 
-        // Step 2: Release the mutex
-        // This must happen AFTER enqueue to prevent lost wakeups.
         drop(guard);
 
         if enqueued {
-            // Step 3: Park until woken
-            // The notifier will dequeue us before calling unpark, so when we wake
-            // up, we're no longer in the wait queue.
             SCHEDULER.park_current(BlockReason::CondvarWait);
         }
-        // If we weren't enqueued (shouldn't happen), skip parking and just re-lock.
-        // This is a spurious "wakeup" but the caller should handle it via their loop.
 
-        // If we consumed a permit immediately and never actually blocked, we may still
-        // be marked as queued in the condvar waiters. Clear any stale membership to
-        // avoid handing out stray permits from unrelated unlocks/notifications.
+        // Clear any stale queue membership when a permit was consumed immediately.
         // TODO: figure out why calling this dropped throughput significantly
         let _ = self.waiters.clear_current_if_queued();
 
-        // Step 4: Re-acquire the mutex and return the guard
         mutex.lock()
     }
 
@@ -119,8 +96,6 @@ impl Condvar {
     /// It is generally recommended to call this while the associated mutex
     /// is held to avoid race conditions on the predicate being waited on.
     pub fn notify_one(&self) {
-        // Dequeue one task and wake it
-        // dequeue_one() clears the task's wait_next, removing it from the queue
         if let Some(task) = self.waiters.dequeue_one() {
             SCHEDULER.unpark(&task);
         }
@@ -131,7 +106,6 @@ impl Condvar {
     /// All currently waiting tasks will be woken up. Tasks that start
     /// waiting after this call will not be woken.
     pub fn notify_all(&self) {
-        // Dequeue all tasks and wake them
         let tasks = self.waiters.dequeue_all();
         for task in tasks {
             SCHEDULER.unpark(&task);

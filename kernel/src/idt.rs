@@ -15,7 +15,7 @@ use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, se
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
-use crate::scheduling::scheduler::yield_interrupt_entry;
+use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry};
 
 /// Internal representation of an IRQ handle
 struct IrqHandleInner {
@@ -566,6 +566,7 @@ pub fn irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
     }
     unsafe { irq_handle_signal_n(handle, meta, n) };
 }
+pub const SCHED_IPI_VECTOR: u8 = 0xF2;
 
 // =============================================================================
 // IRQ VECTOR STUBS
@@ -672,8 +673,11 @@ fn init_idt() -> InterruptDescriptorTable {
     idt[base + 13].set_handler_fn(irq_vec_45);
     idt[base + 14].set_handler_fn(irq_vec_46);
     idt[base + 15].set_handler_fn(irq_vec_47);
-
     unsafe {
+        idt[SCHED_IPI_VECTOR as u8]
+            .set_handler_addr(VirtAddr::new(ipi_entry as u64))
+            .set_stack_index(YIELD_IST_INDEX);
+
         idt[0x80]
             .set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64))
             .set_stack_index(YIELD_IST_INDEX);

@@ -67,84 +67,34 @@ impl<T> SleepMutex<T> {
 
     /// Acquire the mutex, sleeping via the scheduler if it is already held.
     ///
-    /// This method uses a check-under-lock pattern to avoid race conditions:
-    /// 1. Try to acquire (fast path)
-    /// 2. If failed, re-check lock state under wait queue lock
-    /// 3. Only enqueue and sleep if still locked
+    /// Uses a check-under-lock pattern: try the fast path, otherwise enqueue,
+    /// re-check, and only sleep if the mutex is still held.
     pub fn lock(&self) -> SleepMutexGuard<'_, T> {
         loop {
-            // Fast path: try to acquire without touching wait queue
             if let Some(guard) = self.try_lock() {
                 return guard;
             }
 
-            // Slow path: need to wait
-            // The WaitQueue::enqueue_current() will fail if we're already queued
-            // (prevents duplicate entries)
             let enqueued = self.waiters.enqueue_current();
 
             if !enqueued {
-                // Already queued somewhere (shouldn't happen in normal use, but handle it)
-                // Clear our wait_next if it was from a previous incomplete wait
                 self.waiters.clear_current_if_queued();
-                // Try again
                 continue;
             }
 
-            // CRITICAL: Re-check lock state AFTER enqueueing
-            // This prevents the race where:
-            // 1. We check lock (locked)
-            // 2. Another task unlocks and wakes nobody (we weren't queued yet)
-            // 3. We enqueue and sleep forever
-            //
-            // By checking after enqueue, if the lock became free, we can
-            // try to acquire it. The unlock() will have already checked
-            // the wait queue (finding it empty at that moment), so we
-            // won't get a spurious wakeup.
             if let Some(guard) = self.try_lock() {
-                // Lock is now free! We acquired it.
-                // But we're still in the wait queue - we need to handle this.
-                // The next unlock by us will wake someone from the queue,
-                // which might be a stale entry (us) or a real waiter.
-                //
-                // Since we're using intrusive queues with CAS-based enqueue,
-                // we're now in the queue with wait_next set. The safest approach
-                // is to NOT clear ourselves (we'd need to scan the list), but
-                // instead let the unlock logic skip us if we're not blocked.
-                //
-                // Actually, we should clear our wait_next since we succeeded.
-                // But we're in the middle of the list potentially...
-            //
-            // The correct fix: we must NOT be in the queue if we acquired.
-            // Since we can't easily remove ourselves from the middle,
-            // we accept that dequeue_one() may pop us and that's okay -
-            // unpark on a running task just sets a permit.
-            //
-            // However, leaving ourselves marked as queued can hand out a
-            // stray wake permit later (when unlock pops the stale entry),
-            // which in turn can make a future condvar wait skip blocking
-            // while still thinking we're queued. Clear our marker now to
-            // avoid that stale permit/queue entry.
-            let _ = self.waiters.clear_current_if_queued();
-            return guard;
-        }
+                let _ = self.waiters.clear_current_if_queued();
+                return guard;
+            }
 
-            // Lock is still held, park until woken
             SCHEDULER.park_current(BlockReason::MutexLock);
-
-            // After waking, we've been dequeued by unlock().
-            // Loop back to try acquiring again.
         }
     }
 
     /// Release the mutex and wake one waiting task.
     fn unlock(&self) {
-        // Release the lock first
         self.locked.store(0, Ordering::Release);
 
-        // Wake one waiter if any
-        // dequeue_one() clears the task's wait_next, so it won't be
-        // considered "queued" anymore
         if let Some(task) = self.waiters.dequeue_one() {
             SCHEDULER.unpark(&task);
         }

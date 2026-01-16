@@ -127,8 +127,8 @@ impl State {
             r15: 0,
             rip: 0,
             rflags: 0,
-            cs: 0, // Initialize with zero
-            ss: 0, // Initialize with zero
+            cs: 0,
+            ss: 0,
         };
         state
     }

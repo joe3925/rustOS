@@ -1,17 +1,22 @@
 use crate::cpu;
-use crate::drivers::interrupt_index::{current_cpu_id, IpiDest, IpiKind, LocalApic, APIC};
+use crate::drivers::interrupt_index::{
+    current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
+};
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
 use crate::executable::program::PROGRAM_MANAGER;
+use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::runtime::runtime::yield_now;
+use crate::scheduling::scheduler;
 use crate::scheduling::state::{BlockReason, SchedState, State};
-use crate::scheduling::task::{idle_task, Task, TaskRef};
+use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 use crate::util::KERNEL_INITIALIZED;
 
 pub use crate::scheduling::task::TaskHandle;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::task;
 use alloc::vec::Vec;
 use crossbeam_queue::ArrayQueue;
 use goblin::mach::constants::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS;
@@ -143,6 +148,10 @@ impl Scheduler {
         let mut cores_vec: Vec<CoreScheduler> = Vec::with_capacity(num_cores);
         for i in 0..num_cores {
             let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
+
+            idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
+            idle.inner.write().context.r11 = 0x890189d70ecaca7f;
+
             let idle_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
             idle.set_task_id(idle_id);
             idle.set_target_cpu(i);
@@ -317,9 +326,15 @@ impl Scheduler {
 
                     if best_cpu != current_cpu_id() {
                         unsafe {
-                            APIC.lock()
-                                .as_ref()
-                                .map(|a| a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi));
+                            APIC.lock().as_ref().map(|a| {
+                                // TODO: sending to all excluding kills multicore performance fix this at some point
+                                a.lapic.send_ipi(
+                                    IpiDest::AllExcludingSelf,
+                                    IpiKind::Fixed {
+                                        vector: SCHED_IPI_VECTOR,
+                                    },
+                                )
+                            });
                         }
                     }
                     return;
@@ -436,22 +451,6 @@ impl Scheduler {
         // };
         yield_now();
     }
-    #[inline(always)]
-    pub fn on_ipi(&self) {
-        if !interrupts::are_enabled() {
-            // Interrupts being disabled breaks some of our assumptions
-            // (state doesn't need to be preserved, sched_lock will be available), just return
-            return;
-        }
-        let cpu_id = current_cpu_id() as usize;
-        let core = &self.cores[cpu_id];
-        if let Some(current) = &core.sched_lock.lock().current {
-            if Arc::ptr_eq(&current, &core.idle_task) {
-                // idle task by design doesn't need its state preserved
-                self.schedule_next(cpu_id, cpu::get_cycles());
-            }
-        }
-    }
     // TODO: there is a bug somewhere in somewhere on "on_timer_tick" that is causing garbage to be left on the sack
     // not high prio but will be an issue if decided the timer and yield shouldn't be on there own IST or if yield shouldn't be on int 0x80
     #[inline(always)]
@@ -483,20 +482,12 @@ impl Scheduler {
             None => return,
         };
 
-        // Check if we need to restore page table (requires reading inner)
-        let needs_restore = {
-            let t = next.inner.read();
-            t.parent_pid != 0
-        };
+        self.restore_page_table(&next);
 
-        if needs_restore {
-            self.restore_page_table(&next);
-        }
-
-        PER_CORE_SWITCHES
-            .get(cpu_id)
-            .unwrap()
-            .fetch_add(1, Ordering::Relaxed);
+        // PER_CORE_SWITCHES
+        //     .get(cpu_id)
+        //     .unwrap()
+        //     .fetch_add(1, Ordering::Relaxed);
 
         // Hold the guard while we restore context to avoid racing with another
         // CPU modifying the task's saved state.
@@ -583,26 +574,26 @@ impl Scheduler {
 
         // TODO: Temp fix for lost wakeups - scan for stranded tasks when going idle.
         // This should be removed once the root cause of lost wakeups is fixed.
-        drop(sched_state);
-        //self.rescue_stranded_tasks(cpu_id);
-        let mut sched_state = core.sched_lock.lock();
+        // drop(sched_state);
+        // self.rescue_stranded_tasks(cpu_id);
+        // let mut sched_state = core.sched_lock.lock();
 
-        // Check again after rescue - a task may have been enqueued
-        if let Some(cand) = core.run_queue.pop() {
-            if matches!(
-                cand.sched_state(),
-                SchedState::Runnable | SchedState::Running
-            ) {
-                cand.set_sched_state(SchedState::Running);
-                if let Some(t) = cand.inner.try_read() {
-                    t.mark_scheduled_in(cpu_id, now_cycles);
-                }
-                sched_state.current = Some(cand.clone());
-                core.current_ptr
-                    .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);
-                return Some(cand);
-            }
-        }
+        // // Check again after rescue - a task may have been enqueued
+        // if let Some(cand) = core.run_queue.pop() {
+        //     if matches!(
+        //         cand.sched_state(),
+        //         SchedState::Runnable | SchedState::Running
+        //     ) {
+        //         cand.set_sched_state(SchedState::Running);
+        //         if let Some(t) = cand.inner.try_read() {
+        //             t.mark_scheduled_in(cpu_id, now_cycles);
+        //         }
+        //         sched_state.current = Some(cand.clone());
+        //         core.current_ptr
+        //             .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);
+        //         return Some(cand);
+        //     }
+        // }
 
         core.idle_task.set_sched_state(SchedState::Running);
         if let Some(t) = core.idle_task.inner.try_read() {
@@ -616,18 +607,17 @@ impl Scheduler {
         );
         Some(core.idle_task.clone())
     }
-
+    #[inline(always)]
     pub fn restore_page_table(&self, task_handle: &TaskHandle) {
-        let t = task_handle.inner.read();
-        if t.parent_pid == 0 {
+        if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
             return;
         }
+        let pid = task_handle.inner.read().parent_pid;
 
-        if let Some(program) = PROGRAM_MANAGER.get(t.parent_pid) {
+        if let Some(program) = PROGRAM_MANAGER.get(pid) {
             unsafe { Cr3::write(program.read().cr3, Cr3::read().1) };
         } else {
             let id = task_handle.task_id();
-            drop(t);
             let _ = self.delete_task(id);
         }
     }
@@ -729,6 +719,59 @@ impl Scheduler {
             }
         }
     }
+    #[inline(always)]
+    pub fn on_ipi(&self, state: *mut State, cpu_id: usize) {
+        if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+
+        let core = &self.cores[cpu_id];
+
+        // Only use IPI as an "exit idle / recheck runq" poke.
+        let is_idle = {
+            let sched_state = core.sched_lock.lock();
+            match sched_state.current.as_ref() {
+                Some(t) => Arc::ptr_eq(t, &core.idle_task),
+                None => false,
+            }
+        };
+
+        if !is_idle {
+            send_eoi(SCHED_IPI_VECTOR);
+            return;
+        }
+
+        let now_cycles = cpu::get_cycles();
+
+        let next = match self.schedule_next(cpu_id, now_cycles) {
+            Some(t) => t,
+            None => {
+                send_eoi(SCHED_IPI_VECTOR);
+                return;
+            }
+        };
+
+        self.restore_page_table(&next);
+
+        // PER_CORE_SWITCHES
+        //     .get(cpu_id)
+        //     .unwrap()
+        //     .fetch_add(1, Ordering::Relaxed);
+
+        // Must EOI before iretq returns into the (possibly different) task context.
+        send_eoi(SCHED_IPI_VECTOR);
+
+        let ctx_guard = next.inner.read();
+        unsafe { ctx_guard.context.restore(state) };
+    }
+}
+#[no_mangle]
+pub extern "C" fn ipi_handler_c(state: *mut State) {
+    if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    let cpu_id = current_cpu_id() as usize;
+    SCHEDULER.on_ipi(state, cpu_id);
 }
 
 #[no_mangle]
@@ -739,7 +782,54 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
     let cpu_id = current_cpu_id() as usize;
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
+#[no_mangle]
+pub extern "C" fn ipi_eoi_only() {
+    crate::drivers::interrupt_index::send_eoi(SCHED_IPI_VECTOR);
+}
+#[unsafe(naked)]
+#[no_mangle]
+pub extern "win64" fn ipi_entry() {
+    naked_asm!(
+        "cli",
+        "push rax",
+        "mov  rax, {upper}",
+        "cmp  r10, rax",
+        "jne  9f",
+        "mov  rax, {lower}",
+        "cmp  r11, rax",
+        "jne  9f",
+        "pop  rax",
 
+        "push r15","push r14","push r13","push r12",
+        "push r11","push r10","push r9","push r8",
+        "push rdi","push rsi","push rbp","push rbx",
+        "push rdx","push rcx","push rax",
+
+        "mov  rdi, rsp",
+        "cld",
+        "sub  rsp, 8",
+        "call {handler}",
+        "add  rsp, 8",
+
+        "pop  rax","pop  rcx","pop  rdx","pop  rbx",
+        "pop  rbp","pop  rsi","pop  rdi","pop  r8",
+        "pop  r9","pop  r10","pop  r11","pop  r12",
+        "pop  r13","pop  r14","pop  r15",
+        "iretq",
+
+        "9:",
+        "pop  rax",
+        "sub  rsp, 8",
+        "call {eoi_only}",
+        "add  rsp, 8",
+        "iretq",
+
+        upper = const IDLE_UUID_UPPER,
+        lower = const IDLE_MAGIC_LOWER,
+        handler = sym ipi_handler_c,
+        eoi_only = sym ipi_eoi_only,
+    );
+}
 #[unsafe(naked)]
 pub extern "win64" fn yield_interrupt_entry() {
     naked_asm!(
