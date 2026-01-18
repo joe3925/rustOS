@@ -16,20 +16,18 @@ pub use crate::scheduling::task::TaskHandle;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::task;
 use alloc::vec::Vec;
 use crossbeam_queue::ArrayQueue;
-use goblin::mach::constants::S_THREAD_LOCAL_INIT_FUNCTION_POINTERS;
 use x86_64::instructions::interrupts::without_interrupts;
 
 use core::arch::naked_asm;
-use core::mem::MaybeUninit;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
 use spin::Mutex;
+use spin::RwLock;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::control::Cr3;
 
@@ -111,6 +109,7 @@ pub struct CoreScheduler {
     run_queue: ArrayQueue<TaskHandle>,
     idle_task: TaskHandle,
     current_ptr: AtomicPtr<TaskRef>,
+    lapic_id: u8,
 }
 
 struct SchedulerState {
@@ -119,7 +118,7 @@ struct SchedulerState {
 
 pub struct Scheduler {
     all_tasks: TaskTable,
-    cores: Box<[CoreScheduler]>,
+    cores: RwLock<Vec<Arc<CoreScheduler>>>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
     last_balance_tick: AtomicUsize,
@@ -134,7 +133,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             all_tasks: TaskTable::new(MAX_TASKS),
-            cores: Vec::new().into_boxed_slice(),
+            cores: RwLock::new(Vec::new()),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
             last_balance_tick: AtomicUsize::new(0),
@@ -142,35 +141,54 @@ impl Scheduler {
         }
     }
 
-    pub fn init(&self, num_cores: usize) {
-        self.num_cores.store(num_cores, Ordering::Relaxed);
+    #[inline(always)]
+    fn core(&self, cpu_id: usize) -> Option<Arc<CoreScheduler>> {
+        let cores = self.cores.read();
+        cores.get(cpu_id).cloned()
+    }
 
-        let mut cores_vec: Vec<CoreScheduler> = Vec::with_capacity(num_cores);
-        for i in 0..num_cores {
-            let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
+    #[inline(always)]
+    fn build_core(&self, cpu_id: usize, lapic_id: u8) -> Arc<CoreScheduler> {
+        let idle = Task::new_kernel_mode(idle_task, 0, StackSize::Tiny, "".into(), 0);
 
-            idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
-            idle.inner.write().context.r11 = 0x890189d70ecaca7f;
+        idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
+        idle.inner.write().context.r11 = 0x890189d70ecaca7f;
 
-            let idle_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-            idle.set_task_id(idle_id);
-            idle.set_target_cpu(i);
+        let idle_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        idle.set_task_id(idle_id);
+        idle.set_target_cpu(cpu_id);
 
-            self.all_tasks.insert(idle_id, &idle);
+        self.all_tasks.insert(idle_id, &idle);
 
-            let idle_ptr = Arc::as_ptr(&idle) as *mut TaskRef;
+        let idle_ptr = Arc::as_ptr(&idle) as *mut TaskRef;
 
-            cores_vec.push(CoreScheduler {
-                sched_lock: IrqSafeMutex::new(SchedulerState { current: None }),
-                run_queue: ArrayQueue::new(RUNQ_CAP),
-                idle_task: idle,
-                current_ptr: AtomicPtr::new(idle_ptr),
-            });
+        Arc::new(CoreScheduler {
+            sched_lock: IrqSafeMutex::new(SchedulerState { current: None }),
+            run_queue: ArrayQueue::new(RUNQ_CAP),
+            idle_task: idle,
+            current_ptr: AtomicPtr::new(idle_ptr),
+            lapic_id,
+        })
+    }
+
+    pub fn init_core(&self, cpu_id: usize) {
+        let mut cores = self.cores.write();
+
+        if cpu_id < cores.len() {
+            // Already initialized
+            return;
         }
 
-        let cores_box = cores_vec.into_boxed_slice();
-        let ptr = &self.cores as *const _ as *mut Box<[CoreScheduler]>;
-        unsafe { ptr.write(cores_box) };
+        assert!(
+            cpu_id == cores.len(),
+            "cpu ids must be contiguous (got {}, expected next {})",
+            cpu_id,
+            cores.len()
+        );
+
+        let lapic_id = get_current_logical_id();
+        cores.push(self.build_core(cpu_id, lapic_id));
+        self.num_cores.store(cores.len(), Ordering::Release);
     }
 
     fn register_task(&self, task: TaskHandle) -> u64 {
@@ -210,7 +228,9 @@ impl Scheduler {
     }
 
     fn enqueue_to_core(&self, cpu: usize, task: TaskHandle) {
-        let core = &self.cores[cpu];
+        let Some(core) = self.core(cpu) else {
+            panic!("enqueue_to_core: cpu {} not initialized", cpu);
+        };
         Self::push_runqueue_or_panic(cpu, &core.run_queue, task);
     }
 
@@ -225,15 +245,18 @@ impl Scheduler {
     fn choose_core_for_new_task(&self, n: usize) -> usize {
         let start = (self.next_task_id.load(Ordering::Relaxed) as usize) % n;
         let mut best = start;
-        let mut best_load = usize::MAX;
+        let mut best_load: Option<usize> = None;
 
         for k in 0..n {
             let i = (start + k) % n;
-            let load = self.core_load_unlocked(i);
-            if load < best_load {
-                best_load = load;
+            let Some(load) = self.core_effective_load(i) else {
+                continue;
+            };
+
+            if best_load.map_or(true, |b| load < b) {
+                best_load = Some(load);
                 best = i;
-                if best_load == 0 {
+                if load == 0 {
                     break;
                 }
             }
@@ -242,21 +265,23 @@ impl Scheduler {
         best
     }
 
-    fn core_load_unlocked(&self, i: usize) -> usize {
-        let core = &self.cores[i];
-        if let Some(state) = core.sched_lock.try_lock() {
-            let rq_len = core.run_queue.len();
-            let running = match state.current.as_ref() {
-                Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
-                _ => 0,
-            };
-            rq_len + running
-        } else {
-            usize::MAX / 2
-        }
+    fn core_load_unlocked(&self, i: usize) -> Option<usize> {
+        let core = self.core(i)?;
+        let guard = match core.sched_lock.try_lock() {
+            Some(g) => g,
+            None => return None,
+        };
+
+        let rq_len = core.run_queue.len();
+        let running = match guard.current.as_ref() {
+            Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
+            _ => 0,
+        };
+
+        Some(rq_len + running)
     }
 
-    fn core_effective_load(&self, i: usize) -> usize {
+    fn core_effective_load(&self, i: usize) -> Option<usize> {
         self.core_load_unlocked(i)
     }
 
@@ -267,7 +292,7 @@ impl Scheduler {
 
     #[inline(always)]
     pub fn get_current_task(&self, cpu_id: usize) -> Option<TaskHandle> {
-        let core = &self.cores[cpu_id];
+        let core = self.core(cpu_id)?;
         let p = core.current_ptr.load(Ordering::Acquire);
         if p.is_null() {
             return None;
@@ -311,7 +336,7 @@ impl Scheduler {
 
                     let target = task.target_cpu();
                     let best_cpu = if target < n {
-                        let target_load = self.core_effective_load(target);
+                        let target_load = self.core_effective_load(target).unwrap_or(usize::MAX);
                         if target_load == 0 {
                             target
                         } else {
@@ -325,16 +350,17 @@ impl Scheduler {
                     self.enqueue_to_core(best_cpu, task.clone());
 
                     if best_cpu != current_cpu_id() {
-                        unsafe {
-                            APIC.lock().as_ref().map(|a| {
-                                // TODO: sending to all excluding kills multicore performance fix this at some point
-                                a.lapic.send_ipi(
-                                    IpiDest::AllExcludingSelf,
-                                    IpiKind::Fixed {
-                                        vector: SCHED_IPI_VECTOR,
-                                    },
-                                )
-                            });
+                        if let Some(best_core) = self.core(best_cpu) {
+                            unsafe {
+                                APIC.lock().as_ref().map(|a| {
+                                    a.lapic.send_ipi(
+                                        IpiDest::ApicId(best_core.lapic_id),
+                                        IpiKind::Fixed {
+                                            vector: SCHED_IPI_VECTOR,
+                                        },
+                                    )
+                                });
+                            }
                         }
                     }
                     return;
@@ -362,11 +388,19 @@ impl Scheduler {
 
         for k in 1..n {
             let i = (hint + k) % n;
-            let load = self.core_effective_load(i);
-            if load < best_load {
-                best_load = load;
+            let Some(load) = self.core_effective_load(i) else {
+                continue;
+            };
+
+            let take = match best_load {
+                Some(cur) => load < cur,
+                None => true,
+            };
+
+            if take {
+                best_load = Some(load);
                 best = i;
-                if best_load == 0 {
+                if load == 0 {
                     break;
                 }
             }
@@ -377,7 +411,9 @@ impl Scheduler {
 
     pub fn park_current(&self, reason: BlockReason) {
         let cpu_id = current_cpu_id() as usize;
-        let core = &self.cores[cpu_id];
+        let Some(core) = self.core(cpu_id) else {
+            return;
+        };
 
         let current = {
             let state = core.sched_lock.lock();
@@ -414,7 +450,9 @@ impl Scheduler {
 
     pub fn park_current_if(&self, reason: BlockReason, should_park: bool) {
         let cpu_id = current_cpu_id() as usize;
-        let core = &self.cores[cpu_id];
+        let Some(core) = self.core(cpu_id) else {
+            return;
+        };
 
         if !should_park {
             return;
@@ -458,6 +496,9 @@ impl Scheduler {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return;
         }
+        let Some(core) = self.core(cpu_id) else {
+            return;
+        };
 
         //self.maybe_balance();
 
@@ -466,7 +507,7 @@ impl Scheduler {
         // Save current task's context. If we can't acquire the write lock,
         // skip this tick entirely to avoid context corruption.
         {
-            let sched_state = self.cores[cpu_id].sched_lock.lock();
+            let sched_state = core.sched_lock.lock();
             if let Some(ref cur) = sched_state.current {
                 // TODO: maybe causes a lost waker, investigate
                 let Some(mut guard) = cur.inner.try_write() else {
@@ -477,7 +518,7 @@ impl Scheduler {
             }
         }
 
-        let next = match self.schedule_next(cpu_id, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(task) => task,
             None => return,
         };
@@ -495,8 +536,12 @@ impl Scheduler {
         unsafe { ctx_guard.context.restore(state) };
     }
 
-    fn schedule_next(&self, cpu_id: usize, now_cycles: u64) -> Option<TaskHandle> {
-        let core = &self.cores[cpu_id];
+    fn schedule_next(
+        &self,
+        cpu_id: usize,
+        core: &Arc<CoreScheduler>,
+        now_cycles: u64,
+    ) -> Option<TaskHandle> {
         let mut sched_state = core.sched_lock.lock();
 
         let previous = sched_state.current.take();
@@ -645,44 +690,57 @@ impl Scheduler {
             return;
         }
 
-        let mut loads: Vec<usize> = Vec::with_capacity(n);
+        let mut loads: Vec<Option<usize>> = Vec::with_capacity(n);
         for i in 0..n {
             loads.push(self.core_load_unlocked(i));
         }
 
         loop {
-            let (mut min_idx, mut min_load) = (0, loads[0]);
-            let (mut max_idx, mut max_load) = (0, loads[0]);
+            let mut min_idx: Option<usize> = None;
+            let mut max_idx: Option<usize> = None;
+            let mut min_load: usize = 0;
+            let mut max_load: usize = 0;
 
-            for i in 1..n {
-                if loads[i] < min_load {
-                    min_load = loads[i];
-                    min_idx = i;
+            for i in 0..n {
+                let Some(load) = loads[i] else { continue };
+
+                if min_idx.is_none() || load < min_load {
+                    min_idx = Some(i);
+                    min_load = load;
                 }
-                if loads[i] > max_load {
-                    max_load = loads[i];
-                    max_idx = i;
+                if max_idx.is_none() || load > max_load {
+                    max_idx = Some(i);
+                    max_load = load;
                 }
             }
+
+            let (min_idx, max_idx) = match (min_idx, max_idx) {
+                (Some(a), Some(b)) => (a, b),
+                _ => break,
+            };
 
             if max_load <= min_load + 1 {
                 break;
             }
 
-            let task = { self.cores[max_idx].run_queue.pop() };
+            let Some(max_core) = self.core(max_idx) else {
+                break;
+            };
+            let task = { max_core.run_queue.pop() };
 
             let Some(task) = task else {
-                loads[max_idx] = 0;
+                loads[max_idx] = Some(0);
                 continue;
             };
 
             task.set_target_cpu(min_idx);
-            {
-                Self::push_runqueue_or_panic(min_idx, &self.cores[min_idx].run_queue, task);
-            }
+            let Some(min_core) = self.core(min_idx) else {
+                break;
+            };
+            Self::push_runqueue_or_panic(min_idx, &min_core.run_queue, task);
 
-            loads[max_idx] = loads[max_idx].saturating_sub(1);
-            loads[min_idx] += 1;
+            loads[max_idx] = loads[max_idx].map(|v| v.saturating_sub(1)).or(Some(0));
+            loads[min_idx] = loads[min_idx].map(|v| v + 1).or(Some(1));
         }
     }
 
@@ -725,7 +783,9 @@ impl Scheduler {
             return;
         }
 
-        let core = &self.cores[cpu_id];
+        let Some(core) = self.core(cpu_id) else {
+            return;
+        };
 
         // Only use IPI as an "exit idle / recheck runq" poke.
         let is_idle = {
@@ -743,7 +803,7 @@ impl Scheduler {
 
         let now_cycles = cpu::get_cycles();
 
-        let next = match self.schedule_next(cpu_id, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(t) => t,
             None => {
                 send_eoi(SCHED_IPI_VECTOR);

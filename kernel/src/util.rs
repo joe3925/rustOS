@@ -127,9 +127,7 @@ pub unsafe fn init() {
     // BSP APIC calibration (moved here so current_cpu_id() works)
     apic_calibrate_ticks_per_ns_via_wait(10);
     apic_program_period_ns(APIC_START_PERIOD);
-    let task = Task::new_kernel_mode(kernel_main, 0, StackSize::Tiny, "kernel".into(), 0);
-
-    SCHEDULER.init(NUM_CORES.load(Ordering::Acquire));
+    SCHEDULER.init_core(current_cpu_id());
     SCHEDULER.add_task(Task::new_kernel_mode(
         kernel_main,
         0,
