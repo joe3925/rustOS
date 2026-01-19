@@ -3,6 +3,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
+use crate::scheduling::runtime;
 use crate::scheduling::runtime::runtime::{yield_now, BLOCKING_POOL, RUNTIME_POOL};
 use crate::scheduling::scheduler::{self, kernel_task_end, Scheduler, SCHEDULER};
 use crate::scheduling::state::{BlockReason, SchedState, State};

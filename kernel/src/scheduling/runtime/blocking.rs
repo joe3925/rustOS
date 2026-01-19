@@ -1,11 +1,13 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
-use crate::scheduling::runtime::runtime::submit_blocking;
+use crate::scheduling::runtime::runtime::{submit_blocking, submit_blocking_many};
+use crate::structs::thread_pool::Job;
 
 pub struct BlockingInner<R> {
     result: Mutex<Option<R>>,
@@ -100,4 +102,38 @@ where
 
     submit_blocking(blocking_trampoline::<F, R>, ptr);
     BlockingJoin::new(inner)
+}
+
+/// Spawns multiple blocking tasks in a batch, reducing lock contention on the thread pool.
+/// Returns a Vec of BlockingJoin handles that can be awaited.
+pub fn spawn_blocking_many<F, R>(funcs: Vec<F>) -> Vec<BlockingJoin<R>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let count = funcs.len();
+    if count == 0 {
+        return Vec::new();
+    }
+
+    let mut joins = Vec::with_capacity(count);
+    let mut jobs = Vec::with_capacity(count);
+
+    for func in funcs {
+        let inner = Arc::new(BlockingInner::new());
+        let task = BlockingTask {
+            func: Some(func),
+            inner: inner.clone(),
+        };
+        let ptr = Box::into_raw(Box::new(task)) as usize;
+
+        jobs.push(Job {
+            f: blocking_trampoline::<F, R>,
+            a: ptr,
+        });
+        joins.push(BlockingJoin::new(inner));
+    }
+
+    submit_blocking_many(&jobs);
+    joins
 }

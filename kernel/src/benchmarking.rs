@@ -7,7 +7,7 @@ use crate::memory::{
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
 use crate::scheduling::runtime::runtime::{
-    block_on, spawn, spawn_blocking, spawn_detached, JoinAll,
+    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
@@ -1686,23 +1686,24 @@ async fn blocking_chain(x: u64) -> u64 {
 
 #[inline(never)]
 async fn blocking_queue_stress(seed: u64) -> u64 {
-    let mut joins = Vec::with_capacity(50_000);
-
-    let mut i = 0usize;
-    while i < BLOCK_TASKS {
+    // Build all closures first
+    let mut funcs = Vec::with_capacity(BLOCK_TASKS);
+    for i in 0..BLOCK_TASKS {
         let x = seed.wrapping_add(i as u64);
-        joins.push(spawn_blocking(move || {
+        funcs.push(move || {
             let ret = sync_chain(x);
-            if (ret % 10_000 == 0) {
+            if ret % 10_000 == 0 {
                 println!("blocking done num: {}", ret);
             }
             ret
-        }));
-        i += 1;
+        });
     }
 
-    let results = JoinAll::new(joins).await;
-    i.try_into().unwrap()
+    // Submit all at once using batch submission
+    let joins = spawn_blocking_many(funcs);
+
+    let _results = JoinAll::new(joins).await;
+    BLOCK_TASKS.try_into().unwrap()
 }
 
 #[inline(always)]
@@ -1777,7 +1778,7 @@ async fn bench_async_vs_sync_call_latency_async() {
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
-    for index in 1..2 {
+    for index in 1..ITERS as u64 {
         q = 0;
         q = blocking_queue_stress(q).await;
         println!("blocking num: {}", index * q);

@@ -6,7 +6,7 @@ use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
-use crate::scheduling::runtime::runtime::yield_now;
+use crate::scheduling::runtime::runtime::{yield_now, RUNTIME_POOL};
 use crate::scheduling::scheduler;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
@@ -517,7 +517,8 @@ impl Scheduler {
                 guard.update_from_context(state);
             }
         }
-
+        let runtime = RUNTIME_POOL.clone();
+        let test = runtime.is_shutdown();
         let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(task) => task,
             None => return,

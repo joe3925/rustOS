@@ -6,7 +6,7 @@ use core::pin::Pin;
 use core::task::{Context, Poll};
 
 pub use super::block_on::block_on;
-pub use super::blocking::{spawn_blocking, BlockingJoin};
+pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
 use crate::static_handlers::task_yield;
 use crate::structs::thread_pool::Job;
