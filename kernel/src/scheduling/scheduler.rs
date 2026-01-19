@@ -17,24 +17,22 @@ pub use crate::scheduling::task::TaskHandle;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crossbeam_queue::ArrayQueue;
-use x86_64::instructions::interrupts::without_interrupts;
-
 use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-
+use crossbeam_queue::ArrayQueue;
 use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::control::Cr3;
 
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
+const IPIQ_CAP: usize = 64;
 
-// hard cap: id is used as index. slot 0 is reserved as "none".
 const MAX_TASKS: usize = 65_536;
 
 #[derive(Debug)]
@@ -103,10 +101,10 @@ impl TaskTable {
     }
 }
 
-/// Per-core scheduler state
 pub struct CoreScheduler {
     sched_lock: IrqSafeMutex<SchedulerState>,
     run_queue: ArrayQueue<TaskHandle>,
+    ipi_queue: ArrayQueue<TaskHandle>,
     idle_task: TaskHandle,
     current_ptr: AtomicPtr<TaskRef>,
     lapic_id: u8,
@@ -165,6 +163,7 @@ impl Scheduler {
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeMutex::new(SchedulerState { current: None }),
             run_queue: ArrayQueue::new(RUNQ_CAP),
+            ipi_queue: ArrayQueue::new(IPIQ_CAP),
             idle_task: idle,
             current_ptr: AtomicPtr::new(idle_ptr),
             lapic_id,
@@ -175,7 +174,6 @@ impl Scheduler {
         let mut cores = self.cores.write();
 
         if cpu_id < cores.len() {
-            // Already initialized
             return;
         }
 
@@ -234,10 +232,18 @@ impl Scheduler {
         Self::push_runqueue_or_panic(cpu, &core.run_queue, task);
     }
 
+    fn enqueue_to_core_ipi(&self, cpu: usize, task: TaskHandle) {
+        let Some(core) = self.core(cpu) else {
+            panic!("enqueue_to_core_ipi: cpu {} not initialized", cpu);
+        };
+        if let Some(_) = core.ipi_queue.push(task).err() {
+            panic!("ipi queue overflow on cpu {cpu}");
+        }
+    }
+
     #[inline(always)]
     fn push_runqueue_or_panic(cpu: usize, queue: &ArrayQueue<TaskHandle>, task: TaskHandle) {
-        //queue.force_push(task);
-        if let Some(err) = queue.push(task).err() {
+        if let Some(_) = queue.push(task).err() {
             panic!("run queue overflow on cpu {cpu}");
         }
     }
@@ -273,12 +279,13 @@ impl Scheduler {
         };
 
         let rq_len = core.run_queue.len();
+        let ipi_len = core.ipi_queue.len();
         let running = match guard.current.as_ref() {
             Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
             _ => 0,
         };
 
-        Some(rq_len + running)
+        Some(rq_len + ipi_len + running)
     }
 
     fn core_effective_load(&self, i: usize) -> Option<usize> {
@@ -347,9 +354,10 @@ impl Scheduler {
                     };
 
                     task.set_target_cpu(best_cpu);
-                    self.enqueue_to_core(best_cpu, task.clone());
 
                     if best_cpu != current_cpu_id() {
+                        self.enqueue_to_core_ipi(best_cpu, task.clone());
+
                         if let Some(best_core) = self.core(best_cpu) {
                             unsafe {
                                 APIC.lock().as_ref().map(|a| {
@@ -362,7 +370,10 @@ impl Scheduler {
                                 });
                             }
                         }
+                    } else {
+                        self.enqueue_to_core(best_cpu, task.clone());
                     }
+
                     return;
                 }
 
@@ -443,9 +454,6 @@ impl Scheduler {
         }
 
         yield_now();
-        // unsafe {
-        //     hlt();
-        // };
     }
 
     pub fn park_current_if(&self, reason: BlockReason, should_park: bool) {
@@ -484,13 +492,10 @@ impl Scheduler {
             current.set_block_reason(reason);
             current.set_sched_state(SchedState::Parking);
         }
-        // unsafe {
-        //     hlt();
-        // };
+
         yield_now();
     }
-    // TODO: there is a bug somewhere in somewhere on "on_timer_tick" that is causing garbage to be left on the sack
-    // not high prio but will be an issue if decided the timer and yield shouldn't be on there own IST or if yield shouldn't be on int 0x80
+
     #[inline(always)]
     pub fn on_timer_tick(&self, state: *mut State, cpu_id: usize) {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
@@ -500,25 +505,21 @@ impl Scheduler {
             return;
         };
 
-        //self.maybe_balance();
-
         let now_cycles = cpu::get_cycles();
 
-        // Save current task's context. If we can't acquire the write lock,
-        // skip this tick entirely to avoid context corruption.
         {
             let sched_state = core.sched_lock.lock();
             if let Some(ref cur) = sched_state.current {
-                // TODO: maybe causes a lost waker, investigate
                 let Some(mut guard) = cur.inner.try_write() else {
-                    // Can't save context - don't switch, try again next tick
                     return;
                 };
                 guard.update_from_context(state);
             }
         }
+
         let runtime = RUNTIME_POOL.clone();
-        let test = runtime.is_shutdown();
+        let _ = runtime.is_shutdown();
+
         let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(task) => task,
             None => return,
@@ -526,13 +527,6 @@ impl Scheduler {
 
         self.restore_page_table(&next);
 
-        // PER_CORE_SWITCHES
-        //     .get(cpu_id)
-        //     .unwrap()
-        //     .fetch_add(1, Ordering::Relaxed);
-
-        // Hold the guard while we restore context to avoid racing with another
-        // CPU modifying the task's saved state.
         let ctx_guard = next.inner.read();
         unsafe { ctx_guard.context.restore(state) };
     }
@@ -553,9 +547,7 @@ impl Scheduler {
                     t.account_switched_out(now_cycles);
                 }
 
-                let prev_sched_state = prev.sched_state();
-
-                match prev_sched_state {
+                match prev.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
                         prev.set_sched_state(SchedState::Runnable);
                         Self::push_runqueue_or_panic(cpu_id, &core.run_queue, prev.clone());
@@ -565,23 +557,21 @@ impl Scheduler {
                             prev.set_sched_state(SchedState::Runnable);
                             prev.set_block_reason(BlockReason::None);
                             Self::push_runqueue_or_panic(cpu_id, &core.run_queue, prev.clone());
-                        } else {
-                            if prev
-                                .cas_sched_state(SchedState::Parking, SchedState::Blocked)
-                                .is_ok()
-                            {
-                                if prev.consume_permit() {
-                                    if prev
-                                        .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                                        .is_ok()
-                                    {
-                                        prev.set_block_reason(BlockReason::None);
-                                        Self::push_runqueue_or_panic(
-                                            cpu_id,
-                                            &core.run_queue,
-                                            prev.clone(),
-                                        );
-                                    }
+                        } else if prev
+                            .cas_sched_state(SchedState::Parking, SchedState::Blocked)
+                            .is_ok()
+                        {
+                            if prev.consume_permit() {
+                                if prev
+                                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
+                                    .is_ok()
+                                {
+                                    prev.set_block_reason(BlockReason::None);
+                                    Self::push_runqueue_or_panic(
+                                        cpu_id,
+                                        &core.run_queue,
+                                        prev.clone(),
+                                    );
                                 }
                             }
                         }
@@ -597,9 +587,7 @@ impl Scheduler {
                 break;
             };
 
-            let cand_state = cand.sched_state();
-
-            match cand_state {
+            match cand.sched_state() {
                 SchedState::Terminated => continue,
                 SchedState::Parking => continue,
                 SchedState::Blocked => continue,
@@ -618,29 +606,6 @@ impl Scheduler {
             }
         }
 
-        // TODO: Temp fix for lost wakeups - scan for stranded tasks when going idle.
-        // This should be removed once the root cause of lost wakeups is fixed.
-        // drop(sched_state);
-        // self.rescue_stranded_tasks(cpu_id);
-        // let mut sched_state = core.sched_lock.lock();
-
-        // // Check again after rescue - a task may have been enqueued
-        // if let Some(cand) = core.run_queue.pop() {
-        //     if matches!(
-        //         cand.sched_state(),
-        //         SchedState::Runnable | SchedState::Running
-        //     ) {
-        //         cand.set_sched_state(SchedState::Running);
-        //         if let Some(t) = cand.inner.try_read() {
-        //             t.mark_scheduled_in(cpu_id, now_cycles);
-        //         }
-        //         sched_state.current = Some(cand.clone());
-        //         core.current_ptr
-        //             .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);
-        //         return Some(cand);
-        //     }
-        // }
-
         core.idle_task.set_sched_state(SchedState::Running);
         if let Some(t) = core.idle_task.inner.try_read() {
             t.mark_scheduled_in(cpu_id, now_cycles);
@@ -653,6 +618,7 @@ impl Scheduler {
         );
         Some(core.idle_task.clone())
     }
+
     #[inline(always)]
     pub fn restore_page_table(&self, task_handle: &TaskHandle) {
         if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
@@ -727,7 +693,11 @@ impl Scheduler {
             let Some(max_core) = self.core(max_idx) else {
                 break;
             };
-            let task = { max_core.run_queue.pop() };
+
+            let task = match max_core.run_queue.pop() {
+                Some(t) => Some(t),
+                None => max_core.ipi_queue.pop(),
+            };
 
             let Some(task) = task else {
                 loads[max_idx] = Some(0);
@@ -762,7 +732,6 @@ impl Scheduler {
                 continue;
             };
 
-            // Only rescue tasks that are assigned to this core
             if task.target_cpu() != caller_cpu {
                 continue;
             }
@@ -778,6 +747,7 @@ impl Scheduler {
             }
         }
     }
+
     #[inline(always)]
     pub fn on_ipi(&self, state: *mut State, cpu_id: usize) {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
@@ -788,7 +758,6 @@ impl Scheduler {
             return;
         };
 
-        // Only use IPI as an "exit idle / recheck runq" poke.
         let is_idle = {
             let sched_state = core.sched_lock.lock();
             match sched_state.current.as_ref() {
@@ -804,28 +773,57 @@ impl Scheduler {
 
         let now_cycles = cpu::get_cycles();
 
-        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
-            Some(t) => t,
-            None => {
-                send_eoi(SCHED_IPI_VECTOR);
-                return;
+        let mut ipi_cand: Option<TaskHandle> = None;
+        loop {
+            let Some(cand) = core.ipi_queue.pop() else {
+                break;
+            };
+
+            match cand.sched_state() {
+                SchedState::Terminated => continue,
+                SchedState::Parking => continue,
+                SchedState::Blocked => continue,
+                SchedState::Runnable | SchedState::Running => {
+                    ipi_cand = Some(cand);
+                    break;
+                }
+            }
+        }
+
+        let next = if let Some(cand) = ipi_cand {
+            cand.set_sched_state(SchedState::Running);
+
+            if let Some(t) = cand.inner.try_read() {
+                t.mark_scheduled_in(cpu_id, now_cycles);
+            }
+
+            {
+                let mut sched_state = core.sched_lock.lock();
+                sched_state.current = Some(cand.clone());
+                core.current_ptr
+                    .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);
+            }
+
+            cand
+        } else {
+            match self.schedule_next(cpu_id, &core, now_cycles) {
+                Some(t) => t,
+                None => {
+                    send_eoi(SCHED_IPI_VECTOR);
+                    return;
+                }
             }
         };
 
         self.restore_page_table(&next);
 
-        // PER_CORE_SWITCHES
-        //     .get(cpu_id)
-        //     .unwrap()
-        //     .fetch_add(1, Ordering::Relaxed);
-
-        // Must EOI before iretq returns into the (possibly different) task context.
         send_eoi(SCHED_IPI_VECTOR);
 
         let ctx_guard = next.inner.read();
         unsafe { ctx_guard.context.restore(state) };
     }
 }
+
 #[no_mangle]
 pub extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
@@ -843,10 +841,12 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
     let cpu_id = current_cpu_id() as usize;
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
+
 #[no_mangle]
 pub extern "C" fn ipi_eoi_only() {
     crate::drivers::interrupt_index::send_eoi(SCHED_IPI_VECTOR);
 }
+
 #[unsafe(naked)]
 #[no_mangle]
 pub extern "win64" fn ipi_entry() {
@@ -878,7 +878,7 @@ pub extern "win64" fn ipi_entry() {
         "pop  r9","pop  r10","pop  r11","pop  r12",
         "pop  r13","pop  r14","pop  r15",
         "iretq",
-
+        // TODO: Read the ABI for the caller saved registers
         "9:",
         "pop  rax",
         "push r15","push r14","push r13","push r12",
@@ -900,6 +900,7 @@ pub extern "win64" fn ipi_entry() {
         eoi_only = sym ipi_eoi_only,
     );
 }
+
 #[unsafe(naked)]
 pub extern "win64" fn yield_interrupt_entry() {
     naked_asm!(

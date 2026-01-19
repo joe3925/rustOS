@@ -1616,8 +1616,7 @@ pub fn used_memory() -> usize {
 const DEPTH: usize = 100;
 const ITERS: usize = 50_000;
 
-// Queue pressure test: number of blocking tasks submitted at once.
-const BLOCK_TASKS: usize = 50_000;
+const BLOCK_TASKS: usize = 50000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -1675,9 +1674,8 @@ async fn async_chain(mut x: u64) -> u64 {
 async fn blocking_chain(x: u64) -> u64 {
     spawn_blocking(move || {
         let ret = sync_chain(x);
-        if (ret % 10_000 == 0) {
-            // Why is this off by x100?????
-            println!("blocking done num: {}", ret / 100);
+        if ret % 10_000 == 0 {
+            println!("blocking done num: {}", ret);
         }
         ret
     })
@@ -1686,7 +1684,6 @@ async fn blocking_chain(x: u64) -> u64 {
 
 #[inline(never)]
 async fn blocking_queue_stress(seed: u64) -> u64 {
-    // Build all closures first
     let mut funcs = Vec::with_capacity(BLOCK_TASKS);
     for i in 0..BLOCK_TASKS {
         let x = seed.wrapping_add(i as u64);
@@ -1699,11 +1696,9 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
         });
     }
 
-    // Submit all at once using batch submission
     let joins = spawn_blocking_many(funcs);
-
     let _results = JoinAll::new(joins).await;
-    BLOCK_TASKS.try_into().unwrap()
+    BLOCK_TASKS as u64
 }
 
 #[inline(always)]
@@ -1718,7 +1713,15 @@ fn div_u64_round(n: u64, d: u64) -> u64 {
     if d == 0 {
         return 0;
     }
-    n / d
+    (n + (d / 2)) / d
+}
+
+#[inline(always)]
+fn div_u128_round(n: u128, d: u128) -> u128 {
+    if d == 0 {
+        return 0;
+    }
+    (n + (d / 2)) / d
 }
 
 #[inline(always)]
@@ -1727,27 +1730,35 @@ fn sub_i64(a: u64, b: u64) -> i64 {
 }
 
 #[inline(always)]
-fn pct_1e3(part: i64, whole: u64) -> i64 {
+fn ratio_1e3(num: u64, den: u64) -> u64 {
+    if den == 0 {
+        return 0;
+    }
+    div_u128_round((num as u128) * 1000u128, den as u128) as u64
+}
+
+#[inline(always)]
+fn frac_1e3(part: i64, whole: u64) -> i64 {
     if whole == 0 {
         return 0;
     }
-    (part * 1000) / (whole as i64)
+    ((part as i128) * 1000i128 / (whole as i128)) as i64
 }
 
 async fn bench_async_vs_sync_call_latency_async() {
     let mut warm = 0u64;
-    for _ in 0..10000 {
+    for _ in 0..10_000 {
         warm = sync_chain(warm);
     }
 
     let mut warm_async = 0u64;
-    for _ in 0..10000 {
+    for _ in 0..10_000 {
         warm_async = async_chain(warm_async).await;
     }
     black_box(warm_async);
 
     let mut warm_blk = 0u64;
-    for _ in 0..2000 {
+    for _ in 0..2_000 {
         warm_blk = blocking_chain(warm_blk).await;
     }
     black_box(warm_blk);
@@ -1778,7 +1789,7 @@ async fn bench_async_vs_sync_call_latency_async() {
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
-    for index in 1..ITERS as u64 {
+    for index in 1..2u64 {
         q = 0;
         q = blocking_queue_stress(q).await;
         println!("blocking num: {}", index * q);
@@ -1787,14 +1798,16 @@ async fn bench_async_vs_sync_call_latency_async() {
     black_box(q);
 
     let iters_u64 = ITERS as u64;
-    let inner_calls_u64 = (ITERS * DEPTH) as u64;
+    let inner_calls_u64 = (ITERS as u64) * (DEPTH as u64);
 
     let sync_us_per_chain = div_u64_round(sync_us, iters_u64);
     let async_us_per_chain = div_u64_round(async_us, iters_u64);
     let blk_us_per_chain = div_u64_round(blk_us, iters_u64);
 
-    let sync_us_per_inner = div_u64_round(sync_us, inner_calls_u64);
-    let async_us_per_inner = div_u64_round(async_us, inner_calls_u64);
+    let sync_ns_per_inner =
+        div_u128_round((sync_us as u128) * 1000u128, inner_calls_u64 as u128) as u64;
+    let async_ns_per_inner =
+        div_u128_round((async_us as u128) * 1000u128, inner_calls_u64 as u128) as u64;
 
     let (sync_ms, sync_ms_frac) = ms_fixed_3(sync_us);
     let (async_ms, async_ms_frac) = ms_fixed_3(async_us);
@@ -1805,12 +1818,12 @@ async fn bench_async_vs_sync_call_latency_async() {
 
     println!("[bench] iters={} depth={}", ITERS, DEPTH);
     println!(
-        "[bench] sync:  total={} .{:03} ms  us/chain={}  us/inner_call={}",
-        sync_ms, sync_ms_frac, sync_us_per_chain, sync_us_per_inner
+        "[bench] sync:  total={} .{:03} ms  us/chain={}  ns/inner_call={}",
+        sync_ms, sync_ms_frac, sync_us_per_chain, sync_ns_per_inner
     );
     println!(
-        "[bench] async: total={} .{:03} ms  us/chain={}  us/inner_call={}",
-        async_ms, async_ms_frac, async_us_per_chain, async_us_per_inner
+        "[bench] async: total={} .{:03} ms  us/chain={}  ns/inner_call={}",
+        async_ms, async_ms_frac, async_us_per_chain, async_ns_per_inner
     );
     println!(
         "[bench] blk:   total={} .{:03} ms  us/chain={}",
@@ -1821,24 +1834,35 @@ async fn bench_async_vs_sync_call_latency_async() {
         BLOCK_TASKS, q_ms, q_ms_frac, q_us_per_task
     );
 
+    // True multipliers
+    let async_vs_sync_1e3 = ratio_1e3(async_us_per_chain, sync_us_per_chain);
+    let blk_vs_async_1e3 = ratio_1e3(blk_us_per_chain, async_us_per_chain);
+
+    // Overhead deltas (not multipliers)
     let sm_over_us_per_chain = sub_i64(async_us_per_chain, sync_us_per_chain);
-    let sm_over_us_per_inner = sub_i64(async_us_per_inner, sync_us_per_inner);
     let pending_over_us_per_chain = sub_i64(blk_us_per_chain, async_us_per_chain);
 
-    let sm_over_pct_1e3 = pct_1e3(sm_over_us_per_chain, sync_us_per_chain);
-    let pending_over_pct_1e3 = pct_1e3(pending_over_us_per_chain, async_us_per_chain);
+    let sm_over_frac_1e3 = frac_1e3(sm_over_us_per_chain, sync_us_per_chain);
+    let pending_over_frac_1e3 = frac_1e3(pending_over_us_per_chain, async_us_per_chain);
 
     println!(
-        "[bench] overhead: state_machine: {} us/chain ({}.{:03}x sync)  {} us/inner_call",
+        "[bench] x: async/sync = {}.{:03}x   blk/async = {}.{:03}x",
+        async_vs_sync_1e3 / 1000,
+        async_vs_sync_1e3 % 1000,
+        blk_vs_async_1e3 / 1000,
+        blk_vs_async_1e3 % 1000
+    );
+
+    println!(
+        "[bench] overhead: state_machine: {} us/chain (delta={} .{:03}x of sync)",
         sm_over_us_per_chain,
-        sm_over_pct_1e3 / 1000,
-        (sm_over_pct_1e3 % 1000).abs(),
-        sm_over_us_per_inner
+        sm_over_frac_1e3 / 1000,
+        (sm_over_frac_1e3 % 1000).abs()
     );
     println!(
-        "[bench] overhead: pending+wake:  {} us/chain ({}.{:03}x async_ready)",
+        "[bench] overhead: pending+wake:  {} us/chain (delta={} .{:03}x of async)",
         pending_over_us_per_chain,
-        pending_over_pct_1e3 / 1000,
-        (pending_over_pct_1e3 % 1000).abs()
+        pending_over_frac_1e3 / 1000,
+        (pending_over_frac_1e3 % 1000).abs()
     );
 }
