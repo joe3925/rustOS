@@ -23,11 +23,128 @@ const NUM_SHARDS: usize = 8;
 const DEFAULT_SLOTS_PER_SHARD: usize = 128;
 const MAX_SLOTS_PER_SHARD: usize = 4096;
 
+/// Maximum size (in bytes) for inline future storage. Futures larger than this
+/// will be heap-allocated. Default: 128 bytes covers most simple async state machines.
+pub const INLINE_FUTURE_SIZE: usize = 128;
+
+/// Required alignment for inline future storage.
+pub const INLINE_FUTURE_ALIGN: usize = 8;
+
 const SLOT_FREE: u8 = 0;
 const SLOT_ALLOCATED: u8 = 1;
 
 static TASK_SLAB_PTR: Once<&'static TaskSlab> = Once::new();
 static mut TASK_SLAB_STORAGE: MaybeUninit<TaskSlab> = MaybeUninit::uninit();
+
+/// Properly aligned buffer for inline future storage.
+#[repr(C, align(8))]
+struct InlineFutureBuffer {
+    data: [u8; INLINE_FUTURE_SIZE],
+}
+
+impl InlineFutureBuffer {
+    const fn new() -> Self {
+        Self {
+            data: [0u8; INLINE_FUTURE_SIZE],
+        }
+    }
+
+    #[inline]
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_mut_ptr()
+    }
+}
+
+/// Storage for a future - either inline (SBO) or heap-allocated.
+enum FutureStorage {
+    /// Heap-allocated future (for large futures)
+    Boxed(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
+    /// Inline storage with manual vtable for small futures
+    Inline {
+        /// Aligned storage buffer
+        storage: InlineFutureBuffer,
+        /// Function pointer to poll the future
+        poll_fn: unsafe fn(*mut u8, &mut Context<'_>) -> Poll<()>,
+        /// Function pointer to drop the future
+        drop_fn: unsafe fn(*mut u8),
+    },
+}
+
+/// Type-erased poll function for inline futures
+unsafe fn poll_inline<F>(ptr: *mut u8, cx: &mut Context<'_>) -> Poll<()>
+where
+    F: Future<Output = ()>,
+{
+    let future = &mut *(ptr as *mut F);
+    // Safety: The future is pinned within the TaskSlot which doesn't move
+    Pin::new_unchecked(future).poll(cx)
+}
+
+/// Type-erased drop function for inline futures
+unsafe fn drop_inline<F>(ptr: *mut u8) {
+    core::ptr::drop_in_place(ptr as *mut F);
+}
+
+impl FutureStorage {
+    /// Create storage for a future, using inline if it fits
+    fn new<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if core::mem::size_of::<F>() <= INLINE_FUTURE_SIZE
+            && core::mem::align_of::<F>() <= INLINE_FUTURE_ALIGN
+        {
+            Self::new_inline(future)
+        } else {
+            Self::Boxed(Box::pin(future))
+        }
+    }
+
+    fn new_inline<F>(future: F) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut storage = InlineFutureBuffer::new();
+
+        // Safety: We've verified size and alignment requirements in the caller
+        unsafe {
+            let ptr = storage.as_mut_ptr() as *mut F;
+            core::ptr::write(ptr, future);
+        }
+
+        Self::Inline {
+            storage,
+            poll_fn: poll_inline::<F>,
+            drop_fn: drop_inline::<F>,
+        }
+    }
+
+    /// Poll the stored future
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        match self {
+            FutureStorage::Boxed(fut) => fut.as_mut().poll(cx),
+            FutureStorage::Inline {
+                storage, poll_fn, ..
+            } => {
+                // Safety: storage contains a valid F, properly aligned
+                unsafe { poll_fn(storage.as_mut_ptr(), cx) }
+            }
+        }
+    }
+}
+
+impl Drop for FutureStorage {
+    fn drop(&mut self) {
+        if let FutureStorage::Inline {
+            storage, drop_fn, ..
+        } = self
+        {
+            // Safety: storage contains a valid future that needs dropping
+            unsafe { drop_fn(storage.as_mut_ptr()) }
+        }
+        // Boxed variant drops automatically
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct SlabConfig {
@@ -92,7 +209,7 @@ pub struct TaskSlot {
     queued: AtomicBool,
     completed: AtomicBool,
     _pad: [u8; 6],
-    future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    future: Mutex<Option<FutureStorage>>,
 }
 
 impl TaskSlot {
@@ -109,7 +226,7 @@ impl TaskSlot {
 
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
         let mut guard = self.future.lock();
-        *guard = Some(Box::pin(future));
+        *guard = Some(FutureStorage::new(future));
         self.queued.store(false, Ordering::Release);
         self.completed.store(false, Ordering::Release);
     }
@@ -129,7 +246,7 @@ impl TaskSlot {
                 self.completed.store(true, Ordering::Release);
                 return true;
             };
-            fut.as_mut().poll(&mut cx)
+            fut.poll(&mut cx)
         };
 
         if let Poll::Ready(()) = poll_res {
