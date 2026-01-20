@@ -13,31 +13,31 @@
                 "gdb-remote localhost:1234",
                 "target modules load --file kernel.efi .text 0xFFFF850000000000",
                 // acpi.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\acpi.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\acpi.dll\"",
                 "target modules load --file \"acpi.dll\" .text 0xffff900009c13000",
                 // pci.dll 
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\pci.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\pci.dll\"",
                 "target modules load --file \"pci.dll\" .text 0xffff90000aa25000",
                 // i8042.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\i8042.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\i8042.dll\"",
                 "target modules load --file \"i8042.dll\" .text 0xffff90000a9ec000",
                 // ide.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\ide.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\ide.dll\"",
                 "target modules load --file \"ide.dll\" .text 0xffff90000aa73000",
                 // disk.dll 
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\disk.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\disk.dll\"",
                 "target modules load --file \"disk.dll\" .text 0xffff90000aad1000",
                 // partmgr.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\partmgr.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\partmgr.dll\"",
                 "target modules load --file \"partmgr.dll\" .text 0xffff90000ab37000",
                 // volmgr.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\volmgr.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\volmgr.dll\"",
                 "target modules load --file \"volmgr.dll\" .text 0xffff90000ab86000",
                 // mountmgr.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\mountmgr.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\mountmgr.dll\"",
                 "target modules load --file \"mountmgr.dll\" .text 0xffff90000abd1000",
                 // fat32.dll
-                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-pe\\debug\\fat32.dll\"",
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\fat32.dll\"",
                 "target modules load --file \"fat32.dll\" .text 0xffff90000ac7b000"
             ],
             "sourceLanguages": [

@@ -58,6 +58,7 @@
         "clbu",
         "Cmci",
         "cmdheader",
+        "condvar",
         "cpus",
         "ctba",
         "CTBAU",
