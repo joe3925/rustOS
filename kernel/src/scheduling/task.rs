@@ -122,18 +122,6 @@ impl TaskRef {
         self.set_sched_state(SchedState::Terminated);
     }
 
-    /// Get the block reason
-    #[inline(always)]
-    pub fn block_reason(&self) -> BlockReason {
-        BlockReason::from_u32(self.block_reason.load(Ordering::Relaxed))
-    }
-
-    /// Set the block reason
-    #[inline(always)]
-    pub fn set_block_reason(&self, reason: BlockReason) {
-        self.block_reason.store(reason as u32, Ordering::Relaxed);
-    }
-
     /// Deliver a wake permit (called by unpark)
     /// Returns the previous permit value
     #[inline(always)]

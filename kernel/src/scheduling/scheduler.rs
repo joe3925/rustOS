@@ -339,19 +339,20 @@ impl Scheduler {
                         continue;
                     }
 
-                    task.set_block_reason(BlockReason::None);
+                    //task.set_block_reason(BlockReason::None);
 
                     let target = task.target_cpu();
-                    let best_cpu = if target < n {
-                        let target_load = self.core_effective_load(target).unwrap_or(usize::MAX);
-                        if target_load == 0 {
-                            target
-                        } else {
-                            self.find_least_loaded_cpu(n, target)
-                        }
-                    } else {
-                        self.find_least_loaded_cpu(n, 0)
-                    };
+                    let best_cpu = target;
+                    // let best_cpu = if target < n {
+                    //     let target_load = self.core_effective_load(target).unwrap_or(usize::MAX);
+                    //     if target_load == 0 {
+                    //         target
+                    //     } else {
+                    //         self.find_least_loaded_cpu(n, target)
+                    //     }
+                    // } else {
+                    //     self.find_least_loaded_cpu(n, 0)
+                    // };
 
                     task.set_target_cpu(best_cpu);
 
@@ -449,7 +450,7 @@ impl Scheduler {
                 return;
             }
 
-            current.set_block_reason(reason);
+            //current.set_block_reason(reason);
             current.set_sched_state(SchedState::Parking);
         }
 
@@ -489,7 +490,7 @@ impl Scheduler {
                 return;
             }
 
-            current.set_block_reason(reason);
+            //current.set_block_reason(reason);
             current.set_sched_state(SchedState::Parking);
         }
 
@@ -555,7 +556,7 @@ impl Scheduler {
                     SchedState::Parking => {
                         if prev.consume_permit() {
                             prev.set_sched_state(SchedState::Runnable);
-                            prev.set_block_reason(BlockReason::None);
+                            //prev.set_block_reason(BlockReason::None);
                             Self::push_runqueue_or_panic(cpu_id, &core.run_queue, prev.clone());
                         } else if prev
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
@@ -566,7 +567,7 @@ impl Scheduler {
                                     .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
                                     .is_ok()
                                 {
-                                    prev.set_block_reason(BlockReason::None);
+                                    //prev.set_block_reason(BlockReason::None);
                                     Self::push_runqueue_or_panic(
                                         cpu_id,
                                         &core.run_queue,
@@ -741,7 +742,6 @@ impl Scheduler {
                     .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
                     .is_ok()
                 {
-                    task.set_block_reason(BlockReason::None);
                     self.enqueue_to_core(caller_cpu, task);
                 }
             }

@@ -1,13 +1,10 @@
-#![allow(dead_code)]
-
-extern crate alloc;
-
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crossbeam_queue::SegQueue;
 
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -29,7 +26,8 @@ impl From<(extern "win64" fn(usize), usize)> for Job {
 }
 
 struct Shared {
-    queue: SleepMutex<VecDeque<Job>>,
+    queue: SegQueue<Job>,
+    guard: SleepMutex<()>,
     not_empty: Condvar,
 
     shutdown: AtomicBool,
@@ -56,8 +54,8 @@ impl Shared {
     }
 
     #[inline(always)]
-    fn pop_job_locked(q: &mut VecDeque<Job>) -> Option<Job> {
-        q.pop_front()
+    fn pop_job_locked(q: &SegQueue<Job>) -> Option<Job> {
+        q.pop()
     }
 }
 
@@ -75,7 +73,8 @@ impl ThreadPool {
         assert!(threads > 0);
 
         let shared = Arc::new(Shared {
-            queue: SleepMutex::new(VecDeque::new()),
+            queue: SegQueue::new(),
+            guard: SleepMutex::new(()),
             not_empty: Condvar::new(),
 
             shutdown: AtomicBool::new(false),
@@ -113,8 +112,8 @@ impl ThreadPool {
         }
 
         {
-            let mut q = self.shared.queue.lock();
-            q.push_back(Job {
+            let q = &self.shared.queue;
+            q.push(Job {
                 f: function,
                 a: context,
             });
@@ -134,9 +133,9 @@ impl ThreadPool {
         }
 
         {
-            let mut q = self.shared.queue.lock();
+            let mut q = &self.shared.queue;
             for &j in jobs {
-                q.push_back(j);
+                q.push(j);
             }
             self.shared
                 .job_count
@@ -157,8 +156,8 @@ impl ThreadPool {
 
     pub fn try_execute_one(&self) -> bool {
         let job = {
-            let mut q = self.shared.queue.lock();
-            let Some(j) = Shared::pop_job_locked(&mut q) else {
+            let mut q = &self.shared.queue;
+            let Some(j) = Shared::pop_job_locked(q) else {
                 return false;
             };
             self.shared.job_count.fetch_sub(1, Ordering::AcqRel);
@@ -201,7 +200,7 @@ extern "win64" fn worker_entry(ctx: usize) {
 
     loop {
         let job_opt = {
-            let mut q = shared.queue.lock();
+            let mut q = &shared.queue;
 
             loop {
                 if let Some(j) = Shared::pop_job_locked(&mut q) {
@@ -213,7 +212,10 @@ extern "win64" fn worker_entry(ctx: usize) {
                     break None;
                 }
 
-                q = shared.not_empty.wait(q);
+                {
+                    // TODO: this still forces serialization, a condvar that doesn't require a sleep mutex is required to fix this.
+                    shared.not_empty.wait(shared.guard.lock())
+                };
             }
         };
 
