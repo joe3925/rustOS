@@ -1,63 +1,71 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::{Context, Poll};
 use spin::Mutex;
 
 use crate::scheduling::runtime::runtime::{submit_blocking, submit_blocking_many};
 use crate::structs::thread_pool::Job;
+use super::waker::{self, Continuation};
 
 const STATE_PENDING: u8 = 0;
 const STATE_COMPLETE: u8 = 1;
 const STATE_CONSUMED: u8 = 2;
 
 struct SharedTaskHeader<R> {
-    result: UnsafeCell<Option<R>>,
-    waker: Mutex<Option<Waker>>,
+    result: UnsafeCell<MaybeUninit<R>>,
     state: AtomicU8,
+    cont: Mutex<Option<usize>>,
 }
 
 impl<R> SharedTaskHeader<R> {
     fn new() -> Self {
         Self {
-            result: UnsafeCell::new(None),
-            waker: Mutex::new(None),
+            result: UnsafeCell::new(MaybeUninit::uninit()),
             state: AtomicU8::new(STATE_PENDING),
-        }
-    }
-
-    fn record_waker(&self, waker: &Waker) {
-        let mut w = self.waker.lock();
-        *w = Some(waker.clone());
-    }
-
-    fn try_take_result(&self) -> Option<R> {
-        if self.state.load(Ordering::Acquire) == STATE_COMPLETE {
-            // SAFETY: Only the worker thread writes the result, and once state is COMPLETE the
-            // result will not be modified again.
-            let res = unsafe { (*self.result.get()).take() };
-            self.state.store(STATE_CONSUMED, Ordering::Release);
-            res
-        } else {
-            None
+            cont: Mutex::new(None),
         }
     }
 
     fn store_result(&self, result: R) {
         // SAFETY: Only the worker thread writes to result and it happens exactly once.
         unsafe {
-            *self.result.get() = Some(result);
+            (*self.result.get()).write(result);
         }
         self.state.store(STATE_COMPLETE, Ordering::Release);
     }
 
-    fn wake(&self) {
-        if let Some(w) = self.waker.lock().take() {
-            w.wake();
+    fn take_result(&self) -> Option<R> {
+        if self.state.load(Ordering::Acquire) != STATE_COMPLETE {
+            return None;
+        }
+
+        self.state.store(STATE_CONSUMED, Ordering::Release);
+        // SAFETY: state prevents double-read; result was written exactly once.
+        Some(unsafe { (*self.result.get()).assume_init_read() })
+    }
+
+    fn register_continuation(&self, cont: usize) {
+        let mut guard = self.cont.lock();
+        if let Some(prev) = guard.replace(cont) {
+            drop_continuation(prev, true);
+        }
+    }
+
+    fn take_continuation(&self) -> Option<usize> {
+        let mut guard = self.cont.lock();
+        guard.take()
+    }
+
+    fn drop_continuation(&self) {
+        if let Some(prev) = self.take_continuation() {
+            drop_continuation(prev, true);
         }
     }
 }
@@ -82,6 +90,16 @@ unsafe impl<F: Send, R: Send> Sync for SharedTask<F, R> {}
 unsafe impl<R: Send> Send for SharedTaskHeader<R> {}
 unsafe impl<R: Send> Sync for SharedTaskHeader<R> {}
 
+impl<R> Drop for SharedTaskHeader<R> {
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Acquire) == STATE_COMPLETE {
+            // SAFETY: result was initialized if state == COMPLETE.
+            unsafe { (*self.result.get()).assume_init_drop() };
+        }
+        self.drop_continuation();
+    }
+}
+
 fn drop_shared_task<F, R>(ptr: *const SharedTaskHeader<R>) {
     // SAFETY: ptr was produced by Arc::into_raw on Arc<SharedTask<F, R>>.
     unsafe {
@@ -105,6 +123,7 @@ impl<R> Drop for BlockingJoin<R> {
         if self.ptr.is_null() {
             return;
         }
+        unsafe { (&*self.ptr).drop_continuation() };
         (self.drop_fn)(self.ptr);
         self.ptr = ptr::null();
     }
@@ -118,14 +137,16 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
         let header = unsafe { &*self.ptr };
-
-        if let Some(res) = header.try_take_result() {
+        if let Some(res) = header.take_result() {
             return Poll::Ready(res);
         }
 
-        header.record_waker(cx.waker());
+        if let Some(cont) = waker::continuation_from_waker(cx.waker()) {
+            let boxed = Box::into_raw(Box::new(cont));
+            header.register_continuation(boxed as usize);
+        }
 
-        if let Some(res) = header.try_take_result() {
+        if let Some(res) = header.take_result() {
             Poll::Ready(res)
         } else {
             Poll::Pending
@@ -149,7 +170,10 @@ where
     let result = f();
 
     task.header.store_result(result);
-    task.header.wake();
+
+    if let Some(cont_ptr) = task.header.take_continuation() {
+        run_continuation(cont_ptr);
+    }
 }
 
 pub fn spawn_blocking<F, R>(func: F) -> BlockingJoin<R>
@@ -194,4 +218,30 @@ where
 
     submit_blocking_many(&jobs);
     joins
+}
+
+const ASSIST_BUDGET: usize = 1;
+
+fn run_continuation(cont_ptr: usize) {
+    if cont_ptr == 0 {
+        return;
+    }
+    let cont = unsafe { Box::from_raw(cont_ptr as *mut Continuation) };
+    let mut remaining = ASSIST_BUDGET;
+    if remaining > 0 {
+        (cont.tramp)(cont.ctx);
+        remaining -= 1;
+    }
+    drop(cont);
+}
+
+fn drop_continuation(ptr: usize, call_drop: bool) {
+    if ptr == 0 {
+        return;
+    }
+    let cont = unsafe { Box::from_raw(ptr as *mut Continuation) };
+    if call_drop {
+        unsafe { (cont.drop_fn)(cont.ctx) };
+    }
+    drop(cont);
 }
