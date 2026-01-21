@@ -1,7 +1,7 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::{bench_async_vs_sync_call_latency, BenchWindow};
+use crate::benchmarking::{bench_async_vs_sync_call_latency, benchmark_async, BenchWindow};
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
@@ -30,7 +30,7 @@ use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::registry::is_first_boot;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
-use crate::scheduling::runtime::runtime::{spawn, spawn_detached};
+use crate::scheduling::runtime::runtime::{spawn, spawn_blocking, spawn_detached};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
@@ -172,6 +172,10 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     //     install_prepacked_drivers().await;
 
     //     PNP_MANAGER.init_from_registry().await;
+    // });
+    // spawn_blocking(|| {
+    //     wait_duration(Duration::from_secs(10));
+    //     spawn_detached(async move { benchmark_async() });
     // });
     bench_async_vs_sync_call_latency();
     println!("");

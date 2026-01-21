@@ -17,6 +17,8 @@ use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, Once};
 
+use crate::println;
+
 use super::runtime::submit_global;
 
 const NUM_SHARDS: usize = 8;
@@ -25,7 +27,7 @@ const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 /// Maximum size (in bytes) for inline future storage. Futures larger than this
 /// will be heap-allocated. Default: 128 bytes covers most simple async state machines.
-pub const INLINE_FUTURE_SIZE: usize = 128;
+pub const INLINE_FUTURE_SIZE: usize = 256;
 
 /// Required alignment for inline future storage.
 pub const INLINE_FUTURE_ALIGN: usize = 8;
@@ -91,9 +93,8 @@ impl FutureStorage {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if core::mem::size_of::<F>() <= INLINE_FUTURE_SIZE
-            && core::mem::align_of::<F>() <= INLINE_FUTURE_ALIGN
-        {
+        let size = core::mem::size_of::<F>();
+        if size <= INLINE_FUTURE_SIZE && size <= INLINE_FUTURE_ALIGN {
             Self::new_inline(future)
         } else {
             Self::Boxed(Box::pin(future))

@@ -1,5 +1,5 @@
 use crate::alloc::format;
-use crate::drivers::interrupt_index;
+use crate::drivers::interrupt_index::{self, TSC_HZ};
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::file_system::file::File;
 use crate::memory::{
@@ -9,6 +9,7 @@ use crate::memory::{
 use crate::scheduling::runtime::runtime::{
     block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
+use crate::static_handlers::wait_duration;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
 use crate::{cpu, print, println, vec};
@@ -27,6 +28,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
+use kernel_types::status::FileStatus;
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
@@ -1865,4 +1867,299 @@ async fn bench_async_vs_sync_call_latency_async() {
         pending_over_frac_1e3 / 1000,
         (pending_over_frac_1e3 % 1000).abs()
     );
+}
+
+// =====================
+// Config
+// =====================
+
+pub const BENCH_CSV_PATH: &str = "C:\\bench_async.csv";
+
+pub const BENCH_INFLIGHT_START: u64 = 1_000;
+pub const BENCH_INFLIGHT_END: u64 = 500_000;
+pub const BENCH_INFLIGHT_STEP: u64 = 5_000;
+
+pub const BENCH_WARMUP_ITERS: u64 = 1;
+pub const BENCH_ITERS: u64 = 5;
+
+pub const BENCH_USE_BATCH_SPAWN: bool = true;
+
+// Per blocking task work. 0 => no wait.
+pub const BENCH_WORK_NS: u64 = 0;
+
+// 0 = keep all samples. Otherwise cap latency samples by keeping every k-th sample.
+pub const BENCH_MAX_LAT_SAMPLES: usize = 0;
+
+// =====================
+// Helpers
+// =====================
+
+#[inline(always)]
+fn cycles_to_ns(delta_cycles: u64, tsc_hz: u64) -> u64 {
+    if tsc_hz == 0 {
+        return 0;
+    }
+    ((delta_cycles as u128 * 1_000_000_000u128) / (tsc_hz as u128)) as u64
+}
+
+#[inline(always)]
+fn percentile_from_sorted(sorted: &[u64], permille: u32) -> u64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = ((permille as usize) * (n - 1)) / 1000;
+    sorted[idx]
+}
+
+#[inline(always)]
+fn should_keep_sample(sample_idx: usize, total_target: usize) -> bool {
+    if BENCH_MAX_LAT_SAMPLES == 0 {
+        return true;
+    }
+    if total_target <= BENCH_MAX_LAT_SAMPLES {
+        return true;
+    }
+    let stride = (total_target + BENCH_MAX_LAT_SAMPLES - 1) / BENCH_MAX_LAT_SAMPLES;
+    sample_idx % stride == 0
+}
+
+#[inline(always)]
+fn ilog2_u64(mut x: u64) -> u32 {
+    if x <= 1 {
+        return 0;
+    }
+    let mut r = 0u32;
+    while x > 1 {
+        x >>= 1;
+        r += 1;
+    }
+    r
+}
+
+async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
+    let try_existing = File::open(path, &[OpenFlags::Open, OpenFlags::WriteOnly]).await;
+
+    if try_existing.is_ok() {
+        return try_existing;
+    }
+
+    File::open(
+        path,
+        &[OpenFlags::Create, OpenFlags::Open, OpenFlags::WriteOnly],
+    )
+    .await
+}
+
+async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), FileStatus> {
+    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
+        Ok(f) => {
+            if f.size != 0 {
+                return Ok(());
+            }
+        }
+        Err(_) => {}
+    }
+
+    let mut f = open_for_append(path).await?;
+    let mut s = String::new();
+    s.push_str(header);
+    s.push('\n');
+    let _ = f.append(s.as_bytes()).await?;
+    Ok(())
+}
+
+async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
+    let mut f = open_for_append(path).await?;
+    let mut s = String::new();
+    s.push_str(line);
+    s.push('\n');
+    let _ = f.append(s.as_bytes()).await?;
+    Ok(())
+}
+
+// =====================
+// Entry point
+// =====================
+
+pub fn benchmark_async() {
+    spawn_detached(async {
+        benchmark_async_async().await;
+    });
+}
+
+// =====================
+// Benchmark
+// =====================
+
+pub async fn benchmark_async_async() {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    assert!(tsc_hz != 0, "TSC not calibrated");
+
+    let csv_path = Path::from_string(BENCH_CSV_PATH);
+
+    let header = "run_id,x_inflight,x_inflight_log2,ops,elapsed_cycles,elapsed_ns,cycles_per_op,ns_per_op,ops_per_sec,p50_ns,p99_ns,p999_ns,work_ns,use_batch,iters,warmup";
+    let _ = ensure_csv_header(&csv_path, header).await;
+
+    println!("{header}");
+
+    let run_id = cpu::get_cycles();
+
+    let mut inflight = BENCH_INFLIGHT_START;
+    while inflight <= BENCH_INFLIGHT_END {
+        let target_samples = (inflight as usize).saturating_mul(BENCH_ITERS as usize);
+
+        let mut lats_ns: Vec<u64> = Vec::new();
+        if BENCH_MAX_LAT_SAMPLES == 0 || target_samples <= BENCH_MAX_LAT_SAMPLES {
+            lats_ns.reserve(target_samples);
+        } else {
+            lats_ns.reserve(BENCH_MAX_LAT_SAMPLES);
+        }
+
+        let mut total_cycles: u64 = 0;
+        let mut total_ns: u64 = 0;
+        let mut ops_total: u64 = 0;
+
+        let mut iter: u64 = 0;
+        while iter < (BENCH_WARMUP_ITERS + BENCH_ITERS) {
+            let sw = Stopwatch::start();
+
+            if BENCH_USE_BATCH_SPAWN {
+                let mut starts: Vec<u64> = Vec::with_capacity(inflight as usize);
+                let mut funcs = Vec::with_capacity(inflight as usize);
+
+                let mut i = 0u64;
+                while i < inflight {
+                    let start = cpu::get_cycles();
+                    starts.push(start);
+
+                    funcs.push(move || -> u64 {
+                        if BENCH_WORK_NS != 0 {
+                            wait_duration(Duration::from_nanos(BENCH_WORK_NS));
+                        }
+                        cpu::get_cycles()
+                    });
+
+                    i += 1;
+                }
+
+                let joins = spawn_blocking_many(funcs);
+
+                for (j, join) in joins.into_iter().enumerate() {
+                    let end = join.await;
+
+                    if iter >= BENCH_WARMUP_ITERS {
+                        let lat_cycles = end.wrapping_sub(starts[j]);
+                        let lat = cycles_to_ns(lat_cycles, tsc_hz);
+
+                        let sample_idx = ops_total as usize;
+                        if should_keep_sample(sample_idx, target_samples) {
+                            lats_ns.push(lat);
+                        }
+                        ops_total = ops_total.wrapping_add(1);
+                    }
+                }
+            } else {
+                let mut starts: Vec<u64> = Vec::with_capacity(inflight as usize);
+                let mut joins = Vec::with_capacity(inflight as usize);
+
+                let mut i = 0u64;
+                while i < inflight {
+                    let start = cpu::get_cycles();
+                    starts.push(start);
+
+                    let join = spawn_blocking(move || -> u64 {
+                        if BENCH_WORK_NS != 0 {
+                            wait_duration(Duration::from_nanos(BENCH_WORK_NS));
+                        }
+                        cpu::get_cycles()
+                    });
+
+                    joins.push(join);
+                    i += 1;
+                }
+
+                for (j, join) in joins.into_iter().enumerate() {
+                    let end = join.await;
+
+                    if iter >= BENCH_WARMUP_ITERS {
+                        let lat_cycles = end.wrapping_sub(starts[j]);
+                        let lat = cycles_to_ns(lat_cycles, tsc_hz);
+
+                        let sample_idx = ops_total as usize;
+                        if should_keep_sample(sample_idx, target_samples) {
+                            lats_ns.push(lat);
+                        }
+                        ops_total = ops_total.wrapping_add(1);
+                    }
+                }
+            }
+
+            if iter >= BENCH_WARMUP_ITERS {
+                total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
+                total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
+            }
+
+            iter += 1;
+        }
+
+        lats_ns.sort_unstable();
+        let p50 = percentile_from_sorted(&lats_ns, 500);
+        let p99 = percentile_from_sorted(&lats_ns, 990);
+        let p999 = percentile_from_sorted(&lats_ns, 999);
+
+        let cycles_per_op = if ops_total == 0 {
+            0
+        } else {
+            total_cycles / ops_total
+        };
+        let ns_per_op = if ops_total == 0 {
+            0
+        } else {
+            total_ns / ops_total
+        };
+        let ops_per_sec = if total_ns == 0 {
+            0
+        } else {
+            ((ops_total as u128 * 1_000_000_000u128) / (total_ns as u128)) as u64
+        };
+
+        let use_batch = if BENCH_USE_BATCH_SPAWN { 1u64 } else { 0u64 };
+        let x_log2 = ilog2_u64(inflight) as u64;
+
+        let line = format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            run_id,
+            inflight,
+            x_log2,
+            ops_total,
+            total_cycles,
+            total_ns,
+            cycles_per_op,
+            ns_per_op,
+            ops_per_sec,
+            p50,
+            p99,
+            p999,
+            BENCH_WORK_NS,
+            use_batch,
+            BENCH_ITERS,
+            BENCH_WARMUP_ITERS
+        );
+
+        println!("{line}");
+
+        match append_csv_line(&csv_path, &line).await {
+            Ok(_) => {}
+            Err(e) => println!("bench csv append failed: {:?}", e),
+        }
+
+        inflight = inflight.saturating_add(BENCH_INFLIGHT_STEP);
+        if inflight == 0 {
+            break;
+        }
+    }
 }
