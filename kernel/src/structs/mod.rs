@@ -1,6 +1,7 @@
 pub(crate) mod aligned_buffer;
 pub mod channel;
 pub mod condvar;
+pub mod mpmc;
 pub(crate) mod linked_list;
 pub(crate) mod per_core_storage;
 pub mod range_tracker;

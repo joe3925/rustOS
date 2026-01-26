@@ -1,16 +1,12 @@
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crossbeam_queue::SegQueue;
 
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
-use crate::structs::condvar::Condvar;
-use crate::structs::sleep_mutex::SleepMutex;
+use crate::structs::mpmc::{mpmc_channel, Receiver, Sender};
 
 pub type JobFn = extern "win64" fn(usize);
 
@@ -26,69 +22,44 @@ impl From<(extern "win64" fn(usize), usize)> for Job {
 }
 
 struct Shared {
-    queue: SegQueue<Job>,
-    guard: SleepMutex<()>,
-    not_empty: Condvar,
-
     shutdown: AtomicBool,
     job_count: AtomicUsize,
     num_workers: AtomicUsize,
-
-    seq: AtomicUsize,
-}
-
-impl Shared {
-    #[inline(always)]
-    fn bump_seq(&self) {
-        self.seq.fetch_add(1, Ordering::Release);
-    }
-
-    #[inline(always)]
-    fn wake_one(&self) {
-        self.not_empty.notify_one();
-    }
-
-    #[inline(always)]
-    fn wake_all(&self) {
-        self.not_empty.notify_all();
-    }
-
-    #[inline(always)]
-    fn pop_job_locked(q: &SegQueue<Job>) -> Option<Job> {
-        q.pop()
-    }
+    total_workers: AtomicUsize,
 }
 
 struct WorkerCtx {
     shared: Arc<Shared>,
+    receiver: Receiver<Job>,
     _idx: usize,
 }
 
 pub struct ThreadPool {
     shared: Arc<Shared>,
+    sender: Sender<Job>,
+    receiver: Receiver<Job>,
 }
 
 impl ThreadPool {
     pub fn new(threads: usize) -> Self {
         assert!(threads > 0);
 
-        let shared = Arc::new(Shared {
-            queue: SegQueue::new(),
-            guard: SleepMutex::new(()),
-            not_empty: Condvar::new(),
+        let (sender, receiver) = mpmc_channel::<Job>();
 
+        let shared = Arc::new(Shared {
+            total_workers: AtomicUsize::new(threads),
             shutdown: AtomicBool::new(false),
             job_count: AtomicUsize::new(0),
             num_workers: AtomicUsize::new(0),
-
-            seq: AtomicUsize::new(0),
         });
 
         for i in 0..threads {
             shared.num_workers.fetch_add(1, Ordering::Release);
 
+            // Each worker gets its own cloned receiver
             let ctx = Box::new(WorkerCtx {
                 shared: shared.clone(),
+                receiver: receiver.clone(),
                 _idx: i,
             });
 
@@ -103,7 +74,7 @@ impl ThreadPool {
             SCHEDULER.spawn_task(th);
         }
 
-        Self { shared }
+        Self { shared, sender, receiver }
     }
 
     pub fn submit(&self, function: JobFn, context: usize) {
@@ -111,17 +82,14 @@ impl ThreadPool {
             return;
         }
 
-        {
-            let q = &self.shared.queue;
-            q.push(Job {
-                f: function,
-                a: context,
-            });
+        let job = Job {
+            f: function,
+            a: context,
+        };
+
+        if self.sender.send(job).is_ok() {
             self.shared.job_count.fetch_add(1, Ordering::Release);
         }
-
-        self.shared.bump_seq();
-        self.shared.wake_one();
     }
 
     pub fn submit_many(&self, jobs: &[Job]) {
@@ -132,18 +100,15 @@ impl ThreadPool {
             return;
         }
 
-        {
-            let mut q = &self.shared.queue;
-            for &j in jobs {
-                q.push(j);
+        let mut sent = 0usize;
+        for &job in jobs {
+            if self.sender.send(job).is_ok() {
+                sent += 1;
             }
-            self.shared
-                .job_count
-                .fetch_add(jobs.len(), Ordering::Release);
         }
-
-        self.shared.bump_seq();
-        self.shared.wake_all();
+        if sent > 0 {
+            self.shared.job_count.fetch_add(sent, Ordering::Release);
+        }
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) {
@@ -155,23 +120,19 @@ impl ThreadPool {
     }
 
     pub fn try_execute_one(&self) -> bool {
-        let job = {
-            let mut q = &self.shared.queue;
-            let Some(j) = Shared::pop_job_locked(q) else {
-                return false;
-            };
-            self.shared.job_count.fetch_sub(1, Ordering::AcqRel);
-            j
-        };
-
-        (job.f)(job.a);
-        true
+        match self.receiver.try_recv() {
+            Ok(job) => {
+                self.shared.job_count.fetch_sub(1, Ordering::AcqRel);
+                (job.f)(job.a);
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.bump_seq();
-        self.shared.wake_all();
+        // Dropping the sender will close the channel and wake all waiting receivers
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -190,39 +151,35 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.shutdown();
+        // sender is dropped here, which closes the channel
     }
 }
 
 extern "win64" fn worker_entry(ctx: usize) {
     let ctx = unsafe { Box::from_raw(ctx as *mut WorkerCtx) };
     let shared = ctx.shared.clone();
+    let receiver = ctx.receiver.clone();
     drop(ctx);
 
     loop {
-        let job_opt = {
-            let mut q = &shared.queue;
+        // Check shutdown before blocking
+        if shared.shutdown.load(Ordering::Acquire) {
+            break;
+        }
 
-            loop {
-                if let Some(j) = Shared::pop_job_locked(&mut q) {
-                    shared.job_count.fetch_sub(1, Ordering::AcqRel);
-                    break Some(j);
-                }
-
-                if shared.shutdown.load(Ordering::Acquire) {
-                    break None;
-                }
-
-                {
-                    // TODO: this still forces serialization, a condvar that doesn't require a sleep mutex is required to fix this.
-                    shared.not_empty.wait(shared.guard.lock())
-                };
+        // Block until a job is available or channel disconnects
+        let job = match receiver.recv() {
+            Ok(job) => job,
+            Err(_) => {
+                // Channel disconnected (all senders dropped) - exit
+                break;
             }
         };
 
-        let Some(job) = job_opt else {
-            break;
-        };
+        // Decrement job count
+        shared.job_count.fetch_sub(1, Ordering::AcqRel);
 
+        // Execute the job
         (job.f)(job.a);
     }
 
