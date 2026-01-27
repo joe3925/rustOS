@@ -203,20 +203,9 @@ impl Task {
             *(state.rsp as *mut u64) = kernel_task_end as u64;
         }
 
-        state.cs = gdt
-            .selectors_per_cpu
-            .get(cpu_id as usize)
-            .expect("")
-            .user_code_selector
-            .0 as u64
-            | 3;
-        state.ss = gdt
-            .selectors_per_cpu
-            .get(cpu_id as usize)
-            .expect("")
-            .user_data_selector
-            .0 as u64
-            | 3;
+        let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
+        state.cs = selectors.user_code_selector.0 as u64 | 3;
+        state.ss = selectors.user_data_selector.0 as u64 | 3;
 
         let inner_task = Task {
             name,
@@ -273,18 +262,9 @@ impl Task {
             *(state.rsp as *mut u64) = kernel_task_end as u64;
         }
 
-        state.cs = gdt
-            .selectors_per_cpu
-            .get(cpu_id as usize)
-            .expect("")
-            .kernel_code_selector
-            .0 as u64;
-        state.ss = gdt
-            .selectors_per_cpu
-            .get(cpu_id as usize)
-            .expect("")
-            .kernel_data_selector
-            .0 as u64;
+        let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
+        state.cs = selectors.kernel_code_selector.0 as u64;
+        state.ss = selectors.kernel_data_selector.0 as u64;
 
         let inner_task = Task {
             name,

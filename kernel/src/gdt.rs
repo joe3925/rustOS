@@ -11,7 +11,7 @@ use crate::cpu::get_cpu_info;
 use crate::memory::paging::paging::align_up_2mib;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
-use crate::structs::per_core_storage::PCS;
+use crate::structs::per_cpu_vec::PerCpuVec;
 
 use x86_64::instructions::segmentation::{Segment, CS, SS};
 use x86_64::instructions::tables::load_tss;
@@ -24,8 +24,8 @@ lazy_static! {
 }
 
 pub struct GDTTracker {
-    pub gdt_array: PCS<*const GlobalDescriptorTable>,
-    pub selectors_per_cpu: PCS<Selectors>,
+    pub gdt_array: PerCpuVec<*const GlobalDescriptorTable>,
+    pub selectors_per_cpu: PerCpuVec<Selectors>,
     pub base: *mut u8,
     pub size: usize,
 }
@@ -39,8 +39,8 @@ impl GDTTracker {
         .expect("failed to alloc GDT page")
         .as_mut_ptr::<u8>();
         GDTTracker {
-            gdt_array: PCS::new(),
-            selectors_per_cpu: PCS::new(),
+            gdt_array: PerCpuVec::new(),
+            selectors_per_cpu: PerCpuVec::new(),
             base,
             size: 0,
         }
@@ -103,8 +103,8 @@ impl GDTTracker {
             .get_feature_info()
             .expect("NO CPUID")
             .initial_local_apic_id() as usize;
-        self.gdt_array.set(id, gdt_ptr_base);
-        self.selectors_per_cpu.set(id, selectors);
+        self.gdt_array.set_by_id(id, gdt_ptr_base, || core::ptr::null());
+        self.selectors_per_cpu.set_by_id(id, selectors, || Selectors::default());
     }
 }
 pub struct Selectors {
@@ -113,4 +113,17 @@ pub struct Selectors {
     pub(crate) user_code_selector: SegmentSelector,
     pub(crate) user_data_selector: SegmentSelector,
     tss_selector: SegmentSelector,
+}
+
+impl Default for Selectors {
+    fn default() -> Self {
+        use x86_64::PrivilegeLevel;
+        Self {
+            kernel_code_selector: SegmentSelector::new(0, PrivilegeLevel::Ring0),
+            kernel_data_selector: SegmentSelector::new(0, PrivilegeLevel::Ring0),
+            user_code_selector: SegmentSelector::new(0, PrivilegeLevel::Ring0),
+            user_data_selector: SegmentSelector::new(0, PrivilegeLevel::Ring0),
+            tss_selector: SegmentSelector::new(0, PrivilegeLevel::Ring0),
+        }
+    }
 }

@@ -3,7 +3,7 @@ pub mod channel;
 pub mod condvar;
 pub mod mpmc;
 pub(crate) mod linked_list;
-pub(crate) mod per_core_storage;
+pub(crate) mod per_cpu_vec;
 pub mod range_tracker;
 pub mod sleep_mutex;
 pub(crate) mod stopwatch;

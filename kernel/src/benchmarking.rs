@@ -141,7 +141,7 @@ struct BenchState {
 
 impl BenchState {
     fn new() -> Self {
-        let cores = TIMER_TIME_SCHED.iter().count().max(1);
+        let cores = unsafe { TIMER_TIME_SCHED.iter() }.count().max(1);
         let mut rings = Vec::with_capacity(cores);
         for _ in 0..cores {
             rings.push(Mutex::new(BenchRing::new(BENCH_RING_CAPACITY)));
@@ -223,14 +223,12 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
 
     let heap_total_bytes = HEAP_SIZE as u64;
 
-    let core_sched_ns = TIMER_TIME_SCHED
-        .iter()
+    let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
         .map(|a| a.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
 
-    let core_switches = PER_CORE_SWITCHES
-        .iter()
+    let core_switches = unsafe { PER_CORE_SWITCHES.iter() }
         .nth(core_id)
         .map(|a| a.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
@@ -315,14 +313,12 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
 
     let heap_total_bytes = HEAP_SIZE as u64;
 
-    let core_sched_ns = TIMER_TIME_SCHED
-        .iter()
+    let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
         .map(|a| a.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);
 
-    let core_switches = PER_CORE_SWITCHES
-        .iter()
+    let core_switches = unsafe { PER_CORE_SWITCHES.iter() }
         .nth(core_id)
         .map(|a| a.load(Ordering::SeqCst) as u64)
         .unwrap_or(0);

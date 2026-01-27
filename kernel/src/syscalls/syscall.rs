@@ -18,27 +18,12 @@ pub fn syscall_init() {
     let gdt = PER_CPU_GDT.lock();
     unsafe { Efer::update(|e| e.set(EferFlags::SYSTEM_CALL_EXTENSIONS, true)) };
     LStar::write(VirtAddr::new(syscall_entry as u64));
-    let id = get_current_logical_id();
-    let kernel_cs = gdt
-        .selectors_per_cpu
-        .get(id as usize)
-        .expect("")
-        .kernel_code_selector;
-    let kernel_ss = gdt
-        .selectors_per_cpu
-        .get(id as usize)
-        .expect("")
-        .kernel_data_selector;
-    let user_cs = gdt
-        .selectors_per_cpu
-        .get(id as usize)
-        .expect("")
-        .user_code_selector;
-    let user_ss = gdt
-        .selectors_per_cpu
-        .get(id as usize)
-        .expect("")
-        .user_data_selector;
+    let id = get_current_logical_id() as usize;
+    let selectors = gdt.selectors_per_cpu.get_by_id(id);
+    let kernel_cs = selectors.kernel_code_selector;
+    let kernel_ss = selectors.kernel_data_selector;
+    let user_cs = selectors.user_code_selector;
+    let user_ss = selectors.user_data_selector;
 
     Star::write(user_cs, user_ss, kernel_cs, kernel_ss).expect("Bad STAR segment selectors");
 }

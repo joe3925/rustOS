@@ -5,13 +5,12 @@ use crate::drivers::interrupt_index::{
 };
 use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::state::State;
-use crate::structs::per_core_storage::PCS;
+use crate::structs::per_cpu_vec::PerCpuVec;
+use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::KERNEL_INITIALIZED;
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use lazy_static::lazy_static;
-use spin::Mutex;
 
 pub static TIMER: AtomicUsize = AtomicUsize::new(0);
 
@@ -23,23 +22,8 @@ pub struct Al64<T>(pub T);
 pub static NUM_CORES: AtomicUsize = AtomicUsize::new(1);
 pub static ROT_TICKET: Al64<AtomicUsize> = Al64(AtomicUsize::new(0));
 
-lazy_static! {
-    pub static ref TIMER_TIME_SCHED: PCS<AtomicUsize> = PCS::new();
-    pub static ref PER_CORE_SWITCHES: PCS<AtomicUsize> = PCS::new();
-}
-
-#[inline(always)]
-fn add_time(pcs: &PCS<AtomicUsize>, cpu: usize, v: usize) {
-    match pcs.get(cpu) {
-        Some(a) => {
-            a.fetch_add(v, Ordering::Relaxed);
-        }
-        None => {
-            let a = pcs.set(cpu, AtomicUsize::new(0));
-            a.fetch_add(v, Ordering::Relaxed);
-        }
-    }
-}
+pub static TIMER_TIME_SCHED: PerCpuVec<AtomicUsize> = PerCpuVec::new();
+pub static PER_CORE_SWITCHES: PerCpuVec<AtomicUsize> = PerCpuVec::new();
 
 #[derive(Copy, Clone)]
 pub struct TimerDebug {
@@ -60,7 +44,7 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     SCHEDULER.on_timer_tick(state, cpu_id);
     unsafe { bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), 8) };
     let dt = sw.elapsed_nanos() as usize;
-    add_time(&TIMER_TIME_SCHED, cpu_id, dt);
+    TIMER_TIME_SCHED.get().fetch_add(dt, Ordering::Relaxed);
 }
 
 pub fn set_num_cores(n: usize) {
@@ -68,10 +52,9 @@ pub fn set_num_cores(n: usize) {
     NUM_CORES.store(n, Ordering::Relaxed);
     ROT_TICKET.0.store(0, Ordering::Relaxed);
 
-    for id in 0..n {
-        let _ = TIMER_TIME_SCHED.set(id, AtomicUsize::new(0));
-        let _ = PER_CORE_SWITCHES.set(id, AtomicUsize::new(0));
-    }
+    TIMER_TIME_SCHED.init(n, || AtomicUsize::new(0));
+    PER_CORE_SWITCHES.init(n, || AtomicUsize::new(0));
+    APIC_TICKS_PER_NS.init(n, || AtomicU64::new(0));
 }
 
 #[unsafe(naked)]
