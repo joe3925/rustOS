@@ -614,10 +614,16 @@ impl Scheduler {
         }
 
         loop {
-            let Some(cand) = core.run_queue.pop() else {
+            let cand = if let Some(c) = core.run_queue.pop() {
+                core.load.fetch_sub(1, Ordering::Release);
+                c
+            } else if let Some(c) = core.ipi_queue.pop() {
+                // Treat pending IPI enqueues the same as run queue entries.
+                core.load.fetch_sub(1, Ordering::Release);
+                c
+            } else {
                 break;
             };
-            core.load.fetch_sub(1, Ordering::Release);
 
             match cand.sched_state() {
                 SchedState::Terminated => continue,
@@ -746,34 +752,6 @@ impl Scheduler {
 
     pub fn num_cores(&self) -> usize {
         self.num_cores.load(Ordering::Relaxed)
-    }
-
-    pub fn rescue_stranded_tasks(&self, caller_cpu: usize) {
-        let n = self.num_cores.load(Ordering::Acquire);
-        if n == 0 {
-            return;
-        }
-
-        let max_id = self.next_task_id.load(Ordering::Relaxed);
-
-        for id in 1..max_id {
-            let Some(task) = self.all_tasks.get(id) else {
-                continue;
-            };
-
-            if task.target_cpu() != caller_cpu {
-                continue;
-            }
-
-            if task.sched_state() == SchedState::Blocked && task.consume_permit() {
-                if task
-                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                    .is_ok()
-                {
-                    self.enqueue_to_core(caller_cpu, task);
-                }
-            }
-        }
     }
 
     #[inline(always)]

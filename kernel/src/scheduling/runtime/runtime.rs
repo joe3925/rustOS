@@ -19,7 +19,7 @@ use super::slab::get_task_slab;
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(2));
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(6));
     pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(6));
 }
 

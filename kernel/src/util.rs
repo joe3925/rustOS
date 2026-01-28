@@ -180,8 +180,8 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     //     wait_duration(Duration::from_secs(10));
     //     spawn_detached(benchmark_async_async());
     // });
-    //bench_realistic_traffic();
-    bench_async_vs_sync_call_latency();
+    bench_realistic_traffic();
+    //bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]
