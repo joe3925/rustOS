@@ -148,7 +148,7 @@ impl<T> Receiver<T> {
 
             // Check if all senders are gone
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                // One final check - a message may have been sent before sender dropped
+                // One final check a message may have been sent before sender dropped
                 if let Some(value) = self.inner.queue.pop() {
                     return Ok(value);
                 }
@@ -161,8 +161,6 @@ impl<T> Receiver<T> {
                 continue;
             }
 
-            // Re-check after enqueueing - a sender may have pushed between our
-            // pop attempt and enqueue
             if let Some(value) = self.inner.queue.pop() {
                 self.inner.receivers_waiting.clear_current_if_queued();
                 return Ok(value);
@@ -178,9 +176,9 @@ impl<T> Receiver<T> {
                 return Err(RecvError);
             }
 
-            // Park - the permit system handles the race if unpark happened
-            // between our checks and this park call
             SCHEDULER.park_current(BlockReason::ChannelRecv);
+            // Remove this to set thread pools to loop on the queue instead of sleeping fro debugging
+            self.inner.receivers_waiting.clear_current_if_queued();
         }
     }
 

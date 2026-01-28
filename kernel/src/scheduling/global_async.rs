@@ -98,7 +98,7 @@ impl GlobalAsyncExecutor {
         })
     }
 
-    pub fn set_parallelism(&self, n: usize) {
+    pub fn init(&self, n: usize) {
         let n = if n == 0 { 1 } else { n };
         self.max_pumps.store(n, Ordering::Release);
         self.queues.set_active(n);

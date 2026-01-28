@@ -148,7 +148,7 @@ pub unsafe fn init() {
 }
 
 pub extern "win64" fn kernel_main(ctx: usize) {
-    GlobalAsyncExecutor::global().set_parallelism(NUM_CORES.load(Ordering::Acquire));
+    GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
 
     let mut program = Program::new(
@@ -180,8 +180,8 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     //     wait_duration(Duration::from_secs(10));
     //     spawn_detached(benchmark_async_async());
     // });
-    bench_realistic_traffic();
-    //bench_async_vs_sync_call_latency();
+    //bench_realistic_traffic();
+    bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]

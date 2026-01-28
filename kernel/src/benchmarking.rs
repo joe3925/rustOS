@@ -1672,9 +1672,9 @@ async fn async_chain(mut x: u64) -> u64 {
 async fn blocking_chain(x: u64) -> u64 {
     spawn_blocking(move || {
         let ret = sync_chain(x);
-        if ret % 10_000 == 0 {
-            //println!("blocking done num: {}", ret);
-        }
+        // if ret % 10_000 == 0 {
+        //     println!("blocking done num: {}", ret);
+        // }
         ret
     })
     .await
@@ -2016,8 +2016,13 @@ async fn bench_realistic_traffic_async() {
 
         println!(
             "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
-            conc, conc_ms, conc_ms_frac, conc_us_per_task, conc_ops_sec,
-            speedup / 1000, speedup % 1000
+            conc,
+            conc_ms,
+            conc_ms_frac,
+            conc_us_per_task,
+            conc_ops_sec,
+            speedup / 1000,
+            speedup % 1000
         );
     }
 
@@ -2047,8 +2052,13 @@ async fn bench_realistic_traffic_async() {
 
         println!(
             "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
-            bs, bulk_ms, bulk_ms_frac, bulk_us_per_task, bulk_ops_sec,
-            speedup / 1000, speedup % 1000
+            bs,
+            bulk_ms,
+            bulk_ms_frac,
+            bulk_us_per_task,
+            bulk_ops_sec,
+            speedup / 1000,
+            speedup % 1000
         );
     }
 }

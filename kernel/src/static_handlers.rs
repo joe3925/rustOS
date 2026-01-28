@@ -552,7 +552,7 @@ pub extern "win64" fn kernel_async_submit(trampoline: extern "win64" fn(usize), 
 
 #[no_mangle]
 pub extern "win64" fn kernel_async_set_parallelism(n: usize) {
-    GlobalAsyncExecutor::global().set_parallelism(n);
+    todo!();
 }
 
 static BENCH_WINDOWS: Once<Mutex<BTreeMap<u32, BenchWindow>>> = Once::new();
