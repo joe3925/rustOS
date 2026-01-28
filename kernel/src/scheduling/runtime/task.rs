@@ -54,37 +54,35 @@ impl FutureTask {
 
 impl TaskPoll for FutureTask {
     fn enqueue(self: &Arc<Self>) {
-        // Try IDLE -> QUEUED. If the task is in any other state, the
-        // notification is either already pending or will be picked up
-        // when the current poll finishes (POLLING -> NOTIFIED).
-        let prev = self.state.compare_exchange(
-            STATE_IDLE,
-            STATE_QUEUED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        match prev {
-            Ok(_) => {
-                // Successfully IDLE -> QUEUED, submit to thread pool
-                let ptr = Arc::into_raw(self.clone()) as usize;
-                submit_global(poll_trampoline::<Self>, ptr);
-            }
-            Err(STATE_POLLING) => {
-                // A thread is currently polling. Upgrade to NOTIFIED so it
-                // re-enqueues after polling completes. Use compare_exchange
-                // because another wake() might race us here too.
-                let _ = self.state.compare_exchange(
-                    STATE_POLLING,
-                    STATE_NOTIFIED,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-                // If this CAS fails, the state is already NOTIFIED or
-                // COMPLETED, both of which are fine.
-            }
-            Err(_) => {
-                // QUEUED, NOTIFIED, or COMPLETED — nothing to do
+        // Retry loop to handle the race between POLLING→IDLE and our
+        // POLLING→NOTIFIED attempt. Without the loop, observing POLLING
+        // then racing with the poll_once POLLING→IDLE transition causes
+        // the NOTIFIED CAS to fail with IDLE, silently dropping the wake.
+        loop {
+            match self.state.compare_exchange_weak(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let ptr = Arc::into_raw(self.clone()) as usize;
+                    submit_global(poll_trampoline::<Self>, ptr);
+                    return;
+                }
+                Err(STATE_POLLING) => {
+                    match self.state.compare_exchange(
+                        STATE_POLLING,
+                        STATE_NOTIFIED,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return,
+                        Err(STATE_IDLE) => continue,
+                        Err(_) => return,
+                    }
+                }
+                Err(_) => return,
             }
         }
     }
@@ -218,27 +216,32 @@ impl<T: Send + 'static> JoinableTask<T> {
 
 impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
     fn enqueue(self: &Arc<Self>) {
-        let prev = self.state.compare_exchange(
-            STATE_IDLE,
-            STATE_QUEUED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        match prev {
-            Ok(_) => {
-                let ptr = Arc::into_raw(self.clone()) as usize;
-                submit_global(poll_trampoline::<Self>, ptr);
+        loop {
+            match self.state.compare_exchange_weak(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    let ptr = Arc::into_raw(self.clone()) as usize;
+                    submit_global(poll_trampoline::<Self>, ptr);
+                    return;
+                }
+                Err(STATE_POLLING) => {
+                    match self.state.compare_exchange(
+                        STATE_POLLING,
+                        STATE_NOTIFIED,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => return,
+                        Err(STATE_IDLE) => continue,
+                        Err(_) => return,
+                    }
+                }
+                Err(_) => return,
             }
-            Err(STATE_POLLING) => {
-                let _ = self.state.compare_exchange(
-                    STATE_POLLING,
-                    STATE_NOTIFIED,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                );
-            }
-            Err(_) => {}
         }
     }
 

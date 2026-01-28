@@ -1687,9 +1687,9 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
         let x = seed.wrapping_add(i as u64);
         funcs.push(move || {
             let ret = sync_chain(x);
-            if ret % 10_000 == 0 {
-                //println!("blocking done num: {}", ret);
-            }
+            // if ret % 10_000 == 0 {
+            //     println!("blocking done num: {}", ret);
+            // }
             ret
         });
     }

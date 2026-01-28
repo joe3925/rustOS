@@ -78,13 +78,14 @@ extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
     let arc = unsafe { Arc::from_raw(ctx as *const T) };
 
     if arc.is_completed() {
-        let _ = Arc::into_raw(arc);
         return;
     }
 
-    // Atomically IDLE -> POLLING. If it fails, someone else owns this task.
+    // Atomically IDLE -> POLLING. If it fails, someone else owns this task, so
+    // treat this as a regular wake to record the notification instead of
+    // dropping it.
     if !arc.try_start_inline_poll() {
-        let _ = Arc::into_raw(arc);
+        arc.enqueue();
         return;
     }
 
@@ -218,14 +219,19 @@ extern "win64" fn slab_inline_poll(ctx: usize) {
 
     // Atomically IDLE -> QUEUED, then call slab_poll_trampoline which
     // does QUEUED -> POLLING and polls the future.
-    if !slot.try_enqueue() {
-        // If currently polling, try to upgrade to NOTIFIED
-        slot.try_notify();
-        return;
-    }
+    // Loop to handle the race where try_notify sees POLLING but the task
+    // transitions to IDLE before the POLLING->NOTIFIED CAS lands.
+    loop {
+        if slot.try_enqueue() {
+            slab.increment_ref(shard_idx, local_idx, generation);
+            slab_poll_trampoline(ctx);
+            return;
+        }
 
-    slab.increment_ref(shard_idx, local_idx, generation);
-    slab_poll_trampoline(ctx);
+        if slot.try_notify() {
+            return;
+        }
+    }
 }
 
 unsafe fn drop_slab_ctx(ctx: usize) {

@@ -307,14 +307,20 @@ impl TaskSlot {
 
     /// Try to notify: if POLLING, upgrade to NOTIFIED.
     /// Used by enqueue when IDLE->QUEUED fails.
+    /// Returns true if notification was delivered or unnecessary,
+    /// false if the state raced to IDLE and the caller should retry enqueue.
     #[inline]
-    pub fn try_notify(&self) {
-        let _ = self.state.compare_exchange(
+    pub fn try_notify(&self) -> bool {
+        match self.state.compare_exchange(
             STATE_POLLING,
             STATE_NOTIFIED,
             Ordering::AcqRel,
             Ordering::Relaxed,
-        );
+        ) {
+            Ok(_) => true,
+            Err(STATE_IDLE) => false,
+            Err(_) => true,
+        }
     }
 
     /// Try to transition IDLE -> POLLING for inline poll.
@@ -674,16 +680,21 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         return;
     };
 
-    // Try IDLE -> QUEUED
-    if slot.try_enqueue() {
-        slab.increment_ref(shard_idx, local_idx, generation);
-        let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-        submit_global(slab_poll_trampoline, encoded);
-        return;
-    }
+    loop {
+        // Try IDLE -> QUEUED
+        if slot.try_enqueue() {
+            slab.increment_ref(shard_idx, local_idx, generation);
+            let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
+            submit_global(slab_poll_trampoline, encoded);
+            return;
+        }
 
-    // If currently polling, upgrade to NOTIFIED
-    slot.try_notify();
+        // If currently polling, upgrade to NOTIFIED.
+        // Returns false if state raced to IDLE — retry the whole loop.
+        if slot.try_notify() {
+            return;
+        }
+    }
 }
 
 pub fn init_task_slab(config: SlabConfig) {
