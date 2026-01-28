@@ -1611,10 +1611,10 @@ pub fn used_memory() -> usize {
     0
 }
 
-const DEPTH: usize = 100;
-const ITERS: usize = 500_000;
+const DEPTH: usize = 1_000;
+const ITERS: usize = 50_000;
 
-const BLOCK_TASKS: usize = 500000;
+const BLOCK_TASKS: usize = 50000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -1832,37 +1832,225 @@ async fn bench_async_vs_sync_call_latency_async() {
         BLOCK_TASKS, q_ms, q_ms_frac, q_us_per_task
     );
 
-    // True multipliers
-    let async_vs_sync_1e3 = ratio_1e3(async_us_per_chain, sync_us_per_chain);
-    let blk_vs_async_1e3 = ratio_1e3(blk_us_per_chain, async_us_per_chain);
+    // Everything relative to sync baseline
+    let sm_vs_sync = ratio_1e3(async_us, sync_us);
+    let blk_vs_sync = ratio_1e3(blk_us, sync_us);
+    let blk_vs_blkq = ratio_1e3(blk_us, q_us);
 
-    // Overhead deltas (not multipliers)
-    let sm_over_us_per_chain = sub_i64(async_us_per_chain, sync_us_per_chain);
-    let pending_over_us_per_chain = sub_i64(blk_us_per_chain, async_us_per_chain);
+    // Isolate pure overhead costs (us per chain, relative to sync)
+    let sm_overhead_us = sub_i64(async_us_per_chain, sync_us_per_chain);
+    let blk_overhead_us = sub_i64(blk_us_per_chain, sync_us_per_chain);
+    // pending+wake = blk - async (the spawn/wake cost on top of state machine)
+    let pw_overhead_us = sub_i64(blk_us_per_chain, async_us_per_chain);
 
-    let sm_over_frac_1e3 = frac_1e3(sm_over_us_per_chain, sync_us_per_chain);
-    let pending_over_frac_1e3 = frac_1e3(pending_over_us_per_chain, async_us_per_chain);
-
+    println!("[bench] --- vs sync baseline ---");
     println!(
-        "[bench] x: async/sync = {}.{:03}x   blk/async = {}.{:03}x",
-        async_vs_sync_1e3 / 1000,
-        async_vs_sync_1e3 % 1000,
-        blk_vs_async_1e3 / 1000,
-        blk_vs_async_1e3 % 1000
-    );
-
-    println!(
-        "[bench] overhead: state_machine: {} us/chain (delta={} .{:03}x of sync)",
-        sm_over_us_per_chain,
-        sm_over_frac_1e3 / 1000,
-        (sm_over_frac_1e3 % 1000).abs()
+        "[bench] state_machine/sync  = {}.{:03}x  (async overhead: {} us/chain)",
+        sm_vs_sync / 1000,
+        sm_vs_sync % 1000,
+        sm_overhead_us
     );
     println!(
-        "[bench] overhead: pending+wake:  {} us/chain (delta={} .{:03}x of async)",
-        pending_over_us_per_chain,
-        pending_over_frac_1e3 / 1000,
-        (pending_over_frac_1e3 % 1000).abs()
+        "[bench] blk/sync            = {}.{:03}x  (spawn+wake+sm overhead: {} us/chain)",
+        blk_vs_sync / 1000,
+        blk_vs_sync % 1000,
+        blk_overhead_us
     );
+    let pw_vs_sync = ratio_1e3(blk_us_per_chain, async_us_per_chain);
+    println!(
+        "[bench] pending+wake/sync   = {}.{:03}x  (blk/async, pure spawn+wake cost)",
+        pw_vs_sync / 1000,
+        pw_vs_sync % 1000
+    );
+    println!(
+        "[bench] blk/blkq            = {}.{:03}x  (sequential blocking vs bulk queue)",
+        blk_vs_blkq / 1000,
+        blk_vs_blkq % 1000
+    );
+}
+
+// =====================
+// Realistic traffic benchmark
+// =====================
+
+// Simulates a driver-like workload: async setup -> blocking device work -> async postprocess
+// Runs at varying concurrency levels to find saturation point and measure scheduling overhead.
+
+const TRAFFIC_TOTAL_TASKS: usize = 10_000;
+const TRAFFIC_CONCURRENCY: &[usize] = &[1, 4, 8, 16, 32, 64, 128, 256, 512];
+const TRAFFIC_WORK_NS: u64 = 500; // simulated device work per blocking task
+const TRAFFIC_ASYNC_DEPTH: usize = 20; // async setup + postprocess depth
+
+pub fn bench_realistic_traffic() {
+    spawn_detached(async {
+        bench_realistic_traffic_async().await;
+    });
+}
+
+#[inline(never)]
+fn traffic_blocking_work(seed: u64) -> u64 {
+    // Simulate real device work: spin for TRAFFIC_WORK_NS then do a small compute
+    if TRAFFIC_WORK_NS > 0 {
+        crate::drivers::interrupt_index::wait_duration(Duration::from_nanos(TRAFFIC_WORK_NS));
+    }
+    let mut x = seed;
+    for _ in 0..100 {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+    }
+    x
+}
+
+#[inline(never)]
+async fn traffic_async_work(mut x: u64, depth: usize) -> u64 {
+    for _ in 0..depth {
+        x = async_leaf(x).await;
+    }
+    x
+}
+
+/// One "request": async setup -> spawn_blocking device work -> async postprocess
+#[inline(never)]
+async fn traffic_one_request(seed: u64) -> u64 {
+    // Phase 1: async setup (simulate parsing, validation, etc.)
+    let prepared = traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await;
+
+    // Phase 2: blocking device work
+    let device_result = spawn_blocking(move || traffic_blocking_work(prepared)).await;
+
+    // Phase 3: async postprocess (simulate response building, etc.)
+    let result = traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await;
+    result
+}
+
+/// One "request" using bulk queue for the blocking phase
+#[inline(never)]
+async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
+    let count = seeds.len();
+
+    // Phase 1: async setup for all
+    let mut prepared = Vec::with_capacity(count);
+    for &seed in &seeds {
+        prepared.push(traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await);
+    }
+
+    // Phase 2: blocking device work in bulk
+    let funcs: Vec<_> = prepared
+        .iter()
+        .map(|&p| move || traffic_blocking_work(p))
+        .collect();
+    let joins = spawn_blocking_many(funcs);
+    let device_results = JoinAll::new(joins).await;
+
+    // Phase 3: async postprocess for all
+    let mut results = Vec::with_capacity(count);
+    for device_result in device_results {
+        results.push(traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await);
+    }
+    results
+}
+
+async fn bench_realistic_traffic_async() {
+    println!("[traffic] === realistic traffic benchmark ===");
+    println!(
+        "[traffic] tasks={} work_ns={} async_depth={}",
+        TRAFFIC_TOTAL_TASKS, TRAFFIC_WORK_NS, TRAFFIC_ASYNC_DEPTH
+    );
+    println!(
+        "[traffic] {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "conc", "total_ms", "us/task", "ops/s", "vs_seq"
+    );
+
+    // Warmup
+    for i in 0..100u64 {
+        black_box(traffic_one_request(i).await);
+    }
+
+    // Baseline: fully sequential (concurrency=1)
+    let sw_seq = Stopwatch::start();
+    for i in 0..TRAFFIC_TOTAL_TASKS as u64 {
+        black_box(traffic_one_request(i).await);
+    }
+    let seq_us = sw_seq.elapsed_micros();
+    let seq_us_per_task = div_u64_round(seq_us, TRAFFIC_TOTAL_TASKS as u64);
+    let seq_ops_sec = if seq_us == 0 {
+        0
+    } else {
+        (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / seq_us as u128) as u64
+    };
+    let (seq_ms, seq_ms_frac) = ms_fixed_3(seq_us);
+
+    println!(
+        "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {:>10}",
+        1, seq_ms, seq_ms_frac, seq_us_per_task, seq_ops_sec, "1.000x"
+    );
+
+    // Concurrent: spawn N tasks at a time, process in waves
+    for &conc in TRAFFIC_CONCURRENCY {
+        if conc <= 1 {
+            continue;
+        }
+
+        let sw = Stopwatch::start();
+        let mut done = 0usize;
+
+        while done < TRAFFIC_TOTAL_TASKS {
+            let batch = (TRAFFIC_TOTAL_TASKS - done).min(conc);
+            let mut joins = Vec::with_capacity(batch);
+            for j in 0..batch {
+                let seed = (done + j) as u64;
+                joins.push(spawn(traffic_one_request(seed)));
+            }
+            let _results = JoinAll::new(joins).await;
+            done += batch;
+        }
+
+        let conc_us = sw.elapsed_micros();
+        let conc_us_per_task = div_u64_round(conc_us, TRAFFIC_TOTAL_TASKS as u64);
+        let conc_ops_sec = if conc_us == 0 {
+            0
+        } else {
+            (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / conc_us as u128) as u64
+        };
+        let (conc_ms, conc_ms_frac) = ms_fixed_3(conc_us);
+        let speedup = ratio_1e3(seq_us, conc_us);
+
+        println!(
+            "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
+            conc, conc_ms, conc_ms_frac, conc_us_per_task, conc_ops_sec,
+            speedup / 1000, speedup % 1000
+        );
+    }
+
+    // Bulk queue test: batch all blocking work together
+    println!("[traffic] --- bulk queue (batch blocking phase) ---");
+    let batch_sizes: &[usize] = &[64, 256, 1024, TRAFFIC_TOTAL_TASKS];
+    for &bs in batch_sizes {
+        let sw = Stopwatch::start();
+        let mut done = 0usize;
+
+        while done < TRAFFIC_TOTAL_TASKS {
+            let batch = (TRAFFIC_TOTAL_TASKS - done).min(bs);
+            let seeds: Vec<u64> = (done..done + batch).map(|i| i as u64).collect();
+            let _results = traffic_batch_request(seeds).await;
+            done += batch;
+        }
+
+        let bulk_us = sw.elapsed_micros();
+        let bulk_us_per_task = div_u64_round(bulk_us, TRAFFIC_TOTAL_TASKS as u64);
+        let bulk_ops_sec = if bulk_us == 0 {
+            0
+        } else {
+            (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / bulk_us as u128) as u64
+        };
+        let (bulk_ms, bulk_ms_frac) = ms_fixed_3(bulk_us);
+        let speedup = ratio_1e3(seq_us, bulk_us);
+
+        println!(
+            "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
+            bs, bulk_ms, bulk_ms_frac, bulk_us_per_task, bulk_ops_sec,
+            speedup / 1000, speedup % 1000
+        );
+    }
 }
 
 // =====================
