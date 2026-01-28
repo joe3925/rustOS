@@ -1612,9 +1612,9 @@ pub fn used_memory() -> usize {
 }
 
 const DEPTH: usize = 100;
-const ITERS: usize = 50_000;
+const ITERS: usize = 500_000;
 
-const BLOCK_TASKS: usize = 50000;
+const BLOCK_TASKS: usize = 500000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {

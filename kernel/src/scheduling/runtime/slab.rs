@@ -12,7 +12,7 @@ use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, Once};
@@ -20,6 +20,7 @@ use spin::{Mutex, Once};
 use crate::println;
 
 use super::runtime::submit_global;
+use super::task::{STATE_IDLE, STATE_QUEUED, STATE_POLLING, STATE_NOTIFIED, STATE_COMPLETED};
 
 const NUM_SHARDS: usize = 8;
 const DEFAULT_SLOTS_PER_SHARD: usize = 128;
@@ -207,9 +208,8 @@ pub struct SlabStats {
 pub struct TaskSlot {
     ref_count: AtomicU32,
     generation: AtomicU32,
-    queued: AtomicBool,
-    completed: AtomicBool,
-    _pad: [u8; 6],
+    state: AtomicU8,
+    _pad: [u8; 7],
     future: Mutex<Option<FutureStorage>>,
 }
 
@@ -218,25 +218,39 @@ impl TaskSlot {
         Self {
             ref_count: AtomicU32::new(0),
             generation: AtomicU32::new(0),
-            queued: AtomicBool::new(false),
-            completed: AtomicBool::new(false),
-            _pad: [0; 6],
+            state: AtomicU8::new(STATE_IDLE),
+            _pad: [0; 7],
             future: Mutex::new(None),
         }
     }
 
+    /// Initialize the slot with a future. Sets state to QUEUED since the
+    /// caller is expected to immediately submit this to the thread pool.
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
         let mut guard = self.future.lock();
         *guard = Some(FutureStorage::new(future));
-        self.queued.store(false, Ordering::Release);
-        self.completed.store(false, Ordering::Release);
+        self.state.store(STATE_QUEUED, Ordering::Release);
     }
 
-    pub fn poll_once(&self, waker: &Waker) -> bool {
-        self.queued.store(false, Ordering::Release);
+    /// Poll the task. Returns true if the task completed (or was already completed).
+    /// The caller must supply shard/local/generation so we can re-enqueue on NOTIFIED.
+    pub fn poll_once(
+        &self,
+        waker: &Waker,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool {
+        // Transition QUEUED -> POLLING
+        let prev = self.state.compare_exchange(
+            STATE_QUEUED,
+            STATE_POLLING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
 
-        if self.completed.load(Ordering::Acquire) {
-            return true;
+        if let Err(s) = prev {
+            return s == STATE_COMPLETED;
         }
 
         let mut cx = Context::from_waker(waker);
@@ -244,7 +258,7 @@ impl TaskSlot {
         let poll_res = {
             let mut guard = self.future.lock();
             let Some(fut) = guard.as_mut() else {
-                self.completed.store(true, Ordering::Release);
+                self.state.store(STATE_COMPLETED, Ordering::Release);
                 return true;
             };
             fut.poll(&mut cx)
@@ -253,26 +267,62 @@ impl TaskSlot {
         if let Poll::Ready(()) = poll_res {
             let mut guard = self.future.lock();
             *guard = None;
-            self.completed.store(true, Ordering::Release);
-            true
-        } else {
-            false
+            self.state.store(STATE_COMPLETED, Ordering::Release);
+            return true;
         }
+
+        // Pending — try POLLING -> IDLE
+        let prev = self.state.compare_exchange(
+            STATE_POLLING,
+            STATE_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+
+        if let Err(STATE_NOTIFIED) = prev {
+            // Wake arrived during poll — re-enqueue
+            self.state.store(STATE_QUEUED, Ordering::Release);
+            let slab = get_task_slab();
+            slab.increment_ref(shard_idx, local_idx, generation);
+            let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
+            submit_global(slab_poll_trampoline, encoded);
+        }
+
+        false
     }
 
     #[inline]
     pub fn is_completed(&self) -> bool {
-        self.completed.load(Ordering::Acquire)
+        self.state.load(Ordering::Acquire) == STATE_COMPLETED
     }
 
+    /// Try to transition IDLE -> QUEUED for enqueue.
+    /// Returns true if the transition succeeded.
     #[inline]
-    pub fn is_queued(&self) -> bool {
-        self.queued.load(Ordering::Acquire)
+    pub fn try_enqueue(&self) -> bool {
+        self.state
+            .compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
+    /// Try to notify: if POLLING, upgrade to NOTIFIED.
+    /// Used by enqueue when IDLE->QUEUED fails.
     #[inline]
-    pub fn try_set_queued(&self) -> bool {
-        !self.queued.swap(true, Ordering::AcqRel)
+    pub fn try_notify(&self) {
+        let _ = self.state.compare_exchange(
+            STATE_POLLING,
+            STATE_NOTIFIED,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Try to transition IDLE -> POLLING for inline poll.
+    #[inline]
+    pub fn try_start_inline_poll(&self) -> bool {
+        self.state
+            .compare_exchange(STATE_IDLE, STATE_POLLING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
@@ -611,7 +661,7 @@ pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
 
     let waker = super::waker::create_slab_waker(shard_idx, local_idx, generation);
 
-    let completed = slot.poll_once(&waker);
+    let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
 
     if completed {
         slab.decrement_ref(shard_idx, local_idx, generation);
@@ -624,18 +674,16 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         return;
     };
 
-    if slot.is_completed() {
+    // Try IDLE -> QUEUED
+    if slot.try_enqueue() {
+        slab.increment_ref(shard_idx, local_idx, generation);
+        let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
+        submit_global(slab_poll_trampoline, encoded);
         return;
     }
 
-    if !slot.try_set_queued() {
-        return;
-    }
-
-    slab.increment_ref(shard_idx, local_idx, generation);
-
-    let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-    submit_global(slab_poll_trampoline, encoded);
+    // If currently polling, upgrade to NOTIFIED
+    slot.try_notify();
 }
 
 pub fn init_task_slab(config: SlabConfig) {

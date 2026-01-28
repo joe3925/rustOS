@@ -1,7 +1,9 @@
 extern crate rand_xoshiro;
 
 use crate::alloc::format;
-use crate::benchmarking::{bench_async_vs_sync_call_latency, benchmark_async, BenchWindow};
+use crate::benchmarking::{
+    bench_async_vs_sync_call_latency, benchmark_async, benchmark_async_async, BenchWindow,
+};
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
@@ -175,9 +177,9 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     });
     spawn_blocking(|| {
         wait_duration(Duration::from_secs(10));
-        spawn_detached(async move { benchmark_async() });
+        spawn_detached(benchmark_async_async());
     });
-    //bench_async_vs_sync_call_latency();
+    // bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]

@@ -82,13 +82,15 @@ extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
         return;
     }
 
-    if arc.is_queued() {
+    // Atomically IDLE -> POLLING. If it fails, someone else owns this task.
+    if !arc.try_start_inline_poll() {
         let _ = Arc::into_raw(arc);
         return;
     }
 
-    arc.set_queued(true);
-    arc.poll_once();
+    // We are now in POLLING state. poll_once_inline handles the rest
+    // (polling the future, then transitioning to IDLE/COMPLETED/re-enqueue on NOTIFIED).
+    arc.poll_once_inline();
 }
 
 #[repr(C)]
@@ -214,7 +216,11 @@ extern "win64" fn slab_inline_poll(ctx: usize) {
         return;
     }
 
-    if !slot.try_set_queued() {
+    // Atomically IDLE -> QUEUED, then call slab_poll_trampoline which
+    // does QUEUED -> POLLING and polls the future.
+    if !slot.try_enqueue() {
+        // If currently polling, try to upgrade to NOTIFIED
+        slot.try_notify();
         return;
     }
 
