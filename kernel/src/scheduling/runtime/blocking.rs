@@ -17,6 +17,7 @@ use super::waker::{self, Continuation};
 const STATE_PENDING: u8 = 0;
 const STATE_COMPLETE: u8 = 1;
 const STATE_CONSUMED: u8 = 2;
+const STATE_RUNNING: u8 = 3;
 
 struct SharedTaskHeader<R> {
     result: UnsafeCell<MaybeUninit<R>>,
@@ -164,14 +165,25 @@ where
     }
 
     let task = unsafe { Arc::from_raw(ctx as *const SharedTask<F, R>) };
+    let header = &task.header;
+
+    // Ensure the blocking task runs at most once. If a steal path races a worker and
+    // re-enters with the same ctx, bail out instead of double-running and panicking.
+    if header
+        .state
+        .compare_exchange(STATE_PENDING, STATE_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
 
     // SAFETY: Only this worker thread accesses the function slot.
     let f = unsafe { (*task.future.get()).take() }.expect("blocking func missing");
     let result = f();
 
-    task.header.store_result(result);
+    header.store_result(result);
 
-    if let Some(cont_ptr) = task.header.take_continuation() {
+    if let Some(cont_ptr) = header.take_continuation() {
         run_continuation(cont_ptr);
     }
 }

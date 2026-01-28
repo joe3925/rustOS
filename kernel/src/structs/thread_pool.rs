@@ -74,7 +74,11 @@ impl ThreadPool {
             SCHEDULER.spawn_task(th);
         }
 
-        Self { shared, sender, receiver }
+        Self {
+            shared,
+            sender,
+            receiver,
+        }
     }
 
     pub fn submit(&self, function: JobFn, context: usize) {
@@ -171,7 +175,7 @@ extern "win64" fn worker_entry(ctx: usize) {
         let job = match receiver.recv() {
             Ok(job) => job,
             Err(_) => {
-                // Channel disconnected (all senders dropped) - exit
+                // Channel disconnected (all senders dropped)  exit
                 break;
             }
         };

@@ -175,11 +175,11 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
     });
-    spawn_blocking(|| {
-        wait_duration(Duration::from_secs(10));
-        spawn_detached(benchmark_async_async());
-    });
-    // bench_async_vs_sync_call_latency();
+    // spawn_blocking(|| {
+    //     wait_duration(Duration::from_secs(10));
+    //     spawn_detached(benchmark_async_async());
+    // });
+    bench_async_vs_sync_call_latency();
     println!("");
 }
 #[no_mangle]
