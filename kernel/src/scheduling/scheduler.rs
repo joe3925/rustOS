@@ -210,7 +210,9 @@ impl Scheduler {
         let id = self.register_task(task.clone());
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
-        self.enqueue_to_core(best_cpu, task);
+        without_interrupts(|| {
+            self.enqueue_to_core(best_cpu, task);
+        });
         id
     }
 
@@ -223,7 +225,9 @@ impl Scheduler {
         let id = self.register_task(task.clone());
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
-        self.enqueue_to_core(best_cpu, task);
+        without_interrupts(|| {
+            self.enqueue_to_core(best_cpu, task);
+        });
         id
     }
 
@@ -365,24 +369,26 @@ impl Scheduler {
 
                     task.set_target_cpu(best_cpu);
 
-                    if best_cpu != current_cpu_id() {
-                        self.enqueue_to_core_ipi(best_cpu, task.clone());
+                    without_interrupts(|| {
+                        if best_cpu != current_cpu_id() {
+                            self.enqueue_to_core_ipi(best_cpu, task.clone());
 
-                        if let Some(best_core) = self.core(best_cpu) {
-                            unsafe {
-                                APIC.lock().as_ref().map(|a| {
-                                    a.lapic.send_ipi(
-                                        IpiDest::ApicId(best_core.lapic_id),
-                                        IpiKind::Fixed {
-                                            vector: SCHED_IPI_VECTOR,
-                                        },
-                                    )
-                                });
+                            if let Some(best_core) = self.core(best_cpu) {
+                                unsafe {
+                                    APIC.lock().as_ref().map(|a| {
+                                        a.lapic.send_ipi(
+                                            IpiDest::ApicId(best_core.lapic_id),
+                                            IpiKind::Fixed {
+                                                vector: SCHED_IPI_VECTOR,
+                                            },
+                                        )
+                                    });
+                                }
                             }
+                        } else {
+                            self.enqueue_to_core(best_cpu, task.clone());
                         }
-                    } else {
-                        self.enqueue_to_core(best_cpu, task.clone());
-                    }
+                    });
 
                     return;
                 }

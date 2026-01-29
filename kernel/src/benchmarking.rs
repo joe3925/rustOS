@@ -1619,6 +1619,7 @@ const BLOCK_TASKS: usize = 50000;
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
         bench_async_vs_sync_call_latency_async().await;
+        bench_realistic_traffic_async().await;
     });
 }
 
@@ -1911,13 +1912,10 @@ async fn traffic_async_work(mut x: u64, depth: usize) -> u64 {
 /// One "request": async setup -> spawn_blocking device work -> async postprocess
 #[inline(never)]
 async fn traffic_one_request(seed: u64) -> u64 {
-    // Phase 1: async setup (simulate parsing, validation, etc.)
     let prepared = traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await;
 
-    // Phase 2: blocking device work
     let device_result = spawn_blocking(move || traffic_blocking_work(prepared)).await;
 
-    // Phase 3: async postprocess (simulate response building, etc.)
     let result = traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await;
     result
 }
@@ -1927,13 +1925,11 @@ async fn traffic_one_request(seed: u64) -> u64 {
 async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
     let count = seeds.len();
 
-    // Phase 1: async setup for all
     let mut prepared = Vec::with_capacity(count);
     for &seed in &seeds {
         prepared.push(traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await);
     }
 
-    // Phase 2: blocking device work in bulk
     let funcs: Vec<_> = prepared
         .iter()
         .map(|&p| move || traffic_blocking_work(p))
@@ -1941,7 +1937,6 @@ async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
     let joins = spawn_blocking_many(funcs);
     let device_results = JoinAll::new(joins).await;
 
-    // Phase 3: async postprocess for all
     let mut results = Vec::with_capacity(count);
     for device_result in device_results {
         results.push(traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await);
