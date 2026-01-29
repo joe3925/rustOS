@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::{forget, transmute_copy, ManuallyDrop};
@@ -11,6 +12,25 @@ use super::slab::{
 };
 use super::task::TaskPoll;
 
+// Bit 0 is reserved for slab pointers. Use bit 1 to tag Arc-based executor wakers.
+const TASK_WAKER_TAG: usize = 0b10;
+const TASK_WAKER_MASK: usize = !TASK_WAKER_TAG;
+
+#[inline]
+fn is_tagged(ptr: usize) -> bool {
+    ptr & TASK_WAKER_TAG != 0
+}
+
+#[inline]
+fn tag_arc_ptr<T>(arc: Arc<T>) -> *const () {
+    ((Arc::into_raw(arc) as usize) | TASK_WAKER_TAG) as *const ()
+}
+
+#[inline]
+unsafe fn untag_ptr<T>(ptr: *const ()) -> *const T {
+    ((ptr as usize) & TASK_WAKER_MASK) as *const T
+}
+
 // ============================================================================
 // Arc-based wakers (for JoinableTask<T> and fallback FutureTask)
 // ============================================================================
@@ -23,7 +43,7 @@ use super::task::TaskPoll;
 pub fn create_from_task_poll<T: TaskPoll + 'static>(task: Arc<T>) -> Waker {
     // Get the vtable for this specific type
     let vtable = vtable_for::<T>();
-    let ptr = Arc::into_raw(task) as *const ();
+    let ptr = tag_arc_ptr(task);
     unsafe { Waker::from_raw(RawWaker::new(ptr, &vtable.raw)) }
 }
 
@@ -49,34 +69,46 @@ fn vtable_for<T: TaskPoll + 'static>() -> &'static TaskWakerVtable {
 }
 
 unsafe fn clone_waker<T: TaskPoll + 'static>(ptr: *const ()) -> RawWaker {
-    Arc::increment_strong_count(ptr as *const T);
+    Arc::increment_strong_count(untag_ptr::<T>(ptr));
     RawWaker::new(ptr, &vtable_for::<T>().raw)
 }
 
 unsafe fn wake<T: TaskPoll + 'static>(ptr: *const ()) {
-    let arc = Arc::from_raw(ptr as *const T);
+    let arc = Arc::from_raw(untag_ptr::<T>(ptr));
     arc.enqueue();
 }
 
 unsafe fn wake_by_ref<T: TaskPoll + 'static>(ptr: *const ()) {
-    let arc = ManuallyDrop::new(Arc::from_raw(ptr as *const T));
+    let arc = ManuallyDrop::new(Arc::from_raw(untag_ptr::<T>(ptr)));
     arc.enqueue();
 }
 
 unsafe fn drop_waker<T: TaskPoll + 'static>(ptr: *const ()) {
-    drop(Arc::from_raw(ptr as *const T));
+    drop(Arc::from_raw(untag_ptr::<T>(ptr)));
 }
 
 unsafe fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
-    Arc::increment_strong_count(ptr as *const T);
+    Arc::increment_strong_count(untag_ptr::<T>(ptr));
 }
 
 unsafe fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
-    drop(Arc::from_raw(ctx as *const T));
+    drop(Arc::from_raw(untag_ptr::<T>(ctx as *const ())));
+}
+
+extern "win64" fn wake_waker_trampoline(ctx: usize) {
+    // ctx holds Box<Waker>
+    let w = unsafe { &*(ctx as *const Waker) };
+    w.wake_by_ref();
+}
+
+unsafe fn drop_waker_ctx(ctx: usize) {
+    drop(Box::from_raw(ctx as *mut Waker));
 }
 
 extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
-    let arc = unsafe { Arc::from_raw(ctx as *const T) };
+    // Borrow the continuation's ref without consuming it. run_continuation
+    // will call drop_fn to release the ref after we return.
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(untag_ptr::<T>(ctx as *const ())) });
 
     if arc.is_completed() {
         return;
@@ -92,7 +124,8 @@ extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
 
     // We are now in POLLING state. poll_once_inline handles the rest
     // (polling the future, then transitioning to IDLE/COMPLETED/re-enqueue on NOTIFIED).
-    arc.poll_once_inline();
+    // Clone the Arc so poll_once_inline has its own owned ref.
+    Arc::clone(&arc).poll_once_inline();
 }
 
 #[repr(C)]
@@ -140,6 +173,16 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     }
 
     // Arc-based waker with TaskWakerVtable layout
+    if !is_tagged(data) {
+        drop(drop_guard);
+        let boxed = Box::new(w.clone());
+        let ctx = Box::into_raw(boxed) as usize;
+        return Some(Continuation {
+            tramp: wake_waker_trampoline,
+            ctx,
+            drop_fn: drop_waker_ctx,
+        });
+    }
     let meta = vtable_ptr as *const _ as *const TaskWakerVtable;
     unsafe { ((*meta).clone_ctx)(data_ptr) };
     drop(drop_guard);

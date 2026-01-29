@@ -148,6 +148,10 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
         }
 
         if let Some(res) = header.take_result() {
+            // Result arrived after we registered a continuation. The worker
+            // may or may not have already taken it. Clean up whatever is left
+            // so we don't double-free or leak.
+            header.drop_continuation();
             Poll::Ready(res)
         } else {
             Poll::Pending
@@ -244,6 +248,9 @@ fn run_continuation(cont_ptr: usize) {
         (cont.tramp)(cont.ctx);
         remaining -= 1;
     }
+    // Release the continuation's refcount on ctx. The trampoline borrows
+    // ctx via ManuallyDrop and relies on us to drop the owning reference.
+    unsafe { (cont.drop_fn)(cont.ctx) };
     drop(cont);
 }
 

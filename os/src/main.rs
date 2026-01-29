@@ -50,7 +50,7 @@ fn main() {
                 "-machine",
                 "type=pc,accel=tcg",
                 "-smp",
-                "8",
+                "16",
                 "-gdb",
                 "tcp::1234",
                 "-S",

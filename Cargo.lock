@@ -339,6 +339,7 @@ dependencies = [
  "embedded-graphics",
  "goblin",
  "hashbrown",
+ "kernel_executor",
  "kernel_types",
  "lazy_static",
  "pc-keyboard",
@@ -351,6 +352,14 @@ dependencies = [
  "strum_macros",
  "toml",
  "x86_64 0.15.2",
+]
+
+[[package]]
+name = "kernel_executor"
+version = "0.1.0"
+dependencies = [
+ "kernel_types",
+ "spin 0.10.0",
 ]
 
 [[package]]

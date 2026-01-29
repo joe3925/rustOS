@@ -1744,7 +1744,7 @@ fn frac_1e3(part: i64, whole: u64) -> i64 {
     ((part as i128) * 1000i128 / (whole as i128)) as i64
 }
 
-async fn bench_async_vs_sync_call_latency_async() {
+pub async fn bench_async_vs_sync_call_latency_async() {
     let mut warm = 0u64;
     for _ in 0..10_000 {
         warm = sync_chain(warm);
@@ -1944,7 +1944,7 @@ async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
     results
 }
 
-async fn bench_realistic_traffic_async() {
+pub async fn bench_realistic_traffic_async() {
     println!("[traffic] === realistic traffic benchmark ===");
     println!(
         "[traffic] tasks={} work_ns={} async_depth={}",
