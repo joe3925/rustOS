@@ -4,11 +4,12 @@ use core::mem::{forget, transmute_copy, ManuallyDrop};
 use core::ptr;
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
+use crate::platform::JobFn;
+
 use super::slab::{
     decode_slab_ptr, encode_slab_ptr, enqueue_slab_task, get_task_slab, slab_poll_trampoline,
 };
 use super::task::TaskPoll;
-use crate::structs::thread_pool::JobFn;
 
 // ============================================================================
 // Arc-based wakers (for JoinableTask<T> and fallback FutureTask)

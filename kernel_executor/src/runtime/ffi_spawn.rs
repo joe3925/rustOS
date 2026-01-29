@@ -8,7 +8,7 @@ use spin::Mutex;
 
 use kernel_types::async_ffi::FfiFuture;
 
-use crate::scheduling::global_async::GlobalAsyncExecutor;
+use crate::global_async::GlobalAsyncExecutor;
 
 pub struct FfiTask {
     future: Mutex<Option<FfiFuture<()>>>,

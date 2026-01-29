@@ -6,7 +6,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use crate::scheduling::runtime::runtime::{try_steal_blocking_one, yield_now};
+use crate::runtime::runtime::try_steal_blocking_one;
 
 pub struct ThreadNotify {
     ready: AtomicBool,
@@ -46,7 +46,6 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => {
                 if !notify.take_ready() {
                     if !try_steal_blocking_one() {}
-                    //yield_now();
                 }
             }
         }

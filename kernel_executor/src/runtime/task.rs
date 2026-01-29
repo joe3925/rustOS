@@ -7,8 +7,8 @@ use core::task::{Context, Poll, Waker};
 
 use spin::Mutex;
 
-use crate::scheduling::runtime::runtime::submit_global;
-use crate::scheduling::runtime::waker;
+use super::runtime::submit_global;
+use super::waker;
 
 /// Task state machine. Transitions:
 ///   IDLE -> QUEUED      (enqueue: task submitted to thread pool)
@@ -54,9 +54,9 @@ impl FutureTask {
 
 impl TaskPoll for FutureTask {
     fn enqueue(self: &Arc<Self>) {
-        // Retry loop to handle the race between POLLING→IDLE and our
-        // POLLING→NOTIFIED attempt. Without the loop, observing POLLING
-        // then racing with the poll_once POLLING→IDLE transition causes
+        // Retry loop to handle the race between POLLING+IDLE and our
+        // POLLING+NOTIFIED attempt. Without the loop, observing POLLING
+        // then racing with the poll_once POLLING+IDLE transition causes
         // the NOTIFIED CAS to fail with IDLE, silently dropping the wake.
         loop {
             match self.state.compare_exchange_weak(
@@ -130,7 +130,7 @@ impl TaskPoll for FutureTask {
         );
 
         if let Err(STATE_NOTIFIED) = prev {
-            // Wake was called during poll — re-enqueue immediately.
+            // Wake was called during poll – re-enqueue immediately.
             // Transition NOTIFIED -> QUEUED and submit.
             self.state.store(STATE_QUEUED, Ordering::Release);
             let ptr = Arc::into_raw(self.clone()) as usize;
@@ -287,7 +287,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
             return;
         }
 
-        // Pending — transition POLLING -> IDLE, or handle NOTIFIED
+        // Pending – transition POLLING -> IDLE, or handle NOTIFIED
         let prev = self.state.compare_exchange(
             STATE_POLLING,
             STATE_IDLE,

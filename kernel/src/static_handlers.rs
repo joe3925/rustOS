@@ -56,7 +56,10 @@ use crate::{
     scheduling::{
         self,
         global_async::GlobalAsyncExecutor,
-        runtime::runtime::{BLOCKING_POOL, RUNTIME_POOL},
+        runtime::runtime::{
+            block_on as kernel_block_on, spawn as kernel_spawn, spawn_blocking as kernel_spawn_blocking,
+            spawn_detached as kernel_spawn_detached, BLOCKING_POOL, RUNTIME_POOL,
+        },
         scheduler::{TaskError, SCHEDULER},
         task::Task,
     },
@@ -543,6 +546,26 @@ pub extern "win64" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_l
 #[no_mangle]
 pub extern "win64" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
     scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
+    kernel_spawn_detached(async move {
+        fut.await;
+    });
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
+    kernel_block_on(fut);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize) {
+    // Wrap the raw trampoline in the kernel-side blocking executor
+    kernel_spawn_blocking(move || {
+        (trampoline)(ctx);
+    });
 }
 
 #[no_mangle]

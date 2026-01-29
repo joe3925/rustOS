@@ -10,9 +10,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll};
 use spin::Mutex;
 
-use crate::scheduling::runtime::runtime::{submit_blocking, submit_blocking_many};
-use crate::structs::thread_pool::Job;
-use super::waker::{self, Continuation};
+use crate::platform::Job;
+use crate::runtime::runtime::{submit_blocking, submit_blocking_many};
+use crate::runtime::waker::{self, Continuation};
 
 const STATE_PENDING: u8 = 0;
 const STATE_COMPLETE: u8 = 1;

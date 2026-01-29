@@ -17,10 +17,8 @@ use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, Once};
 
-use crate::println;
-
 use super::runtime::submit_global;
-use super::task::{STATE_IDLE, STATE_QUEUED, STATE_POLLING, STATE_NOTIFIED, STATE_COMPLETED};
+use super::task::{STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED};
 
 const NUM_SHARDS: usize = 8;
 const DEFAULT_SLOTS_PER_SHARD: usize = 128;
@@ -271,7 +269,7 @@ impl TaskSlot {
             return true;
         }
 
-        // Pending — try POLLING -> IDLE
+        // Pending – try POLLING -> IDLE
         let prev = self.state.compare_exchange(
             STATE_POLLING,
             STATE_IDLE,
@@ -280,7 +278,7 @@ impl TaskSlot {
         );
 
         if let Err(STATE_NOTIFIED) = prev {
-            // Wake arrived during poll — re-enqueue
+            // Wake arrived during poll – re-enqueue
             self.state.store(STATE_QUEUED, Ordering::Release);
             let slab = get_task_slab();
             slab.increment_ref(shard_idx, local_idx, generation);
@@ -690,7 +688,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         }
 
         // If currently polling, upgrade to NOTIFIED.
-        // Returns false if state raced to IDLE — retry the whole loop.
+        // Returns false if state raced to IDLE – retry the whole loop.
         if slot.try_notify() {
             return;
         }

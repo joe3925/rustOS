@@ -241,6 +241,9 @@ unsafe extern "win64" {
     // =========================================================================
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
     pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
+    pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
+    pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
+    pub fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize);
 
 }
 
