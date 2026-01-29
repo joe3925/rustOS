@@ -21,7 +21,7 @@ use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
-use kernel_types::irq::IrqSafeMutex;
+use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
@@ -102,7 +102,7 @@ impl TaskTable {
 }
 
 pub struct CoreScheduler {
-    sched_lock: IrqSafeMutex<SchedulerState>,
+    sched_lock: IrqSafeRwLock<SchedulerState>,
     run_queue: ArrayQueue<TaskHandle>,
     ipi_queue: ArrayQueue<TaskHandle>,
     idle_task: TaskHandle,
@@ -162,7 +162,7 @@ impl Scheduler {
         let idle_ptr = Arc::as_ptr(&idle) as *mut TaskRef;
 
         Arc::new(CoreScheduler {
-            sched_lock: IrqSafeMutex::new(SchedulerState { current: None }),
+            sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             run_queue: ArrayQueue::new(RUNQ_CAP),
             ipi_queue: ArrayQueue::new(IPIQ_CAP),
             idle_task: idle,
@@ -286,7 +286,7 @@ impl Scheduler {
 
     fn core_load_unlocked(&self, i: usize) -> Option<usize> {
         let core = self.core(i)?;
-        let guard = match core.sched_lock.try_lock() {
+        let guard = match core.sched_lock.try_read() {
             Some(g) => g,
             None => return None,
         };
@@ -452,7 +452,7 @@ impl Scheduler {
         };
 
         let current = {
-            let state = core.sched_lock.lock();
+            let state = core.sched_lock.read();
             match state.current.as_ref() {
                 Some(t) => t.clone(),
                 None => return,
@@ -468,7 +468,7 @@ impl Scheduler {
         }
 
         {
-            let mut _state = core.sched_lock.lock();
+            let _state = core.sched_lock.write();
 
             if current.consume_permit() {
                 return;
@@ -492,7 +492,7 @@ impl Scheduler {
         }
 
         let current = {
-            let state = core.sched_lock.lock();
+            let state = core.sched_lock.read();
             match state.current.as_ref() {
                 Some(t) => t.clone(),
                 None => return,
@@ -508,7 +508,7 @@ impl Scheduler {
         }
 
         {
-            let mut _state = core.sched_lock.lock();
+            let _state = core.sched_lock.write();
 
             if current.consume_permit() {
                 return;
@@ -534,7 +534,7 @@ impl Scheduler {
         self.maybe_balance();
 
         {
-            let sched_state = core.sched_lock.lock();
+            let sched_state = core.sched_lock.read();
             if let Some(ref cur) = sched_state.current {
                 let Some(mut guard) = cur.inner.try_write() else {
                     return;
@@ -563,7 +563,7 @@ impl Scheduler {
         core: &Arc<CoreScheduler>,
         now_cycles: u64,
     ) -> Option<TaskHandle> {
-        let mut sched_state = core.sched_lock.lock();
+        let mut sched_state = core.sched_lock.write();
 
         let previous = sched_state.current.take();
 
@@ -771,7 +771,7 @@ impl Scheduler {
         };
 
         let is_idle = {
-            let sched_state = core.sched_lock.lock();
+            let sched_state = core.sched_lock.read();
             match sched_state.current.as_ref() {
                 Some(t) => Arc::ptr_eq(t, &core.idle_task),
                 None => false,
@@ -811,7 +811,7 @@ impl Scheduler {
             }
 
             {
-                let mut sched_state = core.sched_lock.lock();
+                let mut sched_state = core.sched_lock.write();
                 sched_state.current = Some(cand.clone());
                 core.current_ptr
                     .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);

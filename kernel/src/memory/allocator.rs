@@ -27,10 +27,10 @@ use x86_64::{
 
 // #[global_allocator]
 // pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
-// #[global_allocator]
-// pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
 #[global_allocator]
-pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
+pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
+// #[global_allocator]
+// pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
 
 /// Global allocator wrapper that yields if another CPU is holding the lock
 /// instead of spinning with interrupts off.

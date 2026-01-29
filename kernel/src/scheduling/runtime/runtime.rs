@@ -8,8 +8,8 @@ use crate::static_handlers::task_yield;
 use crate::structs::thread_pool::{Job as TpJob, ThreadPool};
 
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(6));
-    pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(10));
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(2));
+    pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(2));
 }
 
 struct KernelExecutorPlatform;

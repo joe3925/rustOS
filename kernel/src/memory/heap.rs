@@ -4,11 +4,11 @@ use crate::memory::paging::tables::init_mapper;
 use crate::println;
 use crate::structs::linked_list::ListNode;
 use crate::util::boot_info;
-use x86_64::structures::paging::PageTableFlags;
+use x86_64::structures::paging::{PageSize, PageTableFlags, Size1GiB};
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
-pub const HEAP_SIZE: usize = 512 * 1024 * 1024;
+pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 2;
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
     let heap_size = align_up_4k(HEAP_SIZE as u64);
@@ -31,9 +31,4 @@ pub(crate) fn init_heap() {
         )
         .expect("Heap creation failed, can't recover")
     };
-
-    let heap_node = heap_start.as_mut_ptr() as *mut ListNode;
-    unsafe {
-        heap_node.write(ListNode::new(HEAP_SIZE));
-    }
 }

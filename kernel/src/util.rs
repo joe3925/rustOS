@@ -98,7 +98,7 @@ pub unsafe fn init() {
     BootInfoFrameAllocator::init_start(memory_map);
     {
         let _init_lock = INIT_LOCK.lock();
-        //init_heap();
+        init_heap();
         Screen::clear_framebuffer();
         load_idt();
 
@@ -180,13 +180,13 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
         PNP_MANAGER.init_from_registry().await;
 
-        bench_async_vs_sync_call_latency_async().await;
-        bench_realistic_traffic_async().await;
+        // bench_async_vs_sync_call_latency_async().await;
+        // bench_realistic_traffic_async().await;
     });
-    // spawn_blocking(|| {
-    //     wait_duration(Duration::from_secs(10));
-    //     spawn_detached(benchmark_async_async());
-    // });
+    spawn_blocking(|| {
+        wait_duration(Duration::from_secs(15));
+        spawn_detached(benchmark_async_async());
+    });
     println!("");
 }
 #[no_mangle]
@@ -266,7 +266,7 @@ pub fn trigger_breakpoint() {
 }
 
 pub fn test_full_heap() {
-    let element_count = (HEAP_SIZE / 4) / size_of::<u64>();
+    let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
     for i in 0..element_count {

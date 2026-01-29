@@ -9,10 +9,10 @@
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::mem::MaybeUninit;
+use core::mem::{align_of, MaybeUninit};
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, Once};
@@ -26,7 +26,7 @@ const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 /// Maximum size (in bytes) for inline future storage. Futures larger than this
 /// will be heap-allocated. Default: 128 bytes covers most simple async state machines.
-pub const INLINE_FUTURE_SIZE: usize = 256;
+pub const INLINE_FUTURE_SIZE: usize = 128;
 
 /// Required alignment for inline future storage.
 pub const INLINE_FUTURE_ALIGN: usize = 8;
@@ -93,7 +93,9 @@ impl FutureStorage {
         F: Future<Output = ()> + Send + 'static,
     {
         let size = core::mem::size_of::<F>();
-        if size <= INLINE_FUTURE_SIZE && size <= INLINE_FUTURE_ALIGN {
+        let align = align_of::<F>();
+
+        if size <= INLINE_FUTURE_SIZE && align <= INLINE_FUTURE_ALIGN {
             Self::new_inline(future)
         } else {
             Self::Boxed(Box::pin(future))
@@ -105,6 +107,11 @@ impl FutureStorage {
         F: Future<Output = ()> + Send + 'static,
     {
         let mut storage = InlineFutureBuffer::new();
+
+        debug_assert!(
+            align_of::<F>() <= INLINE_FUTURE_ALIGN,
+            "inline future alignment exceeded"
+        );
 
         // Safety: We've verified size and alignment requirements in the caller
         unsafe {
@@ -202,22 +209,44 @@ pub struct SlabStats {
     pub fallback_allocations: u64,
 }
 
+/// Packed generation (high 24 bits) + ref_count (low 8 bits) so that
+/// increment/decrement can atomically verify the generation in a single CAS.
+/// 24-bit generation matches the encoded-pointer width, avoiding truncation bugs.
+/// 8-bit ref_count is sufficient (max concurrent waker clones is far below 255).
 #[repr(C, align(64))]
 pub struct TaskSlot {
-    ref_count: AtomicU32,
-    generation: AtomicU32,
+    /// Layout: bits [31:8] = generation (24 bits), bits [7:0] = ref_count (8 bits)
+    gen_ref: AtomicU32,
     state: AtomicU8,
-    _pad: [u8; 7],
+    _pad: [u8; 3],
     future: Mutex<Option<FutureStorage>>,
+}
+
+const GEN_SHIFT: u32 = 8;
+const REF_MASK: u32 = 0xFF;
+const GEN_MASK: u32 = 0xFFFFFF;
+
+#[inline]
+fn pack_gen_ref(generation: u32, ref_count: u32) -> u32 {
+    ((generation & GEN_MASK) << GEN_SHIFT) | (ref_count & REF_MASK)
+}
+
+#[inline]
+fn unpack_gen(packed: u32) -> u32 {
+    (packed >> GEN_SHIFT) & GEN_MASK
+}
+
+#[inline]
+fn unpack_ref(packed: u32) -> u32 {
+    packed & REF_MASK
 }
 
 impl TaskSlot {
     const fn new() -> Self {
         Self {
-            ref_count: AtomicU32::new(0),
-            generation: AtomicU32::new(0),
+            gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
-            _pad: [0; 7],
+            _pad: [0; 3],
             future: Mutex::new(None),
         }
     }
@@ -299,7 +328,12 @@ impl TaskSlot {
     #[inline]
     pub fn try_enqueue(&self) -> bool {
         self.state
-            .compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
@@ -325,7 +359,12 @@ impl TaskSlot {
     #[inline]
     pub fn try_start_inline_poll(&self) -> bool {
         self.state
-            .compare_exchange(STATE_IDLE, STATE_POLLING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 }
@@ -493,12 +532,12 @@ impl TaskSlab {
             if let Some(local_idx) = shard.try_allocate() {
                 let slot = shard.get_slot(local_idx)?;
 
-                let gen = slot
-                    .generation
-                    .fetch_add(1, Ordering::AcqRel)
-                    .wrapping_add(1);
-
-                slot.ref_count.store(1, Ordering::Release);
+                // Bump generation and set ref_count=1 atomically.
+                // Old value's generation is incremented (mod 24 bits).
+                let old = slot.gen_ref.load(Ordering::Acquire);
+                let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
+                slot.gen_ref
+                    .store(pack_gen_ref(new_gen, 1), Ordering::Release);
 
                 self.total_allocations.fetch_add(1, Ordering::Relaxed);
 
@@ -506,7 +545,7 @@ impl TaskSlab {
                     slab: self,
                     shard_idx: shard_idx as u8,
                     local_idx: local_idx as u16,
-                    generation: gen,
+                    generation: new_gen,
                 });
             }
         }
@@ -529,21 +568,49 @@ impl TaskSlab {
             return None;
         }
         let slot = self.shards[shard_idx].get_slot(local_idx)?;
-        if slot.generation.load(Ordering::Acquire) != expected_gen {
+        let packed = slot.gen_ref.load(Ordering::Acquire);
+        if unpack_gen(packed) != (expected_gen & GEN_MASK) {
             return None;
         }
         Some(slot)
     }
 
+    /// Atomically increment the ref count, but only if the generation still matches.
+    /// Uses a CAS loop on the packed gen_ref field so that a concurrent
+    /// deallocation + reallocation (which changes the generation) is detected.
     pub fn increment_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) -> bool {
-        if let Some(slot) = self.get_slot(shard_idx, local_idx, expected_gen) {
-            slot.ref_count.fetch_add(1, Ordering::AcqRel);
-            true
-        } else {
-            false
+        if shard_idx >= NUM_SHARDS {
+            return false;
+        }
+        let shard = &self.shards[shard_idx];
+        let Some(slot) = shard.get_slot(local_idx) else {
+            return false;
+        };
+
+        let expected_gen = expected_gen & GEN_MASK;
+        loop {
+            let cur = slot.gen_ref.load(Ordering::Acquire);
+            if unpack_gen(cur) != expected_gen {
+                return false;
+            }
+            let rc = unpack_ref(cur);
+            debug_assert!(rc < REF_MASK, "slab ref_count overflow");
+            let new = pack_gen_ref(expected_gen, rc + 1);
+            match slot.gen_ref.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(v) if unpack_gen(v) != expected_gen => return false,
+                Err(_) => continue, // ref_count changed, retry
+            }
         }
     }
 
+    /// Atomically decrement the ref count, but only if the generation still matches.
+    /// If this was the last reference, drops the future and frees the slot.
     pub fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
         if shard_idx >= NUM_SHARDS {
             return;
@@ -554,17 +621,37 @@ impl TaskSlab {
             return;
         };
 
-        if slot.generation.load(Ordering::Acquire) != expected_gen {
-            return;
-        }
-
-        let prev = slot.ref_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
-            {
-                let mut guard = slot.future.lock();
-                *guard = None;
+        let expected_gen = expected_gen & GEN_MASK;
+        loop {
+            let cur = slot.gen_ref.load(Ordering::Acquire);
+            if unpack_gen(cur) != expected_gen {
+                return; // slot was already freed and possibly reallocated
             }
-            shard.deallocate(local_idx);
+            let rc = unpack_ref(cur);
+            if rc == 0 {
+                return; // already fully released
+            }
+            let new = pack_gen_ref(expected_gen, rc - 1);
+            match slot.gen_ref.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if rc == 1 {
+                        // We took the last ref — clean up.
+                        {
+                            let mut guard = slot.future.lock();
+                            *guard = None;
+                        }
+                        shard.deallocate(local_idx);
+                    }
+                    return;
+                }
+                Err(v) if unpack_gen(v) != expected_gen => return,
+                Err(_) => continue,
+            }
         }
     }
 
