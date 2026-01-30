@@ -351,6 +351,7 @@ impl TaskSlot {
         ) {
             Ok(_) => true,
             Err(STATE_IDLE) => false,
+            Err(STATE_QUEUED) => true, // already enqueued, wake is redundant
             Err(_) => true,
         }
     }
@@ -596,12 +597,10 @@ impl TaskSlab {
             let rc = unpack_ref(cur);
             debug_assert!(rc < REF_MASK, "slab ref_count overflow");
             let new = pack_gen_ref(expected_gen, rc + 1);
-            match slot.gen_ref.compare_exchange_weak(
-                cur,
-                new,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match slot
+                .gen_ref
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return true,
                 Err(v) if unpack_gen(v) != expected_gen => return false,
                 Err(_) => continue, // ref_count changed, retry
@@ -632,12 +631,10 @@ impl TaskSlab {
                 return; // already fully released
             }
             let new = pack_gen_ref(expected_gen, rc - 1);
-            match slot.gen_ref.compare_exchange_weak(
-                cur,
-                new,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match slot
+                .gen_ref
+                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     if rc == 1 {
                         // We took the last ref — clean up.
@@ -694,6 +691,9 @@ impl<'a> SlotHandle<'a> {
         let shard = &self.slab.shards[self.shard_idx as usize];
         if let Some(slot) = shard.get_slot(self.local_idx as usize) {
             slot.init(future);
+            // Bump ref for the queued poll (allocate gave us rc=1 as the base ref;
+            // the queue submission needs its own ref that slab_poll_trampoline will release).
+            self.slab.increment_ref(self.shard_idx as usize, self.local_idx as usize, self.generation);
             let encoded = encode_slab_ptr(self.shard_idx, self.local_idx, self.generation);
             submit_global(slab_poll_trampoline, encoded);
         }
@@ -754,7 +754,14 @@ pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
 
     let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
 
+    // Always release the queue-owned ref. Every enqueue path (enqueue_slab_task,
+    // poll_once re-enqueue on NOTIFIED, slab_inline_poll, init_and_enqueue) bumps
+    // the refcount for the queued poll; we consume that ref here regardless of
+    // whether the future completed or returned Pending.
+    slab.decrement_ref(shard_idx, local_idx, generation);
+
     if completed {
+        // The base task ref (from allocate) is also released on completion.
         slab.decrement_ref(shard_idx, local_idx, generation);
     }
 }
