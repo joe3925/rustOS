@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -7,12 +6,11 @@ use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicU8, Ordering};
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
 use crate::platform::Job;
 use crate::runtime::runtime::{submit_blocking, submit_blocking_many};
-use crate::runtime::waker::{self, Continuation};
 
 const STATE_PENDING: u8 = 0;
 const STATE_COMPLETE: u8 = 1;
@@ -22,7 +20,7 @@ const STATE_RUNNING: u8 = 3;
 struct SharedTaskHeader<R> {
     result: UnsafeCell<MaybeUninit<R>>,
     state: AtomicU8,
-    cont: Mutex<Option<usize>>,
+    waker: Mutex<Option<Waker>>,
 }
 
 impl<R> SharedTaskHeader<R> {
@@ -30,7 +28,7 @@ impl<R> SharedTaskHeader<R> {
         Self {
             result: UnsafeCell::new(MaybeUninit::uninit()),
             state: AtomicU8::new(STATE_PENDING),
-            cont: Mutex::new(None),
+            waker: Mutex::new(None),
         }
     }
 
@@ -52,22 +50,24 @@ impl<R> SharedTaskHeader<R> {
         Some(unsafe { (*self.result.get()).assume_init_read() })
     }
 
-    fn register_continuation(&self, cont: usize) {
-        let mut guard = self.cont.lock();
-        if let Some(prev) = guard.replace(cont) {
-            drop_continuation(prev, true);
+    fn register_waker(&self, waker: &Waker) {
+        let mut guard = self.waker.lock();
+        let replace = match guard.as_ref() {
+            Some(current) => !current.will_wake(waker),
+            None => true,
+        };
+
+        if replace {
+            *guard = Some(waker.clone());
         }
     }
 
-    fn take_continuation(&self) -> Option<usize> {
-        let mut guard = self.cont.lock();
-        guard.take()
+    fn take_waker(&self) -> Option<Waker> {
+        self.waker.lock().take()
     }
 
-    fn drop_continuation(&self) {
-        if let Some(prev) = self.take_continuation() {
-            drop_continuation(prev, true);
-        }
+    fn drop_waker(&self) {
+        self.waker.lock().take();
     }
 }
 
@@ -97,7 +97,7 @@ impl<R> Drop for SharedTaskHeader<R> {
             // SAFETY: result was initialized if state == COMPLETE.
             unsafe { (*self.result.get()).assume_init_drop() };
         }
-        self.drop_continuation();
+        self.drop_waker();
     }
 }
 
@@ -124,7 +124,7 @@ impl<R> Drop for BlockingJoin<R> {
         if self.ptr.is_null() {
             return;
         }
-        unsafe { (&*self.ptr).drop_continuation() };
+        unsafe { (&*self.ptr).drop_waker() };
         (self.drop_fn)(self.ptr);
         self.ptr = ptr::null();
     }
@@ -142,16 +142,12 @@ impl<R: Send + 'static> Future for BlockingJoin<R> {
             return Poll::Ready(res);
         }
 
-        if let Some(cont) = waker::continuation_from_waker(cx.waker()) {
-            let boxed = Box::into_raw(Box::new(cont));
-            header.register_continuation(boxed as usize);
-        }
+        header.register_waker(cx.waker());
 
         if let Some(res) = header.take_result() {
-            // Result arrived after we registered a continuation. The worker
-            // may or may not have already taken it. Clean up whatever is left
-            // so we don't double-free or leak.
-            header.drop_continuation();
+            // Result arrived after we registered the waker. Clear any stored
+            // waker to avoid keeping an unnecessary ref alive.
+            header.drop_waker();
             Poll::Ready(res)
         } else {
             Poll::Pending
@@ -187,8 +183,8 @@ where
 
     header.store_result(result);
 
-    if let Some(cont_ptr) = header.take_continuation() {
-        run_continuation(cont_ptr);
+    if let Some(w) = header.take_waker() {
+        w.wake();
     }
 }
 
@@ -234,33 +230,4 @@ where
 
     submit_blocking_many(&jobs);
     joins
-}
-
-const ASSIST_BUDGET: usize = 1;
-
-fn run_continuation(cont_ptr: usize) {
-    if cont_ptr == 0 {
-        return;
-    }
-    let cont = unsafe { Box::from_raw(cont_ptr as *mut Continuation) };
-    let mut remaining = ASSIST_BUDGET;
-    if remaining > 0 {
-        (cont.tramp)(cont.ctx);
-        remaining -= 1;
-    }
-    // Release the continuation's refcount on ctx. The trampoline borrows
-    // ctx via ManuallyDrop and relies on us to drop the owning reference.
-    unsafe { (cont.drop_fn)(cont.ctx) };
-    drop(cont);
-}
-
-fn drop_continuation(ptr: usize, call_drop: bool) {
-    if ptr == 0 {
-        return;
-    }
-    let cont = unsafe { Box::from_raw(ptr as *mut Continuation) };
-    if call_drop {
-        unsafe { (cont.drop_fn)(cont.ctx) };
-    }
-    drop(cont);
 }

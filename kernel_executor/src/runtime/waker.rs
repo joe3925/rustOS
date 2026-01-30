@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::any::TypeId;
 use core::marker::PhantomData;
 use core::mem::{forget, transmute_copy, ManuallyDrop};
 use core::ptr;
@@ -200,7 +201,7 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
 
 /// Static vtable for slab-allocated task wakers.
 static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    slab_clone_waker,
+    slab_clone_waker::<u64>,
     slab_wake,
     slab_wake_by_ref,
     slab_drop_waker,
@@ -215,10 +216,13 @@ pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) ->
     unsafe { Waker::from_raw(RawWaker::new(encoded as *const (), &SLAB_WAKER_VTABLE)) }
 }
 
-unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
+unsafe fn slab_clone_waker<T: 'static>(ptr: *const ()) -> RawWaker {
+    let id = TypeId::of::<T>();
+    if id != TypeId::of::<u64>() {}
     let encoded = ptr as usize;
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
-        get_task_slab().increment_ref(shard_idx, local_idx, generation);
+        let slab = get_task_slab();
+        slab.increment_ref(shard_idx, local_idx, generation);
     }
     RawWaker::new(ptr, &SLAB_WAKER_VTABLE)
 }
