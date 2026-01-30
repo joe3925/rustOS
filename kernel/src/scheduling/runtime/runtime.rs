@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use kernel_executor::platform::{self as exec_platform, ExecutorPlatform, Job};
 use kernel_executor::runtime::runtime as exec_runtime;
 
-use crate::static_handlers::task_yield;
+use crate::static_handlers::{print, task_yield};
 use crate::structs::thread_pool::{Job as TpJob, ThreadPool};
 
 lazy_static::lazy_static! {
@@ -37,6 +37,9 @@ impl ExecutorPlatform for KernelExecutorPlatform {
 
     fn yield_now(&self) {
         unsafe { task_yield() };
+    }
+    fn print(&self, string: &str) {
+        print(string);
     }
 }
 

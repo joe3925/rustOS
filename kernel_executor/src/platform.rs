@@ -17,9 +17,9 @@ pub trait ExecutorPlatform: Send + Sync {
     fn submit_blocking_many(&self, jobs: &[Job]);
     fn try_steal_blocking_one(&self) -> bool;
     fn yield_now(&self);
+    fn print(&self, string: &str);
 }
-
-static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();
+pub static PLATFORM: Once<&'static dyn ExecutorPlatform> = Once::new();
 
 /// Install the platform callbacks. Must be called exactly once by the kernel.
 pub fn init(platform: &'static dyn ExecutorPlatform) {

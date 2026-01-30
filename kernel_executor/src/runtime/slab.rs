@@ -17,6 +17,8 @@ use core::task::{Context, Poll, Waker};
 
 use spin::{Mutex, Once};
 
+use crate::println;
+
 use super::runtime::submit_global;
 use super::task::{STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED};
 
@@ -209,22 +211,24 @@ pub struct SlabStats {
     pub fallback_allocations: u64,
 }
 
-/// Packed generation (high 24 bits) + ref_count (low 8 bits) so that
+/// Packed generation (high 16 bits) + ref_count (low 16 bits) so that
 /// increment/decrement can atomically verify the generation in a single CAS.
-/// 24-bit generation matches the encoded-pointer width, avoiding truncation bugs.
-/// 8-bit ref_count is sufficient (max concurrent waker clones is far below 255).
+/// 16-bit ref_count allows up to 65535 concurrent waker clones.
+///
+// TODO: this is a very temp fix. the ref count for wakers on the slab leaks severely and must be corrected at some point.
+// this fix will fail for joinAll with tasks greater then 0xffff
 #[repr(C, align(64))]
 pub struct TaskSlot {
-    /// Layout: bits [31:8] = generation (24 bits), bits [7:0] = ref_count (8 bits)
+    /// Layout: bits [31:16] = generation (16 bits), bits [15:0] = ref_count (16 bits)
     gen_ref: AtomicU32,
     state: AtomicU8,
     _pad: [u8; 3],
     future: Mutex<Option<FutureStorage>>,
 }
 
-const GEN_SHIFT: u32 = 8;
-const REF_MASK: u32 = 0xFF;
-const GEN_MASK: u32 = 0xFFFFFF;
+const GEN_SHIFT: u32 = 16;
+const REF_MASK: u32 = 0xFFFF;
+const GEN_MASK: u32 = 0xFFFF;
 
 #[inline]
 fn pack_gen_ref(generation: u32, ref_count: u32) -> u32 {
@@ -693,7 +697,11 @@ impl<'a> SlotHandle<'a> {
             slot.init(future);
             // Bump ref for the queued poll (allocate gave us rc=1 as the base ref;
             // the queue submission needs its own ref that slab_poll_trampoline will release).
-            self.slab.increment_ref(self.shard_idx as usize, self.local_idx as usize, self.generation);
+            self.slab.increment_ref(
+                self.shard_idx as usize,
+                self.local_idx as usize,
+                self.generation,
+            );
             let encoded = encode_slab_ptr(self.shard_idx, self.local_idx, self.generation);
             submit_global(slab_poll_trampoline, encoded);
         }
