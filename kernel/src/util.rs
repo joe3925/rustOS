@@ -176,17 +176,17 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     GLOBAL_WINDOW.start();
 
     spawn_detached(async move {
-        install_prepacked_drivers().await;
+        // install_prepacked_drivers().await;
 
-        PNP_MANAGER.init_from_registry().await;
+        // PNP_MANAGER.init_from_registry().await;
 
-        // bench_async_vs_sync_call_latency_async().await;
-        // bench_realistic_traffic_async().await;
+        bench_async_vs_sync_call_latency_async().await;
+        bench_realistic_traffic_async().await;
     });
-    spawn_blocking(|| {
-        wait_duration(Duration::from_secs(15));
-        spawn_detached(benchmark_async_async());
-    });
+    // spawn_blocking(|| {
+    //     wait_duration(Duration::from_secs(15));
+    //     spawn_detached(benchmark_async_async());
+    // });
     println!("");
 }
 #[no_mangle]
