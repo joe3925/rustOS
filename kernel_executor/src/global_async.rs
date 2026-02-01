@@ -15,11 +15,14 @@ struct WorkItem {
 
 const MAX_SHARDS: usize = 8;
 
+#[repr(align(64))]
+struct CacheAligned(AtomicUsize);
+
 struct ShardedQueues {
     queues: Vec<SegQueue<WorkItem>>,
-    active: AtomicUsize,
-    enqueue_hint: AtomicUsize,
-    pump_hint: AtomicUsize,
+    active: CacheAligned,
+    enqueue_hint: CacheAligned,
+    pump_hint: CacheAligned,
 }
 
 impl ShardedQueues {
@@ -32,24 +35,24 @@ impl ShardedQueues {
 
         Self {
             queues,
-            active: AtomicUsize::new(shard_count),
-            enqueue_hint: AtomicUsize::new(0),
-            pump_hint: AtomicUsize::new(0),
+            active: CacheAligned(AtomicUsize::new(shard_count)),
+            enqueue_hint: CacheAligned(AtomicUsize::new(0)),
+            pump_hint: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
     fn set_active(&self, shards: usize) {
         let capped = shards.clamp(1, self.queues.len());
-        self.active.store(capped, Ordering::Release);
+        self.active.0.store(capped, Ordering::Release);
     }
 
     fn shard_count(&self) -> usize {
-        self.active.load(Ordering::Acquire)
+        self.active.0.load(Ordering::Acquire)
     }
 
     fn push(&self, item: WorkItem) {
         let shards = self.shard_count();
-        let idx = self.enqueue_hint.fetch_add(1, Ordering::Relaxed) % shards;
+        let idx = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
         self.queues[idx].push(item);
     }
 
@@ -76,14 +79,14 @@ impl ShardedQueues {
 
     fn next_pump_hint(&self) -> usize {
         let shards = self.shard_count();
-        self.pump_hint.fetch_add(1, Ordering::Relaxed) % shards
+        self.pump_hint.0.fetch_add(1, Ordering::Relaxed) % shards
     }
 }
 
 pub struct GlobalAsyncExecutor {
     queues: ShardedQueues,
-    active_pumps: AtomicUsize,
-    max_pumps: AtomicUsize,
+    active_pumps: CacheAligned,
+    max_pumps: CacheAligned,
 }
 
 impl GlobalAsyncExecutor {
@@ -91,14 +94,14 @@ impl GlobalAsyncExecutor {
         static EXEC: Once<GlobalAsyncExecutor> = Once::new();
         EXEC.call_once(|| GlobalAsyncExecutor {
             queues: ShardedQueues::new(MAX_SHARDS),
-            active_pumps: AtomicUsize::new(0),
-            max_pumps: AtomicUsize::new(1),
+            active_pumps: CacheAligned(AtomicUsize::new(0)),
+            max_pumps: CacheAligned(AtomicUsize::new(1)),
         })
     }
 
     pub fn init(&self, n: usize) {
         let n = if n == 0 { 1 } else { n };
-        self.max_pumps.store(n, Ordering::Release);
+        self.max_pumps.0.store(n, Ordering::Release);
         self.queues.set_active(n);
         self.try_schedule();
     }
@@ -109,8 +112,8 @@ impl GlobalAsyncExecutor {
     }
 
     fn try_schedule(&self) {
-        let max = self.max_pumps.load(Ordering::Acquire);
-        let active = self.active_pumps.load(Ordering::Acquire);
+        let max = self.max_pumps.0.load(Ordering::Acquire);
+        let active = self.active_pumps.0.load(Ordering::Acquire);
         if active >= max {
             return;
         }
@@ -123,17 +126,17 @@ impl GlobalAsyncExecutor {
     }
 
     fn try_enter_pump(&self) -> bool {
-        let max = self.max_pumps.load(Ordering::Acquire);
-        let prev = self.active_pumps.fetch_add(1, Ordering::AcqRel);
+        let max = self.max_pumps.0.load(Ordering::Acquire);
+        let prev = self.active_pumps.0.fetch_add(1, Ordering::AcqRel);
         if prev + 1 > max {
-            self.active_pumps.fetch_sub(1, Ordering::AcqRel);
+            self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
             return false;
         }
         true
     }
 
     fn exit_pump(&self) {
-        self.active_pumps.fetch_sub(1, Ordering::AcqRel);
+        self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn pump(&self, start_hint: usize) {

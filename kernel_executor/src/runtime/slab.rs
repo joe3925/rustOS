@@ -42,19 +42,19 @@ static mut TASK_SLAB_STORAGE: MaybeUninit<TaskSlab> = MaybeUninit::uninit();
 /// Properly aligned buffer for inline future storage.
 #[repr(C, align(8))]
 struct InlineFutureBuffer {
-    data: [u8; INLINE_FUTURE_SIZE],
+    data: MaybeUninit<[u8; INLINE_FUTURE_SIZE]>,
 }
 
 impl InlineFutureBuffer {
     const fn new() -> Self {
         Self {
-            data: [0u8; INLINE_FUTURE_SIZE],
+            data: MaybeUninit::uninit(),
         }
     }
 
     #[inline]
     fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr()
+        self.data.as_mut_ptr() as *mut u8
     }
 }
 
