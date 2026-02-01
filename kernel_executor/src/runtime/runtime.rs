@@ -1,8 +1,11 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
+use core::mem::ManuallyDrop;
 use core::pin::Pin;
-use core::task::{Context, Poll};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use spin::Mutex;
 
 pub use super::block_on::block_on;
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
@@ -61,7 +64,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
         if let Some(result) = self.task.take_result() {
             Poll::Ready(result)
         } else {
-            self.task.set_waker(cx.waker().clone());
+            self.task.update_waker(cx.waker());
             // Check again in case result arrived between take_result and set_waker
             if let Some(result) = self.task.take_result() {
                 Poll::Ready(result)
@@ -99,18 +102,89 @@ enum FutureSlot<F: Future> {
     Done(Option<F::Output>),
 }
 
+/// Shared notifier that holds exactly one parent waker.
+/// Children receive a lightweight proxy waker backed by this notifier;
+/// cloning the proxy only bumps the Arc refcount, not the parent waker's.
+struct SharedNotifier {
+    parent: Mutex<Option<Waker>>,
+}
+
+unsafe fn notifier_clone(ptr: *const ()) -> RawWaker {
+    Arc::increment_strong_count(ptr as *const SharedNotifier);
+    RawWaker::new(ptr, &NOTIFIER_VTABLE)
+}
+
+unsafe fn notifier_wake(ptr: *const ()) {
+    let arc = Arc::from_raw(ptr as *const SharedNotifier);
+    let guard = arc.parent.lock();
+    if let Some(w) = guard.as_ref() {
+        w.wake_by_ref();
+    }
+    drop(guard);
+}
+
+unsafe fn notifier_wake_by_ref(ptr: *const ()) {
+    let arc = ManuallyDrop::new(Arc::from_raw(ptr as *const SharedNotifier));
+    let guard = arc.parent.lock();
+    if let Some(w) = guard.as_ref() {
+        w.wake_by_ref();
+    }
+    drop(guard);
+}
+
+unsafe fn notifier_drop(ptr: *const ()) {
+    drop(Arc::from_raw(ptr as *const SharedNotifier));
+}
+
+static NOTIFIER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    notifier_clone,
+    notifier_wake,
+    notifier_wake_by_ref,
+    notifier_drop,
+);
+
+impl SharedNotifier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parent: Mutex::new(None),
+        })
+    }
+
+    /// Update the stored parent waker, skipping the clone if it already matches.
+    fn update_parent(&self, waker: &Waker) {
+        let mut guard = self.parent.lock();
+        if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
+            *guard = Some(waker.clone());
+        }
+    }
+
+    /// Create a proxy Waker backed by this notifier Arc.
+    /// The caller's Arc ref is transferred into the waker.
+    fn into_waker(self: Arc<Self>) -> Waker {
+        let ptr = Arc::into_raw(self) as *const ();
+        unsafe { Waker::from_raw(RawWaker::new(ptr, &NOTIFIER_VTABLE)) }
+    }
+}
+
 /// Joins multiple futures of the same type, returning their results in order.
 /// Stores futures inline without boxing, saving one heap allocation per future.
+/// Uses a shared notifier so children receive a lightweight proxy waker instead
+/// of each cloning the parent waker.
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
     remaining: usize,
+    notifier: Arc<SharedNotifier>,
 }
 
 impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
         let remaining = fs.len();
         let slots = fs.into_iter().map(FutureSlot::Running).collect();
-        Self { slots, remaining }
+        Self {
+            slots,
+            remaining,
+            notifier: SharedNotifier::new(),
+        }
     }
 }
 
@@ -132,12 +206,17 @@ impl<F: Future> Future for JoinAll<F> {
             return Poll::Ready(out);
         }
 
+        // Store the parent waker once; children get a cheap proxy.
+        this.notifier.update_parent(cx.waker());
+        let proxy = this.notifier.clone().into_waker();
+        let proxy_cx = &mut Context::from_waker(&proxy);
+
         for slot in this.slots.iter_mut() {
             if let FutureSlot::Running(fut) = slot {
                 // SAFETY: The future is stored inline in the Vec which is pinned.
                 // We don't move it, we just poll it in place.
                 let pinned = unsafe { Pin::new_unchecked(fut) };
-                match pinned.poll(cx) {
+                match pinned.poll(proxy_cx) {
                     Poll::Ready(result) => {
                         *slot = FutureSlot::Done(Some(result));
                         this.remaining -= 1;

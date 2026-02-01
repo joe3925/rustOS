@@ -213,10 +213,8 @@ pub struct SlabStats {
 
 /// Packed generation (high 16 bits) + ref_count (low 16 bits) so that
 /// increment/decrement can atomically verify the generation in a single CAS.
-/// 16-bit ref_count allows up to 65535 concurrent waker clones.
-///
-// TODO: this is a very temp fix. the ref count for wakers on the slab leaks severely and must be corrected at some point.
-// this fix will fail for joinAll with tasks greater then 0xffff
+/// Refcount is managed only by structural anchor refs (enqueue/dequeue paths
+/// and continuations), not by waker clone/drop. Typical peak is ~3-4 refs.
 #[repr(C, align(64))]
 pub struct TaskSlot {
     /// Layout: bits [31:16] = generation (16 bits), bits [15:0] = ref_count (16 bits)

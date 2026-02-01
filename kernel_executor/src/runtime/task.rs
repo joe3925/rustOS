@@ -212,6 +212,16 @@ impl<T: Send + 'static> JoinableTask<T> {
     pub fn set_waker(&self, waker: Waker) {
         *self.waker.lock() = Some(waker);
     }
+
+    /// Store a waker only if the currently stored one wouldn't wake the same task.
+    /// Avoids redundant clones when the same parent waker is passed repeatedly
+    /// (e.g., from JoinAll polling N children with the same context).
+    pub fn update_waker(&self, waker: &Waker) {
+        let mut guard = self.waker.lock();
+        if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
+            *guard = Some(waker.clone());
+        }
+    }
 }
 
 impl<T: Send + 'static> TaskPoll for JoinableTask<T> {

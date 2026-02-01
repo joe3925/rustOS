@@ -211,17 +211,14 @@ static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 /// The encoded pointer contains shard index, local index, and generation.
 pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
     let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-    // Increment ref count for the waker
-    get_task_slab().increment_ref(shard_idx, local_idx, generation);
+    // No refcount increment — the slot is kept alive by structural anchor refs
+    // (init_and_enqueue, enqueue_slab_task, poll_once NOTIFIED re-enqueue, etc.).
+    // Waker clone/drop/wake are all refcount-free.
     unsafe { Waker::from_raw(RawWaker::new(encoded as *const (), &SLAB_WAKER_VTABLE)) }
 }
 
 unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
-    let encoded = ptr as usize;
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
-        let slab = get_task_slab();
-        slab.increment_ref(shard_idx, local_idx, generation);
-    }
+    // No refcount change — clones are lightweight borrowed views.
     RawWaker::new(ptr, &SLAB_WAKER_VTABLE)
 }
 
@@ -229,8 +226,7 @@ unsafe fn slab_wake(ptr: *const ()) {
     let encoded = ptr as usize;
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
         enqueue_slab_task(shard_idx, local_idx, generation);
-        // Decrement ref count (wake consumes the waker)
-        get_task_slab().decrement_ref(shard_idx, local_idx, generation);
+        // No refcount decrement — enqueue_slab_task manages its own anchor ref.
     }
 }
 
@@ -242,11 +238,8 @@ unsafe fn slab_wake_by_ref(ptr: *const ()) {
     }
 }
 
-unsafe fn slab_drop_waker(ptr: *const ()) {
-    let encoded = ptr as usize;
-    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
-        get_task_slab().decrement_ref(shard_idx, local_idx, generation);
-    }
+unsafe fn slab_drop_waker(_ptr: *const ()) {
+    // No-op — slot lifetime is managed by structural anchor refs, not waker clones.
 }
 
 extern "win64" fn slab_inline_poll(ctx: usize) {
