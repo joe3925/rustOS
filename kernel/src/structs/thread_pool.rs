@@ -10,7 +10,7 @@ use crate::structs::mpmc::{mpmc_channel, Receiver, Sender};
 
 pub type JobFn = extern "win64" fn(usize);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Job {
     pub f: JobFn,
     pub a: usize,
@@ -23,7 +23,6 @@ impl From<(extern "win64" fn(usize), usize)> for Job {
 
 struct Shared {
     shutdown: AtomicBool,
-    job_count: AtomicUsize,
     num_workers: AtomicUsize,
     total_workers: AtomicUsize,
 }
@@ -49,7 +48,6 @@ impl ThreadPool {
         let shared = Arc::new(Shared {
             total_workers: AtomicUsize::new(threads),
             shutdown: AtomicBool::new(false),
-            job_count: AtomicUsize::new(0),
             num_workers: AtomicUsize::new(0),
         });
 
@@ -90,10 +88,8 @@ impl ThreadPool {
             f: function,
             a: context,
         };
-
-        if self.sender.send(job).is_ok() {
-            self.shared.job_count.fetch_add(1, Ordering::Release);
-        }
+        // TODO: error handling, this shouldn't panic
+        self.sender.send(job).expect("failed to send task to mpmc");
     }
 
     pub fn submit_many(&self, jobs: &[Job]) {
@@ -110,9 +106,6 @@ impl ThreadPool {
                 sent += 1;
             }
         }
-        if sent > 0 {
-            self.shared.job_count.fetch_add(sent, Ordering::Release);
-        }
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) {
@@ -126,7 +119,6 @@ impl ThreadPool {
     pub fn try_execute_one(&self) -> bool {
         match self.receiver.try_recv() {
             Ok(job) => {
-                self.shared.job_count.fetch_sub(1, Ordering::AcqRel);
                 (job.f)(job.a);
                 true
             }
@@ -141,10 +133,6 @@ impl ThreadPool {
 
     pub fn is_shutdown(&self) -> bool {
         self.shared.shutdown.load(Ordering::Acquire)
-    }
-
-    pub fn pending_jobs(&self) -> usize {
-        self.shared.job_count.load(Ordering::Acquire)
     }
 
     pub fn workers(&self) -> usize {
@@ -179,9 +167,6 @@ extern "win64" fn worker_entry(ctx: usize) {
                 break;
             }
         };
-
-        // Decrement job count
-        shared.job_count.fetch_sub(1, Ordering::AcqRel);
 
         // Execute the job
         (job.f)(job.a);
