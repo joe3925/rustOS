@@ -1,9 +1,11 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
-use core::mem::ManuallyDrop;
 use core::pin::Pin;
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+use crossbeam_queue::SegQueue;
 
 use spin::Mutex;
 
@@ -102,55 +104,69 @@ enum FutureSlot<F: Future> {
     Done(Option<F::Output>),
 }
 
-/// Shared notifier that holds exactly one parent waker.
-/// Children receive a lightweight proxy waker backed by this notifier;
-/// cloning the proxy only bumps the Arc refcount, not the parent waker's.
-struct SharedNotifier {
+/// Shared state for JoinAll's indexed waker scheme.
+/// Each child gets a waker that pushes its index into `ready_queue` on wake,
+/// so JoinAll only re-polls children that were actually woken.
+struct JoinAllShared {
     parent: Mutex<Option<Waker>>,
+    ready_queue: SegQueue<usize>,
 }
 
-unsafe fn notifier_clone(ptr: *const ()) -> RawWaker {
-    Arc::increment_strong_count(ptr as *const SharedNotifier);
-    RawWaker::new(ptr, &NOTIFIER_VTABLE)
+/// Per-child waker handle: heap-allocated pair of (shared, index).
+/// The RawWaker data pointer points to this struct.
+struct IndexedWakerData {
+    shared: Arc<JoinAllShared>,
+    index: usize,
 }
 
-unsafe fn notifier_wake(ptr: *const ()) {
-    let arc = Arc::from_raw(ptr as *const SharedNotifier);
-    let guard = arc.parent.lock();
+unsafe fn indexed_waker_clone(ptr: *const ()) -> RawWaker {
+    let data = &*(ptr as *const IndexedWakerData);
+    let cloned = Box::new(IndexedWakerData {
+        shared: data.shared.clone(),
+        index: data.index,
+    });
+    RawWaker::new(Box::into_raw(cloned) as *const (), &INDEXED_WAKER_VTABLE)
+}
+
+unsafe fn indexed_waker_wake(ptr: *const ()) {
+    let data = Box::from_raw(ptr as *mut IndexedWakerData);
+    data.shared.ready_queue.push(data.index);
+    let guard = data.shared.parent.lock();
     if let Some(w) = guard.as_ref() {
         w.wake_by_ref();
     }
     drop(guard);
 }
 
-unsafe fn notifier_wake_by_ref(ptr: *const ()) {
-    let arc = ManuallyDrop::new(Arc::from_raw(ptr as *const SharedNotifier));
-    let guard = arc.parent.lock();
+unsafe fn indexed_waker_wake_by_ref(ptr: *const ()) {
+    let data = &*(ptr as *const IndexedWakerData);
+    data.shared.ready_queue.push(data.index);
+    let guard = data.shared.parent.lock();
     if let Some(w) = guard.as_ref() {
         w.wake_by_ref();
     }
     drop(guard);
 }
 
-unsafe fn notifier_drop(ptr: *const ()) {
-    drop(Arc::from_raw(ptr as *const SharedNotifier));
+unsafe fn indexed_waker_drop(ptr: *const ()) {
+    drop(Box::from_raw(ptr as *mut IndexedWakerData));
 }
 
-static NOTIFIER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    notifier_clone,
-    notifier_wake,
-    notifier_wake_by_ref,
-    notifier_drop,
+static INDEXED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    indexed_waker_clone,
+    indexed_waker_wake,
+    indexed_waker_wake_by_ref,
+    indexed_waker_drop,
 );
 
-impl SharedNotifier {
+impl JoinAllShared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             parent: Mutex::new(None),
+            ready_queue: SegQueue::new(),
         })
     }
 
-    /// Update the stored parent waker, skipping the clone if it already matches.
     fn update_parent(&self, waker: &Waker) {
         let mut guard = self.parent.lock();
         if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
@@ -158,22 +174,29 @@ impl SharedNotifier {
         }
     }
 
-    /// Create a proxy Waker backed by this notifier Arc.
-    /// The caller's Arc ref is transferred into the waker.
-    fn into_waker(self: Arc<Self>) -> Waker {
-        let ptr = Arc::into_raw(self) as *const ();
-        unsafe { Waker::from_raw(RawWaker::new(ptr, &NOTIFIER_VTABLE)) }
+    fn make_waker(self: &Arc<Self>, index: usize) -> Waker {
+        let data = Box::new(IndexedWakerData {
+            shared: self.clone(),
+            index,
+        });
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Box::into_raw(data) as *const (),
+                &INDEXED_WAKER_VTABLE,
+            ))
+        }
     }
 }
 
 /// Joins multiple futures of the same type, returning their results in order.
 /// Stores futures inline without boxing, saving one heap allocation per future.
-/// Uses a shared notifier so children receive a lightweight proxy waker instead
-/// of each cloning the parent waker.
+/// Uses indexed wakers so only children that were woken get re-polled, avoiding
+/// O(n²) scans when many futures are in flight.
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
     remaining: usize,
-    notifier: Arc<SharedNotifier>,
+    shared: Arc<JoinAllShared>,
+    first_poll: bool,
 }
 
 impl<F: Future> JoinAll<F> {
@@ -183,7 +206,8 @@ impl<F: Future> JoinAll<F> {
         Self {
             slots,
             remaining,
-            notifier: SharedNotifier::new(),
+            shared: JoinAllShared::new(),
+            first_poll: true,
         }
     }
 }
@@ -192,8 +216,6 @@ impl<F: Future> Future for JoinAll<F> {
     type Output = Vec<F::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: We never move the futures out of the Vec, only poll them in place.
-        // The Vec itself may reallocate but we don't add elements after construction.
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.remaining == 0 {
@@ -206,22 +228,37 @@ impl<F: Future> Future for JoinAll<F> {
             return Poll::Ready(out);
         }
 
-        // Store the parent waker once; children get a cheap proxy.
-        this.notifier.update_parent(cx.waker());
-        let proxy = this.notifier.clone().into_waker();
-        let proxy_cx = &mut Context::from_waker(&proxy);
+        this.shared.update_parent(cx.waker());
 
-        for slot in this.slots.iter_mut() {
-            if let FutureSlot::Running(fut) = slot {
-                // SAFETY: The future is stored inline in the Vec which is pinned.
-                // We don't move it, we just poll it in place.
-                let pinned = unsafe { Pin::new_unchecked(fut) };
-                match pinned.poll(proxy_cx) {
-                    Poll::Ready(result) => {
+        if this.first_poll {
+            // First poll: must poll every child once to register their wakers.
+            this.first_poll = false;
+            for (i, slot) in this.slots.iter_mut().enumerate() {
+                if let FutureSlot::Running(fut) = slot {
+                    let waker = this.shared.make_waker(i);
+                    let mut child_cx = Context::from_waker(&waker);
+                    let pinned = unsafe { Pin::new_unchecked(fut) };
+                    if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
                         *slot = FutureSlot::Done(Some(result));
                         this.remaining -= 1;
                     }
-                    Poll::Pending => {}
+                }
+            }
+        } else {
+            // Subsequent polls: only re-poll children that were woken.
+            while let Some(idx) = this.shared.ready_queue.pop() {
+                if idx >= this.slots.len() {
+                    continue;
+                }
+                let slot = &mut this.slots[idx];
+                if let FutureSlot::Running(fut) = slot {
+                    let waker = this.shared.make_waker(idx);
+                    let mut child_cx = Context::from_waker(&waker);
+                    let pinned = unsafe { Pin::new_unchecked(fut) };
+                    if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
+                        *slot = FutureSlot::Done(Some(result));
+                        this.remaining -= 1;
+                    }
                 }
             }
         }
