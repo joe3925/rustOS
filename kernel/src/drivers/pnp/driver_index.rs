@@ -108,7 +108,7 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
         let drv_name = rel.to_string();
 
         let image = match get_value(&kpath, "ImagePath").await {
-            Some(Data::Str(s)) => s,
+            Some(Data::Str(s)) => Path::from_string(&s),
             _ => continue,
         };
         let toml_path = match get_value(&kpath, "TomlPath").await {

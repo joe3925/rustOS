@@ -23,6 +23,7 @@ struct ShardedQueues {
     active: CacheAligned,
     enqueue_hint: CacheAligned,
     pump_hint: CacheAligned,
+    work_count: CacheAligned,
 }
 
 impl ShardedQueues {
@@ -38,6 +39,7 @@ impl ShardedQueues {
             active: CacheAligned(AtomicUsize::new(shard_count)),
             enqueue_hint: CacheAligned(AtomicUsize::new(0)),
             pump_hint: CacheAligned(AtomicUsize::new(0)),
+            work_count: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
@@ -54,6 +56,7 @@ impl ShardedQueues {
         let shards = self.shard_count();
         let idx = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
         self.queues[idx].push(item);
+        self.work_count.0.fetch_add(1, Ordering::Release);
     }
 
     fn pop_round_robin(&self, start_idx: usize) -> Option<(WorkItem, usize)> {
@@ -61,6 +64,7 @@ impl ShardedQueues {
         for offset in 0..shards {
             let idx = (start_idx + offset) % shards;
             if let Some(item) = self.queues[idx].pop() {
+                self.work_count.0.fetch_sub(1, Ordering::Release);
                 return Some((item, idx));
             }
         }
@@ -68,13 +72,7 @@ impl ShardedQueues {
     }
 
     fn is_empty(&self) -> bool {
-        let shards = self.shard_count();
-        for i in 0..shards {
-            if !self.queues[i].is_empty() {
-                return false;
-            }
-        }
-        true
+        self.work_count.0.load(Ordering::Acquire) == 0
     }
 
     fn next_pump_hint(&self) -> usize {
@@ -112,8 +110,8 @@ impl GlobalAsyncExecutor {
     }
 
     fn try_schedule(&self) {
-        let max = self.max_pumps.0.load(Ordering::Acquire);
-        let active = self.active_pumps.0.load(Ordering::Acquire);
+        let max = self.max_pumps.0.load(Ordering::Relaxed);
+        let active = self.active_pumps.0.load(Ordering::Relaxed);
         if active >= max {
             return;
         }
@@ -126,17 +124,17 @@ impl GlobalAsyncExecutor {
     }
 
     fn try_enter_pump(&self) -> bool {
-        let max = self.max_pumps.0.load(Ordering::Acquire);
+        let max = self.max_pumps.0.load(Ordering::Relaxed);
         let prev = self.active_pumps.0.fetch_add(1, Ordering::AcqRel);
         if prev + 1 > max {
-            self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
+            self.active_pumps.0.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
         true
     }
 
     fn exit_pump(&self) {
-        self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
+        self.active_pumps.0.fetch_sub(1, Ordering::Release);
     }
 
     fn pump(&self, start_hint: usize) {

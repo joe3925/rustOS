@@ -16,6 +16,7 @@ use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
     DriverRuntime, DriverState, StackLayer,
 };
+use kernel_types::fs::Path;
 use kernel_types::io::IoVtable;
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
@@ -325,7 +326,7 @@ impl PnpManager {
         let svc_key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
 
         let image = match get_value(&svc_key, "ImagePath").await {
-            Some(Data::Str(s)) => s,
+            Some(Data::Str(s)) => Path::from_string(&s),
             _ => return Ok(None),
         };
 
@@ -528,7 +529,7 @@ impl PnpManager {
         let key = alloc::format!("SYSTEM/CurrentControlSet/Services/{svc}");
 
         let image = match get_value(&key, "ImagePath").await {
-            Some(Data::Str(s)) => s,
+            Some(Data::Str(s)) => Path::from_string(&s),
             _ => return None,
         };
 
@@ -813,7 +814,6 @@ impl PnpManager {
             return DriverStatus::NotImplemented;
         }
         if req.status != DriverStatus::Success {
-            println!("{:#?}", req.status);
             return req.status;
         }
 
@@ -827,7 +827,7 @@ impl PnpManager {
         for child_dn in children_to_start {
             let dn = child_dn.clone();
             spawn_detached(async move {
-                let status: Result<(), DriverError> = PNP_MANAGER.bind_and_start(&dn).await;
+                let status = PNP_MANAGER.bind_and_start(&dn).await;
                 if let Some(err) = status.err() {
                     println!(
                         "[MANAGER] Failed to bind and start node: {:#?} with error: {:#?}",
@@ -853,6 +853,7 @@ impl PnpManager {
             let pm = PROGRAM_MANAGER.get(0).expect("Kernel terminated").clone();
             let mut prog = pm.write();
             prog.load_module(pkg.image_path.clone()).await?
+
         };
 
         let _ = OBJECT_MANAGER.mkdir_p("\\Modules".to_string());

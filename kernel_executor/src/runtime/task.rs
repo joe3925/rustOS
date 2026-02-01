@@ -1,5 +1,6 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -39,14 +40,20 @@ pub trait TaskPoll: Send + Sync {
 
 /// A detached task with no return value - used by spawn_detached().
 pub struct FutureTask {
-    future: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
+    /// Safety: exclusive access is guaranteed by the task state machine —
+    /// only the thread in POLLING state touches this field.
+    future: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     state: AtomicU8,
 }
+
+// Safety: The future is Send, and exclusive access is enforced by the state machine.
+unsafe impl Send for FutureTask {}
+unsafe impl Sync for FutureTask {}
 
 impl FutureTask {
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
         Self {
-            future: Mutex::new(Some(Box::pin(future))),
+            future: UnsafeCell::new(Some(Box::pin(future))),
             state: AtomicU8::new(STATE_IDLE),
         }
     }
@@ -104,9 +111,12 @@ impl TaskPoll for FutureTask {
         let w = waker::create_from_task_poll(self.clone());
         let mut cx = Context::from_waker(&w);
 
+        // Safety: state machine guarantees exclusive access — only one thread
+        // can CAS QUEUED→POLLING, so no concurrent access to the future.
+        let future_ref = unsafe { &mut *self.future.get() };
+
         let poll_res = {
-            let mut guard = self.future.lock();
-            let Some(fut) = guard.as_mut() else {
+            let Some(fut) = future_ref.as_mut() else {
                 self.state.store(STATE_COMPLETED, Ordering::Release);
                 return;
             };
@@ -114,8 +124,8 @@ impl TaskPoll for FutureTask {
         };
 
         if let Poll::Ready(()) = poll_res {
-            let mut guard = self.future.lock();
-            *guard = None;
+            // Safety: still in POLLING state, exclusive access.
+            unsafe { *self.future.get() = None };
             self.state.store(STATE_COMPLETED, Ordering::Release);
             return;
         }
@@ -143,9 +153,11 @@ impl TaskPoll for FutureTask {
         let w = waker::create_from_task_poll(self.clone());
         let mut cx = Context::from_waker(&w);
 
+        // Safety: caller transitioned IDLE→POLLING, exclusive access guaranteed.
+        let future_ref = unsafe { &mut *self.future.get() };
+
         let poll_res = {
-            let mut guard = self.future.lock();
-            let Some(fut) = guard.as_mut() else {
+            let Some(fut) = future_ref.as_mut() else {
                 self.state.store(STATE_COMPLETED, Ordering::Release);
                 return;
             };
@@ -153,8 +165,7 @@ impl TaskPoll for FutureTask {
         };
 
         if let Poll::Ready(()) = poll_res {
-            let mut guard = self.future.lock();
-            *guard = None;
+            unsafe { *self.future.get() = None };
             self.state.store(STATE_COMPLETED, Ordering::Release);
             return;
         }
@@ -187,16 +198,23 @@ impl TaskPoll for FutureTask {
 /// A joinable task that stores the result for the JoinHandle to retrieve.
 /// This combines FutureTask + JoinInner into a single Arc allocation.
 pub struct JoinableTask<T: Send + 'static> {
-    future: Mutex<Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>>,
+    /// Safety: exclusive access is guaranteed by the task state machine —
+    /// only the thread in POLLING state touches this field.
+    future: UnsafeCell<Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>>,
     result: Mutex<Option<T>>,
     waker: Mutex<Option<Waker>>,
     state: AtomicU8,
 }
 
+// Safety: The future is Send, and exclusive access is enforced by the state machine.
+// result and waker are protected by Mutex.
+unsafe impl<T: Send + 'static> Send for JoinableTask<T> {}
+unsafe impl<T: Send + 'static> Sync for JoinableTask<T> {}
+
 impl<T: Send + 'static> JoinableTask<T> {
     pub fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
         Self {
-            future: Mutex::new(Some(Box::pin(future))),
+            future: UnsafeCell::new(Some(Box::pin(future))),
             result: Mutex::new(None),
             waker: Mutex::new(None),
             state: AtomicU8::new(STATE_IDLE),
@@ -270,9 +288,12 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
         let w = waker::create_from_task_poll(self.clone());
         let mut cx = Context::from_waker(&w);
 
+        // Safety: state machine guarantees exclusive access — only one thread
+        // can CAS QUEUED→POLLING, so no concurrent access to the future.
+        let future_ref = unsafe { &mut *self.future.get() };
+
         let poll_res = {
-            let mut guard = self.future.lock();
-            let Some(fut) = guard.as_mut() else {
+            let Some(fut) = future_ref.as_mut() else {
                 self.state.store(STATE_COMPLETED, Ordering::Release);
                 return;
             };
@@ -280,10 +301,8 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
         };
 
         if let Poll::Ready(result) = poll_res {
-            {
-                let mut guard = self.future.lock();
-                *guard = None;
-            }
+            // Safety: still in POLLING state, exclusive access.
+            unsafe { *self.future.get() = None };
             {
                 let mut guard = self.result.lock();
                 *guard = Some(result);
@@ -316,9 +335,11 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
         let w = waker::create_from_task_poll(self.clone());
         let mut cx = Context::from_waker(&w);
 
+        // Safety: caller transitioned IDLE→POLLING, exclusive access guaranteed.
+        let future_ref = unsafe { &mut *self.future.get() };
+
         let poll_res = {
-            let mut guard = self.future.lock();
-            let Some(fut) = guard.as_mut() else {
+            let Some(fut) = future_ref.as_mut() else {
                 self.state.store(STATE_COMPLETED, Ordering::Release);
                 return;
             };
@@ -326,10 +347,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
         };
 
         if let Poll::Ready(result) = poll_res {
-            {
-                let mut guard = self.future.lock();
-                *guard = None;
-            }
+            unsafe { *self.future.get() = None };
             {
                 let mut guard = self.result.lock();
                 *guard = Some(result);

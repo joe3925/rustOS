@@ -58,6 +58,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use crossbeam_queue::ArrayQueue;
 use kernel_types::benchmark::BenchWindowConfig;
+use kernel_types::fs::Path;
 use kernel_types::memory::Module;
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -157,7 +158,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
     let mut program = Program::new(
         "KRNL".to_string(),
-        "".to_string(),
+        Path::from_string(""),
         VirtAddr::new(0xFFFF_8500_0000_0000),
         kernel_cr3(),
         KERNEL_RANGE_TRACKER.clone(),
@@ -167,7 +168,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
         title: "KRNL.DLL".into(),
-        image_path: "".into(),
+        image_path: Path::from_string(""),
         parent_pid: 0,
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
         symbols: EXPORTS.to_vec(),
@@ -176,17 +177,15 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     GLOBAL_WINDOW.start();
 
     spawn_detached(async move {
-        // install_prepacked_drivers().await;
+        install_prepacked_drivers().await;
 
-        // PNP_MANAGER.init_from_registry().await;
+        PNP_MANAGER.init_from_registry().await;
 
         bench_async_vs_sync_call_latency_async().await;
         bench_realistic_traffic_async().await;
+
+        benchmark_async_async().await;
     });
-    // spawn_blocking(|| {
-    //     wait_duration(Duration::from_secs(15));
-    //     spawn_detached(benchmark_async_async());
-    // });
     println!("");
 }
 #[no_mangle]

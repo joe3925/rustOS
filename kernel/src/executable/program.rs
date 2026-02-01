@@ -149,7 +149,7 @@ pub type RuleList = Vec<RoutingRule>;
 #[derive(Debug)]
 pub struct Program {
     pub title: String,
-    pub image_path: String,
+    pub image_path: Path,
     pub pid: u64,
     pub image_base: VirtAddr,
     pub main_thread: Option<TaskHandle>,
@@ -169,14 +169,15 @@ pub struct Program {
 impl Program {
     pub fn new(
         title: String,
-        image_path: String,
+        image_path: Path,
         image_base: VirtAddr,
         cr3: PhysFrame,
         tracker: Arc<RangeTracker>,
     ) -> Self {
+        let working_dir = image_path.parent().unwrap_or(image_path.clone());
         Self {
             title,
-            image_path: image_path.clone(),
+            image_path,
             pid: 0,
             image_base,
             main_thread: None,
@@ -185,7 +186,7 @@ impl Program {
             cr3,
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
-            working_dir: Path::from_string(&image_path),
+            working_dir,
             default_queue: Arc::new(RwLock::new(MessageQueue {
                 queue: VecDeque::new(),
             })),
@@ -270,7 +271,7 @@ impl Program {
         result
     }
 
-    pub async fn load_module(&mut self, root_path: String) -> Result<ModuleHandle, LoadError> {
+    pub async fn load_module(&mut self, root_path: Path) -> Result<ModuleHandle, LoadError> {
         let mut queue = Vec::new();
         queue.push(root_path);
 
@@ -283,10 +284,28 @@ impl Program {
             last_handle = Some(handle.clone());
 
             for dll in loader.list_import_dlls() {
-                // TODO: Add more dll search locations
-                let dep_path = alloc::format!(r"C:\BIN\MOD\{}", dll);
-                if !self.has_module(&dll) {
-                    queue.push(dep_path);
+                if self.has_module(&dll) {
+                    continue;
+                }
+
+                let search_dirs = [
+                    self.working_dir.clone(),
+                    Path::from_string(r"C:\bin\mod"),
+                    Path::from_string(r"C:\system"),
+                ];
+
+                let mut found = false;
+                for dir in &search_dirs {
+                    let candidate = dir.clone().join(&dll);
+                    if PELoader::new(&candidate).await.is_some() {
+                        queue.push(candidate);
+                        found = true;
+                        break;
+                    }
+                }
+
+                if !found {
+                    return Err(LoadError::NoFile);
                 }
             }
         }

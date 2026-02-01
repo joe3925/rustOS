@@ -10,6 +10,7 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use spin::{Mutex, Once, RwLock};
 
+use crate::fs::Path;
 use crate::io::IoVtable;
 use crate::memory::Module;
 use crate::pnp::{BootType, DeviceIds, PnpVtable};
@@ -33,7 +34,7 @@ pub enum DevNodeState {
 #[derive(Debug, Clone)]
 pub struct DriverPackage {
     pub name: String,
-    pub image_path: String,
+    pub image_path: Path,
     pub toml_path: String,
     pub start: BootType,
     pub hwids: Vec<String>,

@@ -1877,10 +1877,10 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 // Simulates a driver-like workload: async setup -> blocking device work -> async postprocess
 // Runs at varying concurrency levels to find saturation point and measure scheduling overhead.
 
-const TRAFFIC_TOTAL_TASKS: usize = 10_000;
-const TRAFFIC_CONCURRENCY: &[usize] = &[1, 4, 8, 16, 32, 64, 128, 256, 512];
-const TRAFFIC_WORK_NS: u64 = 500; // simulated device work per blocking task
-const TRAFFIC_ASYNC_DEPTH: usize = 20; // async setup + postprocess depth
+const TRAFFIC_TOTAL_TASKS: usize = 100_000;
+const TRAFFIC_CONCURRENCY: &[usize] = &[1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
+const TRAFFIC_WORK_NS: u64 = 1000; // simulated device work per blocking task
+const TRAFFIC_ASYNC_DEPTH: usize = 10; // async setup + postprocess depth
 
 pub fn bench_realistic_traffic() {
     spawn_detached(async {

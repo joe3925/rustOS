@@ -1,7 +1,7 @@
 use core::mem::transmute;
 use core::ptr::copy_nonoverlapping;
 
-use crate::file_system::file::{file_parser, File};
+use crate::file_system::file::File;
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
@@ -33,16 +33,15 @@ use super::program::{HandleTable, Program, PROGRAM_MANAGER};
 pub struct PELoader {
     buffer: Box<[u8]>,
     pe: PE<'static>,
-    path: String,
+    path: Path,
     current_base: VirtAddr,
 }
 
 impl PELoader {
     /// Opens and prepares a PE loader from the given path.
-    pub async fn new(path: &str) -> Option<Self> {
+    pub async fn new(path: &Path) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
-        let fs_path = Path::from_string(path);
-        let file_handle = File::open(&fs_path, &open_flags).await.ok()?;
+        let file_handle = File::open(path, &open_flags).await.ok()?;
         let file_data: Vec<u8> = file_handle.read().await.ok()?;
 
         let boxed: Box<[u8]> = file_data.into_boxed_slice();
@@ -60,7 +59,7 @@ impl PELoader {
         Some(Self {
             buffer: boxed,
             pe: pe_static,
-            path: path.to_string(),
+            path: path.clone(),
             current_base: base,
         })
     }
@@ -164,7 +163,7 @@ impl PELoader {
             self.load_sections()?;
         }
 
-        let title = file_parser(&self.path).last().unwrap().to_string();
+        let title = self.path.file_name().unwrap_or("unknown").to_string();
         let base = self.current_base.as_u64();
         println!(
             "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
@@ -267,7 +266,7 @@ impl PELoader {
         let heap_size = opt_hdr.windows_fields.size_of_heap_reserve;
         let heap_addr = self.current_base + image_size + 0x1000 + stack_size + 0x10;
 
-        let title = file_parser(&self.path).last().unwrap().to_string();
+        let title = self.path.file_name().unwrap_or("unknown").to_string();
 
         let mut program = Program::new(
             title,
@@ -276,6 +275,7 @@ impl PELoader {
             new_frame,
             range_tracker,
         );
+
 
         // Allocates the image + a guard page + the stack + the heap
         match program.virtual_map_alloc(
@@ -296,7 +296,7 @@ impl PELoader {
             },
             0,
             stack_size,
-            File::remove_file_from_path(self.path.as_str()).to_string(),
+            self.path.parent().map(|p| p.to_string()).unwrap_or_default(),
             stack_addr,
             0,
         );
@@ -336,7 +336,7 @@ impl PELoader {
                 if present.contains(&dll) {
                     continue;
                 }
-                let path = alloc::format!(r"C:\BIN\MOD\{}", dll);
+                let path = Path::from_string(r"C:\BIN\MOD").join(&dll);
                 program.load_module(path).await?;
                 added = true;
             }
