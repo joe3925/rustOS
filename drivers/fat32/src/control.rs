@@ -26,7 +26,7 @@ use kernel_api::{
     println,
     request::{Request, RequestType, TraversalPolicy},
     request_handler,
-    runtime::{spawn, spawn_blocking},
+    runtime::{spawn, spawn_blocking, spawn_detached},
     status::DriverStatus,
 };
 
@@ -220,7 +220,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     ));
 
-    spawn(async move {
+    spawn_detached(async move {
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,

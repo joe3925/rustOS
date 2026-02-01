@@ -51,17 +51,6 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-pub fn spawn_ffi(fut: FfiFuture<()>) {
-    unsafe { kernel_spawn_ffi(fut) };
-}
-
-pub fn spawn_async<F>(future: F)
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    spawn(future)
-}
-
 /// Minimal blocking join handle executed on the kernel blocking pool.
 pub struct BlockingJoin<R> {
     state: Arc<BlockingState<R>>,

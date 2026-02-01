@@ -40,7 +40,7 @@ use kernel_api::{
     reg::{self, switch_to_vfs_async},
     request::{Request, RequestType, TraversalPolicy},
     request_handler,
-    runtime::spawn,
+    runtime::{spawn, spawn_detached},
     status::{Data, DriverStatus, RegError},
 };
 
@@ -140,7 +140,7 @@ pub extern "win64" fn volclass_device_add(
 pub async fn volclass_start(dev: Arc<DeviceObject>, _request: Arc<RwLock<Request>>) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
-    spawn(mount_if_unmounted(dev));
+    spawn_detached(mount_if_unmounted(dev));
     DriverStep::Continue
 }
 
@@ -224,7 +224,7 @@ pub async fn volclass_ctrl_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Reques
                         }
                         drop(wr);
                         let _ = refresh_fs_registry_from_registry().await;
-                        spawn(rescan_all_volumes());
+                        spawn_detached(rescan_all_volumes());
                     }
                     DriverStep::complete(DriverStatus::Success)
                 }
@@ -598,7 +598,7 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {
     let inst = inst_path.to_string();
     let sid = stable_id.to_string();
 
-    spawn(async move {
+    spawn_detached(async move {
         if !VFS_ACTIVE.load(Ordering::Acquire) {
             let mod_ok = fs_check_open(&link, "system/mod").await;
             let inf_ok = fs_check_open(&link, "system/toml").await;

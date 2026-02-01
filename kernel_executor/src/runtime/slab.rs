@@ -28,7 +28,7 @@ const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 /// Maximum size (in bytes) for inline future storage. Futures larger than this
 /// will be heap-allocated. Default: 128 bytes covers most simple async state machines.
-pub const INLINE_FUTURE_SIZE: usize = 128;
+pub const INLINE_FUTURE_SIZE: usize = 256;
 
 /// Required alignment for inline future storage.
 pub const INLINE_FUTURE_ALIGN: usize = 8;
@@ -96,7 +96,7 @@ impl FutureStorage {
     {
         let size = core::mem::size_of::<F>();
         let align = align_of::<F>();
-
+        println!("future size: {}", size);
         if size <= INLINE_FUTURE_SIZE && align <= INLINE_FUTURE_ALIGN {
             Self::new_inline(future)
         } else {
