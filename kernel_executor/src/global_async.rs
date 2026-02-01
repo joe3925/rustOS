@@ -1,7 +1,7 @@
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::{Mutex, Once};
+use crossbeam_queue::SegQueue;
+use spin::Once;
 
 use crate::platform::{platform, Job};
 
@@ -16,7 +16,7 @@ struct WorkItem {
 const MAX_SHARDS: usize = 8;
 
 struct ShardedQueues {
-    queues: Vec<Mutex<VecDeque<WorkItem>>>,
+    queues: Vec<SegQueue<WorkItem>>,
     active: AtomicUsize,
     enqueue_hint: AtomicUsize,
     pump_hint: AtomicUsize,
@@ -27,7 +27,7 @@ impl ShardedQueues {
         let shard_count = if shards == 0 { 1 } else { shards };
         let mut queues = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            queues.push(Mutex::new(VecDeque::new()));
+            queues.push(SegQueue::new());
         }
 
         Self {
@@ -50,16 +50,14 @@ impl ShardedQueues {
     fn push(&self, item: WorkItem) {
         let shards = self.shard_count();
         let idx = self.enqueue_hint.fetch_add(1, Ordering::Relaxed) % shards;
-        let mut q = self.queues[idx].lock();
-        q.push_back(item);
+        self.queues[idx].push(item);
     }
 
     fn pop_round_robin(&self, start_idx: usize) -> Option<(WorkItem, usize)> {
         let shards = self.shard_count();
         for offset in 0..shards {
             let idx = (start_idx + offset) % shards;
-            let mut q = self.queues[idx].lock();
-            if let Some(item) = q.pop_front() {
+            if let Some(item) = self.queues[idx].pop() {
                 return Some((item, idx));
             }
         }
@@ -69,7 +67,7 @@ impl ShardedQueues {
     fn is_empty(&self) -> bool {
         let shards = self.shard_count();
         for i in 0..shards {
-            if !self.queues[i].lock().is_empty() {
+            if !self.queues[i].is_empty() {
                 return false;
             }
         }

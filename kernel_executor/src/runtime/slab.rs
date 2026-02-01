@@ -15,7 +15,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use spin::{Mutex, Once};
+use spin::Once;
 
 use crate::println;
 
@@ -27,8 +27,8 @@ const DEFAULT_SLOTS_PER_SHARD: usize = 128;
 const MAX_SLOTS_PER_SHARD: usize = 4096;
 
 /// Maximum size (in bytes) for inline future storage. Futures larger than this
-/// will be heap-allocated. Default: 128 bytes covers most simple async state machines.
-pub const INLINE_FUTURE_SIZE: usize = 256;
+/// will be heap-allocated.
+pub const INLINE_FUTURE_SIZE: usize = 512;
 
 /// Required alignment for inline future storage.
 pub const INLINE_FUTURE_ALIGN: usize = 8;
@@ -96,7 +96,6 @@ impl FutureStorage {
     {
         let size = core::mem::size_of::<F>();
         let align = align_of::<F>();
-        println!("future size: {}", size);
         if size <= INLINE_FUTURE_SIZE && align <= INLINE_FUTURE_ALIGN {
             Self::new_inline(future)
         } else {
@@ -221,7 +220,10 @@ pub struct TaskSlot {
     gen_ref: AtomicU32,
     state: AtomicU8,
     _pad: [u8; 3],
-    future: Mutex<Option<FutureStorage>>,
+    /// Safety: exclusive access is guaranteed by the task state machine
+    /// (only one thread can be in POLLING state) and by ref-count exclusivity
+    /// (cleanup runs only when rc drops to 0).
+    future: UnsafeCell<Option<FutureStorage>>,
 }
 
 const GEN_SHIFT: u32 = 16;
@@ -249,15 +251,15 @@ impl TaskSlot {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
             _pad: [0; 3],
-            future: Mutex::new(None),
+            future: UnsafeCell::new(None),
         }
     }
 
     /// Initialize the slot with a future. Sets state to QUEUED since the
     /// caller is expected to immediately submit this to the thread pool.
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
-        let mut guard = self.future.lock();
-        *guard = Some(FutureStorage::new(future));
+        // Safety: called on a freshly allocated slot before it is visible to other threads.
+        unsafe { *self.future.get() = Some(FutureStorage::new(future)) };
         self.state.store(STATE_QUEUED, Ordering::Release);
     }
 
@@ -284,9 +286,12 @@ impl TaskSlot {
 
         let mut cx = Context::from_waker(waker);
 
+        // Safety: state machine guarantees exclusive access — only one thread
+        // can CAS QUEUED→POLLING, so no concurrent access to the future.
+        let future_ref = unsafe { &mut *self.future.get() };
+
         let poll_res = {
-            let mut guard = self.future.lock();
-            let Some(fut) = guard.as_mut() else {
+            let Some(fut) = future_ref.as_mut() else {
                 self.state.store(STATE_COMPLETED, Ordering::Release);
                 return true;
             };
@@ -294,8 +299,8 @@ impl TaskSlot {
         };
 
         if let Poll::Ready(()) = poll_res {
-            let mut guard = self.future.lock();
-            *guard = None;
+            // Safety: still in POLLING state, exclusive access.
+            unsafe { *self.future.get() = None };
             self.state.store(STATE_COMPLETED, Ordering::Release);
             return true;
         }
@@ -640,10 +645,9 @@ impl TaskSlab {
                 Ok(_) => {
                     if rc == 1 {
                         // We took the last ref — clean up.
-                        {
-                            let mut guard = slot.future.lock();
-                            *guard = None;
-                        }
+                        // Safety: rc 1→0 via CAS means no other thread holds a
+                        // reference, so exclusive access is guaranteed.
+                        unsafe { *slot.future.get() = None };
                         shard.deallocate(local_idx);
                     }
                     return;

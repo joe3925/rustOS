@@ -358,6 +358,7 @@ dependencies = [
 name = "kernel_executor"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "kernel_types",
  "spin 0.10.0",
 ]
