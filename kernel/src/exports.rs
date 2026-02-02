@@ -50,6 +50,7 @@ export! {
     kernel_alloc,
     kernel_free,
     kernel_irq_register,
+    kernel_irq_register_gsi,
     kernel_irq_signal,
     kernel_irq_signal_n,
     irq_handle_create,

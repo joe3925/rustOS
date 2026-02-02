@@ -35,9 +35,17 @@ pub struct McfgSegment {
     pub end_bus: u8,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PrtEntry {
+    pub device: u8,
+    pub pin: u8,
+    pub gsi: u16,
+}
+
 #[repr(C)]
 pub struct DevExt {
     pub segments: Once<Vec<McfgSegment>>,
+    pub prt: Once<Vec<PrtEntry>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +96,8 @@ pub struct PciPdoExt {
 
     pub irq_pin: u8,
     pub irq_line: u8,
+    /// GSI resolved from ACPI _PRT, if available.
+    pub irq_gsi: Option<u16>,
 
     pub cfg_phys: u64,
 
@@ -265,6 +275,7 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         ss_id,
         irq_pin,
         irq_line,
+        irq_gsi: None,
         cfg_phys: ecam_phys_addr(seg, bus, dev, func, 0),
         bars,
     })
@@ -289,7 +300,6 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
         match b.kind {
             BarKind::None => {}
             BarKind::Io => {
-                // write BAR index in the second u32
                 items.push((ResourceKind::Port as u32, i as u32, b.base, b.size));
             }
             BarKind::Mem32 | BarKind::Mem64 => {
@@ -299,8 +309,15 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     }
 
     if p.irq_pin != 0 {
-        let flags = (p.irq_pin as u32) & 0xFF;
-        items.push((ResourceKind::Interrupt as u32, flags, p.irq_line as u64, 0));
+        println!("{:#?}", p.irq_gsi);
+
+        if let Some(gsi) = p.irq_gsi {
+            let prt_pin = (p.irq_pin - 1) as u32;
+            items.push((ResourceKind::Gsi as u32, prt_pin, gsi as u64, 0));
+        } else {
+            let flags = (p.irq_pin as u32) & 0xFF;
+            items.push((ResourceKind::Interrupt as u32, flags, p.irq_line as u64, 0));
+        }
     }
 
     // Provide the ECAM config space physical address (4 KiB page).
@@ -443,6 +460,31 @@ pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
         i += 1;
     }
     segs
+}
+
+pub fn parse_prt_from_blob(blob: &[u8]) -> Vec<PrtEntry> {
+    let mut entries = Vec::new();
+    let mut i = 0usize;
+    while i + 8 <= blob.len() {
+        if &blob[i..i + 4] == b"PIRT" {
+            let cnt =
+                u32::from_le_bytes([blob[i + 4], blob[i + 5], blob[i + 6], blob[i + 7]]) as usize;
+            let mut off = i + 8;
+            for _ in 0..cnt {
+                if off + 4 > blob.len() {
+                    break;
+                }
+                let device = blob[off];
+                let pin = blob[off + 1];
+                let gsi = u16::from_le_bytes([blob[off + 2], blob[off + 3]]);
+                entries.push(PrtEntry { device, pin, gsi });
+                off += 4;
+            }
+            break;
+        }
+        i += 1;
+    }
+    entries
 }
 
 pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
@@ -659,6 +701,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         ss_id,
         irq_pin,
         irq_line,
+        irq_gsi: None,
         cfg_phys: 0,
         bars,
     })

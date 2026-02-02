@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 use kernel_sys::{
     irq_handle_clone, irq_handle_drop, irq_handle_get_user_ctx, irq_handle_is_closed,
     irq_handle_set_user_ctx, irq_handle_unregister, irq_handle_wait_ffi, kernel_irq_register,
-    kernel_irq_signal, kernel_irq_signal_n,
+    kernel_irq_register_gsi, kernel_irq_signal, kernel_irq_signal_n,
 };
 
 use kernel_types::async_ffi::FfiFuture;
@@ -71,6 +71,11 @@ impl Drop for IrqHandle {
 
 pub fn irq_register_isr(vector: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let p = unsafe { kernel_irq_register(vector, isr, ctx) };
+    unsafe { IrqHandle::from_raw(p) }
+}
+
+pub fn irq_register_isr_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
+    let p = unsafe { kernel_irq_register_gsi(gsi, isr, ctx) };
     unsafe { IrqHandle::from_raw(p) }
 }
 

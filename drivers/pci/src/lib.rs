@@ -11,8 +11,9 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 
 use dev_ext::{
-    DevExt, PciPdoExt, build_resources_blob, header_type, hwids_for, instance_path_for,
-    load_segments_from_parent, name_for, parse_ecam_segments_from_blob, probe_function,
+    DevExt, PciPdoExt, PrtEntry, build_resources_blob, header_type, hwids_for, instance_path_for,
+    load_segments_from_parent, name_for, parse_ecam_segments_from_blob, parse_prt_from_blob,
+    probe_function,
 };
 
 use kernel_api::{
@@ -61,6 +62,7 @@ pub extern "win64" fn bus_driver_device_add(
 
     dev_init.set_dev_ext_from(DevExt {
         segments: Once::new(),
+        prt: Once::new(),
     });
 
     DriverStep::complete(DriverStatus::Success)
@@ -102,8 +104,13 @@ pub async fn pci_bus_pnp_start(device: Arc<DeviceObject>, req: Arc<RwLock<Reques
             return DriverStep::Continue;
         }
 
+        let prt_entries = parse_prt_from_blob(&blob);
+
         if let Ok(ext) = device.try_devext::<DevExt>() {
             ext.segments.call_once(|| segs);
+            if !prt_entries.is_empty() {
+                ext.prt.call_once(|| prt_entries);
+            }
         } else {
             return DriverStep::Continue;
         }
@@ -140,6 +147,16 @@ pub async fn pci_bus_pnp_query_devrels(
     DriverStep::Continue
 }
 
+fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
+    if p.irq_pin == 0 {
+        return;
+    }
+    let prt_pin = p.irq_pin - 1; // PCI irq_pin is 1-based, PRT pin is 0-based
+    if let Some(entry) = prt.iter().find(|e| e.device == p.dev && e.pin == prt_pin) {
+        p.irq_gsi = Some(entry.gsi);
+    }
+}
+
 pub extern "win64" fn enumerate_bus(
     device: &Arc<DeviceObject>,
     _req: &mut Request,
@@ -160,6 +177,8 @@ pub extern "win64" fn enumerate_bus(
         }
     };
 
+    let prt = ext.prt.get().map(|v| v.as_slice()).unwrap_or(&[]);
+
     if ext.segments.get().is_none() {
         println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
         for bus in 0u8..=255 {
@@ -171,7 +190,8 @@ pub extern "win64" fn enumerate_bus(
                 let multi = (ht & 0x80) != 0;
                 let func_span = if multi { 0u8..8 } else { 0u8..1 };
                 for func in func_span {
-                    if let Some(p) = dev_ext::probe_function_legacy(bus, dev, func) {
+                    if let Some(mut p) = dev_ext::probe_function_legacy(bus, dev, func) {
+                        resolve_gsi(&mut p, prt);
                         make_pdo_for_function(&devnode, &p);
                     }
                 }
@@ -190,7 +210,8 @@ pub extern "win64" fn enumerate_bus(
                 let multi = (ht & 0x80) != 0;
                 let func_span = if multi { 0u8..8 } else { 0u8..1 };
                 for func in func_span {
-                    if let Some(p) = probe_function(seg, bus, dev, func) {
+                    if let Some(mut p) = probe_function(seg, bus, dev, func) {
+                        resolve_gsi(&mut p, prt);
                         make_pdo_for_function(&devnode, &p);
                     }
                 }

@@ -522,16 +522,18 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 
     let first_for_vector = {
         let _lock = IRQ_MANAGER.vectors[vector as usize].lock.read();
-        let v = IRQ_MANAGER.vectors[vector as usize].regs;
-        v.is_empty()
+        IRQ_MANAGER.vectors[vector as usize]
+            .count
+            .load(Ordering::Acquire)
+            == 0
     };
 
     IRQ_MANAGER.register(vector, isr, ctx, handle, id);
 
     if first_for_vector {
-        if let Some(irq) = vector_to_irq(vector) {
+        if let Some(gsi) = vector_to_gsi(vector) {
             APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
-                irq,
+                gsi,
                 vector,
                 get_current_logical_id(),
             );
@@ -540,14 +542,51 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 
     handle
 }
-fn vector_to_irq(vector: u8) -> Option<u8> {
+fn vector_to_gsi(vector: u8) -> Option<u8> {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
-    let irq = vector.wrapping_sub(base);
-    if irq < 16 {
-        Some(irq)
+    let gsi = vector.wrapping_sub(base);
+    if gsi < 64 {
+        Some(gsi)
     } else {
         None
     }
+}
+
+/// Register an ISR for a Global System Interrupt (GSI).
+/// The kernel maps the GSI to an IDT vector and programs the IOAPIC.
+pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
+    if gsi >= 64 {
+        return core::ptr::null_mut();
+    }
+    let vector = base + gsi;
+    let id = IRQ_MANAGER.alloc_id();
+    let hook = DropHook::new(irq_unregister_thunk, id);
+
+    let handle = irq_handle_create(hook);
+    if handle.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let first_for_vector = {
+        let _lock = IRQ_MANAGER.vectors[vector as usize].lock.read();
+        IRQ_MANAGER.vectors[vector as usize]
+            .count
+            .load(Ordering::Acquire)
+            == 0
+    };
+
+    IRQ_MANAGER.register(vector, isr, ctx, handle, id);
+
+    if first_for_vector {
+        APIC.lock().as_ref().unwrap().ioapic.unmask_irq_any_cpu(
+            gsi,
+            vector,
+            get_current_logical_id(),
+        );
+    }
+
+    handle
 }
 pub fn irq_dispatch(vector: u8, frame: &mut InterruptStackFrame) {
     IRQ_MANAGER.dispatch(vector, frame);
@@ -580,6 +619,7 @@ macro_rules! gen_irq_stub {
     };
 }
 
+// ISA IRQs 1-15 (vectors 33-47)
 gen_irq_stub!(irq_vec_33, 33);
 gen_irq_stub!(irq_vec_34, 34);
 gen_irq_stub!(irq_vec_35, 35);
@@ -595,6 +635,56 @@ gen_irq_stub!(irq_vec_44, 44);
 gen_irq_stub!(irq_vec_45, 45);
 gen_irq_stub!(irq_vec_46, 46);
 gen_irq_stub!(irq_vec_47, 47);
+
+// IOAPIC GSIs 16-63 (vectors 48-95)
+gen_irq_stub!(irq_vec_48, 48);
+gen_irq_stub!(irq_vec_49, 49);
+gen_irq_stub!(irq_vec_50, 50);
+gen_irq_stub!(irq_vec_51, 51);
+gen_irq_stub!(irq_vec_52, 52);
+gen_irq_stub!(irq_vec_53, 53);
+gen_irq_stub!(irq_vec_54, 54);
+gen_irq_stub!(irq_vec_55, 55);
+gen_irq_stub!(irq_vec_56, 56);
+gen_irq_stub!(irq_vec_57, 57);
+gen_irq_stub!(irq_vec_58, 58);
+gen_irq_stub!(irq_vec_59, 59);
+gen_irq_stub!(irq_vec_60, 60);
+gen_irq_stub!(irq_vec_61, 61);
+gen_irq_stub!(irq_vec_62, 62);
+gen_irq_stub!(irq_vec_63, 63);
+gen_irq_stub!(irq_vec_64, 64);
+gen_irq_stub!(irq_vec_65, 65);
+gen_irq_stub!(irq_vec_66, 66);
+gen_irq_stub!(irq_vec_67, 67);
+gen_irq_stub!(irq_vec_68, 68);
+gen_irq_stub!(irq_vec_69, 69);
+gen_irq_stub!(irq_vec_70, 70);
+gen_irq_stub!(irq_vec_71, 71);
+gen_irq_stub!(irq_vec_72, 72);
+gen_irq_stub!(irq_vec_73, 73);
+gen_irq_stub!(irq_vec_74, 74);
+gen_irq_stub!(irq_vec_75, 75);
+gen_irq_stub!(irq_vec_76, 76);
+gen_irq_stub!(irq_vec_77, 77);
+gen_irq_stub!(irq_vec_78, 78);
+gen_irq_stub!(irq_vec_79, 79);
+gen_irq_stub!(irq_vec_80, 80);
+gen_irq_stub!(irq_vec_81, 81);
+gen_irq_stub!(irq_vec_82, 82);
+gen_irq_stub!(irq_vec_83, 83);
+gen_irq_stub!(irq_vec_84, 84);
+gen_irq_stub!(irq_vec_85, 85);
+gen_irq_stub!(irq_vec_86, 86);
+gen_irq_stub!(irq_vec_87, 87);
+gen_irq_stub!(irq_vec_88, 88);
+gen_irq_stub!(irq_vec_89, 89);
+gen_irq_stub!(irq_vec_90, 90);
+gen_irq_stub!(irq_vec_91, 91);
+gen_irq_stub!(irq_vec_92, 92);
+gen_irq_stub!(irq_vec_93, 93);
+gen_irq_stub!(irq_vec_94, 94);
+gen_irq_stub!(irq_vec_95, 95);
 
 // =============================================================================
 // IDT SETUP
@@ -673,6 +763,57 @@ fn init_idt() -> InterruptDescriptorTable {
     idt[base + 13].set_handler_fn(irq_vec_45);
     idt[base + 14].set_handler_fn(irq_vec_46);
     idt[base + 15].set_handler_fn(irq_vec_47);
+
+    // IOAPIC GSIs 16-63 (vectors 48-95)
+    idt[base + 16].set_handler_fn(irq_vec_48);
+    idt[base + 17].set_handler_fn(irq_vec_49);
+    idt[base + 18].set_handler_fn(irq_vec_50);
+    idt[base + 19].set_handler_fn(irq_vec_51);
+    idt[base + 20].set_handler_fn(irq_vec_52);
+    idt[base + 21].set_handler_fn(irq_vec_53);
+    idt[base + 22].set_handler_fn(irq_vec_54);
+    idt[base + 23].set_handler_fn(irq_vec_55);
+    idt[base + 24].set_handler_fn(irq_vec_56);
+    idt[base + 25].set_handler_fn(irq_vec_57);
+    idt[base + 26].set_handler_fn(irq_vec_58);
+    idt[base + 27].set_handler_fn(irq_vec_59);
+    idt[base + 28].set_handler_fn(irq_vec_60);
+    idt[base + 29].set_handler_fn(irq_vec_61);
+    idt[base + 30].set_handler_fn(irq_vec_62);
+    idt[base + 31].set_handler_fn(irq_vec_63);
+    idt[base + 32].set_handler_fn(irq_vec_64);
+    idt[base + 33].set_handler_fn(irq_vec_65);
+    idt[base + 34].set_handler_fn(irq_vec_66);
+    idt[base + 35].set_handler_fn(irq_vec_67);
+    idt[base + 36].set_handler_fn(irq_vec_68);
+    idt[base + 37].set_handler_fn(irq_vec_69);
+    idt[base + 38].set_handler_fn(irq_vec_70);
+    idt[base + 39].set_handler_fn(irq_vec_71);
+    idt[base + 40].set_handler_fn(irq_vec_72);
+    idt[base + 41].set_handler_fn(irq_vec_73);
+    idt[base + 42].set_handler_fn(irq_vec_74);
+    idt[base + 43].set_handler_fn(irq_vec_75);
+    idt[base + 44].set_handler_fn(irq_vec_76);
+    idt[base + 45].set_handler_fn(irq_vec_77);
+    idt[base + 46].set_handler_fn(irq_vec_78);
+    idt[base + 47].set_handler_fn(irq_vec_79);
+    idt[base + 48].set_handler_fn(irq_vec_80);
+    idt[base + 49].set_handler_fn(irq_vec_81);
+    idt[base + 50].set_handler_fn(irq_vec_82);
+    idt[base + 51].set_handler_fn(irq_vec_83);
+    idt[base + 52].set_handler_fn(irq_vec_84);
+    idt[base + 53].set_handler_fn(irq_vec_85);
+    idt[base + 54].set_handler_fn(irq_vec_86);
+    idt[base + 55].set_handler_fn(irq_vec_87);
+    idt[base + 56].set_handler_fn(irq_vec_88);
+    idt[base + 57].set_handler_fn(irq_vec_89);
+    idt[base + 58].set_handler_fn(irq_vec_90);
+    idt[base + 59].set_handler_fn(irq_vec_91);
+    idt[base + 60].set_handler_fn(irq_vec_92);
+    idt[base + 61].set_handler_fn(irq_vec_93);
+    idt[base + 62].set_handler_fn(irq_vec_94);
+    idt[base + 63].set_handler_fn(irq_vec_95);
+
     unsafe {
         idt[SCHED_IPI_VECTOR as u8]
             .set_handler_addr(VirtAddr::new(ipi_entry as u64))

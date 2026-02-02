@@ -47,7 +47,7 @@ use crate::{
         file::{self, File},
         file_provider::{self, VFS_PROVIDER},
     },
-    idt::{irq_register, irq_signal, irq_signal_n},
+    idt::{irq_register, irq_register_gsi, irq_signal, irq_signal_n},
     memory::{
         allocator::ALLOCATOR,
         paging::{mmio, stack::StackSize},
@@ -106,6 +106,11 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
     unsafe { irq_register(vector, isr, ctx) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+    irq_register_gsi(gsi, isr, ctx)
 }
 
 #[unsafe(no_mangle)]

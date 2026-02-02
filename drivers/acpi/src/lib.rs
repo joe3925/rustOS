@@ -102,6 +102,20 @@ pub async fn bus_driver_prepare_hardware(
             return Err(());
         }
 
+        // Inform firmware we are using APIC mode so _PRT returns GSIs
+        if let Ok(pic_path) = AmlName::from_str("\\_PIC") {
+            let args = ::aml::value::Args([
+                Some(::aml::value::AmlValue::Integer(1)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]);
+            let _ = aml_ctx.invoke_method(&pic_path, args);
+        }
+
         Ok(aml_ctx)
     })
     .await;

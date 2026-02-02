@@ -15,7 +15,7 @@ use core::sync::atomic::Ordering;
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::irq::{IrqHandle, irq_register_isr, irq_wait_ok};
+use kernel_api::irq::{IrqHandle, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
 use kernel_api::kernel_types::io::{IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
@@ -37,6 +37,7 @@ use dev_ext::{ChildExt, DevExt, DevExtInner};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+const PIC_BASE_VECTOR: u8 = 0x20;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -150,8 +151,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
-    let irq_vector = pci::find_irq(&resources);
-
     // Map PCI configuration space (ECAM page) for capability list walking.
     let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
         Some(v) => v,
@@ -215,8 +214,19 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    let irq_handle = if let Some(vector) = irq_vector {
-        irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
+    let irq_handle = if let Some(gsi) = pci::find_gsi(&resources) {
+        if gsi < 64 {
+            irq_register_isr_gsi(gsi as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
+        } else {
+            None
+        }
+    } else if let Some(line) = pci::find_legacy_irq_line(&resources) {
+        if line < 16 {
+            let vector = PIC_BASE_VECTOR + line;
+            irq_register_isr(vector, virtio_isr, caps.isr_cfg.as_u64() as usize)
+        } else {
+            None
+        }
     } else {
         None
     };

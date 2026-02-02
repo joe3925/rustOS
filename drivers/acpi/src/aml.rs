@@ -7,7 +7,6 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use aml::resource::{AddressSpaceDescriptor, Resource as AmlResource, Resource};
 use aml::value::Args;
 use aml::{AmlContext, AmlName, AmlValue, Handler};
 use core::ptr::{read_volatile, write_volatile};
@@ -374,6 +373,7 @@ pub fn create_pnp_bus_from_acpi(
         acpi_path: dev_name.clone(),
         ctx: ctx_lock.clone(),
         ecam: alloc::vec::Vec::new(),
+        prt: alloc::vec::Vec::new(),
     };
 
     // Compute ECAM coverage, then write into the dev-ext
@@ -404,6 +404,7 @@ pub fn create_pnp_bus_from_acpi(
         }
     }
     ext.ecam = ecam;
+    ext.prt = evaluate_prt(&mut ctx, &dev_name);
     init.set_dev_ext_from(ext);
 
     let (_dn, mut pdo) = pnp_create_child_devnode_and_pdo_with_init(
@@ -485,6 +486,179 @@ fn append_ecam(out: &mut Vec<u8>, base: u64, seg: u16, sb: u8, eb: u8) {
     out.extend_from_slice(&seg.to_le_bytes());
     out.push(sb);
     out.push(eb);
+}
+
+fn irqs_from_crs(ctx: &mut AmlContext, link: &AmlName) -> Option<Vec<u32>> {
+    let crs_path = AmlName::from_str(&(link.as_string() + "._CRS")).ok()?;
+    let crs_val = match ctx.namespace.get_by_path(&crs_path) {
+        Ok(AmlValue::Method { .. }) => ctx.invoke_method(&crs_path, Args::EMPTY).ok(),
+        Ok(v) => Some(v.clone()),
+        Err(_) => None,
+    }?;
+
+    let AmlValue::Buffer(buf) = crs_val else {
+        return None;
+    };
+
+    let data = buf.lock();
+    let mut bytes = data.as_slice();
+    let mut irqs = Vec::new();
+
+    while !bytes.is_empty() {
+        let b0 = bytes[0];
+
+        if (b0 & 0x80) != 0 {
+            if bytes.len() < 3 {
+                break;
+            }
+            let len = u16::from_le_bytes([bytes[1], bytes[2]]) as usize;
+            if bytes.len() < 3 + len {
+                break;
+            }
+
+            let body = &bytes[3..3 + len];
+            let typ = b0 & 0x7F;
+
+            if typ == 0x09 && body.len() >= 2 {
+                let count = body[1] as usize;
+                let mut off = 2;
+                for _ in 0..count {
+                    if off + 4 > body.len() {
+                        break;
+                    }
+                    let irq = u32::from_le_bytes([
+                        body[off],
+                        body[off + 1],
+                        body[off + 2],
+                        body[off + 3],
+                    ]);
+                    irqs.push(irq);
+                    off += 4;
+                }
+            }
+
+            bytes = &bytes[3 + len..];
+        } else {
+            let typ = (b0 >> 3) & 0x0F;
+            let len = (b0 & 0x07) as usize;
+            if bytes.len() < 1 + len {
+                break;
+            }
+            if typ == 0x0F {
+                break;
+            }
+
+            let body = &bytes[1..1 + len];
+            if typ == 0x04 && len >= 2 {
+                let mask = u16::from_le_bytes([body[0], body[1]]);
+                for bit in 0..16 {
+                    if (mask & (1 << bit)) != 0 {
+                        irqs.push(bit as u32);
+                    }
+                }
+            }
+
+            bytes = &bytes[1 + len..];
+        }
+    }
+
+    Some(irqs)
+}
+
+/// A single PCI interrupt routing entry from _PRT.
+#[derive(Clone, Copy, Debug)]
+pub struct PrtEntry {
+    pub device: u8,
+    pub pin: u8,
+    pub gsi: u16,
+}
+
+/// Evaluate the _PRT method for a PCI host bridge and return routing entries.
+/// Hardwired GSIs (Source == 0) are used directly; link devices are resolved via their _CRS.
+pub fn evaluate_prt(ctx: &mut AmlContext, dev: &AmlName) -> Vec<PrtEntry> {
+    use aml::value::{AmlValue, Args};
+    let mut out = Vec::new();
+
+    let prt_path = match AmlName::from_str(&(dev.as_string() + "._PRT")) {
+        Ok(p) => p,
+        Err(_) => return out,
+    };
+
+    let val = match ctx.namespace.get_by_path(&prt_path) {
+        Ok(AmlValue::Method { .. }) => match ctx.invoke_method(&prt_path, Args::EMPTY) {
+            Ok(v) => v,
+            Err(_) => return out,
+        },
+        Ok(AmlValue::Package(elems)) => AmlValue::Package(elems.clone()),
+        _ => return out,
+    };
+
+    let AmlValue::Package(entries) = val else {
+        return out;
+    };
+
+    for entry in entries.iter() {
+        let AmlValue::Package(fields) = entry else {
+            continue;
+        };
+        if fields.len() < 4 {
+            continue;
+        }
+
+        // Field 0: Address - device in high word, 0xFFFF in low word
+        let address = match &fields[0] {
+            AmlValue::Integer(n) => *n,
+            _ => continue,
+        };
+        let device = ((address >> 16) & 0xFF) as u8;
+
+        // Field 1: Pin (0=INTA, 1=INTB, 2=INTC, 3=INTD)
+        let pin = match &fields[1] {
+            AmlValue::Integer(n) => *n as u8,
+            _ => continue,
+        };
+
+        let source_index = match &fields[3] {
+            AmlValue::Integer(n) => *n as usize,
+            _ => continue,
+        };
+
+        // Field 2: Source - 0/"" means hardwired GSI, otherwise link device name
+        let gsi = match &fields[2] {
+            AmlValue::Integer(0) => u16::try_from(source_index).ok(),
+            AmlValue::String(s) if s.is_empty() => u16::try_from(source_index).ok(),
+            AmlValue::String(source) => {
+                let link = AmlName::from_str(source).ok();
+                let irqs = link
+                    .as_ref()
+                    .and_then(|l| irqs_from_crs(ctx, l))
+                    .unwrap_or_default();
+                irqs.get(source_index)
+                    .and_then(|irq| u16::try_from(*irq).ok())
+            }
+            _ => None,
+        };
+
+        if let Some(gsi) = gsi {
+            out.push(PrtEntry { device, pin, gsi });
+        }
+    }
+
+    out
+}
+
+/// Serialize PRT entries into a blob section with magic "PIRT".
+pub fn append_prt_list(out: &mut Vec<u8>, entries: &[PrtEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    out.extend_from_slice(b"PIRT");
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        out.push(e.device);
+        out.push(e.pin);
+        out.extend_from_slice(&e.gsi.to_le_bytes());
+    }
 }
 
 fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
@@ -786,6 +960,10 @@ pub async fn acpi_pdo_query_resources(
 
     if !pext.ecam.is_empty() {
         append_ecam_list(&mut blob, &pext.ecam);
+    }
+
+    if !pext.prt.is_empty() {
+        append_prt_list(&mut blob, &pext.prt);
     }
 
     let mut w = req.write();
