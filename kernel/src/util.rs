@@ -75,8 +75,9 @@ pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 150_000;
-pub static BOOTSET: &[BootPkg] =
-    boot_packages!["acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042"];
+pub static BOOTSET: &[BootPkg] = boot_packages![
+    "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
+];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
 lazy_static! {
@@ -180,11 +181,12 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         install_prepacked_drivers().await;
 
         PNP_MANAGER.init_from_registry().await;
+        wait_duration(Duration::from_secs(10));
+        PNP_MANAGER.print_device_tree();
+        // bench_async_vs_sync_call_latency_async().await;
+        // bench_realistic_traffic_async().await;
 
-        bench_async_vs_sync_call_latency_async().await;
-        bench_realistic_traffic_async().await;
-
-        benchmark_async_async().await;
+        // benchmark_async_async().await;
     });
     println!("");
 }

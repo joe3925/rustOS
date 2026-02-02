@@ -121,21 +121,6 @@ impl RequestExt for Request {
         }
     }
 }
-#[no_mangle]
-pub unsafe extern "win64" fn _driver_runtime_submit_task(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    submit_runtime_internal(trampoline, ctx);
-}
-#[no_mangle]
-pub unsafe extern "win64" fn _driver_runtime_submit_blocking_task(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    submit_blocking_internal(trampoline, ctx);
-}
-
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;
 

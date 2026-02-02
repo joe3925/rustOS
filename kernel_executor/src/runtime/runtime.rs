@@ -12,16 +12,14 @@ use spin::Mutex;
 pub use super::block_on::block_on;
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
+use crate::global_async::GlobalAsyncExecutor;
 use crate::platform::{platform, Job};
 
 use super::slab::get_task_slab;
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
-    platform().submit_runtime(Job {
-        f: trampoline,
-        a: ctx,
-    });
+    GlobalAsyncExecutor::global().submit(trampoline, ctx);
 }
 
 pub(crate) fn submit_blocking(trampoline: extern "win64" fn(usize), ctx: usize) {

@@ -21,9 +21,12 @@
                 // i8042.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\i8042.dll\"",
                 "target modules load --file \"i8042.dll\" .text 0xffff90000a9ec000",
+                // virtio.dll
+                "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\virtio.dll\"",
+                "target modules load --file \"virtio.dll\" .text 0xffff900012e56000",
                 // ide.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\ide.dll\"",
-                "target modules load --file \"ide.dll\" .text 0xffff90000aa73000",
+                "target modules load --file \"ide.dll\" .text 0xffff900012272000",
                 // disk.dll 
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\disk.dll\"",
                 "target modules load --file \"disk.dll\" .text 0xffff90000aad1000",

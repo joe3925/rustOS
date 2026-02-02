@@ -27,6 +27,10 @@
   "archive-format": "coff",
   "debuginfo-kind": "pdb",
   "emit-debug-gdb-scripts": false,
+  "split-debuginfo": "packed",
+  "supported-split-debuginfo": [
+    "packed"
+  ],
   "panic-strategy": "abort",
   "relocation-model": "pic",
   "code-model": "large",
@@ -58,10 +62,6 @@
   "supported-sanitizers": [
     "address"
   ],
-  "supported-split-debuginfo": [
-    "packed"
-  ],
-  "split-debuginfo": "packed",
   "plt-by-default": false,
   "staticlib-prefix": "",
   "staticlib-suffix": ".lib"

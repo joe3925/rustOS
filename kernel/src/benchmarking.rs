@@ -1985,19 +1985,28 @@ pub async fn bench_realistic_traffic_async() {
             continue;
         }
 
-        let sw = Stopwatch::start();
         let mut done = 0usize;
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut all_joins = Vec::new();
 
         while done < TRAFFIC_TOTAL_TASKS {
             let batch = (TRAFFIC_TOTAL_TASKS - done).min(conc);
-            let mut joins = Vec::with_capacity(batch);
             for j in 0..batch {
                 let seed = (done + j) as u64;
-                joins.push(spawn(traffic_one_request(seed)));
+                let gate = gate.clone();
+                all_joins.push(spawn(async move {
+                    while !gate.load(Ordering::Acquire) {
+                        ready().await;
+                    }
+                    traffic_one_request(seed).await
+                }));
             }
-            let _results = JoinAll::new(joins).await;
             done += batch;
         }
+
+        let sw = Stopwatch::start();
+        gate.store(true, Ordering::Release);
+        let _results = JoinAll::new(all_joins).await;
 
         let conc_us = sw.elapsed_micros();
         let conc_us_per_task = div_u64_round(conc_us, TRAFFIC_TOTAL_TASKS as u64);
@@ -2025,15 +2034,27 @@ pub async fn bench_realistic_traffic_async() {
     println!("[traffic] --- bulk queue (batch blocking phase) ---");
     let batch_sizes: &[usize] = &[64, 256, 1024, TRAFFIC_TOTAL_TASKS];
     for &bs in batch_sizes {
-        let sw = Stopwatch::start();
+        // Pre-build all seed batches, then gate execution
+        let gate = Arc::new(AtomicBool::new(false));
+        let mut batch_joins = Vec::new();
         let mut done = 0usize;
 
         while done < TRAFFIC_TOTAL_TASKS {
             let batch = (TRAFFIC_TOTAL_TASKS - done).min(bs);
             let seeds: Vec<u64> = (done..done + batch).map(|i| i as u64).collect();
-            let _results = traffic_batch_request(seeds).await;
+            let gate = gate.clone();
+            batch_joins.push(spawn(async move {
+                while !gate.load(Ordering::Acquire) {
+                    ready().await;
+                }
+                traffic_batch_request(seeds).await
+            }));
             done += batch;
         }
+
+        let sw = Stopwatch::start();
+        gate.store(true, Ordering::Release);
+        let _results = JoinAll::new(batch_joins).await;
 
         let bulk_us = sw.elapsed_micros();
         let bulk_us_per_task = div_u64_round(bulk_us, TRAFFIC_TOTAL_TASKS as u64);
@@ -2214,22 +2235,24 @@ pub async fn benchmark_async_async() {
 
         let mut iter: u64 = 0;
         while iter < (BENCH_WARMUP_ITERS + BENCH_ITERS) {
-            let sw = Stopwatch::start();
+            let gate = Arc::new(AtomicBool::new(false));
 
             if BENCH_USE_BATCH_SPAWN {
-                let mut starts: Vec<u64> = Vec::with_capacity(inflight as usize);
                 let mut funcs = Vec::with_capacity(inflight as usize);
 
                 let mut i = 0u64;
                 while i < inflight {
-                    let start = cpu::get_cycles();
-                    starts.push(start);
-
+                    let gate = gate.clone();
                     funcs.push(move || -> u64 {
+                        while !gate.load(Ordering::Acquire) {
+                            core::hint::spin_loop();
+                        }
+                        let start = cpu::get_cycles();
                         if BENCH_WORK_NS != 0 {
                             wait_duration(Duration::from_nanos(BENCH_WORK_NS));
                         }
-                        cpu::get_cycles()
+                        let end = cpu::get_cycles();
+                        end.wrapping_sub(start)
                     });
 
                     i += 1;
@@ -2237,11 +2260,13 @@ pub async fn benchmark_async_async() {
 
                 let joins = spawn_blocking_many(funcs);
 
-                for (j, join) in joins.into_iter().enumerate() {
-                    let end = join.await;
+                let sw = Stopwatch::start();
+                gate.store(true, Ordering::Release);
+
+                for join in joins.into_iter() {
+                    let lat_cycles = join.await;
 
                     if iter >= BENCH_WARMUP_ITERS {
-                        let lat_cycles = end.wrapping_sub(starts[j]);
                         let lat = cycles_to_ns(lat_cycles, tsc_hz);
 
                         let sample_idx = ops_total as usize;
@@ -2251,31 +2276,40 @@ pub async fn benchmark_async_async() {
                         ops_total = ops_total.wrapping_add(1);
                     }
                 }
+
+                if iter >= BENCH_WARMUP_ITERS {
+                    total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
+                    total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
+                }
             } else {
-                let mut starts: Vec<u64> = Vec::with_capacity(inflight as usize);
                 let mut joins = Vec::with_capacity(inflight as usize);
 
                 let mut i = 0u64;
                 while i < inflight {
-                    let start = cpu::get_cycles();
-                    starts.push(start);
-
+                    let gate = gate.clone();
                     let join = spawn_blocking(move || -> u64 {
+                        while !gate.load(Ordering::Acquire) {
+                            core::hint::spin_loop();
+                        }
+                        let start = cpu::get_cycles();
                         if BENCH_WORK_NS != 0 {
                             wait_duration(Duration::from_nanos(BENCH_WORK_NS));
                         }
-                        cpu::get_cycles()
+                        let end = cpu::get_cycles();
+                        end.wrapping_sub(start)
                     });
 
                     joins.push(join);
                     i += 1;
                 }
 
-                for (j, join) in joins.into_iter().enumerate() {
-                    let end = join.await;
+                let sw = Stopwatch::start();
+                gate.store(true, Ordering::Release);
+
+                for join in joins.into_iter() {
+                    let lat_cycles = join.await;
 
                     if iter >= BENCH_WARMUP_ITERS {
-                        let lat_cycles = end.wrapping_sub(starts[j]);
                         let lat = cycles_to_ns(lat_cycles, tsc_hz);
 
                         let sample_idx = ops_total as usize;
@@ -2285,11 +2319,11 @@ pub async fn benchmark_async_async() {
                         ops_total = ops_total.wrapping_add(1);
                     }
                 }
-            }
 
-            if iter >= BENCH_WARMUP_ITERS {
-                total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
-                total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
+                if iter >= BENCH_WARMUP_ITERS {
+                    total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
+                    total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
+                }
             }
 
             iter += 1;

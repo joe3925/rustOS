@@ -12,6 +12,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use kernel_executor::runtime::runtime::block_on;
 use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
     DriverRuntime, DriverState, StackLayer,
@@ -789,10 +790,11 @@ impl PnpManager {
                 let target = IoTarget {
                     target_device: top_device,
                 };
-
-                spawn_detached(async move {
+                // force deterministic loading for testing
+                // todo: fix this when not debugging
+                block_on(spawn(async move {
                     let _ = (&*PNP_MANAGER).send_request(target, req_arc).await;
-                });
+                }));
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);
@@ -853,7 +855,6 @@ impl PnpManager {
             let pm = PROGRAM_MANAGER.get(0).expect("Kernel terminated").clone();
             let mut prog = pm.write();
             prog.load_module(pkg.image_path.clone()).await?
-
         };
 
         let _ = OBJECT_MANAGER.mkdir_p("\\Modules".to_string());
