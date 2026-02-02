@@ -117,6 +117,7 @@ pub enum ResourceKind {
     Memory = 1,
     Port = 2,
     Interrupt = 3,
+    ConfigSpace = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

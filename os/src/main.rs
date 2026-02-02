@@ -48,7 +48,7 @@ fn main() {
                 "-cpu",
                 "qemu64,+apic,+acpi",
                 "-machine",
-                "type=pc,accel=tcg",
+                "q35,accel=tcg",
                 "-smp",
                 "8",
                 "-gdb",

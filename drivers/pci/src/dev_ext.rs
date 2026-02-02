@@ -89,6 +89,8 @@ pub struct PciPdoExt {
     pub irq_pin: u8,
     pub irq_line: u8,
 
+    pub cfg_phys: u64,
+
     pub bars: [Bar; 6],
 }
 
@@ -263,6 +265,7 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         ss_id,
         irq_pin,
         irq_line,
+        cfg_phys: ecam_phys_addr(seg, bus, dev, func, 0),
         bars,
     })
 }
@@ -299,6 +302,9 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
         let flags = (p.irq_pin as u32) & 0xFF;
         items.push((ResourceKind::Interrupt as u32, flags, p.irq_line as u64, 0));
     }
+
+    // Provide the ECAM config space physical address (4 KiB page).
+    items.push((ResourceKind::ConfigSpace as u32, 0, p.cfg_phys, 4096));
 
     let mut out = alloc::vec::Vec::with_capacity(12 + items.len() * 24);
     out.extend_from_slice(b"RSRC");
@@ -653,6 +659,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         ss_id,
         irq_pin,
         irq_line,
+        cfg_phys: 0,
         bars,
     })
 }

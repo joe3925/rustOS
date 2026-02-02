@@ -1,10 +1,10 @@
 use kernel_api::memory::{
-    allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys, PageTableFlags,
+    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::pci;
-use crate::virtqueue::{Virtqueue, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 
 // ---------------------------------------------------------------------------
 // Virtio device status bits
@@ -18,7 +18,7 @@ pub const VIRTIO_STATUS_FAILED: u8 = 128;
 // ---------------------------------------------------------------------------
 // Virtio block request types
 // ---------------------------------------------------------------------------
-pub const VIRTIO_BLK_T_IN: u32 = 0;  // read
+pub const VIRTIO_BLK_T_IN: u32 = 0; // read
 pub const VIRTIO_BLK_T_OUT: u32 = 1; // write
 
 // ---------------------------------------------------------------------------
@@ -94,13 +94,17 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<u64> {
     // Verify FEATURES_OK is still set
     let status = unsafe { pci::common_read_u8(common_cfg, pci::COMMON_DEVICE_STATUS) };
     if status & VIRTIO_STATUS_FEATURES_OK == 0 {
-        unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED) };
+        unsafe {
+            pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
+        };
         return None;
     }
 
     // Read capacity from device config
     let capacity = unsafe {
-        core::ptr::read_volatile((device_cfg.as_u64() as *const u8).add(DEVCFG_CAPACITY) as *const u64)
+        core::ptr::read_volatile(
+            (device_cfg.as_u64() as *const u8).add(DEVCFG_CAPACITY) as *const u64
+        )
     };
 
     Some(capacity)
@@ -149,12 +153,11 @@ impl BlkIoRequest {
     /// `sector` is the starting 512-byte sector.
     /// `data_len` is the number of bytes to transfer (must be sector-aligned).
     pub fn new(req_type: u32, sector: u64, data_len: u32) -> Option<Self> {
-        let flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
 
         // Header (16 bytes, page-aligned)
         let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let header_phys = virt_to_phys(header_va)?;
+        let header_phys = virt_to_phys(header_va);
         unsafe {
             let hdr = header_va.as_u64() as *mut VirtioBlkReqHeader;
             core::ptr::write_volatile(
@@ -170,13 +173,13 @@ impl BlkIoRequest {
         // Data buffer
         let data_pages = ((data_len as u64) + 4095) & !4095;
         let data_va = allocate_auto_kernel_range_mapped(data_pages.max(4096), flags).ok()?;
-        let data_phys = virt_to_phys(data_va)?;
+        let data_phys = virt_to_phys(data_va);
         // Zero data buffer
         unsafe { core::ptr::write_bytes(data_va.as_u64() as *mut u8, 0, data_len as usize) };
 
         // Status byte (1 byte, page-aligned)
         let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let status_phys = virt_to_phys(status_va)?;
+        let status_phys = virt_to_phys(status_va);
         unsafe { core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF) }; // sentinel
 
         Some(Self {
@@ -212,13 +215,18 @@ impl BlkIoRequest {
 
     /// Get a slice view of the data buffer.
     pub fn data_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.data_va.as_u64() as *const u8, self.data_len as usize) }
+        unsafe {
+            core::slice::from_raw_parts(self.data_va.as_u64() as *const u8, self.data_len as usize)
+        }
     }
 
     /// Get a mutable slice view of the data buffer (for writing data before an OUT request).
     pub fn data_slice_mut(&mut self) -> &mut [u8] {
         unsafe {
-            core::slice::from_raw_parts_mut(self.data_va.as_u64() as *mut u8, self.data_len as usize)
+            core::slice::from_raw_parts_mut(
+                self.data_va.as_u64() as *mut u8,
+                self.data_len as usize,
+            )
         }
     }
 

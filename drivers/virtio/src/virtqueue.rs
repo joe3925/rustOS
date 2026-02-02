@@ -1,5 +1,5 @@
 use kernel_api::memory::{
-    allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys, PageTableFlags,
+    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -93,28 +93,30 @@ impl Virtqueue {
         // Select queue
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
-        let size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
-        if size == 0 {
+        let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
+        if max_size == 0 {
             return None;
         }
+        // Use the full size the device offers (could be clamped later if needed).
+        let size = max_size;
+        unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
-        let flags =
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
 
         // Descriptor table: 16 bytes per entry
         let desc_bytes = align_up(size as u64 * 16, 4096);
         let desc_va = allocate_auto_kernel_range_mapped(desc_bytes, flags).ok()?;
-        let desc_phys = virt_to_phys(desc_va)?;
+        let desc_phys = virt_to_phys(desc_va);
 
         // Available ring: 2 (flags) + 2 (idx) + 2*size (ring) + 2 (used_event) — align to page
         let avail_bytes = align_up(6 + size as u64 * 2, 4096);
         let avail_va = allocate_auto_kernel_range_mapped(avail_bytes, flags).ok()?;
-        let avail_phys = virt_to_phys(avail_va)?;
+        let avail_phys = virt_to_phys(avail_va);
 
         // Used ring: 2 (flags) + 2 (idx) + 8*size (elems) + 2 (avail_event) — align to page
         let used_bytes = align_up(6 + size as u64 * 8, 4096);
         let used_va = allocate_auto_kernel_range_mapped(used_bytes, flags).ok()?;
-        let used_phys = virt_to_phys(used_va)?;
+        let used_phys = virt_to_phys(used_va);
 
         // Zero all regions
         unsafe {

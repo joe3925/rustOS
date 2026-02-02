@@ -1,4 +1,9 @@
+use alloc::sync::{Arc, Weak};
+use core::sync::atomic::AtomicBool;
+
+use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
+use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once};
 
@@ -10,6 +15,8 @@ use crate::virtqueue::Virtqueue;
 pub struct DevExt {
     /// Populated during StartDevice after mapping BARs and parsing caps.
     pub inner: Once<DevExtInner>,
+    /// Whether we have already enumerated children.
+    pub enumerated: AtomicBool,
 }
 
 pub struct DevExtInner {
@@ -24,13 +31,25 @@ pub struct DevExtInner {
     pub mapped_bars: Mutex<alloc::vec::Vec<(VirtAddr, u64)>>,
 }
 
+/// Device extension for the child disk PDO.
+#[repr(C)]
+pub struct ChildExt {
+    pub parent_device: Weak<DeviceObject>,
+    pub disk_info: DiskInfo,
+}
+
 unsafe impl Send for DevExt {}
 unsafe impl Sync for DevExt {}
 unsafe impl Send for DevExtInner {}
 unsafe impl Sync for DevExtInner {}
+unsafe impl Send for ChildExt {}
+unsafe impl Sync for ChildExt {}
 
 impl DevExt {
     pub fn new() -> Self {
-        Self { inner: Once::new() }
+        Self {
+            inner: Once::new(),
+            enumerated: AtomicBool::new(false),
+        }
     }
 }

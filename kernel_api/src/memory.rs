@@ -50,6 +50,6 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { kernel_sys::deallocate_kernel_range(addr, size) }
 }
 
-pub fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
+pub fn virt_to_phys(addr: VirtAddr) -> PhysAddr {
     unsafe { kernel_sys::virt_to_phys(addr) }
 }

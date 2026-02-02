@@ -27,9 +27,9 @@
   "archive-format": "coff",
   "debuginfo-kind": "pdb",
   "emit-debug-gdb-scripts": false,
-  "split-debuginfo": "packed",
+  "split-debuginfo": "off",
   "supported-split-debuginfo": [
-    "packed"
+    "off"
   ],
   "panic-strategy": "abort",
   "relocation-model": "pic",

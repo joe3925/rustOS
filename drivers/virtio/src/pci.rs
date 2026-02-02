@@ -63,6 +63,16 @@ pub fn parse_resources(blob: &[u8]) -> Vec<PciResource> {
     out
 }
 
+/// Find the PCI configuration space physical address from the resource blob.
+pub fn find_config_space(resources: &[PciResource]) -> Option<(u64, u64)> {
+    for r in resources {
+        if r.kind == ResourceKind::ConfigSpace as u32 {
+            return Some((r.start, r.length));
+        }
+    }
+    None
+}
+
 /// Find the IRQ line from the resource blob.
 pub fn find_irq(resources: &[PciResource]) -> Option<u8> {
     for r in resources {
