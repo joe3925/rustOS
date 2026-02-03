@@ -28,7 +28,7 @@ use kernel_api::pnp::{
 use kernel_api::request::{Request, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
-use kernel_api::{RequestExt, println, request_handler};
+use kernel_api::{IOCTL_PCI_SETUP_MSIX, RequestExt, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -109,6 +109,55 @@ extern "win64" fn virtio_isr(
         true
     } else {
         false
+    }
+}
+
+/// MSI-X ISR - simpler than legacy ISR since MSI-X is edge-triggered and dedicated.
+/// No need to poll the ISR register.
+extern "win64" fn virtio_msix_isr(
+    _vector: u8,
+    _cpu: u32,
+    _frame: *mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    handle: IrqHandlePtr,
+    _ctx: usize,
+) -> bool {
+    // MSI-X interrupts are dedicated - always signal
+    if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
+        h.signal_one(IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        });
+        core::mem::forget(h); // ISR doesn't own the handle
+    }
+    true
+}
+
+/// Send IOCTL to PCI driver to program MSI-X table entry.
+/// The child driver (us) has already allocated the vector from the kernel.
+async fn setup_msix_via_pci(
+    dev: &Arc<DeviceObject>,
+    vector: u8,
+    cpu: u8,
+    table_index: u16,
+) -> Result<(), DriverStatus> {
+    // Encode request: num_entries(2) + [table_index(2) + vector(1) + cpu(1)] per entry
+    let mut buf = vec![0u8; 6];
+    buf[0..2].copy_from_slice(&1u16.to_le_bytes()); // num_entries = 1
+    buf[2..4].copy_from_slice(&table_index.to_le_bytes());
+    buf[4] = vector;
+    buf[5] = cpu;
+
+    let req = Request::new(
+        RequestType::DeviceControl(IOCTL_PCI_SETUP_MSIX),
+        RequestData::from_boxed_bytes(buf.into_boxed_slice()),
+    );
+    let req = Arc::new(RwLock::new(req));
+    let status = pnp_forward_request_to_next_lower(dev.clone(), req.clone()).await;
+
+    if status == DriverStatus::Success {
+        Ok(())
+    } else {
+        Err(status)
     }
 }
 
@@ -214,7 +263,45 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    let irq_handle = if let Some(gsi) = pci::find_gsi(&resources) {
+    // MSI-X uses vectors starting from 0x40 to avoid conflicts with legacy IRQs
+    const MSIX_BASE_VECTOR: u8 = 0x40;
+
+    // Try MSI-X first, then fall back to GSI, then legacy IRQ
+    let (irq_handle, msix_vector): (Option<IrqHandle>, Option<u8>) =
+        if let Some(_msix_cap) = pci::find_msix_capability(&resources) {
+            // MSI-X available - use a fixed vector for this device
+            let vector = MSIX_BASE_VECTOR;
+            if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
+                // Send IOCTL to PCI driver to program MSI-X table
+                match setup_msix_via_pci(&dev, vector, 0, 0).await {
+                    Ok(()) => {
+                        // Configure virtio device to use MSI-X vector 0 for config and queue
+                        unsafe {
+                            // Set msix_config vector (offset 0x10) to table entry 0
+                            pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
+                            // Set queue 0's msix_vector (offset 0x1A) to table entry 0
+                            pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
+                            pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR, 0);
+                        }
+                        (Some(handle), Some(vector))
+                    }
+                    Err(e) => {
+                        println!("virtio-blk: MSI-X setup IOCTL failed: {:?}, falling back\n", e);
+                        handle.unregister();
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+    // Fall back to GSI or legacy IRQ if MSI-X not available/failed
+    let irq_handle: Option<IrqHandle> = if irq_handle.is_some() {
+        irq_handle
+    } else if let Some(gsi) = pci::find_gsi(&resources) {
         if gsi < 64 {
             irq_register_isr_gsi(gsi as u8, virtio_isr, caps.isr_cfg.as_u64() as usize)
         } else {
@@ -246,6 +333,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         capacity,
         irq_handle,
         mapped_bars: Mutex::new(bar_list),
+        msix_vector,
     });
 
     DriverStep::complete(DriverStatus::Success)

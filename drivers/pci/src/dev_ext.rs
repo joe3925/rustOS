@@ -64,6 +64,16 @@ pub struct Bar {
     pub prefetch: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsixInfo {
+    pub cap_offset: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub table_size: u16,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
+}
+
 impl Default for Bar {
     fn default() -> Self {
         Bar {
@@ -102,6 +112,9 @@ pub struct PciPdoExt {
     pub cfg_phys: u64,
 
     pub bars: [Bar; 6],
+
+    /// MSI-X capability info, if the device supports it.
+    pub msix: Option<MsixInfo>,
 }
 
 #[repr(C)]
@@ -113,6 +126,51 @@ pub struct PrepareHardwareCtx {
 #[inline]
 fn ecam_phys_addr(seg: &McfgSegment, bus: u8, dev: u8, func: u8, offset: u16) -> u64 {
     seg.base + ((bus as u64) << 20) + ((dev as u64) << 15) + ((func as u64) << 12) + (offset as u64)
+}
+
+fn probe_msix_capability(cfg_base: VirtAddr) -> Option<MsixInfo> {
+    // Read Status register (offset 0x06), check bit 4 (Capabilities List)
+    let status = (unsafe { cfg_read32(cfg_base, 0x04) } >> 16) as u16;
+    if (status & (1 << 4)) == 0 {
+        return None;
+    }
+
+    // Walk capability list starting at offset 0x34
+    let mut cap_ptr = (unsafe { cfg_read32(cfg_base, 0x34) } & 0xFF) as u16;
+
+    while cap_ptr != 0 && cap_ptr < 0x100 {
+        let cap_header = unsafe { cfg_read32(cfg_base, cap_ptr) };
+        let cap_id = (cap_header & 0xFF) as u8;
+        let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
+
+        if cap_id == 0x11 {
+            // MSI-X capability found
+            // Message Control at cap_ptr + 2 (upper 16 bits of cap_header)
+            let msg_ctrl = (cap_header >> 16) as u16;
+            let table_size = (msg_ctrl & 0x7FF) + 1;
+
+            // Table Offset/BIR at cap_ptr + 4
+            let table_reg = unsafe { cfg_read32(cfg_base, cap_ptr + 4) };
+            let table_bar = (table_reg & 0x7) as u8;
+            let table_offset = table_reg & !0x7;
+
+            // PBA Offset/BIR at cap_ptr + 8
+            let pba_reg = unsafe { cfg_read32(cfg_base, cap_ptr + 8) };
+            let pba_bar = (pba_reg & 0x7) as u8;
+            let pba_offset = pba_reg & !0x7;
+
+            return Some(MsixInfo {
+                cap_offset: cap_ptr,
+                table_bar,
+                table_offset,
+                table_size,
+                pba_bar,
+                pba_offset,
+            });
+        }
+        cap_ptr = next_ptr;
+    }
+    None
 }
 
 #[inline]
@@ -259,6 +317,8 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         }
     }
 
+    let msix = probe_msix_capability(va);
+
     unsafe { unmap_cfg_page(va, sz) };
     Some(PciPdoExt {
         seg: seg.seg,
@@ -278,6 +338,7 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         irq_gsi: None,
         cfg_phys: ecam_phys_addr(seg, bus, dev, func, 0),
         bars,
+        msix,
     })
 }
 
@@ -322,6 +383,20 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
 
     // Provide the ECAM config space physical address (4 KiB page).
     items.push((ResourceKind::ConfigSpace as u32, 0, p.cfg_phys, 4096));
+
+    // MSI-X capability info if present.
+    // Packed format:
+    //   start: cap_offset(16) | table_bar(8) | pad(8) | table_offset(32)
+    //   length: table_size(16) | pba_bar(8) | pad(8) | pba_offset(32)
+    if let Some(ref msix) = p.msix {
+        let start = (msix.cap_offset as u64)
+            | ((msix.table_bar as u64) << 16)
+            | ((msix.table_offset as u64) << 32);
+        let length = (msix.table_size as u64)
+            | ((msix.pba_bar as u64) << 16)
+            | ((msix.pba_offset as u64) << 32);
+        items.push((ResourceKind::MsixCapability as u32, 0, start, length));
+    }
 
     let mut out = alloc::vec::Vec::with_capacity(12 + items.len() * 24);
     out.extend_from_slice(b"RSRC");
@@ -570,6 +645,50 @@ fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> u32 {
     }
 }
 
+/// Probe MSI-X capability using legacy CFG#1 I/O access.
+/// Caller must hold CFG1_LOCK.
+unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> {
+    // Read Status register (offset 0x06), check bit 4 (Capabilities List)
+    let status = (unsafe { cfg1_read32_unlocked(bus, dev, func, 0x04) } >> 16) as u16;
+    if (status & (1 << 4)) == 0 {
+        return None;
+    }
+
+    // Walk capability list starting at offset 0x34
+    let mut cap_ptr = (unsafe { cfg1_read32_unlocked(bus, dev, func, 0x34) } & 0xFF) as u16;
+
+    while cap_ptr != 0 && cap_ptr < 0x100 {
+        let cap_header = unsafe { cfg1_read32_unlocked(bus, dev, func, cap_ptr) };
+        let cap_id = (cap_header & 0xFF) as u8;
+        let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
+
+        if cap_id == 0x11 {
+            // MSI-X capability found
+            let msg_ctrl = (cap_header >> 16) as u16;
+            let table_size = (msg_ctrl & 0x7FF) + 1;
+
+            let table_reg = unsafe { cfg1_read32_unlocked(bus, dev, func, cap_ptr + 4) };
+            let table_bar = (table_reg & 0x7) as u8;
+            let table_offset = table_reg & !0x7;
+
+            let pba_reg = unsafe { cfg1_read32_unlocked(bus, dev, func, cap_ptr + 8) };
+            let pba_bar = (pba_reg & 0x7) as u8;
+            let pba_offset = pba_reg & !0x7;
+
+            return Some(MsixInfo {
+                cap_offset: cap_ptr,
+                table_bar,
+                table_offset,
+                table_size,
+                pba_bar,
+                pba_offset,
+            });
+        }
+        cap_ptr = next_ptr;
+    }
+    None
+}
+
 pub fn header_type_legacy(bus: u8, dev: u8) -> Option<u8> {
     let vid = cfg1_read32(bus, dev, 0, 0x00) & 0xFFFF;
     if vid == 0xFFFF {
@@ -686,6 +805,8 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         }
     }
 
+    let msix = unsafe { probe_msix_capability_legacy(bus, dev, func) };
+
     Some(PciPdoExt {
         seg: 0,
         bus,
@@ -704,5 +825,6 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         irq_gsi: None,
         cfg_phys: 0,
         bars,
+        msix,
     })
 }

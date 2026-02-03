@@ -119,6 +119,7 @@ pub enum ResourceKind {
     Interrupt = 3,
     ConfigSpace = 4,
     Gsi = 5,
+    MsixCapability = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

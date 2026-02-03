@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod dev_ext;
+mod msix;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 #[cfg(not(test))]
@@ -18,8 +19,9 @@ use dev_ext::{
 
 use kernel_api::{
     RequestExt,
+    IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::{io::IoVtable, pnp::DeviceIds, request::RequestData},
+    kernel_types::{io::{IoType, IoVtable, Synchronization}, pnp::DeviceIds, request::{RequestData, RequestType}},
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -238,7 +240,10 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
         pci_pdo_query_devrels,
     );
 
-    let mut child_init = DeviceInit::new(IoVtable::new(), Some(vt));
+    let mut io_vt = IoVtable::new();
+    io_vt.set(IoType::DeviceControl(pci_pdo_ioctl), Synchronization::Async, 0);
+
+    let mut child_init = DeviceInit::new(io_vt, Some(vt));
     child_init.set_dev_ext_from(*p);
 
     let name = name_for(p);
@@ -326,4 +331,20 @@ pub async fn pci_pdo_query_devrels(
     req: Arc<RwLock<Request>>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
+}
+
+#[request_handler]
+pub async fn pci_pdo_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+    let code = {
+        let r = req.read();
+        match r.kind {
+            RequestType::DeviceControl(c) => c,
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        }
+    };
+
+    match code {
+        IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev, req).await,
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
+    }
 }

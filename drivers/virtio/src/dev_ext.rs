@@ -29,6 +29,8 @@ pub struct DevExtInner {
     pub capacity: u64,
     pub irq_handle: Option<IrqHandle>,
     pub mapped_bars: Mutex<alloc::vec::Vec<(VirtAddr, u64)>>,
+    /// MSI-X vector number if MSI-X is being used, None for legacy/GSI IRQ.
+    pub msix_vector: Option<u8>,
 }
 
 /// Device extension for the child disk PDO.

@@ -266,3 +266,42 @@ pub const COMMON_QUEUE_NOTIFY_OFF: usize = 0x1E;
 pub const COMMON_QUEUE_DESC: usize = 0x20;
 pub const COMMON_QUEUE_DRIVER: usize = 0x28;
 pub const COMMON_QUEUE_DEVICE: usize = 0x30;
+pub const COMMON_MSIX_CONFIG: usize = 0x10;
+pub const COMMON_QUEUE_MSIX_VECTOR: usize = 0x1A;
+
+/// MSI-X capability information parsed from PCI resources.
+#[derive(Clone, Copy, Debug)]
+pub struct MsixCapInfo {
+    pub cap_offset: u16,
+    pub table_bar: u8,
+    pub table_offset: u32,
+    pub table_size: u16,
+    pub pba_bar: u8,
+    pub pba_offset: u32,
+}
+
+/// Find MSI-X capability information from the resource blob.
+/// The PCI driver encodes MSI-X info in a packed format:
+/// - start: cap_offset(16) | table_bar(8) | reserved(8) | table_offset(32)
+/// - length: table_size(16) | pba_bar(8) | reserved(8) | pba_offset(32)
+pub fn find_msix_capability(resources: &[PciResource]) -> Option<MsixCapInfo> {
+    for r in resources {
+        if r.kind == ResourceKind::MsixCapability as u32 {
+            let cap_offset = (r.start & 0xFFFF) as u16;
+            let table_bar = ((r.start >> 16) & 0xFF) as u8;
+            let table_offset = ((r.start >> 32) & 0xFFFF_FFFF) as u32;
+            let table_size = (r.length & 0xFFFF) as u16;
+            let pba_bar = ((r.length >> 16) & 0xFF) as u8;
+            let pba_offset = ((r.length >> 32) & 0xFFFF_FFFF) as u32;
+            return Some(MsixCapInfo {
+                cap_offset,
+                table_bar,
+                table_offset,
+                table_size,
+                pba_bar,
+                pba_offset,
+            });
+        }
+    }
+    None
+}
