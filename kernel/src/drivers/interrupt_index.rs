@@ -295,6 +295,25 @@ pub fn apic_program_period_ms(ms: u64) {
     apic_program_period_ns(ns);
 }
 
+/// Return the list of known APIC logical IDs (BSP first).
+pub fn apic_logical_ids() -> Vec<u8> {
+    let mut ids = Vec::new();
+    ids.push(get_current_logical_id());
+
+    if let Some(pi) = ACPI_TABLES.get_plat_info() {
+        if let Some(proc_info) = pi.processor_info {
+            for ap in proc_info.application_processors.iter() {
+                let id = ap.local_apic_id as u8;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+
+    ids
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ApicErrors {
     NotAvailable,

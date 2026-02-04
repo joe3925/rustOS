@@ -3,7 +3,8 @@ use core::ptr::NonNull;
 use kernel_sys::{
     irq_handle_clone, irq_handle_drop, irq_handle_get_user_ctx, irq_handle_is_closed,
     irq_handle_set_user_ctx, irq_handle_unregister, irq_handle_wait_ffi, kernel_irq_register,
-    kernel_irq_register_gsi, kernel_irq_signal, kernel_irq_signal_n,
+    kernel_irq_register_gsi, kernel_irq_signal, kernel_irq_signal_n, kernel_irq_alloc_vector,
+    kernel_irq_free_vector, kernel_apic_cpu_ids,
 };
 
 use kernel_types::async_ffi::FfiFuture;
@@ -77,6 +78,23 @@ pub fn irq_register_isr(vector: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHand
 pub fn irq_register_isr_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> Option<IrqHandle> {
     let p = unsafe { kernel_irq_register_gsi(gsi, isr, ctx) };
     unsafe { IrqHandle::from_raw(p) }
+}
+
+pub fn irq_alloc_vector() -> Option<u8> {
+    let v = unsafe { kernel_irq_alloc_vector() };
+    if v < 0 {
+        None
+    } else {
+        Some(v as u8)
+    }
+}
+
+pub fn irq_free_vector(vector: u8) -> bool {
+    unsafe { kernel_irq_free_vector(vector) }
+}
+
+pub fn apic_cpu_ids() -> alloc::vec::Vec<u8> {
+    unsafe { kernel_apic_cpu_ids() }
 }
 
 pub fn irq_wait_ok(r: IrqWaitResult) -> bool {

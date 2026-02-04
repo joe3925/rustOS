@@ -18,22 +18,22 @@
                 "target modules load --file \"acpi.dll\" .text 0xffff900010013000",
                 // pci.dll 
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\pci.dll\"",
-                "target modules load --file \"pci.dll\" .text 0xffff9000121f2000",
+                "target modules load --file \"pci.dll\" .text 0xffff9000121f0000",
                 // i8042.dll
                 // "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\i8042.dll\"",
                 // "target modules load --file \"i8042.dll\" .text 0xffff90001223b000",
                 // virtio.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\virtio.dll\"",
-                "target modules load --file \"virtio.dll\" .text 0xffff900014254000",
+                "target modules load --file \"virtio.dll\" .text 0xffff900014252000",
                 // ide.dll
                 // "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\ide.dll\"",
                 // "target modules load --file \"ide.dll\" .text 0xffff9000122cc000",
                 // disk.dll 
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\disk.dll\"",
-                "target modules load --file \"disk.dll\" .text 0xffff9000142b8000",
+                "target modules load --file \"disk.dll\" .text 0xffff9000142b5000",
                 // partmgr.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\partmgr.dll\"",
-                "target modules load --file \"partmgr.dll\" .text 0xffff900014329000",
+                "target modules load --file \"partmgr.dll\" .text 0xffff900014325000",
                 // volmgr.dll
                 "target modules add \"${workspaceRoot}\\drivers\\target\\x86_64-rustos-driver\\debug\\deps\\volmgr.dll\"",
                 "target modules load --file \"volmgr.dll\" .text 0xffff90000ab86000",

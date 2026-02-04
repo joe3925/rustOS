@@ -47,7 +47,7 @@ use crate::{
         file::{self, File},
         file_provider::{self, VFS_PROVIDER},
     },
-    idt::{irq_register, irq_register_gsi, irq_signal, irq_signal_n},
+    idt::{irq_alloc_vector, irq_free_vector, irq_register, irq_register_gsi, irq_signal, irq_signal_n},
     memory::{
         allocator::ALLOCATOR,
         paging::{mmio, stack::StackSize},
@@ -121,6 +121,21 @@ pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
     unsafe { irq_signal_n(handle, meta, n) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_alloc_vector() -> i32 {
+    irq_alloc_vector().map(|v| v as i32).unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_free_vector(vector: u8) -> bool {
+    irq_free_vector(vector)
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_apic_cpu_ids() -> Vec<u8> {
+    interrupt_index::apic_logical_ids()
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn print(str: &str) {

@@ -73,6 +73,8 @@ unsafe extern "win64" {
     pub fn irq_handle_get_user_ctx(h: IrqHandlePtr) -> usize;
 
     pub fn irq_handle_wait_ffi(h: IrqHandlePtr, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
+    pub fn kernel_irq_alloc_vector() -> i32;
+    pub fn kernel_irq_free_vector(vector: u8) -> bool;
     // =========================================================================
     // Paging / VMM
     // =========================================================================
@@ -219,6 +221,7 @@ unsafe extern "win64" {
         relation: DeviceRelationType,
     ) -> FfiFuture<DriverStatus>;
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
+    pub fn kernel_apic_cpu_ids() -> Vec<u8>;
     // =========================================================================
     // Bench (drivers)
     // =========================================================================

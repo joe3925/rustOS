@@ -15,7 +15,7 @@ use core::sync::atomic::Ordering;
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::irq::{IrqHandle, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
+use kernel_api::irq::{IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
 use kernel_api::kernel_types::io::{IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
@@ -263,36 +263,37 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    // MSI-X uses vectors starting from 0x40 to avoid conflicts with legacy IRQs
-    const MSIX_BASE_VECTOR: u8 = 0x40;
-
     // Try MSI-X first, then fall back to GSI, then legacy IRQ
     let (irq_handle, msix_vector): (Option<IrqHandle>, Option<u8>) =
         if let Some(_msix_cap) = pci::find_msix_capability(&resources) {
-            // MSI-X available - use a fixed vector for this device
-            let vector = MSIX_BASE_VECTOR;
-            if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
-                // Send IOCTL to PCI driver to program MSI-X table
-                match setup_msix_via_pci(&dev, vector, 0, 0).await {
-                    Ok(()) => {
-                        // Configure virtio device to use MSI-X vector 0 for config and queue
-                        unsafe {
-                            // Set msix_config vector (offset 0x10) to table entry 0
-                            pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
-                            // Set queue 0's msix_vector (offset 0x1A) to table entry 0
-                            pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
-                            pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR, 0);
+            match irq_alloc_vector() {
+                Some(vector) => {
+                    if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
+                        match setup_msix_via_pci(&dev, vector, 0, 0).await {
+                            Ok(()) => {
+                                // Configure virtio device to use MSI-X vector 0 for config and queue
+                                unsafe {
+                                    // Set msix_config vector (offset 0x10) to table entry 0
+                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
+                                    // Set queue 0's msix_vector (offset 0x1A) to table entry 0
+                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
+                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR, 0);
+                                }
+                                (Some(handle), Some(vector))
+                            }
+                            Err(e) => {
+                                println!("virtio-blk: MSI-X setup IOCTL failed: {:?}, falling back\n", e);
+                                handle.unregister();
+                                let _ = irq_free_vector(vector);
+                                (None, None)
+                            }
                         }
-                        (Some(handle), Some(vector))
-                    }
-                    Err(e) => {
-                        println!("virtio-blk: MSI-X setup IOCTL failed: {:?}, falling back\n", e);
-                        handle.unregister();
+                    } else {
+                        let _ = irq_free_vector(vector);
                         (None, None)
                     }
                 }
-            } else {
-                (None, None)
+                None => (None, None),
             }
         } else {
             (None, None)
