@@ -301,6 +301,8 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         None
     };
 
+    // Queue must remain disabled until after the MSI-X vector (if any) is programmed.
+    vq.enable(caps.common_cfg);
     blk::set_driver_ok(caps.common_cfg);
 
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");

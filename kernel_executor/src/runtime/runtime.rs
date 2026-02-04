@@ -41,8 +41,6 @@ pub extern "win64" fn try_steal_blocking_one() -> bool {
     platform().try_steal_blocking_one()
 }
 
-/// Spawns a future and returns a JoinHandle to await its result.
-/// Uses a single Arc allocation for both the task and result storage.
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
@@ -75,10 +73,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     }
 }
 
-/// Spawns a detached future that runs to completion without a JoinHandle.
-///
-/// This function tries to allocate from the task slab first for better performance.
-/// If the slab is full, it falls back to Arc-based allocation.
+/// Spawns a detached future, preferring slab allocation before falling back to Arc.
 pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -96,22 +91,16 @@ where
     }
 }
 
-/// State of each future in JoinAll - either still running or completed with result.
 enum FutureSlot<F: Future> {
     Running(F),
     Done(Option<F::Output>),
 }
 
-/// Shared state for JoinAll's indexed waker scheme.
-/// Each child gets a waker that pushes its index into `ready_queue` on wake,
-/// so JoinAll only re-polls children that were actually woken.
 struct JoinAllShared {
     parent: Mutex<Option<Waker>>,
     ready_queue: SegQueue<usize>,
 }
 
-/// Per-child waker handle: heap-allocated pair of (shared, index).
-/// The RawWaker data pointer points to this struct.
 struct IndexedWakerData {
     shared: Arc<JoinAllShared>,
     index: usize,
@@ -186,10 +175,7 @@ impl JoinAllShared {
     }
 }
 
-/// Joins multiple futures of the same type, returning their results in order.
-/// Stores futures inline without boxing, saving one heap allocation per future.
-/// Uses indexed wakers so only children that were woken get re-polled, avoiding
-/// O(n²) scans when many futures are in flight.
+/// Joins multiple futures, storing them inline and using indexed wakers to avoid O(n^2) rescans.
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
     remaining: usize,

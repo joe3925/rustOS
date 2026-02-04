@@ -18,11 +18,8 @@ const NUM_SHARDS: usize = 8;
 const DEFAULT_SLOTS_PER_SHARD: usize = 128;
 const MAX_SLOTS_PER_SHARD: usize = 4096;
 
-/// Maximum size (in bytes) for inline future storage. Futures larger than this
-/// will be heap-allocated.
 pub const INLINE_FUTURE_SIZE: usize = 512;
 
-/// Required alignment for inline future storage.
 pub const INLINE_FUTURE_ALIGN: usize = 8;
 
 const SLOT_FREE: u8 = 0;
@@ -31,7 +28,6 @@ const SLOT_ALLOCATED: u8 = 1;
 static TASK_SLAB_PTR: Once<&'static TaskSlab> = Once::new();
 static mut TASK_SLAB_STORAGE: MaybeUninit<TaskSlab> = MaybeUninit::uninit();
 
-/// Properly aligned buffer for inline future storage.
 #[repr(C, align(8))]
 struct InlineFutureBuffer {
     data: MaybeUninit<[u8; INLINE_FUTURE_SIZE]>,
@@ -50,22 +46,15 @@ impl InlineFutureBuffer {
     }
 }
 
-/// Storage for a future - either inline (SBO) or heap-allocated.
 enum FutureStorage {
-    /// Heap-allocated future (for large futures)
     Boxed(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
-    /// Inline storage with manual vtable for small futures
     Inline {
-        /// Aligned storage buffer
         storage: InlineFutureBuffer,
-        /// Function pointer to poll the future
         poll_fn: unsafe fn(*mut u8, &mut Context<'_>) -> Poll<()>,
-        /// Function pointer to drop the future
         drop_fn: unsafe fn(*mut u8),
     },
 }
 
-/// Type-erased poll function for inline futures
 unsafe fn poll_inline<F>(ptr: *mut u8, cx: &mut Context<'_>) -> Poll<()>
 where
     F: Future<Output = ()>,
@@ -75,13 +64,11 @@ where
     Pin::new_unchecked(future).poll(cx)
 }
 
-/// Type-erased drop function for inline futures
 unsafe fn drop_inline<F>(ptr: *mut u8) {
     core::ptr::drop_in_place(ptr as *mut F);
 }
 
 impl FutureStorage {
-    /// Create storage for a future, using inline if it fits
     fn new<F>(future: F) -> Self
     where
         F: Future<Output = ()> + Send + 'static,
@@ -119,7 +106,6 @@ impl FutureStorage {
         }
     }
 
-    /// Poll the stored future
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match self {
             FutureStorage::Boxed(fut) => fut.as_mut().poll(cx),
@@ -247,8 +233,6 @@ impl TaskSlot {
         }
     }
 
-    /// Initialize the slot with a future. Sets state to QUEUED since the
-    /// caller is expected to immediately submit this to the thread pool.
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
         // Safety: called on a freshly allocated slot before it is visible to other threads.
         unsafe { *self.future.get() = Some(FutureStorage::new(future)) };
@@ -322,8 +306,6 @@ impl TaskSlot {
         self.state.load(Ordering::Acquire) == STATE_COMPLETED
     }
 
-    /// Try to transition IDLE -> QUEUED for enqueue.
-    /// Returns true if the transition succeeded.
     #[inline]
     pub fn try_enqueue(&self) -> bool {
         self.state
@@ -336,10 +318,6 @@ impl TaskSlot {
             .is_ok()
     }
 
-    /// Try to notify: if POLLING, upgrade to NOTIFIED.
-    /// Used by enqueue when IDLE->QUEUED fails.
-    /// Returns true if notification was delivered or unnecessary,
-    /// false if the state raced to IDLE and the caller should retry enqueue.
     #[inline]
     pub fn try_notify(&self) -> bool {
         match self.state.compare_exchange(
@@ -355,7 +333,6 @@ impl TaskSlot {
         }
     }
 
-    /// Try to transition IDLE -> POLLING for inline poll.
     #[inline]
     pub fn try_start_inline_poll(&self) -> bool {
         self.state

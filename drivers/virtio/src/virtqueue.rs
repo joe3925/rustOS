@@ -100,8 +100,6 @@ impl Virtqueue {
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DESC, desc_phys.as_u64());
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DRIVER, avail_phys.as_u64());
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DEVICE, used_phys.as_u64());
-
-            pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
         }
 
         Some(Self {
@@ -120,6 +118,15 @@ impl Virtqueue {
             num_free: size,
             last_used_idx: 0,
         })
+    }
+
+    /// Enable the queue after all configuration (including MSI-X vector) is set.
+    pub fn enable(&self, common_cfg: VirtAddr) {
+        unsafe {
+            // Re-select the queue before enabling to ensure the register window is pointed at us.
+            pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, self.idx);
+            pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
+        }
     }
 
     /// Allocate a single descriptor from the free list. Returns descriptor index.

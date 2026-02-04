@@ -25,20 +25,14 @@ pub const STATE_POLLING: u8 = 2;
 pub const STATE_NOTIFIED: u8 = 3;
 pub const STATE_COMPLETED: u8 = 4;
 
-/// Trait for type-erased task polling. Allows the executor to poll tasks
-/// without knowing the concrete future or output type.
 pub trait TaskPoll: Send + Sync {
     fn poll_once(self: Arc<Self>);
-    /// Called when already in POLLING state (from inline poll path).
     fn poll_once_inline(self: Arc<Self>);
     fn enqueue(self: &Arc<Self>);
     fn is_completed(&self) -> bool;
-    /// Attempt to transition from IDLE to POLLING for inline poll.
-    /// Returns true if the transition succeeded.
     fn try_start_inline_poll(&self) -> bool;
 }
 
-/// A detached task with no return value - used by spawn_detached().
 pub struct FutureTask {
     /// Safety: exclusive access is guaranteed by the task state machine —
     /// only the thread in POLLING state touches this field.
@@ -195,8 +189,6 @@ impl TaskPoll for FutureTask {
     }
 }
 
-/// A joinable task that stores the result for the JoinHandle to retrieve.
-/// This combines FutureTask + JoinInner into a single Arc allocation.
 pub struct JoinableTask<T: Send + 'static> {
     /// Safety: exclusive access is guaranteed by the task state machine —
     /// only the thread in POLLING state touches this field.
@@ -221,19 +213,14 @@ impl<T: Send + 'static> JoinableTask<T> {
         }
     }
 
-    /// Take the result if available. Called by JoinHandle::poll.
     pub fn take_result(&self) -> Option<T> {
         self.result.lock().take()
     }
 
-    /// Store a waker to be notified when the task completes.
     pub fn set_waker(&self, waker: Waker) {
         *self.waker.lock() = Some(waker);
     }
 
-    /// Store a waker only if the currently stored one wouldn't wake the same task.
-    /// Avoids redundant clones when the same parent waker is passed repeatedly
-    /// (e.g., from JoinAll polling N children with the same context).
     pub fn update_waker(&self, waker: &Waker) {
         let mut guard = self.waker.lock();
         if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
