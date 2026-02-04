@@ -414,10 +414,8 @@ async fn ensure_loaded() {
         return;
     }
 
-    // 1. Load latest valid snapshot (or empty)
     let mut reg = load_snapshot().await.unwrap_or_else(Registry::empty);
 
-    // 2. Replay WAL
     let max_seq = replay_wal(&mut reg).await;
     WAL_SEQ.store(max_seq, Ordering::Release);
 

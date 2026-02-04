@@ -944,7 +944,6 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
     Some(out)
 }
 
-/* --------------------------- PnP minor callbacks --------------------------- */
 #[request_handler]
 pub async fn acpi_pdo_query_resources(
     dev: Arc<DeviceObject>,

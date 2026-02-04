@@ -1,14 +1,3 @@
-//! Wait queue for blocking synchronization primitives (SegQueue-based).
-//!
-//! This implementation uses `crossbeam_queue::SegQueue` for a lock-free MPMC queue.
-//! Membership/duplication is still enforced with `TaskRef.wait_next` as a per-task
-//! "queued on queue_id" flag.
-//!
-//! Notes:
-//! - Because SegQueue cannot remove arbitrary elements, a task that cancels its wait
-//!   (permit arrives before it actually blocks) may leave a stale entry in the queue.
-//!   Dequeue filters these by checking/clearing `wait_next` atomically.
-
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;

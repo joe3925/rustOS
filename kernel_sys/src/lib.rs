@@ -32,9 +32,7 @@ use kernel_types::{ClassAddCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverUnload}
 
 #[link(name = "KRNL")]
 unsafe extern "win64" {
-    // =========================================================================
     // Memory / Core
-    // =========================================================================
     pub fn kernel_alloc(layout: Layout) -> *mut u8;
     pub fn kernel_free(ptr: *mut u8, layout: Layout);
     pub fn print(s: &str);
@@ -43,9 +41,7 @@ unsafe extern "win64" {
     pub fn wait_duration(time: Duration);
     pub fn get_rsdp() -> u64;
     pub unsafe fn get_current_cpu_id() -> usize;
-    // =========================================================================
     // Tasking
-    // =========================================================================
     pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
     pub fn pnp_queue_dpc(func: DpcFn, arg: usize);
@@ -54,9 +50,7 @@ unsafe extern "win64" {
     pub fn try_steal_blocking_one() -> bool;
     pub unsafe fn park_self_and_yield();
     pub unsafe fn wake_task(id: u64);
-    // =========================================================================
     // IRQ
-    // =========================================================================
     pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
     pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
     pub fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta);
@@ -75,9 +69,7 @@ unsafe extern "win64" {
     pub fn irq_handle_wait_ffi(h: IrqHandlePtr, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
-    // =========================================================================
     // Paging / VMM
-    // =========================================================================
     pub fn allocate_auto_kernel_range_mapped(
         size: u64,
         flags: PageTableFlags,
@@ -94,9 +86,7 @@ unsafe extern "win64" {
     pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
     pub fn virt_to_phys(addr: VirtAddr) -> PhysAddr;
 
-    // =========================================================================
     // Registry (async FFI)
-    // =========================================================================
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;
     pub fn reg_set_value(key_path: &str, name: &str, data: Data)
     -> FfiFuture<Result<(), RegError>>;
@@ -107,9 +97,7 @@ unsafe extern "win64" {
     pub fn reg_list_values(base_path: &str) -> FfiFuture<Result<Vec<String>, RegError>>;
     pub fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>>;
 
-    // =========================================================================
     // File System (async FFI)
-    // =========================================================================
     pub fn file_open(path: &Path, flags: &[OpenFlags]) -> FfiFuture<Result<File, FileStatus>>;
     pub fn fs_list_dir(path: &Path) -> FfiFuture<Result<Vec<String>, FileStatus>>;
     pub fn fs_remove_dir(path: &Path) -> FfiFuture<Result<(), FileStatus>>;
@@ -125,9 +113,7 @@ unsafe extern "win64" {
     );
 
     pub fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize);
-    // =========================================================================
     // PnP / Device Management
-    // =========================================================================
     pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
     pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
     pub fn driver_set_evt_device_add(driver: &Arc<DriverObject>, callback: EvtDriverDeviceAdd);
@@ -222,9 +208,7 @@ unsafe extern "win64" {
     ) -> FfiFuture<DriverStatus>;
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     pub fn kernel_apic_cpu_ids() -> Vec<u8>;
-    // =========================================================================
     // Bench (drivers)
-    // =========================================================================
     pub fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle;
     pub fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool;
     pub fn bench_kernel_window_start(handle: BenchWindowHandle) -> bool;
@@ -240,9 +224,7 @@ unsafe extern "win64" {
     pub fn bench_kernel_span_begin(tag: BenchTag, object_id: BenchObjectId) -> BenchSpanGuard;
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
-    // =========================================================================
     // Async Runtime (global)
-    // =========================================================================
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
     pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);

@@ -1,11 +1,3 @@
-//! Task Slab Allocator for the async executor.
-//!
-//! Pre-allocated pool of task slots for detached tasks. Uses a sharded bitmap
-//! to reduce contention.
-//!
-//! This version avoids constructing multi-MiB temporaries on the stack during
-//! slab initialization by initializing the slab in-place in static storage.
-
 use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;

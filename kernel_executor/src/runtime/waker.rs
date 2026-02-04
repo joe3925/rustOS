@@ -32,17 +32,8 @@ unsafe fn untag_ptr<T>(ptr: *const ()) -> *const T {
     ((ptr as usize) & TASK_WAKER_MASK) as *const T
 }
 
-// ============================================================================
-// Arc-based wakers (for JoinableTask<T> and fallback FutureTask)
-// ============================================================================
-
-/// Creates a Waker from any Arc<T: TaskPoll> without additional allocation.
-/// The Arc's refcount is transferred to the waker.
-///
-/// We use a macro to generate type-specific vtables since we need concrete
-/// types for Arc operations. Each TaskPoll implementation gets its own vtable.
+/// Creates a waker from an Arc<T: TaskPoll>, transferring the Arc's refcount.
 pub fn create_from_task_poll<T: TaskPoll + 'static>(task: Arc<T>) -> Waker {
-    // Get the vtable for this specific type
     let vtable = vtable_for::<T>();
     let ptr = tag_arc_ptr(task);
     unsafe { Waker::from_raw(RawWaker::new(ptr, &vtable.raw)) }
@@ -64,7 +55,6 @@ impl<T: TaskPoll + 'static> TaskWakerVtableHolder<T> {
     };
 }
 
-/// Returns a static vtable for a given TaskPoll type.
 fn vtable_for<T: TaskPoll + 'static>() -> &'static TaskWakerVtable {
     &TaskWakerVtableHolder::<T>::VTABLE
 }
@@ -144,8 +134,6 @@ pub struct Continuation {
     pub drop_fn: unsafe fn(usize),
 }
 
-/// Attempts to build an inline continuation from the provided waker.
-/// Returns None if the waker is not one created by this runtime.
 pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     let cloned = w.clone();
     let raw: RawWaker = unsafe { transmute_copy(&cloned) };
@@ -195,11 +183,6 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     })
 }
 
-// ============================================================================
-// Slab-based wakers (for slab-allocated FutureTask)
-// ============================================================================
-
-/// Static vtable for slab-allocated task wakers.
 static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     slab_clone_waker,
     slab_wake,
@@ -207,8 +190,6 @@ static SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     slab_drop_waker,
 );
 
-/// Creates a Waker for a slab-allocated task.
-/// The encoded pointer contains shard index, local index, and generation.
 pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
     let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
     // No refcount increment — the slot is kept alive by structural anchor refs

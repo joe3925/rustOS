@@ -1,11 +1,3 @@
-//! Multi-producer multi-consumer channel.
-//!
-//! Unlike [`channel`](super::channel), this implementation uses a lock-free
-//! `SegQueue` for the data path and `WaitQueue` + direct `park`/`unpark` for
-//! blocking, avoiding the mutex serialization that occurs with `Condvar`.
-//!
-//! Both [`Sender`] and [`Receiver`] are cloneable, making this a true MPMC channel.
-
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
@@ -91,15 +83,12 @@ impl<T> Sender<T> {
     /// This will not block. If all receivers have been dropped, this returns
     /// `Err(SendError(value))` with the value back.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
-        // Check if channel is closed (all receivers dropped)
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError(value));
         }
 
-        // Push to lock-free queue
         self.inner.queue.push(value);
 
-        // Wake one waiting receiver if any
         if let Some(task) = self.inner.receivers_waiting.dequeue_one() {
             SCHEDULER.unpark(&task);
         }
@@ -126,7 +115,6 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.inner.sender_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            // Last sender dropped - wake all waiting receivers so they see disconnect
             for task in self.inner.receivers_waiting.dequeue_all() {
                 SCHEDULER.unpark(&task);
             }
@@ -141,23 +129,18 @@ impl<T> Receiver<T> {
     /// this returns `Err(RecvError)`.
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
-            // Fast path: try to pop without blocking
             if let Some(value) = self.inner.queue.pop() {
                 return Ok(value);
             }
 
-            // Check if all senders are gone
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                // One final check a message may have been sent before sender dropped
                 if let Some(value) = self.inner.queue.pop() {
                     return Ok(value);
                 }
                 return Err(RecvError);
             }
 
-            // Slow path: enqueue ourselves BEFORE re-checking (prevents lost wakeup)
             if !self.inner.receivers_waiting.enqueue_current() {
-                // Task already in another queue, retry
                 continue;
             }
 
@@ -166,10 +149,8 @@ impl<T> Receiver<T> {
                 return Ok(value);
             }
 
-            // Re-check sender count
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
                 self.inner.receivers_waiting.clear_current_if_queued();
-                // Final drain attempt
                 if let Some(value) = self.inner.queue.pop() {
                     return Ok(value);
                 }
@@ -177,7 +158,6 @@ impl<T> Receiver<T> {
             }
 
             SCHEDULER.park_current(BlockReason::ChannelRecv);
-            // Remove this to set thread pools to loop on the queue instead of sleeping fro debugging
             self.inner.receivers_waiting.clear_current_if_queued();
         }
     }
@@ -191,7 +171,6 @@ impl<T> Receiver<T> {
         if let Some(value) = self.inner.queue.pop() {
             Ok(value)
         } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            // Final check after seeing no senders
             if let Some(value) = self.inner.queue.pop() {
                 Ok(value)
             } else {

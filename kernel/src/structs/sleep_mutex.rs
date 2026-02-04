@@ -6,34 +6,10 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
 use crate::structs::wait_queue::WaitQueue;
 
-/// A sleepable mutex that blocks tasks via the scheduler instead of spinning.
-///
-/// # Correctness guarantees
-///
-/// This implementation avoids the following common bugs:
-///
-/// 1. **No stale waiter entries**: Uses intrusive `WaitQueue` where each task can
-///    only be in one queue at a time (enforced by CAS on `wait_next`).
-///
-/// 2. **No lost wakeups**: Uses check-under-lock pattern - the lock state is
-///    re-checked while holding the wait queue lock before deciding to sleep.
-///
-/// 3. **No thundering herd**: Only one waiter is woken per unlock.
-///
-/// # Usage
-///
-/// ```ignore
-/// let mutex = SleepMutex::new(data);
-/// let guard = mutex.lock();
-/// // ... use guard ...
-/// // guard dropped here, automatically unlocks
-/// ```
+/// Sleepable mutex that blocks tasks via the scheduler instead of spinning.
 pub struct SleepMutex<T> {
-    /// 0 = unlocked, 1 = locked
     locked: AtomicUsize,
-    /// Wait queue for blocked tasks
     waiters: WaitQueue,
-    /// The protected value
     value: UnsafeCell<T>,
 }
 

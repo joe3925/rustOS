@@ -1,23 +1,3 @@
-// this is a no_std version of async_ffi
-
-//! # FFI-compatible [`Future`][`core::future::Future`]s
-//!
-//! Rust currently doesn't provide stable ABI nor stable layout of related structs like
-//! `dyn Future` or `Waker`.
-//! With this crate, we can wrap async blocks or async functions to make a `Future` FFI-safe.
-//!
-//! [`FfiFuture`] provides the same functionality as `Box<dyn Future<Output = T> + Send>` but
-//! it's FFI-compatible, aka. `repr(C)`. Any `Future<Output = T> + Send + 'static` can be converted
-//! into [`FfiFuture`] by calling [`into_ffi`][`FutureExt::into_ffi`] on it, after `use`ing the
-//! trait [`FutureExt`].
-//!
-//! [`FfiFuture`] implements `Future<Output = T> + Send`. You can `await` a [`FfiFuture`] just like
-//! a normal `Future` to wait and get the output.
-//!
-//! For non-[`Send`] or non-`'static` futures, see the section
-//! [Variants of `FfiFuture`](#variants-of-ffifuture) below.
-//!
-//!
 #![deny(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 

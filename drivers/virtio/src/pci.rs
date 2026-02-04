@@ -199,27 +199,6 @@ pub fn parse_virtio_caps(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Volatile accessors for the common configuration structure
-// ---------------------------------------------------------------------------
-// Layout of virtio_pci_common_cfg (offsets from common_cfg base):
-//   0x00  u32  device_feature_select
-//   0x04  u32  device_feature
-//   0x08  u32  driver_feature_select
-//   0x0C  u32  driver_feature
-//   0x10  u16  msix_config
-//   0x12  u16  num_queues
-//   0x14  u8   device_status
-//   0x15  u8   config_generation
-//   0x16  u16  queue_select
-//   0x18  u16  queue_size
-//   0x1A  u16  queue_msix_vector
-//   0x1C  u16  queue_enable
-//   0x1E  u16  queue_notify_off
-//   0x20  u64  queue_desc
-//   0x28  u64  queue_driver   (avail)
-//   0x30  u64  queue_device   (used)
-
 pub unsafe fn common_read_u8(common: VirtAddr, offset: usize) -> u8 {
     unsafe { core::ptr::read_volatile((common.as_u64() as *const u8).add(offset)) }
 }

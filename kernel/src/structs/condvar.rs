@@ -1,53 +1,12 @@
-//! Condition variable for blocking synchronization.
-//!
-//! A condition variable allows tasks to wait until a condition becomes true,
-//! releasing an associated mutex while waiting and re-acquiring it on wakeup.
-
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
 use crate::structs::sleep_mutex::{SleepMutex, SleepMutexGuard};
 use crate::structs::wait_queue::WaitQueue;
 
-/// A condition variable for blocking tasks until a condition becomes true.
+/// Condition variable for blocking tasks until a predicate is satisfied.
 ///
-/// Used together with a [`SleepMutex`] to allow tasks to wait for a condition
-/// while temporarily releasing the mutex, then re-acquiring it upon wakeup.
-///
-/// # Correctness guarantees
-///
-/// This implementation avoids the following common bugs:
-///
-/// 1. **No stale waiter entries**: Uses intrusive `WaitQueue` where each task can
-///    only be in one queue at a time. Tasks are dequeued by the notifier before
-///    being woken.
-///
-/// 2. **No lost wakeups**: The waiter is enqueued BEFORE the mutex is released,
-///    ensuring any notify that happens after the condition check will find the
-///    waiter in the queue.
-///
-/// 3. **Proper mutex discipline**: The mutex must be held when checking the
-///    condition and when calling wait(). This is enforced by requiring a
-///    `SleepMutexGuard` to call wait().
-///
-/// # Spurious wakeups
-///
-/// This implementation may produce spurious wakeups. Callers should always
-/// re-check the condition in a loop:
-///
-/// ```ignore
-/// let mut guard = mutex.lock();
-/// while !condition(&guard) {
-///     guard = condvar.wait(guard);
-/// }
-/// ```
-///
-/// # Usage notes
-///
-/// - `notify_one()` and `notify_all()` should generally be called while holding
-///   the associated mutex to avoid race conditions on the predicate.
-/// - However, calling notify without the mutex is safe (no undefined behavior),
-///   it just may lead to logic races where the predicate changes between check
-///   and wait.
+/// Works with [`SleepMutex`]; wakeups may be spurious, so callers should loop on
+/// the predicate after waking.
 pub struct Condvar {
     /// Wait queue for blocked tasks
     waiters: WaitQueue,

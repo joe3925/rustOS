@@ -46,9 +46,6 @@ fn panic(info: &PanicInfo) -> ! {
     unsafe { panic_common(MOD_NAME, info) }
 }
 
-// ===========================================================================
-// Driver entry
-// ===========================================================================
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -84,9 +81,6 @@ pub extern "win64" fn virtio_device_add(
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// ISR — signals the IRQ handle from interrupt context
-// ===========================================================================
 
 extern "win64" fn virtio_isr(
     _vector: u8,
@@ -104,7 +98,7 @@ extern "win64" fn virtio_isr(
                 tag: 0,
                 data: [0; 3],
             });
-            core::mem::forget(h); // ISR doesn't own the handle
+            core::mem::forget(h);
         }
         true
     } else {
@@ -127,7 +121,7 @@ extern "win64" fn virtio_msix_isr(
             tag: 0,
             data: [0; 3],
         });
-        core::mem::forget(h); // ISR doesn't own the handle
+        core::mem::forget(h);
     }
     true
 }
@@ -161,9 +155,6 @@ async fn setup_msix_via_pci(
     }
 }
 
-// ===========================================================================
-// PnP: StartDevice
-// ===========================================================================
 
 #[request_handler]
 async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
@@ -173,7 +164,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         return DriverStep::complete(status);
     }
 
-    // Query resources from PDO
     let res_req = Arc::new(RwLock::new(Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
@@ -193,14 +183,12 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     let blob = { res_req.read().pnp.as_ref().unwrap().blob_out.clone() };
     let resources = pci::parse_resources(&blob);
 
-    // Map memory BARs
     let mapped_bars = pci::map_memory_bars(&resources);
     if mapped_bars.is_empty() {
         println!("virtio-blk: no memory BARs found\n");
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
-    // Map PCI configuration space (ECAM page) for capability list walking.
     let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
         Some(v) => v,
         None => {
@@ -237,7 +225,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    // Config space no longer needed after capability parsing — unmap it.
     let _ = unmap_mmio_region(cfg_base, cfg_len);
 
     let capacity = match blk::init_device(caps.common_cfg, caps.device_cfg) {
@@ -263,7 +250,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    // Try MSI-X first, then fall back to GSI, then legacy IRQ
     let (irq_handle, msix_vector): (Option<IrqHandle>, Option<u8>) =
         if let Some(_msix_cap) = pci::find_msix_capability(&resources) {
             match irq_alloc_vector() {
@@ -271,11 +257,8 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
                     if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
                         match setup_msix_via_pci(&dev, vector, 0, 0).await {
                             Ok(()) => {
-                                // Configure virtio device to use MSI-X vector 0 for config and queue
                                 unsafe {
-                                    // Set msix_config vector (offset 0x10) to table entry 0
                                     pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
-                                    // Set queue 0's msix_vector (offset 0x1A) to table entry 0
                                     pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
                                     pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR, 0);
                                 }
@@ -299,7 +282,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             (None, None)
         };
 
-    // Fall back to GSI or legacy IRQ if MSI-X not available/failed
     let irq_handle: Option<IrqHandle> = if irq_handle.is_some() {
         irq_handle
     } else if let Some(gsi) = pci::find_gsi(&resources) {
@@ -321,7 +303,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
 
     blk::set_driver_ok(caps.common_cfg);
 
-    // Populate the device extension (set via Once)
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
     let bar_list: Vec<(VirtAddr, u64)> = mapped_bars.iter().map(|&(_, va, sz)| (va, sz)).collect();
     dx.inner.call_once(|| DevExtInner {
@@ -340,9 +321,6 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// PnP: RemoveDevice
-// ===========================================================================
 
 #[request_handler]
 async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
@@ -371,9 +349,6 @@ async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// PnP: QueryDeviceRelations — enumerate child disk PDO
-// ===========================================================================
 
 #[request_handler]
 async fn virtio_pnp_query_devrels(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
@@ -414,7 +389,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     pnp_vt.set(PnpMinorFunction::QueryResources, virtio_pdo_query_resources);
     pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pdo_start);
 
-    // Build DiskInfo from the parent's capacity (in 512-byte sectors).
     let capacity = dx.inner.get().map(|i| i.capacity).unwrap_or(0);
     let total_bytes = capacity * 512;
     let disk_info = kernel_api::kernel_types::io::DiskInfo {
@@ -442,9 +416,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     );
 }
 
-// ===========================================================================
-// I/O: Read (fully async via IRQ)
-// ===========================================================================
 
 #[request_handler]
 pub async fn virtio_blk_read(
@@ -497,7 +468,6 @@ pub async fn virtio_blk_read(
         }
     };
 
-    // Await completion via IRQ — fully async, no blocking
     if let Some(ref irq_handle) = inner.irq_handle {
         let meta = IrqMeta {
             tag: 0,
@@ -533,9 +503,6 @@ pub async fn virtio_blk_read(
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// I/O: Write (fully async via IRQ)
-// ===========================================================================
 
 #[request_handler]
 pub async fn virtio_blk_write(
@@ -623,9 +590,6 @@ pub async fn virtio_blk_write(
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// I/O: DeviceControl
-// ===========================================================================
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 
@@ -645,9 +609,6 @@ pub async fn virtio_blk_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>
     }
 }
 
-// ===========================================================================
-// Child PDO: PnP handlers
-// ===========================================================================
 
 #[request_handler]
 pub async fn virtio_pdo_start(_dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
@@ -706,9 +667,6 @@ pub async fn virtio_pdo_query_resources(
     DriverStep::complete(DriverStatus::Success)
 }
 
-// ===========================================================================
-// Child PDO: I/O handlers (forward to parent FDO)
-// ===========================================================================
 
 fn get_parent_inner(
     pdo: &Arc<DeviceObject>,

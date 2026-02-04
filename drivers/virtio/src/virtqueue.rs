@@ -5,15 +5,9 @@ use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::pci;
 
-// ---------------------------------------------------------------------------
-// Descriptor flags
-// ---------------------------------------------------------------------------
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 
-// ---------------------------------------------------------------------------
-// Descriptor table entry (16 bytes)
-// ---------------------------------------------------------------------------
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VirtqDesc {
@@ -23,21 +17,6 @@ pub struct VirtqDesc {
     pub next: u16,
 }
 
-// ---------------------------------------------------------------------------
-// Available ring header (variable size)
-//   u16 flags
-//   u16 idx
-//   u16[queue_size] ring
-//   u16 used_event  (if VIRTIO_F_EVENT_IDX)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Used ring header (variable size)
-//   u16 flags
-//   u16 idx
-//   VirtqUsedElem[queue_size] ring
-//   u16 avail_event  (if VIRTIO_F_EVENT_IDX)
-// ---------------------------------------------------------------------------
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VirtqUsedElem {
@@ -45,38 +24,28 @@ pub struct VirtqUsedElem {
     pub len: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Descriptor state tracking
-// ---------------------------------------------------------------------------
 #[derive(Clone, Copy)]
 pub struct DescState {
     /// true if this descriptor slot is free
     pub free: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Split virtqueue
-// ---------------------------------------------------------------------------
 pub struct Virtqueue {
     pub idx: u16,
     pub size: u16,
 
-    // DMA regions (virtual)
     pub desc_va: VirtAddr,
     pub avail_va: VirtAddr,
     pub used_va: VirtAddr,
 
-    // Physical addresses written to the device
     pub desc_phys: PhysAddr,
     pub avail_phys: PhysAddr,
     pub used_phys: PhysAddr,
 
-    // Sizes for deallocation
     desc_size: u64,
     avail_size: u64,
     used_size: u64,
 
-    // Free list
     pub free_head: u16,
     pub num_free: u16,
     pub last_used_idx: u16,
@@ -90,42 +59,35 @@ impl Virtqueue {
     /// Allocate and initialise a split virtqueue.
     /// Writes the physical addresses into the device via common_cfg.
     pub fn new(queue_idx: u16, common_cfg: VirtAddr) -> Option<Self> {
-        // Select queue
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
         let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
         if max_size == 0 {
             return None;
         }
-        // Use the full size the device offers (could be clamped later if needed).
         let size = max_size;
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
 
-        // Descriptor table: 16 bytes per entry
         let desc_bytes = align_up(size as u64 * 16, 4096);
         let desc_va = allocate_auto_kernel_range_mapped(desc_bytes, flags).ok()?;
         let desc_phys = virt_to_phys(desc_va);
 
-        // Available ring: 2 (flags) + 2 (idx) + 2*size (ring) + 2 (used_event) — align to page
         let avail_bytes = align_up(6 + size as u64 * 2, 4096);
         let avail_va = allocate_auto_kernel_range_mapped(avail_bytes, flags).ok()?;
         let avail_phys = virt_to_phys(avail_va);
 
-        // Used ring: 2 (flags) + 2 (idx) + 8*size (elems) + 2 (avail_event) — align to page
         let used_bytes = align_up(6 + size as u64 * 8, 4096);
         let used_va = allocate_auto_kernel_range_mapped(used_bytes, flags).ok()?;
         let used_phys = virt_to_phys(used_va);
 
-        // Zero all regions
         unsafe {
             core::ptr::write_bytes(desc_va.as_u64() as *mut u8, 0, desc_bytes as usize);
             core::ptr::write_bytes(avail_va.as_u64() as *mut u8, 0, avail_bytes as usize);
             core::ptr::write_bytes(used_va.as_u64() as *mut u8, 0, used_bytes as usize);
         }
 
-        // Build free list: each descriptor's `next` points to the next index
         for i in 0..size {
             let desc_ptr = (desc_va.as_u64() + i as u64 * 16) as *mut VirtqDesc;
             unsafe {
@@ -134,13 +96,11 @@ impl Virtqueue {
             }
         }
 
-        // Write physical addresses to device
         unsafe {
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DESC, desc_phys.as_u64());
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DRIVER, avail_phys.as_u64());
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DEVICE, used_phys.as_u64());
 
-            // Enable queue
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
         }
 
@@ -213,7 +173,6 @@ impl Virtqueue {
             }
 
             if i > 0 {
-                // Link previous -> current
                 let prev_desc = self.desc_ptr(prev);
                 unsafe {
                     (*prev_desc).flags |= VRING_DESC_F_NEXT;
@@ -223,7 +182,6 @@ impl Virtqueue {
             prev = idx;
         }
 
-        // Add head to available ring
         let avail_base = self.avail_va.as_u64() as *mut u16;
         let avail_idx = unsafe { core::ptr::read_volatile(avail_base.add(1)) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);

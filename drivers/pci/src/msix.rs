@@ -65,12 +65,6 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 }
 
 /// Program MSI-X table and enable MSI-X capability.
-///
-/// This function:
-/// 1. Maps the PCI config space to access MSI-X capability
-/// 2. Maps the MSI-X table BAR region
-/// 3. Programs each requested MSI-X table entry with message address/data
-/// 4. Enables MSI-X in the config space Message Control register
 pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
@@ -82,7 +76,6 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         None => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
-    // Parse request data
     let entries = {
         let r = req.read();
         match parse_msix_setup_request(r.data.as_slice()) {
@@ -91,30 +84,25 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
     };
 
-    // Validate entries don't exceed table size
     for entry in &entries {
         if entry.table_index >= msix.table_size {
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     }
 
-    // Get the BAR containing the MSI-X table
     let table_bar = &ext.bars[msix.table_bar as usize];
     if table_bar.kind == BarKind::None {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }
 
-    // Calculate table region size (16 bytes per entry, round up to page)
     let table_region_size = ((msix.table_size as u64 * 16) + 0xFFF) & !0xFFF;
     let table_phys = table_bar.base + msix.table_offset as u64;
 
-    // Map MSI-X table region
     let table_va = match map_mmio_region(PhysAddr::new(table_phys), table_region_size) {
         Ok(va) => va,
         Err(_) => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
 
-    // Program each MSI-X table entry
     for entry in &entries {
         let entry_offset = entry.table_index as u64 * 16;
         let entry_va = table_va.as_u64() + entry_offset;
@@ -141,7 +129,6 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
     }
 
-    // Map config space to enable MSI-X
     let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
         Ok(va) => va,
         Err(_) => {
@@ -150,14 +137,11 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
     };
 
-    // Enable MSI-X: set bit 15 of Message Control (at cap_offset + 2)
-    // Also clear Function Mask (bit 14) to unmask all vectors
     let msg_ctrl_offset = msix.cap_offset + 2;
     let msg_ctrl = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
     let new_msg_ctrl = (msg_ctrl | (1 << 15)) & !(1 << 14); // Enable MSI-X, clear Function Mask
     unsafe { cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl) };
 
-    // Cleanup mappings
     unsafe {
         unmap_mmio_region(cfg_va, 4096);
         unmap_mmio_region(table_va, table_region_size);

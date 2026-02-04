@@ -201,8 +201,6 @@ where
     BlockingJoin::new(join_ptr, drop_shared_task::<F, R>)
 }
 
-/// Spawns multiple blocking tasks in a batch, reducing lock contention on the thread pool.
-/// Returns a Vec of BlockingJoin handles that can be awaited.
 pub fn spawn_blocking_many<F, R>(funcs: Vec<F>) -> Vec<BlockingJoin<R>>
 where
     F: FnOnce() -> R + Send + 'static,
