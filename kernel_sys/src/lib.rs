@@ -74,6 +74,10 @@ unsafe extern "win64" {
         size: u64,
         flags: PageTableFlags,
     ) -> Result<VirtAddr, PageMapError>;
+    pub fn allocate_auto_kernel_range_mapped_contiguous(
+        size: u64,
+        flags: PageTableFlags,
+    ) -> Result<VirtAddr, PageMapError>;
     pub fn allocate_kernel_range_mapped(
         base: u64,
         size: u64,
@@ -84,7 +88,7 @@ unsafe extern "win64" {
     pub fn identity_map_page(frame_addr: PhysAddr, flags: PageTableFlags);
     pub fn map_mmio_region(mmio_base: PhysAddr, mmio_size: u64) -> Result<VirtAddr, PageMapError>;
     pub fn unmap_mmio_region(mmio_base: VirtAddr, mmio_size: u64) -> Result<(), PageMapError>;
-    pub fn virt_to_phys(addr: VirtAddr) -> PhysAddr;
+    pub fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr>;
 
     // Registry (async FFI)
     pub fn reg_get_value(key_path: &str, name: &str) -> FfiFuture<Option<Data>>;

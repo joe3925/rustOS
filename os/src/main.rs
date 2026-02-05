@@ -62,6 +62,8 @@ fn main() {
                 "file=../../rustOS.vhdx,if=none,format=vhdx,id=sysdisk",
                 "-device",
                 "virtio-blk-pci,drive=sysdisk",
+                "-display",
+                "gtk",
             ],
         );
 

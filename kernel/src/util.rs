@@ -183,8 +183,6 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         install_prepacked_drivers().await;
 
         PNP_MANAGER.init_from_registry().await;
-        wait_duration(Duration::from_secs(10));
-        PNP_MANAGER.print_device_tree();
         // bench_async_vs_sync_call_latency_async().await;
         // bench_realistic_traffic_async().await;
 

@@ -1,5 +1,7 @@
+use alloc::vec::Vec;
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys,
+    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, unmap_range,
+    virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -26,9 +28,11 @@ pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
-pub const VIRTIO_BLK_F_SIZE_MAX: u32 = 1;
-pub const VIRTIO_BLK_F_SEG_MAX: u32 = 2;
-pub const VIRTIO_BLK_F_BLK_SIZE: u32 = 6;
+pub const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
+pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
+pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
+/// Mandatory for modern virtio-pci devices.
+pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
 
 const DEVCFG_CAPACITY: usize = 0x00; // u64 — capacity in 512-byte sectors
 
@@ -53,11 +57,39 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<u64> {
         )
     };
 
+    // Read 64-bit device feature set.
     unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DEVICE_FEATURE_SELECT, 0) };
-    let _dev_features = unsafe { pci::common_read_u32(common_cfg, pci::COMMON_DEVICE_FEATURE) };
+    let dev_features_lo = unsafe { pci::common_read_u32(common_cfg, pci::COMMON_DEVICE_FEATURE) };
+    unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DEVICE_FEATURE_SELECT, 1) };
+    let dev_features_hi = unsafe { pci::common_read_u32(common_cfg, pci::COMMON_DEVICE_FEATURE) };
+    let dev_features = (dev_features_hi as u64) << 32 | dev_features_lo as u64;
 
+    // Modern virtio-pci requires VERSION_1; fail early if missing.
+    if dev_features & VIRTIO_F_VERSION_1 == 0 {
+        unsafe {
+            pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
+        };
+        return None;
+    }
+
+    let supported_features = VIRTIO_F_VERSION_1;
+    let driver_features = dev_features & supported_features;
     unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DRIVER_FEATURE_SELECT, 0) };
-    unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DRIVER_FEATURE, 0) };
+    unsafe {
+        pci::common_write_u32(
+            common_cfg,
+            pci::COMMON_DRIVER_FEATURE,
+            driver_features as u32,
+        )
+    };
+    unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DRIVER_FEATURE_SELECT, 1) };
+    unsafe {
+        pci::common_write_u32(
+            common_cfg,
+            pci::COMMON_DRIVER_FEATURE,
+            (driver_features >> 32) as u32,
+        )
+    };
 
     unsafe {
         pci::common_write_u8(
@@ -103,7 +135,6 @@ pub fn reset_device(common_cfg: VirtAddr) {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 }
 
-
 /// A prepared block I/O request with DMA buffers allocated.
 pub struct BlkIoRequest {
     /// DMA buffer containing the 16-byte request header.
@@ -127,7 +158,7 @@ impl BlkIoRequest {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
 
         let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let header_phys = virt_to_phys(header_va);
+        let header_phys = virt_to_phys(header_va)?;
         unsafe {
             let hdr = header_va.as_u64() as *mut VirtioBlkReqHeader;
             core::ptr::write_volatile(
@@ -142,11 +173,11 @@ impl BlkIoRequest {
 
         let data_pages = ((data_len as u64) + 4095) & !4095;
         let data_va = allocate_auto_kernel_range_mapped(data_pages.max(4096), flags).ok()?;
-        let data_phys = virt_to_phys(data_va);
+        let data_phys = virt_to_phys(data_va)?;
         unsafe { core::ptr::write_bytes(data_va.as_u64() as *mut u8, 0, data_len as usize) };
 
         let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let status_phys = virt_to_phys(status_va);
+        let status_phys = virt_to_phys(status_va)?;
         unsafe { core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF) }; // sentinel
 
         Some(Self {
@@ -164,11 +195,35 @@ impl BlkIoRequest {
     /// Returns the head descriptor index.
     pub fn submit(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
         let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
-        let bufs = [
-            (self.header_phys, 16, 0u16),
-            (self.data_phys, self.data_len, data_flags),
-            (self.status_phys, 1, VRING_DESC_F_WRITE),
-        ];
+
+        let mut bufs: Vec<(PhysAddr, u32, u16)> = Vec::new();
+        bufs.push((self.header_phys, 16, 0u16));
+
+        let mut offset = 0u64;
+        let total = self.data_len as u64;
+        while offset < total {
+            let vaddr = VirtAddr::new(self.data_va.as_u64() + offset);
+            let phys = virt_to_phys(vaddr)?;
+            let page_off = (vaddr.as_u64() & 0xFFF) as u64;
+            let chunk = core::cmp::min(4096u64 - page_off, total - offset);
+            let seg_phys = PhysAddr::new(phys.as_u64() + page_off);
+
+            // Coalesce contiguous physical segments to keep descriptor count low.
+            if let Some(last) = bufs.last_mut() {
+                let last_end = last.0.as_u64() + last.1 as u64;
+                if last.2 == data_flags && last_end == seg_phys.as_u64() {
+                    last.1 = last.1.saturating_add(chunk as u32);
+                    offset += chunk;
+                    continue;
+                }
+            }
+
+            bufs.push((seg_phys, chunk as u32, data_flags));
+            offset += chunk;
+        }
+
+        bufs.push((self.status_phys, 1, VRING_DESC_F_WRITE));
+
         vq.push_chain(&bufs)
     }
 
@@ -196,9 +251,9 @@ impl BlkIoRequest {
 
     /// Free all DMA buffers.
     pub fn destroy(self) {
-        deallocate_kernel_range(self.header_va, 4096);
+        unsafe { unmap_range(self.header_va, 4096) };
         let data_pages = ((self.data_len as u64) + 4095) & !4095;
-        deallocate_kernel_range(self.data_va, data_pages.max(4096));
-        deallocate_kernel_range(self.status_va, 4096);
+        unsafe { unmap_range(self.data_va, data_pages.max(4096)) };
+        unsafe { unmap_range(self.status_va, 4096) };
     }
 }

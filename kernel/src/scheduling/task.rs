@@ -2,7 +2,7 @@ use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
-use crate::memory::paging::virt_tracker::deallocate_kernel_range;
+use crate::memory::paging::virt_tracker::{deallocate_kernel_range, unmap_range};
 use crate::scheduling::runtime;
 use crate::scheduling::runtime::runtime::{yield_now, BLOCKING_POOL, RUNTIME_POOL};
 use crate::scheduling::scheduler::{self, kernel_task_end, Scheduler, SCHEDULER};
@@ -302,7 +302,7 @@ impl Task {
         if self.is_user_mode {
             return;
         }
-        deallocate_kernel_range(VirtAddr::new(self.stack_start), self.stack_size);
+        unmap_range(VirtAddr::new(self.stack_start), self.stack_size);
     }
 
     pub fn grow_stack(&mut self, flags: PageTableFlags) -> Result<bool, PageMapError> {

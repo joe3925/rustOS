@@ -11,6 +11,7 @@ use kernel_api::x86_64::{PhysAddr, VirtAddr};
 use spin::RwLock;
 
 use crate::dev_ext::{BarKind, MsixInfo, PciPdoExt};
+use kernel_api::println;
 
 /// Single MSI-X entry setup request from child driver.
 #[derive(Clone, Copy, Debug)]
@@ -119,14 +120,22 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         let msg_data: u32 = entry.vector as u32;
 
         // Vector Control: bit 0 = mask (0 = unmasked/enabled)
-        let vector_ctrl: u32 = 0;
+        let vector_ctrl_masked: u32 = 1;
+        let vector_ctrl_unmasked: u32 = 0;
 
         unsafe {
+            // Program entry while masked to avoid spurious interrupts on picky devices.
+            write_volatile((entry_va + 12) as *mut u32, vector_ctrl_masked);
             write_volatile((entry_va + 0) as *mut u32, msg_addr_lo);
             write_volatile((entry_va + 4) as *mut u32, msg_addr_hi);
             write_volatile((entry_va + 8) as *mut u32, msg_data);
-            write_volatile((entry_va + 12) as *mut u32, vector_ctrl);
+            write_volatile((entry_va + 12) as *mut u32, vector_ctrl_unmasked);
         }
+
+        // Read back and verify
+        let rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
+        let rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
+        let rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
     }
 
     let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
@@ -137,10 +146,19 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         }
     };
 
+    // Enable Bus Master (bit 2) and Memory Space (bit 1) in PCI Command register.
+    // Bus Master is required for MSI-X since the device must perform memory writes.
+    let cmd = unsafe { cfg_read16(cfg_va, 0x04) };
+
+    unsafe { cfg_write16(cfg_va, 0x04, cmd | 0x06) };
+    let cmd_after = unsafe { cfg_read16(cfg_va, 0x04) };
+
     let msg_ctrl_offset = msix.cap_offset + 2;
     let msg_ctrl = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
+
     let new_msg_ctrl = (msg_ctrl | (1 << 15)) & !(1 << 14); // Enable MSI-X, clear Function Mask
     unsafe { cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl) };
+    let msg_ctrl_after = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
 
     unsafe {
         unmap_mmio_region(cfg_va, 4096);

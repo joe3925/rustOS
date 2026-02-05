@@ -78,6 +78,7 @@ pub enum PageMapError {
     Page4KiB(MapToError<Size4KiB>),
     Page2MiB(MapToError<Size2MiB>),
     Page1GiB(MapToError<Size1GiB>),
+    TranslationFailed(),
     NoMemory(),
     NoMemoryMap(),
 }

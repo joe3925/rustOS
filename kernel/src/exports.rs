@@ -7,6 +7,7 @@ use crate::idt::*;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::tables::virt_to_phys;
+use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
@@ -38,6 +39,7 @@ export! {
     get_acpi_tables,
     task_yield,
     allocate_auto_kernel_range_mapped,
+    allocate_auto_kernel_range_mapped_contiguous,
     allocate_kernel_range_mapped,
     deallocate_kernel_range,
     unmap_range,

@@ -370,7 +370,6 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     }
 
     if p.irq_pin != 0 {
-        println!("{:#?}", p.irq_gsi);
 
         if let Some(gsi) = p.irq_gsi {
             let prt_pin = (p.irq_pin - 1) as u32;

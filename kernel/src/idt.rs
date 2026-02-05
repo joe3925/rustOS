@@ -734,7 +734,6 @@ pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
     handle
 }
 pub fn irq_dispatch(vector: u8, frame: &mut InterruptStackFrame) {
-    println!("interrupt on vector: {:#X}", vector);
     IRQ_MANAGER.dispatch(vector, frame);
 }
 

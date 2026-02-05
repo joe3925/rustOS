@@ -790,11 +790,9 @@ impl PnpManager {
                 let target = IoTarget {
                     target_device: top_device,
                 };
-                // force deterministic loading for testing
-                // todo: fix this when not debugging
-                block_on(spawn(async move {
+                spawn_detached(async move {
                     let _ = (&*PNP_MANAGER).send_request(target, req_arc).await;
-                }));
+                });
             }
         } else {
             dev_node.set_state(DevNodeState::Stopped);

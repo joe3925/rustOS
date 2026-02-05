@@ -12,7 +12,10 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
 use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
-use x86_64::{structures::paging::PageTableFlags, VirtAddr};
+use x86_64::{
+    structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;
 static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
@@ -59,6 +62,39 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
     unsafe {
         map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
     }?;
+    Ok(addr)
+}
+
+pub extern "win64" fn allocate_auto_kernel_range_mapped_contiguous(
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<VirtAddr, PageMapError> {
+    let align_size = align_up_4k(size);
+    if align_size == 0 {
+        return Err(PageMapError::NoMemory());
+    }
+
+    let num_pages = (align_size / 0x1000) as usize;
+    let addr = allocate_auto_kernel_range(align_size).ok_or(PageMapError::NoMemory())?;
+    debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
+
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    let phys_base = BootInfoFrameAllocator::allocate_contiguous_frames(num_pages)
+        .ok_or(PageMapError::NoMemory())?;
+
+    map_contiguous_range(
+        &mut mapper,
+        &mut frame_allocator,
+        addr,
+        phys_base,
+        align_size,
+        flags,
+    )?;
+
     Ok(addr)
 }
 
@@ -146,4 +182,38 @@ pub extern "win64" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     deallocate_kernel_range(virtual_addr, size);
 
     unsafe { unmap_range_impl(virtual_addr, size) };
+}
+
+fn map_contiguous_range<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    virt_base: VirtAddr,
+    phys_base: PhysAddr,
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB>,
+{
+    let mut cur_virt = virt_base;
+    let mut cur_phys = phys_base;
+    let mut remaining = align_up_4k(size);
+
+    while remaining > 0 {
+        let page = Page::<Size4KiB>::containing_address(cur_virt);
+        let frame = PhysFrame::containing_address(cur_phys);
+
+        unsafe {
+            mapper
+                .map_to(page, frame, flags, frame_allocator)
+                .map_err(PageMapError::Page4KiB)?
+                .flush();
+        }
+
+        cur_virt += 0x1000;
+        cur_phys += 0x1000;
+        remaining -= 0x1000;
+    }
+
+    Ok(())
 }

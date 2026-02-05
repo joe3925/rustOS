@@ -1,5 +1,7 @@
+use core::cmp;
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, virt_to_phys,
+    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
+    unmap_range, virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -33,6 +35,7 @@ pub struct DescState {
 pub struct Virtqueue {
     pub idx: u16,
     pub size: u16,
+    pub queue_notify_off: u16,
 
     pub desc_va: VirtAddr,
     pub avail_va: VirtAddr,
@@ -65,22 +68,24 @@ impl Virtqueue {
         if max_size == 0 {
             return None;
         }
-        let size = max_size;
+        // Keep the ring components within a single 4 KiB page; the allocator guarantees physical
+        // contiguity, and limiting the size keeps metadata compact.
+        let size = cmp::min(max_size, 256);
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
 
         let desc_bytes = align_up(size as u64 * 16, 4096);
-        let desc_va = allocate_auto_kernel_range_mapped(desc_bytes, flags).ok()?;
-        let desc_phys = virt_to_phys(desc_va);
+        let desc_va = allocate_auto_kernel_range_mapped_contiguous(desc_bytes, flags).ok()?;
+        let desc_phys = virt_to_phys(desc_va)?;
 
         let avail_bytes = align_up(6 + size as u64 * 2, 4096);
-        let avail_va = allocate_auto_kernel_range_mapped(avail_bytes, flags).ok()?;
-        let avail_phys = virt_to_phys(avail_va);
+        let avail_va = allocate_auto_kernel_range_mapped_contiguous(avail_bytes, flags).ok()?;
+        let avail_phys = virt_to_phys(avail_va)?;
 
         let used_bytes = align_up(6 + size as u64 * 8, 4096);
-        let used_va = allocate_auto_kernel_range_mapped(used_bytes, flags).ok()?;
-        let used_phys = virt_to_phys(used_va);
+        let used_va = allocate_auto_kernel_range_mapped_contiguous(used_bytes, flags).ok()?;
+        let used_phys = virt_to_phys(used_va)?;
 
         unsafe {
             core::ptr::write_bytes(desc_va.as_u64() as *mut u8, 0, desc_bytes as usize);
@@ -95,6 +100,10 @@ impl Virtqueue {
                 (*desc_ptr).flags = 0;
             }
         }
+
+        // Cache the per-queue notify offset while this queue is selected.
+        let queue_notify_off =
+            unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_NOTIFY_OFF) };
 
         unsafe {
             pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DESC, desc_phys.as_u64());
@@ -114,6 +123,7 @@ impl Virtqueue {
             desc_size: desc_bytes,
             avail_size: avail_bytes,
             used_size: used_bytes,
+            queue_notify_off,
             free_head: 0,
             num_free: size,
             last_used_idx: 0,
@@ -204,14 +214,10 @@ impl Virtqueue {
 
     /// Write to the device's notify register to kick the queue.
     pub fn notify(&self, notify_base: VirtAddr, notify_off_multiplier: u32) {
-        let queue_notify_off = unsafe {
-            // Read queue_notify_off from common_cfg — but we don't have common_cfg here,
-            // so the caller should cache it. For simplicity, assume offset 0 for queue 0.
-            // This is written at queue setup time. We just use idx * multiplier.
-            self.idx as u64
-        };
-        let offset = queue_notify_off * notify_off_multiplier as u64;
+        let offset = self.queue_notify_off as u64 * notify_off_multiplier as u64;
         let addr = (notify_base.as_u64() + offset) as *mut u16;
+        // Ensure avail ring updates are visible before the MMIO notify.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { core::ptr::write_volatile(addr, self.idx) };
     }
 
@@ -253,8 +259,8 @@ impl Virtqueue {
 
     /// Deallocate all DMA memory for this virtqueue.
     pub fn destroy(&self) {
-        deallocate_kernel_range(self.desc_va, self.desc_size);
-        deallocate_kernel_range(self.avail_va, self.avail_size);
-        deallocate_kernel_range(self.used_va, self.used_size);
+        unsafe { unmap_range(self.desc_va, self.desc_size) };
+        unsafe { unmap_range(self.avail_va, self.avail_size) };
+        unsafe { unmap_range(self.used_va, self.used_size) };
     }
 }

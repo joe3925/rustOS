@@ -10,12 +10,17 @@ mod pci;
 mod virtqueue;
 
 use alloc::{sync::Arc, vec, vec::Vec};
+use core::hint::spin_loop;
 use core::panic::PanicInfo;
+use core::ptr::read_volatile;
 use core::sync::atomic::Ordering;
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::irq::{IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
+use kernel_api::irq::{
+    IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
+    irq_wait_ok,
+};
 use kernel_api::kernel_types::io::{IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
@@ -37,6 +42,7 @@ use dev_ext::{ChildExt, DevExt, DevExtInner};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
 const PIC_BASE_VECTOR: u8 = 0x20;
 
 #[cfg(not(test))]
@@ -45,7 +51,6 @@ fn panic(info: &PanicInfo) -> ! {
     use kernel_api::util::panic_common;
     unsafe { panic_common(MOD_NAME, info) }
 }
-
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -57,14 +62,8 @@ pub extern "win64" fn virtio_device_add(
     _driver: Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let mut io_vt = IoVtable::new();
-    io_vt.set(IoType::Read(virtio_blk_read), Synchronization::Async, 0);
-    io_vt.set(IoType::Write(virtio_blk_write), Synchronization::Async, 0);
-    io_vt.set(
-        IoType::DeviceControl(virtio_blk_ioctl),
-        Synchronization::Async,
-        0,
-    );
+    // FDO handles only PnP/start; I/O is exposed on the child disk PDO.
+    let io_vt = IoVtable::new();
 
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pnp_start);
@@ -80,7 +79,6 @@ pub extern "win64" fn virtio_device_add(
 
     DriverStep::complete(DriverStatus::Success)
 }
-
 
 extern "win64" fn virtio_isr(
     _vector: u8,
@@ -155,15 +153,8 @@ async fn setup_msix_via_pci(
     }
 }
 
-
 #[request_handler]
 async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let status = pnp_forward_request_to_next_lower(dev.clone(), req.clone()).await;
-    if status != DriverStatus::Success {
-        println!("virtio-blk: lower driver start failed: {:?}\n", status);
-        return DriverStep::complete(status);
-    }
-
     let res_req = Arc::new(RwLock::new(Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
@@ -176,23 +167,24 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     )));
     let qr_status = pnp_forward_request_to_next_lower(dev.clone(), res_req.clone()).await;
     if qr_status != DriverStatus::Success {
-        println!("virtio-blk: QueryResources failed: {:?}\n", qr_status);
+        println!("virtio-blk: QueryResources failed: {:?}", qr_status);
         return DriverStep::complete(qr_status);
     }
 
     let blob = { res_req.read().pnp.as_ref().unwrap().blob_out.clone() };
     let resources = pci::parse_resources(&blob);
+    let msix_cap = pci::find_msix_capability(&resources);
 
     let mapped_bars = pci::map_memory_bars(&resources);
     if mapped_bars.is_empty() {
-        println!("virtio-blk: no memory BARs found\n");
+        println!("virtio-blk: no memory BARs found");
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
     let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
         Some(v) => v,
         None => {
-            println!("virtio-blk: no PCI config space resource\n");
+            println!("virtio-blk: no PCI config space resource");
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
@@ -205,7 +197,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     ) {
         Ok(va) => va,
         Err(_) => {
-            println!("virtio-blk: failed to map PCI config space\n");
+            println!("virtio-blk: failed to map PCI config space");
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
@@ -216,7 +208,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     let caps = match pci::parse_virtio_caps(cfg_base, &mapped_bars) {
         Some(c) => c,
         None => {
-            println!("virtio-blk: failed to parse virtio PCI capabilities\n");
+            println!("virtio-blk: failed to parse virtio PCI capabilities");
             let _ = unmap_mmio_region(cfg_base, cfg_len);
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
@@ -230,7 +222,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     let capacity = match blk::init_device(caps.common_cfg, caps.device_cfg) {
         Some(c) => c,
         None => {
-            println!("virtio-blk: device init / feature negotiation failed\n");
+            println!("virtio-blk: device init / feature negotiation failed");
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
@@ -241,7 +233,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     let vq = match Virtqueue::new(0, caps.common_cfg) {
         Some(vq) => vq,
         None => {
-            println!("virtio-blk: failed to create requestq\n");
+            println!("virtio-blk: failed to create requestq");
             blk::reset_device(caps.common_cfg);
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
@@ -250,37 +242,54 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         }
     };
 
-    let (irq_handle, msix_vector): (Option<IrqHandle>, Option<u8>) =
-        if let Some(_msix_cap) = pci::find_msix_capability(&resources) {
-            match irq_alloc_vector() {
-                Some(vector) => {
-                    if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
-                        match setup_msix_via_pci(&dev, vector, 0, 0).await {
-                            Ok(()) => {
-                                unsafe {
-                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
-                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
-                                    pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR, 0);
-                                }
-                                (Some(handle), Some(vector))
+    let (irq_handle, msix_vector): (Option<IrqHandle>, Option<u8>) = if msix_cap.is_some() {
+        match irq_alloc_vector() {
+            Some(vector) => {
+                if let Some(handle) = irq_register_isr(vector, virtio_msix_isr, 0) {
+                    match setup_msix_via_pci(&dev, vector, 0, 0).await {
+                        Ok(()) => {
+                            unsafe {
+                                pci::common_write_u16(caps.common_cfg, pci::COMMON_MSIX_CONFIG, 0);
+                                pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, 0);
+                                pci::common_write_u16(
+                                    caps.common_cfg,
+                                    pci::COMMON_QUEUE_MSIX_VECTOR,
+                                    0,
+                                );
                             }
-                            Err(e) => {
-                                println!("virtio-blk: MSI-X setup IOCTL failed: {:?}, falling back\n", e);
+                            // Verify the device accepted the MSI-X vector (0xFFFF = rejected)
+                            let readback = unsafe {
+                                pci::common_read_u16(caps.common_cfg, pci::COMMON_QUEUE_MSIX_VECTOR)
+                            };
+                            if readback == 0xFFFF {
+                                println!("virtio-blk: Device rejected MSI-X vector, falling back");
                                 handle.unregister();
                                 let _ = irq_free_vector(vector);
                                 (None, None)
+                            } else {
+                                (Some(handle), Some(vector))
                             }
                         }
-                    } else {
-                        let _ = irq_free_vector(vector);
-                        (None, None)
+                        Err(e) => {
+                            println!(
+                                "virtio-blk: MSI-X setup IOCTL failed: {:?}, falling back",
+                                e
+                            );
+                            handle.unregister();
+                            let _ = irq_free_vector(vector);
+                            (None, None)
+                        }
                     }
+                } else {
+                    let _ = irq_free_vector(vector);
+                    (None, None)
                 }
-                None => (None, None),
             }
-        } else {
-            (None, None)
-        };
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     let irq_handle: Option<IrqHandle> = if irq_handle.is_some() {
         irq_handle
@@ -301,12 +310,46 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         None
     };
 
+    let msix_table_index = if msix_vector.is_some() {
+        Some(0u16)
+    } else {
+        None
+    };
+    let msix_pba = match (msix_vector, msix_cap) {
+        (Some(_), Some(cap)) => mapped_bars
+            .iter()
+            .find(|(idx, _, _)| *idx == cap.pba_bar as u32)
+            .map(|(_, va, _)| VirtAddr::new(va.as_u64() + cap.pba_offset as u64)),
+        _ => None,
+    };
+
     // Queue must remain disabled until after the MSI-X vector (if any) is programmed.
     vq.enable(caps.common_cfg);
     blk::set_driver_ok(caps.common_cfg);
 
+    // Check device status to catch any latent failure before exposing the queue.
+    let status = unsafe { pci::common_read_u8(caps.common_cfg, pci::COMMON_DEVICE_STATUS) };
+    if status & blk::VIRTIO_STATUS_FAILED != 0 || status & blk::VIRTIO_STATUS_DRIVER_OK == 0 {
+        println!(
+            "virtio-blk: device status bad after DRIVER_OK: status={:#x}",
+            status
+        );
+        blk::reset_device(caps.common_cfg);
+        vq.destroy();
+        if let Some(ref h) = irq_handle {
+            h.unregister();
+        }
+        for &(_idx, va, sz) in &mapped_bars {
+            let _ = unmap_mmio_region(va, sz);
+        }
+        return DriverStep::complete(DriverStatus::DeviceError);
+    }
+
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
-    let bar_list: Vec<(VirtAddr, u64)> = mapped_bars.iter().map(|&(_, va, sz)| (va, sz)).collect();
+    let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
+
+    let irq_ready = dev_ext::InitGate::new();
+
     dx.inner.call_once(|| DevExtInner {
         common_cfg: caps.common_cfg,
         notify_base: caps.notify_base,
@@ -318,11 +361,18 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         irq_handle,
         mapped_bars: Mutex::new(bar_list),
         msix_vector,
+        msix_table_index,
+        msix_pba,
+        irq_ready,
     });
+
+    if let Some(inner) = dx.inner.get() {
+        // Interrupt path is configured; either IRQ handle is present or we will poll.
+        inner.irq_ready.set_ready();
+    }
 
     DriverStep::complete(DriverStatus::Success)
 }
-
 
 #[request_handler]
 async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
@@ -341,7 +391,7 @@ async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -
 
             {
                 let bars = inner.mapped_bars.lock();
-                for &(va, sz) in bars.iter() {
+                for &(_, va, sz) in bars.iter() {
                     let _ = unmap_mmio_region(va, sz);
                 }
             }
@@ -350,7 +400,6 @@ async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -
 
     DriverStep::complete(DriverStatus::Success)
 }
-
 
 #[request_handler]
 async fn virtio_pnp_query_devrels(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
@@ -418,199 +467,40 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     );
 }
 
+async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<(), DriverStatus> {
+    // if let Some(ref irq_handle) = inner.irq_handle {
+    //     let meta = IrqMeta {
+    //         tag: 0,
+    //         data: [0; 3],
+    //     };
+    //     let result = irq_handle.wait(meta).await;
+    //     if !irq_wait_ok(result) {
+    //         let mut vq = inner.requestq.lock();
+    //         vq.free_chain(head);
+    //         return Err(DriverStatus::DeviceError);
+    //     }
+    // }
 
-#[request_handler]
-pub async fn virtio_blk_read(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-    _buf_len: usize,
-) -> DriverStep {
-    let dx = match dev.try_devext::<DevExt>() {
-        Ok(x) => x,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
-    let inner = match dx.inner.get() {
-        Some(i) => i,
-        None => return DriverStep::complete(DriverStatus::DeviceNotReady),
-    };
-
-    let (offset, len) = {
-        let r = req.read();
-        match r.kind {
-            RequestType::Read { offset, len } => (offset, len),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
-    };
-
-    if len == 0 {
-        return DriverStep::complete(DriverStatus::Success);
-    }
-    if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
-    }
-
-    let sector = offset >> 9;
-
-    let io_req = match BlkIoRequest::new(VIRTIO_BLK_T_IN, sector, len as u32) {
-        Some(r) => r,
-        None => return DriverStep::complete(DriverStatus::InsufficientResources),
-    };
-
-    let head = {
-        let mut vq = inner.requestq.lock();
-        match io_req.submit(&mut vq, false) {
-            Some(h) => {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                h
-            }
-            None => {
-                io_req.destroy();
-                return DriverStep::complete(DriverStatus::InsufficientResources);
-            }
-        }
-    };
-
-    if let Some(ref irq_handle) = inner.irq_handle {
-        let meta = IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        };
-        let result = irq_handle.wait(meta).await;
-        if !irq_wait_ok(result) {
+    loop {
+        {
             let mut vq = inner.requestq.lock();
-            vq.free_chain(head);
-            io_req.destroy();
-            return DriverStep::complete(DriverStatus::DeviceError);
-        }
-    }
-
-    {
-        let mut vq = inner.requestq.lock();
-        let _ = vq.pop_used();
-        vq.free_chain(head);
-    }
-
-    if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
-        return DriverStep::complete(DriverStatus::DeviceError);
-    }
-
-    {
-        let mut w = req.write();
-        let dst = &mut w.data_slice_mut()[..len];
-        dst.copy_from_slice(io_req.data_slice());
-    }
-
-    io_req.destroy();
-    DriverStep::complete(DriverStatus::Success)
-}
-
-
-#[request_handler]
-pub async fn virtio_blk_write(
-    dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-    _buf_len: usize,
-) -> DriverStep {
-    let dx = match dev.try_devext::<DevExt>() {
-        Ok(x) => x,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
-    let inner = match dx.inner.get() {
-        Some(i) => i,
-        None => return DriverStep::complete(DriverStatus::DeviceNotReady),
-    };
-
-    let (offset, len) = {
-        let r = req.read();
-        match r.kind {
-            RequestType::Write { offset, len } => (offset, len),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
-    };
-
-    if len == 0 {
-        return DriverStep::complete(DriverStatus::Success);
-    }
-    if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
-    }
-
-    let sector = offset >> 9;
-
-    let mut io_req = match BlkIoRequest::new(VIRTIO_BLK_T_OUT, sector, len as u32) {
-        Some(r) => r,
-        None => return DriverStep::complete(DriverStatus::InsufficientResources),
-    };
-
-    {
-        let r = req.read();
-        let src = &r.data_slice()[..len];
-        io_req.data_slice_mut().copy_from_slice(src);
-    }
-
-    let head = {
-        let mut vq = inner.requestq.lock();
-        match io_req.submit(&mut vq, true) {
-            Some(h) => {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                h
-            }
-            None => {
-                io_req.destroy();
-                return DriverStep::complete(DriverStatus::InsufficientResources);
+            if let Some((used_head, _)) = vq.pop_used() {
+                vq.free_chain(used_head as u16);
+                if used_head as u16 == head {
+                    return Ok(());
+                }
+                // Free unrelated completions while we wait for our head.
+                continue;
             }
         }
-    };
 
-    if let Some(ref irq_handle) = inner.irq_handle {
-        let meta = IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        };
-        let result = irq_handle.wait(meta).await;
-        if !irq_wait_ok(result) {
-            let mut vq = inner.requestq.lock();
-            vq.free_chain(head);
-            io_req.destroy();
-            return DriverStep::complete(DriverStatus::DeviceError);
-        }
+        // Poll for completion when no interrupt is configured, or wait for the
+        // device to update the used ring after an interrupt.
+        spin_loop();
     }
-
-    {
-        let mut vq = inner.requestq.lock();
-        let _ = vq.pop_used();
-        vq.free_chain(head);
-    }
-
-    if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
-        return DriverStep::complete(DriverStatus::DeviceError);
-    }
-
-    io_req.destroy();
-    DriverStep::complete(DriverStatus::Success)
 }
-
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-
-#[request_handler]
-pub async fn virtio_blk_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
-        let r = req.read();
-        match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
-    };
-
-    match code {
-        IOCTL_BLOCK_FLUSH => DriverStep::complete(DriverStatus::Success),
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
-    }
-}
-
 
 #[request_handler]
 pub async fn virtio_pdo_start(_dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
@@ -669,7 +559,6 @@ pub async fn virtio_pdo_query_resources(
     DriverStep::complete(DriverStatus::Success)
 }
 
-
 fn get_parent_inner(
     pdo: &Arc<DeviceObject>,
 ) -> Result<(Arc<DeviceObject>, &'static DevExtInner), DriverStatus> {
@@ -722,6 +611,9 @@ pub async fn virtio_pdo_read(
         None => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
 
+    // Wait for IRQ subsystem to be ready
+    inner.irq_ready.wait().await;
+
     let head = {
         let mut vq = inner.requestq.lock();
         match io_req.submit(&mut vq, false) {
@@ -735,25 +627,23 @@ pub async fn virtio_pdo_read(
             }
         }
     };
-
-    if let Some(ref irq_handle) = inner.irq_handle {
-        let meta = IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        };
-        let result = irq_handle.wait(meta).await;
-        if !irq_wait_ok(result) {
-            let mut vq = inner.requestq.lock();
-            vq.free_chain(head);
-            io_req.destroy();
-            return DriverStep::complete(DriverStatus::DeviceError);
-        }
-    }
-
-    {
-        let mut vq = inner.requestq.lock();
-        let _ = vq.pop_used();
-        vq.free_chain(head);
+    // loop {
+    //     if let (Some(pba), Some(idx)) = (inner.msix_pba, inner.msix_table_index) {
+    //         let qword = (idx / 64) as u64;
+    //         let bit = idx % 64;
+    //         let p = (pba.as_u64() + qword * 8) as *const u64;
+    //         let pending = unsafe { read_volatile(p) };
+    //         let set = (pending >> bit) & 1;
+    //         println!(
+    //             "virtio-blk: MSI-X PBA entry {} pending={} raw={:#x}",
+    //             idx, set, pending
+    //         );
+    //     }
+    //     spin_loop();
+    // }
+    if let Err(e) = wait_for_completion(inner, head).await {
+        io_req.destroy();
+        return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {
@@ -810,6 +700,9 @@ pub async fn virtio_pdo_write(
         io_req.data_slice_mut().copy_from_slice(src);
     }
 
+    // Wait for IRQ subsystem to be ready
+    inner.irq_ready.wait().await;
+
     let head = {
         let mut vq = inner.requestq.lock();
         match io_req.submit(&mut vq, true) {
@@ -824,24 +717,9 @@ pub async fn virtio_pdo_write(
         }
     };
 
-    if let Some(ref irq_handle) = inner.irq_handle {
-        let meta = IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        };
-        let result = irq_handle.wait(meta).await;
-        if !irq_wait_ok(result) {
-            let mut vq = inner.requestq.lock();
-            vq.free_chain(head);
-            io_req.destroy();
-            return DriverStep::complete(DriverStatus::DeviceError);
-        }
-    }
-
-    {
-        let mut vq = inner.requestq.lock();
-        let _ = vq.pop_used();
-        vq.free_chain(head);
+    if let Err(e) = wait_for_completion(inner, head).await {
+        io_req.destroy();
+        return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {

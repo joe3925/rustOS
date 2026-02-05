@@ -1,5 +1,9 @@
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::AtomicBool;
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
@@ -28,9 +32,15 @@ pub struct DevExtInner {
     pub requestq: Mutex<Virtqueue>,
     pub capacity: u64,
     pub irq_handle: Option<IrqHandle>,
-    pub mapped_bars: Mutex<alloc::vec::Vec<(VirtAddr, u64)>>,
+    pub mapped_bars: Mutex<Vec<(u32, VirtAddr, u64)>>,
     /// MSI-X vector number if MSI-X is being used, None for legacy/GSI IRQ.
     pub msix_vector: Option<u8>,
+    /// MSI-X table entry programmed for the request queue (if MSI-X is active).
+    pub msix_table_index: Option<u16>,
+    /// Base virtual address of the MSI-X Pending Bit Array region.
+    pub msix_pba: Option<VirtAddr>,
+    /// Gate that becomes ready when interrupt setup is complete and tested.
+    pub irq_ready: InitGate,
 }
 
 /// Device extension for the child disk PDO.
@@ -53,5 +63,68 @@ impl DevExt {
             inner: Once::new(),
             enumerated: AtomicBool::new(false),
         }
+    }
+}
+
+/// A synchronization primitive that allows tasks to wait until initialization is complete.
+/// Once `set_ready()` is called, all current and future waiters immediately return `Ready`.
+pub struct InitGate {
+    ready: AtomicBool,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl InitGate {
+    pub const fn new() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            waiters: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns true if the gate is ready (initialization complete).
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Mark the gate as ready and wake all waiting tasks.
+    pub fn set_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+        let mut waiters = self.waiters.lock();
+        for waker in waiters.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Returns a future that resolves when the gate becomes ready.
+    pub fn wait(&self) -> InitGateWait<'_> {
+        InitGateWait { gate: self }
+    }
+}
+
+/// Future returned by `InitGate::wait()`.
+pub struct InitGateWait<'a> {
+    gate: &'a InitGate,
+}
+
+impl<'a> Future for InitGateWait<'a> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Fast path: already ready
+        if self.gate.ready.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        // Register waker before re-checking to avoid race
+        {
+            let mut waiters = self.gate.waiters.lock();
+            // Double-check after acquiring lock
+            if self.gate.ready.load(Ordering::Acquire) {
+                return Poll::Ready(());
+            }
+            waiters.push(cx.waker().clone());
+        }
+
+        Poll::Pending
     }
 }

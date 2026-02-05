@@ -22,11 +22,16 @@ pub extern "win64" fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
 ) -> Result<VirtAddr, PageMapError> {
-    let phys_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(mmio_base);
-    let num_pages = (mmio_size + 0xFFF) / 4096;
+    let phys_addr = mmio_base.as_u64();
+    let off = phys_addr & 0xFFF;
+    let aligned_base = PhysAddr::new(phys_addr - off);
+    let total_size = align_up_4k(mmio_size + off);
+
+    let phys_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(aligned_base);
+    let num_pages = total_size / 4096;
 
     let virtual_addr =
-        allocate_auto_kernel_range(mmio_size).ok_or_else(|| PageMapError::NoMemory())?;
+        allocate_auto_kernel_range(total_size).ok_or_else(|| PageMapError::NoMemory())?;
 
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
@@ -42,7 +47,7 @@ pub extern "win64" fn map_mmio_region(
                 .flush();
         }
     }
-    Ok(virtual_addr)
+    Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     if size == 0 {

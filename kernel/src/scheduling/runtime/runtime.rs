@@ -13,7 +13,9 @@ lazy_static::lazy_static! {
 }
 
 struct KernelExecutorPlatform;
-
+pub fn yield_now() {
+    unsafe { task_yield() };
+}
 impl ExecutorPlatform for KernelExecutorPlatform {
     fn submit_runtime(&self, job: Job) {
         RUNTIME_POOL.submit(job.f, job.a);
@@ -36,7 +38,7 @@ impl ExecutorPlatform for KernelExecutorPlatform {
     }
 
     fn yield_now(&self) {
-        unsafe { task_yield() };
+        yield_now();
     }
     fn print(&self, string: &str) {
         print(string);
@@ -55,5 +57,4 @@ pub use exec_runtime::spawn_blocking;
 pub use exec_runtime::spawn_blocking_many;
 pub use exec_runtime::spawn_detached;
 pub use exec_runtime::try_steal_blocking_one;
-pub use exec_runtime::yield_now;
 pub use exec_runtime::{BlockingJoin, JoinAll, JoinHandle};

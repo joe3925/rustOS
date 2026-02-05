@@ -60,6 +60,52 @@ impl BootInfoFrameAllocator {
         BootInfoFrameAllocator {}
     }
 
+    pub fn allocate_contiguous_frames(num_frames: usize) -> Option<PhysAddr> {
+        if num_frames == 0 {
+            return None;
+        }
+
+        let mut bm = MEMORY_BITMAP.lock();
+        let total_frames = bm.len() * 64;
+        if num_frames > total_frames {
+            return None;
+        }
+
+        let boot = boot_info();
+
+        for region in boot
+            .memory_regions
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+        {
+            let mut start_frame = usize::max((region.start >> 12) as usize, LOW_FRAMES);
+            let end_frame = (region.end >> 12) as usize;
+
+            if start_frame >= end_frame {
+                continue;
+            }
+
+            while start_frame + num_frames <= end_frame {
+                if range_is_free(&*bm, start_frame, num_frames) {
+                    set_range(bm.as_mut_slice(), start_frame, num_frames);
+                    USED_MEMORY.fetch_add(num_frames * 0x1000, Ordering::SeqCst);
+                    NEXT_WORD_4K.store(start_frame / 64, Ordering::Relaxed);
+
+                    let phys = (start_frame as u64) << 12;
+                    return Some(PhysAddr::new(phys));
+                }
+
+                if bm[start_frame / 64] == u64::MAX {
+                    start_frame = ((start_frame / 64) + 1) * 64;
+                } else {
+                    start_frame += 1;
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
         let base_idx = (frame.start_address().as_u64() >> 12) as usize;
         let (len, bytes_u64) = match S::SIZE {
@@ -331,4 +377,42 @@ fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
     }
 
     bitmap[last_word] &= !(!0u64 >> (63 - (end_incl & 63)));
+}
+
+fn range_is_free(bitmap: &[u64], start: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+
+    let end = match start.checked_add(len) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    let total_bits = bitmap.len() * 64;
+    if end > total_bits {
+        return false;
+    }
+
+    let first_word = start / 64;
+    let last_word = (end - 1) / 64;
+
+    if first_word == last_word {
+        let mask = ((!0u64) << (start & 63)) & ((!0u64) >> (63 - ((end - 1) & 63)));
+        return (bitmap[first_word] & mask) == 0;
+    }
+
+    let first_mask = !0u64 << (start & 63);
+    if (bitmap[first_word] & first_mask) != 0 {
+        return false;
+    }
+
+    for w in (first_word + 1)..last_word {
+        if bitmap[w] != 0 {
+            return false;
+        }
+    }
+
+    let last_mask = !0u64 >> (63 - ((end - 1) & 63));
+    (bitmap[last_word] & last_mask) == 0
 }

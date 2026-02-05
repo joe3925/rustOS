@@ -38,6 +38,13 @@ pub fn allocate_auto_kernel_range_mapped(
     unsafe { kernel_sys::allocate_auto_kernel_range_mapped(size, flags) }
 }
 
+pub fn allocate_auto_kernel_range_mapped_contiguous(
+    size: u64,
+    flags: PageTableFlags,
+) -> Result<VirtAddr, PageMapError> {
+    unsafe { kernel_sys::allocate_auto_kernel_range_mapped_contiguous(size, flags) }
+}
+
 pub fn allocate_kernel_range_mapped(
     base: u64,
     size: u64,
@@ -50,6 +57,6 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { kernel_sys::deallocate_kernel_range(addr, size) }
 }
 
-pub fn virt_to_phys(addr: VirtAddr) -> PhysAddr {
+pub fn virt_to_phys(addr: VirtAddr) -> Option<PhysAddr> {
     unsafe { kernel_sys::virt_to_phys(addr) }
 }

@@ -54,12 +54,12 @@ fn get_level1_page_table(mem_offset: VirtAddr, to_phys: VirtAddr) -> &'static mu
     unsafe { &mut *page_table_ptr }
 }
 
-pub(crate) fn virt_to_phys(to_phys: VirtAddr) -> PhysAddr {
+pub(crate) extern "win64" fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
     let mem_offset = VirtAddr::new(boot_info().physical_memory_offset.into_option().unwrap());
     let l4 = get_level4_page_table(mem_offset);
     let l4e = &l4[to_phys.p4_index()];
     if !l4e.flags().contains(PageTableFlags::PRESENT) {
-        return PhysAddr::new(0);
+        return None;
     }
 
     // Level 3
@@ -67,13 +67,13 @@ pub(crate) fn virt_to_phys(to_phys: VirtAddr) -> PhysAddr {
     let l3_table: &PageTable = unsafe { &*(l3_virt.as_ptr()) };
     let l3e = &l3_table[to_phys.p3_index()];
     if !l3e.flags().contains(PageTableFlags::PRESENT) {
-        return PhysAddr::new(0);
+        return None;
     }
     if l3e.flags().contains(PageTableFlags::HUGE_PAGE) {
         // 1 GiB page
         let base = l3e.addr().as_u64();
         let offset = to_phys.as_u64() & ((1u64 << 30) - 1);
-        return PhysAddr::new(base + offset);
+        return Some(PhysAddr::new(base + offset));
     }
 
     // Level 2
@@ -81,13 +81,13 @@ pub(crate) fn virt_to_phys(to_phys: VirtAddr) -> PhysAddr {
     let l2_table: &PageTable = unsafe { &*(l2_virt.as_ptr()) };
     let l2e = &l2_table[to_phys.p2_index()];
     if !l2e.flags().contains(PageTableFlags::PRESENT) {
-        return PhysAddr::new(0);
+        return None;
     }
     if l2e.flags().contains(PageTableFlags::HUGE_PAGE) {
         // 2 MiB page
         let base = l2e.addr().as_u64();
         let offset = to_phys.as_u64() & ((1u64 << 21) - 1);
-        return PhysAddr::new(base + offset);
+        return Some(PhysAddr::new(base + offset));
     }
 
     // Level 1
@@ -95,11 +95,11 @@ pub(crate) fn virt_to_phys(to_phys: VirtAddr) -> PhysAddr {
     let l1_table: &PageTable = unsafe { &*(l1_virt.as_ptr()) };
     let l1e = &l1_table[to_phys.p1_index()];
     if !l1e.flags().contains(PageTableFlags::PRESENT) {
-        return PhysAddr::new(0);
+        return None;
     }
     let base = l1e.addr().as_u64();
     let offset = to_phys.as_u64() & 0xFFF;
-    PhysAddr::new(base + offset)
+    Some(PhysAddr::new(base + offset))
 }
 pub fn init_mapper(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = get_level4_page_table(physical_memory_offset);
@@ -117,7 +117,7 @@ pub fn new_user_mode_page_table() -> Result<(PhysAddr, VirtAddr), PageMapError> 
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
     )?;
 
-    let table_phys_addr = virt_to_phys(table_virt);
+    let table_phys_addr = virt_to_phys(table_virt).ok_or(PageMapError::TranslationFailed())?;
     let kernel_pml4 = get_level4_page_table(VirtAddr::new(mem_offset));
 
     let new_table: &mut PageTable = unsafe { &mut *(table_virt.as_mut_ptr()) };

@@ -3,13 +3,13 @@ use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
 use crate::file_system::file::File;
-use crate::format;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
 use crate::println;
 use crate::scheduling::runtime::runtime::block_on;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
+use crate::{format, print};
 use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
@@ -94,9 +94,9 @@ fn ensure_thread_object(pid: u64, th: &TaskHandle) -> alloc::sync::Arc<Object> {
     obj
 }
 
-fn println_wrapper(message_ptr: String) {
+fn print_wrapper(message_ptr: String) {
     let message = &*message_ptr;
-    println!("{}", message);
+    print!("{}", message);
 }
 fn u64_to_str_ptr(value: *const u8) -> Option<String> {
     if value.is_null() {
@@ -230,7 +230,7 @@ pub(crate) fn sys_print(ptr: *const u8) -> u64 {
     }
     let c_str = unsafe { core::ffi::CStr::from_ptr(ptr as *const i8) };
     if let Ok(s) = c_str.to_str() {
-        println_wrapper(s.to_string());
+        print_wrapper(s.to_string());
         0
     } else {
         make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 1)
