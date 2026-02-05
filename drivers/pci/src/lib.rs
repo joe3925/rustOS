@@ -12,9 +12,9 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 
 use dev_ext::{
-    DevExt, PciPdoExt, PrtEntry, build_resources_blob, header_type, hwids_for, instance_path_for,
+    DevExt, PciPdoExt, PrtEntry, build_resources_blob, hwids_for, instance_path_for,
     load_segments_from_parent, name_for, parse_ecam_segments_from_blob, parse_prt_from_blob,
-    probe_function,
+    scan_ecam_bus,
 };
 
 use kernel_api::{
@@ -28,6 +28,7 @@ use kernel_api::{
         pnp_forward_request_to_next_lower,
     },
     println,
+    runtime::spawn_blocking,
     request::Request,
     request_handler,
     status::DriverStatus,
@@ -138,7 +139,7 @@ pub async fn pci_bus_pnp_query_devrels(
 ) -> DriverStep {
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation == DeviceRelationType::BusRelations {
-        let st = enumerate_bus(&device, &mut *req.write());
+        let st = enumerate_bus(&device).await;
         if st == DriverStatus::Success {
             return DriverStep::Continue;
         } else {
@@ -159,10 +160,7 @@ fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
     }
 }
 
-pub extern "win64" fn enumerate_bus(
-    device: &Arc<DeviceObject>,
-    _req: &mut Request,
-) -> DriverStatus {
+pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     let devnode = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
@@ -171,17 +169,20 @@ pub extern "win64" fn enumerate_bus(
         }
     };
 
-    let ext = match device.try_devext::<DevExt>() {
-        Ok(g) => g,
+    let (segments, prt_vec) = match device.try_devext::<DevExt>() {
+        Ok(g) => (
+            g.segments.get().cloned(),
+            g.prt.get().cloned().unwrap_or_default(),
+        ),
         Err(_) => {
             println!("[PCI] missing DevExt");
             return DriverStatus::NoSuchDevice;
         }
     };
 
-    let prt = ext.prt.get().map(|v| v.as_slice()).unwrap_or(&[]);
+    let prt_arc: Arc<[PrtEntry]> = Arc::from(prt_vec.clone());
 
-    if ext.segments.get().is_none() {
+    if segments.is_none() {
         println!("[PCI] No ECAM segments; falling back to legacy CFG#1 scan.");
         for bus in 0u8..=255 {
             for dev in 0u8..32 {
@@ -193,7 +194,7 @@ pub extern "win64" fn enumerate_bus(
                 let func_span = if multi { 0u8..8 } else { 0u8..1 };
                 for func in func_span {
                     if let Some(mut p) = dev_ext::probe_function_legacy(bus, dev, func) {
-                        resolve_gsi(&mut p, prt);
+                        resolve_gsi(&mut p, prt_vec.as_slice());
                         make_pdo_for_function(&devnode, &p);
                     }
                 }
@@ -202,22 +203,36 @@ pub extern "win64" fn enumerate_bus(
         return DriverStatus::Success;
     }
 
-    for seg in ext.segments.get().unwrap() {
+    let mut joins = Vec::new();
+    for seg in segments.unwrap() {
         for bus in seg.start_bus..=seg.end_bus {
-            for dev in 0u8..32 {
-                let ht = match header_type(seg, bus, dev) {
-                    Some(v) => v,
-                    None => continue,
+            let seg_copy = seg;
+            let prt_copy = prt_arc.clone();
+            joins.push(spawn_blocking(move || {
+                let mut devices = match scan_ecam_bus(&seg_copy, bus) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!(
+                            "[PCI] failed to scan segment {} bus {}: {:?}",
+                            seg_copy.seg, bus, e
+                        );
+                        Vec::new()
+                    }
                 };
-                let multi = (ht & 0x80) != 0;
-                let func_span = if multi { 0u8..8 } else { 0u8..1 };
-                for func in func_span {
-                    if let Some(mut p) = probe_function(seg, bus, dev, func) {
-                        resolve_gsi(&mut p, prt);
-                        make_pdo_for_function(&devnode, &p);
+
+                if !prt_copy.is_empty() {
+                    for p in devices.iter_mut() {
+                        resolve_gsi(p, prt_copy.as_ref());
                     }
                 }
-            }
+                devices
+            }));
+        }
+    }
+
+    for join in joins {
+        for p in join.await {
+            make_pdo_for_function(&devnode, &p);
         }
     }
 

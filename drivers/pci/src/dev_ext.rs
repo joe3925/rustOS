@@ -186,6 +186,19 @@ fn map_cfg_page(
 }
 
 #[inline]
+fn map_ecam_bus(seg: &McfgSegment, bus: u8) -> Result<(VirtAddr, u64), PageMapError> {
+    let pa = PhysAddr::new(seg.base + ((bus as u64) << 20));
+    // 32 devices * 8 funcs * 4 KiB per func = 1 MiB per bus.
+    let sz = 1u64 << 20;
+    map_mmio_region(pa, sz).map(|va| (va, sz))
+}
+
+#[inline]
+fn function_base(bus_base: VirtAddr, dev: u8, func: u8) -> VirtAddr {
+    VirtAddr::new(bus_base.as_u64() + ((dev as u64) << 15) + ((func as u64) << 12))
+}
+
+#[inline]
 unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
     unsafe { unmap_mmio_region(va, size) };
 }
@@ -340,6 +353,173 @@ pub fn probe_function(seg: &McfgSegment, bus: u8, dev: u8, func: u8) -> Option<P
         bars,
         msix,
     })
+}
+
+#[inline]
+fn probe_function_mapped(
+    seg: &McfgSegment,
+    bus: u8,
+    dev: u8,
+    func: u8,
+    func_base: VirtAddr,
+) -> Option<PciPdoExt> {
+    let vendor = unsafe { cfg_read32(func_base, 0x00) } & 0xFFFF;
+    if vendor == 0xFFFF {
+        return None;
+    }
+
+    let did_vid = unsafe { cfg_read32(func_base, 0x00) };
+    let device_id = ((did_vid >> 16) & 0xFFFF) as u16;
+    let vendor_id = (did_vid & 0xFFFF) as u16;
+
+    let class_rev = unsafe { cfg_read32(func_base, 0x08) };
+    let revision = (class_rev & 0xFF) as u8;
+    let prog_if = ((class_rev >> 8) & 0xFF) as u8;
+    let subclass = ((class_rev >> 16) & 0xFF) as u8;
+    let class = ((class_rev >> 24) & 0xFF) as u8;
+
+    let hdr_type = ((unsafe { cfg_read32(func_base, 0x0C) } >> 16) & 0xFF) as u8;
+    let hdr_kind = hdr_type & 0x7F;
+
+    let (ss_vid, ss_id) = if hdr_kind == 0x00 {
+        let ss = unsafe { cfg_read32(func_base, 0x2C) };
+        ((ss & 0xFFFF) as u16, ((ss >> 16) & 0xFFFF) as u16)
+    } else {
+        (0, 0)
+    };
+
+    let intr = unsafe { cfg_read32(func_base, 0x3C) };
+    let irq_line = (intr & 0xFF) as u8;
+    let irq_pin = ((intr >> 8) & 0xFF) as u8;
+
+    let mut bars = [Bar::default(); 6];
+    let max_bars = if hdr_kind == 0x00 {
+        6
+    } else if hdr_kind == 0x01 {
+        2
+    } else {
+        0
+    };
+
+    let mut i = 0;
+    while i < max_bars {
+        let off = 0x10 + (i as u16) * 4;
+        let orig = unsafe { cfg_read32(func_base, off) };
+        if orig == 0 {
+            i += 1;
+            continue;
+        }
+
+        if (orig & 0x1) == 0x1 {
+            let base = (orig & 0xFFFFFFFC) as u64;
+            unsafe { cfg_write32(func_base, off, 0xFFFF_FFFF) };
+            let sz_mask = unsafe { cfg_read32(func_base, off) } & 0xFFFFFFFC;
+            unsafe { cfg_write32(func_base, off, orig) };
+            let size = ((!sz_mask).wrapping_add(1)) as u64;
+
+            bars[i] = Bar {
+                kind: BarKind::Io,
+                base,
+                size,
+                prefetch: false,
+            };
+            i += 1;
+        } else {
+            let prefetch = (orig & (1 << 3)) != 0;
+            let mem_type = (orig >> 1) & 0x3;
+
+            match mem_type {
+                0b00 => {
+                    let base = (orig & 0xFFFF_FFF0) as u64;
+                    unsafe { cfg_write32(func_base, off, 0xFFFF_FFF0) };
+                    let mask = unsafe { cfg_read32(func_base, off) } & 0xFFFF_FFF0;
+                    unsafe { cfg_write32(func_base, off, orig) };
+                    let size = ((!mask).wrapping_add(1)) as u64;
+
+                    bars[i] = Bar {
+                        kind: BarKind::Mem32,
+                        base,
+                        size,
+                        prefetch,
+                    };
+                    i += 1;
+                }
+                0b10 => {
+                    let orig_hi = unsafe { cfg_read32(func_base, off + 4) };
+                    let base = ((orig_hi as u64) << 32) | ((orig as u64) & 0xFFFF_FFF0);
+
+                    unsafe { cfg_write32(func_base, off, 0xFFFF_FFF0) };
+                    unsafe { cfg_write32(func_base, off + 4, 0xFFFF_FFFF) };
+                    let mask_lo = unsafe { cfg_read32(func_base, off) } & 0xFFFF_FFF0;
+                    let mask_hi = unsafe { cfg_read32(func_base, off + 4) };
+                    unsafe { cfg_write32(func_base, off, orig) };
+                    unsafe { cfg_write32(func_base, off + 4, orig_hi) };
+                    let mask = ((mask_hi as u64) << 32) | (mask_lo as u64);
+                    let size = ((!mask).wrapping_add(1)) as u64;
+
+                    bars[i] = Bar {
+                        kind: BarKind::Mem64,
+                        base,
+                        size,
+                        prefetch,
+                    };
+                    i += 2;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    let msix = probe_msix_capability(func_base);
+
+    Some(PciPdoExt {
+        seg: seg.seg,
+        bus,
+        dev,
+        func,
+        vendor_id,
+        device_id,
+        class,
+        subclass,
+        prog_if,
+        revision,
+        ss_vid,
+        ss_id,
+        irq_pin,
+        irq_line,
+        irq_gsi: None,
+        cfg_phys: ecam_phys_addr(seg, bus, dev, func, 0),
+        bars,
+        msix,
+    })
+}
+
+pub fn scan_ecam_bus(seg: &McfgSegment, bus: u8) -> Result<Vec<PciPdoExt>, PageMapError> {
+    let (bus_base, sz) = map_ecam_bus(seg, bus)?;
+    let mut out = Vec::new();
+
+    for dev in 0u8..32 {
+        let func0_base = function_base(bus_base, dev, 0);
+        let vid = unsafe { cfg_read32(func0_base, 0x00) } & 0xFFFF;
+        if vid == 0xFFFF {
+            continue;
+        }
+
+        let ht = ((unsafe { cfg_read32(func0_base, 0x0C) } >> 16) & 0xFF) as u8;
+        let multi = (ht & 0x80) != 0;
+        let func_span = if multi { 0u8..8 } else { 0u8..1 };
+        for func in func_span {
+            let fbase = function_base(bus_base, dev, func);
+            if let Some(p) = probe_function_mapped(seg, bus, dev, func, fbase) {
+                out.push(p);
+            }
+        }
+    }
+
+    unsafe { unmap_cfg_page(bus_base, sz) };
+    Ok(out)
 }
 
 pub fn header_type(seg: &McfgSegment, bus: u8, dev: u8) -> Option<u8> {

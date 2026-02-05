@@ -1,4 +1,5 @@
 use core::sync::atomic::AtomicU64;
+use spin::Mutex;
 
 use kernel_types::status::PageMapError;
 use x86_64::{
@@ -18,10 +19,13 @@ use crate::{
 };
 
 static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
+static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 pub extern "win64" fn map_mmio_region(
     mmio_base: PhysAddr,
     mmio_size: u64,
 ) -> Result<VirtAddr, PageMapError> {
+    let _lock = MMIO_MAP_LOCK.lock();
+
     let phys_addr = mmio_base.as_u64();
     let off = phys_addr & 0xFFF;
     let aligned_base = PhysAddr::new(phys_addr - off);
@@ -50,6 +54,8 @@ pub extern "win64" fn map_mmio_region(
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    let _lock = MMIO_MAP_LOCK.lock();
+
     if size == 0 {
         return Ok(());
     }
