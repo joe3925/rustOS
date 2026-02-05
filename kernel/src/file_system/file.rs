@@ -5,14 +5,16 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-use core::cmp::PartialEq;
+use core::{cmp::PartialEq, time::Duration};
+use kernel_executor::runtime::runtime::spawn_blocking;
 use kernel_types::{
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
 };
 
 use crate::{
-    drivers::drive::vfs::Vfs,
+    benchmarking::bench_c_drive_io_async,
+    drivers::{drive::vfs::Vfs, interrupt_index::wait_duration},
     file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
@@ -190,6 +192,23 @@ impl File {
         }
     }
 
+    pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FileStatus> {
+        if len > u32::MAX as usize {
+            return Err(FileStatus::UnknownFail);
+        }
+        let (res, st) = file_provider::provider()
+            .read_at(self.fs_file_id, offset, len as u32)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match res.error {
+            None => Ok(res.data),
+            Some(e) => Err(e),
+        }
+    }
+
     pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
         let (wr, st) = file_provider::provider()
             .write_at(self.fs_file_id, 0, data)
@@ -229,6 +248,20 @@ impl File {
             return Err(e);
         }
         Ok(res.pos)
+    }
+
+    pub async fn flush(&self) -> Result<(), FileStatus> {
+        let (res, st) = file_provider::provider()
+            .flush_handle(self.fs_file_id)
+            .await;
+
+        if st != DriverStatus::Success {
+            return Err(FileStatus::UnknownFail);
+        }
+        match res.error {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
     }
 
     pub async fn close(self) -> Result<(), FileStatus> {
@@ -360,7 +393,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
         secs, frac, used_mib, used_mib_frac
     );
-
+    spawn_blocking(|| {
+        wait_duration(Duration::from_millis(50));
+        spawn_detached(bench_c_drive_io_async());
+    });
     Ok(())
 }
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {

@@ -33,7 +33,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -2204,6 +2204,249 @@ pub fn benchmark_async() {
 // =====================
 // Benchmark
 // =====================
+const DISK_BENCH_DIR: &str = "C:\\bench";
+const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
+const DISK_BENCH_TOTAL_BYTES: usize = 2 * 1024 * 1024; // 32 MiB per size
+const DISK_BENCH_SIZES: &[usize] = &[
+    64 * 1024,   // 64 KiB
+    128 * 1024,  // 128 KiB
+    256 * 1024,  // 256 KiB
+    512 * 1024,  // 512 KiB
+    1024 * 1024, // 1 MiB
+];
+
+#[inline(always)]
+fn mib_per_sec(bytes: u64, elapsed_ns: u64) -> f64 {
+    if elapsed_ns == 0 {
+        return 0.0;
+    }
+    let secs = elapsed_ns as f64 / 1_000_000_000.0;
+    let mib = bytes as f64 / (1024.0 * 1024.0);
+    mib / secs
+}
+
+fn lin_regress_overhead(bytes: &[u64], ns_per_op: &[u64]) -> Option<(f64, f64)> {
+    if bytes.len() < 2 || ns_per_op.len() < 2 || bytes.len() != ns_per_op.len() {
+        return None;
+    }
+
+    let n = bytes.len() as f64;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    let mut sum_xx = 0.0;
+    let mut sum_xy = 0.0;
+
+    for (b, t) in bytes.iter().zip(ns_per_op.iter()) {
+        let x = *b as f64;
+        let y = *t as f64;
+        sum_x += x;
+        sum_y += y;
+        sum_xx += x * x;
+        sum_xy += x * y;
+    }
+
+    let denom = n * sum_xx - sum_x * sum_x;
+    if denom.abs() < core::f64::EPSILON {
+        return None;
+    }
+
+    let slope = (n * sum_xy - sum_x * sum_y) / denom;
+    let intercept = (sum_y * sum_xx - sum_x * sum_xy) / denom;
+    Some((intercept, slope))
+}
+
+pub fn bench_c_drive_io() {
+    spawn_detached(async {
+        bench_c_drive_io_async().await;
+    });
+}
+
+pub async fn bench_c_drive_io_async() {
+    // Ensure the target directory exists so the benchmark file can be created.
+    let dir_path = Path::from_string(DISK_BENCH_DIR);
+    if let Err(e) = File::make_dir(&dir_path).await {
+        println!(
+            "[disk-bench] failed to create bench dir {}: {:?}",
+            DISK_BENCH_DIR, e
+        );
+        return;
+    }
+
+    let test_path = Path::from_string(DISK_BENCH_FILE);
+    let mut file = match File::open(&test_path, &[OpenFlags::Create, OpenFlags::ReadWrite]).await {
+        Ok(f) => f,
+        Err(_) => match File::open(&test_path, &[OpenFlags::Open, OpenFlags::ReadWrite]).await {
+            Ok(f) => f,
+            Err(e) => {
+                println!(
+                    "[disk-bench] failed to open {} for read/write: {:?}",
+                    DISK_BENCH_FILE, e
+                );
+                return;
+            }
+        },
+    };
+
+    if let Err(e) = file.set_len(0).await {
+        println!("[disk-bench] failed to truncate benchmark file: {:?}", e);
+        return;
+    }
+
+    let span_cfg = BenchWindowConfig {
+        name: "disk-io-spans",
+        folder: "C:\\system\\logs",
+        log_samples: false,
+        log_spans: true,
+        log_mem_on_persist: false,
+        end_on_drop: false,
+        timeout_ms: None,
+        auto_persist_secs: None,
+        sample_reserve: 64,
+        span_reserve: 4096,
+    };
+    let span_window = BenchWindow::new(span_cfg);
+    span_window.start();
+
+    let mut size_bytes: Vec<u64> = Vec::new();
+    let mut write_ns_per_op: Vec<u64> = Vec::new();
+    let mut read_ns_per_op: Vec<u64> = Vec::new();
+    let mut write_throughput: Vec<f64> = Vec::new();
+    let mut read_throughput: Vec<f64> = Vec::new();
+
+    for &chunk_sz in DISK_BENCH_SIZES {
+        let ops = (DISK_BENCH_TOTAL_BYTES / chunk_sz).max(1);
+
+        if let Err(e) = file.set_len(0).await {
+            println!(
+                "[disk-bench] reset length failed for size {}: {:?}",
+                chunk_sz, e
+            );
+            continue;
+        }
+
+        let mut chunk = vec![0u8; chunk_sz];
+        for (idx, byte) in chunk.iter_mut().enumerate() {
+            *byte = (idx as u8).wrapping_add(1);
+        }
+
+        let sw_write = Stopwatch::start();
+        let mut total_written = 0u64;
+        println!("starting chunk size: {}", chunk_sz);
+        for op in 0..ops {
+            chunk[..8].copy_from_slice(&(op as u64).to_le_bytes());
+            match file.append(&chunk).await {
+                Ok(_) => {
+                    total_written = total_written.saturating_add(chunk_sz as u64);
+                }
+                Err(e) => {
+                    println!(
+                        "[disk-bench] write failed at op {} (size {}): {:?}",
+                        op, chunk_sz, e
+                    );
+                    continue;
+                }
+            }
+        }
+        let write_elapsed = sw_write.elapsed_nanos();
+        let write_mib_s = mib_per_sec(total_written, write_elapsed);
+        let per_write_ns = write_elapsed / ops as u64;
+
+        if let Err(e) = file.flush().await {
+            println!(
+                "[disk-bench] flush after writes failed for size {}: {:?}",
+                chunk_sz, e
+            );
+        }
+
+        let sw_read = Stopwatch::start();
+        let mut total_read = 0u64;
+        let mut offset = 0u64;
+        for op in 0..ops {
+            match file.read_at(offset, chunk_sz).await {
+                Ok(buf) => {
+                    total_read = total_read.saturating_add(buf.len() as u64);
+                    offset = offset.saturating_add(chunk_sz as u64);
+                }
+                Err(e) => {
+                    println!(
+                        "[disk-bench] read failed at op {} (size {}): {:?}",
+                        op, chunk_sz, e
+                    );
+                    continue;
+                }
+            }
+        }
+        let read_elapsed = sw_read.elapsed_nanos();
+        let read_mib_s = mib_per_sec(total_read, read_elapsed);
+        let per_read_ns = read_elapsed / ops as u64;
+
+        size_bytes.push(chunk_sz as u64);
+        write_ns_per_op.push(per_write_ns);
+        read_ns_per_op.push(per_read_ns);
+        write_throughput.push(write_mib_s);
+        read_throughput.push(read_mib_s);
+    }
+
+    let write_overhead = lin_regress_overhead(&size_bytes, &write_ns_per_op);
+    let read_overhead = lin_regress_overhead(&size_bytes, &read_ns_per_op);
+
+    if let Some((over_ns, slope_ns_per_byte)) = write_overhead {
+        let bw = if slope_ns_per_byte > 0.0 {
+            1_000_000_000.0 / (slope_ns_per_byte * 1024.0 * 1024.0)
+        } else {
+            0.0
+        };
+        println!(
+            "[disk-bench] write overhead ~= {:.0} ns/op, est device BW {:.2} MiB/s",
+            over_ns, bw
+        );
+    } else {
+        println!("[disk-bench] write overhead estimation unavailable");
+    }
+
+    if let Some((over_ns, slope_ns_per_byte)) = read_overhead {
+        let bw = if slope_ns_per_byte > 0.0 {
+            1_000_000_000.0 / (slope_ns_per_byte * 1024.0 * 1024.0)
+        } else {
+            0.0
+        };
+        println!(
+            "[disk-bench] read overhead ~= {:.0} ns/op, est device BW {:.2} MiB/s",
+            over_ns, bw
+        );
+    } else {
+        println!("[disk-bench] read overhead estimation unavailable");
+    }
+
+    for idx in 0..size_bytes.len() {
+        let size = size_bytes[idx];
+        let measured_w = write_throughput[idx];
+        let measured_r = read_throughput[idx];
+        let adj_w = if let Some((over, _)) = write_overhead {
+            let adj_ns = (write_ns_per_op[idx] as f64 - over).max(1.0);
+            (size as f64 / adj_ns) * (1_000_000_000.0 / (1024.0 * 1024.0))
+        } else {
+            measured_w
+        };
+        let adj_r = if let Some((over, _)) = read_overhead {
+            let adj_ns = (read_ns_per_op[idx] as f64 - over).max(1.0);
+            (size as f64 / adj_ns) * (1_000_000_000.0 / (1024.0 * 1024.0))
+        } else {
+            measured_r
+        };
+
+        println!(
+            "[disk-bench] size={:>7} KiB write={:>7.2} MiB/s adj_write={:>7.2} MiB/s read={:>7.2} MiB/s adj_read={:>7.2} MiB/s",
+            size / 1024,
+            measured_w,
+            adj_w,
+            measured_r,
+            adj_r
+        );
+    }
+
+    span_window.stop_and_persist().await;
+}
 
 pub async fn benchmark_async_async() {
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);

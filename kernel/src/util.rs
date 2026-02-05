@@ -82,20 +82,20 @@ pub static BOOTSET: &[BootPkg] = boot_packages![
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-lazy_static! {
-    pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
-        name: "global",
-        folder: "C:\\system\\logs",
-        log_samples: false,
-        log_spans: true,
-        log_mem_on_persist: true,
-        end_on_drop: false,
-        timeout_ms: Some(Duration::from_hours(2)),
-        auto_persist_secs: Some(Duration::from_mins(2)),
-        sample_reserve: 256,
-        span_reserve: 256,
-    });
-}
+// lazy_static! {
+//     pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
+//         name: "global",
+//         folder: "C:\\system\\logs",
+//         log_samples: false,
+//         log_spans: true,
+//         log_mem_on_persist: true,
+//         end_on_drop: false,
+//         timeout_ms: None,
+//         auto_persist_secs: None,
+//         sample_reserve: 256,
+//         span_reserve: 256,
+//     });
+// }
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -177,7 +177,6 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         symbols: EXPORTS.to_vec(),
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
-    GLOBAL_WINDOW.start();
 
     spawn_detached(async move {
         install_prepacked_drivers().await;
