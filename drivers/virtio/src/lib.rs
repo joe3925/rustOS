@@ -468,18 +468,18 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
 }
 
 async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<(), DriverStatus> {
-    // if let Some(ref irq_handle) = inner.irq_handle {
-    //     let meta = IrqMeta {
-    //         tag: 0,
-    //         data: [0; 3],
-    //     };
-    //     let result = irq_handle.wait(meta).await;
-    //     if !irq_wait_ok(result) {
-    //         let mut vq = inner.requestq.lock();
-    //         vq.free_chain(head);
-    //         return Err(DriverStatus::DeviceError);
-    //     }
-    // }
+    if let Some(ref irq_handle) = inner.irq_handle {
+        let meta = IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        };
+        let result = irq_handle.wait(meta).await;
+        if !irq_wait_ok(result) {
+            let mut vq = inner.requestq.lock();
+            vq.free_chain(head);
+            return Err(DriverStatus::DeviceError);
+        }
+    }
 
     loop {
         {
@@ -627,20 +627,6 @@ pub async fn virtio_pdo_read(
             }
         }
     };
-    // loop {
-    //     if let (Some(pba), Some(idx)) = (inner.msix_pba, inner.msix_table_index) {
-    //         let qword = (idx / 64) as u64;
-    //         let bit = idx % 64;
-    //         let p = (pba.as_u64() + qword * 8) as *const u64;
-    //         let pending = unsafe { read_volatile(p) };
-    //         let set = (pending >> bit) & 1;
-    //         println!(
-    //             "virtio-blk: MSI-X PBA entry {} pending={} raw={:#x}",
-    //             idx, set, pending
-    //         );
-    //     }
-    //     spin_loop();
-    // }
     if let Err(e) = wait_for_completion(inner, head).await {
         io_req.destroy();
         return DriverStep::complete(e);
