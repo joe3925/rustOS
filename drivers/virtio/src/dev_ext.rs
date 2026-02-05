@@ -11,6 +11,7 @@ use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once};
 
+use crate::blk::BlkIoRequestArena;
 use crate::virtqueue::Virtqueue;
 
 /// Device extension for the virtio-blk FDO.
@@ -41,6 +42,8 @@ pub struct DevExtInner {
     pub msix_pba: Option<VirtAddr>,
     /// Gate that becomes ready when interrupt setup is complete and tested.
     pub irq_ready: InitGate,
+    /// Arena allocator for BlkIoRequest DMA buffers.
+    pub request_arena: BlkIoRequestArena,
 }
 
 /// Device extension for the child disk PDO.

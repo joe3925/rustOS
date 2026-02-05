@@ -37,7 +37,7 @@ use kernel_api::{IOCTL_PCI_SETUP_MSIX, RequestExt, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
-use blk::{BlkIoRequest, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use dev_ext::{ChildExt, DevExt, DevExtInner};
 use virtqueue::Virtqueue;
 
@@ -350,6 +350,23 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
 
     let irq_ready = dev_ext::InitGate::new();
 
+    // Create the arena allocator for BlkIoRequest buffers
+    let request_arena = match blk::BlkIoRequestArena::new() {
+        Some(arena) => arena,
+        None => {
+            println!("virtio-blk: failed to create request arena");
+            blk::reset_device(caps.common_cfg);
+            vq.destroy();
+            if let Some(ref h) = irq_handle {
+                h.unregister();
+            }
+            for &(_idx, va, sz) in &mapped_bars {
+                let _ = unmap_mmio_region(va, sz);
+            }
+            return DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+    };
+
     dx.inner.call_once(|| DevExtInner {
         common_cfg: caps.common_cfg,
         notify_base: caps.notify_base,
@@ -364,6 +381,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         msix_table_index,
         msix_pba,
         irq_ready,
+        request_arena,
     });
 
     if let Some(inner) = dx.inner.get() {
@@ -606,7 +624,7 @@ pub async fn virtio_pdo_read(
 
     let sector = offset >> 9;
 
-    let io_req = match BlkIoRequest::new(VIRTIO_BLK_T_IN, sector, len as u32) {
+    let io_req = match inner.request_arena.alloc(VIRTIO_BLK_T_IN, sector, len as u32) {
         Some(r) => r,
         None => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
@@ -622,18 +640,18 @@ pub async fn virtio_pdo_read(
                 h
             }
             None => {
-                io_req.destroy();
+                inner.request_arena.free(io_req);
                 return DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
     };
     if let Err(e) = wait_for_completion(inner, head).await {
-        io_req.destroy();
+        inner.request_arena.free(io_req);
         return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
+        inner.request_arena.free(io_req);
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
@@ -643,7 +661,7 @@ pub async fn virtio_pdo_read(
         dst.copy_from_slice(io_req.data_slice());
     }
 
-    io_req.destroy();
+    inner.request_arena.free(io_req);
     DriverStep::complete(DriverStatus::Success)
 }
 
@@ -675,7 +693,7 @@ pub async fn virtio_pdo_write(
 
     let sector = offset >> 9;
 
-    let mut io_req = match BlkIoRequest::new(VIRTIO_BLK_T_OUT, sector, len as u32) {
+    let mut io_req = match inner.request_arena.alloc(VIRTIO_BLK_T_OUT, sector, len as u32) {
         Some(r) => r,
         None => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
@@ -697,23 +715,23 @@ pub async fn virtio_pdo_write(
                 h
             }
             None => {
-                io_req.destroy();
+                inner.request_arena.free(io_req);
                 return DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
     };
 
     if let Err(e) = wait_for_completion(inner, head).await {
-        io_req.destroy();
+        inner.request_arena.free(io_req);
         return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
+        inner.request_arena.free(io_req);
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
-    io_req.destroy();
+    inner.request_arena.free(io_req);
     DriverStep::complete(DriverStatus::Success)
 }
 
