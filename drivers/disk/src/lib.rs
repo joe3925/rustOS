@@ -6,13 +6,14 @@ extern crate alloc;
 
 use alloc::collections::VecDeque;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
-use hashbrown::HashMap;
 use core::{
     mem::size_of,
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
+use hashbrown::HashMap;
 use kernel_api::pnp::DriverStep;
+use kernel_api::println;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
@@ -138,7 +139,9 @@ impl SectorCache {
         // Evict oldest if at capacity, reusing its buffer
         let buf = if self.map.len() >= CACHE_BLOCK_COUNT {
             if let Some(old_offset) = self.order.pop_front() {
-                self.map.remove(&old_offset).unwrap_or_else(|| self.get_buffer())
+                self.map
+                    .remove(&old_offset)
+                    .unwrap_or_else(|| self.get_buffer())
             } else {
                 self.get_buffer()
             }
@@ -509,7 +512,6 @@ pub async fn disk_write(
             _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
-
     if total == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }

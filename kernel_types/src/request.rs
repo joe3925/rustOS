@@ -68,6 +68,63 @@ impl RequestData {
         }
     }
 
+    /// Create a RequestData that borrows from a mutable slice.
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - The slice outlives the RequestData
+    /// - The RequestData is not dropped normally (use `take_bytes_borrowed` to reclaim)
+    /// - No other code tries to deallocate the underlying buffer
+    #[inline]
+    pub unsafe fn from_borrowed_mut(slice: &mut [u8]) -> Self {
+        let len = slice.len();
+        let ptr = slice.as_mut_ptr();
+        // Create a fake Box that points to the borrowed slice
+        let fake_box = unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) };
+        Self {
+            bytes: fake_box,
+            tag: None,
+            dropper: |_| {}, // no-op: don't free borrowed memory
+            size: len,
+        }
+    }
+
+    /// Create a RequestData that borrows from a const slice.
+    ///
+    /// # Safety
+    /// The caller must ensure:
+    /// - The slice outlives the RequestData
+    /// - The RequestData is not dropped normally (use `take_bytes_borrowed` to reclaim)
+    /// - No other code tries to deallocate the underlying buffer
+    /// - The data is not mutated through this RequestData
+    #[inline]
+    pub unsafe fn from_borrowed_const(slice: &[u8]) -> Self {
+        let len = slice.len();
+        let ptr = slice.as_ptr() as *mut u8;
+        // Create a fake Box that points to the borrowed slice
+        let fake_box = unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) };
+        Self {
+            bytes: fake_box,
+            tag: None,
+            dropper: |_| {}, // no-op: don't free borrowed memory
+            size: len,
+        }
+    }
+
+    /// Reclaim borrowed bytes without running the dropper.
+    /// Use this to "return" the borrowed slice before the RequestData is dropped.
+    #[inline]
+    pub fn take_bytes_borrowed(&mut self) -> (*mut u8, usize) {
+        let ptr = self.bytes.as_mut_ptr();
+        let len = self.bytes.len();
+        // Replace with empty box and forget the old fake box to prevent deallocation
+        let old = core::mem::replace(&mut self.bytes, Box::new([]));
+        core::mem::forget(old);
+        self.size = 0;
+        self.dropper = |_| {};
+        (ptr, len)
+    }
+
     pub fn from_t<T: 'static>(value: T) -> Self {
         let size = size_of::<T>();
         let bytes = box_to_bytes(Box::new(value));

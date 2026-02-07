@@ -2,7 +2,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
@@ -44,6 +44,8 @@ pub struct DevExtInner {
     pub msix_pba: Option<VirtAddr>,
     /// Gate that becomes ready when interrupt setup is complete and tested.
     pub irq_ready: InitGate,
+    /// Number of tasks currently waiting for the queue interrupt.
+    pub waiting_tasks: AtomicU32,
 }
 
 /// Device extension for the child disk PDO.

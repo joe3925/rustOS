@@ -1,3 +1,4 @@
+use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -5,7 +6,7 @@ use core::task::Waker;
 use crossbeam_queue::{ArrayQueue, SegQueue};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
-    DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult,
+    DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult,
 };
 use spin::{Mutex, Once, RwLock};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
@@ -29,9 +30,9 @@ struct IrqHandleInner {
     /// Pending signal count
     signal_count: AtomicUsize,
     /// Last signaled metadata
-    last_meta: Mutex<IrqMeta>,
+    last_meta: IrqSafeMutex<IrqMeta>,
     /// Wakers waiting for signals
-    waiters: SegQueue<Waker>,
+    waiters: IrqSafeMutex<VecDeque<Waker>>,
 }
 
 impl IrqHandleInner {
@@ -41,8 +42,8 @@ impl IrqHandleInner {
             closed: AtomicBool::new(false),
             user_ctx: AtomicUsize::new(0),
             signal_count: AtomicUsize::new(0),
-            last_meta: Mutex::new(IrqMeta::new()),
-            waiters: SegQueue::new(),
+            last_meta: IrqSafeMutex::new(IrqMeta::new()),
+            waiters: IrqSafeMutex::new(VecDeque::new()),
         }
     }
 
@@ -53,7 +54,7 @@ impl IrqHandleInner {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         // Wake all waiters so they see the closed state
-        while let Some(waker) = self.waiters.pop() {
+        while let Some(waker) = self.waiters.lock().pop_front() {
             waker.wake();
         }
     }
@@ -66,7 +67,7 @@ impl IrqHandleInner {
         self.signal_count.fetch_add(1, Ordering::Release);
 
         // Wake one waiter
-        if let Some(waker) = self.waiters.pop() {
+        if let Some(waker) = self.waiters.lock().pop_front() {
             waker.wake();
         }
     }
@@ -83,7 +84,7 @@ impl IrqHandleInner {
 
         // Wake up to n waiters
         for _ in 0..n {
-            if let Some(waker) = self.waiters.pop() {
+            if let Some(waker) = self.waiters.lock().pop_front() {
                 waker.wake();
             } else {
                 break;
@@ -96,11 +97,11 @@ impl IrqHandleInner {
             let mut m = self.last_meta.lock();
             *m = meta;
         }
-        while let Some(waker) = self.waiters.pop() {
+        while let Some(waker) = self.waiters.lock().pop_front() {
             waker.wake();
         }
         let mut woken = 0;
-        while let Some(waker) = self.waiters.pop() {
+        while let Some(waker) = self.waiters.lock().pop_front() {
             waker.wake();
             woken += 1;
         }
@@ -137,7 +138,7 @@ impl IrqHandleInner {
     }
 
     fn register_waker(&self, waker: Waker) {
-        self.waiters.push(waker);
+        self.waiters.lock().push_back(waker);
     }
 }
 
@@ -630,7 +631,6 @@ impl IrqManager {
                 }
             }
         }
-
         send_eoi(vector);
     }
 }

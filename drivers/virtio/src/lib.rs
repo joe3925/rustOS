@@ -13,7 +13,7 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use core::ptr::read_volatile;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
@@ -44,6 +44,25 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
+
+fn signal_waiters(handle: &IrqHandle) {
+    // user_ctx stores a pointer to the per-device waiting_tasks counter.
+    let ptr = handle.user_ctx() as *const AtomicU32;
+    let waiters = if ptr.is_null() {
+        0
+    } else {
+        unsafe { (*ptr).load(Ordering::Acquire) }
+    };
+
+    let tokens = waiters.max(1);
+    handle.signal_n(
+        IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        },
+        tokens,
+    );
+}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -92,10 +111,7 @@ extern "win64" fn virtio_isr(
 
     if isr_status & 1 != 0 {
         if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-            h.signal_all(IrqMeta {
-                tag: 0,
-                data: [0; 3],
-            });
+            signal_waiters(&h);
             core::mem::forget(h);
         }
         true
@@ -114,10 +130,7 @@ extern "win64" fn virtio_msix_isr(
     _ctx: usize,
 ) -> bool {
     if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-        h.signal_all(IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        });
+        signal_waiters(&h);
         core::mem::forget(h);
     }
     true
@@ -381,9 +394,13 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         msix_table_index,
         msix_pba,
         irq_ready,
+        waiting_tasks: AtomicU32::new(0),
     });
 
     if let Some(inner) = dx.inner.get() {
+        if let Some(ref h) = inner.irq_handle {
+            h.set_user_ctx(&inner.waiting_tasks as *const AtomicU32 as usize);
+        }
         // Interrupt path is configured; either IRQ handle is present or we will poll.
         inner.irq_ready.set_ready();
     }
@@ -490,15 +507,27 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
         data: [0; 3],
     };
 
+    struct WaiterGuard<'a> {
+        counter: &'a AtomicU32,
+    }
+    impl<'a> Drop for WaiterGuard<'a> {
+        fn drop(&mut self) {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    inner.waiting_tasks.fetch_add(1, Ordering::AcqRel);
+    let _waiter_guard = WaiterGuard {
+        counter: &inner.waiting_tasks,
+    };
+
     loop {
         // Drain used ring and check if our request completed
-        println!("awake");
         {
             let mut vq = inner.requestq.lock();
             vq.drain_used_to_completions();
             if let Some(len) = vq.take_completion(head) {
                 vq.free_chain(head);
-                println!("done");
                 return Ok(len);
             }
         }

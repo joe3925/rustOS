@@ -33,7 +33,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = true;
+const BENCH_ENABLED: bool = false;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -534,7 +534,7 @@ fn parse_session_suffix(entry: &str) -> Option<u32> {
     name[8..].parse::<u32>().ok()
 }
 
-async fn ensure_session_async(root: &str) -> BenchSessionInfo {
+async fn ensure_session_async(root: &str, per_core_enabled: bool) -> BenchSessionInfo {
     {
         let reg = session_registry().lock();
         if let Some(info) = reg.get(root) {
@@ -569,10 +569,12 @@ async fn ensure_session_async(root: &str) -> BenchSessionInfo {
     let _ = File::make_dir(&Path::from_string(&avg_windows_dir)).await;
 
     let ncores = bench_ncores();
-    for i in 0..ncores {
-        let core_dir = join_path2(&cores_dir, &format!("core-{i}"));
-        let _ = File::make_dir(&Path::from_string(&core_dir)).await;
-        let _ = File::make_dir(&Path::from_string(&join_path2(&core_dir, "windows"))).await;
+    if per_core_enabled {
+        for i in 0..ncores {
+            let core_dir = join_path2(&cores_dir, &format!("core-{i}"));
+            let _ = File::make_dir(&Path::from_string(&core_dir)).await;
+            let _ = File::make_dir(&Path::from_string(&join_path2(&core_dir, "windows"))).await;
+        }
     }
 
     let info = BenchSessionInfo {
@@ -618,7 +620,12 @@ async fn compute_next_window_suffix_async(windows_root_avg: &str, name: &str) ->
         max_suffix.saturating_add(1).max(1)
     }
 }
-async fn allocate_window_name_async(session_dir: &str, name: &str, ncores: usize) -> String {
+async fn allocate_window_name_async(
+    session_dir: &str,
+    name: &str,
+    ncores: usize,
+    per_core_enabled: bool,
+) -> String {
     let windows_avg = join_path2(&join_path2(session_dir, "avg"), "windows");
 
     let mut reg = window_dir_registry().lock();
@@ -644,13 +651,15 @@ async fn allocate_window_name_async(session_dir: &str, name: &str, ncores: usize
     let avg_win = join_path2(&windows_avg, &window_dir);
     let _ = File::make_dir(&Path::from_string(&avg_win)).await;
 
-    for i in 0..ncores {
-        let core_windows = join_path2(
-            &join_path2(&join_path2(session_dir, "cores"), &format!("core-{i}")),
-            "windows",
-        );
-        let core_win = join_path2(&core_windows, &window_dir);
-        let _ = File::make_dir(&Path::from_string(&core_win)).await;
+    if per_core_enabled {
+        for i in 0..ncores {
+            let core_windows = join_path2(
+                &join_path2(&join_path2(session_dir, "cores"), &format!("core-{i}")),
+                "windows",
+            );
+            let core_win = join_path2(&core_windows, &window_dir);
+            let _ = File::make_dir(&Path::from_string(&core_win)).await;
+        }
     }
 
     window_dir
@@ -830,6 +839,7 @@ pub async fn build_exports_for_window(
     let log_samples = cfg.log_samples;
     let log_spans = cfg.log_spans;
     let want_mem_stream = cfg.log_mem_on_persist;
+    let per_core_enabled = !cfg.disable_per_core;
 
     struct CoreIterator {
         events: Vec<BenchEvent>,
@@ -974,15 +984,17 @@ pub async fn build_exports_for_window(
         match ev.kind {
             BenchEventKind::Sample if log_samples => {
                 if let BenchEventData::Sample(s) = ev.data {
-                    write_sample_row(
-                        &mut bundle.samples_rows[scan_core],
-                        run_id,
-                        ev.timestamp_ns,
-                        ev.core_id,
-                        s.rip,
-                        s.depth.into(),
-                        &s.stack,
-                    );
+                    if per_core_enabled && scan_core < ncores {
+                        write_sample_row(
+                            &mut bundle.samples_rows[scan_core],
+                            run_id,
+                            ev.timestamp_ns,
+                            ev.core_id,
+                            s.rip,
+                            s.depth.into(),
+                            &s.stack,
+                        );
+                    }
                     write_sample_row(
                         &mut bundle.samples_rows[avg],
                         run_id,
@@ -996,13 +1008,15 @@ pub async fn build_exports_for_window(
             }
             BenchEventKind::Metrics if want_mem_stream => {
                 if let BenchEventData::Metrics(m) = ev.data {
-                    write_metrics_row(
-                        &mut bundle.mem_rows[scan_core],
-                        run_id,
-                        ev.timestamp_ns,
-                        ev.core_id,
-                        &m,
-                    );
+                    if per_core_enabled && scan_core < ncores {
+                        write_metrics_row(
+                            &mut bundle.mem_rows[scan_core],
+                            run_id,
+                            ev.timestamp_ns,
+                            ev.core_id,
+                            &m,
+                        );
+                    }
                     write_metrics_row(
                         &mut bundle.mem_rows[avg],
                         run_id,
@@ -1035,7 +1049,7 @@ pub async fn build_exports_for_window(
                         );
 
                         let start_idx = start_core as usize;
-                        if start_idx < ncores {
+                        if per_core_enabled && start_idx < ncores {
                             write_span_row(
                                 &mut bundle.spans_rows[start_idx],
                                 run_id,
@@ -1182,14 +1196,24 @@ impl BenchWindow {
             return false;
         }
 
-        let (folder, name, ncores) = {
+        let (folder, name, ncores, per_core_enabled) = {
             let inner = self.inner.lock();
-            (inner.cfg.folder, inner.cfg.name, inner.ncores)
+            (
+                inner.cfg.folder,
+                inner.cfg.name,
+                inner.ncores,
+                !inner.cfg.disable_per_core,
+            )
         };
 
-        let session = ensure_session_async(folder).await;
-        let window_dir =
-            allocate_window_name_async(&session.session_dir, name, session.ncores).await;
+        let session = ensure_session_async(folder, per_core_enabled).await;
+        let window_dir = allocate_window_name_async(
+            &session.session_dir,
+            name,
+            session.ncores,
+            per_core_enabled,
+        )
+        .await;
 
         {
             let mut inner = self.inner.lock();
@@ -1367,6 +1391,10 @@ impl BenchWindow {
             let header: &'static str = "run_id,timestamp_ns,core,rip,depth,frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n";
 
             for target in 0..(ncores + 1) {
+                if cfg.disable_per_core && target != ncores {
+                    continue;
+                }
+
                 let ex = exports.clone();
                 let session_dir = session_dir.clone();
                 let window_dir = window_dir.clone();
@@ -1412,6 +1440,10 @@ impl BenchWindow {
             let header: &'static str = "run_id,tag,object_id,core,start_ns,duration_ns\n";
 
             for target in 0..(ncores + 1) {
+                if cfg.disable_per_core && target != ncores {
+                    continue;
+                }
+
                 let ex = exports.clone();
                 let session_dir = session_dir.clone();
                 let window_dir = window_dir.clone();
@@ -1457,6 +1489,10 @@ impl BenchWindow {
             let header: &'static str = "run_id,timestamp_ns,core,used_bytes,total_bytes,heap_used_bytes,heap_total_bytes,core_sched_ns,core_switches\n";
 
             for target in 0..(ncores + 1) {
+                if cfg.disable_per_core && target != ncores {
+                    continue;
+                }
+
                 let ex = exports.clone();
                 let session_dir = session_dir.clone();
                 let window_dir = window_dir.clone();
@@ -2206,8 +2242,14 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 1 * 1024 * 1024 * 1024; // 32 MiB per size
-const DISK_BENCH_SIZES: &[usize] = &[1 * 1024 * 1024 * 1024];
+const DISK_BENCH_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const DISK_BENCH_SIZES: &[usize] = &[
+    64 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+];
 
 #[inline(always)]
 fn mib_per_sec(bytes: u64, elapsed_ns: u64) -> f64 {
@@ -2291,6 +2333,7 @@ pub async fn bench_c_drive_io_async() {
         folder: "C:\\system\\logs",
         log_samples: false,
         log_spans: true,
+        disable_per_core: true,
         log_mem_on_persist: false,
         end_on_drop: false,
         timeout_ms: None,
@@ -2319,9 +2362,6 @@ pub async fn bench_c_drive_io_async() {
         }
 
         let mut chunk = vec![0u8; chunk_sz];
-        for (idx, byte) in chunk.iter_mut().enumerate() {
-            *byte = (idx as u8).wrapping_add(1);
-        }
 
         let sw_write = Stopwatch::start();
         let mut total_written = 0u64;
@@ -2436,6 +2476,39 @@ pub async fn bench_c_drive_io_async() {
             adj_w,
             measured_r,
             adj_r
+        );
+    }
+
+    // Baseline: measure fs_seek dispatch cost (no actual I/O) via 10k zero-offset seeks.
+    let seek_iters: u64 = 10_000;
+    let seek_sw = Stopwatch::start();
+    let mut seek_ok = true;
+    for _ in 0..seek_iters {
+        if let Err(e) = file.seek(0, FsSeekWhence::Cur).await {
+            println!("[disk-bench] fs_seek baseline failed: {:?}", e);
+            seek_ok = false;
+            break;
+        }
+    }
+    if seek_ok {
+        let seek_ns = seek_sw.elapsed_nanos();
+        let seek_ms = seek_ns / 1_000_000;
+        let seek_ops_sec = if seek_ns == 0 {
+            0
+        } else {
+            (seek_iters.saturating_mul(1_000_000_000) / seek_ns) as u64
+        };
+        let ops_1 = seek_ops_sec;
+        let ops_5 = seek_ops_sec / 5;
+        let ops_10 = seek_ops_sec / 10;
+        println!(
+            "[disk-bench] fs_seek baseline: iters={} elapsed={} ms ops/sec={} (est per-stack: 1drv={} 5drv={} 10drv={})",
+            seek_iters,
+            seek_ms,
+            seek_ops_sec,
+            ops_1,
+            ops_5,
+            ops_10
         );
     }
 

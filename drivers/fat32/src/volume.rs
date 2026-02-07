@@ -53,6 +53,7 @@ pub struct FileCtx {
     path: Path,
     is_dir: bool,
     pos: u64,
+    size: u64,
 }
 
 fn take_typed_params<T: 'static>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
@@ -103,6 +104,50 @@ fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
     file.seek(SeekFrom::End(0))
 }
 
+fn handle_seek_request(
+    dev: &Arc<DeviceObject>,
+    req: &Arc<RwLock<Request>>,
+    fs: &mut Fs,
+) -> DriverStatus {
+    let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
+        Ok(p) => p,
+        Err(st) => return st,
+    };
+
+    let vdx = ext_mut::<VolCtrlDevExt>(dev);
+
+    let result = {
+        let mut tbl = vdx.table.write();
+        match tbl.get_mut(&params.fs_file_id) {
+            Some(ctx) => {
+                let size = if ctx.is_dir { 0 } else { ctx.size };
+
+                let base: i128 = match params.origin {
+                    FsSeekWhence::Set => 0,
+                    FsSeekWhence::Cur => ctx.pos as i128,
+                    FsSeekWhence::End => size as i128,
+                };
+
+                let pos_i = base + params.offset as i128;
+                let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
+                ctx.pos = clamped;
+                Ok(clamped)
+            }
+            None => Err(FileStatus::PathNotFound),
+        }
+    };
+
+    let mut r = req.write();
+    match result {
+        Ok(pos) => r.set_data_t(FsSeekResult { pos, error: None }),
+        Err(e) => r.set_data_t(FsSeekResult {
+            pos: 0,
+            error: Some(e),
+        }),
+    }
+    DriverStatus::Success
+}
+
 fn handle_fs_request(
     dev: &Arc<DeviceObject>,
     req: &Arc<RwLock<Request>>,
@@ -151,6 +196,7 @@ fn handle_fs_request(
                                         path: params.path,
                                         is_dir,
                                         pos: 0,
+                                        size,
                                     },
                                 );
                             }
@@ -205,10 +251,10 @@ fn handle_fs_request(
                         Err(st) => return st,
                     };
 
-                    let (path, is_dir) = {
+                    let (path, is_dir, _cur_size) = {
                         let tbl = vdx.table.read();
                         match tbl.get(&params.fs_file_id) {
-                            Some(ctx) => (ctx.path.clone() as Path, ctx.is_dir),
+                            Some(ctx) => (ctx.path.clone() as Path, ctx.is_dir, ctx.size),
                             None => {
                                 let mut r = req.write();
                                 r.set_data_t(FsReadResult {
@@ -306,11 +352,15 @@ fn handle_fs_request(
                         }
                     };
 
-                    // Update position on success
+                    // Update position/size on success
                     if let Ok(written) = write_res {
                         let mut tbl = vdx.table.write();
                         if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
-                            ctx.pos = params.offset.saturating_add(written as u64);
+                            let end = params.offset.saturating_add(written as u64);
+                            ctx.pos = end;
+                            if end > ctx.size {
+                                ctx.size = end;
+                            }
                         }
                     }
 
@@ -330,45 +380,7 @@ fn handle_fs_request(
                 }
 
                 FsOp::Seek => {
-                    let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
-                        Ok(p) => p,
-                        Err(st) => return st,
-                    };
-
-                    let result = {
-                        let mut tbl = vdx.table.write();
-                        match tbl.get_mut(&params.fs_file_id) {
-                            Some(ctx) => {
-                                let size = if ctx.is_dir {
-                                    0
-                                } else {
-                                    get_file_len(fs, &ctx.path).unwrap_or(0)
-                                };
-
-                                let base: i128 = match params.origin {
-                                    FsSeekWhence::Set => 0,
-                                    FsSeekWhence::Cur => ctx.pos as i128,
-                                    FsSeekWhence::End => size as i128,
-                                };
-
-                                let pos_i = base + params.offset as i128;
-                                let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
-                                ctx.pos = clamped;
-                                Ok(clamped)
-                            }
-                            None => Err(FileStatus::PathNotFound),
-                        }
-                    };
-
-                    let mut r = req.write();
-                    match result {
-                        Ok(pos) => r.set_data_t(FsSeekResult { pos, error: None }),
-                        Err(e) => r.set_data_t(FsSeekResult {
-                            pos: 0,
-                            error: Some(e),
-                        }),
-                    }
-                    DriverStatus::Success
+                    handle_seek_request(dev, req, fs)
                 }
 
                 FsOp::Flush => {
@@ -461,10 +473,10 @@ fn handle_fs_request(
                         Err(st) => return st,
                     };
 
-                    let (path, is_dir) = {
+                    let (path, is_dir, size_cached) = {
                         let tbl = vdx.table.read();
                         match tbl.get(&params.fs_file_id) {
-                            Some(ctx) => (ctx.path.clone(), ctx.is_dir),
+                            Some(ctx) => (ctx.path.clone(), ctx.is_dir, ctx.size),
                             None => {
                                 let mut r = req.write();
                                 r.set_data_t(FsGetInfoResult {
@@ -481,8 +493,7 @@ fn handle_fs_request(
                     let result = if is_dir {
                         Ok((true, 0u64, u8::from(FileAttribute::Directory)))
                     } else {
-                        let size = get_file_len(fs, &path).unwrap_or(0);
-                        Ok((false, size, u8::from(FileAttribute::Archive)))
+                        Ok((false, size_cached, u8::from(FileAttribute::Archive)))
                     };
 
                     let mut r = req.write();
@@ -549,6 +560,15 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     r.set_data_t(FsSetLenResult { error: err });
+                    if err.is_none() {
+                        let mut tbl = vdx.table.write();
+                        if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
+                            ctx.size = params.new_size;
+                            if ctx.pos > ctx.size {
+                                ctx.pos = ctx.size;
+                            }
+                        }
+                    }
                     DriverStatus::Success
                 }
 
@@ -601,11 +621,12 @@ fn handle_fs_request(
                         }
                     };
 
-                    // Update position on success
+                    // Update position/size on success
                     if let Ok((_, new_size)) = result {
                         let mut tbl = vdx.table.write();
                         if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
                             ctx.pos = new_size;
+                            ctx.size = new_size;
                         }
                     }
 
@@ -701,6 +722,12 @@ pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         vdx.fs.clone()
     };
     let mut fs_guard = fs_arc.lock_owned().await;
+
+    // Fast-path seek: it only updates in-memory state, so avoid a spawn_blocking hop.
+    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+        let status = handle_seek_request(&dev, &req, &mut fs_guard);
+        return DriverStep::complete(status);
+    }
 
     let dev2 = dev.clone();
     let req2 = req.clone();

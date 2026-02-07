@@ -8,7 +8,7 @@ use x86_64::structures::paging::{PageSize, PageTableFlags, Size1GiB};
 use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
-pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 2;
+pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 4;
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
     let heap_size = align_up_4k(HEAP_SIZE as u64);

@@ -33,6 +33,8 @@ pub struct BenchWindowConfig {
 
     pub log_samples: bool,
     pub log_spans: bool,
+    /// When true, skip per-core exports to avoid the overhead of per-core processing.
+    pub disable_per_core: bool,
 
     // When true, export a per-event "memory.csv" stream that includes BOTH
     // heap/memory and scheduler counters. Sampling is driven by span/sample
@@ -54,6 +56,7 @@ impl Default for BenchWindowConfig {
             folder: "C:\\system\\logs",
             log_samples: true,
             log_spans: true,
+            disable_per_core: false,
             log_mem_on_persist: false,
             end_on_drop: true,
             timeout_ms: None,
