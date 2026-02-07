@@ -92,7 +92,7 @@ extern "win64" fn virtio_isr(
 
     if isr_status & 1 != 0 {
         if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-            h.signal_one(IrqMeta {
+            h.signal_all(IrqMeta {
                 tag: 0,
                 data: [0; 3],
             });
@@ -114,7 +114,7 @@ extern "win64" fn virtio_msix_isr(
     _ctx: usize,
 ) -> bool {
     if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-        h.signal_one(IrqMeta {
+        h.signal_all(IrqMeta {
             tag: 0,
             data: [0; 3],
         });
@@ -484,36 +484,37 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     );
 }
 
-async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<(), DriverStatus> {
-    if let Some(ref irq_handle) = inner.irq_handle {
-        let meta = IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        };
-        let result = irq_handle.wait(meta).await;
-        if !irq_wait_ok(result) {
-            let mut vq = inner.requestq.lock();
-            vq.free_chain(head);
-            return Err(DriverStatus::DeviceError);
-        }
-    }
+async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, DriverStatus> {
+    let meta = IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
 
     loop {
+        // Drain used ring and check if our request completed
+        println!("awake");
         {
             let mut vq = inner.requestq.lock();
-            if let Some((used_head, _)) = vq.pop_used() {
-                vq.free_chain(used_head as u16);
-                if used_head as u16 == head {
-                    return Ok(());
-                }
-                // Free unrelated completions while we wait for our head.
-                continue;
+            vq.drain_used_to_completions();
+            if let Some(len) = vq.take_completion(head) {
+                vq.free_chain(head);
+                println!("done");
+                return Ok(len);
             }
         }
 
-        // Poll for completion when no interrupt is configured, or wait for the
-        // device to update the used ring after an interrupt.
-        spin_loop();
+        // Wait for next interrupt (if IRQ configured)
+        if let Some(ref irq_handle) = inner.irq_handle {
+            let result = irq_handle.wait(meta).await;
+            if !irq_wait_ok(result) {
+                let mut vq = inner.requestq.lock();
+                vq.free_chain(head);
+                return Err(DriverStatus::DeviceError);
+            }
+        } else {
+            // Polling mode - yield
+            spin_loop();
+        }
     }
 }
 
@@ -648,10 +649,13 @@ pub async fn virtio_pdo_read(
             }
         }
     };
-    if let Err(e) = wait_for_completion(inner, head).await {
-        // io_req dropped here, returning slot to arena automatically
-        return DriverStep::complete(e);
-    }
+    let _len = match wait_for_completion(inner, head).await {
+        Ok(l) => l,
+        Err(e) => {
+            // io_req dropped here, returning slot to arena automatically
+            return DriverStep::complete(e);
+        }
+    };
 
     if io_req.status() != VIRTIO_BLK_S_OK {
         // io_req dropped here, returning slot to arena automatically
@@ -728,10 +732,13 @@ pub async fn virtio_pdo_write(
         }
     };
 
-    if let Err(e) = wait_for_completion(inner, head).await {
-        // io_req dropped here, returning slot to arena automatically
-        return DriverStep::complete(e);
-    }
+    let _len = match wait_for_completion(inner, head).await {
+        Ok(l) => l,
+        Err(e) => {
+            // io_req dropped here, returning slot to arena automatically
+            return DriverStep::complete(e);
+        }
+    };
 
     if io_req.status() != VIRTIO_BLK_S_OK {
         // io_req dropped here, returning slot to arena automatically

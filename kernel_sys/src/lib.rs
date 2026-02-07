@@ -55,6 +55,7 @@ unsafe extern "win64" {
     pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
     pub fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta);
     pub fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32);
+    pub fn kernel_irq_signal_all(handle: IrqHandlePtr, meta: IrqMeta);
     pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandlePtr;
 
     pub fn irq_handle_clone(h: IrqHandlePtr) -> IrqHandlePtr;

@@ -1,4 +1,5 @@
 use core::cmp;
+use core::sync::atomic::{AtomicU32, Ordering};
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
     unmap_range, virt_to_phys,
@@ -52,6 +53,11 @@ pub struct Virtqueue {
     pub free_head: u16,
     pub num_free: u16,
     pub last_used_idx: u16,
+
+    /// Completion status array indexed by descriptor head.
+    /// - 0: not completed
+    /// - non-zero: completed, value is (len + 1) to distinguish from "not completed"
+    completions: [AtomicU32; 256],
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
@@ -127,6 +133,7 @@ impl Virtqueue {
             free_head: 0,
             num_free: size,
             last_used_idx: 0,
+            completions: core::array::from_fn(|_| AtomicU32::new(0)),
         })
     }
 
@@ -239,6 +246,25 @@ impl Virtqueue {
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         Some((elem.id as u16, elem.len))
+    }
+
+    /// Drain all pending used ring entries into the completions array.
+    pub fn drain_used_to_completions(&mut self) {
+        while let Some((head, len)) = self.pop_used() {
+            // Store len+1 so 0 means "not completed"
+            self.completions[head as usize].store(len.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    /// Check if head is completed and take the completion (atomic swap to 0).
+    /// Returns Some(len) if completed, None if not.
+    pub fn take_completion(&self, head: u16) -> Option<u32> {
+        let val = self.completions[head as usize].swap(0, Ordering::AcqRel);
+        if val == 0 {
+            None
+        } else {
+            Some(val - 1) // Recover original len
+        }
     }
 
     /// Free a descriptor chain starting from `head`.

@@ -91,6 +91,24 @@ impl IrqHandleInner {
         }
     }
 
+    fn signal_all(&self, meta: IrqMeta) {
+        {
+            let mut m = self.last_meta.lock();
+            *m = meta;
+        }
+        while let Some(waker) = self.waiters.pop() {
+            waker.wake();
+        }
+        let mut woken = 0;
+        while let Some(waker) = self.waiters.pop() {
+            waker.wake();
+            woken += 1;
+        }
+        if woken > 0 {
+            self.signal_count.fetch_add(woken, Ordering::Release);
+        }
+    }
+
     fn try_consume(&self) -> Option<(IrqMeta, u32)> {
         let count = self.signal_count.load(Ordering::Acquire);
         if count == 0 {
@@ -162,15 +180,11 @@ impl IrqHandleArc {
 /// Future for waiting on an IRQ signal
 struct IrqWaitFuture {
     handle: IrqHandleArc,
-    registered: bool,
 }
 
 impl IrqWaitFuture {
     fn new(handle: IrqHandleArc) -> Self {
-        Self {
-            handle,
-            registered: false,
-        }
+        Self { handle }
     }
 }
 
@@ -189,10 +203,7 @@ impl core::future::Future for IrqWaitFuture {
             return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, count));
         }
 
-        if !self.registered {
-            self.handle.as_inner().register_waker(cx.waker().clone());
-            self.registered = true;
-        }
+        self.handle.as_inner().register_waker(cx.waker().clone());
 
         if self.handle.as_inner().is_closed() {
             return core::task::Poll::Ready(IrqWaitResult::closed());
@@ -746,6 +757,15 @@ pub fn irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
         return;
     }
     unsafe { irq_handle_signal_n(handle, meta, n) };
+}
+
+pub fn irq_signal_all(handle: IrqHandlePtr, meta: IrqMeta) {
+    if handle.is_null() {
+        return;
+    }
+    let handle = unsafe { IrqHandleArc::clone_from_raw(handle) };
+    handle.as_inner().signal_all(meta);
+    let _ = handle.into_raw();
 }
 
 /// Allocate a free APIC vector from the dynamic range (0x60-0xEF).
