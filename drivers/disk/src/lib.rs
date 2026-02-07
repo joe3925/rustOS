@@ -4,8 +4,9 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::VecDeque;
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use hashbrown::HashMap;
 use core::{
     mem::size_of,
     panic::PanicInfo,
@@ -59,21 +60,30 @@ const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 const CACHE_BYTES: usize = 20 * 1024 * 1024usize;
 const MAX_CHUNK_BYTES: usize = 256 * 1024usize;
 
-/// Simple per-disk sector cache (~20 MiB worth of sectors).
+/// Cache block size - cache in 4KB chunks instead of individual sectors
+const CACHE_BLOCK_SIZE: usize = 4096;
+/// Number of cache blocks we can hold
+const CACHE_BLOCK_COUNT: usize = CACHE_BYTES / CACHE_BLOCK_SIZE;
+
+/// Per-disk sector cache using 4KB blocks for efficiency.
+/// Uses HashMap for O(1) lookups and buffer reuse to avoid allocations.
 struct SectorCache {
     sector_size: usize,
-    capacity_sectors: usize,
-    map: BTreeMap<u64, Box<[u8]>>,
-    order: Vec<u64>, // FIFO approximate eviction
+    /// Map from cache-block-aligned offset to cached data
+    map: HashMap<u64, Box<[u8; CACHE_BLOCK_SIZE]>>,
+    /// FIFO eviction order (stores cache block offsets)
+    order: VecDeque<u64>,
+    /// Pool of reusable buffers from evicted entries
+    free_buffers: Vec<Box<[u8; CACHE_BLOCK_SIZE]>>,
 }
 
 impl Default for SectorCache {
     fn default() -> Self {
         Self {
             sector_size: 0,
-            capacity_sectors: 0,
-            map: BTreeMap::new(),
-            order: Vec::new(),
+            map: HashMap::with_capacity(CACHE_BLOCK_COUNT),
+            order: VecDeque::with_capacity(CACHE_BLOCK_COUNT),
+            free_buffers: Vec::with_capacity(64),
         }
     }
 }
@@ -88,39 +98,61 @@ impl SectorCache {
             return;
         }
         self.sector_size = bs;
-        self.capacity_sectors = (CACHE_BYTES / bs).max(1);
     }
 
     fn clear(&mut self) {
-        self.map.clear();
+        // Move all buffers to free pool for reuse
+        for (_, buf) in self.map.drain() {
+            if self.free_buffers.len() < 128 {
+                self.free_buffers.push(buf);
+            }
+        }
         self.order.clear();
     }
 
-    fn insert_sector(&mut self, lba: u64, src: &[u8]) {
-        if self.sector_size == 0 {
-            return;
-        }
-        if src.len() < self.sector_size {
+    /// Get or allocate a cache buffer, reusing from pool when possible
+    #[inline]
+    fn get_buffer(&mut self) -> Box<[u8; CACHE_BLOCK_SIZE]> {
+        self.free_buffers
+            .pop()
+            .unwrap_or_else(|| Box::new([0u8; CACHE_BLOCK_SIZE]))
+    }
+
+    /// Align offset down to cache block boundary
+    #[inline]
+    const fn align_down(offset: u64) -> u64 {
+        offset & !(CACHE_BLOCK_SIZE as u64 - 1)
+    }
+
+    /// Insert or update a cache block
+    fn insert_block(&mut self, block_offset: u64, src: &[u8]) {
+        debug_assert_eq!(block_offset % CACHE_BLOCK_SIZE as u64, 0);
+        debug_assert!(src.len() <= CACHE_BLOCK_SIZE);
+
+        // Update existing block in-place
+        if let Some(existing) = self.map.get_mut(&block_offset) {
+            existing[..src.len()].copy_from_slice(src);
             return;
         }
 
-        if !self.map.contains_key(&lba)
-            && self.capacity_sectors != 0
-            && self.map.len() == self.capacity_sectors
-        {
-            if let Some(old_lba) = self.order.first().cloned() {
-                self.map.remove(&old_lba);
-                self.order.remove(0);
+        // Evict oldest if at capacity, reusing its buffer
+        let buf = if self.map.len() >= CACHE_BLOCK_COUNT {
+            if let Some(old_offset) = self.order.pop_front() {
+                self.map.remove(&old_offset).unwrap_or_else(|| self.get_buffer())
+            } else {
+                self.get_buffer()
             }
-        }
+        } else {
+            self.get_buffer()
+        };
 
-        let mut buf = vec![0u8; self.sector_size].into_boxed_slice();
-        buf.copy_from_slice(&src[..self.sector_size]);
-
-        if !self.map.contains_key(&lba) {
-            self.order.push(lba);
+        let mut buf = buf;
+        buf[..src.len()].copy_from_slice(src);
+        if src.len() < CACHE_BLOCK_SIZE {
+            buf[src.len()..].fill(0);
         }
-        self.map.insert(lba, buf);
+        self.map.insert(block_offset, buf);
+        self.order.push_back(block_offset);
     }
 
     fn try_read_full(
@@ -130,68 +162,84 @@ impl SectorCache {
         dst: &mut [u8],
         block_size: u32,
     ) -> bool {
-        if self.sector_size == 0 || block_size == 0 {
+        if self.sector_size == 0 || block_size == 0 || total == 0 {
             return false;
         }
 
         let bs = block_size as u64;
-        if (total as u64) % bs != 0 {
+        if (total as u64) % bs != 0 || offset % bs != 0 {
             return false;
         }
-        if self.sector_size != block_size as usize {
-            self.clear();
-            self.sector_size = block_size as usize;
-            self.capacity_sectors = (CACHE_BYTES / self.sector_size).max(1);
-        }
 
-        let start_sector = offset / bs;
-        let num_sectors = (total as u64) / bs;
-
-        for i in 0..num_sectors {
-            if !self.map.contains_key(&(start_sector + i)) {
+        // Check all required cache blocks are present
+        let end = offset + total as u64;
+        let mut check_off = Self::align_down(offset);
+        while check_off < end {
+            if !self.map.contains_key(&check_off) {
                 return false;
             }
+            check_off += CACHE_BLOCK_SIZE as u64;
         }
 
-        let mut out_off = 0usize;
-        for i in 0..num_sectors {
-            let lba = start_sector + i;
-            let buf = match self.map.get(&lba) {
+        // Copy data from cache blocks
+        let mut dst_off = 0usize;
+        let mut cur_off = offset;
+        while dst_off < total {
+            let block_off = Self::align_down(cur_off);
+            let block = match self.map.get(&block_off) {
                 Some(b) => b,
                 None => return false,
             };
-            let remaining = dst.len().saturating_sub(out_off);
-            if remaining < buf.len() {
-                return false;
-            }
-            dst[out_off..out_off + buf.len()].copy_from_slice(buf);
-            out_off += buf.len();
+
+            let offset_in_block = (cur_off - block_off) as usize;
+            let remaining_in_block = CACHE_BLOCK_SIZE - offset_in_block;
+            let remaining_to_read = total - dst_off;
+            let copy_len = remaining_in_block.min(remaining_to_read);
+
+            dst[dst_off..dst_off + copy_len]
+                .copy_from_slice(&block[offset_in_block..offset_in_block + copy_len]);
+
+            dst_off += copy_len;
+            cur_off += copy_len as u64;
         }
 
         true
     }
 
     fn store_range(&mut self, offset: u64, data: &[u8], block_size: u32) {
-        if block_size == 0 || self.sector_size == 0 {
+        if block_size == 0 || self.sector_size == 0 || data.is_empty() {
             return;
         }
 
         let bs = block_size as u64;
-        if (data.len() as u64) % bs != 0 {
+        if (data.len() as u64) % bs != 0 || offset % bs != 0 {
             return;
         }
 
-        let start_sector = offset / bs;
-        let num_sectors = (data.len() as u64) / bs;
         let mut src_off = 0usize;
+        let mut cur_off = offset;
+        let end = offset + data.len() as u64;
 
-        for i in 0..num_sectors {
-            let lba = start_sector + i;
-            if src_off + self.sector_size > data.len() {
-                break;
+        while cur_off < end {
+            let block_off = Self::align_down(cur_off);
+            let offset_in_block = (cur_off - block_off) as usize;
+            let remaining_in_block = CACHE_BLOCK_SIZE - offset_in_block;
+            let remaining_data = data.len() - src_off;
+            let copy_len = remaining_in_block.min(remaining_data);
+
+            // Only cache complete blocks to avoid partial data issues
+            if offset_in_block == 0 && copy_len == CACHE_BLOCK_SIZE {
+                // Full block - insert directly
+                self.insert_block(block_off, &data[src_off..src_off + CACHE_BLOCK_SIZE]);
+            } else if let Some(existing) = self.map.get_mut(&block_off) {
+                // Partial update to existing block
+                existing[offset_in_block..offset_in_block + copy_len]
+                    .copy_from_slice(&data[src_off..src_off + copy_len]);
             }
-            self.insert_sector(lba, &data[src_off..src_off + self.sector_size]);
-            src_off += self.sector_size;
+            // Skip partial blocks that aren't already cached
+
+            src_off += copy_len;
+            cur_off += copy_len as u64;
         }
     }
 }

@@ -11,6 +11,7 @@ use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once};
 
+use crate::blk::BlkIoArena;
 use crate::virtqueue::Virtqueue;
 
 /// Device extension for the virtio-blk FDO.
@@ -30,6 +31,8 @@ pub struct DevExtInner {
     pub isr_cfg: VirtAddr,
     pub device_cfg: VirtAddr,
     pub requestq: Mutex<Virtqueue>,
+    /// Pre-allocated arena for BlkIoRequest slots (lock-free).
+    pub request_arena: BlkIoArena,
     pub capacity: u64,
     pub irq_handle: Option<IrqHandle>,
     pub mapped_bars: Mutex<Vec<(u32, VirtAddr, u64)>>,

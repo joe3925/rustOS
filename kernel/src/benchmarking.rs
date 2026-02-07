@@ -2206,14 +2206,8 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 2 * 1024 * 1024; // 32 MiB per size
-const DISK_BENCH_SIZES: &[usize] = &[
-    64 * 1024,   // 64 KiB
-    128 * 1024,  // 128 KiB
-    256 * 1024,  // 256 KiB
-    512 * 1024,  // 512 KiB
-    1024 * 1024, // 1 MiB
-];
+const DISK_BENCH_TOTAL_BYTES: usize = 1 * 1024 * 1024 * 1024; // 32 MiB per size
+const DISK_BENCH_SIZES: &[usize] = &[1 * 1024 * 1024 * 1024];
 
 #[inline(always)]
 fn mib_per_sec(bytes: u64, elapsed_ns: u64) -> f64 {

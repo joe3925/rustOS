@@ -37,7 +37,7 @@ use kernel_api::{IOCTL_PCI_SETUP_MSIX, RequestExt, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
-use blk::{BlkIoRequest, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use blk::{BlkIoArena, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use dev_ext::{ChildExt, DevExt, DevExtInner};
 use virtqueue::Virtqueue;
 
@@ -113,7 +113,6 @@ extern "win64" fn virtio_msix_isr(
     handle: IrqHandlePtr,
     _ctx: usize,
 ) -> bool {
-    // MSI-X interrupts are dedicated - always signal
     if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
         h.signal_one(IrqMeta {
             tag: 0,
@@ -348,6 +347,23 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
     let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
 
+    // Initialize the request arena for pre-allocated DMA buffers
+    let request_arena = match BlkIoArena::init() {
+        Some(arena) => arena,
+        None => {
+            println!("virtio-blk: failed to initialize request arena");
+            blk::reset_device(caps.common_cfg);
+            vq.destroy();
+            if let Some(ref h) = irq_handle {
+                h.unregister();
+            }
+            for &(_idx, va, sz) in &mapped_bars {
+                let _ = unmap_mmio_region(va, sz);
+            }
+            return DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+    };
+
     let irq_ready = dev_ext::InitGate::new();
 
     dx.inner.call_once(|| DevExtInner {
@@ -357,6 +373,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         isr_cfg: caps.isr_cfg,
         device_cfg: caps.device_cfg,
         requestq: Mutex::new(vq),
+        request_arena,
         capacity,
         irq_handle,
         mapped_bars: Mutex::new(bar_list),
@@ -606,7 +623,11 @@ pub async fn virtio_pdo_read(
 
     let sector = offset >> 9;
 
-    let io_req = match BlkIoRequest::new(VIRTIO_BLK_T_IN, sector, len as u32) {
+    // Use arena allocator for request (returns slot on drop)
+    let io_req = match inner
+        .request_arena
+        .new_request(VIRTIO_BLK_T_IN, sector, len as u32)
+    {
         Some(r) => r,
         None => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
@@ -622,18 +643,18 @@ pub async fn virtio_pdo_read(
                 h
             }
             None => {
-                io_req.destroy();
+                // io_req dropped here, returning slot to arena automatically
                 return DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
     };
     if let Err(e) = wait_for_completion(inner, head).await {
-        io_req.destroy();
+        // io_req dropped here, returning slot to arena automatically
         return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
+        // io_req dropped here, returning slot to arena automatically
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
@@ -643,7 +664,7 @@ pub async fn virtio_pdo_read(
         dst.copy_from_slice(io_req.data_slice());
     }
 
-    io_req.destroy();
+    // io_req dropped here, returning slot to arena automatically
     DriverStep::complete(DriverStatus::Success)
 }
 
@@ -675,7 +696,11 @@ pub async fn virtio_pdo_write(
 
     let sector = offset >> 9;
 
-    let mut io_req = match BlkIoRequest::new(VIRTIO_BLK_T_OUT, sector, len as u32) {
+    // Use arena allocator for request (returns slot on drop)
+    let mut io_req = match inner
+        .request_arena
+        .new_request(VIRTIO_BLK_T_OUT, sector, len as u32)
+    {
         Some(r) => r,
         None => return DriverStep::complete(DriverStatus::InsufficientResources),
     };
@@ -697,23 +722,23 @@ pub async fn virtio_pdo_write(
                 h
             }
             None => {
-                io_req.destroy();
+                // io_req dropped here, returning slot to arena automatically
                 return DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
     };
 
     if let Err(e) = wait_for_completion(inner, head).await {
-        io_req.destroy();
+        // io_req dropped here, returning slot to arena automatically
         return DriverStep::complete(e);
     }
 
     if io_req.status() != VIRTIO_BLK_S_OK {
-        io_req.destroy();
+        // io_req dropped here, returning slot to arena automatically
         return DriverStep::complete(DriverStatus::DeviceError);
     }
 
-    io_req.destroy();
+    // io_req dropped here, returning slot to arena automatically
     DriverStep::complete(DriverStatus::Success)
 }
 

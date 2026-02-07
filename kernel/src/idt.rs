@@ -2,6 +2,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Waker;
+use crossbeam_queue::{ArrayQueue, SegQueue};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
     DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult,
@@ -30,7 +31,7 @@ struct IrqHandleInner {
     /// Last signaled metadata
     last_meta: Mutex<IrqMeta>,
     /// Wakers waiting for signals
-    waiters: Mutex<Vec<Waker>>,
+    waiters: SegQueue<Waker>,
 }
 
 impl IrqHandleInner {
@@ -41,7 +42,7 @@ impl IrqHandleInner {
             user_ctx: AtomicUsize::new(0),
             signal_count: AtomicUsize::new(0),
             last_meta: Mutex::new(IrqMeta::new()),
-            waiters: Mutex::new(Vec::new()),
+            waiters: SegQueue::new(),
         }
     }
 
@@ -52,8 +53,7 @@ impl IrqHandleInner {
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         // Wake all waiters so they see the closed state
-        let mut waiters = self.waiters.lock();
-        for waker in waiters.drain(..) {
+        while let Some(waker) = self.waiters.pop() {
             waker.wake();
         }
     }
@@ -66,8 +66,7 @@ impl IrqHandleInner {
         self.signal_count.fetch_add(1, Ordering::Release);
 
         // Wake one waiter
-        let mut waiters = self.waiters.lock();
-        if let Some(waker) = waiters.pop() {
+        if let Some(waker) = self.waiters.pop() {
             waker.wake();
         }
     }
@@ -83,9 +82,8 @@ impl IrqHandleInner {
         self.signal_count.fetch_add(n as usize, Ordering::Release);
 
         // Wake up to n waiters
-        let mut waiters = self.waiters.lock();
         for _ in 0..n {
-            if let Some(waker) = waiters.pop() {
+            if let Some(waker) = self.waiters.pop() {
                 waker.wake();
             } else {
                 break;
@@ -121,8 +119,7 @@ impl IrqHandleInner {
     }
 
     fn register_waker(&self, waker: Waker) {
-        let mut waiters = self.waiters.lock();
-        waiters.push(waker);
+        self.waiters.push(waker);
     }
 }
 
