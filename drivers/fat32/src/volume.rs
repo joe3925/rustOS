@@ -314,6 +314,7 @@ fn handle_fs_request(
                         Ok(p) => p,
                         Err(st) => return st,
                     };
+                    let write_through = params.write_through;
 
                     let (path, is_dir) = {
                         let tbl = vdx.table.read();
@@ -340,10 +341,12 @@ fn handle_fs_request(
                                     Err(map_fatfs_err(&e))
                                 } else {
                                     match file.write_all(&params.data) {
-                                        Ok(()) => match file.flush() {
-                                            Ok(()) => Ok(n),
-                                            Err(e) => Err(map_fatfs_err(&e)),
-                                        },
+                                        Ok(()) => (if write_through {
+                                            file.flush().map_err(|e| map_fatfs_err(&e))
+                                        } else {
+                                            Ok(())
+                                        })
+                                        .map(|_| n),
                                         Err(e) => Err(map_fatfs_err(&e)),
                                     }
                                 }
@@ -379,9 +382,7 @@ fn handle_fs_request(
                     DriverStatus::Success
                 }
 
-                FsOp::Seek => {
-                    handle_seek_request(dev, req, fs)
-                }
+                FsOp::Seek => handle_seek_request(dev, req, fs),
 
                 FsOp::Flush => {
                     let params: FsFlushParams = match take_typed_params::<FsFlushParams>(req) {
@@ -542,18 +543,16 @@ fn handle_fs_request(
                         Some(FileStatus::AccessDenied)
                     } else {
                         match fs.root_dir().open_file(&path.to_string()) {
-                            Ok(mut file) => {
-                                match file.seek(SeekFrom::Start(params.new_size)) {
-                                    Ok(_) => match file.truncate() {
-                                        Ok(()) => match file.flush() {
-                                            Ok(()) => None,
-                                            Err(e) => Some(map_fatfs_err(&e)),
-                                        },
+                            Ok(mut file) => match file.seek(SeekFrom::Start(params.new_size)) {
+                                Ok(_) => match file.truncate() {
+                                    Ok(()) => match file.flush() {
+                                        Ok(()) => None,
                                         Err(e) => Some(map_fatfs_err(&e)),
                                     },
                                     Err(e) => Some(map_fatfs_err(&e)),
-                                }
-                            }
+                                },
+                                Err(e) => Some(map_fatfs_err(&e)),
+                            },
                             Err(e) => Some(map_fatfs_err(&e)),
                         }
                     };
@@ -577,6 +576,7 @@ fn handle_fs_request(
                         Ok(p) => p,
                         Err(st) => return st,
                     };
+                    let write_through = params.write_through;
 
                     let (path, is_dir) = {
                         let tbl = vdx.table.read();
@@ -598,25 +598,24 @@ fn handle_fs_request(
                         Err(FileStatus::AccessDenied)
                     } else {
                         match fs.root_dir().open_file(&path.to_string()) {
-                            Ok(mut file) => {
-                                match file.seek(SeekFrom::End(0)) {
-                                    Ok(_) => {
-                                        let n = params.data.len();
-                                        match file.write_all(&params.data) {
-                                            Ok(()) => match file.flush() {
-                                                Ok(()) => {
-                                                    let new_size =
-                                                        file.seek(SeekFrom::End(0)).unwrap_or(0);
-                                                    Ok((n, new_size))
-                                                }
-                                                Err(e) => Err(map_fatfs_err(&e)),
-                                            },
-                                            Err(e) => Err(map_fatfs_err(&e)),
-                                        }
+                            Ok(mut file) => match file.seek(SeekFrom::End(0)) {
+                                Ok(_) => {
+                                    let n = params.data.len();
+                                    match file.write_all(&params.data) {
+                                        Ok(()) => (if write_through {
+                                            file.flush().map_err(|e| map_fatfs_err(&e))
+                                        } else {
+                                            Ok(())
+                                        })
+                                        .map(|_| {
+                                            let new_size = file.seek(SeekFrom::End(0)).unwrap_or(0);
+                                            (n, new_size)
+                                        }),
+                                        Err(e) => Err(map_fatfs_err(&e)),
                                     }
-                                    Err(e) => Err(map_fatfs_err(&e)),
                                 }
-                            }
+                                Err(e) => Err(map_fatfs_err(&e)),
+                            },
                             Err(e) => Err(map_fatfs_err(&e)),
                         }
                     };

@@ -384,7 +384,7 @@ pub async fn ide_pdo_write(
     let (offset, len) = {
         let r = req.read();
         match r.kind {
-            RequestType::Write { offset, len } => (offset, len),
+            RequestType::Write { offset, len, .. } => (offset, len),
             _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };

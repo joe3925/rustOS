@@ -130,7 +130,11 @@ impl BlockDev {
         let len = buf.len();
         {
             let mut g = write_req.write();
-            g.kind = RequestType::Write { offset, len };
+            g.kind = RequestType::Write {
+                offset,
+                len,
+                flush_write_through: false,
+            };
             g.data = unsafe { RequestData::from_borrowed_const(buf) };
         }
 

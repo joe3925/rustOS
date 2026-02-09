@@ -485,7 +485,11 @@ impl Drop for RequestData {
 #[repr(C)]
 pub enum RequestType {
     Read { offset: u64, len: usize },
-    Write { offset: u64, len: usize },
+    Write {
+        offset: u64,
+        len: usize,
+        flush_write_through: bool,
+    },
     DeviceControl(u32),
     Fs(FsOp),
     Pnp,

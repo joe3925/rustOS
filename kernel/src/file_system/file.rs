@@ -34,6 +34,7 @@ pub struct File {
     path: Path,
     pub(crate) size: u64,
     is_dir: bool,
+    write_through: bool,
 }
 
 impl File {
@@ -91,7 +92,10 @@ impl File {
     }
 
     pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
-        let (res, st) = file_provider::provider().open_path(path, flags).await;
+        let write_through = flags.iter().any(|f| *f == OpenFlags::WriteThrough);
+        let (res, st) = file_provider::provider()
+            .open_path(path, flags, write_through)
+            .await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
@@ -103,6 +107,7 @@ impl File {
             path: path.clone(),
             size: res.size,
             is_dir: res.is_dir,
+            write_through,
         })
     }
 
@@ -211,7 +216,7 @@ impl File {
 
     pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
         let (wr, st) = file_provider::provider()
-            .write_at(self.fs_file_id, 0, data)
+            .write_at(self.fs_file_id, 0, data, self.write_through)
             .await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -301,7 +306,7 @@ impl File {
     /// Returns the number of bytes written and updates the cached file size.
     pub async fn append(&mut self, data: &[u8]) -> Result<usize, FileStatus> {
         let (res, st) = file_provider::provider()
-            .append(self.fs_file_id, data)
+            .append(self.fs_file_id, data, self.write_through)
             .await;
 
         if st != DriverStatus::Success {

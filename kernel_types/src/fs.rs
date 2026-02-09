@@ -47,6 +47,7 @@ pub enum OpenFlags {
     Create = 1 << 3,
     CreateNew = 1 << 4,
     Open = 1 << 5,
+    WriteThrough = 1 << 6,
 }
 
 /// A bitmask of `OpenFlags` for passing multiple flags efficiently.
@@ -126,6 +127,7 @@ pub enum FsOp {
 #[derive(Debug, Clone)]
 pub struct FsOpenParams {
     pub flags: OpenFlagsMask,
+    pub write_through: bool,
     pub path: Path,
 }
 
@@ -170,6 +172,7 @@ pub struct FsReadResult {
 pub struct FsWriteParams {
     pub fs_file_id: u64,
     pub offset: u64,
+    pub write_through: bool,
     pub data: Vec<u8>,
 }
 
@@ -288,6 +291,7 @@ pub struct FsSetLenResult {
 pub struct FsAppendParams {
     pub fs_file_id: u64,
     pub data: Vec<u8>,
+    pub write_through: bool,
 }
 
 #[repr(C)]

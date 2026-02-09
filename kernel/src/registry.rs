@@ -312,7 +312,12 @@ fn parse_wal_record(data: &[u8]) -> Option<(WalRecordHeader, RegDelta, usize)> {
 /// Load and replay WAL records, returning the highest sequence number seen
 async fn replay_wal(reg: &mut Registry) -> u64 {
     let wal_path = wal_path();
-    let f = match File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Open]).await {
+    let f = match File::open(
+        &wal_path,
+        &[OpenFlags::ReadWrite, OpenFlags::Open, OpenFlags::WriteThrough],
+    )
+    .await
+    {
         Ok(f) => f,
         Err(_) => return 0,
     };
@@ -371,7 +376,15 @@ async fn append_wal(delta: &RegDelta) -> Result<(), kernel_types::status::RegErr
     let record = encode_wal_record(seq, delta).map_err(|_| RegError::EncodingFailed)?;
 
     let wal_path = wal_path();
-    let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let mut file = File::open(
+        &wal_path,
+        &[
+            OpenFlags::ReadWrite,
+            OpenFlags::Create,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await?;
 
     file.append(&record)
         .await
@@ -384,7 +397,15 @@ async fn clear_wal() -> Result<(), kernel_types::status::RegError> {
     use kernel_types::status::RegError;
 
     let wal_path = wal_path();
-    let mut file = File::open(&wal_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let mut file = File::open(
+        &wal_path,
+        &[
+            OpenFlags::ReadWrite,
+            OpenFlags::Create,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await?;
     file.set_len(0)
         .await
         .map_err(|_| RegError::EncodingFailed)?;

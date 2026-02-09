@@ -203,10 +203,14 @@ pub async fn partition_pdo_write(
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
-    let off = {
+    let (off, flush_write_through) = {
         let r = request.read();
         match r.kind {
-            RequestType::Write { offset, len } => {
+            RequestType::Write {
+                offset,
+                len,
+                flush_write_through,
+            } => {
                 if buf_len != len {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
@@ -217,7 +221,7 @@ pub async fn partition_pdo_write(
                 if (offset as u64) % block_size != 0 || (buf_len as u64) % block_size != 0 {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
-                offset
+                (offset, flush_write_through)
             }
             _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
@@ -230,6 +234,7 @@ pub async fn partition_pdo_write(
         w.kind = RequestType::Write {
             offset: phys_off,
             len: buf_len,
+            flush_write_through,
         };
     }
 
@@ -240,6 +245,7 @@ pub async fn partition_pdo_write(
         w.kind = RequestType::Write {
             offset: off,
             len: buf_len,
+            flush_write_through,
         };
     }
 

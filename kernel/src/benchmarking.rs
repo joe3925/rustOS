@@ -2311,16 +2311,13 @@ pub async fn bench_c_drive_io_async() {
     let test_path = Path::from_string(DISK_BENCH_FILE);
     let mut file = match File::open(&test_path, &[OpenFlags::Create, OpenFlags::ReadWrite]).await {
         Ok(f) => f,
-        Err(_) => match File::open(&test_path, &[OpenFlags::Open, OpenFlags::ReadWrite]).await {
-            Ok(f) => f,
-            Err(e) => {
-                println!(
-                    "[disk-bench] failed to open {} for read/write: {:?}",
-                    DISK_BENCH_FILE, e
-                );
-                return;
-            }
-        },
+        Err(e) => {
+            println!(
+                "[disk-bench] failed to open {} for read/write: {:?}",
+                DISK_BENCH_FILE, e
+            );
+            return;
+        }
     };
 
     if let Err(e) = file.set_len(0).await {

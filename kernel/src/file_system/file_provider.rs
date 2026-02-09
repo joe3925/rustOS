@@ -19,6 +19,7 @@ pub trait FileProvider: Send + Sync {
         &self,
         path: &Path,
         flags: &[OpenFlags],
+        write_through: bool,
     ) -> FfiFuture<(FsOpenResult, DriverStatus)>;
 
     fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)>;
@@ -40,6 +41,7 @@ pub trait FileProvider: Send + Sync {
         file_id: u64,
         offset: u64,
         data: &[u8],
+        write_through: bool,
     ) -> FfiFuture<(FsWriteResult, DriverStatus)>;
 
     fn flush_handle(&self, file_id: u64) -> FfiFuture<(FsFlushResult, DriverStatus)>;
@@ -58,7 +60,12 @@ pub trait FileProvider: Send + Sync {
 
     fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)>;
 
-    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)>;
+    fn append(
+        &self,
+        file_id: u64,
+        data: &[u8],
+        write_through: bool,
+    ) -> FfiFuture<(FsAppendResult, DriverStatus)>;
 
     fn zero_range(
         &self,

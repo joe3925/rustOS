@@ -574,6 +574,7 @@ async fn refresh_fs_registry_from_registry() -> usize {
 async fn fs_check_open(public_link: &str, path: &str) -> bool {
     let params = FsOpenParams {
         flags: OpenFlags::Open.into(),
+        write_through: false,
         path: Path::from_string(path),
     };
     let req = Arc::new(RwLock::new(

@@ -1012,6 +1012,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         &self,
         path: &Path,
         flags: &[OpenFlags],
+        _write_through: bool,
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
         let res = self.open_path_sync(&path.to_string(), flags);
         async move { res }.into_ffi()
@@ -1045,6 +1046,7 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         file_id: u64,
         offset: u64,
         data: &[u8],
+        _write_through: bool,
     ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
         let res = self.write_at_sync(file_id, offset, data);
         async move { res }.into_ffi()
@@ -1090,7 +1092,12 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         async move { res }.into_ffi()
     }
 
-    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)> {
+    fn append(
+        &self,
+        file_id: u64,
+        data: &[u8],
+        _write_through: bool,
+    ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
         let res = self.append_sync(file_id, data);
         async move { res }.into_ffi()
     }

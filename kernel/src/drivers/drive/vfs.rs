@@ -179,9 +179,17 @@ impl Vfs {
             }
         };
 
-        let call_open = async |this: &Self, link: &String, path: Path, flags: OpenFlagsMask| {
+        let call_open = async |this: &Self,
+                               link: &String,
+                               path: Path,
+                               flags: OpenFlagsMask,
+                               write_through: bool| {
             let tgt = this.resolve_target(link);
-            let inner = FsOpenParams { flags, path };
+            let inner = FsOpenParams {
+                flags,
+                write_through,
+                path,
+            };
             match this
                 .call_fs::<FsOpenParams, FsOpenResult>(link, tgt, FsOp::Open, inner)
                 .await
@@ -245,7 +253,8 @@ impl Vfs {
                 }
             }
 
-            let (inner_res, st) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
+            let (inner_res, st) =
+                call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
             if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                 return (inner_res, st);
             }
@@ -270,7 +279,8 @@ impl Vfs {
                 DriverStatus::Success,
             )
         } else if has_create {
-            let (try_open, st) = call_open(self, &symlink, fs_path.clone(), p.flags.clone()).await;
+            let (try_open, st) =
+                call_open(self, &symlink, fs_path.clone(), p.flags.clone(), p.write_through).await;
             if st != DriverStatus::Success {
                 return (try_open, st);
             }
@@ -334,7 +344,8 @@ impl Vfs {
                     }
                 }
 
-                let (inner_res, st2) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
+                let (inner_res, st2) =
+                    call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st2);
                 }
@@ -362,7 +373,8 @@ impl Vfs {
             (try_open, DriverStatus::Success)
         } else {
             // Open, ReadOnly, WriteOnly, ReadWrite - just open
-            let (inner_res, st) = call_open(self, &symlink, fs_path, p.flags.clone()).await;
+            let (inner_res, st) =
+                call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
             if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                 return (inner_res, st);
             }
@@ -776,11 +788,13 @@ impl FileProvider for Vfs {
         &self,
         path: &Path,
         flags: &[OpenFlags],
+        write_through: bool,
     ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
         this.open(FsOpenParams {
             flags: OpenFlagsMask::from(flags),
+            write_through,
             path: path.clone(),
         })
         .into_ffi()
@@ -830,6 +844,7 @@ impl FileProvider for Vfs {
         file_id: u64,
         offset: u64,
         data: &[u8],
+        write_through: bool,
     ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
         let data = data.to_vec();
@@ -837,6 +852,7 @@ impl FileProvider for Vfs {
         this.write(FsWriteParams {
             fs_file_id: file_id,
             offset,
+            write_through,
             data,
         })
         .into_ffi()
@@ -922,13 +938,19 @@ impl FileProvider for Vfs {
         .into_ffi()
     }
 
-    fn append(&self, file_id: u64, data: &[u8]) -> FfiFuture<(FsAppendResult, DriverStatus)> {
+    fn append(
+        &self,
+        file_id: u64,
+        data: &[u8],
+        write_through: bool,
+    ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
         let data = data.to_vec();
 
         this.append(FsAppendParams {
             fs_file_id: file_id,
             data,
+            write_through,
         })
         .into_ffi()
     }
