@@ -81,6 +81,7 @@ pub fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 struct PartDevExt {
     start_lba: Once<u64>,
     end_lba: Once<u64>,
+    block_size: Once<u32>,
     part: Once<PartitionInfo>,
 }
 
@@ -137,6 +138,10 @@ pub async fn partition_pdo_read(
     let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
+    let block_size = match dx.block_size.get() {
+        Some(v) if *v != 0 => *v as u64,
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
 
     let off = {
         let r = request.read();
@@ -147,6 +152,9 @@ pub async fn partition_pdo_read(
                 }
                 let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
                 if (offset as u64) + (buf_len as u64) > part_bytes {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                if (offset as u64) % block_size != 0 || (buf_len as u64) % block_size != 0 {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
                 offset
@@ -190,6 +198,10 @@ pub async fn partition_pdo_write(
     let dx = ext::<PartDevExt>(&device);
     let start_lba = *dx.start_lba.get().unwrap();
     let end_lba = *dx.end_lba.get().unwrap();
+    let block_size = match dx.block_size.get() {
+        Some(v) if *v != 0 => *v as u64,
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
 
     let off = {
         let r = request.read();
@@ -200,6 +212,9 @@ pub async fn partition_pdo_write(
                 }
                 let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
                 if (offset as u64) + (buf_len as u64) > part_bytes {
+                    return DriverStep::complete(DriverStatus::InvalidParameter);
+                }
+                if (offset as u64) % block_size != 0 || (buf_len as u64) % block_size != 0 {
                     return DriverStep::complete(DriverStatus::InvalidParameter);
                 }
                 offset
@@ -423,6 +438,7 @@ pub async fn partmgr_pnp_query_devrels(
         let pext = ext::<PartDevExt>(&pdo);
         pext.start_lba.call_once(|| e.first_lba);
         pext.end_lba.call_once(|| e.last_lba);
+        pext.block_size.call_once(|| sec_sz_u32.max(1));
 
         let part_pi = PartitionInfo {
             disk: di,

@@ -92,7 +92,6 @@ impl RequestExt for Request {
         }
 
         Self {
-            id: random_number(),
             kind,
             data,
             completed: false,
@@ -109,7 +108,6 @@ impl RequestExt for Request {
     #[inline]
     fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
         Self {
-            id: random_number(),
             kind: RequestType::Pnp,
             data,
             completed: false,

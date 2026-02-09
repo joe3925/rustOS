@@ -171,7 +171,7 @@ impl IoVtable {
     }
 
     #[inline]
-    pub fn get_for(&self, r: &RequestType) -> Option<IoHandler> {
-        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i).cloned().flatten())
+    pub fn get_for(&self, r: &RequestType) -> Option<&IoHandler> {
+        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i)?.as_ref())
     }
 }

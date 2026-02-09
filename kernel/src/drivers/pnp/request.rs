@@ -51,15 +51,16 @@ impl PnpManager {
     }
 
     pub async fn send_request(&self, target: IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
-        {
+        let (kind, policy) = {
             let mut guard = req.write();
             guard.status = DriverStatus::ContinueStep;
             guard.completed = false;
             guard.waker = None;
-        }
+            (guard.kind, guard.traversal_policy)
+        };
 
         let dev = target.target_device.clone();
-        let status = self.call_device_handler(dev, req.clone()).await;
+        let status = self.call_device_handler(dev, req.clone(), kind, policy).await;
 
         if status == DriverStatus::PendingStep {
             return RequestCompletion { req }.await;
@@ -137,13 +138,10 @@ impl PnpManager {
         &self,
         mut dev: Arc<DeviceObject>,
         req_arc: Arc<RwLock<Request>>,
+        kind: RequestType,
+        policy: TraversalPolicy,
     ) -> DriverStatus {
         loop {
-            let (kind, policy) = {
-                let r = req_arc.read();
-                (r.kind, r.traversal_policy)
-            };
-
             if matches!(kind, RequestType::Dummy) {
                 req_arc.write().status = DriverStatus::Success;
                 return self.complete_request(&req_arc);
@@ -312,7 +310,6 @@ impl RequestExt for Request {
         }
 
         Self {
-            id: random_number(),
             kind,
             data,
             completed: false,
@@ -329,7 +326,6 @@ impl RequestExt for Request {
     #[inline]
     fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
         Self {
-            id: random_number(),
             kind: RequestType::Pnp,
             data,
             completed: false,

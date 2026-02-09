@@ -402,101 +402,27 @@ pub async fn disk_read(
     }
 
     let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
-    if aligned {
+    if !aligned {
         let mut p = parent.write();
-        let n = core::cmp::min(total, p.data_len());
-        if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
-            p.status = DriverStatus::Success;
-            return DriverStep::complete(DriverStatus::Success);
-        }
-
-        let ctx = Box::new(DiskReadCtx {
-            dev: dev.clone(),
-            offset: off,
-            len: total,
-        });
-        p.add_completion(disk_read_complete, Box::into_raw(ctx) as usize);
-        p.traversal_policy = TraversalPolicy::ForwardLower;
-        return DriverStep::Continue;
+        p.status = DriverStatus::InvalidParameter;
+        return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let end = match off.checked_add(total as u64) {
-        Some(v) => v,
-        None => return DriverStep::complete(DriverStatus::InvalidParameter),
-    };
-
-    let start_sector = off / bs;
-    let last_sector = (end - 1) / bs;
-
-    let mut out_off = 0usize;
-    {
-        let mut p = parent.write();
-        let out = &mut p.data_slice_mut()[..total];
-
-        let head_off = (off % bs) as usize;
-        let head_lba = start_sector * bs;
-        let first = match read_from_lower(&dev, head_lba, bs as usize).await {
-            Ok(b) => b,
-            Err(st) => {
-                p.status = st;
-                return DriverStep::complete(st);
-            }
-        };
-        cache_store_read(&dx, head_lba, &first);
-
-        if start_sector == last_sector {
-            out.copy_from_slice(&first[head_off..head_off + total]);
-            p.status = DriverStatus::Success;
-            return DriverStep::complete(DriverStatus::Success);
-        }
-
-        let head_take = core::cmp::min(total, (bs as usize).saturating_sub(head_off));
-        out[..head_take].copy_from_slice(&first[head_off..head_off + head_take]);
-        out_off += head_take;
-
-        let mid_start_sector = start_sector + 1;
-        let mid_end_sector = last_sector;
-
-        let mut cur_sector = mid_start_sector;
-        while cur_sector < mid_end_sector {
-            let remaining_sectors = (mid_end_sector - cur_sector) as usize;
-            let max_sectors = (MAX_CHUNK_BYTES / (bs as usize)).max(1);
-            let take_sectors = core::cmp::min(remaining_sectors, max_sectors);
-
-            let chunk_off = cur_sector * bs;
-            let chunk_len = take_sectors * (bs as usize);
-
-            let chunk = match read_from_lower(&dev, chunk_off, chunk_len).await {
-                Ok(b) => b,
-                Err(st) => {
-                    p.status = st;
-                    return DriverStep::complete(st);
-                }
-            };
-
-            out[out_off..out_off + chunk_len].copy_from_slice(&chunk[..chunk_len]);
-            cache_store_read(&dx, chunk_off, &chunk[..chunk_len]);
-
-            out_off += chunk_len;
-            cur_sector += take_sectors as u64;
-        }
-
-        let tail_len = total - out_off;
-        let tail_lba = last_sector * bs;
-        let last = match read_from_lower(&dev, tail_lba, bs as usize).await {
-            Ok(b) => b,
-            Err(st) => {
-                p.status = st;
-                return DriverStep::complete(st);
-            }
-        };
-        cache_store_read(&dx, tail_lba, &last);
-        out[out_off..].copy_from_slice(&last[..tail_len]);
-
+    let mut p = parent.write();
+    let n = core::cmp::min(total, p.data_len());
+    if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
         p.status = DriverStatus::Success;
+        return DriverStep::complete(DriverStatus::Success);
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    let ctx = Box::new(DiskReadCtx {
+        dev: dev.clone(),
+        offset: off,
+        len: total,
+    });
+    p.add_completion(disk_read_complete, Box::into_raw(ctx) as usize);
+    p.traversal_policy = TraversalPolicy::ForwardLower;
+    DriverStep::Continue
 }
 
 #[request_handler]
@@ -536,166 +462,21 @@ pub async fn disk_write(
     }
 
     let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
-    if aligned {
+    if !aligned {
         let mut p = parent.write();
-        let ctx = Box::new(DiskWriteCtx {
-            dev: dev.clone(),
-            offset: off,
-            len: total,
-        });
-        p.add_completion(disk_write_complete, Box::into_raw(ctx) as usize);
-        p.traversal_policy = TraversalPolicy::ForwardLower;
-        return DriverStep::Continue;
+        p.status = DriverStatus::InvalidParameter;
+        return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let _rmw = dx.rmw_lock.lock();
-
-    let end = match off.checked_add(total as u64) {
-        Some(v) => v,
-        None => return DriverStep::complete(DriverStatus::InvalidParameter),
-    };
-
-    let start_sector = off / bs;
-    let last_sector = (end - 1) / bs;
-
-    let head_off = (off % bs) as usize;
-    let tail_off = (end % bs) as usize;
-
-    let payload = {
-        let g = parent.read();
-        g.data_slice()[..total].to_vec()
-    };
-    let payload = &payload[..];
-
-    if start_sector == last_sector {
-        let lba = start_sector * bs;
-        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
-            Ok(b) => b,
-            Err(st) => {
-                let mut p = parent.write();
-                p.status = st;
-                return DriverStep::complete(st);
-            }
-        };
-
-        sec[head_off..head_off + total].copy_from_slice(payload);
-
-        let st = write_to_lower(&dev, lba, &sec).await;
-        {
-            let mut p = parent.write();
-            p.status = st;
-        }
-        if st == DriverStatus::Success {
-            cache_update_write(&dx, lba, &sec);
-        }
-        return DriverStep::complete(st);
-    }
-
-    let mut consumed = 0usize;
-
-    if head_off != 0 {
-        let lba = start_sector * bs;
-        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
-            Ok(b) => b,
-            Err(st) => {
-                let mut p = parent.write();
-                p.status = st;
-                return DriverStep::complete(st);
-            }
-        };
-
-        let take = core::cmp::min(total, (bs as usize).saturating_sub(head_off));
-        sec[head_off..head_off + take].copy_from_slice(&payload[..take]);
-
-        let st = write_to_lower(&dev, lba, &sec).await;
-        if st != DriverStatus::Success {
-            let mut p = parent.write();
-            p.status = st;
-            return DriverStep::complete(st);
-        }
-        cache_update_write(&dx, lba, &sec);
-
-        consumed += take;
-    }
-
-    let mut mid_sector = start_sector;
-    if head_off != 0 {
-        mid_sector = start_sector + 1;
-    }
-
-    let mut mid_end = last_sector;
-    if tail_off != 0 {
-        mid_end = last_sector;
-    } else {
-        mid_end = last_sector + 1;
-    }
-
-    let mut cur = mid_sector;
-    while cur < mid_end {
-        let remaining_bytes = total.saturating_sub(consumed);
-        if remaining_bytes < bs as usize {
-            break;
-        }
-
-        let remaining_sectors = (mid_end - cur) as usize;
-        let max_sectors = (MAX_CHUNK_BYTES / (bs as usize)).max(1);
-        let mut take_sectors = core::cmp::min(remaining_sectors, max_sectors);
-
-        let max_bytes = take_sectors * (bs as usize);
-        let avail = total - consumed;
-        if max_bytes > avail {
-            take_sectors = (avail / (bs as usize)).max(1);
-        }
-
-        let bytes = take_sectors * (bs as usize);
-        if bytes == 0 {
-            break;
-        }
-
-        let lba = cur * bs;
-        let st = write_to_lower(&dev, lba, &payload[consumed..consumed + bytes]).await;
-        if st != DriverStatus::Success {
-            let mut p = parent.write();
-            p.status = st;
-            return DriverStep::complete(st);
-        }
-
-        cache_update_write(&dx, lba, &payload[consumed..consumed + bytes]);
-
-        consumed += bytes;
-        cur += take_sectors as u64;
-    }
-
-    if tail_off != 0 {
-        let lba = last_sector * bs;
-        let mut sec = match read_from_lower(&dev, lba, bs as usize).await {
-            Ok(b) => b,
-            Err(st) => {
-                let mut p = parent.write();
-                p.status = st;
-                return DriverStep::complete(st);
-            }
-        };
-
-        let tail_len = total - consumed;
-        sec[..tail_len].copy_from_slice(&payload[consumed..consumed + tail_len]);
-
-        let st = write_to_lower(&dev, lba, &sec).await;
-        {
-            let mut p = parent.write();
-            p.status = st;
-        }
-        if st == DriverStatus::Success {
-            cache_update_write(&dx, lba, &sec);
-        }
-        return DriverStep::complete(st);
-    }
-
-    {
-        let mut p = parent.write();
-        p.status = DriverStatus::Success;
-    }
-    DriverStep::complete(DriverStatus::Success)
+    let mut p = parent.write();
+    let ctx = Box::new(DiskWriteCtx {
+        dev: dev.clone(),
+        offset: off,
+        len: total,
+    });
+    p.add_completion(disk_write_complete, Box::into_raw(ctx) as usize);
+    p.traversal_policy = TraversalPolicy::ForwardLower;
+    DriverStep::Continue
 }
 
 #[request_handler]
