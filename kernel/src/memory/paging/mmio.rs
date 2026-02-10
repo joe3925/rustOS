@@ -54,6 +54,7 @@ pub extern "win64" fn map_mmio_region(
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
 }
 pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
+    // todo: big slow down maybe fixable
     let _lock = MMIO_MAP_LOCK.lock();
 
     if size == 0 {

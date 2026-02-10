@@ -6,7 +6,7 @@ use kernel_api::{
     RequestExt,
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
-    request::{Request, RequestHandle, RequestType, SharedRequest, TraversalPolicy},
+    request::{Request, RequestHandle, RequestType, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
@@ -21,8 +21,6 @@ pub struct BlockDev {
     pos: u64,
     /// Small buffer only for unaligned partial-sector reads/writes
     sector_buf: Vec<u8>,
-    read_req: SharedRequest,
-    write_req: SharedRequest,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -44,20 +42,12 @@ impl IoBase for BlockDev {
 
 impl BlockDev {
     pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
-        let mut r = Request::new(RequestType::Dummy, RequestData::empty());
-        r.traversal_policy = TraversalPolicy::ForwardLower;
-
-        let mut w = Request::new(RequestType::Dummy, RequestData::empty());
-        w.traversal_policy = TraversalPolicy::ForwardLower;
-
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
             sector_buf: vec![0u8; sector_size as usize],
-            read_req: SharedRequest::new(r),
-            write_req: SharedRequest::new(w),
         }
     }
 
@@ -94,19 +84,17 @@ impl BlockDev {
     /// Read into a buffer (allocates internal buffer, copies result)
     async fn pnp_read_into(
         volume: &IoTarget,
-        read_req: &SharedRequest,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
-        {
-            let mut g = read_req.write();
-            g.kind = RequestType::Read { offset, len };
-            // Allocate owned buffer for the request
-            g.data = RequestData::from_boxed_bytes(alloc::vec![0u8; len].into_boxed_slice());
-        }
+        let mut req = Request::new(
+            RequestType::Read { offset, len },
+            RequestData::from_boxed_bytes(alloc::vec![0u8; len].into_boxed_slice()),
+        );
+        req.traversal_policy = TraversalPolicy::ForwardLower;
 
-        let (handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(read_req.clone())).await;
+        let (handle, st) = pnp_send_request(volume.clone(), RequestHandle::Stack(&mut req)).await;
 
         if st == DriverStatus::Success {
             let g = handle.read();
@@ -123,23 +111,21 @@ impl BlockDev {
     /// Write from a buffer (copies data into request)
     async fn pnp_write_from(
         volume: &IoTarget,
-        write_req: &SharedRequest,
         offset: u64,
         buf: &[u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
-        {
-            let mut g = write_req.write();
-            g.kind = RequestType::Write {
+        let mut req = Request::new(
+            RequestType::Write {
                 offset,
                 len,
                 flush_write_through: false,
-            };
-            // Copy data into owned storage
-            g.data = RequestData::from_boxed_bytes(buf.to_vec().into_boxed_slice());
-        }
+            },
+            RequestData::from_boxed_bytes(buf.to_vec().into_boxed_slice()),
+        );
+        req.traversal_policy = TraversalPolicy::ForwardLower;
 
-        let (_, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(write_req.clone())).await;
+        let (_, st) = pnp_send_request(volume.clone(), RequestHandle::Stack(&mut req)).await;
 
         if st == DriverStatus::Success {
             Ok(())
@@ -167,14 +153,9 @@ impl BlockDev {
             // Unaligned or partial sector read - must use sector buffer
             if in_off != 0 || remaining < bps {
                 let sector_off = lba * bps as u64;
-                Self::pnp_read_into(
-                    &self.volume,
-                    &self.read_req,
-                    sector_off,
-                    &mut self.sector_buf[..bps],
-                )
-                .await
-                .map_err(BlkError::from)?;
+                Self::pnp_read_into(&self.volume, sector_off, &mut self.sector_buf[..bps])
+                    .await
+                    .map_err(BlkError::from)?;
                 let take = min(remaining, room);
                 dst[out_off..out_off + take]
                     .copy_from_slice(&self.sector_buf[in_off..in_off + take]);
@@ -193,7 +174,6 @@ impl BlockDev {
             let byte_off = lba * bps as u64;
             Self::pnp_read_into(
                 &self.volume,
-                &self.read_req,
                 byte_off,
                 &mut dst[out_off..out_off + chunk_bytes],
             )
@@ -229,14 +209,9 @@ impl BlockDev {
                 let sector_off = lba * bps as u64;
 
                 // Read existing sector
-                Self::pnp_read_into(
-                    &self.volume,
-                    &self.read_req,
-                    sector_off,
-                    &mut self.sector_buf[..bps],
-                )
-                .await
-                .map_err(BlkError::from)?;
+                Self::pnp_read_into(&self.volume, sector_off, &mut self.sector_buf[..bps])
+                    .await
+                    .map_err(BlkError::from)?;
 
                 // Modify
                 let take = min(remaining, room);
@@ -244,14 +219,9 @@ impl BlockDev {
                     .copy_from_slice(&src[in_off_src..in_off_src + take]);
 
                 // Write back
-                Self::pnp_write_from(
-                    &self.volume,
-                    &self.write_req,
-                    sector_off,
-                    &self.sector_buf[..bps],
-                )
-                .await
-                .map_err(BlkError::from)?;
+                Self::pnp_write_from(&self.volume, sector_off, &self.sector_buf[..bps])
+                    .await
+                    .map_err(BlkError::from)?;
 
                 self.pos += take as u64;
                 in_off_src += take;
@@ -269,7 +239,6 @@ impl BlockDev {
 
             Self::pnp_write_from(
                 &self.volume,
-                &self.write_req,
                 byte_off,
                 &src[in_off_src..in_off_src + chunk_bytes],
             )
