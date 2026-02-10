@@ -17,6 +17,7 @@ use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::map_mmio_region;
 use kernel_api::memory::unmap_mmio_region;
+use kernel_api::pnp::DriverStep;
 use kernel_api::pnp::PnpMinorFunction;
 use kernel_api::pnp::PnpVtable;
 use kernel_api::pnp::QueryIdType;
@@ -943,8 +944,8 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 #[request_handler]
 pub async fn acpi_pdo_query_resources<'a>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &mut RequestHandle<'a>,
+) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ctx_lock = &pext.ctx;
@@ -969,14 +970,14 @@ pub async fn acpi_pdo_query_resources<'a>(
         w.status = DriverStatus::Success;
     }
 
-    req.complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
 pub async fn acpi_pdo_query_id<'a>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &mut RequestHandle<'a>,
+) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
@@ -1019,13 +1020,13 @@ pub async fn acpi_pdo_query_id<'a>(
         w.status = status;
     }
 
-    req.complete(status)
+    DriverStep::complete(status)
 }
 
 #[request_handler]
 pub async fn acpi_pdo_start<'a>(
     _dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    req.complete(DriverStatus::Success)
+    _req: &mut RequestHandle<'a>,
+) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }

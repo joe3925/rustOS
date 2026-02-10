@@ -829,23 +829,21 @@ impl<'a> RequestHandle<'a> {
         }
     }
 
-    /// Promote stack request to shared ownership.
-    /// Stack: moves content into SharedRequest, leaves empty sentinel.
-    /// Shared: returns self unchanged.
-    pub fn promote(self) -> RequestHandle<'static> {
-        match self {
-            RequestHandle::Stack(req_ref) => {
-                let request = core::mem::replace(req_ref, Request::empty());
-                RequestHandle::Shared(SharedRequest::new(request))
-            }
-            RequestHandle::Shared(shared) => RequestHandle::Shared(shared),
+    /// Promote stack request to shared (heap) ownership.
+    /// Stack: copies content into a new SharedRequest, leaves empty sentinel in original.
+    /// Shared: no-op, already on heap.
+    pub fn promote(&mut self) {
+        if let RequestHandle::Stack(req_ref) = self {
+            let request = core::mem::replace(*req_ref, Request::empty());
+            *self = RequestHandle::Shared(SharedRequest::new(request));
         }
     }
 
     /// Convert to SharedRequest. Promotes if needed.
     #[inline]
-    pub fn into_shared(self) -> SharedRequest {
-        match self.promote() {
+    pub fn into_shared(mut self) -> SharedRequest {
+        self.promote();
+        match self {
             RequestHandle::Shared(s) => s,
             _ => unreachable!(),
         }
@@ -859,29 +857,9 @@ impl<'a> RequestHandle<'a> {
             _ => None,
         }
     }
-
-    /// Consume handle and return Complete result.
-    #[inline]
-    pub fn complete(self, status: DriverStatus) -> RequestHandleResult<'a> {
-        RequestHandleResult {
-            step: DriverStep::Complete { status },
-            handle: self,
-        }
-    }
-
-    /// Consume handle and return Continue result.
-    #[inline]
-    pub fn cont(self) -> RequestHandleResult<'a> {
-        RequestHandleResult {
-            step: DriverStep::Continue,
-            handle: self,
-        }
-    }
 }
 
 impl RequestHandle<'static> {
-    /// Consume 'static handle and return Pending result.
-    /// COMPILE-TIME SAFETY: Only 'static handles (from promote()) can call this.
     #[inline]
     pub fn pending(self) -> RequestHandleResult<'static> {
         RequestHandleResult {

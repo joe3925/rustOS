@@ -33,37 +33,21 @@ pub type EvtDriverDeviceAdd = extern "win64" fn(
 pub type EvtDriverUnload =
     extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = extern "win64" fn(
-    Arc<DeviceObject>,
-    RequestHandle<'_>,
-    usize,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
-pub type EvtIoWrite = extern "win64" fn(
-    Arc<DeviceObject>,
-    RequestHandle<'_>,
-    usize,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
-pub type EvtIoDeviceControl = extern "win64" fn(
-    Arc<DeviceObject>,
-    RequestHandle<'_>,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
-pub type EvtIoFs = extern "win64" fn(
-    Arc<DeviceObject>,
-    RequestHandle<'_>,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
-
-pub type EvtDevicePrepareHardware = extern "win64" fn(Arc<DeviceObject>) -> FfiFuture<DriverStep>;
-pub type EvtDeviceEnumerateDevices = extern "win64" fn(
-    Arc<DeviceObject>,
-    RequestHandle<'_>,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
+pub type EvtIoRead =
+    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>, usize) -> FfiFuture<DriverStep>;
+pub type EvtIoWrite =
+    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>, usize) -> FfiFuture<DriverStep>;
+pub type EvtIoDeviceControl =
+    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>) -> FfiFuture<DriverStep>;
+pub type EvtIoFs =
+    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine =
     extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
-pub type PnpMinorCallback = extern "win64" fn(
+pub type PnpMinorCallback = for<'a> extern "win64" fn(
     Arc<DeviceObject>,
-    RequestHandle<'_>,
-) -> BorrowingFfiFuture<'_, RequestHandleResult<'_>>;
+    &'a mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, DriverStep>;
 
 pub type DpcFn = extern "win64" fn(usize);

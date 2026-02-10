@@ -746,8 +746,7 @@ impl PnpManager {
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.add_completion(Self::start_io, ctx);
 
-            let (_status, _handle) = self
-                .send_request(top_device, RequestHandle::Stack(&mut start_request))
+            self.send_request(top_device, &mut RequestHandle::Stack(&mut start_request))
                 .await;
         } else {
             dn.set_state(DevNodeState::Faulted);
@@ -785,7 +784,7 @@ impl PnpManager {
 
                 spawn_detached(async move {
                     let _ = (&*PNP_MANAGER)
-                        .send_request(top_device, RequestHandle::Shared(shared))
+                        .send_request(top_device, &mut RequestHandle::Shared(shared))
                         .await;
                 });
             }
@@ -906,7 +905,9 @@ impl PnpManager {
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.add_completion(Self::process_enumerated_children, ctx);
 
-        let (status, _handle) = self.send_request(top, RequestHandle::Stack(&mut req)).await;
+        let status = self
+            .send_request(top, &mut RequestHandle::Stack(&mut req))
+            .await;
         status
     }
 
@@ -958,22 +959,22 @@ impl PnpManager {
     pub async fn send_request_via_symlink<'a>(
         &self,
         link_path: String,
-        handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStatus {
         match self.resolve_targetio_from_symlink(link_path) {
             Some(tgt) => self.send_request(tgt, handle).await,
-            None => (DriverStatus::NoSuchDevice, handle),
+            None => DriverStatus::NoSuchDevice,
         }
     }
 
     pub async fn send_request_to_stack_top<'a>(
         &self,
         dev_node_weak: alloc::sync::Weak<DevNode>,
-        handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStatus {
         let dev_node = match dev_node_weak.upgrade() {
             Some(dn) => dn,
-            None => return (DriverStatus::NoSuchDevice, handle),
+            None => return DriverStatus::NoSuchDevice,
         };
 
         let target_device_opt = dev_node
@@ -986,7 +987,7 @@ impl PnpManager {
         if let Some(target_device) = target_device_opt {
             self.send_request(target_device, handle).await
         } else {
-            (DriverStatus::NoSuchDevice, handle)
+            DriverStatus::NoSuchDevice
         }
     }
 
@@ -994,8 +995,8 @@ impl PnpManager {
         &self,
         link_path: String,
         _control_code: u32,
-        handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStatus {
         self.send_request_via_symlink(link_path, handle).await
     }
 
@@ -1276,8 +1277,7 @@ impl PnpManager {
         let ctx = Arc::into_raw(dn.clone()) as usize;
         start_request.add_completion(Self::start_io, ctx);
 
-        let (_status, _handle) = self
-            .send_request(top.clone(), RequestHandle::Stack(&mut start_request))
+        self.send_request(top.clone(), &mut RequestHandle::Stack(&mut start_request))
             .await;
 
         dn.set_state(DevNodeState::Started);

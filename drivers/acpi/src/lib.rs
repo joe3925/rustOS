@@ -60,8 +60,8 @@ pub extern "win64" fn bus_driver_device_add(
 #[request_handler]
 pub async fn bus_driver_prepare_hardware<'a>(
     device: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &mut RequestHandle<'a>,
+) -> DriverStep {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
 
@@ -119,13 +119,13 @@ pub async fn bus_driver_prepare_hardware<'a>(
     .await;
 
     let Ok(aml_ctx) = parsed else {
-        return req.cont();
+        return DriverStep::Continue;
     };
 
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
-    req.cont()
+    DriverStep::Continue
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -148,8 +148,8 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 #[request_handler]
 pub async fn enumerate_bus<'a>(
     device: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &mut RequestHandle<'a>,
+) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = device
@@ -188,7 +188,7 @@ pub async fn enumerate_bus<'a>(
     }
     create_synthetic_i8042_pdo(&parent_dev_node);
 
-    req.complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
 fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let ids = DeviceIds {

@@ -1,6 +1,6 @@
+use crate::PnpMinorCallback;
 use crate::request::RequestData;
 use crate::status::DriverStatus;
-use crate::PnpMinorCallback;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -117,7 +117,11 @@ impl PnpRequest {
     pub fn print_meta(&self) -> alloc::string::String {
         alloc::format!(
             "PnpRequest {{ minor_function: {:?}, relation: {:?}, id_type: {:?}, ids_out: {:?}, data_out: {} }}",
-            self.minor_function, self.relation, self.id_type, self.ids_out, self.data_out.print_meta()
+            self.minor_function,
+            self.relation,
+            self.id_type,
+            self.ids_out,
+            self.data_out.print_meta()
         )
     }
 }

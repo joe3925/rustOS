@@ -23,7 +23,7 @@ use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
-use kernel_types::request::{RequestHandle, RequestHandleResult};
+use kernel_types::request::RequestHandle;
 use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
@@ -145,20 +145,20 @@ unsafe extern "win64" {
 
     pub fn pnp_forward_request_to_next_lower<'a>(
         from: Arc<DeviceObject>,
-        req: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        req: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
     pub fn pnp_forward_request_to_next_upper<'a>(
         from: Arc<DeviceObject>,
-        req: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        req: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
     pub fn pnp_send_request<'a>(
         target: IoTarget,
-        req: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        req: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
-    pub fn pnp_complete_request<'a>(req: RequestHandle<'a>) -> RequestHandleResult<'a>;
+    pub fn pnp_complete_request<'a>(req: &'a mut RequestHandle<'a>) -> DriverStatus;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
@@ -167,14 +167,14 @@ unsafe extern "win64" {
 
     pub fn pnp_send_request_via_symlink<'a>(
         link_path: String,
-        req: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        req: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
     pub fn pnp_ioctl_via_symlink<'a>(
         link_path: String,
         control_code: u32,
-        request: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        request: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
@@ -205,8 +205,8 @@ unsafe extern "win64" {
 
     pub fn pnp_send_request_to_stack_top<'a>(
         dev_node_weak: Weak<DevNode>,
-        req: RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
+        req: &'a mut RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, DriverStatus>;
 
     pub fn InvalidateDeviceRelations(
         device: Arc<DeviceObject>,

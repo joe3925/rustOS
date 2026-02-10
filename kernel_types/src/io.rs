@@ -1,4 +1,5 @@
 use crate::device::DeviceObject;
+use crate::pnp::DriverStep;
 use crate::request::{RequestHandle, RequestHandleResult, RequestType};
 use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
@@ -93,8 +94,8 @@ impl IoType {
     pub async fn invoke<'a>(
         &self,
         dev: Arc<DeviceObject>,
-        handle: RequestHandle<'a>,
-    ) -> RequestHandleResult<'a> {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStep {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
                 let len = handle.read().data.len();

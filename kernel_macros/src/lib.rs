@@ -23,8 +23,18 @@ pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     transform_function(&mut func).into()
 }
 
-/// Check if a type looks like RequestHandle (with optional lifetime)
-fn type_is_request_handle(ty: &Type) -> bool {
+/// Check if a type is `&mut RequestHandle`
+fn type_is_mut_ref_request_handle(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => r.mutability.is_some() && type_is_request_handle_path(&r.elem),
+        Type::Paren(p) => type_is_mut_ref_request_handle(&p.elem),
+        Type::Group(g) => type_is_mut_ref_request_handle(&g.elem),
+        _ => false,
+    }
+}
+
+/// Check if a type path is RequestHandle
+fn type_is_request_handle_path(ty: &Type) -> bool {
     match ty {
         Type::Path(p) => p
             .path
@@ -32,8 +42,8 @@ fn type_is_request_handle(ty: &Type) -> bool {
             .last()
             .map(|s| s.ident == "RequestHandle")
             .unwrap_or(false),
-        Type::Paren(p) => type_is_request_handle(&p.elem),
-        Type::Group(g) => type_is_request_handle(&g.elem),
+        Type::Paren(p) => type_is_request_handle_path(&p.elem),
+        Type::Group(g) => type_is_request_handle_path(&g.elem),
         _ => false,
     }
 }
@@ -46,7 +56,7 @@ fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
             continue;
         };
 
-        if type_is_request_handle(&pat_ty.ty) {
+        if type_is_mut_ref_request_handle(&pat_ty.ty) {
             return Some(pat_ident.ident.clone());
         }
     }
@@ -77,12 +87,12 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ));
     }
 
-    // Check that there's at least one RequestHandle parameter
+    // Check that there's at least one &mut RequestHandle parameter
     let has_request_handle = find_request_handle_param(sig).is_some();
     if !has_request_handle {
         return Err(syn::Error::new_spanned(
             sig,
-            "#[request_handler] requires a RequestHandle parameter",
+            "#[request_handler] requires a &mut RequestHandle parameter",
         ));
     }
 
@@ -95,13 +105,19 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
                 ));
             }
             FnArg::Typed(pat_ty) => {
-                // Allow RequestHandle (which contains a reference internally)
-                if type_is_request_handle(&pat_ty.ty) {
-                    // RequestHandle is allowed
+                // Allow &mut RequestHandle
+                if type_is_mut_ref_request_handle(&pat_ty.ty) {
                     continue;
                 }
 
+                // Disallow reference types (including non-mut RequestHandle)
                 if let Type::Reference(ty_ref) = &*pat_ty.ty {
+                    if type_is_request_handle_path(&ty_ref.elem) {
+                        return Err(syn::Error::new_spanned(
+                            ty_ref,
+                            "#[request_handler] RequestHandle must be passed as &mut RequestHandle",
+                        ));
+                    }
                     return Err(syn::Error::new_spanned(
                         ty_ref,
                         "#[request_handler] handler parameters must be owned types (no references); use Arc<T> etc. instead",
@@ -122,15 +138,15 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 sig,
-                "#[request_handler] function must return RequestHandleResult",
+                "#[request_handler] function must return DriverStep",
             ));
         }
         ReturnType::Type(_, ty) => {
             let type_str = quote::quote!(#ty).to_string();
-            if !type_str.contains("RequestHandleResult") {
+            if !type_str.contains("DriverStep") {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[request_handler] function must return RequestHandleResult",
+                    "#[request_handler] function must return DriverStep",
                 ));
             }
         }
@@ -152,18 +168,9 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
 
-    // Add lifetime 'a to the function if not already present
-    // and update the return type to BorrowingFfiFuture<'a, RequestHandleResult<'a>>
-    let has_lifetime_a = sig.generics.lifetimes().any(|lt| lt.lifetime.ident == "a");
-    if !has_lifetime_a {
-        sig.generics
-            .params
-            .insert(0, syn::parse_quote!('a));
-    }
-
-    // Set the return type to BorrowingFfiFuture<'a, RequestHandleResult<'a>>
+    // Set the return type to FfiFuture<DriverStep>
     sig.output = syn::parse_quote!(
-        -> ::kernel_api::async_ffi::BorrowingFfiFuture<'a, ::kernel_api::request::RequestHandleResult<'a>>
+        -> ::kernel_api::async_ffi::FfiFuture<::kernel_api::pnp::DriverStep>
     );
 
     let original_stmts = &body.stmts;

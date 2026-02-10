@@ -51,8 +51,8 @@ impl PnpManager {
     pub async fn send_request<'a>(
         &self,
         target: IoTarget,
-        mut handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> (DriverStatus) {
         {
             let mut guard = handle.write();
             guard.status = DriverStatus::ContinueStep;
@@ -68,30 +68,30 @@ impl PnpManager {
         let dev = target.clone();
         let result = self.call_device_handler(dev, handle, kind, policy).await;
 
-        match result.step {
+        match result {
             DriverStep::Pending => {
                 // Handler returned Pending with promoted handle
-                let shared = match &result.handle {
+                let shared = match &handle {
                     RequestHandle::Shared(s) => s.clone(),
                     _ => panic!("Pending returned without promoted handle"),
                 };
                 let status = RequestCompletionHandle::new(shared).await;
-                (status, result.handle)
+                status
             }
-            DriverStep::Complete { status } => (status, result.handle),
+            DriverStep::Complete { status } => status,
             DriverStep::Continue => {
-                let status = result.handle.read().status;
-                (status, result.handle)
+                let status = handle.read().status;
+                status
             }
         }
     }
     pub async fn send_request_to_next_lower<'a>(
         &self,
         from: Arc<DeviceObject>,
-        handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStatus {
         let Some(target_dev) = from.lower_device.get() else {
-            return (DriverStatus::NoSuchDevice, handle);
+            return DriverStatus::NoSuchDevice;
         };
 
         self.send_request(target_dev.clone(), handle).await
@@ -100,27 +100,25 @@ impl PnpManager {
     pub async fn send_request_to_next_upper<'a>(
         &self,
         from: Arc<DeviceObject>,
-        handle: RequestHandle<'a>,
-    ) -> (DriverStatus, RequestHandle<'a>) {
+        handle: &mut RequestHandle<'a>,
+    ) -> DriverStatus {
         let Some(target_dev) = from.upper_device.get() else {
-            return (DriverStatus::NoSuchDevice, handle);
+            return DriverStatus::NoSuchDevice;
         };
 
         let Some(up) = target_dev.upgrade() else {
-            return (DriverStatus::NoSuchDevice, handle);
+            return DriverStatus::NoSuchDevice;
         };
 
         self.send_request(up, handle).await
     }
     /// Complete a request. Does NOT promote - returns handle with same lifetime.
-    pub fn complete_request<'a>(&self, mut handle: RequestHandle<'a>) -> RequestHandleResult<'a> {
+    pub fn complete_request<'a>(&self, handle: &mut RequestHandle<'a>) -> DriverStatus {
         let (status, waker) = {
             let mut guard = handle.write();
 
             if guard.completed {
-                let s = guard.status;
-                drop(guard);
-                return handle.complete(s);
+                return guard.status;
             }
 
             if let Some(fp) = guard.completion_routine.take() {
@@ -141,49 +139,43 @@ impl PnpManager {
             w.wake();
         }
 
-        handle.complete(status)
+        status
     }
 
     async fn call_device_handler<'a>(
         &self,
         mut dev: Arc<DeviceObject>,
-        mut handle: RequestHandle<'a>,
+        mut handle: &mut RequestHandle<'a>,
         kind: RequestType,
         policy: TraversalPolicy,
-    ) -> RequestHandleResult<'a> {
+    ) -> DriverStep {
         loop {
             if matches!(kind, RequestType::Dummy) {
                 handle.write().status = DriverStatus::Success;
-                return self.complete_request(handle);
+                return DriverStep::complete(self.complete_request(handle));
             }
 
             if matches!(kind, RequestType::Pnp) {
-                let result = Self::pnp_minor_dispatch(&dev, handle).await;
-                handle = result.handle;
-
-                match result.step {
+                let step = Self::pnp_minor_dispatch(&dev, handle).await;
+                match step {
                     DriverStep::Pending => {
-                        handle.write().status = DriverStatus::PendingStep;
-                        return RequestHandleResult {
-                            step: DriverStep::Pending,
-                            handle,
-                        };
+                        // This case can't happen
                     }
                     DriverStep::Complete { status } => {
                         handle.write().status = status;
-                        return self.complete_request(handle);
+                        return DriverStep::complete(self.complete_request(handle));
                     }
                     DriverStep::Continue => {
                         if policy != TraversalPolicy::ForwardLower {
                             handle.write().status = DriverStatus::InvalidParameter;
-                            return self.complete_request(handle);
+                            return DriverStep::complete(self.complete_request(handle));
                         }
 
                         let next = match dev.lower_device.get() {
                             Some(n) => n.clone(),
                             None => {
                                 handle.write().status = DriverStatus::Success;
-                                return self.complete_request(handle);
+                                return DriverStep::complete(self.complete_request(handle));
                             }
                         };
                         dev = next;
@@ -192,7 +184,7 @@ impl PnpManager {
                 }
             }
 
-            let result = if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
+            let step = if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
                 let result = h.handler.invoke(dev.clone(), handle).await;
 
                 match h.synchronization {
@@ -204,22 +196,17 @@ impl PnpManager {
 
                 result
             } else {
-                handle.cont()
+                DriverStep::Continue
             };
 
-            handle = result.handle;
-
-            match result.step {
+            match step {
                 DriverStep::Pending => {
                     handle.write().status = DriverStatus::PendingStep;
-                    return RequestHandleResult {
-                        step: DriverStep::Pending,
-                        handle,
-                    };
+                    return DriverStep::Pending;
                 }
                 DriverStep::Complete { status } => {
                     handle.write().status = status;
-                    return self.complete_request(handle);
+                    return DriverStep::complete(self.complete_request(handle));
                 }
                 DriverStep::Continue => {
                     let next = match policy {
@@ -241,7 +228,7 @@ impl PnpManager {
                         }
                         Err(_) => {
                             handle.write().status = DriverStatus::NotImplemented;
-                            return self.complete_request(handle);
+                            return DriverStep::complete(self.complete_request(handle));
                         }
                     }
                 }
@@ -251,19 +238,19 @@ impl PnpManager {
 
     async fn pnp_minor_dispatch<'a>(
         device: &Arc<DeviceObject>,
-        handle: RequestHandle<'a>,
-    ) -> RequestHandleResult<'a> {
+        handle: &'a mut RequestHandle<'a>,
+    ) -> DriverStep {
         let (minor_opt, policy) = {
             let r = handle.read();
             (r.pnp.as_ref().map(|p| p.minor_function), r.traversal_policy)
         };
 
         let Some(minor) = minor_opt else {
-            return handle.complete(DriverStatus::InvalidParameter);
+            return DriverStep::complete(DriverStatus::InvalidParameter);
         };
 
         if policy != TraversalPolicy::ForwardLower {
-            return handle.complete(DriverStatus::InvalidParameter);
+            return DriverStep::complete(DriverStatus::InvalidParameter);
         }
 
         if let Some(cb) = device
@@ -272,21 +259,23 @@ impl PnpManager {
             .as_ref()
             .and_then(|vt| vt.get(minor))
         {
-            let mut result = cb(device.clone(), handle).await;
+            let mut step = cb(device.clone(), handle).await;
             if matches!(
-                result.step,
+                step,
                 DriverStep::Complete {
                     status: DriverStatus::NotImplemented
                 }
             ) {
-                result.step = DriverStep::Complete {
+                step = DriverStep::Complete {
                     status: minor.default_status_for_unhandled(),
                 };
+            } else if matches!(step, DriverStep::Pending) {
+                panic!("PNP request handlers can not return pending")
             }
-            return result;
+            return step;
         }
 
-        handle.cont()
+        DriverStep::Continue
     }
 }
 

@@ -295,9 +295,9 @@ pub async fn vol_pdo_read<'a>(
 #[request_handler]
 pub async fn vol_pdo_write<'a>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
+    req: &mut RequestHandle<'a>,
     _buf_len: usize,
-) -> RequestHandleResult<'a> {
+) -> DriverStep {
     let parsed = {
         let r = req.read();
         match r.kind {
@@ -317,16 +317,16 @@ pub async fn vol_pdo_write<'a>(
     };
     let (offset, len, flush_write_through, policy) = match parsed {
         Ok(v) => v,
-        Err(st) => return req.complete(st),
+        Err(st) => return DriverStep::complete(st),
     };
     if len == 0 {
-        return req.complete(DriverStatus::Success);
+        return DriverStep::complete(DriverStatus::Success);
     }
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match binding.backing.get() {
         Some(t) => t,
-        None => return req.complete(DriverStatus::NoSuchDevice),
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
     // Copy data to forward request
@@ -353,8 +353,8 @@ pub async fn vol_pdo_write<'a>(
 #[request_handler]
 async fn vol_pdo_query_resources<'a>(
     pdo: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &mut RequestHandle<'a>,
+) -> DriverStep {
     let status = {
         let mut w = req.write();
         if let Some(pnp) = w.pnp.as_mut() {
