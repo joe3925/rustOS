@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
+use kernel_api::runtime::spawn_blocking;
 
 use fatfs::{
     Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
@@ -723,11 +724,24 @@ pub async fn fs_op_dispatch<'a>(
     };
     let mut fs_guard = fs_arc.lock_owned().await;
 
-    let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
-        handle_seek_request(&dev, &mut req, &mut fs_guard)
+    let status: DriverStatus;
+
+    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+        status = handle_seek_request(&dev, &mut req, &mut fs_guard);
     } else {
-        handle_fs_request(&dev, &mut req, &mut fs_guard)
-    };
+        let shared = req.into_shared();
+        let shared_for_blocking = shared.clone();
+        let dev_for_blocking = dev.clone();
+        let mut fs_guard_for_blocking = fs_guard;
+
+        status = spawn_blocking(move || {
+            let mut h = RequestHandle::Shared(shared_for_blocking);
+            handle_fs_request(&dev_for_blocking, &mut h, &mut fs_guard_for_blocking)
+        })
+        .await;
+
+        req = RequestHandle::Shared(shared);
+    }
 
     req.complete(status)
 }

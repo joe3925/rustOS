@@ -379,11 +379,7 @@ impl RequestData {
 
                 let mut vec = Vec::with_capacity(self.size);
                 unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.heap_ptr,
-                        vec.as_mut_ptr(),
-                        self.size,
-                    );
+                    core::ptr::copy_nonoverlapping(self.heap_ptr, vec.as_mut_ptr(), self.size);
                     vec.set_len(self.size);
 
                     // Run typed dropper
