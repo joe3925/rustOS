@@ -944,7 +944,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 #[request_handler]
 pub async fn acpi_pdo_query_resources<'a>(
     dev: Arc<DeviceObject>,
-    req: &mut RequestHandle<'a>,
+    req: &'a mut RequestHandle<'a>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -976,7 +976,7 @@ pub async fn acpi_pdo_query_resources<'a>(
 #[request_handler]
 pub async fn acpi_pdo_query_id<'a>(
     dev: Arc<DeviceObject>,
-    req: &mut RequestHandle<'a>,
+    req: &'a mut RequestHandle<'a>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -1026,7 +1026,7 @@ pub async fn acpi_pdo_query_id<'a>(
 #[request_handler]
 pub async fn acpi_pdo_start<'a>(
     _dev: Arc<DeviceObject>,
-    _req: &mut RequestHandle<'a>,
+    _req: &'a mut RequestHandle<'a>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

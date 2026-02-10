@@ -33,14 +33,24 @@ pub type EvtDriverDeviceAdd = extern "win64" fn(
 pub type EvtDriverUnload =
     extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead =
-    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>, usize) -> FfiFuture<DriverStep>;
-pub type EvtIoWrite =
-    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>, usize) -> FfiFuture<DriverStep>;
-pub type EvtIoDeviceControl =
-    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>) -> FfiFuture<DriverStep>;
-pub type EvtIoFs =
-    extern "win64" fn(Arc<DeviceObject>, &mut RequestHandle<'_>) -> FfiFuture<DriverStep>;
+pub type EvtIoRead = for<'a> extern "win64" fn(
+    Arc<DeviceObject>,
+    &'a mut RequestHandle<'a>,
+    usize,
+) -> BorrowingFfiFuture<'a, DriverStep>;
+pub type EvtIoWrite = for<'a> extern "win64" fn(
+    Arc<DeviceObject>,
+    &'a mut RequestHandle<'a>,
+    usize,
+) -> BorrowingFfiFuture<'a, DriverStep>;
+pub type EvtIoDeviceControl = for<'a> extern "win64" fn(
+    Arc<DeviceObject>,
+    &'a mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, DriverStep>;
+pub type EvtIoFs = for<'a> extern "win64" fn(
+    Arc<DeviceObject>,
+    &'a mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine =

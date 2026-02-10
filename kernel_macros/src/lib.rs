@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{quote, quote_spanned};
-use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{parse_macro_input, FnArg, ItemFn, Lifetime, Pat, ReturnType, Type};
 
 #[proc_macro_attribute]
 pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -58,6 +58,42 @@ fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
 
         if type_is_mut_ref_request_handle(&pat_ty.ty) {
             return Some(pat_ident.ident.clone());
+        }
+    }
+    None
+}
+
+/// Extract the lifetime used on `RequestHandle<'a>` if present.
+fn extract_request_handle_lifetime(ty: &Type) -> Option<Lifetime> {
+    match ty {
+        Type::Reference(r) => extract_request_handle_lifetime(&r.elem),
+        Type::Paren(p) => extract_request_handle_lifetime(&p.elem),
+        Type::Group(g) => extract_request_handle_lifetime(&g.elem),
+        Type::Path(p) => {
+            let seg = p.path.segments.last()?;
+            match &seg.arguments {
+                syn::PathArguments::AngleBracketed(ab) => {
+                    for arg in ab.args.iter() {
+                        if let syn::GenericArgument::Lifetime(lt) = arg {
+                            return Some(lt.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Find the lifetime attached to the `&mut RequestHandle<'a>` parameter, if any.
+fn find_request_handle_lifetime(sig: &syn::Signature) -> Option<Lifetime> {
+    for arg in sig.inputs.iter() {
+        let FnArg::Typed(pat_ty) = arg else { continue };
+
+        if type_is_mut_ref_request_handle(&pat_ty.ty) {
+            return extract_request_handle_lifetime(&pat_ty.ty);
         }
     }
     None
@@ -163,14 +199,16 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
 
     let fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
+    let req_lt = find_request_handle_lifetime(sig)
+        .unwrap_or_else(|| Lifetime::new("'static", Span::call_site()));
 
     // Remove async keyword
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
 
-    // Set the return type to FfiFuture<DriverStep>
+    // Set the return type to BorrowingFfiFuture<'a, DriverStep>
     sig.output = syn::parse_quote!(
-        -> ::kernel_api::async_ffi::FfiFuture<::kernel_api::pnp::DriverStep>
+        -> ::kernel_api::async_ffi::BorrowingFfiFuture<#req_lt, ::kernel_api::pnp::DriverStep>
     );
 
     let original_stmts = &body.stmts;

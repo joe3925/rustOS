@@ -51,7 +51,7 @@ impl PnpManager {
     pub async fn send_request<'a>(
         &self,
         target: IoTarget,
-        handle: &mut RequestHandle<'a>,
+        handle: &'a mut RequestHandle<'a>,
     ) -> (DriverStatus) {
         {
             let mut guard = handle.write();
@@ -88,7 +88,7 @@ impl PnpManager {
     pub async fn send_request_to_next_lower<'a>(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'a>,
+        handle: &'a mut RequestHandle<'a>,
     ) -> DriverStatus {
         let Some(target_dev) = from.lower_device.get() else {
             return DriverStatus::NoSuchDevice;
@@ -100,7 +100,7 @@ impl PnpManager {
     pub async fn send_request_to_next_upper<'a>(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'a>,
+        handle: &'a mut RequestHandle<'a>,
     ) -> DriverStatus {
         let Some(target_dev) = from.upper_device.get() else {
             return DriverStatus::NoSuchDevice;
@@ -145,7 +145,7 @@ impl PnpManager {
     async fn call_device_handler<'a>(
         &self,
         mut dev: Arc<DeviceObject>,
-        mut handle: &mut RequestHandle<'a>,
+        handle: &'a mut RequestHandle<'a>,
         kind: RequestType,
         policy: TraversalPolicy,
     ) -> DriverStep {
