@@ -18,22 +18,25 @@ use dev_ext::{
 };
 
 use kernel_api::{
-    RequestExt,
-    IOCTL_PCI_SETUP_MSIX,
+    IOCTL_PCI_SETUP_MSIX, RequestExt,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::{io::{IoType, IoVtable, Synchronization}, pnp::DeviceIds, request::{RequestData, RequestType}},
+    kernel_types::{
+        io::{IoType, IoVtable, Synchronization},
+        pnp::DeviceIds,
+        request::RequestData,
+    },
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
         pnp_forward_request_to_next_lower,
     },
     println,
-    runtime::spawn_blocking,
-    request::Request,
+    request::{Request, RequestHandle, RequestHandleResult, RequestType},
     request_handler,
+    runtime::spawn_blocking,
     status::DriverStatus,
 };
-use spin::{Once, RwLock};
+use spin::Once;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -72,39 +75,40 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn pci_bus_pnp_start(device: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let query = Request::new_pnp(
+pub async fn pci_bus_pnp_start<'a>(
+    device: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let mut query = Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
-            blob_out: Vec::new(),
+            data_out: RequestData::empty(),
         },
         RequestData::empty(),
     );
 
-    let child = Arc::new(RwLock::new(query));
-    let st = pnp_forward_request_to_next_lower(device.clone(), child.clone()).await;
+    let (_, st) =
+        pnp_forward_request_to_next_lower(device.clone(), RequestHandle::Stack(&mut query)).await;
 
     if st != DriverStatus::NoSuchDevice {
-        let qst = { child.read().status };
+        let qst = query.status;
         if qst != DriverStatus::Success {
-            return DriverStep::complete(qst);
+            return req.complete(qst);
         }
 
-        let blob = {
-            let g = child.read();
-            g.pnp
-                .as_ref()
-                .map(|p| p.blob_out.clone())
-                .unwrap_or_default()
-        };
+        let blob = query
+            .pnp
+            .as_ref()
+            .map(|p| p.data_out.as_slice().to_vec())
+            .unwrap_or_default();
         let segs = parse_ecam_segments_from_blob(&blob);
 
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
-            return DriverStep::Continue;
+            return req.cont();
         }
 
         let prt_entries = parse_prt_from_blob(&blob);
@@ -115,39 +119,39 @@ pub async fn pci_bus_pnp_start(device: Arc<DeviceObject>, req: Arc<RwLock<Reques
                 ext.prt.call_once(|| prt_entries);
             }
         } else {
-            return DriverStep::Continue;
+            return req.cont();
         }
     } else {
         // Fallback derive segments from parent using platform-specific probe
-        let segs = load_segments_from_parent(&device);
+        let segs = load_segments_from_parent(&device).await;
         if let Ok(ext) = device.try_devext::<DevExt>() {
             if !segs.is_empty() {
                 ext.segments.call_once(|| segs);
             }
         } else {
-            return DriverStep::Continue;
+            return req.cont();
         }
     }
 
-    DriverStep::Continue
+    req.cont()
 }
 
 #[request_handler]
-pub async fn pci_bus_pnp_query_devrels(
+pub async fn pci_bus_pnp_query_devrels<'a>(
     device: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStep {
-    let relation = req.read().pnp.as_ref().unwrap().relation;
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         let st = enumerate_bus(&device).await;
         if st == DriverStatus::Success {
-            return DriverStep::Continue;
+            return req.cont();
         } else {
-            return DriverStep::complete(st);
+            return req.complete(st);
         }
     }
 
-    DriverStep::Continue
+    req.cont()
 }
 
 fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
@@ -256,7 +260,11 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     );
 
     let mut io_vt = IoVtable::new();
-    io_vt.set(IoType::DeviceControl(pci_pdo_ioctl), Synchronization::Async, 0);
+    io_vt.set(
+        IoType::DeviceControl(pci_pdo_ioctl),
+        Synchronization::Async,
+        0,
+    );
 
     let mut child_init = DeviceInit::new(io_vt, Some(vt));
     child_init.set_dev_ext_from(*p);
@@ -275,91 +283,110 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 }
 
 #[request_handler]
-pub async fn pci_pdo_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn pci_pdo_query_id<'a>(
+    dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     use kernel_api::pnp::QueryIdType;
 
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => {
-            req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStep::complete(DriverStatus::Success);
-        }
+        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
     };
 
-    let mut r = req.write();
-    let pnp = r.pnp.as_mut().unwrap();
-    match pnp.id_type {
-        QueryIdType::HardwareIds => {
-            let (hw, _cmp, _) = hwids_for(&ext);
-            pnp.ids_out.extend(hw);
-            r.status = DriverStatus::Success;
-        }
-        QueryIdType::CompatibleIds => {
-            let (_hw, cmp, _) = hwids_for(&ext);
-            pnp.ids_out.extend(cmp);
-            r.status = DriverStatus::Success;
-        }
-        QueryIdType::DeviceId => {
-            let (hw, _, _) = hwids_for(&ext);
-            if let Some(primary) = hw.first() {
-                pnp.ids_out.push(primary.clone());
-                r.status = DriverStatus::Success;
-            } else {
-                r.status = DriverStatus::NoSuchDevice;
-            }
-        }
-        QueryIdType::InstanceId => {
-            pnp.ids_out.push(instance_path_for(&ext));
-            r.status = DriverStatus::Success;
+    let mut status = DriverStatus::Success;
+    {
+        let mut r = req.write();
+        match r.pnp.as_mut() {
+            Some(pnp) => match pnp.id_type {
+                QueryIdType::HardwareIds => {
+                    let (hw, _cmp, _) = hwids_for(&ext);
+                    pnp.ids_out.extend(hw);
+                    r.status = DriverStatus::Success;
+                }
+                QueryIdType::CompatibleIds => {
+                    let (_hw, cmp, _) = hwids_for(&ext);
+                    pnp.ids_out.extend(cmp);
+                    r.status = DriverStatus::Success;
+                }
+                QueryIdType::DeviceId => {
+                    let (hw, _, _) = hwids_for(&ext);
+                    if let Some(primary) = hw.first() {
+                        pnp.ids_out.push(primary.clone());
+                        r.status = DriverStatus::Success;
+                    } else {
+                        r.status = DriverStatus::NoSuchDevice;
+                    }
+                }
+                QueryIdType::InstanceId => {
+                    pnp.ids_out.push(instance_path_for(&ext));
+                    r.status = DriverStatus::Success;
+                }
+            },
+            None => status = DriverStatus::InvalidParameter,
         }
     }
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(status)
 }
 
 #[request_handler]
-pub async fn pci_pdo_query_resources(
+pub async fn pci_pdo_query_resources<'a>(
     dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStep {
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => {
-            req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+    };
+
+    let status = {
+        let mut r = req.write();
+        match r.pnp.as_mut() {
+            Some(pnp) => {
+                pnp.data_out =
+                    RequestData::from_boxed_bytes(build_resources_blob(&ext).into_boxed_slice());
+                DriverStatus::Success
+            }
+            None => DriverStatus::InvalidParameter,
         }
     };
 
-    let mut r = req.write();
-    let pnp = r.pnp.as_mut().unwrap();
-    pnp.blob_out = build_resources_blob(&ext);
-    r.status = DriverStatus::Success;
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(status)
 }
 
 #[request_handler]
-pub async fn pci_pdo_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
-}
-#[request_handler]
-pub async fn pci_pdo_query_devrels(
+pub async fn pci_pdo_start<'a>(
     _dev: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    req.complete(DriverStatus::Success)
+}
+#[request_handler]
+pub async fn pci_pdo_query_devrels<'a>(
+    _dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn pci_pdo_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
+pub async fn pci_pdo_ioctl<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match {
         let r = req.read();
         match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+            RequestType::DeviceControl(c) => Some(c),
+            _ => None,
         }
+    } {
+        Some(c) => c,
+        None => return req.complete(DriverStatus::InvalidParameter),
     };
 
     match code {
         IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev, req).await,
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
 }

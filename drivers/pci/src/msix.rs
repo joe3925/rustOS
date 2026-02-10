@@ -4,11 +4,9 @@ use core::ptr::{read_volatile, write_volatile};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
-use kernel_api::pnp::DriverStep;
-use kernel_api::request::Request;
+use kernel_api::request::{RequestHandle, RequestHandleResult};
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
-use spin::RwLock;
 
 use crate::dev_ext::{BarKind, MsixInfo, PciPdoExt};
 use kernel_api::println;
@@ -66,34 +64,37 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 }
 
 /// Program MSI-X table and enable MSI-X capability.
-pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn pci_setup_msix(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'_>,
+) -> RequestHandleResult<'_> {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
     };
 
     let msix = match ext.msix.as_ref() {
         Some(m) => m,
-        None => return DriverStep::complete(DriverStatus::NotImplemented),
+        None => return req.complete(DriverStatus::NotImplemented),
     };
 
-    let entries = {
+    let entries = match {
         let r = req.read();
-        match parse_msix_setup_request(r.data.as_slice()) {
-            Some(e) => e,
-            None => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
+        parse_msix_setup_request(r.data.as_slice())
+    } {
+        Some(e) => e,
+        None => return req.complete(DriverStatus::InvalidParameter),
     };
 
     for entry in &entries {
         if entry.table_index >= msix.table_size {
-            return DriverStep::complete(DriverStatus::InvalidParameter);
+            return req.complete(DriverStatus::InvalidParameter);
         }
     }
 
     let table_bar = &ext.bars[msix.table_bar as usize];
     if table_bar.kind == BarKind::None {
-        return DriverStep::complete(DriverStatus::NotImplemented);
+        return req.complete(DriverStatus::NotImplemented);
     }
 
     let table_region_size = ((msix.table_size as u64 * 16) + 0xFFF) & !0xFFF;
@@ -101,7 +102,7 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
 
     let table_va = match map_mmio_region(PhysAddr::new(table_phys), table_region_size) {
         Ok(va) => va,
-        Err(_) => return DriverStep::complete(DriverStatus::InsufficientResources),
+        Err(_) => return req.complete(DriverStatus::InsufficientResources),
     };
 
     for entry in &entries {
@@ -142,7 +143,7 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         Ok(va) => va,
         Err(_) => {
             unsafe { unmap_mmio_region(table_va, table_region_size) };
-            return DriverStep::complete(DriverStatus::InsufficientResources);
+            return req.complete(DriverStatus::InsufficientResources);
         }
     };
 
@@ -165,5 +166,5 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
         unmap_mmio_region(table_va, table_region_size);
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }

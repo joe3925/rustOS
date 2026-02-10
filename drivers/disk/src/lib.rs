@@ -13,8 +13,8 @@ use core::{
 };
 use hashbrown::HashMap;
 use kernel_api::pnp::DriverStep;
-use kernel_api::println;
-use spin::{Mutex, RwLock};
+use kernel_api::{println, status};
+use spin::Mutex;
 
 use kernel_api::{
     RequestExt,
@@ -27,7 +27,7 @@ use kernel_api::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
-    request::{Request, RequestType, TraversalPolicy},
+    request::{Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy},
     request_handler,
     status::DriverStatus,
 };
@@ -41,18 +41,6 @@ fn panic(info: &PanicInfo) -> ! {
         use kernel_api::util::panic_common;
         panic_common(MOD_NAME, info)
     }
-}
-
-#[inline]
-fn take_req(r: &Arc<RwLock<Request>>) -> Request {
-    let mut g = r.write();
-    core::mem::replace(&mut *g, Request::empty())
-}
-
-#[inline]
-fn put_req(r: &Arc<RwLock<Request>>, req: Request) {
-    let mut g = r.write();
-    *g = req;
 }
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -427,9 +415,12 @@ struct DiskWriteCtx {
 }
 
 #[request_handler]
-async fn disk_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
+async fn disk_pnp_remove<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let _ = flush_dirty_blocks(&dev).await;
-    DriverStep::Continue
+    req.cont()
 }
 
 extern "win64" fn disk_read_complete(req: &mut Request, ctx: usize) -> DriverStatus {
@@ -511,178 +502,203 @@ extern "win64" fn disk_write_complete(req: &mut Request, ctx: usize) -> DriverSt
 }
 
 #[request_handler]
-pub async fn disk_read(
+pub async fn disk_read<'a>(
     dev: Arc<DeviceObject>,
-    parent: Arc<RwLock<Request>>,
+    mut req: RequestHandle<'a>,
     _buf_len: usize,
-) -> DriverStep {
-    let (off, total) = {
-        let g = parent.read();
-        match g.kind {
-            RequestType::Read { offset, len } => (offset, len),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
+) -> RequestHandleResult<'a> {
+    let (off, total) = match {
+        let g = req.read();
+        g.kind
+    } {
+        RequestType::Read { offset, len } => (offset, len),
+        _ => return req.complete(DriverStatus::InvalidParameter),
     };
 
     if total == 0 {
-        return DriverStep::complete(DriverStatus::Success);
+        return req.complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
-            return DriverStep::complete(st);
+            return req.complete(st);
         }
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
-    {
-        let p = parent.read();
-        if p.data_len() < total {
-            return DriverStep::complete(DriverStatus::InsufficientResources);
-        }
+    let data_too_small = {
+        let p = req.read();
+        p.data_len() < total
+    };
+    if data_too_small {
+        return req.complete(DriverStatus::InsufficientResources);
     }
 
     let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
     if !aligned {
-        let mut p = parent.write();
-        p.status = DriverStatus::InvalidParameter;
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        {
+            let mut p = req.write();
+            p.status = DriverStatus::InvalidParameter;
+        }
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
-    let mut p = parent.write();
-    let n = core::cmp::min(total, p.data_len());
-    if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
-        p.status = DriverStatus::Success;
-        return DriverStep::complete(DriverStatus::Success);
-    }
+    let hit_cache = {
+        let mut p = req.write();
+        let n = core::cmp::min(total, p.data_len());
+        if n != 0 && cache_try_read(&dx, off, n, &mut p.data_slice_mut()[..n]) {
+            p.status = DriverStatus::Success;
+            true
+        } else {
+            let ctx = Box::new(DiskReadCtx {
+                dev: dev.clone(),
+                offset: off,
+                len: total,
+            });
+            p.add_completion(disk_read_complete, Box::into_raw(ctx) as usize);
+            p.traversal_policy = TraversalPolicy::ForwardLower;
+            false
+        }
+    };
 
-    let ctx = Box::new(DiskReadCtx {
-        dev: dev.clone(),
-        offset: off,
-        len: total,
-    });
-    p.add_completion(disk_read_complete, Box::into_raw(ctx) as usize);
-    p.traversal_policy = TraversalPolicy::ForwardLower;
-    DriverStep::Continue
+    if hit_cache {
+        return req.complete(DriverStatus::Success);
+    }
+    req.cont()
 }
 
 #[request_handler]
-pub async fn disk_write(
+pub async fn disk_write<'a>(
     dev: Arc<DeviceObject>,
-    parent: Arc<RwLock<Request>>,
+    mut req: RequestHandle<'a>,
     _buf_len: usize,
-) -> DriverStep {
-    let (off, total, write_through) = {
-        let g = parent.read();
-        match g.kind {
-            RequestType::Write {
-                offset,
-                len,
-                flush_write_through,
-            } => (offset, len, flush_write_through),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
-        }
+) -> RequestHandleResult<'a> {
+    let (off, total, write_through) = match {
+        let g = req.read();
+        g.kind
+    } {
+        RequestType::Write {
+            offset,
+            len,
+            flush_write_through,
+        } => (offset, len, flush_write_through),
+        _ => return req.complete(DriverStatus::InvalidParameter),
     };
     if total == 0 {
-        return DriverStep::complete(DriverStatus::Success);
+        return req.complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(Ordering::Acquire) {
         if let Err(st) = query_props_sync(&dev).await {
-            return DriverStep::complete(st);
+            return req.complete(st);
         }
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
-    {
-        let p = parent.read();
-        if p.data_len() < total {
-            return DriverStep::complete(DriverStatus::InsufficientResources);
-        }
+    let data_too_small = {
+        let p = req.read();
+        p.data_len() < total
+    };
+    if data_too_small {
+        return req.complete(DriverStatus::InsufficientResources);
     }
 
     let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
     if !aligned {
-        let mut p = parent.write();
-        p.status = DriverStatus::InvalidParameter;
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        {
+            let mut p = req.write();
+            p.status = DriverStatus::InvalidParameter;
+        }
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
     if !write_through {
         // Write-back: update cache immediately and complete without hitting the disk.
         {
-            let p = parent.read();
+            let p = req.read();
             let data = &p.data_slice()[..total];
             cache_update_write(&dx, off, data, true);
         }
 
-        let mut p = parent.write();
-        p.status = DriverStatus::Success;
-        return DriverStep::complete(DriverStatus::Success);
+        {
+            let mut p = req.write();
+            p.status = DriverStatus::Success;
+        }
+        return req.complete(DriverStatus::Success);
     }
 
-    let mut p = parent.write();
-    let ctx = Box::new(DiskWriteCtx {
-        dev: dev.clone(),
-        offset: off,
-        len: total,
-        write_through: write_through,
-    });
-    p.add_completion(disk_write_complete, Box::into_raw(ctx) as usize);
-    p.traversal_policy = TraversalPolicy::ForwardLower;
-    DriverStep::Continue
+    {
+        let mut p = req.write();
+        let ctx = Box::new(DiskWriteCtx {
+            dev: dev.clone(),
+            offset: off,
+            len: total,
+            write_through,
+        });
+        p.add_completion(disk_write_complete, Box::into_raw(ctx) as usize);
+        p.traversal_policy = TraversalPolicy::ForwardLower;
+    }
+    req.cont()
 }
 
 #[request_handler]
-pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) -> DriverStep {
-    let code = match parent.read().kind {
+pub async fn disk_ioctl<'a>(
+    dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match {
+        let g = req.read();
+        g.kind
+    } {
         RequestType::DeviceControl(c) => c,
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => return req.complete(DriverStatus::InvalidParameter),
     };
 
     match code {
         IOCTL_DRIVE_IDENTIFY => {
-            let mut ch = Request::new_pnp(
+            let mut ch = RequestHandle::Stack(&mut Request::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
                     id_type: QueryIdType::CompatibleIds,
                     ids_out: alloc::vec::Vec::new(),
-                    blob_out: alloc::vec::Vec::new(),
+                    data_out: RequestData::empty(),
                 },
                 RequestData::empty(),
-            );
+            ));
 
-            if let Some(pnp) = ch.pnp.as_mut() {
-                pnp.relation = DeviceRelationType::TargetDeviceRelation;
-                pnp.id_type = QueryIdType::CompatibleIds;
+            let (mut ch, st) = pnp_forward_request_to_next_lower(dev, ch).await;
+            if st != DriverStatus::Success {
+                return req.complete(st);
             }
-
-            let ch = Arc::new(RwLock::new(ch));
-
-            pnp_forward_request_to_next_lower(dev, ch.clone()).await;
-
-            let blob = {
-                let r = ch.read();
-                r.pnp
-                    .as_ref()
-                    .map(|p| p.blob_out.clone())
-                    .unwrap_or_default()
+            // todo: properly handle the none case
+            let info = if let Some(di) = ch
+                .write()
+                .pnp
+                .as_ref()
+                .and_then(|p| p.data_out.view::<DiskInfo>())
+            {
+                *di
+            } else {
+                return req.complete(DriverStatus::Unsuccessful);
             };
 
-            let mut w = parent.write();
-            w.set_data_bytes(blob.into_boxed_slice());
-            DriverStep::complete(DriverStatus::Success)
+            let status = {
+                let mut w = req.write();
+                w.set_data_t::<DiskInfo>(info);
+                DriverStatus::Success
+            };
+            req.complete(status)
         }
         IOCTL_BLOCK_FLUSH => {
             let dx = disk_ext(&dev);
@@ -692,19 +708,17 @@ pub async fn disk_ioctl(dev: Arc<DeviceObject>, parent: Arc<RwLock<Request>>) ->
                 RequestData::empty(),
             );
             req_child.traversal_policy = TraversalPolicy::ForwardLower;
-            let child = Arc::new(RwLock::new(req_child));
-
-            let status = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
-            if status != DriverStatus::Success {
-                return DriverStep::complete(status);
-            }
-            let st = child.read().status;
-            if st == DriverStatus::Success {
+            let (_, status) = pnp_forward_request_to_next_lower(
+                dev.clone(),
+                RequestHandle::Stack(&mut req_child),
+            )
+            .await;
+            if status == DriverStatus::Success {
                 cache_clear(&dx);
             }
-            DriverStep::complete(st)
+            req.complete(status)
         }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -718,22 +732,21 @@ async fn read_from_lower(
     offset: u64,
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
-    let child = Arc::new(RwLock::new(
-        Request::new(
-            RequestType::Read { offset, len },
-            RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower),
-    ));
-    let st = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
+    let mut child = Request::new(
+        RequestType::Read { offset, len },
+        RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
+
+    let (_, st) =
+        pnp_forward_request_to_next_lower(dev.clone(), RequestHandle::Stack(&mut child)).await;
     if st != DriverStatus::Success {
         return Err(st);
     }
-    let mut g = child.write();
-    if g.status != DriverStatus::Success {
-        return Err(g.status);
+    if child.status != DriverStatus::Success {
+        return Err(child.status);
     }
-    Ok(g.take_data_bytes())
+    Ok(child.take_data_bytes())
 }
 
 /// Flush all dirty cached blocks to the lower device. Not invoked automatically.
@@ -789,22 +802,21 @@ async fn write_to_lower(
     data: &[u8],
     flush_write_through: bool,
 ) -> DriverStatus {
-    let child = Arc::new(RwLock::new(
-        Request::new(
-            RequestType::Write {
-                offset,
-                len: data.len(),
-                flush_write_through,
-            },
-            RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower),
-    ));
-    let st = pnp_forward_request_to_next_lower(dev.clone(), child.clone()).await;
+    let mut child = Request::new(
+        RequestType::Write {
+            offset,
+            len: data.len(),
+            flush_write_through,
+        },
+        RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    let (_, st) =
+        pnp_forward_request_to_next_lower(dev.clone(), RequestHandle::Stack(&mut child)).await;
     if st != DriverStatus::Success {
         return st;
     }
-    child.read().status
+    child.status
 }
 
 async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
@@ -814,29 +826,32 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
-            blob_out: Vec::new(),
+            data_out: RequestData::empty(),
         },
         RequestData::empty(),
     );
-    let ch = Arc::new(RwLock::new(ch));
+    let (_, st) =
+        pnp_forward_request_to_next_lower(dev.clone(), RequestHandle::Stack(&mut ch)).await;
 
-    pnp_forward_request_to_next_lower(dev.clone(), ch.clone()).await;
-
-    let c = ch.read();
-    if c.status != DriverStatus::Success {
-        return Err(c.status);
+    if st != DriverStatus::Success {
+        return Err(st);
+    }
+    if ch.status != DriverStatus::Success {
+        return Err(ch.status);
     }
 
-    let pnp = match c.pnp.as_ref() {
-        Some(p) => p,
-        None => return Err(DriverStatus::Unsuccessful),
+    let di = if let Some(di) = ch.pnp.as_ref().and_then(|p| p.data_out.view::<DiskInfo>()) {
+        *di
+    } else {
+        let Some(pnp) = ch.pnp.as_ref() else {
+            return Err(DriverStatus::Unsuccessful);
+        };
+        let blob = pnp.data_out.as_slice();
+        if blob.len() < size_of::<DiskInfo>() {
+            return Err(DriverStatus::Unsuccessful);
+        }
+        unsafe { *(blob.as_ptr() as *const DiskInfo) }
     };
-
-    if pnp.blob_out.len() < size_of::<DiskInfo>() {
-        return Err(DriverStatus::Unsuccessful);
-    }
-
-    let di = unsafe { *(pnp.blob_out.as_ptr() as *const DiskInfo) };
 
     let dx = disk_ext(dev);
     dx.block_size

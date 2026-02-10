@@ -1,12 +1,14 @@
 use crate::CompletionRoutine;
 use crate::fs::FsOp;
+use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
-    mem::{size_of, align_of, MaybeUninit},
+    mem::{MaybeUninit, align_of, size_of},
+    ops::{Deref, DerefMut},
     pin::Pin,
     ptr::null_mut,
     task::{Context, Poll, Waker},
@@ -140,11 +142,7 @@ impl RequestData {
             };
 
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    result.inline.as_mut_ptr(),
-                    size,
-                );
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), result.inline.as_mut_ptr(), size);
             }
             // Original box is dropped here
 
@@ -213,7 +211,11 @@ impl RequestData {
     /// Use this to "return" the borrowed slice before the RequestData is dropped.
     #[inline]
     pub fn take_bytes_borrowed(&mut self) -> (*mut u8, usize) {
-        debug_assert_eq!(self.mode, StorageMode::Borrowed, "take_bytes_borrowed called on non-borrowed data");
+        debug_assert_eq!(
+            self.mode,
+            StorageMode::Borrowed,
+            "take_bytes_borrowed called on non-borrowed data"
+        );
 
         let ptr = match &mut self.heap {
             Some(b) => b.as_mut_ptr(),
@@ -299,30 +301,26 @@ impl RequestData {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self.mode {
-            StorageMode::Inline => {
-                unsafe { core::slice::from_raw_parts(self.inline.as_ptr(), self.size) }
-            }
-            StorageMode::Heap | StorageMode::Borrowed => {
-                match &self.heap {
-                    Some(b) => &b[..self.size],
-                    None => &[],
-                }
-            }
+            StorageMode::Inline => unsafe {
+                core::slice::from_raw_parts(self.inline.as_ptr(), self.size)
+            },
+            StorageMode::Heap | StorageMode::Borrowed => match &self.heap {
+                Some(b) => &b[..self.size],
+                None => &[],
+            },
         }
     }
 
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         match self.mode {
-            StorageMode::Inline => {
-                unsafe { core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size) }
-            }
-            StorageMode::Heap | StorageMode::Borrowed => {
-                match &mut self.heap {
-                    Some(b) => &mut b[..self.size],
-                    None => &mut [],
-                }
-            }
+            StorageMode::Inline => unsafe {
+                core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size)
+            },
+            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
+                Some(b) => &mut b[..self.size],
+                None => &mut [],
+            },
         }
     }
 
@@ -337,12 +335,10 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => {
-                match &self.heap {
-                    Some(b) => b.as_ptr(),
-                    None => return None,
-                }
-            }
+            StorageMode::Heap | StorageMode::Borrowed => match &self.heap {
+                Some(b) => b.as_ptr(),
+                None => return None,
+            },
         };
 
         Some(unsafe { &*(ptr as *const T) })
@@ -355,12 +351,10 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => {
-                match &mut self.heap {
-                    Some(b) => b.as_mut_ptr(),
-                    None => return None,
-                }
-            }
+            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
+                Some(b) => b.as_mut_ptr(),
+                None => return None,
+            },
         };
 
         Some(unsafe { &mut *(ptr as *mut T) })
@@ -452,12 +446,10 @@ impl Drop for RequestData {
         // Get the data pointer based on storage mode
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => {
-                match &mut self.heap {
-                    Some(b) => b.as_mut_ptr(),
-                    None => return,
-                }
-            }
+            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
+                Some(b) => b.as_mut_ptr(),
+                None => return,
+            },
         };
 
         // Call the typed dropper to run T's destructor
@@ -481,10 +473,25 @@ impl Drop for RequestData {
     }
 }
 
+impl RequestData {
+    /// Print metadata without the actual data payload
+    pub fn print_meta(&self) -> alloc::string::String {
+        alloc::format!(
+            "RequestData {{ tag: {:?}, size: {}, mode: {:?} }}",
+            self.tag,
+            self.size,
+            self.mode
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(C)]
 pub enum RequestType {
-    Read { offset: u64, len: usize },
+    Read {
+        offset: u64,
+        len: usize,
+    },
     Write {
         offset: u64,
         len: usize,
@@ -576,6 +583,26 @@ impl Request {
         self.data.take_bytes()
     }
 
+    /// Print all fields except the actual data payloads
+    pub fn print_meta(&self) -> alloc::string::String {
+        let pnp_str = match &self.pnp {
+            Some(p) => p.print_meta(),
+            None => alloc::string::String::from("None"),
+        };
+        alloc::format!(
+            "Request {{ kind: {:?}, data: {}, completed: {}, status: {:?}, traversal_policy: {:?}, pnp: {}, completion_routine: {:?}, completion_context: {:#x}, waker: {} }}",
+            self.kind,
+            self.data.print_meta(),
+            self.completed,
+            self.status,
+            self.traversal_policy,
+            pnp_str,
+            self.completion_routine.map(|_| "Some(fn)"),
+            self.completion_context,
+            if self.waker.is_some() { "Some" } else { "None" }
+        )
+    }
+
     #[inline]
     pub fn empty() -> Self {
         Self {
@@ -637,6 +664,7 @@ impl Drop for Request {
         self.complete_for_drop();
     }
 }
+#[repr(C)]
 struct CompletionNode {
     func: CompletionRoutine,
     ctx: usize,
@@ -676,6 +704,7 @@ extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverSta
 
     status
 }
+#[repr(C)]
 pub struct RequestCompletion {
     pub req: Arc<RwLock<Request>>,
 }
@@ -692,5 +721,234 @@ impl Future for RequestCompletion {
 
         guard.waker = Some(cx.waker().clone());
         Poll::Pending
+    }
+}
+
+// ============================================================================
+// RequestHandle - Stack or Shared ownership abstraction
+// ============================================================================
+
+/// Wrapper for shared request ownership. Guarantees 'static lifetime.
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct SharedRequest(pub Arc<RwLock<Request>>);
+
+impl SharedRequest {
+    #[inline]
+    pub fn new(req: Request) -> Self {
+        Self(Arc::new(RwLock::new(req)))
+    }
+
+    #[inline]
+    pub fn arc(&self) -> &Arc<RwLock<Request>> {
+        &self.0
+    }
+
+    #[inline]
+    pub fn read(&self) -> spin::RwLockReadGuard<'_, Request> {
+        self.0.read()
+    }
+
+    #[inline]
+    pub fn write(&self) -> spin::RwLockWriteGuard<'_, Request> {
+        self.0.write()
+    }
+}
+
+impl Clone for SharedRequest {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// Handle to a request - stack-allocated or heap-allocated (shared).
+#[repr(C)]
+#[derive(Debug)]
+pub enum RequestHandle<'a> {
+    /// Mutable borrow of a stack-allocated request.
+    Stack(&'a mut Request),
+    /// Shared ownership - already heap-allocated.
+    Shared(SharedRequest),
+}
+
+/// Read guard for RequestHandle - either a direct reference or an RwLock guard.
+#[repr(C)]
+pub enum HandleReadGuard<'a> {
+    Stack(&'a Request),
+    Shared(spin::RwLockReadGuard<'a, Request>),
+}
+
+impl<'a> Deref for HandleReadGuard<'a> {
+    type Target = Request;
+
+    #[inline]
+    fn deref(&self) -> &Request {
+        match self {
+            HandleReadGuard::Stack(r) => r,
+            HandleReadGuard::Shared(g) => &*g,
+        }
+    }
+}
+
+/// Write guard for RequestHandle - either a direct reference or an RwLock guard.
+#[repr(C)]
+pub enum HandleWriteGuard<'a> {
+    Stack(&'a mut Request),
+    Shared(spin::RwLockWriteGuard<'a, Request>),
+}
+
+impl<'a> Deref for HandleWriteGuard<'a> {
+    type Target = Request;
+
+    #[inline]
+    fn deref(&self) -> &Request {
+        match self {
+            HandleWriteGuard::Stack(r) => r,
+            HandleWriteGuard::Shared(g) => &*g,
+        }
+    }
+}
+
+impl<'a> DerefMut for HandleWriteGuard<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Request {
+        match self {
+            HandleWriteGuard::Stack(r) => r,
+            HandleWriteGuard::Shared(g) => &mut *g,
+        }
+    }
+}
+
+impl<'a> RequestHandle<'a> {
+    #[inline]
+    pub fn is_stack(&self) -> bool {
+        matches!(self, Self::Stack(_))
+    }
+
+    #[inline]
+    pub fn is_shared(&self) -> bool {
+        matches!(self, Self::Shared(_))
+    }
+    #[inline]
+    pub fn status(&self) -> DriverStatus {
+        self.read().status
+    }
+
+    /// Acquire read access. Returns a guard that derefs to &Request.
+    #[inline]
+    pub fn read(&self) -> HandleReadGuard<'_> {
+        match self {
+            RequestHandle::Stack(r) => HandleReadGuard::Stack(r),
+            RequestHandle::Shared(s) => HandleReadGuard::Shared(s.read()),
+        }
+    }
+
+    /// Acquire write access. Returns a guard that derefs to &mut Request.
+    #[inline]
+    pub fn write(&mut self) -> HandleWriteGuard<'_> {
+        match self {
+            RequestHandle::Stack(r) => HandleWriteGuard::Stack(r),
+            RequestHandle::Shared(s) => HandleWriteGuard::Shared(s.write()),
+        }
+    }
+
+    /// Promote stack request to shared ownership.
+    /// Stack: moves content into SharedRequest, leaves empty sentinel.
+    /// Shared: returns self unchanged.
+    pub fn promote(self) -> RequestHandle<'static> {
+        match self {
+            RequestHandle::Stack(req_ref) => {
+                let request = core::mem::replace(req_ref, Request::empty());
+                RequestHandle::Shared(SharedRequest::new(request))
+            }
+            RequestHandle::Shared(shared) => RequestHandle::Shared(shared),
+        }
+    }
+
+    /// Convert to SharedRequest. Promotes if needed.
+    #[inline]
+    pub fn into_shared(self) -> SharedRequest {
+        match self.promote() {
+            RequestHandle::Shared(s) => s,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Get SharedRequest if already shared.
+    #[inline]
+    pub fn as_shared(&self) -> Option<&SharedRequest> {
+        match self {
+            RequestHandle::Shared(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Consume handle and return Complete result.
+    #[inline]
+    pub fn complete(self, status: DriverStatus) -> RequestHandleResult<'a> {
+        RequestHandleResult {
+            step: DriverStep::Complete { status },
+            handle: self,
+        }
+    }
+
+    /// Consume handle and return Continue result.
+    #[inline]
+    pub fn cont(self) -> RequestHandleResult<'a> {
+        RequestHandleResult {
+            step: DriverStep::Continue,
+            handle: self,
+        }
+    }
+}
+
+impl RequestHandle<'static> {
+    /// Consume 'static handle and return Pending result.
+    /// COMPILE-TIME SAFETY: Only 'static handles (from promote()) can call this.
+    #[inline]
+    pub fn pending(self) -> RequestHandleResult<'static> {
+        RequestHandleResult {
+            step: DriverStep::Pending,
+            handle: self,
+        }
+    }
+}
+impl<'a> RequestHandleResult<'a> {
+    pub fn status(&self) -> DriverStatus {
+        match self.step {
+            DriverStep::Complete { status } => return status,
+            DriverStep::Continue => return todo!(),
+            DriverStep::Pending => return DriverStatus::PendingStep,
+        }
+    }
+}
+/// Handler return type. Carries step + handle back to dispatcher.
+#[repr(C)]
+pub struct RequestHandleResult<'a> {
+    pub step: DriverStep,
+    pub handle: RequestHandle<'a>,
+}
+
+/// Future for awaiting completion of a shared request.
+#[repr(C)]
+pub struct RequestCompletionHandle(SharedRequest);
+
+impl RequestCompletionHandle {
+    pub fn new(shared: SharedRequest) -> Self {
+        Self(shared)
+    }
+}
+
+impl Future for RequestCompletionHandle {
+    type Output = DriverStatus;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut guard = self.0.write();
+        if guard.completed {
+            Poll::Ready(guard.status)
+        } else {
+            guard.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }

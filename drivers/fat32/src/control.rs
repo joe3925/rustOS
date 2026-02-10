@@ -24,7 +24,7 @@ use kernel_api::{
         pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
     println,
-    request::{Request, RequestType, TraversalPolicy},
+    request::{Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy},
     request_handler,
     runtime::{spawn, spawn_blocking, spawn_detached},
     status::DriverStatus,
@@ -78,50 +78,50 @@ fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
 }
 
 #[request_handler]
-pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
-        let r = req.read();
-        match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => {
-                drop(r);
-                req.write().status = DriverStatus::InvalidParameter;
-                return DriverStep::complete(DriverStatus::NotImplemented);
-            }
-        }
+pub async fn fs_root_ioctl<'a>(
+    _dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match { req.read().kind } {
+        RequestType::DeviceControl(c) => c,
+        _ => return req.complete(DriverStatus::NotImplemented),
     };
 
     match code {
         IOCTL_FS_IDENTIFY => {
-            let mut id = {
-                let mut r = req.write();
-                match r.take_data::<FsIdentify>() {
-                    Some(v) => v,
-                    None => return DriverStep::complete(DriverStatus::InvalidParameter),
-                }
+            let mut r = req.write();
+            let id_opt = r.take_data::<FsIdentify>();
+            drop(r);
+            let mut id = match id_opt {
+                Some(v) => v,
+                None => return req.complete(DriverStatus::InvalidParameter),
             };
 
-            let q = Request::new_pnp(
+            let q = RequestHandle::Stack(&mut Request::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
                     id_type: QueryIdType::DeviceId,
                     ids_out: Vec::new(),
-                    blob_out: Vec::new(),
+                    data_out: RequestData::empty(),
                 },
                 RequestData::empty(),
-            );
-            let q = Arc::new(RwLock::new(q));
+            ));
 
-            pnp_send_request(id.volume_fdo.clone(), q.clone()).await;
+            let (mut reg, st) = pnp_send_request(id.volume_fdo.clone(), q).await;
 
             let mut sector_size: Option<u16> = None;
             let mut total_sectors: Option<u64> = None;
-            let mut w = q.write();
-            if w.status == DriverStatus::Success {
-                if let Some(pnp) = w.pnp.as_mut() {
-                    let buf = core::mem::take(&mut pnp.blob_out);
-                    if let Ok(pi) = from_boxed_bytes::<PartitionInfo>(buf.into_boxed_slice()) {
+
+            if st == DriverStatus::Success {
+                if let Some(pnp) = reg.write().pnp.as_mut() {
+                    let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
+                    if pi_opt.is_none() {
+                        let raw = pnp.data_out.take_bytes();
+                        pi_opt = from_boxed_bytes::<PartitionInfo>(raw).ok();
+                    }
+
+                    if let Some(pi) = pi_opt {
                         sector_size = Some(if pi.disk.logical_block_size != 0 {
                             pi.disk.logical_block_size as u16
                         } else {
@@ -134,15 +134,13 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     }
                 }
             }
-            drop(w);
-
             let (sector_size, total_sectors) = match (sector_size, total_sectors) {
                 (Some(sz), Some(ts)) => (sz, ts),
                 _ => {
                     id.mount_device = None;
                     id.can_mount = false;
                     req.write().set_data_t(id);
-                    return DriverStep::complete(DriverStatus::Success);
+                    return req.complete(DriverStatus::Success);
                 }
             };
 
@@ -175,26 +173,18 @@ pub async fn fs_root_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
                     req.write().set_data_t(id);
-                    DriverStep::complete(DriverStatus::Success)
+                    req.complete(DriverStatus::Success)
                 }
                 Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
                     req.write().set_data_t(id);
-                    DriverStep::complete(DriverStatus::Success)
+                    req.complete(DriverStatus::Success)
                 }
             }
         }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn fat_start(
-    _dev: &Arc<DeviceObject>,
-    _req: Arc<spin::rwlock::RwLock<Request>>,
-) -> DriverStep {
-    DriverStep::Continue
 }
 
 #[unsafe(no_mangle)]
@@ -212,19 +202,19 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let ctrl_name = "\\Device\\fat32.fs".to_string();
     let _ctrl = pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone());
 
-    let reg = Arc::new(RwLock::new(
-        Request::new(
-            RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-            RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower),
-    ));
-
     spawn_detached(async move {
+        let reg = RequestHandle::Stack(
+            &mut Request::new(
+                RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
+                RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
+            )
+            .set_traversal_policy(TraversalPolicy::ForwardLower),
+        );
+
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
-            reg.clone(),
+            reg,
         )
         .await;
     });

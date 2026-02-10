@@ -10,12 +10,11 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::time::Duration;
-use kernel_types::async_ffi::FfiFuture;
+use kernel_types::async_ffi::{BorrowingFfiFuture, FfiFuture};
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
 use kernel_types::irq::{DropHook, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult};
-use spin::RwLock;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::PageTableFlags;
@@ -24,7 +23,7 @@ use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
-use kernel_types::request::Request;
+use kernel_types::request::{RequestHandle, RequestHandleResult};
 use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
@@ -144,36 +143,38 @@ unsafe extern "win64" {
     pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
-    pub fn pnp_forward_request_to_next_lower(
+    pub fn pnp_forward_request_to_next_lower<'a>(
         from: Arc<DeviceObject>,
-        req: Arc<RwLock<Request>>,
-    ) -> FfiFuture<DriverStatus>;
+        req: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
-    pub fn pnp_forward_request_to_next_upper(
+    pub fn pnp_forward_request_to_next_upper<'a>(
         from: Arc<DeviceObject>,
-        req: Arc<RwLock<Request>>,
-    ) -> FfiFuture<DriverStatus>;
+        req: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
-    pub fn pnp_send_request(target: IoTarget, req: Arc<RwLock<Request>>)
-    -> FfiFuture<DriverStatus>;
+    pub fn pnp_send_request<'a>(
+        target: IoTarget,
+        req: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
-    pub fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus;
+    pub fn pnp_complete_request<'a>(req: RequestHandle<'a>) -> RequestHandleResult<'a>;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus;
     pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
 
-    pub fn pnp_send_request_via_symlink(
+    pub fn pnp_send_request_via_symlink<'a>(
         link_path: String,
-        req: Arc<RwLock<Request>>,
-    ) -> FfiFuture<DriverStatus>;
+        req: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
-    pub fn pnp_ioctl_via_symlink(
+    pub fn pnp_ioctl_via_symlink<'a>(
         link_path: String,
         control_code: u32,
-        request: Arc<RwLock<Request>>,
-    ) -> FfiFuture<DriverStatus>;
+        request: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
@@ -202,10 +203,10 @@ unsafe extern "win64" {
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
-    pub fn pnp_send_request_to_stack_top(
+    pub fn pnp_send_request_to_stack_top<'a>(
         dev_node_weak: Weak<DevNode>,
-        req: Arc<RwLock<Request>>,
-    ) -> FfiFuture<DriverStatus>;
+        req: RequestHandle<'a>,
+    ) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>>;
 
     pub fn InvalidateDeviceRelations(
         device: Arc<DeviceObject>,

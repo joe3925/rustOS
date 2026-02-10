@@ -23,6 +23,36 @@ pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     transform_function(&mut func).into()
 }
 
+/// Check if a type looks like RequestHandle (with optional lifetime)
+fn type_is_request_handle(ty: &Type) -> bool {
+    match ty {
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "RequestHandle")
+            .unwrap_or(false),
+        Type::Paren(p) => type_is_request_handle(&p.elem),
+        Type::Group(g) => type_is_request_handle(&g.elem),
+        _ => false,
+    }
+}
+
+/// Find the RequestHandle parameter and return its identifier
+fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
+    for arg in sig.inputs.iter() {
+        let FnArg::Typed(pat_ty) = arg else { continue };
+        let Pat::Ident(pat_ident) = &*pat_ty.pat else {
+            continue;
+        };
+
+        if type_is_request_handle(&pat_ty.ty) {
+            return Some(pat_ident.ident.clone());
+        }
+    }
+    None
+}
+
 fn validate_function(func: &ItemFn) -> syn::Result<()> {
     let sig = &func.sig;
 
@@ -47,6 +77,15 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ));
     }
 
+    // Check that there's at least one RequestHandle parameter
+    let has_request_handle = find_request_handle_param(sig).is_some();
+    if !has_request_handle {
+        return Err(syn::Error::new_spanned(
+            sig,
+            "#[request_handler] requires a RequestHandle parameter",
+        ));
+    }
+
     for input in &sig.inputs {
         match input {
             FnArg::Receiver(rec) => {
@@ -56,6 +95,12 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
                 ));
             }
             FnArg::Typed(pat_ty) => {
+                // Allow RequestHandle (which contains a reference internally)
+                if type_is_request_handle(&pat_ty.ty) {
+                    // RequestHandle is allowed
+                    continue;
+                }
+
                 if let Type::Reference(ty_ref) = &*pat_ty.ty {
                     return Err(syn::Error::new_spanned(
                         ty_ref,
@@ -77,15 +122,15 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
         ReturnType::Default => {
             return Err(syn::Error::new_spanned(
                 sig,
-                "#[request_handler] function must return DriverStep",
+                "#[request_handler] function must return RequestHandleResult",
             ));
         }
         ReturnType::Type(_, ty) => {
             let type_str = quote::quote!(#ty).to_string();
-            if !type_str.contains("DriverStep") {
+            if !type_str.contains("RequestHandleResult") {
                 return Err(syn::Error::new_spanned(
                     ty,
-                    "#[request_handler] function must return DriverStep",
+                    "#[request_handler] function must return RequestHandleResult",
                 ));
             }
         }
@@ -103,14 +148,23 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
 
-    let ret_ty: Type = match &sig.output {
-        ReturnType::Type(_, ty) => (*ty.clone()),
-        ReturnType::Default => unreachable!(),
-    };
-
+    // Remove async keyword
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
-    sig.output = syn::parse_quote!(-> ::kernel_api::async_ffi::FfiFuture<#ret_ty>);
+
+    // Add lifetime 'a to the function if not already present
+    // and update the return type to BorrowingFfiFuture<'a, RequestHandleResult<'a>>
+    let has_lifetime_a = sig.generics.lifetimes().any(|lt| lt.lifetime.ident == "a");
+    if !has_lifetime_a {
+        sig.generics
+            .params
+            .insert(0, syn::parse_quote!('a));
+    }
+
+    // Set the return type to BorrowingFfiFuture<'a, RequestHandleResult<'a>>
+    sig.output = syn::parse_quote!(
+        -> ::kernel_api::async_ffi::BorrowingFfiFuture<'a, ::kernel_api::request::RequestHandleResult<'a>>
+    );
 
     let original_stmts = &body.stmts;
 

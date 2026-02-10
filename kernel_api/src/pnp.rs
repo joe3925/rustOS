@@ -1,12 +1,10 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use kernel_sys::KernelAcpiHandler;
-use spin::RwLock;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::io::IoTarget;
-use kernel_types::pnp::DeviceIds;
-use kernel_types::request::Request;
+use kernel_types::request::{RequestHandle, RequestHandleResult};
 use kernel_types::status::{DriverError, DriverStatus};
 use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
 
@@ -86,48 +84,65 @@ pub fn pnp_add_class_listener(
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }
 
-pub fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus {
-    unsafe { kernel_sys::pnp_complete_request(req) }
+pub fn pnp_complete_request<'a>(req: RequestHandle<'a>) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_complete_request(req) };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_send_request(target: IoTarget, req: Arc<RwLock<Request>>) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request(target, req).await }
+pub async fn pnp_send_request<'a>(
+    target: IoTarget,
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_send_request(target, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_forward_request_to_next_lower(
+pub async fn pnp_forward_request_to_next_lower<'a>(
     from: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req).await }
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_forward_request_to_next_upper(
+pub async fn pnp_forward_request_to_next_upper<'a>(
     from: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_forward_request_to_next_upper(from, req).await }
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_forward_request_to_next_upper(from, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_send_request_via_symlink(
+pub async fn pnp_send_request_via_symlink<'a>(
     link_path: String,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req).await }
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_ioctl_via_symlink(
+pub async fn pnp_ioctl_via_symlink<'a>(
     link_path: String,
     control_code: u32,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req).await }
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
-pub async fn pnp_send_request_to_stack_top(
+pub async fn pnp_send_request_to_stack_top<'a>(
     dev_node_weak: Weak<DevNode>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req).await }
+    req: RequestHandle<'a>,
+) -> (RequestHandle<'a>, DriverStatus) {
+    let res = unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req).await };
+    let status = res.handle.status();
+    (res.handle, status)
 }
 
 #[allow(clippy::too_many_arguments)]

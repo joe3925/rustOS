@@ -1,5 +1,6 @@
-use crate::PnpMinorCallback;
+use crate::request::RequestData;
 use crate::status::DriverStatus;
+use crate::PnpMinorCallback;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -102,13 +103,23 @@ impl PnpVtable {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PnpRequest {
     pub minor_function: PnpMinorFunction,
     pub relation: DeviceRelationType,
     pub id_type: QueryIdType,
     pub ids_out: Vec<String>,
-    pub blob_out: Vec<u8>,
+    pub data_out: RequestData,
+}
+
+impl PnpRequest {
+    /// Print metadata without the actual data payload
+    pub fn print_meta(&self) -> alloc::string::String {
+        alloc::format!(
+            "PnpRequest {{ minor_function: {:?}, relation: {:?}, id_type: {:?}, ids_out: {:?}, data_out: {} }}",
+            self.minor_function, self.relation, self.id_type, self.ids_out, self.data_out.print_meta()
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

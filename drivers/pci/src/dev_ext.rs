@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::RequestExt;
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region, unmap_range};
-use kernel_api::request::{Request, RequestData};
+use kernel_api::request::{Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
 use kernel_api::pnp::{
@@ -550,7 +550,6 @@ pub fn build_resources_blob(p: &PciPdoExt) -> alloc::vec::Vec<u8> {
     }
 
     if p.irq_pin != 0 {
-
         if let Some(gsi) = p.irq_gsi {
             let prt_pin = (p.irq_pin - 1) as u32;
             items.push((ResourceKind::Gsi as u32, prt_pin, gsi as u64, 0));
@@ -664,7 +663,7 @@ extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(p) = req.pnp.as_ref() {
-        out.extend_from_slice(&p.blob_out);
+        out.extend_from_slice(p.data_out.as_slice());
     }
     unsafe {
         *w.status.get() = req.status;
@@ -741,33 +740,30 @@ pub fn parse_prt_from_blob(blob: &[u8]) -> Vec<PrtEntry> {
     entries
 }
 
-pub fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
+pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSegment> {
     let pnp = PnpRequest {
         minor_function: PnpMinorFunction::QueryResources,
         relation: DeviceRelationType::TargetDeviceRelation,
         id_type: QueryIdType::CompatibleIds,
         ids_out: alloc::vec::Vec::new(),
-        blob_out: alloc::vec::Vec::new(),
+        data_out: RequestData::empty(),
     };
 
-    let req = Request::new_pnp(pnp, RequestData::empty());
+    let mut req = Request::new_pnp(pnp, RequestData::empty());
 
-    let req_arc = alloc::sync::Arc::new(spin::RwLock::new(req));
-    let down = pnp_forward_request_to_next_lower(device.clone(), req_arc.clone());
+    let (_, status) =
+        pnp_forward_request_to_next_lower(device.clone(), RequestHandle::Stack(&mut req)).await;
 
-    let st = { req_arc.read().status };
-    if st != DriverStatus::Success {
+    if status != DriverStatus::Success || req.status != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");
         return alloc::vec::Vec::new();
     }
 
-    let blob = {
-        let g = req_arc.read();
-        g.pnp
-            .as_ref()
-            .map(|p| p.blob_out.clone())
-            .unwrap_or_default()
-    };
+    let blob = req
+        .pnp
+        .as_ref()
+        .map(|p| p.data_out.as_slice().to_vec())
+        .unwrap_or_default();
 
     let segs: Vec<McfgSegment> = parse_ecam_segments_from_blob(&blob);
     if segs.is_empty() {

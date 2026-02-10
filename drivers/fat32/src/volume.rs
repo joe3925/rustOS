@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
-use kernel_api::runtime::spawn_blocking;
 
 use fatfs::{
     Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
@@ -16,8 +15,7 @@ use fatfs::{
 use spin::RwLock;
 
 use kernel_api::device::DeviceObject;
-use kernel_api::pnp::DriverStep;
-use kernel_api::request::{Request, RequestType};
+use kernel_api::request::{RequestHandle, RequestHandleResult, RequestType};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
@@ -56,7 +54,7 @@ pub struct FileCtx {
     size: u64,
 }
 
-fn take_typed_params<T: 'static>(req: &Arc<RwLock<Request>>) -> Result<T, DriverStatus> {
+fn take_typed_params<T: 'static>(req: &mut RequestHandle<'_>) -> Result<T, DriverStatus> {
     let mut r = req.write();
     r.take_data::<T>().ok_or(DriverStatus::InvalidParameter)
 }
@@ -106,7 +104,7 @@ fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
 
 fn handle_seek_request(
     dev: &Arc<DeviceObject>,
-    req: &Arc<RwLock<Request>>,
+    req: &mut RequestHandle<'_>,
     fs: &mut Fs,
 ) -> DriverStatus {
     let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
@@ -150,7 +148,7 @@ fn handle_seek_request(
 
 fn handle_fs_request(
     dev: &Arc<DeviceObject>,
-    req: &Arc<RwLock<Request>>,
+    req: &mut RequestHandle<'_>,
     fs: &mut Fs,
 ) -> DriverStatus {
     let kind = { req.read().kind };
@@ -715,26 +713,21 @@ fn handle_fs_request(
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn fs_op_dispatch<'a>(
+    dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let fs_arc = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         vdx.fs.clone()
     };
     let mut fs_guard = fs_arc.lock_owned().await;
 
-    // Fast-path seek: it only updates in-memory state, so avoid a spawn_blocking hop.
-    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
-        let status = handle_seek_request(&dev, &req, &mut fs_guard);
-        return DriverStep::complete(status);
-    }
+    let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+        handle_seek_request(&dev, &mut req, &mut fs_guard)
+    } else {
+        handle_fs_request(&dev, &mut req, &mut fs_guard)
+    };
 
-    let dev2 = dev.clone();
-    let req2 = req.clone();
-    let res = spawn_blocking(move || {
-        let fs: &mut Fs = &mut *fs_guard;
-        handle_fs_request(&dev2, &req2, fs)
-    })
-    .await;
-
-    DriverStep::complete(res)
+    req.complete(status)
 }

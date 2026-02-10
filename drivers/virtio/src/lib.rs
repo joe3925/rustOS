@@ -21,7 +21,7 @@ use kernel_api::irq::{
     IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
     irq_wait_ok,
 };
-use kernel_api::kernel_types::io::{IoType, IoVtable, Synchronization};
+use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::unmap_mmio_region;
@@ -30,7 +30,7 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{Request, RequestType};
+use kernel_api::request::{Request, RequestHandle, RequestHandleResult, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, RequestExt, println, request_handler};
@@ -151,12 +151,11 @@ async fn setup_msix_via_pci(
     buf[4] = vector;
     buf[5] = cpu;
 
-    let req = Request::new(
+    let req = RequestHandle::Stack(&mut Request::new(
         RequestType::DeviceControl(IOCTL_PCI_SETUP_MSIX),
         RequestData::from_boxed_bytes(buf.into_boxed_slice()),
-    );
-    let req = Arc::new(RwLock::new(req));
-    let status = pnp_forward_request_to_next_lower(dev.clone(), req.clone()).await;
+    ));
+    let (_, status) = pnp_forward_request_to_next_lower(dev.clone(), req).await;
 
     if status == DriverStatus::Success {
         Ok(())
@@ -166,31 +165,42 @@ async fn setup_msix_via_pci(
 }
 
 #[request_handler]
-async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let res_req = Arc::new(RwLock::new(Request::new_pnp(
-        PnpRequest {
-            minor_function: PnpMinorFunction::QueryResources,
-            relation: DeviceRelationType::TargetDeviceRelation,
-            id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            blob_out: Vec::new(),
-        },
-        RequestData::empty(),
-    )));
-    let qr_status = pnp_forward_request_to_next_lower(dev.clone(), res_req.clone()).await;
+async fn virtio_pnp_start<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let res_req = RequestHandle::Stack(
+        (&mut Request::new_pnp(
+            PnpRequest {
+                minor_function: PnpMinorFunction::QueryResources,
+                relation: DeviceRelationType::TargetDeviceRelation,
+                id_type: QueryIdType::CompatibleIds,
+                ids_out: Vec::new(),
+                data_out: RequestData::empty(),
+            },
+            RequestData::empty(),
+        )),
+    );
+    let (res_req, qr_status) = pnp_forward_request_to_next_lower(dev.clone(), res_req).await;
     if qr_status != DriverStatus::Success {
         println!("virtio-blk: QueryResources failed: {:?}", qr_status);
-        return DriverStep::complete(qr_status);
+        return req.complete(qr_status);
     }
 
-    let blob = { res_req.read().pnp.as_ref().unwrap().blob_out.clone() };
+    let blob = {
+        let r = res_req.read();
+        r.pnp
+            .as_ref()
+            .map(|p| p.data_out.as_slice().to_vec())
+            .unwrap_or_default()
+    };
     let resources = pci::parse_resources(&blob);
     let msix_cap = pci::find_msix_capability(&resources);
 
     let mapped_bars = pci::map_memory_bars(&resources);
     if mapped_bars.is_empty() {
         println!("virtio-blk: no memory BARs found");
-        return DriverStep::complete(DriverStatus::DeviceError);
+        return req.complete(DriverStatus::DeviceError);
     }
 
     let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
@@ -200,7 +210,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::DeviceError);
+            return req.complete(DriverStatus::DeviceError);
         }
     };
     let cfg_base = match kernel_api::memory::map_mmio_region(
@@ -213,7 +223,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::DeviceError);
+            return req.complete(DriverStatus::DeviceError);
         }
     };
 
@@ -225,7 +235,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::DeviceError);
+            return req.complete(DriverStatus::DeviceError);
         }
     };
 
@@ -238,7 +248,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::DeviceError);
+            return req.complete(DriverStatus::DeviceError);
         }
     };
 
@@ -250,7 +260,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::DeviceError);
+            return req.complete(DriverStatus::DeviceError);
         }
     };
 
@@ -354,7 +364,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unmap_mmio_region(va, sz);
         }
-        return DriverStep::complete(DriverStatus::DeviceError);
+        return req.complete(DriverStatus::DeviceError);
     }
 
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
@@ -373,7 +383,7 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return DriverStep::complete(DriverStatus::InsufficientResources);
+            return req.complete(DriverStatus::InsufficientResources);
         }
     };
 
@@ -405,11 +415,14 @@ async fn virtio_pnp_start(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> 
         inner.irq_ready.set_ready();
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
+async fn virtio_pnp_remove<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
         if let Some(inner) = dx.inner.get() {
             blk::reset_device(inner.common_cfg);
@@ -432,17 +445,20 @@ async fn virtio_pnp_remove(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -
         }
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn virtio_pnp_query_devrels(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+async fn virtio_pnp_query_devrels<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         create_child_pdo(&dev);
-        return DriverStep::complete(DriverStatus::Success);
+        return req.complete(DriverStatus::Success);
     }
-    DriverStep::Continue
+    req.cont()
 }
 
 fn create_child_pdo(parent: &Arc<DeviceObject>) {
@@ -550,60 +566,70 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 
 #[request_handler]
-pub async fn virtio_pdo_start(_dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+pub async fn virtio_pdo_start<'a>(
+    _dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn virtio_pdo_query_id(pdo: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let ty = { req.read().pnp.as_ref().unwrap().id_type };
-    let mut w = req.write();
-    let p = w.pnp.as_mut().unwrap();
-    match ty {
-        QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
-            p.ids_out.push("VirtIO\\Disk".into());
-            p.ids_out.push("GenDisk".into());
-        }
-        QueryIdType::DeviceId => {
-            p.ids_out.push("VirtIO\\Disk".into());
-        }
-        QueryIdType::InstanceId => {
-            p.ids_out.push(
-                pdo.dev_node
-                    .get()
-                    .unwrap()
-                    .upgrade()
-                    .unwrap()
-                    .instance_path
-                    .clone(),
-            );
-        }
-    }
-    DriverStep::complete(DriverStatus::Success)
-}
-
-#[request_handler]
-pub async fn virtio_pdo_query_resources(
+pub async fn virtio_pdo_query_id<'a>(
     pdo: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> DriverStep {
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let ty = { req.read().pnp.as_ref().unwrap().id_type };
+    let status = {
+        let mut w = req.write();
+        let p = w.pnp.as_mut().unwrap();
+        match ty {
+            QueryIdType::HardwareIds | QueryIdType::CompatibleIds => {
+                p.ids_out.push("VirtIO\\Disk".into());
+                p.ids_out.push("GenDisk".into());
+            }
+            QueryIdType::DeviceId => {
+                p.ids_out.push("VirtIO\\Disk".into());
+            }
+            QueryIdType::InstanceId => {
+                p.ids_out.push(
+                    pdo.dev_node
+                        .get()
+                        .unwrap()
+                        .upgrade()
+                        .unwrap()
+                        .instance_path
+                        .clone(),
+                );
+            }
+        }
+        DriverStatus::Success
+    };
+    req.complete(status)
+}
+
+#[request_handler]
+pub async fn virtio_pdo_query_resources<'a>(
+    pdo: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
-        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
     };
 
-    let mut w = req.write();
-    let Some(p) = w.pnp.as_mut() else {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+    let status = {
+        let mut w = req.write();
+        match w.pnp.as_mut() {
+            Some(p) => {
+                let di = &cdx.disk_info;
+                p.data_out = RequestData::from_t::<DiskInfo>(*di);
+                DriverStatus::Success
+            }
+            None => DriverStatus::InvalidParameter,
+        }
     };
 
-    let di = &cdx.disk_info;
-    let di_ptr = di as *const kernel_api::kernel_types::io::DiskInfo as *const u8;
-    let n = core::mem::size_of::<kernel_api::kernel_types::io::DiskInfo>();
-    let bytes = unsafe { core::slice::from_raw_parts(di_ptr, n) };
-    p.blob_out = bytes.to_vec();
-
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(status)
 }
 
 fn get_parent_inner(
@@ -626,29 +652,32 @@ fn get_parent_inner(
 }
 
 #[request_handler]
-pub async fn virtio_pdo_read(
+pub async fn virtio_pdo_read<'a>(
     pdo: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
+    mut req: RequestHandle<'a>,
     _buf_len: usize,
-) -> DriverStep {
+) -> RequestHandleResult<'a> {
     let (_parent, inner) = match get_parent_inner(&pdo) {
         Ok(v) => v,
-        Err(s) => return DriverStep::complete(s),
+        Err(s) => return req.complete(s),
     };
 
-    let (offset, len) = {
+    let (offset, len) = match {
         let r = req.read();
         match r.kind {
-            RequestType::Read { offset, len } => (offset, len),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+            RequestType::Read { offset, len } => Some((offset, len)),
+            _ => None,
         }
+    } {
+        Some(v) => v,
+        None => return req.complete(DriverStatus::InvalidParameter),
     };
 
     if len == 0 {
-        return DriverStep::complete(DriverStatus::Success);
+        return req.complete(DriverStatus::Success);
     }
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
     let sector = offset >> 9;
@@ -659,7 +688,7 @@ pub async fn virtio_pdo_read(
         .new_request(VIRTIO_BLK_T_IN, sector, len as u32)
     {
         Some(r) => r,
-        None => return DriverStep::complete(DriverStatus::InsufficientResources),
+        None => return req.complete(DriverStatus::InsufficientResources),
     };
 
     // Wait for IRQ subsystem to be ready
@@ -674,21 +703,18 @@ pub async fn virtio_pdo_read(
             }
             None => {
                 // io_req dropped here, returning slot to arena automatically
-                return DriverStep::complete(DriverStatus::InsufficientResources);
+                return req.complete(DriverStatus::InsufficientResources);
             }
         }
     };
     let _len = match wait_for_completion(inner, head).await {
         Ok(l) => l,
-        Err(e) => {
-            // io_req dropped here, returning slot to arena automatically
-            return DriverStep::complete(e);
-        }
+        Err(e) => return req.complete(e),
     };
 
     if io_req.status() != VIRTIO_BLK_S_OK {
         // io_req dropped here, returning slot to arena automatically
-        return DriverStep::complete(DriverStatus::DeviceError);
+        return req.complete(DriverStatus::DeviceError);
     }
 
     {
@@ -698,33 +724,36 @@ pub async fn virtio_pdo_read(
     }
 
     // io_req dropped here, returning slot to arena automatically
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn virtio_pdo_write(
+pub async fn virtio_pdo_write<'a>(
     pdo: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
+    mut req: RequestHandle<'a>,
     _buf_len: usize,
-) -> DriverStep {
+) -> RequestHandleResult<'a> {
     let (_parent, inner) = match get_parent_inner(&pdo) {
         Ok(v) => v,
-        Err(s) => return DriverStep::complete(s),
+        Err(s) => return req.complete(s),
     };
 
-    let (offset, len) = {
+    let (offset, len) = match {
         let r = req.read();
         match r.kind {
-            RequestType::Write { offset, len, .. } => (offset, len),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+            RequestType::Write { offset, len, .. } => Some((offset, len)),
+            _ => None,
         }
+    } {
+        Some(v) => v,
+        None => return req.complete(DriverStatus::InvalidParameter),
     };
 
     if len == 0 {
-        return DriverStep::complete(DriverStatus::Success);
+        return req.complete(DriverStatus::Success);
     }
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
+        return req.complete(DriverStatus::InvalidParameter);
     }
 
     let sector = offset >> 9;
@@ -735,7 +764,7 @@ pub async fn virtio_pdo_write(
         .new_request(VIRTIO_BLK_T_OUT, sector, len as u32)
     {
         Some(r) => r,
-        None => return DriverStep::complete(DriverStatus::InsufficientResources),
+        None => return req.complete(DriverStatus::InsufficientResources),
     };
 
     {
@@ -756,40 +785,43 @@ pub async fn virtio_pdo_write(
             }
             None => {
                 // io_req dropped here, returning slot to arena automatically
-                return DriverStep::complete(DriverStatus::InsufficientResources);
+                return req.complete(DriverStatus::InsufficientResources);
             }
         }
     };
 
     let _len = match wait_for_completion(inner, head).await {
         Ok(l) => l,
-        Err(e) => {
-            // io_req dropped here, returning slot to arena automatically
-            return DriverStep::complete(e);
-        }
+        Err(e) => return req.complete(e),
     };
 
     if io_req.status() != VIRTIO_BLK_S_OK {
         // io_req dropped here, returning slot to arena automatically
-        return DriverStep::complete(DriverStatus::DeviceError);
+        return req.complete(DriverStatus::DeviceError);
     }
 
     // io_req dropped here, returning slot to arena automatically
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn virtio_pdo_ioctl(_pdo: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
+pub async fn virtio_pdo_ioctl<'a>(
+    _pdo: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match {
         let r = req.read();
         match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+            RequestType::DeviceControl(c) => Some(c),
+            _ => None,
         }
+    } {
+        Some(c) => c,
+        None => return req.complete(DriverStatus::InvalidParameter),
     };
 
     match code {
-        IOCTL_BLOCK_FLUSH => DriverStep::complete(DriverStatus::Success),
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        IOCTL_BLOCK_FLUSH => req.complete(DriverStatus::Success),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
 }

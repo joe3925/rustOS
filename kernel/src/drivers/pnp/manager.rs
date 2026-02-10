@@ -1,5 +1,4 @@
 use super::driver_index::{self as idx, HwIndex};
-use super::request::IoTarget;
 use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::drivers::pnp::request::RequestExt;
@@ -18,11 +17,11 @@ use kernel_types::device::{
     DriverRuntime, DriverState, StackLayer,
 };
 use kernel_types::fs::Path;
-use kernel_types::io::IoVtable;
+use kernel_types::io::{IoTarget, IoVtable};
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
-use kernel_types::request::{Request, RequestData};
+use kernel_types::request::{Request, RequestData, RequestHandle, SharedRequest};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -740,20 +739,16 @@ impl PnpManager {
                 relation: DeviceRelationType::TargetDeviceRelation,
                 id_type: QueryIdType::CompatibleIds,
                 ids_out: Vec::new(),
-                blob_out: Vec::new(),
+                data_out: RequestData::empty(),
             };
             let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.add_completion(Self::start_io, ctx);
 
-            let req_arc = Arc::new(RwLock::new(start_request));
-
-            let target = IoTarget {
-                target_device: top_device,
-            };
-
-            self.send_request(target, req_arc).await;
+            let (_status, _handle) = self
+                .send_request(top_device, RequestHandle::Stack(&mut start_request))
+                .await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -779,19 +774,19 @@ impl PnpManager {
                     relation: DeviceRelationType::BusRelations,
                     id_type: QueryIdType::CompatibleIds,
                     ids_out: Vec::new(),
-                    blob_out: Vec::new(),
+                    data_out: RequestData::empty(),
                 };
                 let mut bus_enum_request = Request::new_pnp(pnp_payload, RequestData::empty());
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
                 bus_enum_request.add_completion(Self::process_enumerated_children, ctx);
 
-                let req_arc = Arc::new(RwLock::new(bus_enum_request));
+                // Use SharedRequest because this is spawned detached
+                let shared = SharedRequest::new(bus_enum_request);
 
-                let target = IoTarget {
-                    target_device: top_device,
-                };
                 spawn_detached(async move {
-                    let _ = (&*PNP_MANAGER).send_request(target, req_arc).await;
+                    let _ = (&*PNP_MANAGER)
+                        .send_request(top_device, RequestHandle::Shared(shared))
+                        .await;
                 });
             }
         } else {
@@ -904,16 +899,15 @@ impl PnpManager {
             relation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
-            blob_out: Vec::new(),
+            data_out: RequestData::empty(),
         };
 
         let mut req = Request::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.add_completion(Self::process_enumerated_children, ctx);
 
-        let tgt = IoTarget { target_device: top };
-
-        self.send_request(tgt, Arc::new(RwLock::new(req))).await
+        let (status, _handle) = self.send_request(top, RequestHandle::Stack(&mut req)).await;
+        status
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
@@ -948,11 +942,7 @@ impl PnpManager {
         for _ in 0..32 {
             let o = OBJECT_MANAGER.open(p.clone()).ok()?;
             match &o.payload {
-                ObjectPayload::Device(d) => {
-                    return Some(IoTarget {
-                        target_device: d.clone(),
-                    })
-                }
+                ObjectPayload::Device(d) => return Some(d.clone()),
                 ObjectPayload::Directory(_) => {
                     p = alloc::format!("{}\\Top", p);
                 }
@@ -965,25 +955,25 @@ impl PnpManager {
         None
     }
 
-    pub async fn send_request_via_symlink(
+    pub async fn send_request_via_symlink<'a>(
         &self,
         link_path: String,
-        req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+        handle: RequestHandle<'a>,
+    ) -> (DriverStatus, RequestHandle<'a>) {
         match self.resolve_targetio_from_symlink(link_path) {
-            Some(tgt) => self.send_request(tgt, req).await,
-            None => DriverStatus::NoSuchDevice,
+            Some(tgt) => self.send_request(tgt, handle).await,
+            None => (DriverStatus::NoSuchDevice, handle),
         }
     }
 
-    pub async fn send_request_to_stack_top(
+    pub async fn send_request_to_stack_top<'a>(
         &self,
-        dev_node_weak: &alloc::sync::Weak<DevNode>,
-        req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
+        dev_node_weak: alloc::sync::Weak<DevNode>,
+        handle: RequestHandle<'a>,
+    ) -> (DriverStatus, RequestHandle<'a>) {
         let dev_node = match dev_node_weak.upgrade() {
             Some(dn) => dn,
-            None => return DriverStatus::NoSuchDevice,
+            None => return (DriverStatus::NoSuchDevice, handle),
         };
 
         let target_device_opt = dev_node
@@ -994,20 +984,19 @@ impl PnpManager {
             .or_else(|| dev_node.get_pdo());
 
         if let Some(target_device) = target_device_opt {
-            let target = IoTarget { target_device };
-            self.send_request(target, req).await
+            self.send_request(target_device, handle).await
         } else {
-            DriverStatus::NoSuchDevice
+            (DriverStatus::NoSuchDevice, handle)
         }
     }
 
-    pub async fn ioctl_via_symlink(
+    pub async fn ioctl_via_symlink<'a>(
         &self,
         link_path: String,
         _control_code: u32,
-        req: Arc<RwLock<Request>>,
-    ) -> DriverStatus {
-        self.send_request_via_symlink(link_path, req).await
+        handle: RequestHandle<'a>,
+    ) -> (DriverStatus, RequestHandle<'a>) {
+        self.send_request_via_symlink(link_path, handle).await
     }
 
     pub fn add_class_listener(
@@ -1129,9 +1118,7 @@ impl PnpManager {
         let om_path = alloc::format!("\\Device\\{}\\Top", instance_path);
         if let Ok(o) = OBJECT_MANAGER.open(om_path) {
             if let ObjectPayload::Device(d) = &o.payload {
-                return Some(IoTarget {
-                    target_device: d.clone(),
-                });
+                return Some(d.clone());
             }
         }
         self.dev_root
@@ -1142,9 +1129,7 @@ impl PnpManager {
                     .as_ref()
                     .and_then(|s| s.get_top_device_object())
             })
-            .map(|dev_obj| IoTarget {
-                target_device: dev_obj,
-            })
+            .map(|dev_obj| dev_obj)
     }
 
     pub async fn create_devnode_over_pdo_with_function(
@@ -1285,17 +1270,14 @@ impl PnpManager {
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
-            blob_out: Vec::new(),
+            data_out: RequestData::empty(),
         };
         let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dn.clone()) as usize;
         start_request.add_completion(Self::start_io, ctx);
 
-        let tgt = IoTarget {
-            target_device: top.clone(),
-        };
-
-        self.send_request(tgt, Arc::new(RwLock::new(start_request)))
+        let (_status, _handle) = self
+            .send_request(top.clone(), RequestHandle::Stack(&mut start_request))
             .await;
 
         dn.set_state(DevNodeState::Started);

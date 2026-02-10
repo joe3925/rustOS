@@ -3,12 +3,13 @@ use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
-use kernel_types::request::{Request, RequestType, TraversalPolicy};
+use kernel_types::io::IoTarget;
+use kernel_types::request::{Request, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::drivers::pnp::request::{IoTarget, RequestExt};
+use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
 use kernel_types::{
@@ -140,15 +141,19 @@ impl Vfs {
         TParam: 'static,
         TResult: 'static,
     {
-        let req = Arc::new(RwLock::new(
-            Request::new(RequestType::Fs(op), RequestData::from_t(param))
-                .set_traversal_policy(TraversalPolicy::ForwardLower),
-        ));
-        let status = if let Some(tgt) = target {
-            PNP_MANAGER.send_request(tgt, req.clone()).await
+        let mut req = Request::new(RequestType::Fs(op), RequestData::from_t(param))
+            .set_traversal_policy(TraversalPolicy::ForwardLower);
+
+        let (status, mut handle) = if let Some(tgt) = target {
+            PNP_MANAGER
+                .send_request(tgt, RequestHandle::Stack(&mut req))
+                .await
         } else {
             PNP_MANAGER
-                .send_request_via_symlink(volume_symlink.to_string(), req.clone())
+                .send_request_via_symlink(
+                    volume_symlink.to_string(),
+                    RequestHandle::Stack(&mut req),
+                )
                 .await
         };
         if status != DriverStatus::Success {
@@ -156,7 +161,8 @@ impl Vfs {
             return Err(status);
         }
 
-        let ret = req
+        // Get the result from the handle (which may still be Stack or promoted to Shared)
+        let ret = handle
             .write()
             .take_data::<TResult>()
             .ok_or(DriverStatus::InvalidParameter);
@@ -279,8 +285,14 @@ impl Vfs {
                 DriverStatus::Success,
             )
         } else if has_create {
-            let (try_open, st) =
-                call_open(self, &symlink, fs_path.clone(), p.flags.clone(), p.write_through).await;
+            let (try_open, st) = call_open(
+                self,
+                &symlink,
+                fs_path.clone(),
+                p.flags.clone(),
+                p.write_through,
+            )
+            .await;
             if st != DriverStatus::Success {
                 return (try_open, st);
             }

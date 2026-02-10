@@ -8,11 +8,10 @@ use kernel_api::{
     device::{DeviceInit, DeviceObject, DriverObject},
     pnp::{DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add},
     println,
-    request::Request,
+    request::RequestHandle,
     request_handler,
     status::DriverStatus,
 };
-use spin::RwLock;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -27,7 +26,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    driver: Arc<DriverObject>,
+    _driver: Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
@@ -37,10 +36,11 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware(
+pub async fn bus_driver_prepare_hardware<'a>(
     device: Arc<DeviceObject>,
-    _request: Arc<RwLock<Request>>,
-) -> DriverStep {
+    request: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
-    DriverStep::complete(DriverStatus::Success)
+    let _ = device; // suppress unused for now
+    request.complete(DriverStatus::Success)
 }

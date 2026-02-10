@@ -38,7 +38,7 @@ use kernel_api::{
     },
     println,
     reg::{self, switch_to_vfs_async},
-    request::{Request, RequestType, TraversalPolicy},
+    request::{Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy},
     request_handler,
     runtime::{spawn, spawn_detached},
     status::{Data, DriverStatus, RegError},
@@ -137,24 +137,24 @@ pub extern "win64" fn volclass_device_add(
 }
 
 #[request_handler]
-pub async fn volclass_start(dev: Arc<DeviceObject>, _request: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn volclass_start<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
     spawn_detached(mount_if_unmounted(dev));
-    DriverStep::Continue
+    req.cont()
 }
 
 #[request_handler]
-pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
-        let r = req.read();
-        match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => {
-                drop(r);
-                return DriverStep::complete(DriverStatus::NotImplemented);
-            }
-        }
+pub async fn volclass_ioctl<'a>(
+    dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match { req.read().kind } {
+        RequestType::DeviceControl(c) => c,
+        _ => return req.complete(DriverStatus::NotImplemented),
     };
 
     match code {
@@ -173,40 +173,39 @@ pub async fn volclass_ioctl(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
-            DriverStep::complete(DriverStatus::Success)
+            req.complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
             w.set_data_bytes(build_status_blob(&dev));
-            DriverStep::complete(DriverStatus::Success)
+            drop(w);
+            req.complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev).await;
             // Enumerate all volumes and assign labels on-demand
             enumerate_and_assign_all_labels().await;
-            DriverStep::complete(DriverStatus::Success)
+            req.complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
             w.set_data_bytes(list_fs_blob());
-            DriverStep::complete(DriverStatus::Success)
+            drop(w);
+            req.complete(DriverStatus::Success)
         }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
 }
 
 #[request_handler]
-pub async fn volclass_ctrl_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    let code = {
-        let r = req.read();
-        match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => {
-                drop(r);
-                return DriverStep::complete(DriverStatus::NotImplemented);
-            }
-        }
+pub async fn volclass_ctrl_ioctl<'a>(
+    _dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    let code = match { req.read().kind } {
+        RequestType::DeviceControl(c) => c,
+        _ => return req.complete(DriverStatus::NotImplemented),
     };
 
     match code {
@@ -226,12 +225,12 @@ pub async fn volclass_ctrl_ioctl(_dev: Arc<DeviceObject>, req: Arc<RwLock<Reques
                         let _ = refresh_fs_registry_from_registry().await;
                         spawn_detached(rescan_all_volumes());
                     }
-                    DriverStep::complete(DriverStatus::Success)
+                    req.complete(DriverStatus::Success)
                 }
-                _ => DriverStep::complete(DriverStatus::InvalidParameter),
+                _ => req.complete(DriverStatus::InvalidParameter),
             }
         }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => req.complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -309,36 +308,34 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
 /// Returns None if the volume lacks a valid GPT GUID.
 async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
     let vol_target = parent_fdo.clone();
-    let req = Arc::new(RwLock::new(
-        Request::new_pnp(
-            PnpRequest {
-                minor_function: PnpMinorFunction::QueryResources,
-                relation: DeviceRelationType::TargetDeviceRelation,
-                id_type: QueryIdType::CompatibleIds,
-                ids_out: Vec::new(),
-                blob_out: Vec::new(),
-            },
-            RequestData::empty(),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower),
-    ));
-
-    kernel_api::pnp::pnp_send_request(vol_target, req.clone()).await;
-
-    let mut w = req.write();
-    if w.status != DriverStatus::Success {
+    let request = &mut Request::new_pnp(
+        PnpRequest {
+            minor_function: PnpMinorFunction::QueryResources,
+            relation: DeviceRelationType::TargetDeviceRelation,
+            id_type: QueryIdType::CompatibleIds,
+            ids_out: Vec::with_capacity(0),
+            data_out: RequestData::empty(),
+        },
+        RequestData::empty(),
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    let req = RequestHandle::Stack(request);
+    let (req, status) = kernel_api::pnp::pnp_send_request(vol_target, req).await;
+    if status != DriverStatus::Success {
         return None;
     }
 
-    // PartitionInfo is returned in the PnP payload blob_out for QueryResources
+    // PartitionInfo is returned in the PnP payload data_out for QueryResources
     let pi = {
-        let pnp = w.pnp.as_ref()?;
-        let blob = &pnp.blob_out;
-        if blob.len() != core::mem::size_of::<kernel_api::kernel_types::io::PartitionInfo>() {
+        let r = req.read();
+        let pnp = r.pnp.as_ref()?;
+        if let Some(pi) = pnp
+            .data_out
+            .view::<kernel_api::kernel_types::io::PartitionInfo>()
+        {
+            pi.clone()
+        } else {
             return None;
-        }
-        unsafe {
-            ptr::read_unaligned(blob.as_ptr() as *const kernel_api::kernel_types::io::PartitionInfo)
         }
     };
     let ge = pi.gpt_entry?;
@@ -408,8 +405,8 @@ async fn try_bind_filesystems_for_parent_fdo(
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
-        let req = Arc::new(RwLock::new(
-            Request::new(
+        let req = RequestHandle::Stack(
+            &mut Request::new(
                 RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
                 RequestData::from_t(FsIdentify {
                     volume_fdo: parent_fdo.clone(),
@@ -418,10 +415,10 @@ async fn try_bind_filesystems_for_parent_fdo(
                 }),
             )
             .set_traversal_policy(TraversalPolicy::ForwardLower),
-        ));
+        );
 
-        let err =
-            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req.clone()).await;
+        let (mut req, err) =
+            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, req).await;
         if err != DriverStatus::Success {
             continue;
         }
@@ -577,12 +574,12 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         write_through: false,
         path: Path::from_string(path),
     };
-    let req = Arc::new(RwLock::new(
-        Request::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params))
+    let req = RequestHandle::Stack(
+        &mut Request::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params))
             .set_traversal_policy(TraversalPolicy::ForwardLower),
-    ));
+    );
 
-    let err = unsafe { pnp_send_request_via_symlink(public_link.to_string(), req.clone()).await };
+    let (mut req, err) = pnp_send_request_via_symlink(public_link.to_string(), req).await;
 
     let mut r = req.write();
     if r.status != DriverStatus::Success {

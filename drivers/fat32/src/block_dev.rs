@@ -1,13 +1,12 @@
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
 use core::cmp::min;
-use spin::RwLock;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     RequestExt,
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
-    request::{Request, RequestType, TraversalPolicy},
+    request::{Request, RequestHandle, RequestType, SharedRequest, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
@@ -22,8 +21,8 @@ pub struct BlockDev {
     pos: u64,
     /// Small buffer only for unaligned partial-sector reads/writes
     sector_buf: Vec<u8>,
-    read_req: Arc<RwLock<Request>>,
-    write_req: Arc<RwLock<Request>>,
+    read_req: SharedRequest,
+    write_req: SharedRequest,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -57,8 +56,8 @@ impl BlockDev {
             total_sectors,
             pos: 0,
             sector_buf: vec![0u8; sector_size as usize],
-            read_req: Arc::new(RwLock::new(r)),
-            write_req: Arc::new(RwLock::new(w)),
+            read_req: SharedRequest::new(r),
+            write_req: SharedRequest::new(w),
         }
     }
 
@@ -95,7 +94,7 @@ impl BlockDev {
     /// Read directly into a borrowed buffer (zero-copy for aligned reads)
     async fn pnp_read_borrowed(
         volume: &IoTarget,
-        read_req: &Arc<RwLock<Request>>,
+        read_req: &SharedRequest,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<(), DriverStatus> {
@@ -106,12 +105,13 @@ impl BlockDev {
             g.data = unsafe { RequestData::from_borrowed_mut(buf) };
         }
 
-        pnp_send_request(volume.clone(), read_req.clone()).await;
+        let (mut handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(read_req.clone())).await;
 
-        let mut g = read_req.write();
-        let st = g.status;
-        // Reclaim the borrowed pointer (no-op, just prevents dropper issues)
-        let _ = g.data.take_bytes_borrowed();
+        {
+            let mut g = handle.write();
+            // Reclaim the borrowed pointer (no-op, just prevents dropper issues)
+            let _ = g.data.take_bytes_borrowed();
+        }
 
         if st == DriverStatus::Success {
             Ok(())
@@ -123,7 +123,7 @@ impl BlockDev {
     /// Write directly from a borrowed buffer (zero-copy for aligned writes)
     async fn pnp_write_borrowed(
         volume: &IoTarget,
-        write_req: &Arc<RwLock<Request>>,
+        write_req: &SharedRequest,
         offset: u64,
         buf: &[u8],
     ) -> Result<(), DriverStatus> {
@@ -138,11 +138,12 @@ impl BlockDev {
             g.data = unsafe { RequestData::from_borrowed_const(buf) };
         }
 
-        pnp_send_request(volume.clone(), write_req.clone()).await;
+        let (mut handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(write_req.clone())).await;
 
-        let mut g = write_req.write();
-        let st = g.status;
-        let _ = g.data.take_bytes_borrowed();
+        {
+            let mut g = handle.write();
+            let _ = g.data.take_bytes_borrowed();
+        }
 
         if st == DriverStatus::Success {
             Ok(())

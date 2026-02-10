@@ -14,15 +14,16 @@ use alloc::{
     vec::Vec,
 };
 use kernel_types::{
-    async_ffi::{FfiFuture, FutureExt},
+    async_ffi::{BorrowingFfiFuture, FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::{OpenFlags, Path},
+    io::IoTarget,
     irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
-    request::Request,
+    request::{Request, RequestHandle, RequestHandleResult, SharedRequest},
     status::{Data, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
@@ -37,10 +38,7 @@ use crate::{
     drivers::{
         driver_install::DriverError,
         interrupt_index::{self, current_cpu_id},
-        pnp::{
-            manager::PNP_MANAGER,
-            request::{DpcFn, IoTarget},
-        },
+        pnp::{manager::PNP_MANAGER, request::DpcFn},
         ACPI::{ACPIImpl, ACPI_TABLES},
     },
     file_system::{
@@ -60,8 +58,9 @@ use crate::{
         self,
         global_async::GlobalAsyncExecutor,
         runtime::runtime::{
-            block_on as kernel_block_on, spawn as kernel_spawn, spawn_blocking as kernel_spawn_blocking,
-            spawn_detached as kernel_spawn_detached, BLOCKING_POOL, RUNTIME_POOL,
+            block_on as kernel_block_on, spawn as kernel_spawn,
+            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
+            BLOCKING_POOL, RUNTIME_POOL,
         },
         scheduler::{TaskError, SCHEDULER},
         task::Task,
@@ -271,31 +270,54 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_lower(
+pub extern "win64" fn pnp_forward_request_to_next_lower<'a>(
     from: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
-    PNP_MANAGER.send_request_to_next_lower(from, req).into_ffi()
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
+    async move {
+        let (status, handle) = PNP_MANAGER.send_request_to_next_lower(from, handle).await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
+    }
+    .into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_upper(
+pub extern "win64" fn pnp_forward_request_to_next_upper<'a>(
     from: Arc<DeviceObject>,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
-    PNP_MANAGER.send_request_to_next_upper(from, req).into_ffi()
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
+    async move {
+        let (status, handle) = PNP_MANAGER.send_request_to_next_upper(from, handle).await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
+    }
+    .into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request(
+pub extern "win64" fn pnp_send_request<'a>(
     target: IoTarget,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
-    PNP_MANAGER.send_request(target, req).into_ffi()
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
+    async move {
+        let (status, handle) = PNP_MANAGER.send_request(target, handle).await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
+    }
+    .into_ffi()
 }
 
-pub extern "win64" fn pnp_complete_request(req: Arc<RwLock<Request>>) -> DriverStatus {
-    PNP_MANAGER.complete_request(&req)
+pub extern "win64" fn pnp_complete_request<'a>(
+    handle: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    PNP_MANAGER.complete_request(handle)
 }
 
 pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
@@ -408,24 +430,38 @@ pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request_via_symlink(
+pub extern "win64" fn pnp_send_request_via_symlink<'a>(
     link_path: String,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
-    PNP_MANAGER
-        .send_request_via_symlink(link_path, req)
-        .into_ffi()
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
+    async move {
+        let (status, handle) = PNP_MANAGER
+            .send_request_via_symlink(link_path, handle)
+            .await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
+    }
+    .into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_ioctl_via_symlink(
+pub extern "win64" fn pnp_ioctl_via_symlink<'a>(
     link_path: String,
     control_code: u32,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
-    PNP_MANAGER
-        .ioctl_via_symlink(link_path, control_code, req)
-        .into_ffi()
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
+    async move {
+        let (status, handle) = PNP_MANAGER
+            .ioctl_via_symlink(link_path, control_code, handle)
+            .await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
+    }
+    .into_ffi()
 }
 
 #[unsafe(no_mangle)]
@@ -491,14 +527,18 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
 }
 
 #[no_mangle]
-pub extern "win64" fn pnp_send_request_to_stack_top(
+pub extern "win64" fn pnp_send_request_to_stack_top<'a>(
     dev_node_weak: alloc::sync::Weak<DevNode>,
-    req: Arc<RwLock<Request>>,
-) -> FfiFuture<DriverStatus> {
+    handle: RequestHandle<'a>,
+) -> BorrowingFfiFuture<'a, RequestHandleResult<'a>> {
     async move {
-        PNP_MANAGER
-            .send_request_to_stack_top(&dev_node_weak, req)
-            .await
+        let (status, handle) = PNP_MANAGER
+            .send_request_to_stack_top(dev_node_weak, handle)
+            .await;
+        RequestHandleResult {
+            step: kernel_types::pnp::DriverStep::Complete { status },
+            handle,
+        }
     }
     .into_ffi()
 }

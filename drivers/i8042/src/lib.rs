@@ -16,12 +16,10 @@ use kernel_api::{
         DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
     },
-    print, println,
-    request::Request,
+    request::{RequestHandle, RequestHandleResult},
     request_handler,
     status::DriverStatus,
 };
-use spin::RwLock;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
@@ -68,7 +66,10 @@ pub extern "win64" fn ps2_device_add(
 }
 
 #[request_handler]
-pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn ps2_start<'a>(
+    dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     if let Ok(mut ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -76,32 +77,33 @@ pub async fn ps2_start(dev: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> Dr
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
-        return DriverStep::complete(DriverStatus::NoSuchDevice);
+        return req.complete(DriverStatus::NoSuchDevice);
     }
-    DriverStep::Continue
+    req.cont()
 }
 
 #[request_handler]
-pub async fn ps2_query_devrels(device: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn ps2_query_devrels<'a>(
+    device: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
-        return DriverStep::complete(DriverStatus::NotImplemented);
+        return req.complete(DriverStatus::NotImplemented);
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return req.complete(DriverStatus::NoSuchDevice);
         }
     };
 
     let ext = match device.try_devext::<DevExt>() {
         Ok(g) => g,
         Err(_) => {
-            req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStep::complete(DriverStatus::NoSuchDevice);
+            return req.complete(DriverStatus::NoSuchDevice);
         }
     };
 
@@ -128,7 +130,7 @@ pub async fn ps2_query_devrels(device: Arc<DeviceObject>, req: Arc<RwLock<Reques
         );
     }
 
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 fn make_child_pdo(
@@ -172,68 +174,69 @@ fn make_child_pdo(
 }
 
 #[request_handler]
-async fn ps2_child_query_id(dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+async fn ps2_child_query_id<'a>(
+    dev: Arc<DeviceObject>,
+    mut req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
-        Err(_) => {
-            req.write().status = DriverStatus::NoSuchDevice;
-            return DriverStep::complete(DriverStatus::Success);
-        }
+        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
     };
 
-    let mut r = req.write();
-    let p = r.pnp.as_mut().unwrap();
+    {
+        let mut r = req.write();
+        let p = r.pnp.as_mut().unwrap();
 
-    match p.id_type {
-        QueryIdType::HardwareIds => {
-            if is_kbd {
-                p.ids_out.push("PS2\\Keyboard".into());
-                p.ids_out.push("ACPI\\PNP0303".into());
-            } else {
-                p.ids_out.push("PS2\\Mouse".into());
-                p.ids_out.push("ACPI\\PNP0F13".into());
-            }
-            r.status = DriverStatus::Success;
-        }
-        QueryIdType::CompatibleIds => {
-            if is_kbd {
-                p.ids_out.push("INPUT\\Keyboard".into());
-                p.ids_out.push("INPUT\\GenericKbd".into());
-            } else {
-                p.ids_out.push("INPUT\\Pointer".into());
-                p.ids_out.push("INPUT\\GenericMouse".into());
-            }
-            r.status = DriverStatus::Success;
-        }
-        QueryIdType::DeviceId => {
-            p.ids_out.push(
+        match p.id_type {
+            QueryIdType::HardwareIds => {
                 if is_kbd {
-                    "PS2\\Keyboard"
+                    p.ids_out.push("PS2\\Keyboard".into());
+                    p.ids_out.push("ACPI\\PNP0303".into());
                 } else {
-                    "PS2\\Mouse"
+                    p.ids_out.push("PS2\\Mouse".into());
+                    p.ids_out.push("ACPI\\PNP0F13".into());
                 }
-                .into(),
-            );
-            r.status = DriverStatus::Success;
-        }
-        QueryIdType::InstanceId => {
-            p.ids_out.push(
+            }
+            QueryIdType::CompatibleIds => {
                 if is_kbd {
-                    "\\I8042\\Kbd0"
+                    p.ids_out.push("INPUT\\Keyboard".into());
+                    p.ids_out.push("INPUT\\GenericKbd".into());
                 } else {
-                    "\\I8042\\Mouse0"
+                    p.ids_out.push("INPUT\\Pointer".into());
+                    p.ids_out.push("INPUT\\GenericMouse".into());
                 }
-                .into(),
-            );
-            r.status = DriverStatus::Success;
+            }
+            QueryIdType::DeviceId => {
+                p.ids_out.push(
+                    if is_kbd {
+                        "PS2\\Keyboard"
+                    } else {
+                        "PS2\\Mouse"
+                    }
+                    .into(),
+                );
+            }
+            QueryIdType::InstanceId => {
+                p.ids_out.push(
+                    if is_kbd {
+                        "\\I8042\\Kbd0"
+                    } else {
+                        "\\I8042\\Mouse0"
+                    }
+                    .into(),
+                );
+            }
         }
     }
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn ps2_child_start(_dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
-    DriverStep::complete(DriverStatus::Success)
+async fn ps2_child_start<'a>(
+    _dev: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
+    req.complete(DriverStatus::Success)
 }
 
 const I8042_DATA: u16 = 0x60;

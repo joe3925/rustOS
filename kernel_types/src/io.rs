@@ -1,13 +1,9 @@
-use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
-use crate::pnp::DriverStep;
-use crate::request::{Request, RequestType};
-use crate::status::DriverStatus;
+use crate::request::{RequestHandle, RequestHandleResult, RequestType};
 use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
-use spin::RwLock;
 pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]
@@ -94,14 +90,18 @@ impl IoType {
     }
 
     #[inline]
-    pub async fn invoke(&self, dev: Arc<DeviceObject>, req: Arc<RwLock<Request>>) -> DriverStep {
+    pub async fn invoke<'a>(
+        &self,
+        dev: Arc<DeviceObject>,
+        handle: RequestHandle<'a>,
+    ) -> RequestHandleResult<'a> {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {
-                let len = req.read().data.len();
-                h(dev, req, len).await
+                let len = handle.read().data.len();
+                h(dev, handle, len).await
             }
-            IoType::DeviceControl(h) => h(dev, req).await,
-            IoType::Fs(h) => h(dev, req).await,
+            IoType::DeviceControl(h) => h(dev, handle).await,
+            IoType::Fs(h) => h(dev, handle).await,
         }
     }
 

@@ -10,8 +10,6 @@ mod pdo;
 use ::aml::{AmlContext, AmlName, DebugVerbosity, LevelType};
 use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
-use core::sync::atomic::Ordering;
-use core::{intrinsics::size_of, mem, ptr};
 use dev_ext::DevExt;
 use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::IoVtable;
@@ -21,12 +19,12 @@ use kernel_api::pnp::{
     DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::Request;
+use kernel_api::request::RequestHandle;
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
 use kernel_api::{println, request_handler};
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -60,10 +58,10 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware(
+pub async fn bus_driver_prepare_hardware<'a>(
     device: Arc<DeviceObject>,
-    _req: Arc<RwLock<Request>>,
-) -> DriverStep {
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
 
@@ -121,13 +119,13 @@ pub async fn bus_driver_prepare_hardware(
     .await;
 
     let Ok(aml_ctx) = parsed else {
-        return DriverStep::Continue;
+        return req.cont();
     };
 
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
     dev_ext.ctx.call_once(|| Arc::new(RwLock::new(aml_ctx)));
 
-    DriverStep::Continue
+    req.cont()
 }
 pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
     let offset = paddr & (PAGE_SIZE - 1);
@@ -148,7 +146,10 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 #[request_handler]
-pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>) -> DriverStep {
+pub async fn enumerate_bus<'a>(
+    device: Arc<DeviceObject>,
+    req: RequestHandle<'a>,
+) -> RequestHandleResult<'a> {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 
     let parent_dev_node = device
@@ -187,7 +188,7 @@ pub async fn enumerate_bus(device: Arc<DeviceObject>, _req: Arc<RwLock<Request>>
     }
     create_synthetic_i8042_pdo(&parent_dev_node);
 
-    DriverStep::complete(DriverStatus::Success)
+    req.complete(DriverStatus::Success)
 }
 fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
     let ids = DeviceIds {
