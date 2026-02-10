@@ -7,6 +7,7 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
+    alloc::Layout,
     mem::{MaybeUninit, align_of, size_of},
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -27,10 +28,10 @@ const INLINE_ALIGN: usize = 8;
 enum StorageMode {
     /// Data is stored inline in the `inline` buffer
     Inline = 0,
-    /// Data is heap-allocated in `heap`
-    Heap = 1,
-    /// Data is borrowed from an external source (uses heap field but not owned)
-    Borrowed = 2,
+    /// Data is heap-allocated as typed data (raw ptr + Layout for deallocation)
+    HeapTyped = 1,
+    /// Data is heap-allocated as raw bytes (from Box<[u8]>, reconstruct on drop)
+    HeapBytes = 2,
 }
 
 /// Aligned inline buffer for small data
@@ -64,37 +65,48 @@ impl core::fmt::Debug for InlineBuffer {
     }
 }
 
-/// Dropper function signature - takes pointer, size, and storage mode
-type DropperFn = fn(*mut u8, usize, StorageMode);
+/// Dropper function signature - only does drop_in_place, never deallocates
+type DropperFn = fn(*mut u8);
 
-fn box_to_bytes<T>(b: Box<T>) -> Box<[u8]> {
-    let len = size_of::<T>();
-    let ptr = Box::into_raw(b) as *mut u8;
-    unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) }
-}
+// TODO: Consider adding a safe zero-copy borrowed mode using raw pointer + PhantomData
+// lifetime tracking to avoid memory copies on I/O operations. Current approach removes
+// borrowed mode entirely and copies data, which is safe but has overhead.
 
-unsafe fn bytes_to_box<T>(b: Box<[u8]>) -> Box<T> {
-    debug_assert_eq!(b.len(), size_of::<T>());
-    let ptr = Box::into_raw(b) as *mut u8 as *mut T;
-    Box::from_raw(ptr)
-}
-
-#[derive(Debug)]
 #[repr(C)]
 pub struct RequestData {
     /// Inline buffer for small data (always present, may be unused)
     inline: InlineBuffer,
-    /// Heap storage for large data (None when using inline)
-    heap: Option<Box<[u8]>>,
+    /// Raw heap pointer (valid when mode is HeapTyped or HeapBytes)
+    heap_ptr: *mut u8,
+    /// Layout of the heap allocation (only used for HeapTyped mode)
+    heap_layout: Layout,
     /// Type tag for runtime type checking
     tag: Option<u64>,
-    /// Custom drop function that handles both inline and heap cases
+    /// Custom drop function that runs T's destructor (drop_in_place only, no dealloc)
     dropper: DropperFn,
-    /// Size of contained data
+    /// Size of contained data in bytes
     size: usize,
     /// Storage mode indicator
     mode: StorageMode,
 }
+
+impl core::fmt::Debug for RequestData {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RequestData")
+            .field("tag", &self.tag)
+            .field("size", &self.size)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: RequestData owns its heap allocation exclusively. The raw pointer is only
+// used internally and never escapes. The data pointed to is either:
+// - HeapTyped: allocated via alloc::alloc, exclusively owned
+// - HeapBytes: from Box::into_raw, exclusively owned
+// Both cases ensure exclusive ownership, making Send/Sync safe.
+unsafe impl Send for RequestData {}
+unsafe impl Sync for RequestData {}
 // TODO: better hashing is probably possible to reduce the case where 2 types have the same name.
 #[inline]
 pub const fn type_tag<T: 'static>() -> u64 {
@@ -113,13 +125,14 @@ pub const fn type_tag<T: 'static>() -> u64 {
 }
 
 /// No-op dropper for raw bytes or empty data
-fn noop_dropper(_: *mut u8, _: usize, _: StorageMode) {}
+fn noop_dropper(_: *mut u8) {}
 
 impl RequestData {
     pub fn empty() -> Self {
         Self {
             inline: InlineBuffer::new(),
-            heap: None,
+            heap_ptr: null_mut(),
+            heap_layout: Layout::new::<()>(),
             tag: None,
             dropper: noop_dropper,
             size: 0,
@@ -134,7 +147,8 @@ impl RequestData {
             // Copy to inline buffer
             let mut result = Self {
                 inline: InlineBuffer::new(),
-                heap: None,
+                heap_ptr: null_mut(),
+                heap_layout: Layout::new::<()>(),
                 tag: None,
                 dropper: noop_dropper,
                 size,
@@ -148,123 +162,36 @@ impl RequestData {
 
             result
         } else {
-            // Keep as heap allocation
+            // Keep as heap allocation - store raw pointer from Box
+            let ptr = Box::into_raw(bytes) as *mut u8;
+
             Self {
                 inline: InlineBuffer::new(),
-                heap: Some(bytes),
+                heap_ptr: ptr,
+                heap_layout: Layout::new::<()>(), // Not used for HeapBytes
                 tag: None,
                 dropper: noop_dropper,
                 size,
-                mode: StorageMode::Heap,
+                mode: StorageMode::HeapBytes,
             }
         }
-    }
-
-    /// Create a RequestData that borrows from a mutable slice.
-    ///
-    /// # Safety
-    /// The caller must ensure:
-    /// - The slice outlives the RequestData
-    /// - The RequestData is not dropped normally (use `take_bytes_borrowed` to reclaim)
-    /// - No other code tries to deallocate the underlying buffer
-    #[inline]
-    pub unsafe fn from_borrowed_mut(slice: &mut [u8]) -> Self {
-        let len = slice.len();
-        let ptr = slice.as_mut_ptr();
-        // Create a fake Box that points to the borrowed slice
-        let fake_box = unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) };
-        Self {
-            inline: InlineBuffer::new(),
-            heap: Some(fake_box),
-            tag: None,
-            dropper: noop_dropper,
-            size: len,
-            mode: StorageMode::Borrowed,
-        }
-    }
-
-    /// Create a RequestData that borrows from a const slice.
-    ///
-    /// # Safety
-    /// The caller must ensure:
-    /// - The slice outlives the RequestData
-    /// - The RequestData is not dropped normally (use `take_bytes_borrowed` to reclaim)
-    /// - No other code tries to deallocate the underlying buffer
-    /// - The data is not mutated through this RequestData
-    #[inline]
-    pub unsafe fn from_borrowed_const(slice: &[u8]) -> Self {
-        let len = slice.len();
-        let ptr = slice.as_ptr() as *mut u8;
-        // Create a fake Box that points to the borrowed slice
-        let fake_box = unsafe { Box::from_raw(core::slice::from_raw_parts_mut(ptr, len)) };
-        Self {
-            inline: InlineBuffer::new(),
-            heap: Some(fake_box),
-            tag: None,
-            dropper: noop_dropper,
-            size: len,
-            mode: StorageMode::Borrowed,
-        }
-    }
-
-    /// Reclaim borrowed bytes without running the dropper.
-    /// Use this to "return" the borrowed slice before the RequestData is dropped.
-    #[inline]
-    pub fn take_bytes_borrowed(&mut self) -> (*mut u8, usize) {
-        debug_assert_eq!(
-            self.mode,
-            StorageMode::Borrowed,
-            "take_bytes_borrowed called on non-borrowed data"
-        );
-
-        let ptr = match &mut self.heap {
-            Some(b) => b.as_mut_ptr(),
-            None => null_mut(),
-        };
-        let len = self.size;
-
-        // Forget the fake box to prevent deallocation
-        if let Some(old) = self.heap.take() {
-            core::mem::forget(old);
-        }
-
-        // Reset to empty state
-        self.size = 0;
-        self.mode = StorageMode::Inline;
-        self.dropper = noop_dropper;
-
-        (ptr, len)
     }
 
     pub fn from_t<T: 'static>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
 
-        /// Typed dropper that properly handles Drop for T
-        fn typed_dropper<T>(ptr: *mut u8, _size: usize, mode: StorageMode) {
-            match mode {
-                StorageMode::Inline => {
-                    // Drop in place - memory is owned by inline buffer
-                    unsafe { core::ptr::drop_in_place(ptr as *mut T) };
-                }
-                StorageMode::Heap => {
-                    // Reconstruct and drop the Box<T>
-                    unsafe {
-                        let boxed = Box::from_raw(ptr as *mut T);
-                        drop(boxed);
-                    }
-                }
-                StorageMode::Borrowed => {
-                    // No-op: borrowed data is not owned
-                }
-            }
+        /// Typed dropper that only runs T's destructor (no deallocation)
+        fn typed_dropper<T>(ptr: *mut u8) {
+            unsafe { core::ptr::drop_in_place(ptr as *mut T) };
         }
 
         if size <= INLINE_THRESHOLD && align <= INLINE_ALIGN {
             // INLINE PATH: Copy value into inline buffer
             let mut result = Self {
                 inline: InlineBuffer::new(),
-                heap: None,
+                heap_ptr: null_mut(),
+                heap_layout: Layout::new::<()>(),
                 tag: Some(type_tag::<T>()),
                 dropper: typed_dropper::<T>,
                 size,
@@ -278,17 +205,26 @@ impl RequestData {
 
             result
         } else {
-            // HEAP PATH: Box the value and convert to byte slice
-            let boxed = Box::new(value);
-            let bytes = box_to_bytes(boxed);
+            // HEAP PATH: Allocate with correct Layout
+            let layout = Layout::new::<T>();
+            let ptr = unsafe { alloc::alloc::alloc(layout) };
+
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+
+            unsafe {
+                core::ptr::write(ptr as *mut T, value);
+            }
 
             Self {
                 inline: InlineBuffer::new(),
-                heap: Some(bytes),
+                heap_ptr: ptr,
+                heap_layout: layout,
                 tag: Some(type_tag::<T>()),
                 dropper: typed_dropper::<T>,
                 size,
-                mode: StorageMode::Heap,
+                mode: StorageMode::HeapTyped,
             }
         }
     }
@@ -304,10 +240,13 @@ impl RequestData {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts(self.inline.as_ptr(), self.size)
             },
-            StorageMode::Heap | StorageMode::Borrowed => match &self.heap {
-                Some(b) => &b[..self.size],
-                None => &[],
-            },
+            StorageMode::HeapTyped | StorageMode::HeapBytes => {
+                if self.heap_ptr.is_null() {
+                    &[]
+                } else {
+                    unsafe { core::slice::from_raw_parts(self.heap_ptr, self.size) }
+                }
+            }
         }
     }
 
@@ -317,10 +256,13 @@ impl RequestData {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size)
             },
-            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
-                Some(b) => &mut b[..self.size],
-                None => &mut [],
-            },
+            StorageMode::HeapTyped | StorageMode::HeapBytes => {
+                if self.heap_ptr.is_null() {
+                    &mut []
+                } else {
+                    unsafe { core::slice::from_raw_parts_mut(self.heap_ptr, self.size) }
+                }
+            }
         }
     }
 
@@ -335,11 +277,13 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => match &self.heap {
-                Some(b) => b.as_ptr(),
-                None => return None,
-            },
+            StorageMode::HeapTyped => self.heap_ptr,
+            StorageMode::HeapBytes => return None, // Can't view bytes as typed
         };
+
+        if ptr.is_null() {
+            return None;
+        }
 
         Some(unsafe { &*(ptr as *const T) })
     }
@@ -351,11 +295,13 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
-                Some(b) => b.as_mut_ptr(),
-                None => return None,
-            },
+            StorageMode::HeapTyped => self.heap_ptr,
+            StorageMode::HeapBytes => return None, // Can't view bytes as typed
         };
+
+        if ptr.is_null() {
+            return None;
+        }
 
         Some(unsafe { &mut *(ptr as *mut T) })
     }
@@ -373,19 +319,29 @@ impl RequestData {
                     core::ptr::read(ptr)
                 }
             }
-            StorageMode::Heap => {
-                // Take the heap box and convert back to T
-                let bytes = self.heap.take()?;
-                let boxed_t = unsafe { bytes_to_box::<T>(bytes) };
-                *boxed_t
+            StorageMode::HeapTyped => {
+                // Read from heap, then deallocate the memory
+                if self.heap_ptr.is_null() {
+                    return None;
+                }
+
+                let value = unsafe { core::ptr::read(self.heap_ptr as *const T) };
+
+                // Deallocate the memory (we've taken ownership of the value)
+                unsafe {
+                    alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
+                }
+
+                value
             }
-            StorageMode::Borrowed => {
-                // Cannot take ownership of borrowed data
+            StorageMode::HeapBytes => {
+                // Cannot take typed value from raw bytes
                 return None;
             }
         };
 
         // Reset to empty state (don't run dropper - we took ownership)
+        self.heap_ptr = null_mut();
         self.tag = None;
         self.size = 0;
         self.mode = StorageMode::Inline;
@@ -407,31 +363,53 @@ impl RequestData {
                     );
                     vec.set_len(self.size);
                 }
-                vec.into_boxed_slice()
-            }
-            StorageMode::Heap => {
-                // Take the existing box directly
-                self.heap.take().unwrap_or_else(|| Box::new([]))
-            }
-            StorageMode::Borrowed => {
-                // Copy borrowed data to owned box
-                let slice = match &self.heap {
-                    Some(b) => &b[..self.size],
-                    None => &[],
-                };
-                let mut vec = Vec::with_capacity(slice.len());
-                vec.extend_from_slice(slice);
 
-                // Forget the fake box
-                if let Some(old) = self.heap.take() {
-                    core::mem::forget(old);
+                // Run dropper for typed inline data
+                if self.tag.is_some() {
+                    (self.dropper)(self.inline.as_mut_ptr());
                 }
 
                 vec.into_boxed_slice()
             }
+            StorageMode::HeapTyped => {
+                // Allocate new Box<[u8]>, copy data, deallocate original
+                if self.heap_ptr.is_null() {
+                    return Box::new([]);
+                }
+
+                let mut vec = Vec::with_capacity(self.size);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        self.heap_ptr,
+                        vec.as_mut_ptr(),
+                        self.size,
+                    );
+                    vec.set_len(self.size);
+
+                    // Run typed dropper
+                    (self.dropper)(self.heap_ptr);
+
+                    // Deallocate with original layout
+                    alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
+                }
+
+                vec.into_boxed_slice()
+            }
+            StorageMode::HeapBytes => {
+                // Reconstruct the Box<[u8]> directly
+                if self.heap_ptr.is_null() {
+                    Box::new([])
+                } else {
+                    unsafe {
+                        let slice = core::slice::from_raw_parts_mut(self.heap_ptr, self.size);
+                        Box::from_raw(slice)
+                    }
+                }
+            }
         };
 
         // Reset to empty state
+        self.heap_ptr = null_mut();
         self.tag = None;
         self.size = 0;
         self.mode = StorageMode::Inline;
@@ -443,31 +421,34 @@ impl RequestData {
 
 impl Drop for RequestData {
     fn drop(&mut self) {
-        // Get the data pointer based on storage mode
-        let ptr = match self.mode {
-            StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::Heap | StorageMode::Borrowed => match &mut self.heap {
-                Some(b) => b.as_mut_ptr(),
-                None => return,
-            },
-        };
-
-        // Call the typed dropper to run T's destructor
-        (self.dropper)(ptr, self.size, self.mode);
-
-        // Handle memory deallocation based on mode
         match self.mode {
-            StorageMode::Heap => {
-                // Let the Option<Box> drop naturally (already handled by struct drop)
+            StorageMode::Inline => {
+                // Run dropper for typed data
+                if self.tag.is_some() && self.size > 0 {
+                    (self.dropper)(self.inline.as_mut_ptr());
+                }
+                // Inline buffer is part of struct, no deallocation needed
             }
-            StorageMode::Borrowed => {
-                // Forget the fake box to prevent deallocation of borrowed memory
-                if let Some(fake) = self.heap.take() {
-                    core::mem::forget(fake);
+            StorageMode::HeapTyped => {
+                if !self.heap_ptr.is_null() {
+                    // Run typed dropper (drop_in_place)
+                    (self.dropper)(self.heap_ptr);
+
+                    // Deallocate with stored Layout
+                    unsafe {
+                        alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
+                    }
                 }
             }
-            StorageMode::Inline => {
-                // Nothing to deallocate - inline buffer is part of the struct
+            StorageMode::HeapBytes => {
+                if !self.heap_ptr.is_null() {
+                    // Reconstruct and drop the Box<[u8]>
+                    unsafe {
+                        let slice = core::slice::from_raw_parts_mut(self.heap_ptr, self.size);
+                        let _ = Box::from_raw(slice);
+                        // Box drops here, deallocating with correct layout
+                    }
+                }
             }
         }
     }

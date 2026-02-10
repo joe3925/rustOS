@@ -22,7 +22,6 @@ use kernel_api::request::{
     Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy,
 };
 use kernel_api::status::DriverStatus;
-use kernel_api::util::box_to_bytes;
 use kernel_api::{RequestExt, request_handler};
 use spin::{Once, RwLock};
 
@@ -97,8 +96,7 @@ async fn partition_pdo_query_resources<'a>(
         if let Some(pnp) = w.pnp.as_mut() {
             let dx = ext::<PartDevExt>(&device);
             if let Some(pi) = dx.part.get() {
-                let bytes: Box<[u8]> = box_to_bytes(Box::new((*pi).clone()));
-                pnp.data_out = RequestData::from_boxed_bytes(bytes);
+                pnp.data_out = RequestData::from_t((*pi).clone());
             }
         }
 
@@ -111,7 +109,7 @@ async fn partition_pdo_query_resources<'a>(
 async fn send_req_parent<'a>(
     dev: &Arc<DeviceObject>,
     req: RequestHandle<'a>,
-) -> Result<(), DriverStatus> {
+) -> (RequestHandle<'a>, DriverStatus) {
     let (req, status) = pnp_send_request_to_stack_top(
         dev.dev_node
             .get()
@@ -126,12 +124,7 @@ async fn send_req_parent<'a>(
     )
     .await;
 
-    let g = req.read();
-    if g.status == DriverStatus::Success {
-        Ok(())
-    } else {
-        Err(g.status)
-    }
+    (req, status)
 }
 #[request_handler]
 pub async fn partition_pdo_read<'a>(
@@ -175,11 +168,9 @@ pub async fn partition_pdo_read<'a>(
     };
 
     let phys_off = off + ((start_lba as u64) << 9);
-    let borrowed = {
-        let mut w = request.write();
-        let buf = w.data_slice_mut();
-        unsafe { RequestData::from_borrowed_mut(buf) }
-    };
+
+    // Allocate buffer for child request
+    let child_data = RequestData::from_boxed_bytes(vec![0u8; buf_len].into_boxed_slice());
 
     let child = RequestHandle::Stack(
         &mut Request::new(
@@ -187,17 +178,22 @@ pub async fn partition_pdo_read<'a>(
                 offset: phys_off,
                 len: buf_len,
             },
-            borrowed,
+            child_data,
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     );
 
-    let status = send_req_parent(&device, child).await;
+    let (child_handle, status) = send_req_parent(&device, child).await;
 
-    match status {
-        Ok(()) => request.complete(DriverStatus::Success),
-        Err(st) => request.complete(st),
+    // Copy data back to original request on success
+    if status == DriverStatus::Success {
+        let binding = child_handle.read();
+        let src = binding.data.as_slice();
+        let mut w = request.write();
+        w.data_slice_mut()[..src.len()].copy_from_slice(src);
     }
+
+    request.complete(status)
 }
 
 #[request_handler]
@@ -246,10 +242,11 @@ pub async fn partition_pdo_write<'a>(
     };
 
     let phys_off = off + ((start_lba as u64) << 9);
-    let borrowed = {
-        let w = request.read();
-        let buf = w.data_slice();
-        unsafe { RequestData::from_borrowed_const(buf) }
+
+    // Copy data to child request
+    let child_data = {
+        let r = request.read();
+        RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
     };
 
     let child = RequestHandle::Stack(
@@ -259,17 +256,14 @@ pub async fn partition_pdo_write<'a>(
                 len: buf_len,
                 flush_write_through,
             },
-            borrowed,
+            child_data,
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower),
     );
 
-    let status = send_req_parent(&device, child).await;
+    let (_, status) = send_req_parent(&device, child).await;
 
-    match status {
-        Ok(()) => request.complete(DriverStatus::Success),
-        Err(st) => request.complete(st),
-    }
+    request.complete(status)
 }
 #[request_handler]
 pub async fn partmgr_start<'a>(

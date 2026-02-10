@@ -149,17 +149,7 @@ pub async fn vol_prepare_hardware<'a>(
 
     let pi_opt: Option<PartitionInfo> = {
         let pnp = g.pnp.as_mut().unwrap();
-        if let Some(pi) = pnp.data_out.try_take::<PartitionInfo>() {
-            Some(pi)
-        } else {
-            let bytes = pnp.data_out.take_bytes();
-            if bytes.len() == core::mem::size_of::<PartitionInfo>() {
-                let boxed_pi: Box<PartitionInfo> = unsafe { kernel_api::util::bytes_to_box(bytes) };
-                Some(*boxed_pi)
-            } else {
-                None
-            }
-        }
+        pnp.data_out.try_take::<PartitionInfo>()
     };
     if let Some(pi) = pi_opt {
         dx.part.call_once(|| pi);
@@ -281,17 +271,24 @@ pub async fn vol_pdo_read<'a>(
         None => return req.complete(DriverStatus::NoSuchDevice),
     };
 
-    let borrowed = {
-        let mut w = req.write();
-        let buf = w.data_slice_mut();
-        unsafe { RequestData::from_borrowed_mut(buf) }
-    };
+    // Allocate buffer for forward request
+    let forward_data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
 
     let forward = RequestHandle::Stack(
-        &mut Request::new(RequestType::Read { offset, len }, borrowed).set_traversal_policy(policy),
+        &mut Request::new(RequestType::Read { offset, len }, forward_data)
+            .set_traversal_policy(policy),
     );
 
-    let (_, status) = pnp_send_request(tgt, forward).await;
+    let (forward_handle, status) = pnp_send_request(tgt, forward).await;
+
+    // Copy data back to original request
+    if status == DriverStatus::Success {
+        let binding = forward_handle.read();
+        let src = binding.data.as_slice();
+        let mut w = req.write();
+        w.data_slice_mut()[..src.len()].copy_from_slice(src);
+    }
+
     req.complete(status)
 }
 
@@ -332,10 +329,10 @@ pub async fn vol_pdo_write<'a>(
         None => return req.complete(DriverStatus::NoSuchDevice),
     };
 
-    let borrowed = {
-        let w = req.read();
-        let buf = w.data_slice();
-        unsafe { RequestData::from_borrowed_const(buf) }
+    // Copy data to forward request
+    let forward_data = {
+        let r = req.read();
+        RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
     };
 
     let forward = RequestHandle::Stack(
@@ -345,7 +342,7 @@ pub async fn vol_pdo_write<'a>(
                 len,
                 flush_write_through,
             },
-            borrowed,
+            forward_data,
         )
         .set_traversal_policy(policy),
     );

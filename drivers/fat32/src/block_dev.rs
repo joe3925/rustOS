@@ -91,8 +91,8 @@ impl BlockDev {
         (byte_off % self.sector_size as u64) as usize
     }
 
-    /// Read directly into a borrowed buffer (zero-copy for aligned reads)
-    async fn pnp_read_borrowed(
+    /// Read into a buffer (allocates internal buffer, copies result)
+    async fn pnp_read_into(
         volume: &IoTarget,
         read_req: &SharedRequest,
         offset: u64,
@@ -102,15 +102,15 @@ impl BlockDev {
         {
             let mut g = read_req.write();
             g.kind = RequestType::Read { offset, len };
-            g.data = unsafe { RequestData::from_borrowed_mut(buf) };
+            // Allocate owned buffer for the request
+            g.data = RequestData::from_boxed_bytes(alloc::vec![0u8; len].into_boxed_slice());
         }
 
-        let (mut handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(read_req.clone())).await;
+        let (handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(read_req.clone())).await;
 
-        {
-            let mut g = handle.write();
-            // Reclaim the borrowed pointer (no-op, just prevents dropper issues)
-            let _ = g.data.take_bytes_borrowed();
+        if st == DriverStatus::Success {
+            let g = handle.read();
+            buf.copy_from_slice(g.data.as_slice());
         }
 
         if st == DriverStatus::Success {
@@ -120,8 +120,8 @@ impl BlockDev {
         }
     }
 
-    /// Write directly from a borrowed buffer (zero-copy for aligned writes)
-    async fn pnp_write_borrowed(
+    /// Write from a buffer (copies data into request)
+    async fn pnp_write_from(
         volume: &IoTarget,
         write_req: &SharedRequest,
         offset: u64,
@@ -135,15 +135,11 @@ impl BlockDev {
                 len,
                 flush_write_through: false,
             };
-            g.data = unsafe { RequestData::from_borrowed_const(buf) };
+            // Copy data into owned storage
+            g.data = RequestData::from_boxed_bytes(buf.to_vec().into_boxed_slice());
         }
 
-        let (mut handle, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(write_req.clone())).await;
-
-        {
-            let mut g = handle.write();
-            let _ = g.data.take_bytes_borrowed();
-        }
+        let (_, st) = pnp_send_request(volume.clone(), RequestHandle::Shared(write_req.clone())).await;
 
         if st == DriverStatus::Success {
             Ok(())
@@ -171,7 +167,7 @@ impl BlockDev {
             // Unaligned or partial sector read - must use sector buffer
             if in_off != 0 || remaining < bps {
                 let sector_off = lba * bps as u64;
-                Self::pnp_read_borrowed(
+                Self::pnp_read_into(
                     &self.volume,
                     &self.read_req,
                     sector_off,
@@ -188,14 +184,14 @@ impl BlockDev {
                 continue;
             }
 
-            // Aligned read - read directly into destination buffer (zero-copy)
+            // Aligned read - read into destination buffer
             let full_sectors = remaining / bps;
             let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
             let chunk_sectors = min(full_sectors, max_sectors);
             let chunk_bytes = chunk_sectors * bps;
 
             let byte_off = lba * bps as u64;
-            Self::pnp_read_borrowed(
+            Self::pnp_read_into(
                 &self.volume,
                 &self.read_req,
                 byte_off,
@@ -233,7 +229,7 @@ impl BlockDev {
                 let sector_off = lba * bps as u64;
 
                 // Read existing sector
-                Self::pnp_read_borrowed(
+                Self::pnp_read_into(
                     &self.volume,
                     &self.read_req,
                     sector_off,
@@ -248,7 +244,7 @@ impl BlockDev {
                     .copy_from_slice(&src[in_off_src..in_off_src + take]);
 
                 // Write back
-                Self::pnp_write_borrowed(
+                Self::pnp_write_from(
                     &self.volume,
                     &self.write_req,
                     sector_off,
@@ -263,7 +259,7 @@ impl BlockDev {
                 continue;
             }
 
-            // Aligned write - write directly from source (zero-copy)
+            // Aligned write - write from source
             let full_sectors = remaining / bps;
             let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
             let chunk_sectors = min(full_sectors, max_sectors);
@@ -271,7 +267,7 @@ impl BlockDev {
 
             let byte_off = lba * bps as u64;
 
-            Self::pnp_write_borrowed(
+            Self::pnp_write_from(
                 &self.volume,
                 &self.write_req,
                 byte_off,
