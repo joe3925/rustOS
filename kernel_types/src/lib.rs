@@ -23,7 +23,7 @@ use alloc::sync::Arc;
 use crate::async_ffi::{BorrowingFfiFuture, FfiFuture};
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
-use crate::request::{Request, RequestHandle, RequestHandleResult};
+use crate::request::{Request, RequestHandle};
 use crate::status::DriverStatus;
 
 pub type EvtDriverDeviceAdd = extern "win64" fn(
@@ -33,31 +33,31 @@ pub type EvtDriverDeviceAdd = extern "win64" fn(
 pub type EvtDriverUnload =
     extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = for<'a> extern "win64" fn(
+pub type EvtIoRead = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
-    &'a mut RequestHandle<'a>,
+    &'b mut RequestHandle<'a>,
     usize,
-) -> BorrowingFfiFuture<'a, DriverStep>;
-pub type EvtIoWrite = for<'a> extern "win64" fn(
+) -> BorrowingFfiFuture<'b, DriverStep>;
+pub type EvtIoWrite = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
-    &'a mut RequestHandle<'a>,
+    &'b mut RequestHandle<'a>,
     usize,
-) -> BorrowingFfiFuture<'a, DriverStep>;
-pub type EvtIoDeviceControl = for<'a> extern "win64" fn(
+) -> BorrowingFfiFuture<'b, DriverStep>;
+pub type EvtIoDeviceControl = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
-    &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStep>;
-pub type EvtIoFs = for<'a> extern "win64" fn(
+    &'b mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'b, DriverStep>;
+pub type EvtIoFs = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
-    &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStep>;
+    &'b mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'b, DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine =
     extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
-pub type PnpMinorCallback = for<'a> extern "win64" fn(
+pub type PnpMinorCallback = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
-    &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStep>;
+    &'b mut RequestHandle<'a>,
+) -> BorrowingFfiFuture<'b, DriverStep>;
 
 pub type DpcFn = extern "win64" fn(usize);

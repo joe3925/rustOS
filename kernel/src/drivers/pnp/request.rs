@@ -48,10 +48,10 @@ impl PnpManager {
 
     /// Send a request. Caller retains access to stack request after return
     /// (unless it was promoted by a handler returning Pending).
-    pub async fn send_request<'a>(
+    pub async fn send_request(
         &self,
         target: IoTarget,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> (DriverStatus) {
         {
             let mut guard = handle.write();
@@ -66,7 +66,9 @@ impl PnpManager {
         };
 
         let dev = target.clone();
-        let result = self.call_device_handler(dev, handle, kind, policy).await;
+        let result = self
+            .call_device_handler(dev, &mut *handle, kind, policy)
+            .await;
 
         match result {
             DriverStep::Pending => {
@@ -85,10 +87,10 @@ impl PnpManager {
             }
         }
     }
-    pub async fn send_request_to_next_lower<'a>(
+    pub async fn send_request_to_next_lower(
         &self,
         from: Arc<DeviceObject>,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
         let Some(target_dev) = from.lower_device.get() else {
             return DriverStatus::NoSuchDevice;
@@ -97,10 +99,10 @@ impl PnpManager {
         self.send_request(target_dev.clone(), handle).await
     }
 
-    pub async fn send_request_to_next_upper<'a>(
+    pub async fn send_request_to_next_upper(
         &self,
         from: Arc<DeviceObject>,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
         let Some(target_dev) = from.upper_device.get() else {
             return DriverStatus::NoSuchDevice;
@@ -113,7 +115,7 @@ impl PnpManager {
         self.send_request(up, handle).await
     }
     /// Complete a request. Does NOT promote - returns handle with same lifetime.
-    pub fn complete_request<'a>(&self, handle: &'a mut RequestHandle<'a>) -> DriverStatus {
+    pub fn complete_request(&self, handle: &mut RequestHandle<'_>) -> DriverStatus {
         let (status, waker) = {
             let mut guard = handle.write();
 
@@ -142,10 +144,10 @@ impl PnpManager {
         status
     }
 
-    async fn call_device_handler<'a>(
+    async fn call_device_handler(
         &self,
         mut dev: Arc<DeviceObject>,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
         kind: RequestType,
         policy: TraversalPolicy,
     ) -> DriverStep {
@@ -156,10 +158,13 @@ impl PnpManager {
             }
 
             if matches!(kind, RequestType::Pnp) {
-                let step = Self::pnp_minor_dispatch(&dev, handle).await;
+                let step = {
+                    let h: &mut RequestHandle<'_> = handle;
+                    Self::pnp_minor_dispatch(&dev, h).await
+                };
                 match step {
                     DriverStep::Pending => {
-                        // This case can't happen
+                        // PnP handlers should never return pending
                     }
                     DriverStep::Complete { status } => {
                         handle.write().status = status;
@@ -184,19 +189,12 @@ impl PnpManager {
                 }
             }
 
-            let step = if let Some(h) = dev.dev_init.io_vtable.get_for(&kind) {
-                let result = h.handler.invoke(dev.clone(), handle).await;
-
-                match h.synchronization {
-                    Synchronization::Sync | Synchronization::Async => {
-                        h.running_request.fetch_sub(1, Ordering::Release);
-                    }
-                    _ => {}
-                }
-
-                result
-            } else {
-                DriverStep::Continue
+            let step = match {
+                let h: &mut RequestHandle<'_> = handle;
+                Self::invoke_io_handler(&dev, h, &kind).await
+            } {
+                Some(step) => step,
+                None => DriverStep::Continue,
             };
 
             match step {
@@ -236,9 +234,30 @@ impl PnpManager {
         }
     }
 
-    async fn pnp_minor_dispatch<'a>(
+    async fn invoke_io_handler(
+        dev: &Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_>,
+        kind: &RequestType,
+    ) -> Option<DriverStep> {
+        let Some(h) = dev.dev_init.io_vtable.get_for(kind) else {
+            return None;
+        };
+
+        let result = h.handler.invoke(dev.clone(), handle).await;
+
+        match h.synchronization {
+            Synchronization::Sync | Synchronization::Async => {
+                h.running_request.fetch_sub(1, Ordering::Release);
+            }
+            _ => {}
+        }
+
+        Some(result)
+    }
+
+    async fn pnp_minor_dispatch(
         device: &Arc<DeviceObject>,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStep {
         let (minor_opt, policy) = {
             let r = handle.read();

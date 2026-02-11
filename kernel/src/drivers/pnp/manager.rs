@@ -956,10 +956,10 @@ impl PnpManager {
         None
     }
 
-    pub async fn send_request_via_symlink<'a>(
+    pub async fn send_request_via_symlink(
         &self,
         link_path: String,
-        handle: &mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
         match self.resolve_targetio_from_symlink(link_path) {
             Some(tgt) => self.send_request(tgt, handle).await,
@@ -967,10 +967,10 @@ impl PnpManager {
         }
     }
 
-    pub async fn send_request_to_stack_top<'a>(
+    pub async fn send_request_to_stack_top(
         &self,
         dev_node_weak: alloc::sync::Weak<DevNode>,
-        handle: &mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
         let dev_node = match dev_node_weak.upgrade() {
             Some(dn) => dn,
@@ -991,11 +991,11 @@ impl PnpManager {
         }
     }
 
-    pub async fn ioctl_via_symlink<'a>(
+    pub async fn ioctl_via_symlink(
         &self,
         link_path: String,
         _control_code: u32,
-        handle: &mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
         self.send_request_via_symlink(link_path, handle).await
     }

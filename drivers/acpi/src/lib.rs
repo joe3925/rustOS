@@ -58,9 +58,9 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware<'a>(
+pub async fn bus_driver_prepare_hardware<'a, 'b>(
     device: Arc<DeviceObject>,
-    _req: &'a mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
@@ -146,9 +146,9 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 #[request_handler]
-pub async fn enumerate_bus<'a>(
+pub async fn enumerate_bus<'a, 'b>(
     device: Arc<DeviceObject>,
-    _req: &'a mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 

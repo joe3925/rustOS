@@ -1,6 +1,6 @@
 use crate::device::DeviceObject;
 use crate::pnp::DriverStep;
-use crate::request::{RequestHandle, RequestHandleResult, RequestType};
+use crate::request::{RequestHandle, RequestType};
 use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -91,10 +91,10 @@ impl IoType {
     }
 
     #[inline]
-    pub async fn invoke<'a>(
+    pub async fn invoke(
         &self,
         dev: Arc<DeviceObject>,
-        handle: &'a mut RequestHandle<'a>,
+        handle: &mut RequestHandle<'_>,
     ) -> DriverStep {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {

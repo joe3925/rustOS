@@ -87,13 +87,24 @@ fn extract_request_handle_lifetime(ty: &Type) -> Option<Lifetime> {
     }
 }
 
-/// Find the lifetime attached to the `&mut RequestHandle<'a>` parameter, if any.
-fn find_request_handle_lifetime(sig: &syn::Signature) -> Option<Lifetime> {
+/// Extract the borrow lifetime from `&'b mut T` if present.
+fn extract_borrow_lifetime(ty: &Type) -> Option<Lifetime> {
+    match ty {
+        Type::Reference(r) => r.lifetime.clone(),
+        Type::Paren(p) => extract_borrow_lifetime(&p.elem),
+        Type::Group(g) => extract_borrow_lifetime(&g.elem),
+        _ => None,
+    }
+}
+
+/// Find the borrow lifetime attached to the `&'b mut RequestHandle<'a>` parameter, if any.
+/// Returns the borrow lifetime `'b`, not the inner `RequestHandle<'a>` lifetime.
+fn find_request_handle_borrow_lifetime(sig: &syn::Signature) -> Option<Lifetime> {
     for arg in sig.inputs.iter() {
         let FnArg::Typed(pat_ty) = arg else { continue };
 
         if type_is_mut_ref_request_handle(&pat_ty.ty) {
-            return extract_request_handle_lifetime(&pat_ty.ty);
+            return extract_borrow_lifetime(&pat_ty.ty);
         }
     }
     None
@@ -199,7 +210,8 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
 
     let fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
-    let req_lt = find_request_handle_lifetime(sig)
+    // Use the borrow lifetime ('b in `&'b mut RequestHandle<'a>`) for the future
+    let req_lt = find_request_handle_borrow_lifetime(sig)
         .unwrap_or_else(|| Lifetime::new("'static", Span::call_site()));
 
     // Remove async keyword
