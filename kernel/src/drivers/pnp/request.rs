@@ -132,7 +132,8 @@ impl PnpManager {
             if guard.status == DriverStatus::ContinueStep {
                 guard.status = DriverStatus::Success;
             }
-
+            guard.completion_context = 0;
+            guard.completion_routine = None;
             guard.completed = true;
             (guard.status, guard.waker.take())
         };

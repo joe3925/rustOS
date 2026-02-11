@@ -157,28 +157,13 @@ pub async fn partition_pdo_read<'a, 'b>(
     };
 
     let phys_off = off + ((start_lba as u64) << 9);
+    request.set_traversal_policy(TraversalPolicy::ForwardLower);
+    request.write().kind = RequestType::Read {
+        offset: phys_off,
+        len: buf_len,
+    };
 
-    // Allocate buffer for child request
-    let child_data = RequestData::from_boxed_bytes(vec![0u8; buf_len].into_boxed_slice());
-
-    let mut child_req = RequestHandle::new(
-        RequestType::Read {
-            offset: phys_off,
-            len: buf_len,
-        },
-        child_data,
-    );
-    child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-    let status = send_req_parent(&device, &mut child_req).await;
-
-    // Copy data back to original request on success
-    if status == DriverStatus::Success {
-        let binding = child_req.read();
-        let src = binding.data.as_slice();
-        let mut w = request.write();
-        w.data_slice_mut()[..src.len()].copy_from_slice(&src);
-    }
+    let status = send_req_parent(&device, request).await;
 
     DriverStep::complete(status)
 }
@@ -230,23 +215,15 @@ pub async fn partition_pdo_write<'a, 'b>(
 
     let phys_off = off + ((start_lba as u64) << 9);
 
-    // Copy data to child request
-    let child_data = {
-        let r = request.read();
-        RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
+    // Move caller buffer into forwarded request to avoid copying
+    request.set_traversal_policy(TraversalPolicy::ForwardLower);
+    request.write().kind = RequestType::Write {
+        offset: phys_off,
+        len: buf_len,
+        flush_write_through,
     };
 
-    let mut child = RequestHandle::new(
-        RequestType::Write {
-            offset: phys_off,
-            len: buf_len,
-            flush_write_through,
-        },
-        child_data,
-    );
-    child.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-    let status = send_req_parent(&device, &mut child).await;
+    let status = send_req_parent(&device, request).await;
 
     DriverStep::complete(status)
 }

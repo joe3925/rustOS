@@ -201,15 +201,15 @@ async fn virtio_pnp_start<'a, 'b>(
         return complete_req(req, qr_status);
     }
 
-    let blob = {
-        query_req
-            .read()
+    let resources = {
+        let req = query_req.read();
+        let blob = req
             .pnp
             .as_ref()
-            .map(|p| p.data_out.as_slice().to_vec())
-            .unwrap_or_default()
+            .map(|p| p.data_out.as_slice())
+            .unwrap_or(&[]);
+        pci::parse_resources(blob)
     };
-    let resources = pci::parse_resources(&blob);
     let msix_cap = pci::find_msix_capability(&resources);
 
     let mapped_bars = pci::map_memory_bars(&resources);

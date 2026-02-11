@@ -678,13 +678,22 @@ pub async fn disk_ioctl<'a, 'b>(
                 return DriverStep::complete(st);
             }
             // todo: properly handle the none case
-            let info = if let Some(di) = ch
-                .read()
-                .pnp
-                .as_ref()
-                .and_then(|p| p.data_out.view::<DiskInfo>())
-            {
-                *di
+            let mut info_opt = {
+                let mut wr = ch.write();
+                wr.pnp
+                    .as_mut()
+                    .and_then(|p| p.data_out.try_take::<DiskInfo>())
+            };
+            if info_opt.is_none() {
+                info_opt = ch
+                    .read()
+                    .pnp
+                    .as_ref()
+                    .and_then(|p| p.data_out.view::<DiskInfo>())
+                    .copied();
+            }
+            let info = if let Some(di) = info_opt {
+                di
             } else {
                 return DriverStep::complete(DriverStatus::Unsuccessful);
             };
@@ -769,21 +778,17 @@ pub async fn flush_dirty_blocks(dev: &Arc<DeviceObject>) -> DriverStatus {
         return DriverStatus::Success;
     }
 
-    for (_block_idx, _mask, _block_len, segments) in dirty.iter() {
+    for (block_idx, mask, _block_len, segments) in dirty {
         for (offset, data) in segments {
-            let st = write_to_lower(dev, *offset, data, true).await;
+            let st = write_to_lower(dev, offset, data, true).await;
             if st != DriverStatus::Success {
                 return st;
             }
         }
-    }
 
-    {
         let mut cache = dx.cache.lock();
         if cache.ensure_init(bs) {
-            for (block_idx, mask, _block_len, _segments) in dirty {
-                cache.clear_dirty_mask(block_idx, mask);
-            }
+            cache.clear_dirty_mask(block_idx, mask);
         }
     }
 
@@ -793,7 +798,7 @@ pub async fn flush_dirty_blocks(dev: &Arc<DeviceObject>) -> DriverStatus {
 async fn write_to_lower(
     dev: &Arc<DeviceObject>,
     offset: u64,
-    data: &[u8],
+    data: Vec<u8>,
     flush_write_through: bool,
 ) -> DriverStatus {
     let mut child = RequestHandle::new(
@@ -802,7 +807,7 @@ async fn write_to_lower(
             len: data.len(),
             flush_write_through,
         },
-        RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
+        RequestData::from_boxed_bytes(data.into_boxed_slice()),
     );
     child.set_traversal_policy(TraversalPolicy::ForwardLower);
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child).await;
@@ -835,20 +840,35 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         }
     }
 
-    let di = {
+    let mut di_opt = {
+        let mut req = ch.write();
+        req.pnp
+            .as_mut()
+            .and_then(|p| p.data_out.try_take::<DiskInfo>())
+    };
+
+    if di_opt.is_none() {
         let req = ch.read();
-        if let Some(di) = req.pnp.as_ref().and_then(|p| p.data_out.view::<DiskInfo>()) {
-            *di
-        } else {
-            let Some(pnp) = req.pnp.as_ref() else {
-                return Err(DriverStatus::Unsuccessful);
-            };
-            let blob = pnp.data_out.as_slice();
-            if blob.len() < size_of::<DiskInfo>() {
-                return Err(DriverStatus::Unsuccessful);
-            }
-            unsafe { *(blob.as_ptr() as *const DiskInfo) }
-        }
+        di_opt = req
+            .pnp
+            .as_ref()
+            .and_then(|p| p.data_out.view::<DiskInfo>())
+            .copied()
+            .or_else(|| {
+                let Some(pnp) = req.pnp.as_ref() else {
+                    return None;
+                };
+                let blob = pnp.data_out.as_slice();
+                if blob.len() < size_of::<DiskInfo>() {
+                    return None;
+                }
+                Some(unsafe { *(blob.as_ptr() as *const DiskInfo) })
+            });
+    }
+
+    let di = match di_opt {
+        Some(di) => di,
+        None => return Err(DriverStatus::Unsuccessful),
     };
 
     let dx = disk_ext(dev);

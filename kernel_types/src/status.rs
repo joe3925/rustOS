@@ -156,12 +156,12 @@ pub enum RegError {
     PersistenceFailed,
     EncodingFailed,
     CorruptReg,
-    FileIO(FileStatus),
+    FileIO { status: FileStatus },
 }
 
 impl From<FileStatus> for RegError {
     fn from(status: FileStatus) -> Self {
-        RegError::FileIO(status)
+        RegError::FileIO { status }
     }
 }
 #[derive(Debug, Clone, Encode, Decode, PartialEq)]

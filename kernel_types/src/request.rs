@@ -235,6 +235,11 @@ impl RequestData {
     }
 
     #[inline]
+    pub fn set_len(&mut self, new_size: usize) {
+        self.size = new_size;
+    }
+
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self.mode {
             StorageMode::Inline => unsafe {

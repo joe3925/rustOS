@@ -254,28 +254,13 @@ pub async fn vol_pdo_read<'a, 'b>(
             _ => Err(DriverStatus::InvalidParameter),
         }
     };
-    let (offset, len, policy) = match off_res {
-        Ok(Some(v)) => v,
-        Ok(None) => return DriverStep::complete(DriverStatus::Success),
-        Err(st) => return DriverStep::complete(st),
-    };
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match binding.backing.get() {
         Some(t) => t.clone(),
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
-
-    let forward_data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-    let mut forward_req = RequestHandle::new(RequestType::Read { offset, len }, forward_data);
-    forward_req.set_traversal_policy(policy);
-    let status = pnp_send_request(tgt, &mut forward_req).await;
-
-    if status == DriverStatus::Success {
-        let src_buf = forward_req.read().data.as_slice().to_vec();
-        let mut w = req.write();
-        w.data_slice_mut()[..src_buf.len()].copy_from_slice(&src_buf);
-    }
+    let status = pnp_send_request(tgt, req).await;
 
     DriverStep::complete(status)
 }
@@ -284,7 +269,7 @@ pub async fn vol_pdo_read<'a, 'b>(
 pub async fn vol_pdo_write<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
-    _buf_len: usize,
+    buf_len: usize,
 ) -> DriverStep {
     let parsed = {
         let r = req.read();
@@ -303,11 +288,7 @@ pub async fn vol_pdo_write<'a, 'b>(
             _ => Err(DriverStatus::InvalidParameter),
         }
     };
-    let (offset, len, flush_write_through, policy) = match parsed {
-        Ok(v) => v,
-        Err(st) => return DriverStep::complete(st),
-    };
-    if len == 0 {
+    if buf_len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }
 
@@ -317,23 +298,8 @@ pub async fn vol_pdo_write<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    // Copy data to forward request
-    let forward_data = {
-        let r = req.read();
-        RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
-    };
+    let status = pnp_send_request(tgt.clone(), req).await;
 
-    let mut forward = RequestHandle::new(
-        RequestType::Write {
-            offset,
-            len,
-            flush_write_through,
-        },
-        forward_data,
-    );
-    forward.set_traversal_policy(policy);
-
-    let status = pnp_send_request(tgt.clone(), &mut forward).await;
     DriverStep::complete(status)
 }
 #[request_handler]
