@@ -748,9 +748,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         data_out: RequestData::empty(),
     };
 
-    let mut req = Request::new_pnp(pnp, RequestData::empty());
-
-    let mut handle = RequestHandle::Stack(&mut req);
+    let mut handle = RequestHandle::new_pnp(pnp, RequestData::empty());
     let status = pnp_forward_request_to_next_lower(device.clone(), &mut handle).await;
 
     if status != DriverStatus::Success {
@@ -758,7 +756,8 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         return alloc::vec::Vec::new();
     }
 
-    let blob = req
+    let blob = handle
+        .read()
         .pnp
         .as_ref()
         .map(|p| p.data_out.as_slice().to_vec())

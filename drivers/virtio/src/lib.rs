@@ -167,10 +167,10 @@ async fn setup_msix_via_pci(
     buf[4] = vector;
     buf[5] = cpu;
 
-    let mut req = RequestHandle::Stack(&mut Request::new(
+    let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_PCI_SETUP_MSIX),
         RequestData::from_boxed_bytes(buf.into_boxed_slice()),
-    ));
+    );
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
 
     if status == DriverStatus::Success {
@@ -185,7 +185,7 @@ async fn virtio_pnp_start<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let mut query_req = Request::new_pnp(
+    let mut query_req = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -195,10 +195,7 @@ async fn virtio_pnp_start<'a, 'b>(
         },
         RequestData::empty(),
     );
-    let qr_status = {
-        let mut res_handle = RequestHandle::Stack(&mut query_req);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut res_handle).await
-    };
+    let qr_status = pnp_forward_request_to_next_lower(dev.clone(), &mut query_req).await;
     if qr_status != DriverStatus::Success {
         println!("virtio-blk: QueryResources failed: {:?}", qr_status);
         return complete_req(req, qr_status);
@@ -206,6 +203,7 @@ async fn virtio_pnp_start<'a, 'b>(
 
     let blob = {
         query_req
+            .read()
             .pnp
             .as_ref()
             .map(|p| p.data_out.as_slice().to_vec())

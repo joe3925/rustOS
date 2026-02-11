@@ -30,8 +30,11 @@ use kernel_api::{
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
         pnp_forward_request_to_next_lower,
     },
-    println, request::{Request, RequestHandle, RequestType}, request_handler,
-    runtime::spawn_blocking, status::DriverStatus,
+    println,
+    request::{Request, RequestHandle, RequestType},
+    request_handler,
+    runtime::spawn_blocking,
+    status::DriverStatus,
 };
 use spin::Once;
 
@@ -76,7 +79,7 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
     device: Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let mut query = Request::new_pnp(
+    let mut query_handle = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -87,7 +90,6 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
         RequestData::empty(),
     );
 
-    let mut query_handle = RequestHandle::Stack(&mut query);
     let st = pnp_forward_request_to_next_lower(device.clone(), &mut query_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
@@ -96,7 +98,8 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
             return DriverStep::complete(qst);
         }
 
-        let blob = query
+        let blob = query_handle
+            .read()
             .pnp
             .as_ref()
             .map(|p| p.data_out.as_slice().to_vec())

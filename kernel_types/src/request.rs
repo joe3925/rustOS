@@ -490,6 +490,7 @@ pub enum TraversalPolicy {
 
 #[derive(Debug)]
 #[repr(C)]
+#[non_exhaustive]
 pub struct Request {
     pub kind: RequestType,
     pub data: RequestData,
@@ -505,12 +506,12 @@ pub struct Request {
 
 impl Request {
     /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
-    pub fn new(kind: RequestType, data: RequestData) -> Self {
+    pub(crate) fn new(kind: RequestType, data: RequestData) -> Self {
         if matches!(kind, RequestType::Pnp) {
             panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
         }
 
-        Self {
+        let request = Self {
             kind,
             data,
             completed: false,
@@ -521,12 +522,13 @@ impl Request {
             completion_context: 0,
 
             waker: None,
-        }
+        };
+        request
     }
 
     /// Create a PnP request.
     #[inline]
-    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+    pub(crate) fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
         Self {
             kind: RequestType::Pnp,
             data,
@@ -543,25 +545,25 @@ impl Request {
 
     /// Create a request with typed payload.
     #[inline]
-    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+    pub(crate) fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
         Self::new(kind, RequestData::from_t(data))
     }
 
     /// Create a PnP request with typed payload.
     #[inline]
-    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+    pub(crate) fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
         Self::new_pnp(pnp, RequestData::from_t(data))
     }
 
     /// Create a request from boxed bytes.
     #[inline]
-    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
+    pub(crate) fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
         Self::new(kind, RequestData::from_boxed_bytes(data))
     }
 
     /// Create a PnP request from boxed bytes.
     #[inline]
-    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
+    pub(crate) fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
         Self::new_pnp(pnp, RequestData::from_boxed_bytes(data))
     }
 
@@ -642,7 +644,7 @@ impl Request {
     }
 
     #[inline]
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
             kind: RequestType::Dummy,
             data: RequestData::empty(),
@@ -799,12 +801,14 @@ impl Clone for SharedRequest {
     }
 }
 
-/// Handle to a request - stack-allocated or heap-allocated (shared).
+/// Handle to a request - stack-allocated, owned, or heap-allocated (shared).
 #[repr(C)]
 #[derive(Debug)]
 pub enum RequestHandle<'a> {
     /// Mutable borrow of a stack-allocated request.
     Stack(&'a mut Request),
+    /// Owned request - the RequestHandle owns the Request directly.
+    Owned(Request),
     /// Shared ownership - already heap-allocated.
     Shared(SharedRequest),
 }
@@ -864,6 +868,11 @@ impl<'a> RequestHandle<'a> {
     }
 
     #[inline]
+    pub fn is_owned(&self) -> bool {
+        matches!(self, Self::Owned(_))
+    }
+
+    #[inline]
     pub fn is_shared(&self) -> bool {
         matches!(self, Self::Shared(_))
     }
@@ -877,6 +886,7 @@ impl<'a> RequestHandle<'a> {
     pub fn read(&self) -> HandleReadGuard<'_> {
         match self {
             RequestHandle::Stack(r) => HandleReadGuard::Stack(r),
+            RequestHandle::Owned(r) => HandleReadGuard::Stack(r),
             RequestHandle::Shared(s) => HandleReadGuard::Shared(s.read()),
         }
     }
@@ -886,17 +896,29 @@ impl<'a> RequestHandle<'a> {
     pub fn write(&mut self) -> HandleWriteGuard<'_> {
         match self {
             RequestHandle::Stack(r) => HandleWriteGuard::Stack(r),
+            RequestHandle::Owned(r) => HandleWriteGuard::Stack(r),
             RequestHandle::Shared(s) => HandleWriteGuard::Shared(s.write()),
         }
     }
     // TODO: this currently does not work as intended the request on the request handle on the stack should not point to nothing
-    /// Promote stack request to shared (heap) ownership.
+    /// Promote stack/owned request to shared (heap) ownership.
     /// Stack: copies content into a new SharedRequest, leaves empty sentinel in original.
+    /// Owned: moves the owned request into a new SharedRequest.
     /// Shared: no-op, already on heap.
     pub fn promote(&mut self) {
-        if let RequestHandle::Stack(req_ref) = self {
-            let request = core::mem::replace(*req_ref, Request::empty());
-            *self = RequestHandle::Shared(SharedRequest::new(request));
+        match self {
+            RequestHandle::Stack(req_ref) => {
+                let request = core::mem::replace(*req_ref, Request::empty());
+                *self = RequestHandle::Shared(SharedRequest::new(request));
+            }
+            RequestHandle::Owned(_) => {
+                // Take ownership of the request and wrap in SharedRequest
+                let old = core::mem::replace(self, RequestHandle::Owned(Request::empty()));
+                if let RequestHandle::Owned(request) = old {
+                    *self = RequestHandle::Shared(SharedRequest::new(request));
+                }
+            }
+            RequestHandle::Shared(_) => {}
         }
     }
 
@@ -918,9 +940,60 @@ impl<'a> RequestHandle<'a> {
             _ => None,
         }
     }
+
+    #[inline]
+    pub fn set_traversal_policy(&mut self, policy: TraversalPolicy) {
+        match self {
+            RequestHandle::Stack(r) => {
+                r.traversal_policy = policy;
+            }
+            RequestHandle::Shared(s) => {
+                s.write().traversal_policy = policy;
+            }
+            RequestHandle::Owned(request) => {
+                request.traversal_policy = policy;
+            }
+        }
+    }
 }
 
 impl RequestHandle<'static> {
+    /// Create a non-PnP request owned by the RequestHandle. Panics if called with `RequestType::Pnp`.
+    #[inline]
+    pub fn new(kind: RequestType, data: RequestData) -> Self {
+        RequestHandle::Owned(Request::new(kind, data))
+    }
+
+    /// Create a PnP request owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+        RequestHandle::Owned(Request::new_pnp(pnp_request, data))
+    }
+
+    /// Create a request with typed payload owned by the RequestHandle.
+    #[inline]
+    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+        RequestHandle::Owned(Request::new_t(kind, data))
+    }
+
+    /// Create a PnP request with typed payload owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+        RequestHandle::Owned(Request::new_pnp_t(pnp, data))
+    }
+
+    /// Create a request from boxed bytes owned by the RequestHandle.
+    #[inline]
+    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
+        RequestHandle::Owned(Request::new_bytes(kind, data))
+    }
+
+    /// Create a PnP request from boxed bytes owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
+        RequestHandle::Owned(Request::new_pnp_bytes(pnp, data))
+    }
+
     #[inline]
     pub fn pending(self) -> RequestHandleResult<'static> {
         RequestHandleResult {

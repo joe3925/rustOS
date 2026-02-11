@@ -4,7 +4,7 @@ use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::io::IoTarget;
-use kernel_types::request::{Request, RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
 
@@ -140,19 +140,14 @@ impl Vfs {
         TParam: 'static,
         TResult: 'static,
     {
-        let mut req = Request::new(RequestType::Fs(op), RequestData::from_t(param))
-            .set_traversal_policy(TraversalPolicy::ForwardLower);
+        let mut handle = RequestHandle::new(RequestType::Fs(op), RequestData::from_t(param));
+        handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = if let Some(tgt) = target {
-            PNP_MANAGER
-                .send_request(tgt, &mut RequestHandle::Stack(&mut req))
-                .await
+            PNP_MANAGER.send_request(tgt, &mut handle).await
         } else {
             PNP_MANAGER
-                .send_request_via_symlink(
-                    volume_symlink.to_string(),
-                    &mut RequestHandle::Stack(&mut req),
-                )
+                .send_request_via_symlink(volume_symlink.to_string(), &mut handle)
                 .await
         };
         if status != DriverStatus::Success {
@@ -161,7 +156,8 @@ impl Vfs {
         }
 
         // Get the result from the handle (which may still be Stack or promoted to Shared)
-        let ret = req
+        let ret = handle
+            .write()
             .take_data::<TResult>()
             .ok_or(DriverStatus::InvalidParameter);
         ret

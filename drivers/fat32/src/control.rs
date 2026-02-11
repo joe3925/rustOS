@@ -97,7 +97,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 None => return DriverStep::complete(DriverStatus::InvalidParameter),
             };
 
-            let mut query = Request::new_pnp(
+            let mut query = RequestHandle::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
@@ -107,16 +107,13 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 },
                 RequestData::empty(),
             );
-            let st = {
-                let mut q = RequestHandle::Stack(&mut query);
-                pnp_send_request(id.volume_fdo.clone(), &mut q).await
-            };
+            let st = pnp_send_request(id.volume_fdo.clone(), &mut query).await;
 
             let mut sector_size: Option<u16> = None;
             let mut total_sectors: Option<u64> = None;
 
             if st == DriverStatus::Success {
-                if let Some(pnp) = query.pnp.as_mut() {
+                if let Some(pnp) = query.write().pnp.as_mut() {
                     let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
                     if pi_opt.is_none() {
                         let raw = pnp.data_out.take_bytes();
@@ -211,12 +208,11 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl = pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone());
 
     spawn_detached(async move {
-        let mut reg_req = Request::new(
+        let mut binding = RequestHandle::new(
             RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
             RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
-        let mut reg = RequestHandle::Stack(&mut reg_req);
+        );
+        let mut reg = binding.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),

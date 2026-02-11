@@ -740,13 +740,13 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 data_out: RequestData::empty(),
             };
-            let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
+            let mut start_request =
+                RequestHandle::new_pnp(pnp_payload, RequestData::empty());
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
-            start_request.add_completion(Self::start_io, ctx);
+            start_request.write().add_completion(Self::start_io, ctx);
 
-            self.send_request(top_device, &mut RequestHandle::Stack(&mut start_request))
-                .await;
+            self.send_request(top_device, &mut start_request).await;
         } else {
             dn.set_state(DevNodeState::Faulted);
         }
@@ -774,16 +774,20 @@ impl PnpManager {
                     ids_out: Vec::new(),
                     data_out: RequestData::empty(),
                 };
-                let mut bus_enum_request = Request::new_pnp(pnp_payload, RequestData::empty());
+                let mut bus_enum_request =
+                    RequestHandle::new_pnp(pnp_payload, RequestData::empty());
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
-                bus_enum_request.add_completion(Self::process_enumerated_children, ctx);
+                bus_enum_request
+                    .write()
+                    .add_completion(Self::process_enumerated_children, ctx);
 
                 // Use SharedRequest because this is spawned detached
-                let shared = SharedRequest::new(bus_enum_request);
+                let shared = bus_enum_request.into_shared();
 
                 spawn_detached(async move {
+                    let mut handle = RequestHandle::Shared(shared);
                     let _ = (&*PNP_MANAGER)
-                        .send_request(top_device, &mut RequestHandle::Shared(shared))
+                        .send_request(top_device, &mut handle)
                         .await;
                 });
             }
@@ -900,14 +904,12 @@ impl PnpManager {
             data_out: RequestData::empty(),
         };
 
-        let mut req = Request::new_pnp(pnp_payload, RequestData::empty());
+        let mut req = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
-        req.add_completion(Self::process_enumerated_children, ctx);
+        req.write()
+            .add_completion(Self::process_enumerated_children, ctx);
 
-        let status = self
-            .send_request(top, &mut RequestHandle::Stack(&mut req))
-            .await;
-        status
+        self.send_request(top, &mut req).await
     }
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
@@ -1272,12 +1274,11 @@ impl PnpManager {
             ids_out: Vec::new(),
             data_out: RequestData::empty(),
         };
-        let mut start_request = Request::new_pnp(pnp_payload, RequestData::empty());
+        let mut start_request = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
         let ctx = Arc::into_raw(dn.clone()) as usize;
-        start_request.add_completion(Self::start_io, ctx);
+        start_request.write().add_completion(Self::start_io, ctx);
 
-        self.send_request(top.clone(), &mut RequestHandle::Stack(&mut start_request))
-            .await;
+        self.send_request(top.clone(), &mut start_request).await;
 
         dn.set_state(DevNodeState::Started);
         Ok((dn, top))

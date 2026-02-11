@@ -113,7 +113,7 @@ async fn ide_pnp_start<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let mut child_req = Request::new_pnp(
+    let mut child_handle = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -123,18 +123,21 @@ async fn ide_pnp_start<'a, 'b>(
         },
         RequestData::empty(),
     );
-    let st = {
-        let mut child_handle = RequestHandle::Stack(&mut child_req);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await
-    };
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await;
     if st != DriverStatus::NoSuchDevice {
-        let qst = child_req.status;
+        let qst = child_handle.read().status;
         if qst != DriverStatus::Success {
             return complete_req(req, qst);
         }
 
         let bars = {
-            let data = child_req.pnp.as_ref().unwrap().data_out.as_slice();
+            let data = child_handle
+                .read()
+                .pnp
+                .as_ref()
+                .unwrap()
+                .data_out
+                .as_slice();
             parse_ide_bars(data)
         };
 

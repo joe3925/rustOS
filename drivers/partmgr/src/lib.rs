@@ -167,7 +167,7 @@ pub async fn partition_pdo_read<'a, 'b>(
     // Allocate buffer for child request
     let child_data = RequestData::from_boxed_bytes(vec![0u8; buf_len].into_boxed_slice());
 
-    let mut child_req = Request::new(
+    let mut child_req = RequestHandle::new(
         RequestType::Read {
             offset: phys_off,
             len: buf_len,
@@ -176,16 +176,13 @@ pub async fn partition_pdo_read<'a, 'b>(
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let status = {
-        let mut child_handle = RequestHandle::Stack(&mut child_req);
-        send_req_parent(&device, &mut child_handle).await
-    };
+    let status = send_req_parent(&device, &mut child_req).await;
 
     // Copy data back to original request on success
     if status == DriverStatus::Success {
-        let src = child_req.data.as_slice();
+        let src = child_req.read().data.as_slice().to_vec();
         let mut w = request.write();
-        w.data_slice_mut()[..src.len()].copy_from_slice(src);
+        w.data_slice_mut()[..src.len()].copy_from_slice(&src);
     }
 
     DriverStep::complete(status)
@@ -244,19 +241,16 @@ pub async fn partition_pdo_write<'a, 'b>(
         RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
     };
 
-    let child = RequestHandle::Stack(
-        &mut Request::new(
-            RequestType::Write {
-                offset: phys_off,
-                len: buf_len,
-                flush_write_through,
-            },
-            child_data,
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower),
-    );
+    let mut child = RequestHandle::new(
+        RequestType::Write {
+            offset: phys_off,
+            len: buf_len,
+            flush_write_through,
+        },
+        child_data,
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let mut child = child;
     let status = send_req_parent(&device, &mut child).await;
 
     DriverStep::complete(status)
@@ -268,20 +262,17 @@ pub async fn partmgr_start<'a, 'b>(
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
 
-    let mut parent_req = Request::new(
+    let mut parent_req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_DRIVE_IDENTIFY),
         RequestData::empty(),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = {
-        let mut parent = RequestHandle::Stack(&mut parent_req);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut parent).await
-    };
+    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut parent_req).await;
     if status != DriverStatus::Success {
         return DriverStep::complete(status);
     }
 
-    if let Some(data) = parent_req.take_data::<DiskInfo>() {
+    if let Some(data) = parent_req.write().take_data::<DiskInfo>() {
         dx.disk_info.call_once(|| data);
     } else {
         return DriverStep::complete(status);
@@ -295,17 +286,14 @@ async fn read_from_lower_async(
     offset: u64,
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
-    let mut child_req = Request::new(
+    let mut child_req = RequestHandle::new(
         RequestType::Read { offset, len },
         RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = {
-        let mut handle = RequestHandle::Stack(&mut child_req);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await
-    };
+    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
     if status == DriverStatus::Success {
-        Ok(child_req.take_data_bytes())
+        Ok(child_req.write().take_data_bytes())
     } else {
         Err(status)
     }

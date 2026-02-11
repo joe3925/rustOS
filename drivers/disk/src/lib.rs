@@ -662,7 +662,7 @@ pub async fn disk_ioctl<'a, 'b>(
 
     match code {
         IOCTL_DRIVE_IDENTIFY => {
-            let mut req_pnp = Request::new_pnp(
+            let mut ch = RequestHandle::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
@@ -672,14 +672,14 @@ pub async fn disk_ioctl<'a, 'b>(
                 },
                 RequestData::empty(),
             );
-            let mut ch = RequestHandle::Stack(&mut req_pnp);
 
             let st = pnp_forward_request_to_next_lower(dev, &mut ch).await;
             if st != DriverStatus::Success {
                 return DriverStep::complete(st);
             }
             // todo: properly handle the none case
-            let info = if let Some(di) = req_pnp
+            let info = if let Some(di) = ch
+                .read()
                 .pnp
                 .as_ref()
                 .and_then(|p| p.data_out.view::<DiskInfo>())
@@ -699,12 +699,11 @@ pub async fn disk_ioctl<'a, 'b>(
         IOCTL_BLOCK_FLUSH => {
             let dx = disk_ext(&dev);
 
-            let mut req_child = Request::new(
-            RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-            RequestData::empty(),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
-            let mut handle = RequestHandle::Stack(&mut req_child);
+            let mut handle = RequestHandle::new(
+                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
+                RequestData::empty(),
+            )
+            .set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
             if status == DriverStatus::Success {
                 cache_clear(&dx);
@@ -725,21 +724,23 @@ async fn read_from_lower(
     offset: u64,
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
-    let mut child = Request::new(
+    let mut child = RequestHandle::new(
         RequestType::Read { offset, len },
         RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let mut handle = RequestHandle::Stack(&mut child);
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child).await;
     if st != DriverStatus::Success {
         return Err(st);
     }
-    if child.status != DriverStatus::Success {
-        return Err(child.status);
+    {
+        let status = child.read().status;
+        if status != DriverStatus::Success {
+            return Err(status);
+        }
     }
-    Ok(child.take_data_bytes())
+    Ok(child.write().take_data_bytes())
 }
 
 /// Flush all dirty cached blocks to the lower device. Not invoked automatically.
@@ -795,7 +796,7 @@ async fn write_to_lower(
     data: &[u8],
     flush_write_through: bool,
 ) -> DriverStatus {
-    let mut child = Request::new(
+    let mut child = RequestHandle::new(
         RequestType::Write {
             offset,
             len: data.len(),
@@ -804,46 +805,50 @@ async fn write_to_lower(
         RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let mut handle = RequestHandle::Stack(&mut child);
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child).await;
     if st != DriverStatus::Success {
         return st;
     }
-    child.status
+    child.read().status
 }
 
 async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let mut ch = Request::new_pnp(
+    let mut ch = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
-        ids_out: Vec::new(),
-        data_out: RequestData::empty(),
-    },
-    RequestData::empty(),
-);
-    let mut handle = RequestHandle::Stack(&mut ch);
-    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
+            ids_out: Vec::new(),
+            data_out: RequestData::empty(),
+        },
+        RequestData::empty(),
+    );
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
 
     if st != DriverStatus::Success {
         return Err(st);
     }
-    if ch.status != DriverStatus::Success {
-        return Err(ch.status);
+    {
+        let status = ch.read().status;
+        if status != DriverStatus::Success {
+            return Err(status);
+        }
     }
 
-    let di = if let Some(di) = ch.pnp.as_ref().and_then(|p| p.data_out.view::<DiskInfo>()) {
-        *di
-    } else {
-        let Some(pnp) = ch.pnp.as_ref() else {
-            return Err(DriverStatus::Unsuccessful);
-        };
-        let blob = pnp.data_out.as_slice();
-        if blob.len() < size_of::<DiskInfo>() {
-            return Err(DriverStatus::Unsuccessful);
+    let di = {
+        let req = ch.read();
+        if let Some(di) = req.pnp.as_ref().and_then(|p| p.data_out.view::<DiskInfo>()) {
+            *di
+        } else {
+            let Some(pnp) = req.pnp.as_ref() else {
+                return Err(DriverStatus::Unsuccessful);
+            };
+            let blob = pnp.data_out.as_slice();
+            if blob.len() < size_of::<DiskInfo>() {
+                return Err(DriverStatus::Unsuccessful);
+            }
+            unsafe { *(blob.as_ptr() as *const DiskInfo) }
         }
-        unsafe { *(blob.as_ptr() as *const DiskInfo) }
     };
 
     let dx = disk_ext(dev);

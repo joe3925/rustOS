@@ -312,7 +312,7 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
 /// Returns None if the volume lacks a valid GPT GUID.
 async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
     let vol_target = parent_fdo.clone();
-    let mut request = Request::new_pnp(
+    let mut request = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -323,17 +323,15 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
         RequestData::empty(),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = {
-        let mut req_handle = RequestHandle::Stack(&mut request);
-        kernel_api::pnp::pnp_send_request(vol_target, &mut req_handle).await
-    };
+    let status = kernel_api::pnp::pnp_send_request(vol_target, &mut request).await;
     if status != DriverStatus::Success {
         return None;
     }
 
     // PartitionInfo is returned in the PnP payload data_out for QueryResources
     let pi = {
-        let pnp = request.pnp.as_ref()?;
+        let req = request.read();
+        let pnp = req.pnp.as_ref()?;
         if let Some(pi) = pnp
             .data_out
             .view::<kernel_api::kernel_types::io::PartitionInfo>()
@@ -410,7 +408,7 @@ async fn try_bind_filesystems_for_parent_fdo(
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
-        let mut identify_req = Request::new(
+        let mut identify_req = RequestHandle::new(
             RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
             RequestData::from_t(FsIdentify {
                 volume_fdo: parent_fdo.clone(),
@@ -420,19 +418,18 @@ async fn try_bind_filesystems_for_parent_fdo(
         )
         .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let err = {
-            let mut handle = RequestHandle::Stack(&mut identify_req);
-            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, &mut handle).await
-        };
+        let err =
+            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, &mut identify_req)
+                .await;
         if err != DriverStatus::Success {
             continue;
         }
 
-        if identify_req.status != DriverStatus::Success {
+        if identify_req.read().status != DriverStatus::Success {
             continue;
         }
 
-        let Some(id) = identify_req.take_data::<FsIdentify>() else {
+        let Some(id) = identify_req.write().take_data::<FsIdentify>() else {
             continue;
         };
         if !id.can_mount {
@@ -578,23 +575,24 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         write_through: false,
         path: Path::from_string(path),
     };
-    let mut req_inner = Request::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params))
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
+    let mut req_inner = RequestHandle::new(
+        RequestType::Fs(FsOp::Open),
+        RequestData::from_t(params),
+    )
+    .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let err = {
-        let mut handle = RequestHandle::Stack(&mut req_inner);
-        pnp_send_request_via_symlink(public_link.to_string(), &mut handle).await
-    };
+    let err = pnp_send_request_via_symlink(public_link.to_string(), &mut req_inner).await;
 
     if err != DriverStatus::Success {
         return false;
     }
 
-    if req_inner.status != DriverStatus::Success {
+    if req_inner.read().status != DriverStatus::Success {
         return false;
     }
 
     if let Some(_) = req_inner
+        .write()
         .take_data::<FsOpenResult>()
         .map(|res| res.error.is_none())
     {

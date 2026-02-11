@@ -87,20 +87,17 @@ impl BlockDev {
         buf: &mut [u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
-        let mut req = Request::new(
+        let mut handle = RequestHandle::new(
             RequestType::Read { offset, len },
             RequestData::from_boxed_bytes(alloc::vec![0u8; len].into_boxed_slice()),
-        );
-        req.traversal_policy = TraversalPolicy::ForwardLower;
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let st = {
-            let mut handle = RequestHandle::Stack(&mut req);
-            let status = pnp_send_request(volume.clone(), &mut handle).await;
-            if status == DriverStatus::Success {
-                buf.copy_from_slice(req.data.as_slice());
-            }
-            status
-        };
+        let st = pnp_send_request(volume.clone(), &mut handle).await;
+        if st == DriverStatus::Success {
+            let data = handle.read();
+            buf.copy_from_slice(data.data.as_slice());
+        }
 
         if st == DriverStatus::Success {
             Ok(())
@@ -116,17 +113,16 @@ impl BlockDev {
         buf: &[u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
-        let mut req = Request::new(
+        let mut handle = RequestHandle::new(
             RequestType::Write {
                 offset,
                 len,
                 flush_write_through: false,
             },
             RequestData::from_boxed_bytes(buf.to_vec().into_boxed_slice()),
-        );
-        req.traversal_policy = TraversalPolicy::ForwardLower;
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let mut handle = RequestHandle::Stack(&mut req);
         let st = pnp_send_request(volume.clone(), &mut handle).await;
 
         if st == DriverStatus::Success {

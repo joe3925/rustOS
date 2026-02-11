@@ -37,9 +37,7 @@ use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
 use kernel_api::println;
-use kernel_api::request::{
-    Request, RequestHandle, RequestType, TraversalPolicy,
-};
+use kernel_api::request::{Request, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
@@ -121,7 +119,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     dev: Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let mut query_req = Request::new_pnp(
+    let mut query_req = RequestHandle::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -132,21 +130,20 @@ pub async fn vol_prepare_hardware<'a, 'b>(
         RequestData::empty(),
     );
 
-    let st = {
-        let mut req_lock = RequestHandle::Stack(&mut query_req);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut req_lock).await
-    };
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut query_req).await;
     if st == DriverStatus::NoSuchDevice {
         return DriverStep::complete(DriverStatus::Success);
     }
 
     let mut dx = ext::<VolExt>(&dev);
-    if query_req.status != DriverStatus::Success {
-        return DriverStep::complete(query_req.status);
+    let status = query_req.read().status;
+    if status != DriverStatus::Success {
+        return DriverStep::complete(status);
     }
 
     let pi_opt: Option<PartitionInfo> = {
-        let pnp = query_req.pnp.as_mut().unwrap();
+        let mut req = query_req.write();
+        let pnp = req.pnp.as_mut().unwrap();
         pnp.data_out.try_take::<PartitionInfo>()
     };
     if let Some(pi) = pi_opt {
@@ -269,17 +266,13 @@ pub async fn vol_pdo_read<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let status;
     let forward_data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-    let mut forward_req =
-        Request::new(RequestType::Read { offset, len }, forward_data).set_traversal_policy(policy);
-    {
-        let mut forward_handle = RequestHandle::Stack(&mut forward_req);
-        status = pnp_send_request(tgt, &mut forward_handle).await;
-    }
+    let mut forward_req = RequestHandle::new(RequestType::Read { offset, len }, forward_data)
+        .set_traversal_policy(policy);
+    let status = pnp_send_request(tgt, &mut forward_req).await;
 
     if status == DriverStatus::Success {
-        let src_buf = forward_req.data.as_slice().to_vec();
+        let src_buf = forward_req.read().data.as_slice().to_vec();
         let mut w = req.write();
         w.data_slice_mut()[..src_buf.len()].copy_from_slice(&src_buf);
     }
@@ -330,17 +323,15 @@ pub async fn vol_pdo_write<'a, 'b>(
         RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
     };
 
-    let mut forward = RequestHandle::Stack(
-        &mut Request::new(
-            RequestType::Write {
-                offset,
-                len,
-                flush_write_through,
-            },
-            forward_data,
-        )
-        .set_traversal_policy(policy),
-    );
+    let mut forward = RequestHandle::new(
+        RequestType::Write {
+            offset,
+            len,
+            flush_write_through,
+        },
+        forward_data,
+    )
+    .set_traversal_policy(policy);
 
     let status = pnp_send_request(tgt.clone(), &mut forward).await;
     DriverStep::complete(status)
