@@ -15,7 +15,10 @@ pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 use crate::global_async::GlobalAsyncExecutor;
 use crate::platform::{platform, Job};
 
-use super::slab::get_task_slab;
+use core::marker::PhantomData;
+use core::mem::{align_of, size_of};
+
+use super::slab::{get_task_slab, JOINABLE_STORAGE_SIZE, INLINE_FUTURE_ALIGN};
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
@@ -41,35 +44,151 @@ pub extern "win64" fn try_steal_blocking_one() -> bool {
     platform().try_steal_blocking_one()
 }
 
+/// Spawns a future, preferring slab allocation before falling back to Arc.
+/// Returns a JoinHandle that can be awaited to get the result.
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    let slab = get_task_slab();
+
+    // Check if both future and result fit in slab storage
+    let future_fits = size_of::<F>() <= JOINABLE_STORAGE_SIZE && align_of::<F>() <= INLINE_FUTURE_ALIGN;
+    let result_fits = size_of::<T>() <= JOINABLE_STORAGE_SIZE && align_of::<T>() <= INLINE_FUTURE_ALIGN;
+
+    if future_fits && result_fits {
+        if let Some(slot_handle) = slab.allocate_joinable() {
+            let (shard_idx, local_idx, generation) = slot_handle.init_and_enqueue(future);
+            return JoinHandle {
+                inner: JoinHandleInner::Slab {
+                    shard_idx,
+                    local_idx,
+                    generation,
+                    consumed: false,
+                    _marker: PhantomData,
+                },
+            };
+        }
+    }
+
+    // Fallback to Arc-based allocation
+    slab.record_joinable_fallback();
     let task = Arc::new(JoinableTask::new(future));
     task.enqueue();
-    JoinHandle { task }
+    JoinHandle {
+        inner: JoinHandleInner::Arc(task),
+    }
 }
 
 pub struct JoinHandle<T: Send + 'static> {
-    task: Arc<JoinableTask<T>>,
+    inner: JoinHandleInner<T>,
+}
+
+enum JoinHandleInner<T: Send + 'static> {
+    Arc(Arc<JoinableTask<T>>),
+    Slab {
+        shard_idx: u8,
+        local_idx: u16,
+        generation: u32,
+        /// Set to true after we've taken the result and decremented our ref
+        consumed: bool,
+        _marker: PhantomData<T>,
+    },
 }
 
 impl<T: Send + 'static> Future for JoinHandle<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        if let Some(result) = self.task.take_result() {
-            Poll::Ready(result)
-        } else {
-            self.task.update_waker(cx.waker());
-            // Check again in case result arrived between take_result and set_waker
-            if let Some(result) = self.task.take_result() {
-                Poll::Ready(result)
-            } else {
-                Poll::Pending
+        // Safety: JoinHandle doesn't contain any self-referential data,
+        // so it's safe to get mutable access through Pin
+        let this = unsafe { self.get_unchecked_mut() };
+
+        match &mut this.inner {
+            JoinHandleInner::Arc(task) => {
+                if let Some(result) = task.take_result() {
+                    Poll::Ready(result)
+                } else {
+                    task.update_waker(cx.waker());
+                    // Check again in case result arrived between take_result and set_waker
+                    if let Some(result) = task.take_result() {
+                        Poll::Ready(result)
+                    } else {
+                        Poll::Pending
+                    }
+                }
+            }
+            JoinHandleInner::Slab {
+                shard_idx,
+                local_idx,
+                generation,
+                consumed,
+                ..
+            } => {
+                if *consumed {
+                    panic!("JoinHandle polled after completion");
+                }
+
+                let slab = get_task_slab();
+                let Some(slot) = slab.get_joinable_slot(
+                    *shard_idx as usize,
+                    *local_idx as usize,
+                    *generation,
+                ) else {
+                    panic!("JoinHandle slot freed prematurely");
+                };
+
+                if slot.is_completed() {
+                    let result = unsafe { slot.take_result::<T>() };
+                    slab.decrement_joinable_ref(
+                        *shard_idx as usize,
+                        *local_idx as usize,
+                        *generation,
+                    );
+                    *consumed = true;
+                    Poll::Ready(result)
+                } else {
+                    slot.update_join_waker(cx.waker());
+                    // Double-check after setting waker
+                    if slot.is_completed() {
+                        let result = unsafe { slot.take_result::<T>() };
+                        slab.decrement_joinable_ref(
+                            *shard_idx as usize,
+                            *local_idx as usize,
+                            *generation,
+                        );
+                        *consumed = true;
+                        Poll::Ready(result)
+                    } else {
+                        Poll::Pending
+                    }
+                }
             }
         }
+    }
+}
+
+impl<T: Send + 'static> Drop for JoinHandle<T> {
+    fn drop(&mut self) {
+        if let JoinHandleInner::Slab {
+            shard_idx,
+            local_idx,
+            generation,
+            consumed,
+            ..
+        } = &self.inner
+        {
+            if !*consumed {
+                // Release the JoinHandle's ref if we haven't already
+                get_task_slab().decrement_joinable_ref(
+                    *shard_idx as usize,
+                    *local_idx as usize,
+                    *generation,
+                );
+            }
+        }
+        // Arc variant drops automatically
     }
 }
 

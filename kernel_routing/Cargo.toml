@@ -11,7 +11,6 @@ default = ["ffi"]
 # When enabled, uses direct function calls via linker seams instead of FFI.
 # This should only be enabled when compiling as part of the kernel.
 kernel_link = []
-# When enabled (default), uses FFI calls to kernel_sys.
 ffi = ["dep:kernel_sys"]
 
 [dependencies]

@@ -9,3 +9,17 @@ build = "build.rs"
 kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
 bootloader = { version = "0.11", default-features = false, features = ["uefi"] }
 [dependencies]
+
+[profile.dev]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

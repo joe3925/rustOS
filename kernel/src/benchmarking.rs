@@ -2309,7 +2309,16 @@ pub async fn bench_c_drive_io_async() {
     }
 
     let test_path = Path::from_string(DISK_BENCH_FILE);
-    let mut file = match File::open(&test_path, &[OpenFlags::Create, OpenFlags::ReadWrite]).await {
+    let mut file = match File::open(
+        &test_path,
+        &[
+            OpenFlags::Create,
+            OpenFlags::ReadWrite,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await
+    {
         Ok(f) => f,
         Err(e) => {
             println!(

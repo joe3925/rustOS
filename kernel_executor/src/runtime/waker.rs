@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::any::TypeId;
 use core::marker::PhantomData;
 use core::mem::{forget, transmute_copy, ManuallyDrop};
 use core::ptr;
@@ -9,7 +8,9 @@ use core::task::{RawWaker, RawWakerVTable, Waker};
 use crate::platform::JobFn;
 
 use super::slab::{
-    decode_slab_ptr, encode_slab_ptr, enqueue_slab_task, get_task_slab, slab_poll_trampoline,
+    decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,
+    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, joinable_slab_poll_trampoline,
+    slab_poll_trampoline,
 };
 use super::task::TaskPoll;
 
@@ -144,7 +145,7 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     let data = data_ptr as usize;
     let drop_guard = unsafe { Waker::from_raw(raw) };
 
-    // Slab-based waker
+    // Slab-based waker (detached)
     if ptr::eq(vtable_ptr, &SLAB_WAKER_VTABLE) {
         // Keep slot alive while the continuation is stored
         if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(data) {
@@ -154,6 +155,22 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
                 tramp: slab_inline_poll,
                 ctx: data,
                 drop_fn: drop_slab_ctx,
+            });
+        } else {
+            drop(drop_guard);
+            return None;
+        }
+    }
+
+    // Joinable slab-based waker
+    if ptr::eq(vtable_ptr, &JOINABLE_SLAB_WAKER_VTABLE) {
+        if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(data) {
+            get_task_slab().increment_joinable_ref(shard_idx, local_idx, generation);
+            drop(drop_guard);
+            return Some(Continuation {
+                tramp: joinable_slab_inline_poll,
+                ctx: data,
+                drop_fn: drop_joinable_slab_ctx,
             });
         } else {
             drop(drop_guard);
@@ -257,5 +274,78 @@ extern "win64" fn slab_inline_poll(ctx: usize) {
 unsafe fn drop_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(ctx) {
         get_task_slab().decrement_ref(shard_idx, local_idx, generation);
+    }
+}
+
+// ============================================================================
+// Joinable slab waker - for slab-backed tasks that return a value
+// ============================================================================
+
+static JOINABLE_SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    joinable_slab_clone_waker,
+    joinable_slab_wake,
+    joinable_slab_wake_by_ref,
+    joinable_slab_drop_waker,
+);
+
+/// Creates a waker for a joinable slab task. Waker operations are refcount-free.
+pub fn create_joinable_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+    let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
+    unsafe { Waker::from_raw(RawWaker::new(encoded as *const (), &JOINABLE_SLAB_WAKER_VTABLE)) }
+}
+
+unsafe fn joinable_slab_clone_waker(ptr: *const ()) -> RawWaker {
+    // No refcount change — clones are lightweight borrowed views
+    RawWaker::new(ptr, &JOINABLE_SLAB_WAKER_VTABLE)
+}
+
+unsafe fn joinable_slab_wake(ptr: *const ()) {
+    let encoded = ptr as usize;
+    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
+        enqueue_joinable_slab_task(shard_idx, local_idx, generation);
+    }
+}
+
+unsafe fn joinable_slab_wake_by_ref(ptr: *const ()) {
+    let encoded = ptr as usize;
+    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
+        enqueue_joinable_slab_task(shard_idx, local_idx, generation);
+    }
+}
+
+unsafe fn joinable_slab_drop_waker(_ptr: *const ()) {
+    // No-op — slot lifetime is managed by structural anchor refs, not waker clones
+}
+
+extern "win64" fn joinable_slab_inline_poll(ctx: usize) {
+    let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) else {
+        return;
+    };
+
+    let slab = get_task_slab();
+    let Some(slot) = slab.get_joinable_slot(shard_idx, local_idx, generation) else {
+        return;
+    };
+
+    if slot.is_completed() {
+        return;
+    }
+
+    loop {
+        if slot.try_enqueue() {
+            slab.increment_joinable_ref(shard_idx, local_idx, generation);
+            joinable_slab_poll_trampoline(ctx);
+            return;
+        }
+
+        if slot.try_notify() {
+            return;
+        }
+    }
+}
+
+unsafe fn drop_joinable_slab_ctx(ctx: usize) {
+    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) {
+        get_task_slab().decrement_joinable_ref(shard_idx, local_idx, generation);
     }
 }
