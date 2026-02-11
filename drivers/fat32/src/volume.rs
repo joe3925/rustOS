@@ -16,7 +16,8 @@ use fatfs::{
 use spin::RwLock;
 
 use kernel_api::device::DeviceObject;
-use kernel_api::request::{RequestHandle, RequestHandleResult, RequestType};
+use kernel_api::pnp::DriverStep;
+use kernel_api::request::{RequestHandle, RequestType};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
@@ -714,10 +715,10 @@ fn handle_fs_request(
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch<'a>(
+pub async fn fs_op_dispatch<'a, 'b>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let fs_arc = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         vdx.fs.clone()
@@ -727,21 +728,23 @@ pub async fn fs_op_dispatch<'a>(
     let status: DriverStatus;
 
     if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
-        status = handle_seek_request(&dev, &mut req, &mut fs_guard);
+        status = handle_seek_request(&dev, req, &mut fs_guard);
     } else {
-        let shared = req.into_shared();
-        let shared_for_blocking = shared.clone();
+        req.promote();
+        let shared = req
+            .as_shared()
+            .expect("RequestHandle should be shared after promote")
+            .clone();
         let dev_for_blocking = dev.clone();
         let mut fs_guard_for_blocking = fs_guard;
 
         status = spawn_blocking(move || {
-            let mut h = RequestHandle::Shared(shared_for_blocking);
+            let mut h = RequestHandle::Shared(shared);
             handle_fs_request(&dev_for_blocking, &mut h, &mut fs_guard_for_blocking)
         })
         .await;
-
-        req = RequestHandle::Shared(shared);
     }
 
-    req.complete(status)
+    req.write().status = status;
+    DriverStep::complete(status)
 }

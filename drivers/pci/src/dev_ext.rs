@@ -751,10 +751,10 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
 
     let mut req = Request::new_pnp(pnp, RequestData::empty());
 
-    let (_, status) =
-        pnp_forward_request_to_next_lower(device.clone(), RequestHandle::Stack(&mut req)).await;
+    let mut handle = RequestHandle::Stack(&mut req);
+    let status = pnp_forward_request_to_next_lower(device.clone(), &mut handle).await;
 
-    if status != DriverStatus::Success || req.status != DriverStatus::Success {
+    if status != DriverStatus::Success {
         println!("[PCI] parent QueryResources failed; no ECAM");
         return alloc::vec::Vec::new();
     }

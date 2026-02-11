@@ -94,12 +94,14 @@ impl BlockDev {
         );
         req.traversal_policy = TraversalPolicy::ForwardLower;
 
-        let (handle, st) = pnp_send_request(volume.clone(), RequestHandle::Stack(&mut req)).await;
-
-        if st == DriverStatus::Success {
-            let g = handle.read();
-            buf.copy_from_slice(g.data.as_slice());
-        }
+        let st = {
+            let mut handle = RequestHandle::Stack(&mut req);
+            let status = pnp_send_request(volume.clone(), &mut handle).await;
+            if status == DriverStatus::Success {
+                buf.copy_from_slice(req.data.as_slice());
+            }
+            status
+        };
 
         if st == DriverStatus::Success {
             Ok(())
@@ -125,7 +127,8 @@ impl BlockDev {
         );
         req.traversal_policy = TraversalPolicy::ForwardLower;
 
-        let (_, st) = pnp_send_request(volume.clone(), RequestHandle::Stack(&mut req)).await;
+        let mut handle = RequestHandle::Stack(&mut req);
+        let st = pnp_send_request(volume.clone(), &mut handle).await;
 
         if st == DriverStatus::Success {
             Ok(())

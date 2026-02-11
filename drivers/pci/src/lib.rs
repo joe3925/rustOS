@@ -30,11 +30,8 @@ use kernel_api::{
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
         pnp_forward_request_to_next_lower,
     },
-    println,
-    request::{Request, RequestHandle, RequestHandleResult, RequestType},
-    request_handler,
-    runtime::spawn_blocking,
-    status::DriverStatus,
+    println, request::{Request, RequestHandle, RequestType}, request_handler,
+    runtime::spawn_blocking, status::DriverStatus,
 };
 use spin::Once;
 
@@ -75,10 +72,10 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn pci_bus_pnp_start<'a>(
+pub async fn pci_bus_pnp_start<'a, 'b>(
     device: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let mut query = Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
@@ -90,13 +87,13 @@ pub async fn pci_bus_pnp_start<'a>(
         RequestData::empty(),
     );
 
-    let (_, st) =
-        pnp_forward_request_to_next_lower(device.clone(), RequestHandle::Stack(&mut query)).await;
+    let mut query_handle = RequestHandle::Stack(&mut query);
+    let st = pnp_forward_request_to_next_lower(device.clone(), &mut query_handle).await;
 
     if st != DriverStatus::NoSuchDevice {
-        let qst = query.status;
+        let qst = st;
         if qst != DriverStatus::Success {
-            return req.complete(qst);
+            return DriverStep::complete(qst);
         }
 
         let blob = query
@@ -108,7 +105,7 @@ pub async fn pci_bus_pnp_start<'a>(
 
         if segs.is_empty() {
             println!("[PCI] no ECAM block found in parent resources");
-            return req.cont();
+            return DriverStep::Continue;
         }
 
         let prt_entries = parse_prt_from_blob(&blob);
@@ -119,7 +116,7 @@ pub async fn pci_bus_pnp_start<'a>(
                 ext.prt.call_once(|| prt_entries);
             }
         } else {
-            return req.cont();
+            return DriverStep::Continue;
         }
     } else {
         // Fallback derive segments from parent using platform-specific probe
@@ -129,29 +126,29 @@ pub async fn pci_bus_pnp_start<'a>(
                 ext.segments.call_once(|| segs);
             }
         } else {
-            return req.cont();
+            return DriverStep::Continue;
         }
     }
 
-    req.cont()
+    DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn pci_bus_pnp_query_devrels<'a>(
+pub async fn pci_bus_pnp_query_devrels<'a, 'b>(
     device: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         let st = enumerate_bus(&device).await;
         if st == DriverStatus::Success {
-            return req.cont();
+            return DriverStep::Continue;
         } else {
-            return req.complete(st);
+            return DriverStep::complete(st);
         }
     }
 
-    req.cont()
+    DriverStep::Continue
 }
 
 fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
@@ -283,15 +280,15 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 }
 
 #[request_handler]
-pub async fn pci_pdo_query_id<'a>(
+pub async fn pci_pdo_query_id<'a, 'b>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     use kernel_api::pnp::QueryIdType;
 
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
     let mut status = DriverStatus::Success;
@@ -326,17 +323,17 @@ pub async fn pci_pdo_query_id<'a>(
             None => status = DriverStatus::InvalidParameter,
         }
     }
-    req.complete(status)
+    DriverStep::complete(status)
 }
 
 #[request_handler]
-pub async fn pci_pdo_query_resources<'a>(
+pub async fn pci_pdo_query_resources<'a, 'b>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
     let status = {
@@ -351,29 +348,29 @@ pub async fn pci_pdo_query_resources<'a>(
         }
     };
 
-    req.complete(status)
+    DriverStep::complete(status)
 }
 
 #[request_handler]
-pub async fn pci_pdo_start<'a>(
+pub async fn pci_pdo_start<'a, 'b>(
     _dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    req.complete(DriverStatus::Success)
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }
 #[request_handler]
-pub async fn pci_pdo_query_devrels<'a>(
+pub async fn pci_pdo_query_devrels<'a, 'b>(
     _dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    req.complete(DriverStatus::Success)
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn pci_pdo_ioctl<'a>(
+pub async fn pci_pdo_ioctl<'a, 'b>(
     dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let code = match {
         let r = req.read();
         match r.kind {
@@ -382,11 +379,11 @@ pub async fn pci_pdo_ioctl<'a>(
         }
     } {
         Some(c) => c,
-        None => return req.complete(DriverStatus::InvalidParameter),
+        None => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
     match code {
         IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev, req).await,
-        _ => req.complete(DriverStatus::NotImplemented),
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }

@@ -16,9 +16,7 @@ use kernel_api::{
         DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
     },
-    request::{RequestHandle, RequestHandleResult},
-    request_handler,
-    status::DriverStatus,
+    request::RequestHandle, request_handler, status::DriverStatus,
 };
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -66,10 +64,10 @@ pub extern "win64" fn ps2_device_add(
 }
 
 #[request_handler]
-pub async fn ps2_start<'a>(
+pub async fn ps2_start<'a, 'b>(
     dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     if let Ok(mut ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
@@ -77,33 +75,33 @@ pub async fn ps2_start<'a>(
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }
     } else {
-        return req.complete(DriverStatus::NoSuchDevice);
+        return DriverStep::complete(DriverStatus::NoSuchDevice);
     }
-    req.cont()
+    DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn ps2_query_devrels<'a>(
+pub async fn ps2_query_devrels<'a, 'b>(
     device: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
     if relation != DeviceRelationType::BusRelations {
-        return req.complete(DriverStatus::NotImplemented);
+        return DriverStep::complete(DriverStatus::NotImplemented);
     }
 
     let devnode: Arc<DevNode> = match device.dev_node.get().unwrap().upgrade() {
         Some(dn) => dn,
         None => {
-            return req.complete(DriverStatus::NoSuchDevice);
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
         }
     };
 
     let ext = match device.try_devext::<DevExt>() {
         Ok(g) => g,
         Err(_) => {
-            return req.complete(DriverStatus::NoSuchDevice);
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
         }
     };
 
@@ -130,7 +128,7 @@ pub async fn ps2_query_devrels<'a>(
         );
     }
 
-    req.complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
 
 fn make_child_pdo(
@@ -174,13 +172,13 @@ fn make_child_pdo(
 }
 
 #[request_handler]
-async fn ps2_child_query_id<'a>(
+async fn ps2_child_query_id<'a, 'b>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
     {
@@ -228,15 +226,15 @@ async fn ps2_child_query_id<'a>(
             }
         }
     }
-    req.complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
 
 #[request_handler]
-async fn ps2_child_start<'a>(
+async fn ps2_child_start<'a, 'b>(
     _dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    req.complete(DriverStatus::Success)
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    DriverStep::complete(DriverStatus::Success)
 }
 
 const I8042_DATA: u16 = 0x60;

@@ -33,14 +33,13 @@ use kernel_api::pnp::PnpRequest;
 use kernel_api::pnp::PnpVtable;
 use kernel_api::pnp::QueryIdType;
 use kernel_api::pnp::driver_set_evt_device_add;
-use kernel_api::pnp::pnp_complete_request;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
 use kernel_api::println;
 use kernel_api::request::{
-    Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy,
+    Request, RequestHandle, RequestType, TraversalPolicy,
 };
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
@@ -119,11 +118,11 @@ pub extern "win64" fn vol_device_add(
 }
 
 #[request_handler]
-pub async fn vol_prepare_hardware<'a>(
+pub async fn vol_prepare_hardware<'a, 'b>(
     dev: Arc<DeviceObject>,
-    request: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    let mut query_req = &mut Request::new_pnp(
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    let mut query_req = Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -134,61 +133,61 @@ pub async fn vol_prepare_hardware<'a>(
         RequestData::empty(),
     );
 
-    let mut req_lock = RequestHandle::Stack(query_req);
-    let (mut req_lock, st) = pnp_forward_request_to_next_lower(dev.clone(), req_lock).await;
+    let st = {
+        let mut req_lock = RequestHandle::Stack(&mut query_req);
+        pnp_forward_request_to_next_lower(dev.clone(), &mut req_lock).await
+    };
     if st == DriverStatus::NoSuchDevice {
-        return request.complete(DriverStatus::Success);
+        return DriverStep::complete(DriverStatus::Success);
     }
 
-    let mut g = req_lock.write();
     let mut dx = ext::<VolExt>(&dev);
-
-    if g.status != DriverStatus::Success {
-        return request.complete(g.status);
+    if query_req.status != DriverStatus::Success {
+        return DriverStep::complete(query_req.status);
     }
 
     let pi_opt: Option<PartitionInfo> = {
-        let pnp = g.pnp.as_mut().unwrap();
+        let pnp = query_req.pnp.as_mut().unwrap();
         pnp.data_out.try_take::<PartitionInfo>()
     };
     if let Some(pi) = pi_opt {
         dx.part.call_once(|| pi);
     }
 
-    request.cont()
+    DriverStep::Continue
 }
 #[request_handler]
-pub async fn vol_enumerate_devices<'a>(
+pub async fn vol_enumerate_devices<'a, 'b>(
     device: Arc<DeviceObject>,
-    request: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let dx = ext::<VolExt>(&device);
 
     let binding = dx.part.get();
     let pi = if let Some(ref pi) = binding {
         pi
     } else {
-        return request.cont();
+        return DriverStep::Continue;
     };
 
     let binding = (pi.gpt_header, pi.gpt_entry);
     let (_hdr, ent) = if let (Some(ref hdr), Some(ref ent)) = binding {
         (hdr, ent)
     } else {
-        return request.cont();
+        return DriverStep::Continue;
     };
 
     if dx
         .enumerated
         .swap(true, core::sync::atomic::Ordering::AcqRel)
     {
-        return request.cont();
+        return DriverStep::Continue;
     }
 
     let parent_dn = if let Some(dn) = device.dev_node.get().unwrap().upgrade() {
         dn
     } else {
-        return request.complete(DriverStatus::Unsuccessful);
+        return DriverStep::complete(DriverStatus::Unsuccessful);
     };
 
     let zero = [0u8; 16];
@@ -203,7 +202,7 @@ pub async fn vol_enumerate_devices<'a>(
 
     let ptype = ent.partition_type_guid;
     if ptype == zero || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
-        return request.cont();
+        return DriverStep::Continue;
     }
 
     let part_guid_s = guid_to_string(&ent.unique_partition_guid);
@@ -238,14 +237,14 @@ pub async fn vol_enumerate_devices<'a>(
             .part
             .call_once(|| dx.part.get().unwrap().clone());
     }
-    request.cont()
+    DriverStep::Continue
 }
 #[request_handler]
-pub async fn vol_pdo_read<'a>(
+pub async fn vol_pdo_read<'a, 'b>(
     dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
-) -> RequestHandleResult<'a> {
+) -> DriverStep {
     let off_res = {
         let r = req.read();
         match r.kind {
@@ -261,41 +260,38 @@ pub async fn vol_pdo_read<'a>(
     };
     let (offset, len, policy) = match off_res {
         Ok(Some(v)) => v,
-        Ok(None) => return req.complete(DriverStatus::Success),
-        Err(st) => return req.complete(st),
+        Ok(None) => return DriverStep::complete(DriverStatus::Success),
+        Err(st) => return DriverStep::complete(st),
     };
 
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match binding.backing.get() {
         Some(t) => t.clone(),
-        None => return req.complete(DriverStatus::NoSuchDevice),
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    // Allocate buffer for forward request
+    let status;
     let forward_data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-
-    let forward = RequestHandle::Stack(
-        &mut Request::new(RequestType::Read { offset, len }, forward_data)
-            .set_traversal_policy(policy),
-    );
-
-    let (forward_handle, status) = pnp_send_request(tgt, forward).await;
-
-    // Copy data back to original request
-    if status == DriverStatus::Success {
-        let binding = forward_handle.read();
-        let src = binding.data.as_slice();
-        let mut w = req.write();
-        w.data_slice_mut()[..src.len()].copy_from_slice(src);
+    let mut forward_req =
+        Request::new(RequestType::Read { offset, len }, forward_data).set_traversal_policy(policy);
+    {
+        let mut forward_handle = RequestHandle::Stack(&mut forward_req);
+        status = pnp_send_request(tgt, &mut forward_handle).await;
     }
 
-    req.complete(status)
+    if status == DriverStatus::Success {
+        let src_buf = forward_req.data.as_slice().to_vec();
+        let mut w = req.write();
+        w.data_slice_mut()[..src_buf.len()].copy_from_slice(&src_buf);
+    }
+
+    DriverStep::complete(status)
 }
 
 #[request_handler]
-pub async fn vol_pdo_write<'a>(
+pub async fn vol_pdo_write<'a, 'b>(
     dev: Arc<DeviceObject>,
-    req: &mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
     let parsed = {
@@ -335,7 +331,7 @@ pub async fn vol_pdo_write<'a>(
         RequestData::from_boxed_bytes(r.data_slice().to_vec().into_boxed_slice())
     };
 
-    let forward = RequestHandle::Stack(
+    let mut forward = RequestHandle::Stack(
         &mut Request::new(
             RequestType::Write {
                 offset,
@@ -347,13 +343,13 @@ pub async fn vol_pdo_write<'a>(
         .set_traversal_policy(policy),
     );
 
-    let (_, status) = pnp_send_request(tgt.clone(), forward).await;
-    req.complete(status)
+    let status = pnp_send_request(tgt.clone(), &mut forward).await;
+    DriverStep::complete(status)
 }
 #[request_handler]
-async fn vol_pdo_query_resources<'a>(
+async fn vol_pdo_query_resources<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    req: &mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let status = {
         let mut w = req.write();
@@ -369,5 +365,5 @@ async fn vol_pdo_query_resources<'a>(
         }
     };
 
-    req.complete(status)
+    DriverStep::complete(status)
 }

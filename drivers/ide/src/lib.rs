@@ -60,6 +60,22 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 10000;
 
+fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
+    {
+        let mut w = req.write();
+        w.status = status;
+    }
+    DriverStep::complete(status)
+}
+
+fn continue_req(req: &mut RequestHandle) -> DriverStep {
+    {
+        let mut w = req.write();
+        w.status = DriverStatus::ContinueStep;
+    }
+    DriverStep::Continue
+}
+
 #[repr(C)]
 pub struct ChildExt {
     pub parent_device: Weak<DeviceObject>,
@@ -93,11 +109,11 @@ pub extern "win64" fn ide_device_add(
 }
 
 #[request_handler]
-async fn ide_pnp_start<'a>(
+async fn ide_pnp_start<'a, 'b>(
     dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    let mut child = RequestHandle::Stack(&mut Request::new_pnp(
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    let mut child_req = Request::new_pnp(
         PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
@@ -106,17 +122,19 @@ async fn ide_pnp_start<'a>(
             data_out: RequestData::empty(),
         },
         RequestData::empty(),
-    ));
-    let (child, st) = pnp_forward_request_to_next_lower(dev.clone(), child).await;
+    );
+    let st = {
+        let mut child_handle = RequestHandle::Stack(&mut child_req);
+        pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await
+    };
     if st != DriverStatus::NoSuchDevice {
-        let qst = { child.read().status };
+        let qst = child_req.status;
         if qst != DriverStatus::Success {
-            return req.complete(qst);
+            return complete_req(req, qst);
         }
 
         let bars = {
-            let g = child.read();
-            let data = g.pnp.as_ref().unwrap().data_out.as_slice();
+            let data = child_req.pnp.as_ref().unwrap().data_out.as_slice();
             parse_ide_bars(data)
         };
 
@@ -140,20 +158,20 @@ async fn ide_pnp_start<'a>(
         dx.enumerated.store(false, Ordering::Release);
     }
 
-    req.cont()
+    continue_req(req)
 }
 
 #[request_handler]
-async fn ide_pnp_query_devrels<'a>(
+async fn ide_pnp_query_devrels<'a, 'b>(
     dev: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(&dev);
-        return req.complete(DriverStatus::Success);
+        return complete_req(req, DriverStatus::Success);
     }
-    req.cont()
+    continue_req(req)
 }
 
 fn acquire_controller(dx: &DevExt) {
@@ -280,28 +298,28 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 }
 
 #[request_handler]
-pub async fn ide_pdo_read<'a>(
+pub async fn ide_pdo_read<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
-) -> RequestHandleResult<'a> {
+) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     if !cdx.present.load(Ordering::Acquire) {
-        return req.complete(DriverStatus::NoSuchDevice);
+        return complete_req(req, DriverStatus::NoSuchDevice);
     }
 
     let parent = match cdx.parent_device.upgrade() {
         Some(p) => p,
-        None => return req.complete(DriverStatus::NoSuchDevice),
+        None => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let dx = match parent.try_devext::<DevExt>() {
         Ok(dx) => dx,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let kind = {
@@ -310,22 +328,22 @@ pub async fn ide_pdo_read<'a>(
     };
     let (offset, len) = match kind {
         RequestType::Read { offset, len } => (offset, len),
-        _ => return req.complete(DriverStatus::InvalidParameter),
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
     };
 
     if len == 0 {
-        return req.complete(DriverStatus::Success);
+        return complete_req(req, DriverStatus::Success);
     }
 
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return req.complete(DriverStatus::InvalidParameter);
+        return complete_req(req, DriverStatus::InvalidParameter);
     }
 
     let lba = offset >> 9;
     let sectors = (len / 512) as u32;
 
     if sectors == 0 || (lba >> 28) != 0 {
-        return req.complete(DriverStatus::InvalidParameter);
+        return complete_req(req, DriverStatus::InvalidParameter);
     }
 
     let has_buffer = {
@@ -333,7 +351,7 @@ pub async fn ide_pdo_read<'a>(
         r.data_len() >= len
     };
     if !has_buffer {
-        return req.complete(DriverStatus::InsufficientResources);
+        return complete_req(req, DriverStatus::InsufficientResources);
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
@@ -349,32 +367,32 @@ pub async fn ide_pdo_read<'a>(
         }
     };
 
-    req.complete(status)
+    complete_req(req, status)
 }
 
 #[request_handler]
-pub async fn ide_pdo_write<'a>(
+pub async fn ide_pdo_write<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
-) -> RequestHandleResult<'a> {
+) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     if !cdx.present.load(Ordering::Acquire) {
-        return req.complete(DriverStatus::NoSuchDevice);
+        return complete_req(req, DriverStatus::NoSuchDevice);
     }
 
     let parent = match cdx.parent_device.upgrade() {
         Some(p) => p,
-        None => return req.complete(DriverStatus::NoSuchDevice),
+        None => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let dx = match parent.try_devext::<DevExt>() {
         Ok(dx) => dx,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let kind = {
@@ -383,22 +401,22 @@ pub async fn ide_pdo_write<'a>(
     };
     let (offset, len) = match kind {
         RequestType::Write { offset, len, .. } => (offset, len),
-        _ => return req.complete(DriverStatus::InvalidParameter),
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
     };
 
     if len == 0 {
-        return req.complete(DriverStatus::Success);
+        return complete_req(req, DriverStatus::Success);
     }
 
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
-        return req.complete(DriverStatus::InvalidParameter);
+        return complete_req(req, DriverStatus::InvalidParameter);
     }
 
     let lba = offset >> 9;
     let sectors = (len / 512) as u32;
 
     if sectors == 0 || (lba >> 28) != 0 {
-        return req.complete(DriverStatus::InvalidParameter);
+        return complete_req(req, DriverStatus::InvalidParameter);
     }
 
     let has_buffer = {
@@ -406,7 +424,7 @@ pub async fn ide_pdo_write<'a>(
         r.data_len() >= len
     };
     if !has_buffer {
-        return req.complete(DriverStatus::InsufficientResources);
+        return complete_req(req, DriverStatus::InsufficientResources);
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
@@ -423,30 +441,30 @@ pub async fn ide_pdo_write<'a>(
         }
     };
 
-    req.complete(status)
+    complete_req(req, status)
 }
 
 #[request_handler]
-pub async fn ide_pdo_internal_ioctl<'a>(
+pub async fn ide_pdo_internal_ioctl<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     if !cdx.present.load(Ordering::Acquire) {
-        return req.complete(DriverStatus::NoSuchDevice);
+        return complete_req(req, DriverStatus::NoSuchDevice);
     }
 
     let parent: Arc<DeviceObject> = match cdx.parent_device.upgrade() {
         Some(p) => p,
-        None => return req.complete(DriverStatus::NoSuchDevice),
+        None => return complete_req(req, DriverStatus::NoSuchDevice),
     };
     let dx = match parent.try_devext::<DevExt>() {
         Ok(dx) => dx,
-        Err(_) => return req.complete(DriverStatus::NoSuchDevice),
+        Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
     let kind = {
@@ -455,7 +473,7 @@ pub async fn ide_pdo_internal_ioctl<'a>(
     };
     let code = match kind {
         RequestType::DeviceControl(c) => c,
-        _ => return req.complete(DriverStatus::InvalidParameter),
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
     };
 
     match code {
@@ -470,12 +488,12 @@ pub async fn ide_pdo_internal_ioctl<'a>(
             let ok = wait_not_busy(&dx.ports, TIMEOUT_MS);
 
             if ok {
-                req.complete(DriverStatus::Success)
+                complete_req(req, DriverStatus::Success)
             } else {
-                req.complete(DriverStatus::Unsuccessful)
+                complete_req(req, DriverStatus::Unsuccessful)
             }
         }
-        _ => req.complete(DriverStatus::NotImplemented),
+        _ => complete_req(req, DriverStatus::NotImplemented),
     }
 }
 
@@ -841,10 +859,10 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
 }
 
 #[request_handler]
-pub async fn ide_pdo_query_id<'a>(
+pub async fn ide_pdo_query_id<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     use QueryIdType::*;
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
 
@@ -876,18 +894,18 @@ pub async fn ide_pdo_query_id<'a>(
             }
         }
     }
-    req.complete(DriverStatus::Success)
+    complete_req(req, DriverStatus::Success)
 }
 
 #[request_handler]
-pub async fn ide_pdo_query_resources<'a>(
+pub async fn ide_pdo_query_resources<'a, 'b>(
     pdo: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
         Err(_) => {
-            return req.complete(DriverStatus::NoSuchDevice);
+            return complete_req(req, DriverStatus::NoSuchDevice);
         }
     };
 
@@ -905,13 +923,13 @@ pub async fn ide_pdo_query_resources<'a>(
         }
     };
 
-    req.complete(status)
+    complete_req(req, status)
 }
 
 #[request_handler]
-pub async fn ide_pdo_start<'a>(
+pub async fn ide_pdo_start<'a, 'b>(
     _pdo: Arc<DeviceObject>,
-    req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
-    req.complete(DriverStatus::Success)
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
+    complete_req(req, DriverStatus::Success)
 }

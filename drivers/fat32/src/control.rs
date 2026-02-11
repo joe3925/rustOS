@@ -24,9 +24,9 @@ use kernel_api::{
         pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
     println,
-    request::{Request, RequestHandle, RequestHandleResult, RequestType, TraversalPolicy},
+    request::{Request, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
-    runtime::{spawn, spawn_blocking, spawn_detached},
+    runtime::{spawn_blocking, spawn_detached},
     status::DriverStatus,
 };
 
@@ -78,13 +78,13 @@ fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
 }
 
 #[request_handler]
-pub async fn fs_root_ioctl<'a>(
+pub async fn fs_root_ioctl<'a, 'b>(
     _dev: Arc<DeviceObject>,
-    mut req: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     let code = match { req.read().kind } {
         RequestType::DeviceControl(c) => c,
-        _ => return req.complete(DriverStatus::NotImplemented),
+        _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
     match code {
@@ -94,10 +94,10 @@ pub async fn fs_root_ioctl<'a>(
             drop(r);
             let mut id = match id_opt {
                 Some(v) => v,
-                None => return req.complete(DriverStatus::InvalidParameter),
+                None => return DriverStep::complete(DriverStatus::InvalidParameter),
             };
 
-            let q = RequestHandle::Stack(&mut Request::new_pnp(
+            let mut query = Request::new_pnp(
                 PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
@@ -106,15 +106,17 @@ pub async fn fs_root_ioctl<'a>(
                     data_out: RequestData::empty(),
                 },
                 RequestData::empty(),
-            ));
-
-            let (mut reg, st) = pnp_send_request(id.volume_fdo.clone(), q).await;
+            );
+            let st = {
+                let mut q = RequestHandle::Stack(&mut query);
+                pnp_send_request(id.volume_fdo.clone(), &mut q).await
+            };
 
             let mut sector_size: Option<u16> = None;
             let mut total_sectors: Option<u64> = None;
 
             if st == DriverStatus::Success {
-                if let Some(pnp) = reg.write().pnp.as_mut() {
+                if let Some(pnp) = query.pnp.as_mut() {
                     let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
                     if pi_opt.is_none() {
                         let raw = pnp.data_out.take_bytes();
@@ -139,8 +141,10 @@ pub async fn fs_root_ioctl<'a>(
                 _ => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    req.write().set_data_t(id);
-                    return req.complete(DriverStatus::Success);
+                    let mut w = req.write();
+                    w.set_data_t(id);
+                    w.status = DriverStatus::Success;
+                    return DriverStep::complete(DriverStatus::Success);
                 }
             };
 
@@ -172,18 +176,22 @@ pub async fn fs_root_ioctl<'a>(
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
-                    req.write().set_data_t(id);
-                    req.complete(DriverStatus::Success)
+                    let mut w = req.write();
+                    w.set_data_t(id);
+                    w.status = DriverStatus::Success;
+                    DriverStep::complete(DriverStatus::Success)
                 }
                 Err(_e) => {
                     id.mount_device = None;
                     id.can_mount = false;
-                    req.write().set_data_t(id);
-                    req.complete(DriverStatus::Success)
+                    let mut w = req.write();
+                    w.set_data_t(id);
+                    w.status = DriverStatus::Success;
+                    DriverStep::complete(DriverStatus::Success)
                 }
             }
         }
-        _ => req.complete(DriverStatus::NotImplemented),
+        _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }
 
@@ -203,18 +211,17 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl = pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone());
 
     spawn_detached(async move {
-        let reg = RequestHandle::Stack(
-            &mut Request::new(
-                RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-                RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
-            )
-            .set_traversal_policy(TraversalPolicy::ForwardLower),
-        );
+        let mut reg_req = Request::new(
+            RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
+            RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower);
+        let mut reg = RequestHandle::Stack(&mut reg_req);
 
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
-            reg,
+            &mut reg,
         )
         .await;
     });

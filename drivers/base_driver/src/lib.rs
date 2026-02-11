@@ -36,11 +36,11 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware<'a>(
+pub async fn bus_driver_prepare_hardware<'a, 'b>(
     device: Arc<DeviceObject>,
-    request: RequestHandle<'a>,
-) -> RequestHandleResult<'a> {
+    _req: &'b mut RequestHandle<'a>,
+) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     let _ = device; // suppress unused for now
-    request.complete(DriverStatus::Success)
+    DriverStep::complete(DriverStatus::Success)
 }
