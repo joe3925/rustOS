@@ -26,10 +26,10 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 use kernel_api::request::{Request, RequestHandle, RequestType};
+use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::request_handler;
 use spin::Mutex;
 use spin::rwlock::RwLock;
 
@@ -129,15 +129,9 @@ async fn ide_pnp_start<'a, 'b>(
         if qst != DriverStatus::Success {
             return complete_req(req, qst);
         }
-
+        let binding = child_handle.read();
         let bars = {
-            let data = child_handle
-                .read()
-                .pnp
-                .as_ref()
-                .unwrap()
-                .data_out
-                .as_slice();
+            let data = binding.pnp.as_ref().unwrap().data_out.as_slice();
             parse_ide_bars(data)
         };
 

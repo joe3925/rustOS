@@ -40,6 +40,7 @@ unsafe extern "win64" {
     pub fn wait_duration(time: Duration);
     pub fn get_rsdp() -> u64;
     pub unsafe fn get_current_cpu_id() -> usize;
+
     // Tasking
     pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
@@ -49,6 +50,7 @@ unsafe extern "win64" {
     pub fn try_steal_blocking_one() -> bool;
     pub unsafe fn park_self_and_yield();
     pub unsafe fn wake_task(id: u64);
+
     // IRQ
     pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
     pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
@@ -69,6 +71,7 @@ unsafe extern "win64" {
     pub fn irq_handle_wait_ffi(h: IrqHandlePtr, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
+
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(
         size: u64,
@@ -115,8 +118,8 @@ unsafe extern "win64" {
         symlink_ptr: *const u8,
         symlink_len: usize,
     );
-
     pub fn vfs_notify_label_unpublished(label_ptr: *const u8, label_len: usize);
+
     // PnP / Device Management
     pub fn driver_get_name(driver: &Arc<DriverObject>) -> String;
     pub fn driver_get_flags(driver: &Arc<DriverObject>) -> u32;
@@ -143,38 +146,38 @@ unsafe extern "win64" {
     pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
-    pub fn pnp_forward_request_to_next_lower<'a>(
+    pub fn pnp_forward_request_to_next_lower<'h, 'd>(
         from: Arc<DeviceObject>,
-        req: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        req: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
-    pub fn pnp_forward_request_to_next_upper<'a>(
+    pub fn pnp_forward_request_to_next_upper<'h, 'd>(
         from: Arc<DeviceObject>,
-        req: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        req: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
-    pub fn pnp_send_request<'a>(
+    pub fn pnp_send_request<'h, 'd>(
         target: IoTarget,
-        req: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        req: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
-    pub fn pnp_complete_request<'a>(req: &'a mut RequestHandle<'a>) -> DriverStatus;
+    pub fn pnp_complete_request<'h, 'd>(req: &'h mut RequestHandle<'d>) -> DriverStatus;
 
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus;
     pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
 
-    pub fn pnp_send_request_via_symlink<'a>(
+    pub fn pnp_send_request_via_symlink<'h, 'd>(
         link_path: String,
-        req: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        req: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
-    pub fn pnp_ioctl_via_symlink<'a>(
+    pub fn pnp_ioctl_via_symlink<'h, 'd>(
         link_path: String,
         control_code: u32,
-        request: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        request: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
@@ -203,17 +206,19 @@ unsafe extern "win64" {
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
-    pub fn pnp_send_request_to_stack_top<'a>(
+    pub fn pnp_send_request_to_stack_top<'h, 'd>(
         dev_node_weak: Weak<DevNode>,
-        req: &'a mut RequestHandle<'a>,
-    ) -> BorrowingFfiFuture<'a, DriverStatus>;
+        req: &'h mut RequestHandle<'d>,
+    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
     pub fn InvalidateDeviceRelations(
         device: Arc<DeviceObject>,
         relation: DeviceRelationType,
     ) -> FfiFuture<DriverStatus>;
+
     pub fn get_acpi_tables() -> Arc<acpi::AcpiTables<KernelAcpiHandler>>;
     pub fn kernel_apic_cpu_ids() -> Vec<u8>;
+
     // Bench (drivers)
     pub fn bench_kernel_window_create(cfg: BenchWindowConfig) -> BenchWindowHandle;
     pub fn bench_kernel_window_destroy(handle: BenchWindowHandle) -> bool;
@@ -236,7 +241,6 @@ unsafe extern "win64" {
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
     pub fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize);
-
 }
 
 #[repr(C)]
@@ -274,6 +278,7 @@ impl acpi::AcpiHandler for KernelAcpiHandler {
         }
     }
 }
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct BenchSpanGuard {

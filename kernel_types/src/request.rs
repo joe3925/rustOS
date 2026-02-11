@@ -862,6 +862,41 @@ impl<'a> DerefMut for HandleWriteGuard<'a> {
 }
 
 impl<'a> RequestHandle<'a> {
+    /// Create a non-PnP request owned by the RequestHandle. Panics if called with `RequestType::Pnp`.
+    #[inline]
+    pub fn new(kind: RequestType, data: RequestData) -> Self {
+        RequestHandle::Owned(Request::new(kind, data))
+    }
+
+    /// Create a PnP request owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+        RequestHandle::Owned(Request::new_pnp(pnp_request, data))
+    }
+
+    /// Create a request with typed payload owned by the RequestHandle.
+    #[inline]
+    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+        RequestHandle::Owned(Request::new_t(kind, data))
+    }
+
+    /// Create a PnP request with typed payload owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+        RequestHandle::Owned(Request::new_pnp_t(pnp, data))
+    }
+
+    /// Create a request from boxed bytes owned by the RequestHandle.
+    #[inline]
+    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
+        RequestHandle::Owned(Request::new_bytes(kind, data))
+    }
+
+    /// Create a PnP request from boxed bytes owned by the RequestHandle.
+    #[inline]
+    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
+        RequestHandle::Owned(Request::new_pnp_bytes(pnp, data))
+    }
     #[inline]
     pub fn is_stack(&self) -> bool {
         matches!(self, Self::Stack(_))
@@ -958,42 +993,6 @@ impl<'a> RequestHandle<'a> {
 }
 
 impl RequestHandle<'static> {
-    /// Create a non-PnP request owned by the RequestHandle. Panics if called with `RequestType::Pnp`.
-    #[inline]
-    pub fn new(kind: RequestType, data: RequestData) -> Self {
-        RequestHandle::Owned(Request::new(kind, data))
-    }
-
-    /// Create a PnP request owned by the RequestHandle.
-    #[inline]
-    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
-        RequestHandle::Owned(Request::new_pnp(pnp_request, data))
-    }
-
-    /// Create a request with typed payload owned by the RequestHandle.
-    #[inline]
-    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
-        RequestHandle::Owned(Request::new_t(kind, data))
-    }
-
-    /// Create a PnP request with typed payload owned by the RequestHandle.
-    #[inline]
-    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
-        RequestHandle::Owned(Request::new_pnp_t(pnp, data))
-    }
-
-    /// Create a request from boxed bytes owned by the RequestHandle.
-    #[inline]
-    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
-        RequestHandle::Owned(Request::new_bytes(kind, data))
-    }
-
-    /// Create a PnP request from boxed bytes owned by the RequestHandle.
-    #[inline]
-    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
-        RequestHandle::Owned(Request::new_pnp_bytes(pnp, data))
-    }
-
     #[inline]
     pub fn pending(self) -> RequestHandleResult<'static> {
         RequestHandleResult {

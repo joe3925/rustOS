@@ -90,8 +90,8 @@ impl BlockDev {
         let mut handle = RequestHandle::new(
             RequestType::Read { offset, len },
             RequestData::from_boxed_bytes(alloc::vec![0u8; len].into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
+        );
+        handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let st = pnp_send_request(volume.clone(), &mut handle).await;
         if st == DriverStatus::Success {
@@ -120,8 +120,8 @@ impl BlockDev {
                 flush_write_through: false,
             },
             RequestData::from_boxed_bytes(buf.to_vec().into_boxed_slice()),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
+        );
+        handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let st = pnp_send_request(volume.clone(), &mut handle).await;
 

@@ -212,12 +212,12 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
             RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
         );
-        let mut reg = binding.set_traversal_policy(TraversalPolicy::ForwardLower);
+        binding.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
-            &mut reg,
+            &mut binding,
         )
         .await;
     });

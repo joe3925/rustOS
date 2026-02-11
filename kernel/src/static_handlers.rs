@@ -270,31 +270,73 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_lower<'a>(
+pub extern "win64" fn pnp_forward_request_to_next_lower<'h, 'd>(
     from: Arc<DeviceObject>,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
     async move { PNP_MANAGER.send_request_to_next_lower(from, handle).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_upper<'a>(
+pub extern "win64" fn pnp_forward_request_to_next_upper<'h, 'd>(
     from: Arc<DeviceObject>,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
     async move { PNP_MANAGER.send_request_to_next_upper(from, handle).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request<'a>(
+pub extern "win64" fn pnp_send_request<'h, 'd>(
     target: IoTarget,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
     async move { PNP_MANAGER.send_request(target, handle).await }.into_ffi()
 }
 
-pub extern "win64" fn pnp_complete_request<'a>(handle: &'a mut RequestHandle<'a>) -> DriverStatus {
+pub extern "win64" fn pnp_complete_request<'h, 'd>(
+    handle: &'h mut RequestHandle<'d>,
+) -> DriverStatus {
     PNP_MANAGER.complete_request(handle)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_send_request_via_symlink<'h, 'd>(
+    link_path: String,
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
+    async move {
+        PNP_MANAGER
+            .send_request_via_symlink(link_path, handle)
+            .await
+    }
+    .into_ffi()
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_ioctl_via_symlink<'h, 'd>(
+    link_path: String,
+    control_code: u32,
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
+    async move {
+        PNP_MANAGER
+            .ioctl_via_symlink(link_path, control_code, handle)
+            .await
+    }
+    .into_ffi()
+}
+
+#[no_mangle]
+pub extern "win64" fn pnp_send_request_to_stack_top<'h, 'd>(
+    dev_node_weak: alloc::sync::Weak<DevNode>,
+    handle: &'h mut RequestHandle<'d>,
+) -> BorrowingFfiFuture<'h, DriverStatus> {
+    async move {
+        PNP_MANAGER
+            .send_request_to_stack_top(dev_node_weak, handle)
+            .await
+    }
+    .into_ffi()
 }
 
 pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {
@@ -405,34 +447,6 @@ pub extern "win64" fn pnp_remove_symlink(link_path: String) -> DriverStatus {
         Err(_) => DriverStatus::NoSuchDevice,
     }
 }
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request_via_symlink<'a>(
-    link_path: String,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
-    async move {
-        PNP_MANAGER
-            .send_request_via_symlink(link_path, handle)
-            .await
-    }
-    .into_ffi()
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_ioctl_via_symlink<'a>(
-    link_path: String,
-    control_code: u32,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
-    async move {
-        PNP_MANAGER
-            .ioctl_via_symlink(link_path, control_code, handle)
-            .await
-    }
-    .into_ffi()
-}
-
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>> {
     async move { PNP_MANAGER.load_service(&name).await }.into_ffi()
@@ -490,19 +504,6 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
                 function_fdo,
                 init_pdo,
             )
-            .await
-    }
-    .into_ffi()
-}
-
-#[no_mangle]
-pub extern "win64" fn pnp_send_request_to_stack_top<'a>(
-    dev_node_weak: alloc::sync::Weak<DevNode>,
-    handle: &'a mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'a, DriverStatus> {
-    async move {
-        PNP_MANAGER
-            .send_request_to_stack_top(dev_node_weak, handle)
             .await
     }
     .into_ffi()

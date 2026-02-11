@@ -702,8 +702,8 @@ pub async fn disk_ioctl<'a, 'b>(
             let mut handle = RequestHandle::new(
                 RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
                 RequestData::empty(),
-            )
-            .set_traversal_policy(TraversalPolicy::ForwardLower);
+            );
+            handle.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
             if status == DriverStatus::Success {
                 cache_clear(&dx);
@@ -727,8 +727,8 @@ async fn read_from_lower(
     let mut child = RequestHandle::new(
         RequestType::Read { offset, len },
         RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    child.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child).await;
     if st != DriverStatus::Success {
@@ -803,8 +803,8 @@ async fn write_to_lower(
             flush_write_through,
         },
         RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    child.set_traversal_policy(TraversalPolicy::ForwardLower);
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child).await;
     if st != DriverStatus::Success {
         return st;

@@ -321,8 +321,8 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
             data_out: RequestData::empty(),
         },
         RequestData::empty(),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    request.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = kernel_api::pnp::pnp_send_request(vol_target, &mut request).await;
     if status != DriverStatus::Success {
         return None;
@@ -415,12 +415,15 @@ async fn try_bind_filesystems_for_parent_fdo(
                 mount_device: None,
                 can_mount: false,
             }),
-        )
-        .set_traversal_policy(TraversalPolicy::ForwardLower);
+        );
+        identify_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let err =
-            pnp_ioctl_via_symlink(tag.clone(), kernel_api::IOCTL_FS_IDENTIFY, &mut identify_req)
-                .await;
+        let err = pnp_ioctl_via_symlink(
+            tag.clone(),
+            kernel_api::IOCTL_FS_IDENTIFY,
+            &mut identify_req,
+        )
+        .await;
         if err != DriverStatus::Success {
             continue;
         }
@@ -575,11 +578,9 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         write_through: false,
         path: Path::from_string(path),
     };
-    let mut req_inner = RequestHandle::new(
-        RequestType::Fs(FsOp::Open),
-        RequestData::from_t(params),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    let mut req_inner =
+        RequestHandle::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params));
+    req_inner.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let err = pnp_send_request_via_symlink(public_link.to_string(), &mut req_inner).await;
 

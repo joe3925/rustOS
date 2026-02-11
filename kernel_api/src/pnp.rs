@@ -84,49 +84,49 @@ pub fn pnp_add_class_listener(
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }
 
-pub fn pnp_complete_request<'a>(req: &'a mut RequestHandle<'a>) -> DriverStatus {
+pub fn pnp_complete_request<'h, 'd>(req: &'h mut RequestHandle<'d>) -> DriverStatus {
     unsafe { kernel_sys::pnp_complete_request(req) }
 }
 
-pub async fn pnp_send_request<'a>(
+pub async fn pnp_send_request<'h, 'd>(
     target: IoTarget,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_send_request(target, req).await }
 }
 
-pub async fn pnp_forward_request_to_next_lower<'a>(
+pub async fn pnp_forward_request_to_next_lower<'h, 'd>(
     from: Arc<DeviceObject>,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req).await }
 }
 
-pub async fn pnp_forward_request_to_next_upper<'a>(
+pub async fn pnp_forward_request_to_next_upper<'h, 'd>(
     from: Arc<DeviceObject>,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_forward_request_to_next_upper(from, req).await }
 }
 
-pub async fn pnp_send_request_via_symlink<'a>(
+pub async fn pnp_send_request_via_symlink<'h, 'd>(
     link_path: String,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req).await }
 }
 
-pub async fn pnp_ioctl_via_symlink<'a>(
+pub async fn pnp_ioctl_via_symlink<'h, 'd>(
     link_path: String,
     control_code: u32,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req).await }
 }
 
-pub async fn pnp_send_request_to_stack_top<'a>(
+pub async fn pnp_send_request_to_stack_top<'h, 'd>(
     dev_node_weak: Weak<DevNode>,
-    req: &'a mut RequestHandle<'a>,
+    req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
     unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req).await }
 }

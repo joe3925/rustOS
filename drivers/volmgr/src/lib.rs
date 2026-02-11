@@ -267,8 +267,8 @@ pub async fn vol_pdo_read<'a, 'b>(
     };
 
     let forward_data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-    let mut forward_req = RequestHandle::new(RequestType::Read { offset, len }, forward_data)
-        .set_traversal_policy(policy);
+    let mut forward_req = RequestHandle::new(RequestType::Read { offset, len }, forward_data);
+    forward_req.set_traversal_policy(policy);
     let status = pnp_send_request(tgt, &mut forward_req).await;
 
     if status == DriverStatus::Success {
@@ -330,8 +330,8 @@ pub async fn vol_pdo_write<'a, 'b>(
             flush_write_through,
         },
         forward_data,
-    )
-    .set_traversal_policy(policy);
+    );
+    forward.set_traversal_policy(policy);
 
     let status = pnp_send_request(tgt.clone(), &mut forward).await;
     DriverStep::complete(status)

@@ -18,11 +18,9 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
     pnp_send_request_to_stack_top,
 };
-use kernel_api::request::{
-    Request, RequestHandle, RequestType, TraversalPolicy,
-};
-use kernel_api::status::DriverStatus;
+use kernel_api::request::{Request, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
+use kernel_api::status::DriverStatus;
 use spin::Once;
 
 #[cfg(not(test))]
@@ -100,26 +98,22 @@ async fn partition_pdo_query_resources<'a, 'b>(
     DriverStep::complete(DriverStatus::Success)
 }
 
-async fn send_req_parent<'a, 'b>(
+async fn send_req_parent<'h, 'd>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
-) -> DriverStatus
-where
-    'b: 'a,
-{
-    pnp_send_request_to_stack_top(
-        dev.dev_node
-            .get()
-            .unwrap()
-            .upgrade()
-            .unwrap()
-            .parent
-            .get()
-            .unwrap()
-            .clone(),
-        req,
-    )
-    .await
+    req: &'h mut RequestHandle<'d>,
+) -> DriverStatus {
+    let parent = dev
+        .dev_node
+        .get()
+        .unwrap()
+        .upgrade()
+        .unwrap()
+        .parent
+        .get()
+        .unwrap()
+        .clone();
+
+    pnp_send_request_to_stack_top(parent, req).await
 }
 #[request_handler]
 pub async fn partition_pdo_read<'a, 'b>(
@@ -173,14 +167,15 @@ pub async fn partition_pdo_read<'a, 'b>(
             len: buf_len,
         },
         child_data,
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let status = send_req_parent(&device, &mut child_req).await;
 
     // Copy data back to original request on success
     if status == DriverStatus::Success {
-        let src = child_req.read().data.as_slice().to_vec();
+        let binding = child_req.read();
+        let src = binding.data.as_slice();
         let mut w = request.write();
         w.data_slice_mut()[..src.len()].copy_from_slice(&src);
     }
@@ -248,8 +243,8 @@ pub async fn partition_pdo_write<'a, 'b>(
             flush_write_through,
         },
         child_data,
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    child.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let status = send_req_parent(&device, &mut child).await;
 
@@ -265,8 +260,8 @@ pub async fn partmgr_start<'a, 'b>(
     let mut parent_req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_DRIVE_IDENTIFY),
         RequestData::empty(),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    parent_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut parent_req).await;
     if status != DriverStatus::Success {
         return DriverStep::complete(status);
@@ -289,8 +284,8 @@ async fn read_from_lower_async(
     let mut child_req = RequestHandle::new(
         RequestType::Read { offset, len },
         RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
-    )
-    .set_traversal_policy(TraversalPolicy::ForwardLower);
+    );
+    child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
     if status == DriverStatus::Success {
         Ok(child_req.write().take_data_bytes())
