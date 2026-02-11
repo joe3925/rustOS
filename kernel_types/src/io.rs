@@ -94,7 +94,7 @@ impl IoType {
     pub async fn invoke<'a>(
         &self,
         dev: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'a>,
+        handle: &'a mut RequestHandle<'a>,
     ) -> DriverStep {
         match *self {
             IoType::Read(h) | IoType::Write(h) => {

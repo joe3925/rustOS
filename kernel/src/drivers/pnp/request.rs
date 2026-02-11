@@ -113,7 +113,7 @@ impl PnpManager {
         self.send_request(up, handle).await
     }
     /// Complete a request. Does NOT promote - returns handle with same lifetime.
-    pub fn complete_request<'a>(&self, handle: &mut RequestHandle<'a>) -> DriverStatus {
+    pub fn complete_request<'a>(&self, handle: &'a mut RequestHandle<'a>) -> DriverStatus {
         let (status, waker) = {
             let mut guard = handle.write();
 
