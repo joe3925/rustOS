@@ -11,7 +11,7 @@ use fatfs::FsOptions;
 use spin::{Mutex, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS, RequestExt,
+    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         async_types::AsyncMutex,

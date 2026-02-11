@@ -29,7 +29,7 @@ use kernel_api::request::{Request, RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::{RequestExt, request_handler};
+use kernel_api::request_handler;
 use spin::Mutex;
 use spin::rwlock::RwLock;
 

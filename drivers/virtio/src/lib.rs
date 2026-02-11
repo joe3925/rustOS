@@ -33,7 +33,7 @@ use kernel_api::pnp::{
 use kernel_api::request::{Request, RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
-use kernel_api::{IOCTL_PCI_SETUP_MSIX, RequestExt, println, request_handler};
+use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::Mutex;
 use spin::rwlock::RwLock;
 

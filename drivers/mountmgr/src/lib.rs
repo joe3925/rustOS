@@ -20,7 +20,7 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, RequestExt,
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
     kernel_types::{
@@ -594,10 +594,13 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         return false;
     }
 
-    req_inner
+    if let Some(_) = req_inner
         .take_data::<FsOpenResult>()
         .map(|res| res.error.is_none())
-        .unwrap_or(false)
+    {
+        return true;
+    }
+    return false;
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {

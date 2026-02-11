@@ -9,7 +9,6 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use spin::RwLock;
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::drivers::pnp::request::RequestExt;
 use crate::file_system::file_provider::FileProvider;
 use crate::println;
 use kernel_types::{

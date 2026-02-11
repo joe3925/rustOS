@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
+use kernel_api::println;
 use kernel_api::runtime::spawn_blocking;
 
 use fatfs::{
@@ -730,19 +731,8 @@ pub async fn fs_op_dispatch<'a, 'b>(
     if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         status = handle_seek_request(&dev, req, &mut fs_guard);
     } else {
-        req.promote();
-        let shared = req
-            .as_shared()
-            .expect("RequestHandle should be shared after promote")
-            .clone();
-        let dev_for_blocking = dev.clone();
-        let mut fs_guard_for_blocking = fs_guard;
-
-        status = spawn_blocking(move || {
-            let mut h = RequestHandle::Shared(shared);
-            handle_fs_request(&dev_for_blocking, &mut h, &mut fs_guard_for_blocking)
-        })
-        .await;
+        // Todo: change this to spawn blocking when I fix request promotion
+        status = handle_fs_request(&dev, req, &mut fs_guard);
     }
 
     req.write().status = status;

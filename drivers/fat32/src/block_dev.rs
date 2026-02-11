@@ -3,7 +3,6 @@ use core::cmp::min;
 
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    RequestExt,
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
     request::{Request, RequestHandle, RequestType, TraversalPolicy},

@@ -16,7 +16,6 @@ use kernel_api::pnp::DriverStep;
 use spin::Mutex;
 
 use kernel_api::{
-    RequestExt,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         io::{DiskInfo, IoType, Synchronization},
@@ -701,12 +700,12 @@ pub async fn disk_ioctl<'a, 'b>(
             let dx = disk_ext(&dev);
 
             let mut req_child = Request::new(
-                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-                RequestData::empty(),
-            );
-            req_child.traversal_policy = TraversalPolicy::ForwardLower;
-            let mut req_child = RequestHandle::Stack(&mut req_child);
-            let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req_child).await;
+            RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
+            RequestData::empty(),
+        )
+        .set_traversal_policy(TraversalPolicy::ForwardLower);
+            let mut handle = RequestHandle::Stack(&mut req_child);
+            let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
             if status == DriverStatus::Success {
                 cache_clear(&dx);
             }
@@ -732,10 +731,8 @@ async fn read_from_lower(
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let st = {
-        let mut handle = RequestHandle::Stack(&mut child);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await
-    };
+    let mut handle = RequestHandle::Stack(&mut child);
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
     if st != DriverStatus::Success {
         return Err(st);
     }
@@ -807,10 +804,8 @@ async fn write_to_lower(
         RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice()),
     )
     .set_traversal_policy(TraversalPolicy::ForwardLower);
-    let st = {
-        let mut handle = RequestHandle::Stack(&mut child);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await
-    };
+    let mut handle = RequestHandle::Stack(&mut child);
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
     if st != DriverStatus::Success {
         return st;
     }
@@ -823,15 +818,13 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
-            ids_out: Vec::new(),
-            data_out: RequestData::empty(),
-        },
-        RequestData::empty(),
-    );
-    let st = {
-        let mut handle = RequestHandle::Stack(&mut ch);
-        pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await
-    };
+        ids_out: Vec::new(),
+        data_out: RequestData::empty(),
+    },
+    RequestData::empty(),
+);
+    let mut handle = RequestHandle::Stack(&mut ch);
+    let st = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
 
     if st != DriverStatus::Success {
         return Err(st);

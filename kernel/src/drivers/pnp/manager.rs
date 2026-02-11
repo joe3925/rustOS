@@ -1,7 +1,6 @@
 use super::driver_index::{self as idx, HwIndex};
 use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
-use crate::drivers::pnp::request::RequestExt;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;

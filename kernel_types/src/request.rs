@@ -504,6 +504,67 @@ pub struct Request {
 }
 
 impl Request {
+    /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
+    pub fn new(kind: RequestType, data: RequestData) -> Self {
+        if matches!(kind, RequestType::Pnp) {
+            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
+        }
+
+        Self {
+            kind,
+            data,
+            completed: false,
+            status: DriverStatus::ContinueStep,
+            traversal_policy: TraversalPolicy::FailIfUnhandled,
+            pnp: None,
+            completion_routine: None,
+            completion_context: 0,
+
+            waker: None,
+        }
+    }
+
+    /// Create a PnP request.
+    #[inline]
+    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+        Self {
+            kind: RequestType::Pnp,
+            data,
+            completed: false,
+            status: DriverStatus::ContinueStep,
+            traversal_policy: TraversalPolicy::ForwardLower,
+            pnp: Some(pnp_request),
+            completion_routine: None,
+            completion_context: 0,
+
+            waker: None,
+        }
+    }
+
+    /// Create a request with typed payload.
+    #[inline]
+    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+        Self::new(kind, RequestData::from_t(data))
+    }
+
+    /// Create a PnP request with typed payload.
+    #[inline]
+    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+        Self::new_pnp(pnp, RequestData::from_t(data))
+    }
+
+    /// Create a request from boxed bytes.
+    #[inline]
+    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
+        Self::new(kind, RequestData::from_boxed_bytes(data))
+    }
+
+    /// Create a PnP request from boxed bytes.
+    #[inline]
+    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
+        Self::new_pnp(pnp, RequestData::from_boxed_bytes(data))
+    }
+
     #[inline]
     pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
         self.traversal_policy = policy;
@@ -828,7 +889,7 @@ impl<'a> RequestHandle<'a> {
             RequestHandle::Shared(s) => HandleWriteGuard::Shared(s.write()),
         }
     }
-
+    // TODO: this currently does not work as intended the request on the request handle on the stack should not point to nothing
     /// Promote stack request to shared (heap) ownership.
     /// Stack: copies content into a new SharedRequest, leaves empty sentinel in original.
     /// Shared: no-op, already on heap.

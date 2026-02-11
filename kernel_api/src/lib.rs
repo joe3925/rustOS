@@ -3,18 +3,12 @@
 #![allow(non_upper_case_globals)]
 pub extern crate alloc;
 
-use alloc::boxed::Box;
-use kernel_sys::{submit_blocking_internal, submit_runtime_internal};
-use kernel_types::pnp::PnpRequest;
-use kernel_types::request::{Request, RequestData, RequestType, TraversalPolicy};
-use kernel_types::status::DriverStatus;
 pub use kernel_types::{async_ffi, device, request, status};
 
 pub use kernel_types;
 
 pub use x86_64;
 
-use crate::util::random_number;
 pub use acpi;
 pub use kernel_macros::request_handler;
 pub mod benchmark;
@@ -51,75 +45,6 @@ macro_rules! print {
 macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", $crate::alloc::format!($($arg)*)));
-}
-pub trait RequestExt {
-    fn new(kind: RequestType, data: RequestData) -> Self;
-    fn new_pnp(pnp: PnpRequest, data: RequestData) -> Self;
-    #[inline]
-    fn new_t<T: 'static>(kind: RequestType, data: T) -> Self
-    where
-        Self: Sized,
-    {
-        Self::new(kind, RequestData::from_t(data))
-    }
-    #[inline]
-    fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self
-    where
-        Self: Sized,
-    {
-        Self::new_pnp(pnp, RequestData::from_t(data))
-    }
-    #[inline]
-    fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self
-    where
-        Self: Sized,
-    {
-        Self::new(kind, RequestData::from_boxed_bytes(data))
-    }
-    #[inline]
-    fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self
-    where
-        Self: Sized,
-    {
-        Self::new_pnp(pnp, RequestData::from_boxed_bytes(data))
-    }
-}
-
-impl RequestExt for Request {
-    fn new(kind: RequestType, data: RequestData) -> Self {
-        if matches!(kind, RequestType::Pnp) {
-            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
-        }
-
-        Self {
-            kind,
-            data,
-            completed: false,
-            status: DriverStatus::ContinueStep,
-            traversal_policy: TraversalPolicy::FailIfUnhandled,
-            pnp: None,
-            completion_routine: None,
-            completion_context: 0,
-
-            waker: None,
-        }
-    }
-
-    #[inline]
-    fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
-        Self {
-            kind: RequestType::Pnp,
-            data,
-            completed: false,
-            status: DriverStatus::ContinueStep,
-            traversal_policy: TraversalPolicy::ForwardLower,
-            pnp: Some(pnp_request),
-            completion_routine: None,
-            completion_context: 0,
-
-            waker: None,
-        }
-    }
 }
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;

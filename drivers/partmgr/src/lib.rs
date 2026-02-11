@@ -22,7 +22,7 @@ use kernel_api::request::{
     Request, RequestHandle, RequestType, TraversalPolicy,
 };
 use kernel_api::status::DriverStatus;
-use kernel_api::{RequestExt, request_handler};
+use kernel_api::request_handler;
 use spin::Once;
 
 #[cfg(not(test))]

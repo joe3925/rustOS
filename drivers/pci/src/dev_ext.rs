@@ -6,7 +6,6 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_api::RequestExt;
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region, unmap_range};
 use kernel_api::request::{Request, RequestData, RequestHandle};

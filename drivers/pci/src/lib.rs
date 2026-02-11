@@ -18,7 +18,7 @@ use dev_ext::{
 };
 
 use kernel_api::{
-    IOCTL_PCI_SETUP_MSIX, RequestExt,
+    IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         io::{IoType, IoVtable, Synchronization},
