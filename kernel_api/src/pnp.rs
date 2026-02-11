@@ -1,14 +1,25 @@
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use kernel_sys::KernelAcpiHandler;
 
 use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::io::IoTarget;
-use kernel_types::request::RequestHandle;
 use kernel_types::status::{DriverError, DriverStatus};
 use kernel_types::{ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload};
 
 pub use kernel_types::pnp::*;
+
+// Re-export routing functions from kernel_routing crate
+// These now compile per-driver, eliminating one FFI future boundary
+pub use kernel_routing::{
+    send_request as pnp_send_request,
+    send_request_to_next_lower as pnp_forward_request_to_next_lower,
+    send_request_to_next_upper as pnp_forward_request_to_next_upper,
+    send_request_via_symlink as pnp_send_request_via_symlink,
+    send_request_to_stack_top as pnp_send_request_to_stack_top,
+    ioctl_via_symlink as pnp_ioctl_via_symlink,
+    complete_request as pnp_complete_request,
+};
 
 pub fn create_pdo(
     parent: &Arc<DevNode>,
@@ -82,53 +93,6 @@ pub fn pnp_add_class_listener(
     dev_obj: Arc<DeviceObject>,
 ) {
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
-}
-
-pub fn pnp_complete_request<'h, 'd>(req: &'h mut RequestHandle<'d>) -> DriverStatus {
-    unsafe { kernel_sys::pnp_complete_request(req) }
-}
-
-pub async fn pnp_send_request<'h, 'd>(
-    target: IoTarget,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request(target, req).await }
-}
-
-pub async fn pnp_forward_request_to_next_lower<'h, 'd>(
-    from: Arc<DeviceObject>,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_forward_request_to_next_lower(from, req).await }
-}
-
-pub async fn pnp_forward_request_to_next_upper<'h, 'd>(
-    from: Arc<DeviceObject>,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_forward_request_to_next_upper(from, req).await }
-}
-
-pub async fn pnp_send_request_via_symlink<'h, 'd>(
-    link_path: String,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request_via_symlink(link_path, req).await }
-}
-
-pub async fn pnp_ioctl_via_symlink<'h, 'd>(
-    link_path: String,
-    control_code: u32,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_ioctl_via_symlink(link_path, control_code, req).await }
-}
-
-pub async fn pnp_send_request_to_stack_top<'h, 'd>(
-    dev_node_weak: Weak<DevNode>,
-    req: &'h mut RequestHandle<'d>,
-) -> DriverStatus {
-    unsafe { kernel_sys::pnp_send_request_to_stack_top(dev_node_weak, req).await }
 }
 
 #[allow(clippy::too_many_arguments)]

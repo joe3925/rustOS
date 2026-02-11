@@ -185,7 +185,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         // bench_async_vs_sync_call_latency_async().await;
         // bench_realistic_traffic_async().await;
 
-        // benchmark_async_async().await;
+        //benchmark_async_async().await;
     });
     println!("");
 }

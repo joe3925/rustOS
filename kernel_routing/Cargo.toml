@@ -1,0 +1,20 @@
+[package]
+name = "kernel_routing"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[features]
+default = ["ffi"]
+# When enabled, uses direct function calls via linker seams instead of FFI.
+# This should only be enabled when compiling as part of the kernel.
+kernel_link = []
+# When enabled (default), uses FFI calls to kernel_sys.
+ffi = ["dep:kernel_sys"]
+
+[dependencies]
+kernel_sys = { path = "../kernel_sys", optional = true }
+kernel_types = { path = "../kernel_types" }
+spin = "0.10.0"

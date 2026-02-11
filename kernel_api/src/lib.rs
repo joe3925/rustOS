@@ -6,6 +6,7 @@ pub extern crate alloc;
 pub use kernel_types::{async_ffi, device, request, status};
 
 pub use kernel_types;
+pub use kernel_routing;
 
 pub use x86_64;
 

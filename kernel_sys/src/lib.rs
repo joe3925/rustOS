@@ -10,7 +10,7 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use core::ptr::NonNull;
 use core::time::Duration;
-use kernel_types::async_ffi::{BorrowingFfiFuture, FfiFuture};
+use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
@@ -23,7 +23,6 @@ use kernel_types::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_types::fs::{File, OpenFlags, Path};
 use kernel_types::io::IoTarget;
 use kernel_types::pnp::{DeviceIds, DeviceRelationType};
-use kernel_types::request::RequestHandle;
 use kernel_types::status::{
     Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError, TaskError,
 };
@@ -146,38 +145,10 @@ unsafe extern "win64" {
     pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
-    pub fn pnp_forward_request_to_next_lower<'h, 'd>(
-        from: Arc<DeviceObject>,
-        req: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
-
-    pub fn pnp_forward_request_to_next_upper<'h, 'd>(
-        from: Arc<DeviceObject>,
-        req: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
-
-    pub fn pnp_send_request<'h, 'd>(
-        target: IoTarget,
-        req: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
-
-    pub fn pnp_complete_request<'h, 'd>(req: &'h mut RequestHandle<'d>) -> DriverStatus;
-
     pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
     pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus;
     pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
-
-    pub fn pnp_send_request_via_symlink<'h, 'd>(
-        link_path: String,
-        req: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
-
-    pub fn pnp_ioctl_via_symlink<'h, 'd>(
-        link_path: String,
-        control_code: u32,
-        request: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;
 
@@ -205,11 +176,6 @@ unsafe extern "win64" {
         function_fdo: &Arc<DeviceObject>,
         init_pdo: DeviceInit,
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
-
-    pub fn pnp_send_request_to_stack_top<'h, 'd>(
-        dev_node_weak: Weak<DevNode>,
-        req: &'h mut RequestHandle<'d>,
-    ) -> BorrowingFfiFuture<'h, DriverStatus>;
 
     pub fn InvalidateDeviceRelations(
         device: Arc<DeviceObject>,
@@ -241,6 +207,10 @@ unsafe extern "win64" {
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
     pub fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize);
+
+    // Routing FFI (sync - for kernel_routing crate)
+    pub fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget>;
+    pub fn routing_get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>>;
 }
 
 #[repr(C)]

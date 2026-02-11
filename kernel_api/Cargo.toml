@@ -16,3 +16,4 @@ spin = "0.10.0"
 kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types" }
 kernel_sys = { path = "../kernel_sys" }
+kernel_routing = { path = "../kernel_routing" }

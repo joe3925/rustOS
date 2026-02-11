@@ -38,7 +38,7 @@ use crate::{
     drivers::{
         driver_install::DriverError,
         interrupt_index::{self, current_cpu_id},
-        pnp::{manager::PNP_MANAGER, request::DpcFn},
+        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::{ACPIImpl, ACPI_TABLES},
     },
     file_system::{
@@ -708,4 +708,44 @@ pub extern "win64" fn get_current_cpu_id() -> usize {
 #[no_mangle]
 pub extern "win64" fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> {
     mmio::unmap_mmio_region(base, size)
+}
+
+// ============================================================================
+// Routing functions - linker seams for kernel_routing crate (kernel_link feature)
+// and FFI exports for drivers
+// ============================================================================
+
+/// Resolve a symlink/path to a device target
+/// Linker seam for kernel_routing when compiled with kernel_link feature
+#[no_mangle]
+pub fn routing_resolve_path_to_device_impl(path: &str) -> Option<IoTarget> {
+    PNP_MANAGER.resolve_targetio_from_symlink(path.to_string())
+}
+
+/// Get the top device from a weak DevNode reference
+/// Linker seam for kernel_routing when compiled with kernel_link feature
+#[no_mangle]
+pub fn routing_get_stack_top_from_weak_impl(
+    dev_node_weak: &alloc::sync::Weak<DevNode>,
+) -> Option<Arc<DeviceObject>> {
+    let dn = dev_node_weak.upgrade()?;
+    let stack_top = dn
+        .stack
+        .read()
+        .as_ref()
+        .and_then(|s| s.get_top_device_object());
+    stack_top.or_else(|| dn.get_pdo())
+}
+
+// FFI exports for drivers (extern "win64" ABI)
+#[no_mangle]
+pub extern "win64" fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget> {
+    routing_resolve_path_to_device_impl(path)
+}
+
+#[no_mangle]
+pub extern "win64" fn routing_get_stack_top_from_weak(
+    dev_node_weak: &alloc::sync::Weak<DevNode>,
+) -> Option<Arc<DeviceObject>> {
+    routing_get_stack_top_from_weak_impl(dev_node_weak)
 }

@@ -957,15 +957,41 @@ impl PnpManager {
         None
     }
 
+    // Request routing methods delegate to kernel_routing crate
+    pub async fn send_request(
+        &self,
+        target: IoTarget,
+        handle: &mut RequestHandle<'_>,
+    ) -> DriverStatus {
+        kernel_routing::send_request(target, handle).await
+    }
+
+    pub async fn send_request_to_next_lower(
+        &self,
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_>,
+    ) -> DriverStatus {
+        kernel_routing::send_request_to_next_lower(from, handle).await
+    }
+
+    pub async fn send_request_to_next_upper(
+        &self,
+        from: Arc<DeviceObject>,
+        handle: &mut RequestHandle<'_>,
+    ) -> DriverStatus {
+        kernel_routing::send_request_to_next_upper(from, handle).await
+    }
+
+    pub fn complete_request(&self, handle: &mut RequestHandle<'_>) -> DriverStatus {
+        kernel_routing::complete_request(handle)
+    }
+
     pub async fn send_request_via_symlink(
         &self,
         link_path: String,
         handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
-        match self.resolve_targetio_from_symlink(link_path) {
-            Some(tgt) => self.send_request(tgt, handle).await,
-            None => DriverStatus::NoSuchDevice,
-        }
+        kernel_routing::send_request_via_symlink(link_path, handle).await
     }
 
     pub async fn send_request_to_stack_top(
@@ -973,32 +999,16 @@ impl PnpManager {
         dev_node_weak: alloc::sync::Weak<DevNode>,
         handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
-        let dev_node = match dev_node_weak.upgrade() {
-            Some(dn) => dn,
-            None => return DriverStatus::NoSuchDevice,
-        };
-
-        let target_device_opt = dev_node
-            .stack
-            .read()
-            .as_ref()
-            .and_then(|s| s.get_top_device_object())
-            .or_else(|| dev_node.get_pdo());
-
-        if let Some(target_device) = target_device_opt {
-            self.send_request(target_device, handle).await
-        } else {
-            DriverStatus::NoSuchDevice
-        }
+        kernel_routing::send_request_to_stack_top(dev_node_weak, handle).await
     }
 
     pub async fn ioctl_via_symlink(
         &self,
         link_path: String,
-        _control_code: u32,
+        control_code: u32,
         handle: &mut RequestHandle<'_>,
     ) -> DriverStatus {
-        self.send_request_via_symlink(link_path, handle).await
+        kernel_routing::ioctl_via_symlink(link_path, control_code, handle).await
     }
 
     pub fn add_class_listener(
