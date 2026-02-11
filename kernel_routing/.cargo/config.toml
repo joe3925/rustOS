@@ -1,0 +1,7 @@
+[target]
+rustflags = ["-C", "code-model=large"]
+[target."../drivers/x86_64-rustos-driver.json"]
+rustflags = ["-C", "code-model=large"]
+[unstable]
+build-std = ["core", "alloc", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]
