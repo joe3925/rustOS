@@ -32,6 +32,10 @@ pub struct QueueState {
     pub queue: Mutex<Virtqueue>,
     /// Pre-allocated arena for this queue's BlkIoRequest slots.
     pub arena: BlkIoArena,
+    /// Maximum safe data payload per request on this queue (512-byte aligned).
+    pub max_request_bytes: u32,
+    /// Maximum number of data descriptors we will use for a single request.
+    pub max_data_segments: u16,
     /// IRQ handle for this queue (MSI-X or shared legacy).
     pub irq_handle: Option<IrqHandle>,
     /// MSI-X vector number if MSI-X is being used for this queue.

@@ -480,9 +480,20 @@ async fn virtio_pnp_start<'a, 'b>(
             .next()
             .expect("virtio-blk: virtqueue missing during init");
 
+        let vq_capacity = vq.size as usize;
+        let max_data_segments = core::cmp::min(
+            blk::MAX_DESCRIPTORS_PER_REQUEST.saturating_sub(2),
+            vq_capacity.saturating_sub(2),
+        )
+        .max(1);
+        let max_request_bytes =
+            ((max_data_segments * 4096) & !511 /* keep sector alignment */).max(512) as u32;
+
         queue_states.push(QueueState {
             queue: Mutex::new(vq),
             arena,
+            max_request_bytes,
+            max_data_segments: max_data_segments as u16,
             irq_handle,
             msix_vector,
             msix_table_index,
@@ -813,33 +824,59 @@ fn rdtsc() -> u64 {
 // Benchmark Implementation
 // =============================================================================
 
-/// Size of each benchmark request in bytes (64 KiB).
-const BENCH_REQUEST_SIZE: u32 = 100 * 1024 * 1024;
-
 /// Total data to transfer per benchmark run.
 const BENCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Number of requests per benchmark run.
-const BENCH_REQUEST_COUNT: usize = (BENCH_TOTAL_BYTES / BENCH_REQUEST_SIZE as u64) as usize;
+struct BenchConfig {
+    /// Target payload size per request (512-byte aligned, fits any queue).
+    request_size: u32,
+    /// Worst-case descriptor count per request (header + data segments + status).
+    descs_per_request: usize,
+    /// Expected number of requests to cover BENCH_TOTAL_BYTES (used for sizing vectors).
+    expected_requests: usize,
+}
 
-/// Approximate descriptor count per benchmark request for inflight sizing.
-const DESCS_PER_REQUEST: usize = 2 + ((BENCH_REQUEST_SIZE as usize + 4095) / 4096);
+impl BenchConfig {
+    fn from_inner(inner: &DevExtInner) -> Self {
+        // Use the most conservative per-queue limit so every queue can service the request size.
+        let request_size = inner
+            .queues
+            .iter()
+            .map(|qs| qs.max_request_bytes)
+            .min()
+            .unwrap_or(512)
+            .min(BENCH_TOTAL_BYTES as u32)
+            .max(512);
+
+        let descs_per_request = 2 + ((request_size as usize + 4095) / 4096);
+        let expected_requests = ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64)
+            .max(1) as usize;
+
+        Self {
+            request_size,
+            descs_per_request,
+            expected_requests,
+        }
+    }
+}
 
 /// Pending request tracking for benchmark.
 struct PendingBenchRequest<'a> {
     head: u16,
     queue_idx: usize,
+    len: u32,
     start_tsc: u64,
     _request: blk::BlkIoRequestHandle<'a>,
 }
 
 /// Run a benchmark with a specific inflight request count.
-/// Uses 64 KiB reads, total 100 MiB of data.
+/// Uses the largest safe per-request size supported by all queues, totaling 100 MiB of data.
 /// Uses round-robin queue selection across all available queues.
 async fn bench_reads_with_inflight(
     inner: &DevExtInner,
     start_sector: u64,
     inflight: usize,
+    bench_cfg: &BenchConfig,
 ) -> Result<BenchLevelResult, DriverStatus> {
     // Wait for IRQ subsystem to be ready
     inner.irq_ready.wait().await;
@@ -857,15 +894,13 @@ async fn bench_reads_with_inflight(
         p999_cycles: 0,
     };
 
-    let mut lat_samples: Vec<u64> = Vec::with_capacity(BENCH_REQUEST_COUNT);
+    let mut lat_samples: Vec<u64> = Vec::with_capacity(bench_cfg.expected_requests);
     let run_start_tsc = rdtsc();
 
-    let mut pending: Vec<PendingBenchRequest<'_>> = Vec::with_capacity(inflight);
-    let mut submitted_count: usize = 0;
-    let mut completed_count: usize = 0;
-
-    // Sectors per request (64 KiB / 512 bytes = 128 sectors)
-    let sectors_per_request = BENCH_REQUEST_SIZE / 512;
+    let mut pending: Vec<PendingBenchRequest<'_>> = Vec::with_capacity(inflight.max(1));
+    let mut submitted_bytes: u64 = 0;
+    let mut completed_bytes: u64 = 0;
+    let target_bytes: u64 = BENCH_TOTAL_BYTES;
 
     let meta = kernel_api::kernel_types::irq::IrqMeta {
         tag: 0,
@@ -895,7 +930,7 @@ async fn bench_reads_with_inflight(
     let queue_count = inner.queue_count;
 
     // Main benchmark loop: submit requests up to inflight limit, drain completions
-    while completed_count < BENCH_REQUEST_COUNT {
+    while completed_bytes < target_bytes {
         // Submit new requests until we hit the inflight limit or total count
         // Batch submissions per queue and notify once per queue to reduce MMIO overhead
         let batch_start_tsc = rdtsc();
@@ -903,63 +938,78 @@ async fn bench_reads_with_inflight(
         // Track which queues need notification
         let mut queue_needs_notify: Vec<(usize, u16)> = Vec::with_capacity(queue_count);
 
-        while pending.len() < inflight && submitted_count < BENCH_REQUEST_COUNT {
-            let sector = start_sector + (submitted_count as u64 * sectors_per_request as u64);
+        let mut blocked_on_space = false;
+        while pending.len() < inflight && submitted_bytes < target_bytes {
+            let remaining = target_bytes - submitted_bytes;
+            let chunk_len = core::cmp::min(bench_cfg.request_size as u64, remaining) as u32;
+            let sector = start_sector + (submitted_bytes / 512);
 
-            // Round-robin queue selection
-            let queue_idx = rr_idx % queue_count;
-            rr_idx = rr_idx.wrapping_add(1);
+            // Try all queues before giving up for this batch.
+            let start_rr = rr_idx;
+            let mut submitted = false;
+            for attempt in 0..queue_count {
+                let queue_idx = (start_rr + attempt) % queue_count;
+                let qs = inner.get_queue(queue_idx);
 
-            let qs = inner.get_queue(queue_idx);
+                // Allocate request from this queue's arena
+                let io_req =
+                    match qs
+                        .arena
+                        .new_request(blk::VIRTIO_BLK_T_IN, sector, chunk_len)
+                    {
+                        Some(r) => r,
+                        None => {
+                            // This queue's arena exhausted, try next queue
+                            continue;
+                        }
+                    };
 
-            // Allocate request from this queue's arena
-            let io_req =
-                match qs
-                    .arena
-                    .new_request(blk::VIRTIO_BLK_T_IN, sector, BENCH_REQUEST_SIZE)
-                {
-                    Some(r) => r,
-                    None => {
-                        // This queue's arena exhausted, try next queue
-                        continue;
+                // Submit without notifying yet
+                let head = {
+                    let mut vq = qs.queue.lock();
+                    let avail_idx_before = vq.avail_idx();
+
+                    match io_req.submit(&mut vq, false) {
+                        Some(h) => {
+                            // Track if this queue needs notification
+                            if vq.needs_notify(avail_idx_before) {
+                                // Update or add entry for this queue
+                                if let Some(entry) = queue_needs_notify
+                                    .iter_mut()
+                                    .find(|(idx, _)| *idx == queue_idx)
+                                {
+                                    entry.1 = avail_idx_before;
+                                } else {
+                                    queue_needs_notify.push((queue_idx, avail_idx_before));
+                                }
+                            }
+                            h
+                        }
+                        None => {
+                            // Queue full, try next queue
+                            continue;
+                        }
                     }
                 };
 
-            // Submit without notifying yet
-            let head = {
-                let mut vq = qs.queue.lock();
-                let avail_idx_before = vq.avail_idx();
+                pending.push(PendingBenchRequest {
+                    head,
+                    queue_idx,
+                    len: chunk_len,
+                    start_tsc: batch_start_tsc,
+                    _request: io_req,
+                });
+                submitted_bytes += chunk_len as u64;
+                rr_idx = queue_idx.wrapping_add(1);
+                submitted = true;
+                break;
+            }
 
-                match io_req.submit(&mut vq, false) {
-                    Some(h) => {
-                        // Track if this queue needs notification
-                        if vq.needs_notify(avail_idx_before) {
-                            // Update or add entry for this queue
-                            if let Some(entry) = queue_needs_notify
-                                .iter_mut()
-                                .find(|(idx, _)| *idx == queue_idx)
-                            {
-                                entry.1 = avail_idx_before;
-                            } else {
-                                queue_needs_notify.push((queue_idx, avail_idx_before));
-                            }
-                        }
-                        h
-                    }
-                    None => {
-                        // Queue full, try next queue
-                        continue;
-                    }
-                }
-            };
-
-            pending.push(PendingBenchRequest {
-                head,
-                queue_idx,
-                start_tsc: batch_start_tsc,
-                _request: io_req,
-            });
-            submitted_count += 1;
+            if !submitted {
+                // All queues full or exhausted; pause submissions for now.
+                blocked_on_space = true;
+                break;
+            }
         }
 
         // Notify all queues that had submissions
@@ -1003,10 +1053,10 @@ async fn bench_reads_with_inflight(
                         result.min_cycles = result.min_cycles.min(cycles);
                         lat_samples.push(cycles);
                         result.request_count += 1;
+                        completed_bytes += pending[i].len as u64;
 
                         vq.free_chain(pending[i].head);
                         pending.swap_remove(i);
-                        completed_count += 1;
                         found_any = true;
                     } else {
                         i += 1;
@@ -1038,16 +1088,20 @@ async fn bench_reads_with_inflight(
                         result.min_cycles = result.min_cycles.min(cycles);
                         lat_samples.push(cycles);
                         result.request_count += 1;
+                        completed_bytes += pending[i].len as u64;
 
                         vq.free_chain(pending[i].head);
                         pending.swap_remove(i);
-                        completed_count += 1;
                         found_any = true;
                     } else {
                         i += 1;
                     }
                 }
             }
+        }
+
+        if blocked_on_space && pending.is_empty() {
+            return Err(DriverStatus::InsufficientResources);
         }
 
         // If no completions found and we have pending requests, wait for IRQ from any queue
@@ -1119,6 +1173,8 @@ const BENCH_SECTORS_PER_RUN: u64 = BENCH_TOTAL_BYTES / 512;
 async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStatus> {
     const LEVELS: [usize; BENCH_MAX_LEVELS] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
 
+    let bench_cfg = BenchConfig::from_inner(inner);
+
     // Determine maximum supported inflight based on combined ring capacity across all queues
     let combined_ring_size: usize = inner
         .queues
@@ -1134,7 +1190,7 @@ async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStat
         inner.queues.iter().map(|qs| qs.arena.max_capacity()).sum();
 
     // max_supported = min(combined_ring_size / descs_per_req, combined_arena_capacity)
-    let max_from_ring = combined_ring_size / DESCS_PER_REQUEST;
+    let max_from_ring = combined_ring_size / bench_cfg.descs_per_request;
     let max_supported = max_from_ring.min(combined_arena_capacity);
 
     let mut result = BenchSweepResult::default();
@@ -1157,7 +1213,8 @@ async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStat
         }
 
         // Run benchmark for this level with unique disk region
-        let level_result = bench_reads_with_inflight(inner, current_sector, clamped_level).await?;
+        let level_result =
+            bench_reads_with_inflight(inner, current_sector, clamped_level, &bench_cfg).await?;
 
         result.levels[result.used as usize] = level_result;
         result.used += 1;
@@ -1291,49 +1348,104 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
     let sector = offset >> 9;
 
-    // Select queue based on strategy (CPU affinity or round-robin)
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
+    // Select starting queue, but allow falling back to others if full.
+    let mut queue_idx = inner.select_queue();
+    let queue_count = inner.queue_count.max(1);
+    let max_chunk = inner
+        .queues
+        .iter()
+        .map(|q| q.max_request_bytes.max(512) as u64)
+        .min()
+        .unwrap_or(512);
 
     // Use this queue's arena allocator for request (returns slot on drop)
-    let io_req = match qs.arena.new_request(VIRTIO_BLK_T_IN, sector, len as u32) {
-        Some(r) => r,
-        None => return complete_req(req, DriverStatus::InsufficientResources),
-    };
+    let mut remaining = len as u64;
+    let mut buf_offset = 0usize;
+    let mut next_sector = sector;
 
     // Wait for IRQ subsystem to be ready
     inner.irq_ready.wait().await;
 
-    let head = {
-        let mut vq = qs.queue.lock();
-        match io_req.submit(&mut vq, false) {
-            Some(h) => {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                h
-            }
-            None => {
+    let meta = IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
+
+    while remaining > 0 {
+        let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
+
+        // Try all queues before waiting for space.
+        let mut submitted = false;
+        let start_idx = queue_idx;
+        for attempt in 0..queue_count {
+            let qi = (start_idx + attempt) % queue_count;
+            let qs = inner.get_queue(qi);
+
+            let io_req = match qs.arena.new_request(VIRTIO_BLK_T_IN, next_sector, chunk_len) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            let head = {
+                let mut vq = qs.queue.lock();
+                match io_req.submit(&mut vq, false) {
+                    Some(h) => {
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        h
+                    }
+                    None => {
+                        // io_req dropped here, returning slot to arena automatically
+                        continue;
+                    }
+                }
+            };
+            let _len = match wait_for_completion(qs, head).await {
+                Ok(l) => l,
+                Err(e) => return complete_req(req, e),
+            };
+
+            if io_req.status() != VIRTIO_BLK_S_OK {
                 // io_req dropped here, returning slot to arena automatically
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return complete_req(req, DriverStatus::DeviceError);
+            }
+
+            {
+                let mut w = req.write();
+                let dst =
+                    &mut w.data_slice_mut()[buf_offset..buf_offset + chunk_len as usize];
+                dst.copy_from_slice(io_req.data_slice());
+            }
+
+            remaining = remaining.saturating_sub(chunk_len as u64);
+            buf_offset += chunk_len as usize;
+            next_sector = next_sector.saturating_add((chunk_len as u64) >> 9);
+            queue_idx = (qi + 1) % queue_count; // advance starting queue for fairness
+            submitted = true;
+            break;
+        }
+
+        if submitted {
+            continue;
+        }
+
+        // All queues full/exhausted: wait for an IRQ, then retry.
+        let mut waited = false;
+        for qs in inner.queues.iter() {
+            if let Some(ref irq_handle) = qs.irq_handle {
+                let wait_result = irq_handle.wait(meta).await;
+                if !irq_wait_ok(wait_result) {
+                    return complete_req(req, DriverStatus::DeviceError);
+                }
+                waited = true;
+                break;
             }
         }
-    };
-    let _len = match wait_for_completion(qs, head).await {
-        Ok(l) => l,
-        Err(e) => return complete_req(req, e),
-    };
-
-    if io_req.status() != VIRTIO_BLK_S_OK {
-        // io_req dropped here, returning slot to arena automatically
-        return complete_req(req, DriverStatus::DeviceError);
+        if !waited {
+            spin_loop();
+        }
     }
 
-    {
-        let mut w = req.write();
-        let dst = &mut w.data_slice_mut()[..len];
-        dst.copy_from_slice(io_req.data_slice());
-    }
-
-    // io_req dropped here, returning slot to arena automatically
+    // All chunk requests completed successfully; their handles have been dropped and returned.
     complete_req(req, DriverStatus::Success)
 }
 
@@ -1368,50 +1480,105 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
     let sector = offset >> 9;
 
-    // Select queue based on strategy (CPU affinity or round-robin)
-    let queue_idx = inner.select_queue();
-    let qs = inner.get_queue(queue_idx);
+    // Select starting queue, but allow falling back to others if full.
+    let mut queue_idx = inner.select_queue();
+    let queue_count = inner.queue_count.max(1);
+    let max_chunk = inner
+        .queues
+        .iter()
+        .map(|q| q.max_request_bytes.max(512) as u64)
+        .min()
+        .unwrap_or(512);
 
-    // Use this queue's arena allocator for request (returns slot on drop)
-    let mut io_req = match qs.arena.new_request(VIRTIO_BLK_T_OUT, sector, len as u32) {
-        Some(r) => r,
-        None => return complete_req(req, DriverStatus::InsufficientResources),
-    };
-
-    {
-        let r = req.read();
-        let src = &r.data_slice()[..len];
-        io_req.data_slice_mut().copy_from_slice(src);
-    }
+    let mut remaining = len as u64;
+    let mut buf_offset = 0usize;
+    let mut next_sector = sector;
 
     // Wait for IRQ subsystem to be ready
     inner.irq_ready.wait().await;
 
-    let head = {
-        let mut vq = qs.queue.lock();
-        match io_req.submit(&mut vq, true) {
-            Some(h) => {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                h
+    let meta = IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
+
+    while remaining > 0 {
+        let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
+
+        // Try all queues before waiting for space.
+        let mut submitted = false;
+        let start_idx = queue_idx;
+        for attempt in 0..queue_count {
+            let qi = (start_idx + attempt) % queue_count;
+            let qs = inner.get_queue(qi);
+
+            // Use this queue's arena allocator for request (returns slot on drop)
+            let mut io_req =
+                match qs.arena.new_request(VIRTIO_BLK_T_OUT, next_sector, chunk_len) {
+                    Some(r) => r,
+                    None => continue,
+                };
+
+            {
+                let r = req.read();
+                let src = &r.data_slice()[buf_offset..buf_offset + chunk_len as usize];
+                io_req.data_slice_mut().copy_from_slice(src);
             }
-            None => {
+
+            let head = {
+                let mut vq = qs.queue.lock();
+                match io_req.submit(&mut vq, true) {
+                    Some(h) => {
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        h
+                    }
+                    None => {
+                        // io_req dropped here, returning slot to arena automatically
+                        continue;
+                    }
+                }
+            };
+
+            let _len = match wait_for_completion(qs, head).await {
+                Ok(l) => l,
+                Err(e) => return complete_req(req, e),
+            };
+
+            if io_req.status() != VIRTIO_BLK_S_OK {
                 // io_req dropped here, returning slot to arena automatically
-                return complete_req(req, DriverStatus::InsufficientResources);
+                return complete_req(req, DriverStatus::DeviceError);
+            }
+
+            remaining = remaining.saturating_sub(chunk_len as u64);
+            buf_offset += chunk_len as usize;
+            next_sector = next_sector.saturating_add((chunk_len as u64) >> 9);
+            queue_idx = (qi + 1) % queue_count; // advance starting queue for fairness
+            submitted = true;
+            break;
+        }
+
+        if submitted {
+            continue;
+        }
+
+        // All queues full/exhausted: wait for an IRQ, then retry.
+        let mut waited = false;
+        for qs in inner.queues.iter() {
+            if let Some(ref irq_handle) = qs.irq_handle {
+                let wait_result = irq_handle.wait(meta).await;
+                if !irq_wait_ok(wait_result) {
+                    return complete_req(req, DriverStatus::DeviceError);
+                }
+                waited = true;
+                break;
             }
         }
-    };
-
-    let _len = match wait_for_completion(qs, head).await {
-        Ok(l) => l,
-        Err(e) => return complete_req(req, e),
-    };
-
-    if io_req.status() != VIRTIO_BLK_S_OK {
-        // io_req dropped here, returning slot to arena automatically
-        return complete_req(req, DriverStatus::DeviceError);
+        if !waited {
+            spin_loop();
+        }
     }
 
-    // io_req dropped here, returning slot to arena automatically
+    // Chunk requests dropped here, returning slots to arena automatically
     complete_req(req, DriverStatus::Success)
 }
 
