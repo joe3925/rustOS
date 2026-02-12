@@ -63,21 +63,17 @@ fn continue_req(req: &mut RequestHandle) -> DriverStep {
 }
 
 fn signal_waiters(handle: &IrqHandle) {
-    // user_ctx stores a pointer to the per-device waiting_tasks counter.
-    let ptr = handle.user_ctx() as *const AtomicU32;
-    let waiters = if ptr.is_null() {
-        0
-    } else {
-        unsafe { (*ptr).load(Ordering::Acquire) }
-    };
-
-    let tokens = waiters.max(1);
+    // Single-drainer pattern: always signal exactly ONE token.
+    // This wakes one drainer task which will drain all completions and then
+    // wake other waiters if their requests completed. This prevents the
+    // thundering herd problem where N completions cause N wakeups that all
+    // contend on the same virtqueue lock.
     handle.signal_n(
         IrqMeta {
             tag: 0,
             data: [0; 3],
         },
-        tokens,
+        1,
     );
 }
 
@@ -554,29 +550,64 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
     };
 
     loop {
-        // Fast path: check if already completed (lock-free peek)
+        // Fast path: check if already completed (lock-free peek via atomic)
         {
-            let vq = inner.requestq.lock();
+            let mut vq = inner.requestq.lock();
             if let Some(len) = vq.take_completion(head) {
-                // Need to free chain while holding lock
-                drop(vq);
-                let mut vq = inner.requestq.lock();
                 vq.free_chain(head);
                 return Ok(len);
             }
         }
 
-        // Drain used ring if there are pending completions
-        {
-            let mut vq = inner.requestq.lock();
-            if vq.has_pending_used() {
-                vq.drain_used_to_completions();
-                // Check again after draining
+        // Single-drainer pattern: try to become the drainer
+        let epoch_before = {
+            let vq = inner.requestq.lock();
+            vq.drain_epoch()
+        };
+
+        let we_are_drainer = {
+            let vq = inner.requestq.lock();
+            vq.try_acquire_drainer()
+        };
+
+        if we_are_drainer {
+            // We are the single drainer - drain all pending completions
+            {
+                let mut vq = inner.requestq.lock();
+                if vq.has_pending_used() {
+                    vq.drain_used_to_completions();
+                }
+                vq.release_drainer();
+
+                // Check our completion after draining
                 if let Some(len) = vq.take_completion(head) {
                     vq.free_chain(head);
                     return Ok(len);
                 }
             }
+
+            // Re-signal one waiter if there are still pending used entries
+            // This ensures forward progress when multiple completions arrive
+            {
+                let vq = inner.requestq.lock();
+                if vq.has_pending_used() {
+                    if let Some(ref irq_handle) = inner.irq_handle {
+                        irq_handle.signal_n(meta, 1);
+                    }
+                }
+            }
+        } else {
+            // Another task is draining. Check if our completion is ready.
+            {
+                let mut vq = inner.requestq.lock();
+                if let Some(len) = vq.take_completion(head) {
+                    vq.free_chain(head);
+                    return Ok(len);
+                }
+            }
+
+            // Wait for epoch to change (i.e., drainer to complete) or IRQ
+            // to avoid busy-spinning while another task drains
         }
 
         // Wait for next interrupt (if IRQ configured)
@@ -588,8 +619,23 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
                 return Err(DriverStatus::DeviceError);
             }
         } else {
-            // Polling mode - yield
+            // Polling mode - yield and spin
             spin_loop();
+        }
+
+        // After waking, check if epoch changed (meaning drainer processed completions)
+        // If so, immediately check our completion before trying to become drainer
+        let epoch_after = {
+            let vq = inner.requestq.lock();
+            vq.drain_epoch()
+        };
+        if epoch_after != epoch_before {
+            // New completions were processed, check ours immediately
+            let mut vq = inner.requestq.lock();
+            if let Some(len) = vq.take_completion(head) {
+                vq.free_chain(head);
+                return Ok(len);
+            }
         }
     }
 }
@@ -736,33 +782,72 @@ async fn bench_reads_with_inflight(
             }
         }
 
-        // Drain completions
-        let mut found_any = false;
-        {
-            let mut vq = inner.requestq.lock();
-            vq.drain_used_to_completions();
+        // Single-drainer pattern for benchmark: try to become the drainer
+        let we_are_drainer = {
+            let vq = inner.requestq.lock();
+            vq.try_acquire_drainer()
+        };
 
-            // Check each pending request for completion
+        let mut found_any = false;
+
+        if we_are_drainer {
+            // Drain completions as the single drainer
+            {
+                let mut vq = inner.requestq.lock();
+                vq.drain_used_to_completions();
+                vq.release_drainer();
+
+                // Check each pending request for completion
+                let mut i = 0;
+                while i < pending.len() {
+                    if let Some(_len) = vq.take_completion(pending[i].head) {
+                        let end_tsc = rdtsc();
+                        let cycles = end_tsc.saturating_sub(pending[i].start_tsc);
+
+                        // Update statistics
+                        result.total_cycles += cycles;
+                        result.max_cycles = result.max_cycles.max(cycles);
+                        result.min_cycles = result.min_cycles.min(cycles);
+                        result.request_count += 1;
+
+                        // Free the descriptor chain
+                        vq.free_chain(pending[i].head);
+
+                        // Remove from pending (swap-remove for efficiency)
+                        pending.swap_remove(i);
+                        completed_count += 1;
+                        found_any = true;
+                        // Don't increment i since we swapped in a new element
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                // Re-signal if there are still pending used entries
+                if vq.has_pending_used() {
+                    if let Some(ref irq_handle) = inner.irq_handle {
+                        irq_handle.signal_n(meta, 1);
+                    }
+                }
+            }
+        } else {
+            // Another task is draining, just check our completions
+            let mut vq = inner.requestq.lock();
             let mut i = 0;
             while i < pending.len() {
                 if let Some(_len) = vq.take_completion(pending[i].head) {
                     let end_tsc = rdtsc();
                     let cycles = end_tsc.saturating_sub(pending[i].start_tsc);
 
-                    // Update statistics
                     result.total_cycles += cycles;
                     result.max_cycles = result.max_cycles.max(cycles);
                     result.min_cycles = result.min_cycles.min(cycles);
                     result.request_count += 1;
 
-                    // Free the descriptor chain
                     vq.free_chain(pending[i].head);
-
-                    // Remove from pending (swap-remove for efficiency)
                     pending.swap_remove(i);
                     completed_count += 1;
                     found_any = true;
-                    // Don't increment i since we swapped in a new element
                 } else {
                     i += 1;
                 }
@@ -772,8 +857,8 @@ async fn bench_reads_with_inflight(
         // If no completions found and we have pending requests, wait for IRQ
         if !found_any && !pending.is_empty() {
             if let Some(ref irq_handle) = inner.irq_handle {
-                let result = irq_handle.wait(meta).await;
-                if !irq_wait_ok(result) {
+                let wait_result = irq_handle.wait(meta).await;
+                if !irq_wait_ok(wait_result) {
                     // Clean up pending requests
                     let mut vq = inner.requestq.lock();
                     for req in pending.drain(..) {

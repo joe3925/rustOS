@@ -1,5 +1,5 @@
 use core::cmp;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
     unmap_range, virt_to_phys,
@@ -58,6 +58,14 @@ pub struct Virtqueue {
     /// - 0: not completed
     /// - non-zero: completed, value is (len + 1) to distinguish from "not completed"
     completions: [AtomicU32; 256],
+
+    /// Single-drainer gate: true if a drain operation is in progress.
+    /// Only one task should drain at a time to prevent thundering herd.
+    draining: AtomicBool,
+
+    /// Epoch counter incremented each time drain_used_to_completions() drains entries.
+    /// Waiters can use this to detect when new completions have been processed.
+    drain_epoch: AtomicU64,
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
@@ -134,6 +142,8 @@ impl Virtqueue {
             num_free: size,
             last_used_idx: 0,
             completions: core::array::from_fn(|_| AtomicU32::new(0)),
+            draining: AtomicBool::new(false),
+            drain_epoch: AtomicU64::new(0),
         })
     }
 
@@ -265,11 +275,48 @@ impl Virtqueue {
     }
 
     /// Drain all pending used ring entries into the completions array.
-    pub fn drain_used_to_completions(&mut self) {
+    /// Returns the number of entries drained.
+    pub fn drain_used_to_completions(&mut self) -> usize {
+        let mut count = 0;
         while let Some((head, len)) = self.pop_used() {
             // Store len+1 so 0 means "not completed"
             self.completions[head as usize].store(len.wrapping_add(1), Ordering::Release);
+            count += 1;
         }
+        if count > 0 {
+            // Increment epoch to signal waiters that new completions are available
+            self.drain_epoch.fetch_add(1, Ordering::Release);
+        }
+        count
+    }
+
+    /// Try to acquire the single-drainer gate.
+    /// Returns true if this caller is now the drainer, false if another drainer is active.
+    /// Use `release_drainer()` when done draining.
+    #[inline]
+    pub fn try_acquire_drainer(&self) -> bool {
+        self.draining
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Release the single-drainer gate after draining is complete.
+    #[inline]
+    pub fn release_drainer(&self) {
+        self.draining.store(false, Ordering::Release);
+    }
+
+    /// Check if a drain operation is currently in progress.
+    #[inline]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Get the current drain epoch. Waiters can compare this value before and after
+    /// sleeping to detect if new completions have been processed.
+    #[inline]
+    pub fn drain_epoch(&self) -> u64 {
+        self.drain_epoch.load(Ordering::Acquire)
     }
 
     /// Check if head is completed and take the completion (atomic swap to 0).
