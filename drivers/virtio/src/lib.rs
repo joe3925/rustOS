@@ -11,13 +11,11 @@ mod virtqueue;
 
 use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::cell::UnsafeCell;
-use core::future::poll_fn;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
-use core::pin::Pin;
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use kernel_api::benchmark::{BENCH_MAX_LEVELS, BenchLevelResult, BenchSweepResult};
+use kernel_api::benchmark::{BenchLevelResult, BenchSweepResult};
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
@@ -33,7 +31,7 @@ use kernel_api::memory::unmap_mmio_region;
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
-    pnp_forward_request_to_next_lower, pnp_send_request,
+    pnp_forward_request_to_next_lower,
 };
 use kernel_api::request::{Request, RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
@@ -825,103 +823,92 @@ fn rdtsc() -> u64 {
 // =============================================================================
 
 /// Total data to transfer per benchmark run.
-const BENCH_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const BENCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 
 struct BenchConfig {
     /// Target payload size per request (512-byte aligned, fits any queue).
     request_size: u32,
     /// Number of fixed-size requests to cover BENCH_TOTAL_BYTES.
     requests_per_run: u32,
+    /// Maximum inflight requests that can fit in the queue.
+    max_queue_inflight: u16,
 }
 
 impl BenchConfig {
     fn from_inner(inner: &DevExtInner) -> Self {
-        // Use the most conservative per-queue limit so every queue can service the request size.
-        let request_size = 1016 * 1024;
+        // Use small request size to maximize I/O operations and interrupt frequency.
+        // 4KB aligns with arena preallocated slot size for optimal performance.
+        let request_size = 64 * 1024;
 
         let requests_per_run =
             ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64).max(1) as u32;
 
+        // Calculate max inflight based on queue size and descriptors per request.
+        // Each request uses: 1 header + N data segments + 1 status descriptor.
+        // For our request size, calculate how many descriptors we need per request.
+        let data_segments = ((request_size as usize + 4095) / 4096).max(1);
+        let descriptors_per_request = 1 + data_segments + 1; // header + data + status
+
+        // Get minimum queue size across all queues
+        let min_queue_size = inner
+            .queues
+            .iter()
+            .map(|qs| {
+                // Access queue size through the lock-free path
+                let vq = unsafe { &*qs.queue.as_ptr() };
+                vq.size as usize
+            })
+            .min()
+            .unwrap_or(64);
+
+        // Max inflight = queue_size / descriptors_per_request
+        let max_queue_inflight = (min_queue_size / descriptors_per_request).max(1) as u16;
+
         Self {
             request_size,
             requests_per_run,
+            max_queue_inflight,
         }
     }
 }
 
-/// Run a benchmark with a specific inflight request count.
-/// Each worker repeatedly issues fixed-size read requests via `pnp_send_request` until the
-/// total request budget for the level is consumed.
-async fn run_bench_worker(
-    pdo: Arc<DeviceObject>,
-    start_sector: u64,
-    request_size: usize,
-    sectors_per_request: u64,
-    total_requests: u32,
-    completed: Arc<AtomicU32>,
-    next_request: Arc<AtomicU32>,
-    lat_samples: Arc<Mutex<Vec<u64>>>,
-    error: Arc<Mutex<Option<DriverStatus>>>,
-) -> Result<(), DriverStatus> {
-    let mut handle = RequestHandle::new(
-        RequestType::Read { offset: 0, len: 0 },
-        RequestData::from_boxed_bytes(vec![0u8; request_size].into_boxed_slice()),
-    );
-    loop {
-        if error.lock().is_some() {
-            break;
-        }
-
-        let idx = next_request.fetch_add(1, Ordering::AcqRel);
-        if idx >= total_requests {
-            break;
-        }
-
-        let sector = start_sector.saturating_add(sectors_per_request.saturating_mul(idx as u64));
-        let offset = sector << 9;
-        handle.write().kind = RequestType::Read {
-            offset,
-            len: request_size,
-        };
-        let start_tsc = rdtsc();
-        let status = pnp_send_request(pdo.clone(), &mut handle).await;
-        let end_tsc = rdtsc();
-
-        if status != DriverStatus::Success {
-            *error.lock() = Some(status);
-            return Err(status);
-        }
-
-        lat_samples.lock().push(end_tsc.saturating_sub(start_tsc));
-
-        let finished = completed.fetch_add(1, Ordering::AcqRel) + 1;
-        if finished >= total_requests {
-            break;
-        }
-    }
-
-    Ok(())
+/// State for a single in-flight benchmark request.
+struct BenchInflightSlot<'a> {
+    /// Arena request handle (owns DMA buffers).
+    io_req: blk::BlkIoRequestHandle<'a>,
+    /// Descriptor chain head in the virtqueue.
+    head: u16,
+    /// TSC when request was submitted.
+    start_tsc: u64,
 }
 
-async fn bench_reads_with_inflight(
-    pdo: Arc<DeviceObject>,
+/// Run a benchmark with a specific inflight request count by submitting directly to the virtqueue.
+/// - `use_interrupts`: if true, await interrupts when queue is full or waiting for completions.
+///   if false, always poll without waiting.
+async fn bench_reads_direct(
     inner: &DevExtInner,
     start_sector: u64,
     inflight: usize,
     bench_cfg: &BenchConfig,
+    use_interrupts: bool,
 ) -> Result<BenchLevelResult, DriverStatus> {
     // Wait for IRQ subsystem to be ready
     inner.irq_ready.wait().await;
 
+    // Use queue 0 for benchmarking (simplifies logic, avoids cross-queue coordination)
+    let qs = inner.get_queue(0);
+
+    // Snap inflight to max queue capacity if requested is higher
+    let effective_inflight = (inflight as u16).min(bench_cfg.max_queue_inflight) as usize;
+    if effective_inflight == 0 {
+        return Err(DriverStatus::InvalidParameter);
+    }
+
     let sectors_per_request = (bench_cfg.request_size as u64) >> 9;
-    let total_requests = bench_cfg.requests_per_run.max(1);
-    let lat_samples = Arc::new(Mutex::new(Vec::with_capacity(total_requests as usize)));
-    let completed = Arc::new(AtomicU32::new(0));
-    let next_request = Arc::new(AtomicU32::new(0));
-    let error: Arc<Mutex<Option<DriverStatus>>> = Arc::new(Mutex::new(None));
+    let total_requests = bench_cfg.requests_per_run;
 
     let mut result = BenchLevelResult {
-        inflight: inflight as u32,
+        inflight: effective_inflight as u32,
         request_count: 0,
         total_time_cycles: 0,
         total_cycles: 0,
@@ -933,69 +920,146 @@ async fn bench_reads_with_inflight(
         p999_cycles: 0,
     };
 
+    // Track in-flight requests (circular buffer style)
+    let mut inflight_slots: Vec<Option<BenchInflightSlot<'_>>> =
+        (0..effective_inflight).map(|_| None).collect();
+    let mut next_slot = 0usize;
+    let mut submitted = 0u32;
+    let mut completed_count = 0u32;
+    let mut current_sector = start_sector;
+
+    // Latency samples
+    let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
+
+    let meta = kernel_api::kernel_types::irq::IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
+
     let run_start_tsc = rdtsc();
 
-    let mut workers: Vec<
-        Option<Pin<Box<dyn core::future::Future<Output = Result<(), DriverStatus>> + Send>>>,
-    > = Vec::with_capacity(inflight.max(1));
+    // Main benchmark loop
+    while completed_count < total_requests {
+        // Phase 1: Submit as many requests as possible up to inflight limit
+        while submitted < total_requests {
+            // Check if we have a free slot
+            if inflight_slots[next_slot].is_some() {
+                // Slot occupied, need to wait for completion
+                break;
+            }
 
-    for _ in 0..inflight.max(1) {
-        workers.push(Some(Box::pin(run_bench_worker(
-            pdo.clone(),
-            start_sector,
-            bench_cfg.request_size as usize,
-            sectors_per_request,
-            total_requests,
-            completed.clone(),
-            next_request.clone(),
-            lat_samples.clone(),
-            error.clone(),
-        ))));
-    }
-
-    poll_fn(|cx| {
-        let mut active = 0usize;
-
-        for slot in workers.iter_mut() {
-            if let Some(fut) = slot.as_mut() {
-                match fut.as_mut().poll(cx) {
-                    core::task::Poll::Ready(res) => {
-                        if let Err(e) = res {
-                            *error.lock() = Some(e);
-                        }
-                        *slot = None;
+            // Allocate request from arena
+            let io_req =
+                match qs
+                    .arena
+                    .new_request(VIRTIO_BLK_T_IN, current_sector, bench_cfg.request_size)
+                {
+                    Some(r) => r,
+                    None => {
+                        // Arena exhausted, wait for completions
+                        break;
                     }
-                    core::task::Poll::Pending => {
-                        active += 1;
+                };
+
+            // Try to submit to queue
+            let head = {
+                let mut vq = qs.queue.lock().await;
+                match io_req.submit(&mut vq, false) {
+                    Some(h) => {
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        h
                     }
+                    None => {
+                        // Queue full, drop io_req (returns to arena) and wait
+                        break;
+                    }
+                }
+            };
+
+            let start_tsc = rdtsc();
+
+            inflight_slots[next_slot] = Some(BenchInflightSlot {
+                io_req,
+                head,
+                start_tsc,
+            });
+
+            submitted += 1;
+            current_sector = current_sector.saturating_add(sectors_per_request);
+            next_slot = (next_slot + 1) % effective_inflight;
+        }
+
+        // Phase 2: Check for completions
+        let mut made_progress = false;
+
+        // Try to drain used ring
+        if qs.try_acquire_drainer() {
+            let drained = qs.drain_used_to_completions_lockfree();
+            qs.release_drainer();
+            if drained > 0 {
+                made_progress = true;
+            }
+        }
+
+        // Check all inflight slots for completions
+        for slot in inflight_slots.iter_mut() {
+            if let Some(inflight) = slot.as_ref() {
+                if let Some(_len) = qs.take_completion(inflight.head) {
+                    let end_tsc = rdtsc();
+                    let latency = end_tsc.saturating_sub(inflight.start_tsc);
+                    lat_samples.push(latency);
+
+                    // Check status
+                    if inflight.io_req.status() != VIRTIO_BLK_S_OK {
+                        return Err(DriverStatus::DeviceError);
+                    }
+
+                    // Defer freeing the descriptor chain
+                    qs.defer_free_chain(inflight.head);
+
+                    completed_count += 1;
+                    made_progress = true;
+
+                    // Clear the slot (io_req dropped here, returns to arena)
+                    *slot = None;
                 }
             }
         }
 
-        let has_error = error.lock().is_some();
-        let reached_target = completed.load(Ordering::Acquire) >= total_requests;
+        // Phase 3: If no progress and we need to wait
+        if !made_progress && completed_count < total_requests {
+            if use_interrupts {
+                // Wait for interrupt if we have pending requests
+                let any_inflight = inflight_slots.iter().any(|s| s.is_some());
+                if any_inflight {
+                    if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
+                        qs.waiting_tasks.fetch_add(1, Ordering::AcqRel);
+                        let wait_result = irq_handle.wait(meta).await;
+                        qs.waiting_tasks.fetch_sub(1, Ordering::AcqRel);
 
-        if active == 0 && (has_error || reached_target) {
-            core::task::Poll::Ready(())
-        } else {
-            core::task::Poll::Pending
+                        if !irq_wait_ok(wait_result) {
+                            return Err(DriverStatus::DeviceError);
+                        }
+                    } else {
+                        // No IRQ handle, just spin
+                        spin_loop();
+                    }
+                }
+            } else {
+                // Polling mode: just spin briefly and retry
+                spin_loop();
+            }
         }
-    })
-    .await;
-
-    if let Some(err) = error.lock().take() {
-        return Err(err);
     }
 
     let run_end_tsc = rdtsc();
-    let samples = { lat_samples.lock().clone() };
 
-    result.request_count = samples.len() as u32;
+    result.request_count = lat_samples.len() as u32;
     result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
 
-    if !samples.is_empty() {
-        let mut sorted = samples.clone();
-        let total_cycles: u64 = samples.iter().copied().sum();
+    if !lat_samples.is_empty() {
+        let mut sorted = lat_samples.clone();
+        let total_cycles: u64 = lat_samples.iter().copied().sum();
         sorted.sort_unstable();
 
         let percentile_idx = |pct: f64, len: usize| -> usize {
@@ -1019,49 +1083,47 @@ async fn bench_reads_with_inflight(
 }
 
 /// Run a benchmark sweep across multiple inflight levels.
-/// Tests power-of-two levels from 1 to 1024, clamped by the request budget for the run.
-/// Each level reads from a different disk region to avoid host/page cache hits.
-/// Requests are driven through the PDO using the regular request path.
+/// Requests are submitted directly to the virtqueue, bypassing the PnP request path.
+/// Inflight is snapped to max queue capacity if it exceeds what the queue can hold.
 async fn bench_sweep(
-    pdo: Arc<DeviceObject>,
     inner: &DevExtInner,
+    use_interrupts: bool,
 ) -> Result<BenchSweepResult, DriverStatus> {
-    let levels: [usize; _] = [
-        1,
-        //2, 4, 8, 16, 32
-    ];
-
     let bench_cfg = BenchConfig::from_inner(inner);
-    let max_supported = bench_cfg.requests_per_run as usize;
+
+    // Test levels from 1 up to max queue capacity
+    // With 256-desc queue and 4KB requests (3 desc each), max ~85 inflight
+    let max_inflight = bench_cfg.max_queue_inflight as usize;
+    let levels: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 85];
+
     let sectors_per_run =
         ((bench_cfg.request_size as u64) >> 9).saturating_mul(bench_cfg.requests_per_run as u64);
 
     let mut result = BenchSweepResult::default();
 
     // Each level uses a different starting sector to avoid host/page cache hits.
-    // This ensures we're measuring actual storage/virtio performance, not cached reads.
-    let mut current_sector: u16 = 0;
+    let mut current_sector: u64 = 0;
 
     for &level in levels.iter() {
-        // Clamp level to max supported
-        let clamped_level = level.min(max_supported.max(1));
+        // Snap to max queue capacity
+        let effective_level = level.min(max_inflight).max(1);
 
-        // Skip if we've already tested this clamped level
+        // Skip if we've already tested this effective level
         if result.used > 0 {
             let prev_level = result.levels[result.used as usize - 1].inflight as usize;
-            if clamped_level == prev_level {
+            if effective_level == prev_level {
                 // Already tested this level, stop the sweep
                 break;
             }
         }
 
         // Run benchmark for this level with unique disk region
-        let level_result = bench_reads_with_inflight(
-            pdo.clone(),
+        let level_result = bench_reads_direct(
             inner,
-            current_sector as u64,
-            clamped_level,
+            current_sector,
+            effective_level,
             &bench_cfg,
+            use_interrupts,
         )
         .await?;
 
@@ -1069,10 +1131,10 @@ async fn bench_sweep(
         result.used += 1;
 
         // Advance to next region for the next level to avoid cache hits
-        current_sector = current_sector.wrapping_add(sectors_per_run as u16);
+        current_sector = current_sector.wrapping_add(sectors_per_run);
 
-        // Stop if we've hit the cap
-        if clamped_level >= max_supported {
+        // Stop if we've hit the max queue capacity
+        if effective_level >= max_inflight {
             break;
         }
     }
@@ -1460,7 +1522,8 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                 Err(s) => return complete_req(req, s),
             };
 
-            match bench_sweep(pdo.clone(), inner).await {
+            // Run benchmark with interrupts enabled
+            match bench_sweep(inner, true).await {
                 Ok(result) => {
                     {
                         let mut w = req.write();
@@ -1477,22 +1540,8 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                 Err(s) => return complete_req(req, s),
             };
 
-            // Temporarily disable IRQ handles to force polling mode
-            let mut saved_handles: Vec<Option<IrqHandle>> = Vec::new();
-            for qs in inner.queues.iter() {
-                let handle_ptr = qs.irq_handle.get();
-                saved_handles.push(unsafe { (*handle_ptr).take() });
-            }
-
-            let result = bench_sweep(pdo.clone(), inner).await;
-
-            // Restore IRQ handles
-            for (qs, saved) in inner.queues.iter().zip(saved_handles.into_iter()) {
-                let handle_ptr = qs.irq_handle.get();
-                unsafe { *handle_ptr = saved };
-            }
-
-            match result {
+            // Run benchmark in polling mode (no interrupt waits)
+            match bench_sweep(inner, false).await {
                 Ok(result) => {
                     {
                         let mut w = req.write();

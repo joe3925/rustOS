@@ -16,20 +16,21 @@ use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 4096);
 
 /// Number of preallocated slots with 4KB data regions (common I/O size)
-pub const ARENA_PREALLOCATED_SLOTS: usize = 64;
+/// Tuned for 256-descriptor queue with 1 virtqueue: ~85 max inflight (256/3)
+pub const ARENA_PREALLOCATED_SLOTS: usize = 85;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
 pub const ARENA_DYNAMIC_SLOTS: usize = 0;
 
 /// Maximum arena capacity before overflow requests are not cached
-pub const ARENA_MAX_CAPACITY: usize = 64;
+pub const ARENA_MAX_CAPACITY: usize = 128;
 
 /// Number of u64 bitmap words needed to track all arena slots
 pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
-/// TODO: Changing this value can significantly impact performance maybe should be tunable at runtime?
-pub const PREALLOCATED_DATA_SIZE: usize = 1016 * 1024;
+/// Tuned for interrupt benchmark: smaller requests = more I/O ops = more interrupts
+pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 
 // =============================================================================
 // Slot State Constants
@@ -872,7 +873,7 @@ pub fn calculate_per_queue_arena_sizes(queue_count: usize) -> (usize, usize) {
     let queue_count = queue_count.max(1);
     // Divide total slots across queues, with reasonable minimums
     let prealloc = (ARENA_PREALLOCATED_SLOTS / queue_count).max(4);
-    let dynamic = (ARENA_DYNAMIC_SLOTS / queue_count).max(2);
+    let dynamic = ARENA_DYNAMIC_SLOTS / queue_count;
     (prealloc, dynamic)
 }
 
