@@ -850,7 +850,7 @@ impl<'a> BlkIoRequestHandle<'a> {
 
     /// Get the capacity of the indirect descriptor table in descriptors.
     #[inline]
-    pub fn indirect_table_capacity(&self) -> usize {
+    pub fn indirect_table_capacity(&self) -> u16 {
         let len = match self {
             Self::Preallocated { .. } => PREALLOCATED_INDIRECT_TABLE_SIZE,
             Self::Dynamic {
@@ -862,7 +862,9 @@ impl<'a> BlkIoRequestHandle<'a> {
             Self::Overflow(req) => req.indirect_table_len as usize,
         };
         // Each descriptor is 16 bytes.
-        len / 16
+        (len / 16)
+            .try_into()
+            .expect("blkio request table would overflow")
     }
 
     /// Initialize the request header.
@@ -939,13 +941,7 @@ impl<'a> BlkIoRequestHandle<'a> {
 
         while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
             let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
-            let phys = match virt_to_phys(vaddr) {
-                Some(p) => p,
-                None => {
-                    // Fallback: use base physical + offset (assumes contiguous)
-                    PhysAddr::new(data_phys_base.as_u64() + offset)
-                }
-            };
+            let phys = virt_to_phys(vaddr).expect("Todo");
             let page_off = (vaddr.as_u64() & 0xFFF) as u64;
             let chunk = core::cmp::min(4096u64 - page_off, total - offset);
             let seg_phys = PhysAddr::new(phys.as_u64());
@@ -982,12 +978,12 @@ impl<'a> BlkIoRequestHandle<'a> {
 
         let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
 
-        let mut desc_count = 0usize;
+        let mut desc_count: u16 = 0;
         let table_ptr = table_va.as_u64() as *mut crate::virtqueue::VirtqDesc;
 
         // Helper to write a descriptor at the given index
-        let write_desc = |idx: usize, addr: u64, len: u32, flags: u16| unsafe {
-            let desc = table_ptr.add(idx);
+        let write_desc = |idx: u16, addr: u64, len: u32, flags: u16| unsafe {
+            let desc = table_ptr.add(idx as usize);
             (*desc).addr = addr;
             (*desc).len = len;
             (*desc).flags = flags;
@@ -1018,10 +1014,7 @@ impl<'a> BlkIoRequestHandle<'a> {
 
         while offset < total {
             let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
-            let phys = match virt_to_phys(vaddr) {
-                Some(p) => p.as_u64(),
-                None => data_phys_base.as_u64() + offset,
-            };
+            let phys = virt_to_phys(vaddr).expect("Todo").as_u64();
             let page_off = vaddr.as_u64() & 0xFFF;
             let chunk = core::cmp::min(4096 - page_off, total - offset) as u32;
 

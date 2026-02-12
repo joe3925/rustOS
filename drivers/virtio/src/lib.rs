@@ -723,7 +723,7 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
     };
 
     let mut spins: u32 = 0;
-    const SPIN_BEFORE_WAIT: u32 = 10;
+    const SPIN_BEFORE_WAIT: u32 = 0;
 
     loop {
         // All operations below are lock-free via QueueState delegation methods
@@ -837,7 +837,7 @@ fn rdtsc() -> u64 {
 // =============================================================================
 
 /// Total data to transfer per benchmark run.
-const BENCH_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BENCH_TOTAL_BYTES: u64 = 1 * 1024 * 1024 * 1024;
 
 struct BenchConfig {
     /// Target payload size per request (512-byte aligned, fits any queue).
@@ -883,14 +883,44 @@ impl BenchConfig {
         }
     }
 }
+#[inline]
+fn percentile_index_permille(len: usize, permille: u32) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+    let n = (len - 1) as u64;
+    let num = n * permille as u64 + 500;
+    let idx = (num / 1000) as usize;
+    if idx >= len { len - 1 } else { idx }
+}
 
+#[inline]
+fn bench_descs_per_request(use_indirect: bool, request_size: u32) -> usize {
+    if use_indirect {
+        return 1;
+    }
+    let pages = ((request_size as usize) + 4095) / 4096;
+    1 + pages + 1
+}
+#[inline]
+fn bench_max_inflight_queue0(inner: &DevExtInner, request_size: u32, use_indirect: bool) -> usize {
+    let qs = inner.get_queue(0);
+    let vq = unsafe { &*qs.queue.as_ptr() };
+    let qsz = vq.size as usize;
+    let dpr = bench_descs_per_request(use_indirect, request_size);
+    if dpr == 0 {
+        return 1;
+    }
+    if !use_indirect && dpr > qsz {
+        return 0;
+    }
+    let max = qsz / dpr;
+    max.max(1)
+}
 /// State for a single in-flight benchmark request.
 struct BenchInflightSlot<'a> {
-    /// Arena request handle (owns DMA buffers).
-    io_req: blk::BlkIoRequestHandle<'a>,
-    /// Descriptor chain head in the virtqueue.
+    io_req: Option<blk::BlkIoRequestHandle<'a>>,
     head: u16,
-    /// TSC when request was submitted.
     start_tsc: u64,
 }
 
@@ -904,19 +934,17 @@ async fn bench_reads_direct(
     bench_cfg: &BenchConfig,
     use_interrupts: bool,
 ) -> Result<BenchLevelResult, DriverStatus> {
-    // Wait for IRQ subsystem to be ready
     inner.irq_ready.wait().await;
 
-    // Use queue 0 for benchmarking (simplifies logic, avoids cross-queue coordination)
     let qs = inner.get_queue(0);
+    let use_indirect = inner.indirect_desc_enabled;
 
-    // Snap inflight to max queue capacity if requested is higher
-    let effective_inflight = (inflight as u16).min(bench_cfg.max_queue_inflight) as usize;
-    if effective_inflight == 0 {
+    let max_inflight = bench_max_inflight_queue0(inner, bench_cfg.request_size, use_indirect);
+    if max_inflight == 0 {
         return Err(DriverStatus::InvalidParameter);
     }
 
-    let sectors_per_request = (bench_cfg.request_size as u64) >> 9;
+    let effective_inflight = inflight.min(max_inflight).max(1);
     let total_requests = bench_cfg.requests_per_run;
 
     let mut result = BenchLevelResult {
@@ -933,134 +961,133 @@ async fn bench_reads_direct(
         idle_pct: 0.0,
     };
 
-    // Track in-flight requests (circular buffer style)
-    let mut inflight_slots: Vec<Option<BenchInflightSlot<'_>>> =
-        (0..effective_inflight).map(|_| None).collect();
-    let mut next_slot = 0usize;
-    let mut submitted = 0u32;
-    let mut completed_count = 0u32;
-    let mut current_sector = start_sector;
+    let sectors_per_request = (bench_cfg.request_size as u64) >> 9;
 
-    // Latency samples
     let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
 
-    let meta = kernel_api::kernel_types::irq::IrqMeta {
+    let meta = IrqMeta {
         tag: 0,
         data: [0; 3],
     };
 
     let run_start_tsc = rdtsc();
 
-    // Main benchmark loop
-    while completed_count < total_requests {
-        // Phase 1: Submit as many requests as possible up to inflight limit
-        while submitted < total_requests {
-            // Check if we have a free slot
-            if inflight_slots[next_slot].is_some() {
-                // Slot occupied, need to wait for completion
+    let mut submitted: u32 = 0;
+    let mut completed: u32 = 0;
+    let mut current_sector = start_sector;
+
+    while completed < total_requests {
+        let remaining = (total_requests - submitted) as usize;
+        let batch_target = remaining.min(effective_inflight);
+
+        let mut batch: Vec<BenchInflightSlot<'_>> = Vec::with_capacity(batch_target);
+
+        {
+            let mut vq = qs.queue.lock().await;
+
+            for _ in 0..batch_target {
+                let io_req = match qs.arena.new_request(
+                    VIRTIO_BLK_T_IN,
+                    current_sector,
+                    bench_cfg.request_size,
+                ) {
+                    Some(r) => r,
+                    None => return Err(DriverStatus::InsufficientResources),
+                };
+
+                let head = match io_req.submit(&mut vq, false, use_indirect) {
+                    Some(h) => h,
+                    None => return Err(DriverStatus::InsufficientResources),
+                };
+
+                batch.push(BenchInflightSlot {
+                    io_req: Some(io_req),
+                    head,
+                    start_tsc: 0,
+                });
+
+                submitted += 1;
+                current_sector = current_sector.saturating_add(sectors_per_request);
+            }
+
+            if batch.is_empty() {
+                return Err(DriverStatus::InsufficientResources);
+            }
+
+            let batch_start_tsc = rdtsc();
+            for slot in batch.iter_mut() {
+                slot.start_tsc = batch_start_tsc;
+            }
+
+            vq.notify(inner.notify_base, inner.notify_off_multiplier);
+        }
+
+        let mut remaining_in_batch = batch.len();
+
+        while remaining_in_batch != 0 {
+            let mut made_progress = false;
+
+            if qs.try_acquire_drainer() {
+                let drained = qs.drain_used_to_completions_lockfree();
+                qs.release_drainer();
+                if drained != 0 {
+                    made_progress = true;
+                }
+            }
+
+            for slot in batch.iter_mut() {
+                if slot.head == 0xFFFF {
+                    continue;
+                }
+                let len_opt = qs.take_completion(slot.head);
+                if len_opt.is_none() {
+                    continue;
+                }
+
+                let end_tsc = rdtsc();
+                let head = slot.head;
+                let start_tsc = slot.start_tsc;
+
+                let io_req = match slot.io_req.take() {
+                    Some(r) => r,
+                    None => return Err(DriverStatus::DeviceError),
+                };
+
+                if io_req.status() != VIRTIO_BLK_S_OK {
+                    return Err(DriverStatus::DeviceError);
+                }
+
+                qs.defer_free_chain(head);
+
+                lat_samples.push(end_tsc.saturating_sub(start_tsc));
+
+                slot.head = 0xFFFF;
+                remaining_in_batch -= 1;
+                completed += 1;
+                made_progress = true;
+            }
+
+            if remaining_in_batch == 0 {
                 break;
             }
 
-            // Allocate request from arena
-            let io_req =
-                match qs
-                    .arena
-                    .new_request(VIRTIO_BLK_T_IN, current_sector, bench_cfg.request_size)
-                {
-                    Some(r) => r,
-                    None => {
-                        // Arena exhausted, wait for completions
-                        break;
-                    }
-                };
-
-            // Try to submit to queue
-            let head = {
-                let mut vq = qs.queue.lock().await;
-                let use_indirect = inner.indirect_desc_enabled;
-                match io_req.submit(&mut vq, false, use_indirect) {
-                    Some(h) => {
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        h
-                    }
-                    None => {
-                        // Queue full, drop io_req (returns to arena) and wait
-                        break;
-                    }
-                }
-            };
-
-            let start_tsc = rdtsc();
-
-            inflight_slots[next_slot] = Some(BenchInflightSlot {
-                io_req,
-                head,
-                start_tsc,
-            });
-
-            submitted += 1;
-            current_sector = current_sector.saturating_add(sectors_per_request);
-            next_slot = (next_slot + 1) % effective_inflight;
-        }
-
-        // Phase 2: Check for completions
-        let mut made_progress = false;
-
-        // Try to drain used ring
-        if qs.try_acquire_drainer() {
-            let drained = qs.drain_used_to_completions_lockfree();
-            qs.release_drainer();
-            if drained > 0 {
-                made_progress = true;
+            if made_progress {
+                continue;
             }
-        }
 
-        // Check all inflight slots for completions
-        for slot in inflight_slots.iter_mut() {
-            if let Some(inflight) = slot.as_ref() {
-                if let Some(_len) = qs.take_completion(inflight.head) {
-                    let end_tsc = rdtsc();
-                    let latency = end_tsc.saturating_sub(inflight.start_tsc);
-                    lat_samples.push(latency);
+            if use_interrupts {
+                if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
+                    qs.waiting_tasks.fetch_add(1, Ordering::AcqRel);
+                    let wait_result = irq_handle.wait(meta).await;
+                    qs.waiting_tasks.fetch_sub(1, Ordering::AcqRel);
 
-                    // Check status
-                    if inflight.io_req.status() != VIRTIO_BLK_S_OK {
+                    if !irq_wait_ok(wait_result) {
                         return Err(DriverStatus::DeviceError);
                     }
-
-                    // Defer freeing the descriptor chain
-                    qs.defer_free_chain(inflight.head);
-
-                    completed_count += 1;
-                    made_progress = true;
-
-                    // Clear the slot (io_req dropped here, returns to arena)
-                    *slot = None;
-                }
-            }
-        }
-
-        // Phase 3: If no progress and we need to wait
-        if !made_progress && completed_count < total_requests {
-            if use_interrupts {
-                // Wait for interrupt if we have pending requests
-                let any_inflight = inflight_slots.iter().any(|s| s.is_some());
-                if any_inflight {
-                    if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                        qs.waiting_tasks.fetch_add(1, Ordering::AcqRel);
-                        let wait_result = irq_handle.wait(meta).await;
-                        qs.waiting_tasks.fetch_sub(1, Ordering::AcqRel);
-
-                        if !irq_wait_ok(wait_result) {
-                            return Err(DriverStatus::DeviceError);
-                        }
-                    } else {
-                        // No IRQ handle, just spin
-                        spin_loop();
-                    }
+                } else {
+                    spin_loop();
                 }
             } else {
-                // Polling mode: just spin briefly and retry
                 spin_loop();
             }
         }
@@ -1072,96 +1099,81 @@ async fn bench_reads_direct(
     result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
 
     if !lat_samples.is_empty() {
-        let mut sorted = lat_samples.clone();
         let total_cycles: u64 = lat_samples.iter().copied().sum();
-        sorted.sort_unstable();
-
-        let percentile_idx = |pct: f64, len: usize| -> usize {
-            let len_minus_one = (len.saturating_sub(1)) as f64;
-            let idx = (len_minus_one * pct) + 0.5;
-            idx as usize
-        };
+        lat_samples.sort_unstable();
 
         result.total_cycles = total_cycles;
-        result.max_cycles = *sorted.last().unwrap_or(&0);
-        result.min_cycles = *sorted.first().unwrap_or(&0);
-        result.avg_cycles = total_cycles / sorted.len() as u64;
-        result.p50_cycles = sorted[percentile_idx(0.50, sorted.len()).min(sorted.len() - 1)];
-        result.p99_cycles = sorted[percentile_idx(0.99, sorted.len()).min(sorted.len() - 1)];
-        result.p999_cycles = sorted[percentile_idx(0.999, sorted.len()).min(sorted.len() - 1)];
+        result.max_cycles = *lat_samples.last().unwrap_or(&0);
+        result.min_cycles = *lat_samples.first().unwrap_or(&0);
+        result.avg_cycles = total_cycles / lat_samples.len() as u64;
+
+        let p50i = percentile_index_permille(lat_samples.len(), 500);
+        let p99i = percentile_index_permille(lat_samples.len(), 990);
+        let p999i = percentile_index_permille(lat_samples.len(), 999);
+
+        result.p50_cycles = lat_samples[p50i];
+        result.p99_cycles = lat_samples[p99i];
+        result.p999_cycles = lat_samples[p999i];
     } else {
         result.min_cycles = 0;
     }
 
     Ok(result)
 }
-
-/// Run a benchmark sweep across multiple inflight levels.
-/// Requests are submitted directly to the virtqueue, bypassing the PnP request path.
-/// Inflight is snapped to max queue capacity if it exceeds what the queue can hold.
 async fn bench_sweep(
     inner: &DevExtInner,
     use_interrupts: bool,
 ) -> Result<BenchSweepResult, DriverStatus> {
     let bench_cfg = BenchConfig::from_inner(inner);
-
-    // Test levels from 1 up to max queue capacity
-    // With 256-desc queue and 4KB requests (3 desc each), max ~85 inflight
-    let max_inflight = bench_cfg.max_queue_inflight as usize;
-    let levels: [usize; 8] = [1, 2, 4, 8, 16, 32, 64, 85];
+    let max_inflight =
+        bench_max_inflight_queue0(inner, bench_cfg.request_size, inner.indirect_desc_enabled);
+    if max_inflight == 0 {
+        return Err(DriverStatus::InvalidParameter);
+    }
 
     let sectors_per_run =
         ((bench_cfg.request_size as u64) >> 9).saturating_mul(bench_cfg.requests_per_run as u64);
 
-    let mut result = BenchSweepResult::default();
+    let mut levels: Vec<usize> = Vec::new();
+    let mut lvl = 1usize;
+    while lvl < max_inflight {
+        levels.push(lvl);
+        let next = lvl.saturating_mul(2);
+        if next == lvl {
+            break;
+        }
+        lvl = next;
+        if levels.len() >= 16 {
+            break;
+        }
+    }
+    if *levels.last().unwrap_or(&0) != max_inflight {
+        levels.push(max_inflight);
+    }
 
-    // Each level uses a different starting sector to avoid host/page cache hits.
+    let mut result = BenchSweepResult::default();
     let mut current_sector: u64 = 0;
 
-    for &level in levels.iter() {
-        // Snap to max queue capacity
-        let effective_level = level.min(max_inflight).max(1);
-
-        // Skip if we've already tested this effective level
-        if result.used > 0 {
-            let prev_level = result.levels[result.used as usize - 1].inflight as usize;
-            if effective_level == prev_level {
-                // Already tested this level, stop the sweep
-                break;
-            }
-        }
-
-        // Start idle tracking right before the level begins
+    for level in levels {
         kernel_api::benchmark::idle_tracking_start();
 
-        // Run benchmark for this level with unique disk region
-        let mut level_result = bench_reads_direct(
-            inner,
-            current_sector,
-            effective_level,
-            &bench_cfg,
-            use_interrupts,
-        )
-        .await?;
+        let mut level_result =
+            bench_reads_direct(inner, current_sector, level, &bench_cfg, use_interrupts).await?;
 
-        // Stop idle tracking and record the idle percentage for this level
         level_result.idle_pct = kernel_api::benchmark::idle_tracking_stop();
 
         result.levels[result.used as usize] = level_result;
         result.used += 1;
 
-        // Advance to next region for the next level to avoid cache hits
         current_sector = current_sector.wrapping_add(sectors_per_run);
 
-        // Stop if we've hit the max queue capacity
-        if effective_level >= max_inflight {
+        if (level as usize) >= max_inflight {
             break;
         }
     }
 
     Ok(result)
 }
-
 // =============================================================================
 #[request_handler]
 pub async fn virtio_pdo_start<'a, 'b>(
