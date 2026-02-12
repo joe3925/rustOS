@@ -12,21 +12,24 @@ use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 
 /// Maximum number of descriptors in a single request chain.
-/// header(1) + data segments (up to 64KB / 4KB = 16) + status(1) = 18 max
-pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 18;
+/// header(1) + data segments (PREALLOCATED_DATA_SIZE / 4KB) + status(1)
+pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 4096);
 
 /// Number of preallocated slots with 4KB data regions (common I/O size)
-pub const ARENA_PREALLOCATED_SLOTS: usize = 48;
+pub const ARENA_PREALLOCATED_SLOTS: usize = 1024;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 16;
+pub const ARENA_DYNAMIC_SLOTS: usize = 0;
 
 /// Maximum arena capacity before overflow requests are not cached
-pub const ARENA_MAX_CAPACITY: usize = 1024;
+pub const ARENA_MAX_CAPACITY: usize = 2048;
+
+/// Number of u64 bitmap words needed to track all arena slots
+pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
 /// TODO: Changing this value can significantly impact performance maybe should be tunable at runtime?
-pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 512 * 1024;
 
 // =============================================================================
 // Slot State Constants
@@ -102,12 +105,12 @@ pub struct DynamicSlot {
 /// Pre-allocates DMA buffers to avoid allocation overhead on the hot path.
 pub struct BlkIoArena {
     /// Bitmap for preallocated slots: 1 = free, 0 = in use
-    preallocated_bitmap: AtomicU64,
+    preallocated_bitmap: [AtomicU64; ARENA_BITMAP_WORDS],
     /// Bitmap for dynamic slots: 1 = free, 0 = in use
-    dynamic_bitmap: AtomicU64,
-    /// Hint for next preallocated allocation (reduces contention)
+    dynamic_bitmap: [AtomicU64; ARENA_BITMAP_WORDS],
+    /// Hint for next preallocated allocation word (reduces contention)
     preallocated_hint: AtomicUsize,
-    /// Hint for next dynamic allocation
+    /// Hint for next dynamic allocation word
     dynamic_hint: AtomicUsize,
     /// Storage for preallocated slots
     preallocated_slots: [UnsafeCell<MaybeUninit<PreallocatedSlot>>; ARENA_PREALLOCATED_SLOTS],
@@ -164,10 +167,7 @@ impl BlkIoArena {
     /// Initialize the arena with custom slot counts.
     /// Used for multiqueue to distribute capacity across queues.
     /// Slot counts are clamped to the maximum array sizes.
-    pub fn init_with_capacity(
-        preallocated_count: usize,
-        dynamic_count: usize,
-    ) -> Option<Self> {
+    pub fn init_with_capacity(preallocated_count: usize, dynamic_count: usize) -> Option<Self> {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         // Clamp to maximum array sizes
@@ -244,27 +244,39 @@ impl BlkIoArena {
             }
         }
 
-        // Set bits in bitmaps only for initialized slots
-        // Use saturating_sub to handle the case where count is 0
-        let preallocated_mask = if preallocated_count >= 64 {
-            u64::MAX
-        } else if preallocated_count == 0 {
-            0
-        } else {
-            (1u64 << preallocated_count) - 1
-        };
+        // Initialize bitmap arrays - set bits for initialized slots (1 = free)
+        let preallocated_bitmap: [AtomicU64; ARENA_BITMAP_WORDS] =
+            core::array::from_fn(|word_idx| {
+                let start_slot = word_idx * 64;
+                let end_slot = (start_slot + 64).min(preallocated_count);
+                let bits_in_word = end_slot.saturating_sub(start_slot);
+                let mask = if bits_in_word >= 64 {
+                    u64::MAX
+                } else if bits_in_word == 0 {
+                    0
+                } else {
+                    (1u64 << bits_in_word) - 1
+                };
+                AtomicU64::new(mask)
+            });
 
-        let dynamic_mask = if dynamic_count >= 64 {
-            u64::MAX
-        } else if dynamic_count == 0 {
-            0
-        } else {
-            (1u64 << dynamic_count) - 1
-        };
+        let dynamic_bitmap: [AtomicU64; ARENA_BITMAP_WORDS] = core::array::from_fn(|word_idx| {
+            let start_slot = word_idx * 64;
+            let end_slot = (start_slot + 64).min(dynamic_count);
+            let bits_in_word = end_slot.saturating_sub(start_slot);
+            let mask = if bits_in_word >= 64 {
+                u64::MAX
+            } else if bits_in_word == 0 {
+                0
+            } else {
+                (1u64 << bits_in_word) - 1
+            };
+            AtomicU64::new(mask)
+        });
 
         Some(Self {
-            preallocated_bitmap: AtomicU64::new(preallocated_mask),
-            dynamic_bitmap: AtomicU64::new(dynamic_mask),
+            preallocated_bitmap,
+            dynamic_bitmap,
             preallocated_hint: AtomicUsize::new(0),
             dynamic_hint: AtomicUsize::new(0),
             preallocated_slots,
@@ -313,128 +325,148 @@ impl BlkIoArena {
         if let Some(handle) = self.try_allocate_dynamic(data_len) {
             return Some(handle);
         }
-
-        // If data fits in 4KB but preallocated was full, we already tried above
-        // Fallback: allocate overflow request
         self.allocate_overflow(data_len)
     }
 
     /// Try to allocate from the preallocated slot pool using lock-free CAS.
     fn try_allocate_preallocated(&self, data_len: u32) -> Option<BlkIoRequestHandle<'_>> {
-        loop {
-            let bits = self.preallocated_bitmap.load(Ordering::Acquire);
-            if bits == 0 {
-                return None; // No free slots
-            }
+        let hint = self.preallocated_hint.load(Ordering::Relaxed);
+        let start_word = (hint / 64).min(ARENA_BITMAP_WORDS.saturating_sub(1));
 
-            // Find first set bit (free slot)
-            let bit_idx = bits.trailing_zeros() as usize;
-            if bit_idx >= ARENA_PREALLOCATED_SLOTS {
-                return None;
-            }
+        // Search from hint word, then wrap around
+        for offset in 0..ARENA_BITMAP_WORDS {
+            let word_idx = (start_word + offset) % ARENA_BITMAP_WORDS;
+            let bitmap = &self.preallocated_bitmap[word_idx];
 
-            let mask = 1u64 << bit_idx;
-
-            // Try to claim the slot atomically by clearing the bit
-            match self.preallocated_bitmap.compare_exchange_weak(
-                bits,
-                bits & !mask,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Successfully claimed slot
-                    self.preallocated_hint
-                        .store(bit_idx.wrapping_add(1), Ordering::Relaxed);
-
-                    // Update slot state with new generation
-                    let slot = self.get_preallocated_slot(bit_idx);
-                    let old_state = slot.state.load(Ordering::Acquire);
-                    let new_gen = unpack_generation(old_state).wrapping_add(1);
-                    slot.state
-                        .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
-
-                    return Some(BlkIoRequestHandle::Preallocated {
-                        arena: self,
-                        slot_idx: bit_idx as u16,
-                        generation: new_gen,
-                        data_len,
-                    });
+            loop {
+                let bits = bitmap.load(Ordering::Acquire);
+                if bits == 0 {
+                    break; // No free slots in this word
                 }
-                Err(_) => continue, // Retry on contention
+
+                // Find first set bit (free slot)
+                let bit_in_word = bits.trailing_zeros() as usize;
+                let slot_idx = word_idx * 64 + bit_in_word;
+
+                if slot_idx >= self.preallocated_count {
+                    break; // Beyond initialized slots
+                }
+
+                let mask = 1u64 << bit_in_word;
+
+                // Try to claim the slot atomically by clearing the bit
+                match bitmap.compare_exchange_weak(
+                    bits,
+                    bits & !mask,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // Successfully claimed slot
+                        self.preallocated_hint
+                            .store(slot_idx.wrapping_add(1), Ordering::Relaxed);
+
+                        // Update slot state with new generation
+                        let slot = self.get_preallocated_slot(slot_idx);
+                        let old_state = slot.state.load(Ordering::Acquire);
+                        let new_gen = unpack_generation(old_state).wrapping_add(1);
+                        slot.state
+                            .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
+
+                        return Some(BlkIoRequestHandle::Preallocated {
+                            arena: self,
+                            slot_idx: slot_idx as u16,
+                            generation: new_gen,
+                            data_len,
+                        });
+                    }
+                    Err(_) => continue, // Retry on contention
+                }
             }
         }
+        None
     }
 
     /// Try to allocate from the dynamic slot pool using lock-free CAS.
     fn try_allocate_dynamic(&self, data_len: u32) -> Option<BlkIoRequestHandle<'_>> {
-        loop {
-            let bits = self.dynamic_bitmap.load(Ordering::Acquire);
-            if bits == 0 {
-                return None; // No free slots
-            }
+        let hint = self.dynamic_hint.load(Ordering::Relaxed);
+        let start_word = (hint / 64).min(ARENA_BITMAP_WORDS.saturating_sub(1));
 
-            let bit_idx = bits.trailing_zeros() as usize;
-            if bit_idx >= ARENA_DYNAMIC_SLOTS {
-                return None;
-            }
+        for offset in 0..ARENA_BITMAP_WORDS {
+            let word_idx = (start_word + offset) % ARENA_BITMAP_WORDS;
+            let bitmap = &self.dynamic_bitmap[word_idx];
 
-            let mask = 1u64 << bit_idx;
+            loop {
+                let bits = bitmap.load(Ordering::Acquire);
+                if bits == 0 {
+                    break; // No free slots in this word
+                }
 
-            match self.dynamic_bitmap.compare_exchange_weak(
-                bits,
-                bits & !mask,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.dynamic_hint
-                        .store(bit_idx.wrapping_add(1), Ordering::Relaxed);
+                let bit_in_word = bits.trailing_zeros() as usize;
+                let slot_idx = word_idx * 64 + bit_in_word;
 
-                    let slot = self.get_dynamic_slot(bit_idx);
+                if slot_idx >= self.dynamic_count {
+                    break; // Beyond initialized slots
+                }
 
-                    // Allocate data buffer on demand
-                    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-                    let data_pages = ((data_len as u64) + 4095) & !4095;
-                    let data_va =
-                        match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
-                            Ok(va) => va,
-                            Err(_) => {
-                                // Failed to allocate data buffer, return slot to pool
-                                self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
+                let mask = 1u64 << bit_in_word;
+
+                match bitmap.compare_exchange_weak(
+                    bits,
+                    bits & !mask,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        self.dynamic_hint
+                            .store(slot_idx.wrapping_add(1), Ordering::Relaxed);
+
+                        let slot = self.get_dynamic_slot(slot_idx);
+
+                        // Allocate data buffer on demand
+                        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+                        let data_pages = ((data_len as u64) + 4095) & !4095;
+                        let data_va =
+                            match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
+                                Ok(va) => va,
+                                Err(_) => {
+                                    // Failed to allocate data buffer, return slot to pool
+                                    bitmap.fetch_or(mask, Ordering::Release);
+                                    return None;
+                                }
+                            };
+                        let data_phys = match virt_to_phys(data_va) {
+                            Some(p) => p,
+                            None => {
+                                // Failed to get physical address, clean up and return slot
+                                unsafe { unmap_range(data_va, data_pages.max(4096)) };
+                                bitmap.fetch_or(mask, Ordering::Release);
                                 return None;
                             }
                         };
-                    let data_phys = match virt_to_phys(data_va) {
-                        Some(p) => p,
-                        None => {
-                            // Failed to get physical address, clean up and return slot
-                            unsafe { unmap_range(data_va, data_pages.max(4096)) };
-                            self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
-                            return None;
-                        }
-                    };
 
-                    // Store data info atomically
-                    slot.data_va.store(data_va.as_u64(), Ordering::Release);
-                    slot.data_phys.store(data_phys.as_u64(), Ordering::Release);
-                    slot.data_len.store(data_len, Ordering::Release);
+                        // Store data info atomically
+                        slot.data_va.store(data_va.as_u64(), Ordering::Release);
+                        slot.data_phys.store(data_phys.as_u64(), Ordering::Release);
+                        slot.data_len.store(data_len, Ordering::Release);
 
-                    // Update generation
-                    let old_state = slot.state.load(Ordering::Acquire);
-                    let new_gen = unpack_generation(old_state).wrapping_add(1);
-                    slot.state
-                        .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
+                        // Update generation
+                        let old_state = slot.state.load(Ordering::Acquire);
+                        let new_gen = unpack_generation(old_state).wrapping_add(1);
+                        slot.state
+                            .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
 
-                    return Some(BlkIoRequestHandle::Dynamic {
-                        arena: self,
-                        slot_idx: bit_idx as u16,
-                        generation: new_gen,
-                    });
+                        return Some(BlkIoRequestHandle::Dynamic {
+                            arena: self,
+                            slot_idx: slot_idx as u16,
+                            generation: new_gen,
+                        });
+                    }
+                    Err(_) => continue,
                 }
-                Err(_) => continue,
             }
         }
+        None
     }
 
     /// Allocate an overflow request using traditional allocation.
@@ -471,9 +503,11 @@ impl BlkIoArena {
         slot.state
             .store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
 
-        // Return to free pool by setting bit
-        let mask = 1u64 << idx;
-        self.preallocated_bitmap.fetch_or(mask, Ordering::Release);
+        // Return to free pool by setting bit in the correct bitmap word
+        let word_idx = idx / 64;
+        let bit_in_word = idx % 64;
+        let mask = 1u64 << bit_in_word;
+        self.preallocated_bitmap[word_idx].fetch_or(mask, Ordering::Release);
 
         // Update hint for faster allocation
         self.preallocated_hint.store(idx, Ordering::Relaxed);
@@ -515,8 +549,10 @@ impl BlkIoArena {
         slot.state
             .store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
 
-        let mask = 1u64 << idx;
-        self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
+        let word_idx = idx / 64;
+        let bit_in_word = idx % 64;
+        let mask = 1u64 << bit_in_word;
+        self.dynamic_bitmap[word_idx].fetch_or(mask, Ordering::Release);
         self.dynamic_hint.store(idx, Ordering::Relaxed);
     }
 

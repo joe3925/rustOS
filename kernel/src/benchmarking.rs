@@ -2697,8 +2697,10 @@ fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
     (cycles as f64 / tsc_hz as f64) * 1000.0
 }
 
-/// IOCTL code for triggering the benchmark sweep on virtio-blk PDO.
+/// IOCTL code for triggering the benchmark sweep on virtio-blk PDO (uses IRQ-based waiting).
 const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
+/// IOCTL code for triggering the benchmark sweep in polling mode (no IRQ waits).
+const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 
 /// Run a benchmark sweep on the VirtIO disk, testing different inflight levels.
 /// Results are printed in milliseconds.
@@ -2773,4 +2775,217 @@ pub async fn bench_virtio_disk_sweep() {
     }
 
     println!("[virtio-bench] Benchmark complete.");
+}
+
+/// Run a benchmark sweep on the VirtIO disk using polling mode (no IRQ waits).
+/// Results are printed in milliseconds.
+pub async fn bench_virtio_disk_sweep_polling() {
+    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
+    use kernel_types::request::{RequestData, RequestHandle, RequestType};
+    use kernel_types::status::DriverStatus;
+
+    let target = match pnp_get_device_target("VirtIO\\Disk_0") {
+        Some(t) => t,
+        None => {
+            println!("[virtio-bench-poll] VirtIO disk not found at VirtIO\\Disk_0");
+            return;
+        }
+    };
+
+    println!("[virtio-bench-poll] Starting polling mode benchmark sweep on VirtIO disk...");
+
+    let mut req = RequestHandle::new(
+        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
+        RequestData::empty(),
+    );
+    req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status = PNP_MANAGER.send_request(target, &mut req).await;
+    if status != DriverStatus::Success {
+        println!("[virtio-bench-poll] IOCTL failed: {:?}", status);
+        return;
+    }
+
+    let result: BenchSweepResult = {
+        let guard = req.read();
+        match guard.data.view::<BenchSweepResult>() {
+            Some(r) => *r,
+            None => {
+                println!("[virtio-bench-poll] Failed to parse benchmark result");
+                return;
+            }
+        }
+    };
+
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        println!("[virtio-bench-poll] TSC not calibrated, cannot convert to ms");
+        return;
+    }
+
+    println!("[virtio-bench-poll] Polling Mode Inflight Sweep Results (100 MiB total, 64 KiB/req):");
+    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
+    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
+
+    for i in 0..result.used as usize {
+        let level = &result.levels[i];
+        let total_ms = cycles_to_ms(level.total_time_cycles, tsc_hz);
+        let avg_ms = cycles_to_ms(level.avg_cycles, tsc_hz);
+        let p50_ms = cycles_to_ms(level.p50_cycles, tsc_hz);
+        let p99_ms = cycles_to_ms(level.p99_cycles, tsc_hz);
+        let p999_ms = cycles_to_ms(level.p999_cycles, tsc_hz);
+        let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
+        let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
+        println!(
+            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+            level.inflight,
+            total_ms,
+            avg_ms,
+            p50_ms,
+            p99_ms,
+            p999_ms,
+            min_ms,
+            max_ms,
+            level.request_count
+        );
+    }
+
+    println!("[virtio-bench-poll] Benchmark complete.");
+}
+
+/// Run both IRQ-based and polling mode benchmarks and print comparison.
+pub async fn bench_virtio_disk_sweep_both() {
+    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
+    use kernel_types::request::{RequestData, RequestHandle, RequestType};
+    use kernel_types::status::DriverStatus;
+
+    let target = match pnp_get_device_target("VirtIO\\Disk_0") {
+        Some(t) => t,
+        None => {
+            println!("[virtio-bench] VirtIO disk not found at VirtIO\\Disk_0");
+            return;
+        }
+    };
+
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        println!("[virtio-bench] TSC not calibrated, cannot convert to ms");
+        return;
+    }
+
+    // Run IRQ-based benchmark
+    println!("[virtio-bench] Running IRQ-based benchmark...");
+    let mut req_irq = RequestHandle::new(
+        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
+        RequestData::empty(),
+    );
+    req_irq.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status_irq = PNP_MANAGER.send_request(target.clone(), &mut req_irq).await;
+
+    let result_irq: Option<BenchSweepResult> = if status_irq == DriverStatus::Success {
+        let guard = req_irq.read();
+        guard.data.view::<BenchSweepResult>().copied()
+    } else {
+        println!("[virtio-bench] IRQ benchmark IOCTL failed: {:?}", status_irq);
+        None
+    };
+
+    // Run polling-based benchmark
+    println!("[virtio-bench] Running polling-based benchmark...");
+    let mut req_poll = RequestHandle::new(
+        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
+        RequestData::empty(),
+    );
+    req_poll.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status_poll = PNP_MANAGER.send_request(target, &mut req_poll).await;
+
+    let result_poll: Option<BenchSweepResult> = if status_poll == DriverStatus::Success {
+        let guard = req_poll.read();
+        guard.data.view::<BenchSweepResult>().copied()
+    } else {
+        println!("[virtio-bench] Polling benchmark IOCTL failed: {:?}", status_poll);
+        None
+    };
+
+    // Print comparison
+    println!();
+    println!("[virtio-bench] ============================================");
+    println!("[virtio-bench] Benchmark Comparison (100 MiB total, 64 KiB/req)");
+    println!("[virtio-bench] ============================================");
+    println!();
+
+    if let Some(ref irq) = result_irq {
+        println!("[virtio-bench] IRQ Mode Results:");
+        println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
+        println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
+        for i in 0..irq.used as usize {
+            let level = &irq.levels[i];
+            println!(
+                "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+                level.inflight,
+                cycles_to_ms(level.total_time_cycles, tsc_hz),
+                cycles_to_ms(level.avg_cycles, tsc_hz),
+                cycles_to_ms(level.p50_cycles, tsc_hz),
+                cycles_to_ms(level.p99_cycles, tsc_hz),
+                cycles_to_ms(level.p999_cycles, tsc_hz),
+                cycles_to_ms(level.min_cycles, tsc_hz),
+                cycles_to_ms(level.max_cycles, tsc_hz),
+                level.request_count
+            );
+        }
+        println!();
+    }
+
+    if let Some(ref poll) = result_poll {
+        println!("[virtio-bench] Polling Mode Results:");
+        println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
+        println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
+        for i in 0..poll.used as usize {
+            let level = &poll.levels[i];
+            println!(
+                "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+                level.inflight,
+                cycles_to_ms(level.total_time_cycles, tsc_hz),
+                cycles_to_ms(level.avg_cycles, tsc_hz),
+                cycles_to_ms(level.p50_cycles, tsc_hz),
+                cycles_to_ms(level.p99_cycles, tsc_hz),
+                cycles_to_ms(level.p999_cycles, tsc_hz),
+                cycles_to_ms(level.min_cycles, tsc_hz),
+                cycles_to_ms(level.max_cycles, tsc_hz),
+                level.request_count
+            );
+        }
+        println!();
+    }
+
+    // Print side-by-side comparison if both succeeded
+    if let (Some(irq), Some(poll)) = (&result_irq, &result_poll) {
+        println!("[virtio-bench] Side-by-side Comparison (Avg latency in ms):");
+        println!("  Inflight |   IRQ Avg   |  Poll Avg   | Diff (Poll-IRQ) | Speedup");
+        println!("  ---------|-------------|-------------|-----------------|--------");
+
+        let max_levels = (irq.used as usize).min(poll.used as usize);
+        for i in 0..max_levels {
+            let irq_level = &irq.levels[i];
+            let poll_level = &poll.levels[i];
+
+            if irq_level.inflight == poll_level.inflight {
+                let irq_avg = cycles_to_ms(irq_level.avg_cycles, tsc_hz);
+                let poll_avg = cycles_to_ms(poll_level.avg_cycles, tsc_hz);
+                let diff = poll_avg - irq_avg;
+                let speedup = if poll_avg > 0.0 { irq_avg / poll_avg } else { 0.0 };
+
+                println!(
+                    "  {:>8} | {:>11.3} | {:>11.3} | {:>+15.3} | {:>6.2}x",
+                    irq_level.inflight,
+                    irq_avg,
+                    poll_avg,
+                    diff,
+                    speedup
+                );
+            }
+        }
+        println!();
+    }
+
+    println!("[virtio-bench] Benchmark comparison complete.");
 }

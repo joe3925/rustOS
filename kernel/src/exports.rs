@@ -46,7 +46,6 @@ export! {
     identity_map_page,
     map_mmio_region,
     unmap_mmio_region,
-    virt_to_phys,
     get_current_cpu_id,
     get_current_lapic_id,
 

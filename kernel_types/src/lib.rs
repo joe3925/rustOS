@@ -19,13 +19,14 @@ pub mod pnp;
 pub mod request;
 pub mod status;
 use alloc::sync::Arc;
+use x86_64::VirtAddr;
 
 use crate::async_ffi::{BorrowingFfiFuture, FfiFuture};
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
 use crate::request::{Request, RequestHandle};
 use crate::status::DriverStatus;
-
+pub const PHYSICAL_MEMORY_OFFSET: VirtAddr = VirtAddr::new(0xFFFF_8000_0000_0000);
 pub type EvtDriverDeviceAdd = extern "win64" fn(
     driver: Arc<device::DriverObject>,
     init: &mut device::DeviceInit,

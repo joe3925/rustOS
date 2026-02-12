@@ -2,6 +2,7 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
@@ -37,7 +38,8 @@ pub struct QueueState {
     /// Maximum number of data descriptors we will use for a single request.
     pub max_data_segments: u16,
     /// IRQ handle for this queue (MSI-X or shared legacy).
-    pub irq_handle: Option<IrqHandle>,
+    /// UnsafeCell to allow temporarily disabling for polling benchmarks.
+    pub irq_handle: UnsafeCell<Option<IrqHandle>>,
     /// MSI-X vector number if MSI-X is being used for this queue.
     pub msix_vector: Option<u8>,
     /// MSI-X table entry index for this queue.

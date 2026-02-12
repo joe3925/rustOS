@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
+use x86_64::instructions::interrupts::without_interrupts;
 
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
@@ -86,10 +87,11 @@ impl<T> Sender<T> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError(value));
         }
+        without_interrupts(|| {
+            self.inner.queue.push(value);
+        });
 
-        self.inner.queue.push(value);
-
-        if let Some(task) = self.inner.receivers_waiting.dequeue_one() {
+        if let Some(task) = without_interrupts(|| self.inner.receivers_waiting.dequeue_one()) {
             SCHEDULER.unpark(&task);
         }
 
@@ -115,7 +117,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.inner.sender_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            for task in self.inner.receivers_waiting.dequeue_all() {
+            for task in without_interrupts(|| self.inner.receivers_waiting.dequeue_all()) {
                 SCHEDULER.unpark(&task);
             }
         }
@@ -129,29 +131,29 @@ impl<T> Receiver<T> {
     /// this returns `Err(RecvError)`.
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
-            if let Some(value) = self.inner.queue.pop() {
+            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
                 return Ok(value);
             }
 
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                if let Some(value) = self.inner.queue.pop() {
+                if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
                     return Ok(value);
                 }
                 return Err(RecvError);
             }
 
-            if !self.inner.receivers_waiting.enqueue_current() {
+            if !without_interrupts(|| self.inner.receivers_waiting.enqueue_current()) {
                 continue;
             }
 
-            if let Some(value) = self.inner.queue.pop() {
+            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
                 self.inner.receivers_waiting.clear_current_if_queued();
                 return Ok(value);
             }
 
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
                 self.inner.receivers_waiting.clear_current_if_queued();
-                if let Some(value) = self.inner.queue.pop() {
+                if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
                     return Ok(value);
                 }
                 return Err(RecvError);
@@ -168,10 +170,10 @@ impl<T> Receiver<T> {
     /// `Err(TryRecvError::Empty)` if no message but channel is open,
     /// `Err(TryRecvError::Disconnected)` if all senders dropped and queue empty.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(value) = self.inner.queue.pop() {
+        if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
             Ok(value)
         } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            if let Some(value) = self.inner.queue.pop() {
+            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
                 Ok(value)
             } else {
                 Err(TryRecvError::Disconnected)

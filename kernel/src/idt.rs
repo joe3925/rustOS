@@ -180,9 +180,31 @@ impl IrqHandleInner {
     }
 
     fn signal_one(&self, meta: IrqMeta) {
-        let _ = self.signal_n(meta, 1);
-    }
+        if self.is_closed() {
+            return;
+        }
 
+        let mut waker: Option<Waker> = None;
+        {
+            let mut state = self.state.lock();
+            state.last_meta = meta;
+
+            if let Some(node) = state.waiters.pop_front() {
+                unsafe {
+                    (*node).enqueued = false;
+                    (*node).next = core::ptr::null_mut();
+                    (*node).result = Some(IrqWaitResult::ok_n(meta, 1));
+                    waker = (*node).waker.take();
+                }
+            } else {
+                state.pending_signals = state.pending_signals.saturating_add(1);
+            }
+        }
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
     fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
         if n == 0 || self.is_closed() {
             return 0;
