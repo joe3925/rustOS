@@ -10,6 +10,7 @@ use crate::pci;
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
+pub const VRING_DESC_F_INDIRECT: u16 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -253,6 +254,40 @@ impl Virtqueue {
         Some(head)
     }
 
+    /// Push a single indirect descriptor table into the virtqueue.
+    /// `table_phys` is the physical address of the indirect descriptor table.
+    /// `table_len` is the total size in bytes of the indirect table.
+    /// Returns the head descriptor index.
+    pub fn push_indirect(&mut self, table_phys: PhysAddr, table_len: u32) -> Option<u16> {
+        // Drain any deferred frees first (we hold the lock)
+        self.drain_deferred_frees();
+
+        if self.num_free == 0 {
+            return None;
+        }
+
+        let head = self.alloc_desc()?;
+        let desc = self.desc_ptr(head);
+        unsafe {
+            (*desc).addr = table_phys.as_u64();
+            (*desc).len = table_len;
+            (*desc).flags = VRING_DESC_F_INDIRECT;
+            (*desc).next = 0; // next is not used for indirect descriptors
+        }
+
+        let avail_base = self.avail_va.as_u64() as *mut u16;
+        let avail_idx = unsafe { core::ptr::read_volatile(avail_base.add(1)) };
+        let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
+        unsafe {
+            core::ptr::write_volatile(ring_entry, head);
+            // Memory barrier before updating idx
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            core::ptr::write_volatile(avail_base.add(1), avail_idx.wrapping_add(1));
+        }
+
+        Some(head)
+    }
+
     /// Write to the device's notify register to kick the queue.
     pub fn notify(&self, notify_base: VirtAddr, notify_off_multiplier: u32) {
         let offset = self.queue_notify_off as u64 * notify_off_multiplier as u64;
@@ -440,8 +475,18 @@ impl Virtqueue {
             let desc = self.desc_ptr(idx);
             let flags = unsafe { (*desc).flags };
             let next = unsafe { (*desc).next };
+
+            // For an indirect descriptor, we only free the single head descriptor.
+            // The descriptors within the indirect table are not part of this virtqueue's
+            // free list and are managed separately by the request arena.
+            if (flags & VRING_DESC_F_INDIRECT) != 0 {
+                self.free_desc(idx);
+                return;
+            }
+
             self.free_desc(idx);
-            if flags & VRING_DESC_F_NEXT != 0 {
+
+            if (flags & VRING_DESC_F_NEXT) != 0 {
                 idx = next;
             } else {
                 break;

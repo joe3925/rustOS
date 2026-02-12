@@ -6,6 +6,7 @@ use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, unmap_range,
     virt_to_phys,
 };
+use kernel_api::println;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::pci;
@@ -15,22 +16,35 @@ use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 /// header(1) + data segments (PREALLOCATED_DATA_SIZE / 4KB) + status(1)
 pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 4096);
 
-/// Number of preallocated slots with 4KB data regions (common I/O size)
-/// Tuned for 256-descriptor queue with 1 virtqueue: ~85 max inflight (256/3)
-pub const ARENA_PREALLOCATED_SLOTS: usize = 85;
+pub const ARENA_PREALLOCATED_SLOTS: usize = 64;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 0;
+pub const ARENA_DYNAMIC_SLOTS: usize = 1024;
 
 /// Maximum arena capacity before overflow requests are not cached
-pub const ARENA_MAX_CAPACITY: usize = 128;
+pub const ARENA_MAX_CAPACITY: usize = 5096;
 
 /// Number of u64 bitmap words needed to track all arena slots
 pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
 /// Tuned for interrupt benchmark: smaller requests = more I/O ops = more interrupts
-pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 32 * 1024 * 1024;
+
+/// Calculate the required indirect table size in bytes for a given data length.
+/// Returns a page-aligned size (minimum 4KB) to satisfy allocation requirements.
+/// Formula: (header + max_data_descriptors + status) * 16 bytes per descriptor
+#[inline]
+pub const fn calculate_indirect_table_size(data_len: u32) -> u64 {
+    // Worst case: 1 descriptor per 4KB page (no coalescing)
+    let data_pages = (data_len as u64 + 4095) / 4096;
+    // header(1) + data_pages + status(1)
+    let descriptors_needed = 1 + data_pages + 1;
+    let bytes_needed = descriptors_needed * 16;
+    // Round up to page boundary (minimum 4KB)
+    let aligned = (bytes_needed + 4095) & !4095;
+    if aligned < 4096 { 4096 } else { aligned }
+}
 
 // =============================================================================
 // Slot State Constants
@@ -76,6 +90,9 @@ pub struct PreallocatedSlot {
     /// Status DMA buffer (4KB page, 1 byte used)
     pub status_va: VirtAddr,
     pub status_phys: PhysAddr,
+    /// Indirect descriptor table DMA buffer (preallocated)
+    pub indirect_table_va: VirtAddr,
+    pub indirect_table_phys: PhysAddr,
 }
 
 /// A dynamic slot with header/status preallocated, data mapped on demand.
@@ -96,6 +113,12 @@ pub struct DynamicSlot {
     pub data_phys: AtomicU64,
     /// Data buffer length in bytes
     pub data_len: AtomicU32,
+    /// Indirect descriptor table virtual address (0 when not allocated)
+    pub indirect_table_va: AtomicU64,
+    /// Indirect descriptor table physical address (0 when not allocated)
+    pub indirect_table_phys: AtomicU64,
+    /// Indirect descriptor table length in bytes
+    pub indirect_table_len: AtomicU32,
 }
 
 // =============================================================================
@@ -123,6 +146,10 @@ pub struct BlkIoArena {
     preallocated_count: usize,
     /// Number of initialized dynamic slots (for capacity reporting)
     dynamic_count: usize,
+    /// Base address of the single large allocation for preallocated indirect tables.
+    pub indirect_pages_va: Option<VirtAddr>,
+    /// Number of pages in the preallocated indirect table allocation.
+    pub indirect_pages_count: usize,
 }
 
 // SAFETY: Arena uses atomic operations for all shared state
@@ -182,6 +209,17 @@ impl BlkIoArena {
         let dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
+        // Allocate one large block for all preallocated indirect tables.
+        // Handle both cases: tables smaller than a page (pack multiple) or larger (multiple pages per table).
+        let (indirect_pages_va, indirect_pages_count) = if preallocated_count > 0 {
+            let total_bytes = preallocated_count * PREALLOCATED_INDIRECT_TABLE_SIZE;
+            let pages_needed = (total_bytes + 4095) / 4096;
+            let va = allocate_auto_kernel_range_mapped((pages_needed * 4096) as u64, flags).ok()?;
+            (Some(va), pages_needed)
+        } else {
+            (None, 0)
+        };
+
         // Initialize preallocated slots with all DMA buffers (only up to requested count)
         for i in 0..preallocated_count {
             let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
@@ -193,6 +231,12 @@ impl BlkIoArena {
 
             let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
             let status_phys = virt_to_phys(status_va)?;
+
+            // Assign a slice of the indirect table allocation to this slot.
+            // Each table is at offset i * PREALLOCATED_INDIRECT_TABLE_SIZE from the base.
+            let table_offset = i * PREALLOCATED_INDIRECT_TABLE_SIZE;
+            let table_va = VirtAddr::new(indirect_pages_va.unwrap().as_u64() + table_offset as u64);
+            let table_phys = virt_to_phys(table_va)?;
 
             // Initialize status sentinel
             unsafe {
@@ -207,6 +251,8 @@ impl BlkIoArena {
                 data_phys,
                 status_va,
                 status_phys,
+                indirect_table_va: table_va,
+                indirect_table_phys: table_phys,
             };
 
             // SAFETY: We own this slot and are initializing it
@@ -215,7 +261,7 @@ impl BlkIoArena {
             }
         }
 
-        // Initialize dynamic slots (header + status only, data on demand)
+        // Initialize dynamic slots (header + status only, data and indirect table on demand)
         for i in 0..dynamic_count {
             let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
             let header_phys = virt_to_phys(header_va)?;
@@ -237,6 +283,9 @@ impl BlkIoArena {
                 data_va: AtomicU64::new(0),
                 data_phys: AtomicU64::new(0),
                 data_len: AtomicU32::new(0),
+                indirect_table_va: AtomicU64::new(0),
+                indirect_table_phys: AtomicU64::new(0),
+                indirect_table_len: AtomicU32::new(0),
             };
 
             // SAFETY: We own this slot and are initializing it
@@ -285,6 +334,8 @@ impl BlkIoArena {
             overflow_count: AtomicUsize::new(0),
             preallocated_count,
             dynamic_count,
+            indirect_pages_va,
+            indirect_pages_count,
         })
     }
 
@@ -446,10 +497,39 @@ impl BlkIoArena {
                             }
                         };
 
+                        // Allocate indirect table sized for the data length
+                        let table_len = calculate_indirect_table_size(data_len);
+                        let indirect_va = match allocate_auto_kernel_range_mapped(table_len, flags)
+                        {
+                            Ok(va) => va,
+                            Err(_) => {
+                                unsafe { unmap_range(data_va, data_pages.max(4096)) };
+                                bitmap.fetch_or(mask, Ordering::Release);
+                                return None;
+                            }
+                        };
+                        let indirect_phys = match virt_to_phys(indirect_va) {
+                            Some(p) => p,
+                            None => {
+                                unsafe { unmap_range(data_va, data_pages.max(4096)) };
+                                unsafe { unmap_range(indirect_va, table_len) };
+                                bitmap.fetch_or(mask, Ordering::Release);
+                                return None;
+                            }
+                        };
+
                         // Store data info atomically
                         slot.data_va.store(data_va.as_u64(), Ordering::Release);
                         slot.data_phys.store(data_phys.as_u64(), Ordering::Release);
                         slot.data_len.store(data_len, Ordering::Release);
+
+                        // Store indirect table info atomically
+                        slot.indirect_table_va
+                            .store(indirect_va.as_u64(), Ordering::Release);
+                        slot.indirect_table_phys
+                            .store(indirect_phys.as_u64(), Ordering::Release);
+                        slot.indirect_table_len
+                            .store(table_len as u32, Ordering::Release);
 
                         // Update generation
                         let old_state = slot.state.load(Ordering::Acquire);
@@ -476,7 +556,22 @@ impl BlkIoArena {
         self.overflow_count.fetch_add(1, Ordering::Relaxed);
 
         // Use traditional BlkIoRequest allocation
-        let req = BlkIoRequest::new_internal(data_len)?;
+        let mut req = BlkIoRequest::new_internal(data_len)?;
+
+        // Also try to allocate an indirect table for the overflow request.
+        // If this fails, we can still proceed with a direct descriptor chain.
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let table_len = calculate_indirect_table_size(data_len);
+        if let Ok(va) = allocate_auto_kernel_range_mapped(table_len, flags) {
+            if let Some(pa) = virt_to_phys(va) {
+                req.indirect_table_va = Some(va);
+                req.indirect_table_phys = Some(pa);
+                req.indirect_table_len = table_len as u32;
+            } else {
+                unsafe { unmap_range(va, table_len) };
+            }
+        }
+
         Some(BlkIoRequestHandle::Overflow(req))
     }
 
@@ -538,6 +633,17 @@ impl BlkIoArena {
             let data_pages = ((data_len as u64) + 4095) & !4095;
             unsafe {
                 unmap_range(VirtAddr::new(data_va), data_pages.max(4096));
+            }
+        }
+
+        // Free the dynamically allocated indirect table
+        let indirect_va = slot.indirect_table_va.swap(0, Ordering::AcqRel);
+        let indirect_len = slot.indirect_table_len.swap(0, Ordering::AcqRel);
+        slot.indirect_table_phys.store(0, Ordering::Release);
+
+        if indirect_va != 0 {
+            unsafe {
+                unmap_range(VirtAddr::new(indirect_va), indirect_len as u64);
             }
         }
 
@@ -690,6 +796,75 @@ impl<'a> BlkIoRequestHandle<'a> {
         }
     }
 
+    /// Get the indirect table virtual address.
+    #[inline]
+    pub fn indirect_table_va(&self) -> Option<VirtAddr> {
+        match self {
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => Some(
+                arena
+                    .get_preallocated_slot(*slot_idx as usize)
+                    .indirect_table_va,
+            ),
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
+                let slot = arena.get_dynamic_slot(*slot_idx as usize);
+                let va = slot.indirect_table_va.load(Ordering::Acquire);
+                if va == 0 {
+                    None
+                } else {
+                    Some(VirtAddr::new(va))
+                }
+            }
+            Self::Overflow(req) => req.indirect_table_va,
+        }
+    }
+
+    /// Get the indirect table physical address.
+    #[inline]
+    pub fn indirect_table_phys(&self) -> Option<PhysAddr> {
+        match self {
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => Some(
+                arena
+                    .get_preallocated_slot(*slot_idx as usize)
+                    .indirect_table_phys,
+            ),
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
+                let slot = arena.get_dynamic_slot(*slot_idx as usize);
+                let pa = slot.indirect_table_phys.load(Ordering::Acquire);
+                if pa == 0 {
+                    None
+                } else {
+                    Some(PhysAddr::new(pa))
+                }
+            }
+            Self::Overflow(req) => req.indirect_table_phys,
+        }
+    }
+
+    /// Get the capacity of the indirect descriptor table in descriptors.
+    #[inline]
+    pub fn indirect_table_capacity(&self) -> usize {
+        let len = match self {
+            Self::Preallocated { .. } => PREALLOCATED_INDIRECT_TABLE_SIZE,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
+                let slot = arena.get_dynamic_slot(*slot_idx as usize);
+                slot.indirect_table_len.load(Ordering::Acquire) as usize
+            }
+            Self::Overflow(req) => req.indirect_table_len as usize,
+        };
+        // Each descriptor is 16 bytes.
+        len / 16
+    }
+
     /// Initialize the request header.
     pub fn set_header(&self, req_type: u32, sector: u64) {
         unsafe {
@@ -733,10 +908,19 @@ impl<'a> BlkIoRequestHandle<'a> {
         }
     }
 
+    /// Dispatches to direct or indirect submission based on feature flag.
+    pub fn submit(&self, vq: &mut Virtqueue, is_write: bool, use_indirect: bool) -> Option<u16> {
+        if use_indirect && self.indirect_table_phys().is_some() {
+            self.submit_indirect(vq, is_write)
+        } else {
+            self.submit_direct(vq, is_write)
+        }
+    }
+
     /// Build the descriptor chain for this request and push it to the virtqueue.
     /// Returns the head descriptor index.
     /// Uses a stack-allocated buffer to avoid heap allocation on the hot path.
-    pub fn submit(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
+    pub fn submit_direct(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
         let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
 
         // Stack-allocated descriptor buffer to avoid heap allocation
@@ -788,6 +972,119 @@ impl<'a> BlkIoRequestHandle<'a> {
 
         vq.push_chain(&bufs[..buf_count])
     }
+
+    /// Build the descriptor chain in the indirect table and submit it.
+    /// Coalesces contiguous physical segments to minimize descriptor count.
+    pub fn submit_indirect(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
+        let table_va = self.indirect_table_va()?;
+        let table_phys = self.indirect_table_phys()?;
+        let table_capacity = self.indirect_table_capacity();
+
+        let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
+
+        let mut desc_count = 0usize;
+        let table_ptr = table_va.as_u64() as *mut crate::virtqueue::VirtqDesc;
+
+        // Helper to write a descriptor at the given index
+        let write_desc = |idx: usize, addr: u64, len: u32, flags: u16| unsafe {
+            let desc = table_ptr.add(idx);
+            (*desc).addr = addr;
+            (*desc).len = len;
+            (*desc).flags = flags;
+            (*desc).next = (idx + 1) as u16;
+        };
+
+        // Write header descriptor into table
+        if table_capacity < 3 {
+            return None; // Need at least header + 1 data + status
+        }
+        write_desc(
+            desc_count,
+            self.header_phys().as_u64(),
+            16,
+            VRING_DESC_F_NEXT,
+        );
+        desc_count += 1;
+
+        // Write data descriptors into table with coalescing
+        let mut offset = 0u64;
+        let total = self.data_len() as u64;
+        let data_va_base = self.data_va();
+        let data_phys_base = self.data_phys();
+
+        // Track current segment for coalescing
+        let mut seg_start_phys: u64 = 0;
+        let mut seg_len: u32 = 0;
+
+        while offset < total {
+            let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
+            let phys = match virt_to_phys(vaddr) {
+                Some(p) => p.as_u64(),
+                None => data_phys_base.as_u64() + offset,
+            };
+            let page_off = vaddr.as_u64() & 0xFFF;
+            let chunk = core::cmp::min(4096 - page_off, total - offset) as u32;
+
+            if seg_len == 0 {
+                // Start a new segment
+                seg_start_phys = phys;
+                seg_len = chunk;
+            } else if seg_start_phys + seg_len as u64 == phys {
+                // Contiguous with current segment, coalesce
+                seg_len = seg_len.saturating_add(chunk);
+            } else {
+                // Non-contiguous, flush current segment and start new one
+                if desc_count >= table_capacity - 1 {
+                    return None; // Not enough space
+                }
+                write_desc(
+                    desc_count,
+                    seg_start_phys,
+                    seg_len,
+                    data_flags | VRING_DESC_F_NEXT,
+                );
+                desc_count += 1;
+
+                seg_start_phys = phys;
+                seg_len = chunk;
+            }
+
+            offset += chunk as u64;
+        }
+
+        // Flush final data segment if any
+        if seg_len > 0 {
+            if desc_count >= table_capacity - 1 {
+                return None; // Not enough space
+            }
+            write_desc(
+                desc_count,
+                seg_start_phys,
+                seg_len,
+                data_flags | VRING_DESC_F_NEXT,
+            );
+            desc_count += 1;
+        }
+
+        // Write status descriptor into table
+        if desc_count >= table_capacity {
+            return None; // Not enough space for status
+        }
+        // Status is always device-writable, no NEXT flag (end of chain)
+        write_desc(
+            desc_count,
+            self.status_phys().as_u64(),
+            1,
+            VRING_DESC_F_WRITE,
+        );
+        desc_count += 1;
+
+        // Fix up the last descriptor to not have F_NEXT (already done for status above)
+        // The status descriptor was written without F_NEXT, so we're good
+
+        let total_table_len = (desc_count * 16) as u32;
+        vq.push_indirect(table_phys, total_table_len)
+    }
 }
 
 // =============================================================================
@@ -819,6 +1116,11 @@ impl<'a> Drop for BlkIoRequestHandle<'a> {
                     let data_pages = ((req.data_len as u64) + 4095) & !4095;
                     unmap_range(req.data_va, data_pages.max(4096));
                     unmap_range(req.status_va, 4096);
+                    if let Some(va) = req.indirect_table_va {
+                        if req.indirect_table_len > 0 {
+                            unmap_range(va, req.indirect_table_len as u64);
+                        }
+                    }
                 }
             }
         }
@@ -854,6 +1156,18 @@ pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
 /// Multiqueue feature bit - device supports multiple request queues.
 pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
 
+/// Indirect descriptors feature bit - allows chaining descriptors via a table.
+pub const VIRTIO_F_INDIRECT_DESC: u64 = 1u64 << 28;
+
+/// Size of indirect descriptor table for preallocated slots.
+/// Calculated from PREALLOCATED_DATA_SIZE: header(1) + data_pages + status(1) descriptors * 16 bytes each.
+/// No power-of-2 rounding needed - just use exact size (each descriptor is 16 bytes).
+pub const PREALLOCATED_INDIRECT_TABLE_SIZE: usize = {
+    let data_pages = (PREALLOCATED_DATA_SIZE + 4095) / 4096;
+    let descriptors_needed = 1 + data_pages + 1; // header + data + status
+    descriptors_needed * 16
+};
+
 const DEVCFG_CAPACITY: usize = 0x00; // u64 — capacity in 512-byte sectors
 const DEVCFG_NUM_QUEUES: usize = 0x08; // u16 — number of request queues (if VIRTIO_BLK_F_MQ)
 
@@ -865,6 +1179,8 @@ pub struct DeviceInitResult {
     pub num_queues: u16,
     /// Whether multiqueue feature was successfully negotiated.
     pub mq_negotiated: bool,
+    /// Whether indirect descriptors were successfully negotiated.
+    pub indirect_desc_supported: bool,
 }
 
 /// Calculate per-queue arena slot counts to keep total capacity bounded.
@@ -913,13 +1229,17 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         return None;
     }
 
-    // Check if device supports multiqueue
+    // Check for feature support
     let mq_supported = (dev_features & VIRTIO_BLK_F_MQ) != 0;
+    let indirect_supported = (dev_features & VIRTIO_F_INDIRECT_DESC) != 0;
 
-    // Negotiate VERSION_1 and optionally MQ
+    // Negotiate VERSION_1 and other supported features
     let mut supported_features = VIRTIO_F_VERSION_1;
     if mq_supported {
         supported_features |= VIRTIO_BLK_F_MQ;
+    }
+    if indirect_supported {
+        supported_features |= VIRTIO_F_INDIRECT_DESC;
     }
     let driver_features = dev_features & supported_features;
 
@@ -956,8 +1276,9 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         return None;
     }
 
-    // Check if MQ was actually negotiated (device may have rejected it)
+    // Check if features were actually negotiated
     let mq_negotiated = mq_supported && (driver_features & VIRTIO_BLK_F_MQ) != 0;
+    let indirect_negotiated = indirect_supported && (driver_features & VIRTIO_F_INDIRECT_DESC) != 0;
 
     let capacity = unsafe {
         core::ptr::read_volatile(
@@ -981,6 +1302,7 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         capacity,
         num_queues,
         mq_negotiated,
+        indirect_desc_supported: indirect_negotiated,
     })
 }
 
@@ -1015,50 +1337,13 @@ pub struct BlkIoRequest {
     /// DMA buffer for the 1-byte status response.
     pub status_va: VirtAddr,
     pub status_phys: PhysAddr,
+    /// DMA buffer for the indirect descriptor table (for overflow requests).
+    pub indirect_table_va: Option<VirtAddr>,
+    pub indirect_table_phys: Option<PhysAddr>,
+    pub indirect_table_len: u32,
 }
 
 impl BlkIoRequest {
-    /// Allocate DMA buffers and prepare a block I/O request.
-    /// `req_type` is VIRTIO_BLK_T_IN (read) or VIRTIO_BLK_T_OUT (write).
-    /// `sector` is the starting 512-byte sector.
-    /// `data_len` is the number of bytes to transfer (must be sector-aligned).
-    pub fn new(req_type: u32, sector: u64, data_len: u32) -> Option<Self> {
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
-        let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let header_phys = virt_to_phys(header_va)?;
-        unsafe {
-            let hdr = header_va.as_u64() as *mut VirtioBlkReqHeader;
-            core::ptr::write_volatile(
-                hdr,
-                VirtioBlkReqHeader {
-                    req_type,
-                    reserved: 0,
-                    sector,
-                },
-            );
-        }
-
-        let data_pages = ((data_len as u64) + 4095) & !4095;
-        let data_va = allocate_auto_kernel_range_mapped(data_pages.max(4096), flags).ok()?;
-        let data_phys = virt_to_phys(data_va)?;
-        unsafe { core::ptr::write_bytes(data_va.as_u64() as *mut u8, 0, data_len as usize) };
-
-        let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
-        let status_phys = virt_to_phys(status_va)?;
-        unsafe { core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF) }; // sentinel
-
-        Some(Self {
-            header_va,
-            header_phys,
-            data_va,
-            data_phys,
-            data_len,
-            status_va,
-            status_phys,
-        })
-    }
-
     /// Internal allocation without header initialization (used by arena overflow).
     /// Header must be set separately via BlkIoRequestHandle::set_header.
     pub(crate) fn new_internal(data_len: u32) -> Option<Self> {
@@ -1083,83 +1368,9 @@ impl BlkIoRequest {
             data_len,
             status_va,
             status_phys,
+            indirect_table_va: None,
+            indirect_table_phys: None,
+            indirect_table_len: 0,
         })
-    }
-
-    /// Build the descriptor chain for this request and push it to the virtqueue.
-    /// Returns the head descriptor index.
-    /// Uses a stack-allocated buffer to avoid heap allocation on the hot path.
-    pub fn submit(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
-        let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
-
-        // Stack-allocated descriptor buffer to avoid heap allocation
-        let mut bufs: [(PhysAddr, u32, u16); MAX_DESCRIPTORS_PER_REQUEST] =
-            [(PhysAddr::new(0), 0, 0); MAX_DESCRIPTORS_PER_REQUEST];
-        let mut buf_count: usize = 0;
-
-        // Header descriptor
-        bufs[buf_count] = (self.header_phys, 16, 0u16);
-        buf_count += 1;
-
-        let mut offset = 0u64;
-        let total = self.data_len as u64;
-        while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
-            let vaddr = VirtAddr::new(self.data_va.as_u64() + offset);
-            let phys = virt_to_phys(vaddr)?;
-            let page_off = (vaddr.as_u64() & 0xFFF) as u64;
-            let chunk = core::cmp::min(4096u64 - page_off, total - offset);
-            let seg_phys = PhysAddr::new(phys.as_u64() + page_off);
-
-            // Coalesce contiguous physical segments to keep descriptor count low.
-            if buf_count > 0 {
-                let last = &mut bufs[buf_count - 1];
-                let last_end = last.0.as_u64() + last.1 as u64;
-                if last.2 == data_flags && last_end == seg_phys.as_u64() {
-                    last.1 = last.1.saturating_add(chunk as u32);
-                    offset += chunk;
-                    continue;
-                }
-            }
-
-            bufs[buf_count] = (seg_phys, chunk as u32, data_flags);
-            buf_count += 1;
-            offset += chunk;
-        }
-
-        // Status descriptor
-        bufs[buf_count] = (self.status_phys, 1, VRING_DESC_F_WRITE);
-        buf_count += 1;
-
-        vq.push_chain(&bufs[..buf_count])
-    }
-
-    /// Read the status byte from the DMA buffer.
-    pub fn status(&self) -> u8 {
-        unsafe { core::ptr::read_volatile(self.status_va.as_u64() as *const u8) }
-    }
-
-    /// Get a slice view of the data buffer.
-    pub fn data_slice(&self) -> &[u8] {
-        unsafe {
-            core::slice::from_raw_parts(self.data_va.as_u64() as *const u8, self.data_len as usize)
-        }
-    }
-
-    /// Get a mutable slice view of the data buffer (for writing data before an OUT request).
-    pub fn data_slice_mut(&mut self) -> &mut [u8] {
-        unsafe {
-            core::slice::from_raw_parts_mut(
-                self.data_va.as_u64() as *mut u8,
-                self.data_len as usize,
-            )
-        }
-    }
-
-    /// Free all DMA buffers.
-    pub fn destroy(self) {
-        unsafe { unmap_range(self.header_va, 4096) };
-        let data_pages = ((self.data_len as u64) + 4095) & !4095;
-        unsafe { unmap_range(self.data_va, data_pages.max(4096)) };
-        unsafe { unmap_range(self.status_va, 4096) };
     }
 }

@@ -27,7 +27,7 @@ use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::memory::unmap_mmio_region;
+use kernel_api::memory::{unmap_mmio_region, unmap_range};
 use kernel_api::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -44,6 +44,8 @@ use blk::{
 };
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
+
+use crate::blk::PREALLOCATED_DATA_SIZE;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -421,7 +423,10 @@ async fn virtio_pnp_start<'a, 'b>(
         let arena = match BlkIoArena::init_with_capacity(prealloc_per_queue, dynamic_per_queue) {
             Some(a) => a,
             None => {
-                println!("virtio-blk: failed to create arena for queue {}", i);
+                println!(
+                    "virtio-blk: failed to create arena for queue {} with prealloc {} and dynamic {}",
+                    i, prealloc_per_queue, dynamic_per_queue
+                );
                 // Clean up already created queue states
                 for qs in queue_states.iter() {
                     if let Some(h) = unsafe { &*qs.irq_handle.get() } {
@@ -489,6 +494,7 @@ async fn virtio_pnp_start<'a, 'b>(
             msix_vector,
             msix_table_index,
             waiting_tasks: AtomicU32::new(0),
+            use_indirect: init_result.indirect_desc_supported,
         });
     }
 
@@ -556,6 +562,7 @@ async fn virtio_pnp_start<'a, 'b>(
         mapped_bars: Mutex::new(bar_list),
         msix_pba,
         irq_ready,
+        indirect_desc_enabled: init_result.indirect_desc_supported,
     });
 
     if let Some(inner) = dx.inner.get() {
@@ -601,6 +608,13 @@ async fn virtio_pnp_remove<'a, 'b>(
                         .try_lock()
                         .expect("queue not locked during cleanup");
                     vq.destroy();
+                }
+
+                // Manually deallocate the packed indirect table allocation for the arena.
+                if let Some(va) = qs.arena.indirect_pages_va {
+                    unsafe {
+                        unmap_range(va, (qs.arena.indirect_pages_count * 4096) as u64);
+                    }
                 }
 
                 // Arena cleanup is automatic via Drop
@@ -823,7 +837,7 @@ fn rdtsc() -> u64 {
 // =============================================================================
 
 /// Total data to transfer per benchmark run.
-const BENCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+const BENCH_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 struct BenchConfig {
     /// Target payload size per request (512-byte aligned, fits any queue).
@@ -836,33 +850,31 @@ struct BenchConfig {
 
 impl BenchConfig {
     fn from_inner(inner: &DevExtInner) -> Self {
-        // Use small request size to maximize I/O operations and interrupt frequency.
-        // 4KB aligns with arena preallocated slot size for optimal performance.
-        let request_size = 64 * 1024;
+        // Keep this aligned and predictable. If you actually want "small", set this to 4*1024.
+        let request_size: u32 = PREALLOCATED_DATA_SIZE as u32;
 
         let requests_per_run =
             ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64).max(1) as u32;
 
-        // Calculate max inflight based on queue size and descriptors per request.
-        // Each request uses: 1 header + N data segments + 1 status descriptor.
-        // For our request size, calculate how many descriptors we need per request.
-        let data_segments = ((request_size as usize + 4095) / 4096).max(1);
-        let descriptors_per_request = 1 + data_segments + 1; // header + data + status
-
-        // Get minimum queue size across all queues
         let min_queue_size = inner
             .queues
             .iter()
             .map(|qs| {
-                // Access queue size through the lock-free path
                 let vq = unsafe { &*qs.queue.as_ptr() };
                 vq.size as usize
             })
             .min()
             .unwrap_or(64);
 
-        // Max inflight = queue_size / descriptors_per_request
-        let max_queue_inflight = (min_queue_size / descriptors_per_request).max(1) as u16;
+        // If indirect is enabled, each request consumes 1 main-ring descriptor (the INDIRECT head).
+        // Otherwise, it consumes 1(header) + N(4KiB segments) + 1(status).
+        let max_queue_inflight = if inner.indirect_desc_enabled {
+            min_queue_size.max(1) as u16
+        } else {
+            let data_segments = ((request_size as usize + 4095) / 4096).max(1);
+            let descriptors_per_request = 1 + data_segments + 1;
+            (min_queue_size / descriptors_per_request).max(1) as u16
+        };
 
         Self {
             request_size,
@@ -965,7 +977,8 @@ async fn bench_reads_direct(
             // Try to submit to queue
             let head = {
                 let mut vq = qs.queue.lock().await;
-                match io_req.submit(&mut vq, false) {
+                let use_indirect = inner.indirect_desc_enabled;
+                match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
                         h
@@ -1310,7 +1323,8 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
             let head = {
                 let mut vq = qs.queue.lock().await;
-                match io_req.submit(&mut vq, false) {
+                let use_indirect = inner.indirect_desc_enabled;
+                match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
                         h
@@ -1450,7 +1464,8 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
             let head = {
                 let mut vq = qs.queue.lock().await;
-                match io_req.submit(&mut vq, true) {
+                let use_indirect = inner.indirect_desc_enabled;
+                match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
                         h

@@ -48,6 +48,8 @@ pub struct QueueState {
     pub msix_table_index: Option<u16>,
     /// Number of tasks currently waiting on this queue's interrupt.
     pub waiting_tasks: AtomicU32,
+    /// Whether to use indirect descriptors on this queue.
+    pub use_indirect: bool,
 }
 
 unsafe impl Send for QueueState {}
@@ -137,6 +139,8 @@ pub struct DevExtInner {
     pub msix_pba: Option<VirtAddr>,
     /// Gate that becomes ready when interrupt setup is complete and tested.
     pub irq_ready: InitGate,
+    /// Whether indirect descriptors are enabled for this device.
+    pub indirect_desc_enabled: bool,
 }
 
 impl DevExtInner {
