@@ -39,6 +39,7 @@ use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::Mutex;
+use spin::mutex::SpinMutex;
 
 use blk::{
     BlkIoArena, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, calculate_per_queue_arena_sizes,
@@ -479,7 +480,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         queue_states.push(QueueState {
-            queue: Mutex::new(vq),
+            queue: SpinMutex::new(vq),
             arena,
             max_request_bytes,
             max_data_segments: max_data_segments as u16,
@@ -704,57 +705,32 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
     const SPIN_BEFORE_WAIT: u32 = 10;
 
     loop {
-        let epoch_before = {
-            let vq = qs.queue.lock();
-            vq.drain_epoch()
-        };
+        // All operations below are lock-free via QueueState delegation methods
 
-        {
-            let mut vq = qs.queue.lock();
-            if let Some(len) = vq.take_completion(head) {
-                vq.free_chain(head);
-                return Ok(len);
-            }
+        // Read drain epoch (lock-free)
+        let epoch_before = qs.drain_epoch();
+
+        // Try to take our completion (lock-free)
+        if let Some(len) = qs.take_completion(head) {
+            // Defer descriptor freeing (lock-free push to MPSC queue)
+            qs.defer_free_chain(head);
+            return Ok(len);
         }
 
-        let we_are_drainer = {
-            let vq = qs.queue.lock();
-            vq.try_acquire_drainer()
-        };
+        // Try to become the drainer (lock-free)
+        let we_are_drainer = qs.try_acquire_drainer();
 
         let mut made_progress = false;
 
         if we_are_drainer {
-            let (drained_total, completed) = {
-                let mut vq = qs.queue.lock();
+            // Drain used ring to completions (lock-free CAS loop)
+            let drained = qs.drain_used_to_completions_lockfree();
 
-                let mut drained = 0u32;
-                if vq.has_pending_used() {
-                    drained = drained.saturating_add(vq.drain_used_to_completions()as u32);
-                }
-
-                let mut done = None;
-                if let Some(len) = vq.take_completion(head) {
-                    vq.free_chain(head);
-                    done = Some(len);
-                }
-
-                if done.is_none() && vq.has_pending_used() {
-                    drained = drained.saturating_add(vq.drain_used_to_completions() as u32);
-                    if let Some(len) = vq.take_completion(head) {
-                        vq.free_chain(head);
-                        done = Some(len);
-                    }
-                }
-
-                vq.release_drainer();
-                (drained, done)
-            };
-
-            if drained_total > 0 {
+            if drained > 0 {
                 made_progress = true;
                 spins = 0;
 
+                // Wake other waiters
                 if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                     let waiters = qs.waiting_tasks.load(Ordering::Acquire);
                     let to_wake = waiters.saturating_sub(1);
@@ -764,13 +740,18 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
                 }
             }
 
-            if let Some(len) = completed {
+            // Check for our completion again (lock-free)
+            if let Some(len) = qs.take_completion(head) {
+                qs.release_drainer();
+                qs.defer_free_chain(head);
                 return Ok(len);
             }
+
+            qs.release_drainer();
         } else {
-            let mut vq = qs.queue.lock();
-            if let Some(len) = vq.take_completion(head) {
-                vq.free_chain(head);
+            // Non-drainer path - just check completion (lock-free)
+            if let Some(len) = qs.take_completion(head) {
+                qs.defer_free_chain(head);
                 return Ok(len);
             }
         }
@@ -779,10 +760,8 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             continue;
         }
 
-        let epoch_after = {
-            let vq = qs.queue.lock();
-            vq.drain_epoch()
-        };
+        // Check if epoch changed (lock-free)
+        let epoch_after = qs.drain_epoch();
 
         if epoch_after != epoch_before {
             spins = 0;
@@ -849,7 +828,7 @@ struct BenchConfig {
 impl BenchConfig {
     fn from_inner(inner: &DevExtInner) -> Self {
         // Use the most conservative per-queue limit so every queue can service the request size.
-        let request_size = 512 * 1024;
+        let request_size = 16 * 1024 * 1024;
 
         let requests_per_run =
             ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64).max(1) as u32;

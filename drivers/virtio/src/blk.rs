@@ -19,7 +19,7 @@ pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 409
 pub const ARENA_PREALLOCATED_SLOTS: usize = 1024;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 0;
+pub const ARENA_DYNAMIC_SLOTS: usize = 128;
 
 /// Maximum arena capacity before overflow requests are not cached
 pub const ARENA_MAX_CAPACITY: usize = 2048;
@@ -29,7 +29,7 @@ pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
 /// TODO: Changing this value can significantly impact performance maybe should be tunable at runtime?
-pub const PREALLOCATED_DATA_SIZE: usize = 512 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 16 * 1024;
 
 // =============================================================================
 // Slot State Constants

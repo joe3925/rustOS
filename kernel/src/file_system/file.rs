@@ -404,8 +404,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         wait_duration(Duration::from_millis(50));
         spawn_detached(async move {
             bench_c_drive_io_async().await;
-            bench_virtio_disk_sweep().await;
             bench_virtio_disk_sweep_polling().await;
+
+            bench_virtio_disk_sweep().await;
         });
     });
     Ok(())
