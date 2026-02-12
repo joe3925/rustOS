@@ -72,44 +72,41 @@ impl IrqHandleInner {
         }
     }
 
-    fn signal_n(&self, meta: IrqMeta, n: u32) {
+    pub fn signal_n(&self, mut n: usize) -> usize {
         if n == 0 {
-            return;
+            return 0;
         }
-        {
-            let mut m = self.last_meta.lock();
-            *m = meta;
-        }
-        self.signal_count.fetch_add(n as usize, Ordering::Release);
 
-        // Wake up to n waiters
-        for _ in 0..n {
-            if let Some(waker) = self.waiters.lock().pop_front() {
-                waker.wake();
-            } else {
-                break;
+        let mut to_wake = alloc::vec::Vec::new();
+
+        {
+            let mut g = self.waiters.lock();
+            while n != 0 {
+                match g.pop_front() {
+                    // or pop(), depending on your container
+                    Some(w) => {
+                        to_wake.push(w);
+                        n -= 1;
+                    }
+                    None => break,
+                }
             }
         }
-    }
 
-    fn signal_all(&self, meta: IrqMeta) {
-        {
-            let mut m = self.last_meta.lock();
-            *m = meta;
+        let woke = to_wake.len() as u32;
+        if woke != 0 {
+            self.signal_count
+                .fetch_add(woke as usize, Ordering::Release);
+            for w in to_wake {
+                w.wake();
+            }
         }
-        while let Some(waker) = self.waiters.lock().pop_front() {
-            waker.wake();
-        }
-        let mut woken = 0;
-        while let Some(waker) = self.waiters.lock().pop_front() {
-            waker.wake();
-            woken += 1;
-        }
-        if woken > 0 {
-            self.signal_count.fetch_add(woken, Ordering::Release);
-        }
-    }
 
+        woke as usize
+    }
+    pub fn signal_all(&self) -> usize {
+        self.signal_n(usize::MAX)
+    }
     fn try_consume(&self) -> Option<(IrqMeta, u32)> {
         let count = self.signal_count.load(Ordering::Acquire);
         if count == 0 {

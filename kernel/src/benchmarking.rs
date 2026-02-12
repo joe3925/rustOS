@@ -1,5 +1,6 @@
 use crate::alloc::format;
 use crate::drivers::interrupt_index::{self, TSC_HZ};
+use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::file_system::file::File;
 use crate::memory::{
@@ -28,6 +29,7 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
+use kernel_types::request::TraversalPolicy;
 use kernel_types::status::FileStatus;
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
@@ -2701,4 +2703,126 @@ pub async fn benchmark_async_async() {
             break;
         }
     }
+}
+
+// =============================================================================
+// VirtIO Disk Benchmark Sweep
+// =============================================================================
+
+/// Maximum number of inflight levels supported by the benchmark sweep.
+const VIRTIO_BENCH_MAX_LEVELS: usize = 11;
+
+/// Result for a single inflight level benchmark (matches virtio driver's struct).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtioBenchLevelResult {
+    /// Inflight level tested
+    inflight: u32,
+    /// Number of requests completed
+    request_count: u32,
+    /// Total cycles across all requests
+    total_cycles: u64,
+    /// Average cycles per request
+    avg_cycles: u64,
+    /// Maximum cycles for any single request
+    max_cycles: u64,
+    /// Minimum cycles for any single request (0 if no samples)
+    min_cycles: u64,
+}
+
+/// Result of a full benchmark sweep (matches virtio driver's struct).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct VirtioBenchSweepResult {
+    /// Number of levels actually tested
+    used: u32,
+    /// Padding for alignment
+    _pad: u32,
+    /// Results for each level
+    levels: [VirtioBenchLevelResult; VIRTIO_BENCH_MAX_LEVELS],
+}
+
+impl Default for VirtioBenchSweepResult {
+    fn default() -> Self {
+        Self {
+            used: 0,
+            _pad: 0,
+            levels: [VirtioBenchLevelResult::default(); VIRTIO_BENCH_MAX_LEVELS],
+        }
+    }
+}
+
+/// Convert TSC cycles to milliseconds.
+#[inline]
+fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
+    if tsc_hz == 0 {
+        return 0.0;
+    }
+    (cycles as f64 / tsc_hz as f64) * 1000.0
+}
+
+/// IOCTL code for triggering the benchmark sweep on virtio-blk PDO.
+const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
+
+/// Run a benchmark sweep on the VirtIO disk, testing different inflight levels.
+/// Results are printed in milliseconds.
+pub async fn bench_virtio_disk_sweep() {
+    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
+    use kernel_types::request::{RequestData, RequestHandle, RequestType};
+    use kernel_types::status::DriverStatus;
+
+    let target = match pnp_get_device_target("VirtIO\\Disk_0") {
+        Some(t) => t,
+        None => {
+            println!("[virtio-bench] VirtIO disk not found at VirtIO\\Disk_0");
+            return;
+        }
+    };
+
+    println!("[virtio-bench] Starting benchmark sweep on VirtIO disk...");
+
+    let mut req = RequestHandle::new(
+        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
+        RequestData::empty(),
+    );
+    req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status = PNP_MANAGER.send_request(target, &mut req).await;
+    if status != DriverStatus::Success {
+        println!("[virtio-bench] IOCTL failed: {:?}", status);
+        return;
+    }
+
+    let result: VirtioBenchSweepResult = {
+        let guard = req.read();
+        match guard.data.view::<VirtioBenchSweepResult>() {
+            Some(r) => *r,
+            None => {
+                println!("[virtio-bench] Failed to parse benchmark result");
+                return;
+            }
+        }
+    };
+
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        println!("[virtio-bench] TSC not calibrated, cannot convert to ms");
+        return;
+    }
+
+    println!("[virtio-bench] Inflight Sweep Results (100 MiB total, 64 KiB/req):");
+    println!("  Inflight |   Avg (ms) |   Min (ms) |   Max (ms) | Requests");
+    println!("  ---------|------------|------------|------------|----------");
+
+    for i in 0..result.used as usize {
+        let level = &result.levels[i];
+        let avg_ms = cycles_to_ms(level.avg_cycles, tsc_hz);
+        let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
+        let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
+        println!(
+            "  {:>8} | {:>10.3} | {:>10.3} | {:>10.3} | {:>8}",
+            level.inflight, avg_ms, min_ms, max_ms, level.request_count
+        );
+    }
+
+    println!("[virtio-bench] Benchmark complete.");
 }

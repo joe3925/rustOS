@@ -579,6 +579,303 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
 }
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
+const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
+
+// =============================================================================
+// Benchmark Result Structures (C-ABI compatible)
+// =============================================================================
+
+/// Maximum number of inflight levels supported by the benchmark sweep.
+/// Covers power-of-two levels: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
+pub const BENCH_MAX_LEVELS: usize = 11;
+
+/// Result for a single inflight level benchmark.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BenchLevelResult {
+    /// Inflight level tested
+    pub inflight: u32,
+    /// Number of requests completed
+    pub request_count: u32,
+    /// Total cycles across all requests
+    pub total_cycles: u64,
+    /// Average cycles per request
+    pub avg_cycles: u64,
+    /// Maximum cycles for any single request
+    pub max_cycles: u64,
+    /// Minimum cycles for any single request (0 if no samples)
+    pub min_cycles: u64,
+}
+
+/// Result of a full benchmark sweep across multiple inflight levels.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BenchSweepResult {
+    /// Number of levels actually tested
+    pub used: u32,
+    /// Padding for alignment
+    pub _pad: u32,
+    /// Results for each level (up to BENCH_MAX_LEVELS)
+    pub levels: [BenchLevelResult; BENCH_MAX_LEVELS],
+}
+
+impl Default for BenchSweepResult {
+    fn default() -> Self {
+        Self {
+            used: 0,
+            _pad: 0,
+            levels: [BenchLevelResult::default(); BENCH_MAX_LEVELS],
+        }
+    }
+}
+
+// =============================================================================
+// rdtsc helper
+// =============================================================================
+
+/// Read the CPU's Time Stamp Counter (TSC) using the RDTSC instruction.
+#[inline]
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!(
+            "rdtsc",
+            out("eax") lo,
+            out("edx") hi,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+// =============================================================================
+// Benchmark Implementation
+// =============================================================================
+
+/// Size of each benchmark request in bytes (64 KiB).
+const BENCH_REQUEST_SIZE: u32 = 64 * 1024;
+
+/// Total data to transfer per benchmark run (100 MiB).
+const BENCH_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Number of requests per benchmark run.
+const BENCH_REQUEST_COUNT: usize = (BENCH_TOTAL_BYTES / BENCH_REQUEST_SIZE as u64) as usize;
+
+/// Approximate number of descriptors per 64 KiB read request.
+/// header(1) + data pages(16 for 64KiB) + status(1) = 18
+const DESCS_PER_REQUEST: usize = 18;
+
+/// Pending request tracking for benchmark.
+struct PendingBenchRequest<'a> {
+    head: u16,
+    start_tsc: u64,
+    _request: blk::BlkIoRequestHandle<'a>,
+}
+
+/// Run a benchmark with a specific inflight request count.
+/// Uses 64 KiB reads, total 100 MiB of data.
+async fn bench_reads_with_inflight(
+    inner: &DevExtInner,
+    start_sector: u64,
+    inflight: usize,
+) -> Result<BenchLevelResult, DriverStatus> {
+    // Wait for IRQ subsystem to be ready
+    inner.irq_ready.wait().await;
+
+    let mut result = BenchLevelResult {
+        inflight: inflight as u32,
+        request_count: 0,
+        total_cycles: 0,
+        avg_cycles: 0,
+        max_cycles: 0,
+        min_cycles: u64::MAX,
+    };
+
+    let mut pending: Vec<PendingBenchRequest<'_>> = Vec::with_capacity(inflight);
+    let mut submitted_count: usize = 0;
+    let mut completed_count: usize = 0;
+
+    // Sectors per request (64 KiB / 512 bytes = 128 sectors)
+    let sectors_per_request = BENCH_REQUEST_SIZE / 512;
+
+    let meta = kernel_api::kernel_types::irq::IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
+
+    // Waiter guard for proper cleanup
+    struct WaiterGuard<'a> {
+        counter: &'a AtomicU32,
+    }
+    impl<'a> Drop for WaiterGuard<'a> {
+        fn drop(&mut self) {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    inner.waiting_tasks.fetch_add(1, Ordering::AcqRel);
+    let _waiter_guard = WaiterGuard {
+        counter: &inner.waiting_tasks,
+    };
+
+    // Main benchmark loop: submit requests up to inflight limit, drain completions
+    while completed_count < BENCH_REQUEST_COUNT {
+        // Submit new requests until we hit the inflight limit or total count
+        while pending.len() < inflight && submitted_count < BENCH_REQUEST_COUNT {
+            let sector = start_sector + (submitted_count as u64 * sectors_per_request as u64);
+
+            // Allocate request from arena
+            let io_req = match inner.request_arena.new_request(
+                blk::VIRTIO_BLK_T_IN,
+                sector,
+                BENCH_REQUEST_SIZE,
+            ) {
+                Some(r) => r,
+                None => {
+                    // Arena exhausted, wait for completions
+                    break;
+                }
+            };
+
+            // Record start time and submit
+            let start_tsc = rdtsc();
+            let head = {
+                let mut vq = inner.requestq.lock();
+                match io_req.submit(&mut vq, false) {
+                    Some(h) => {
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        h
+                    }
+                    None => {
+                        // Queue full, wait for completions
+                        break;
+                    }
+                }
+            };
+
+            pending.push(PendingBenchRequest {
+                head,
+                start_tsc,
+                _request: io_req,
+            });
+            submitted_count += 1;
+        }
+
+        // Drain completions
+        let mut found_any = false;
+        {
+            let mut vq = inner.requestq.lock();
+            vq.drain_used_to_completions();
+
+            // Check each pending request for completion
+            let mut i = 0;
+            while i < pending.len() {
+                if let Some(_len) = vq.take_completion(pending[i].head) {
+                    let end_tsc = rdtsc();
+                    let cycles = end_tsc.saturating_sub(pending[i].start_tsc);
+
+                    // Update statistics
+                    result.total_cycles += cycles;
+                    result.max_cycles = result.max_cycles.max(cycles);
+                    result.min_cycles = result.min_cycles.min(cycles);
+                    result.request_count += 1;
+
+                    // Free the descriptor chain
+                    vq.free_chain(pending[i].head);
+
+                    // Remove from pending (swap-remove for efficiency)
+                    pending.swap_remove(i);
+                    completed_count += 1;
+                    if (completed_count % 64 == 0) {
+                        println!("Completed request {}: {} cycles", completed_count, cycles);
+                    }
+                    found_any = true;
+                    // Don't increment i since we swapped in a new element
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // If no completions found and we have pending requests, wait for IRQ
+        if !found_any && !pending.is_empty() {
+            if let Some(ref irq_handle) = inner.irq_handle {
+                let result = irq_handle.wait(meta).await;
+                if !irq_wait_ok(result) {
+                    // Clean up pending requests
+                    let mut vq = inner.requestq.lock();
+                    for req in pending.drain(..) {
+                        vq.free_chain(req.head);
+                    }
+                    return Err(DriverStatus::DeviceError);
+                }
+            } else {
+                // Polling mode - yield
+                spin_loop();
+            }
+        }
+    }
+
+    // Compute average (avoid division by zero)
+    if result.request_count > 0 {
+        result.avg_cycles = result.total_cycles / result.request_count as u64;
+    }
+
+    // If no samples were collected, set min to 0
+    if result.min_cycles == u64::MAX {
+        result.min_cycles = 0;
+    }
+
+    Ok(result)
+}
+
+/// Run a benchmark sweep across multiple inflight levels.
+/// Tests power-of-two levels from 1 to 1024, clamped by hardware capacity.
+async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStatus> {
+    const LEVELS: [usize; BENCH_MAX_LEVELS] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+
+    // Determine maximum supported inflight based on ring capacity and arena
+    let ring_size = {
+        let vq = inner.requestq.lock();
+        vq.size as usize
+    };
+
+    // max_supported = min(ring_size / descs_per_req, arena_max_capacity)
+    let max_from_ring = ring_size / DESCS_PER_REQUEST;
+    let max_supported = max_from_ring.min(blk::ARENA_MAX_CAPACITY);
+
+    let mut result = BenchSweepResult::default();
+
+    // Use sector 0 as starting point for benchmark reads
+    let start_sector: u64 = 0;
+
+    for &level in LEVELS.iter() {
+        // Clamp level to max supported
+        let clamped_level = level.min(max_supported);
+
+        // Skip if we've already tested this clamped level
+        if result.used > 0 {
+            let prev_level = result.levels[result.used as usize - 1].inflight as usize;
+            if clamped_level == prev_level {
+                // Already tested this level, stop the sweep
+                break;
+            }
+        }
+
+        // Run benchmark for this level
+        let level_result = bench_reads_with_inflight(inner, start_sector, clamped_level).await?;
+
+        result.levels[result.used as usize] = level_result;
+        result.used += 1;
+
+        // Stop if we've hit the cap
+        if clamped_level >= max_supported {
+            break;
+        }
+    }
+
+    Ok(result)
+}
 
 #[request_handler]
 pub async fn virtio_pdo_start<'a, 'b>(
@@ -821,7 +1118,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
 #[request_handler]
 pub async fn virtio_pdo_ioctl<'a, 'b>(
-    _pdo: Arc<DeviceObject>,
+    pdo: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match {
@@ -837,6 +1134,23 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
 
     match code {
         IOCTL_BLOCK_FLUSH => complete_req(req, DriverStatus::Success),
+        IOCTL_BLOCK_BENCH_SWEEP => {
+            let (_parent, inner) = match get_parent_inner(&pdo) {
+                Ok(v) => v,
+                Err(s) => return complete_req(req, s),
+            };
+
+            match bench_sweep(inner).await {
+                Ok(result) => {
+                    {
+                        let mut w = req.write();
+                        w.data = RequestData::from_t(result);
+                    }
+                    complete_req(req, DriverStatus::Success)
+                }
+                Err(e) => complete_req(req, e),
+            }
+        }
         _ => complete_req(req, DriverStatus::NotImplemented),
     }
 }

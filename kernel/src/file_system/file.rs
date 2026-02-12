@@ -13,7 +13,7 @@ use kernel_types::{
 };
 
 use crate::{
-    benchmarking::bench_c_drive_io_async,
+    benchmarking::{bench_c_drive_io_async, bench_virtio_disk_sweep},
     drivers::{drive::vfs::Vfs, interrupt_index::wait_duration},
     file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
@@ -400,7 +400,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     );
     spawn_blocking(|| {
         wait_duration(Duration::from_millis(50));
-        spawn_detached(bench_c_drive_io_async());
+        spawn_detached(async move {
+            bench_c_drive_io_async().await;
+            bench_virtio_disk_sweep().await;
+        });
     });
     Ok(())
 }

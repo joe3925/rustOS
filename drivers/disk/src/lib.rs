@@ -719,7 +719,7 @@ pub async fn disk_ioctl<'a, 'b>(
             }
             DriverStep::complete(status)
         }
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
+        _ => DriverStep::Continue,
     }
 }
 

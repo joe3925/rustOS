@@ -340,6 +340,7 @@ dependencies = [
  "goblin",
  "hashbrown",
  "kernel_executor",
+ "kernel_routing",
  "kernel_types",
  "lazy_static",
  "pc-keyboard",
@@ -361,6 +362,25 @@ dependencies = [
  "crossbeam-queue",
  "kernel_types",
  "spin 0.10.0",
+]
+
+[[package]]
+name = "kernel_routing"
+version = "0.1.0"
+dependencies = [
+ "kernel_sys",
+ "kernel_types",
+ "spin 0.10.0",
+]
+
+[[package]]
+name = "kernel_sys"
+version = "0.1.0"
+dependencies = [
+ "acpi",
+ "kernel_types",
+ "spin 0.10.0",
+ "x86_64 0.15.2",
 ]
 
 [[package]]
