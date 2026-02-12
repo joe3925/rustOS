@@ -918,6 +918,7 @@ async fn bench_reads_direct(
         p50_cycles: 0,
         p99_cycles: 0,
         p999_cycles: 0,
+        idle_pct: 0.0,
     };
 
     // Track in-flight requests (circular buffer style)
@@ -1117,8 +1118,11 @@ async fn bench_sweep(
             }
         }
 
+        // Start idle tracking right before the level begins
+        kernel_api::benchmark::idle_tracking_start();
+
         // Run benchmark for this level with unique disk region
-        let level_result = bench_reads_direct(
+        let mut level_result = bench_reads_direct(
             inner,
             current_sector,
             effective_level,
@@ -1126,6 +1130,9 @@ async fn bench_sweep(
             use_interrupts,
         )
         .await?;
+
+        // Stop idle tracking and record the idle percentage for this level
+        level_result.idle_pct = kernel_api::benchmark::idle_tracking_stop();
 
         result.levels[result.used as usize] = level_result;
         result.used += 1;

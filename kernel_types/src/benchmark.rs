@@ -64,6 +64,8 @@ pub struct BenchLevelResult {
     pub p99_cycles: u64,
     /// 99.9th percentile latency in cycles
     pub p999_cycles: u64,
+    /// CPU idle percentage during this level (0.0 - 100.0)
+    pub idle_pct: f64,
 }
 
 impl Default for BenchSweepResult {

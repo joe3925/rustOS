@@ -116,6 +116,10 @@ export! {
     bench_kernel_window_start,
     bench_kernel_window_destroy,
     bench_kernel_window_create,
+
+    idle_tracking_start,
+    idle_tracking_stop,
+
     kernel_apic_cpu_ids,
 
     routing_resolve_path_to_device,

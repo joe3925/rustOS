@@ -2705,8 +2705,7 @@ const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 /// Run a benchmark sweep on the VirtIO disk, testing different inflight levels.
 /// Results are printed in milliseconds.
 pub async fn bench_virtio_disk_sweep() {
-    use crate::drivers::timer_driver::{idle_tracking_start, idle_tracking_stop};
-    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
+    use crate::static_handlers::pnp_get_device_target;
     use kernel_types::request::{RequestData, RequestHandle, RequestType};
     use kernel_types::status::DriverStatus;
 
@@ -2720,18 +2719,12 @@ pub async fn bench_virtio_disk_sweep() {
 
     println!("[virtio-bench] Starting benchmark sweep on VirtIO disk...");
 
-    // Start idle time tracking
-    idle_tracking_start();
-
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
         RequestData::empty(),
     );
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = PNP_MANAGER.send_request(target, &mut req).await;
-
-    // Stop idle tracking and get result
-    let idle_pct = idle_tracking_stop();
 
     if status != DriverStatus::Success {
         println!("[virtio-bench] IOCTL failed: {:?}", status);
@@ -2756,8 +2749,8 @@ pub async fn bench_virtio_disk_sweep() {
     }
 
     println!("[virtio-bench] Inflight Sweep Results (100 MiB total, 64 KiB/req):");
-    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
-    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
+    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests | Idle (%)");
+    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------|----------");
 
     for i in 0..result.used as usize {
         let level = &result.levels[i];
@@ -2769,7 +2762,7 @@ pub async fn bench_virtio_disk_sweep() {
         let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
         let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
         println!(
-            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8} | {:>8.2}",
             level.inflight,
             total_ms,
             avg_ms,
@@ -2778,19 +2771,18 @@ pub async fn bench_virtio_disk_sweep() {
             p999_ms,
             min_ms,
             max_ms,
-            level.request_count
+            level.request_count,
+            level.idle_pct
         );
     }
 
-    println!("[virtio-bench] Aggregate CPU Idle: {:.2}%", idle_pct);
     println!("[virtio-bench] Benchmark complete.");
 }
 
 /// Run a benchmark sweep on the VirtIO disk using polling mode (no IRQ waits).
 /// Results are printed in milliseconds.
 pub async fn bench_virtio_disk_sweep_polling() {
-    use crate::drivers::timer_driver::{idle_tracking_start, idle_tracking_stop};
-    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
+    use crate::static_handlers::pnp_get_device_target;
     use kernel_types::request::{RequestData, RequestHandle, RequestType};
     use kernel_types::status::DriverStatus;
 
@@ -2804,18 +2796,12 @@ pub async fn bench_virtio_disk_sweep_polling() {
 
     println!("[virtio-bench-poll] Starting polling mode benchmark sweep on VirtIO disk...");
 
-    // Start idle time tracking
-    idle_tracking_start();
-
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
         RequestData::empty(),
     );
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = PNP_MANAGER.send_request(target, &mut req).await;
-
-    // Stop idle tracking and get result
-    let idle_pct = idle_tracking_stop();
 
     if status != DriverStatus::Success {
         println!("[virtio-bench-poll] IOCTL failed: {:?}", status);
@@ -2840,8 +2826,8 @@ pub async fn bench_virtio_disk_sweep_polling() {
     }
 
     println!("[virtio-bench-poll] Polling Mode Inflight Sweep Results (100 MiB total, 64 KiB/req):");
-    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
-    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
+    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests | Idle (%)");
+    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------|----------");
 
     for i in 0..result.used as usize {
         let level = &result.levels[i];
@@ -2853,7 +2839,7 @@ pub async fn bench_virtio_disk_sweep_polling() {
         let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
         let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
         println!(
-            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8} | {:>8.2}",
             level.inflight,
             total_ms,
             avg_ms,
@@ -2862,11 +2848,11 @@ pub async fn bench_virtio_disk_sweep_polling() {
             p999_ms,
             min_ms,
             max_ms,
-            level.request_count
+            level.request_count,
+            level.idle_pct
         );
     }
 
-    println!("[virtio-bench-poll] Aggregate CPU Idle: {:.2}%", idle_pct);
     println!("[virtio-bench-poll] Benchmark complete.");
 }
 

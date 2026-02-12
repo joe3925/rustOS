@@ -705,6 +705,16 @@ pub extern "win64" fn bench_kernel_span_end(
 }
 
 #[no_mangle]
+pub extern "win64" fn idle_tracking_start() {
+    crate::drivers::timer_driver::idle_tracking_start();
+}
+
+#[no_mangle]
+pub extern "win64" fn idle_tracking_stop() -> f64 {
+    crate::drivers::timer_driver::idle_tracking_stop()
+}
+
+#[no_mangle]
 pub extern "win64" fn get_current_cpu_id() -> usize {
     current_cpu_id()
 }
