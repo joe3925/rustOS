@@ -14,6 +14,7 @@ use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use core::ptr::read_volatile;
 use core::sync::atomic::{AtomicU32, Ordering};
+use kernel_api::benchmark::{BENCH_MAX_LEVELS, BenchLevelResult, BenchSweepResult};
 use kernel_api::kernel_types::pnp::DeviceIds;
 
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
@@ -582,54 +583,6 @@ const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 
 // =============================================================================
-// Benchmark Result Structures (C-ABI compatible)
-// =============================================================================
-
-/// Maximum number of inflight levels supported by the benchmark sweep.
-/// Covers power-of-two levels: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
-pub const BENCH_MAX_LEVELS: usize = 11;
-
-/// Result for a single inflight level benchmark.
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct BenchLevelResult {
-    /// Inflight level tested
-    pub inflight: u32,
-    /// Number of requests completed
-    pub request_count: u32,
-    /// Total cycles across all requests
-    pub total_cycles: u64,
-    /// Average cycles per request
-    pub avg_cycles: u64,
-    /// Maximum cycles for any single request
-    pub max_cycles: u64,
-    /// Minimum cycles for any single request (0 if no samples)
-    pub min_cycles: u64,
-}
-
-/// Result of a full benchmark sweep across multiple inflight levels.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct BenchSweepResult {
-    /// Number of levels actually tested
-    pub used: u32,
-    /// Padding for alignment
-    pub _pad: u32,
-    /// Results for each level (up to BENCH_MAX_LEVELS)
-    pub levels: [BenchLevelResult; BENCH_MAX_LEVELS],
-}
-
-impl Default for BenchSweepResult {
-    fn default() -> Self {
-        Self {
-            used: 0,
-            _pad: 0,
-            levels: [BenchLevelResult::default(); BENCH_MAX_LEVELS],
-        }
-    }
-}
-
-// =============================================================================
 // rdtsc helper
 // =============================================================================
 
@@ -786,9 +739,6 @@ async fn bench_reads_with_inflight(
                     // Remove from pending (swap-remove for efficiency)
                     pending.swap_remove(i);
                     completed_count += 1;
-                    if (completed_count % 64 == 0) {
-                        println!("Completed request {}: {} cycles", completed_count, cycles);
-                    }
                     found_any = true;
                     // Don't increment i since we swapped in a new element
                 } else {

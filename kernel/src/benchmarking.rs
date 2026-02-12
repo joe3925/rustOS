@@ -27,7 +27,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
-use kernel_types::benchmark::BenchWindowConfig;
+use kernel_types::benchmark::{BenchSweepResult, BenchWindowConfig};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::request::TraversalPolicy;
 use kernel_types::status::FileStatus;
@@ -2709,49 +2709,6 @@ pub async fn benchmark_async_async() {
 // VirtIO Disk Benchmark Sweep
 // =============================================================================
 
-/// Maximum number of inflight levels supported by the benchmark sweep.
-const VIRTIO_BENCH_MAX_LEVELS: usize = 11;
-
-/// Result for a single inflight level benchmark (matches virtio driver's struct).
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct VirtioBenchLevelResult {
-    /// Inflight level tested
-    inflight: u32,
-    /// Number of requests completed
-    request_count: u32,
-    /// Total cycles across all requests
-    total_cycles: u64,
-    /// Average cycles per request
-    avg_cycles: u64,
-    /// Maximum cycles for any single request
-    max_cycles: u64,
-    /// Minimum cycles for any single request (0 if no samples)
-    min_cycles: u64,
-}
-
-/// Result of a full benchmark sweep (matches virtio driver's struct).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct VirtioBenchSweepResult {
-    /// Number of levels actually tested
-    used: u32,
-    /// Padding for alignment
-    _pad: u32,
-    /// Results for each level
-    levels: [VirtioBenchLevelResult; VIRTIO_BENCH_MAX_LEVELS],
-}
-
-impl Default for VirtioBenchSweepResult {
-    fn default() -> Self {
-        Self {
-            used: 0,
-            _pad: 0,
-            levels: [VirtioBenchLevelResult::default(); VIRTIO_BENCH_MAX_LEVELS],
-        }
-    }
-}
-
 /// Convert TSC cycles to milliseconds.
 #[inline]
 fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
@@ -2792,9 +2749,9 @@ pub async fn bench_virtio_disk_sweep() {
         return;
     }
 
-    let result: VirtioBenchSweepResult = {
+    let result: BenchSweepResult = {
         let guard = req.read();
-        match guard.data.view::<VirtioBenchSweepResult>() {
+        match guard.data.view::<BenchSweepResult>() {
             Some(r) => *r,
             None => {
                 println!("[virtio-bench] Failed to parse benchmark result");

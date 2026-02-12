@@ -1,38 +1,140 @@
-use alloc::collections::vec_deque::VecDeque;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
+use alloc::{sync::Arc, vec::Vec};
+use core::marker::PhantomPinned;
+use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use core::task::Waker;
-use crossbeam_queue::{ArrayQueue, SegQueue};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
     DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult,
 };
-use spin::{Mutex, Once, RwLock};
+use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
+use crate::drivers;
 use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
 use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry};
-use crate::{drivers, println};
 
-/// Internal representation of an IRQ handle
+struct WaiterNode {
+    next: *mut WaiterNode,
+    waker: Option<Waker>,
+    enqueued: bool,
+    result: Option<IrqWaitResult>,
+}
+
+unsafe impl Send for WaiterNode {}
+
+impl WaiterNode {
+    const fn new() -> Self {
+        Self {
+            next: ptr::null_mut(),
+            waker: None,
+            enqueued: false,
+            result: None,
+        }
+    }
+}
+
+struct WaiterList {
+    head: *mut WaiterNode,
+    tail: *mut WaiterNode,
+}
+
+unsafe impl Send for WaiterList {}
+
+impl WaiterList {
+    const fn new() -> Self {
+        Self {
+            head: ptr::null_mut(),
+            tail: ptr::null_mut(),
+        }
+    }
+
+    fn push_back(&mut self, node: *mut WaiterNode) {
+        unsafe {
+            (*node).next = ptr::null_mut();
+        }
+        if self.head.is_null() {
+            self.head = node;
+            self.tail = node;
+        } else {
+            unsafe {
+                (*self.tail).next = node;
+            }
+            self.tail = node;
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<*mut WaiterNode> {
+        let head = self.head;
+        if head.is_null() {
+            return None;
+        }
+
+        let next = unsafe { (*head).next };
+        self.head = next;
+        if next.is_null() {
+            self.tail = ptr::null_mut();
+        }
+        unsafe {
+            (*head).next = ptr::null_mut();
+        }
+        Some(head)
+    }
+
+    fn remove(&mut self, target: *mut WaiterNode) -> bool {
+        let mut prev: *mut WaiterNode = ptr::null_mut();
+        let mut curr = self.head;
+        while !curr.is_null() {
+            if curr == target {
+                let next = unsafe { (*curr).next };
+                if prev.is_null() {
+                    self.head = next;
+                } else {
+                    unsafe { (*prev).next = next };
+                }
+                if self.tail == curr {
+                    self.tail = prev;
+                }
+                unsafe {
+                    (*curr).next = ptr::null_mut();
+                    (*curr).enqueued = false;
+                }
+                return true;
+            }
+            prev = curr;
+            curr = unsafe { (*curr).next };
+        }
+        false
+    }
+}
+
+struct WaitState {
+    waiters: WaiterList,
+    pending_signals: usize,
+    last_meta: IrqMeta,
+}
+
+unsafe impl Send for WaitState {}
+
+impl WaitState {
+    const fn new() -> Self {
+        Self {
+            waiters: WaiterList::new(),
+            pending_signals: 0,
+            last_meta: IrqMeta::new(),
+        }
+    }
+}
+
 struct IrqHandleInner {
-    /// Drop hook called when refcount reaches zero
     drop_hook: Option<DropHook>,
-    /// Whether the handle has been closed/unregistered
     closed: AtomicBool,
-    /// User-defined context value
     user_ctx: AtomicUsize,
-    /// Pending signal count
-    signal_count: AtomicUsize,
-    /// Last signaled metadata
-    last_meta: IrqSafeMutex<IrqMeta>,
-    /// Wakers waiting for signals
-    waiters: IrqSafeMutex<VecDeque<Waker>>,
+    state: IrqSafeMutex<WaitState>,
 }
 
 impl IrqHandleInner {
@@ -41,9 +143,7 @@ impl IrqHandleInner {
             drop_hook: Some(drop_hook),
             closed: AtomicBool::new(false),
             user_ctx: AtomicUsize::new(0),
-            signal_count: AtomicUsize::new(0),
-            last_meta: IrqSafeMutex::new(IrqMeta::new()),
-            waiters: IrqSafeMutex::new(VecDeque::new()),
+            state: IrqSafeMutex::new(WaitState::new()),
         }
     }
 
@@ -52,90 +152,114 @@ impl IrqHandleInner {
     }
 
     fn close(&self) {
-        self.closed.store(true, Ordering::Release);
-        // Wake all waiters so they see the closed state
-        while let Some(waker) = self.waiters.lock().pop_front() {
-            waker.wake();
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let mut wakers: Vec<Waker> = Vec::new();
+
+        {
+            let mut state = self.state.lock();
+            state.pending_signals = 0;
+
+            while let Some(node) = state.waiters.pop_front() {
+                unsafe {
+                    (*node).enqueued = false;
+                    (*node).next = ptr::null_mut();
+                    (*node).result = Some(IrqWaitResult::closed());
+                    if let Some(w) = (*node).waker.take() {
+                        wakers.push(w);
+                    }
+                }
+            }
+        }
+
+        for w in wakers {
+            w.wake();
         }
     }
 
     fn signal_one(&self, meta: IrqMeta) {
-        {
-            let mut m = self.last_meta.lock();
-            *m = meta;
-        }
-        self.signal_count.fetch_add(1, Ordering::Release);
-
-        // Wake one waiter
-        if let Some(waker) = self.waiters.lock().pop_front() {
-            waker.wake();
-        }
+        let _ = self.signal_n(meta, 1);
     }
 
-    pub fn signal_n(&self, mut n: usize) -> usize {
-        if n == 0 {
+    fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
+        if n == 0 || self.is_closed() {
             return 0;
         }
 
-        let mut to_wake = alloc::vec::Vec::new();
+        let mut wakers: Vec<Waker> = Vec::new();
+        let mut woken = 0;
 
         {
-            let mut g = self.waiters.lock();
-            while n != 0 {
-                match g.pop_front() {
-                    // or pop(), depending on your container
-                    Some(w) => {
-                        to_wake.push(w);
-                        n -= 1;
+            let mut state = self.state.lock();
+            state.last_meta = meta;
+
+            while woken < n {
+                let Some(node) = state.waiters.pop_front() else {
+                    break;
+                };
+                unsafe {
+                    (*node).enqueued = false;
+                    (*node).next = ptr::null_mut();
+                    (*node).result = Some(IrqWaitResult::ok_n(meta, 1));
+                    if let Some(w) = (*node).waker.take() {
+                        wakers.push(w);
                     }
-                    None => break,
                 }
+                woken += 1;
+            }
+
+            if woken < n {
+                state.pending_signals = state.pending_signals.saturating_add(n - woken);
             }
         }
 
-        let woke = to_wake.len() as u32;
-        if woke != 0 {
-            self.signal_count
-                .fetch_add(woke as usize, Ordering::Release);
-            for w in to_wake {
-                w.wake();
-            }
+        for w in wakers {
+            w.wake();
         }
-
-        woke as usize
+        woken
     }
-    pub fn signal_all(&self) -> usize {
-        self.signal_n(usize::MAX)
-    }
-    fn try_consume(&self) -> Option<(IrqMeta, u32)> {
-        let count = self.signal_count.load(Ordering::Acquire);
-        if count == 0 {
-            return None;
+
+    fn signal_all(&self, meta: IrqMeta) -> usize {
+        if self.is_closed() {
+            return 0;
         }
 
-        // Try to consume one signal
-        loop {
-            let current = self.signal_count.load(Ordering::Acquire);
-            if current == 0 {
-                return None;
-            }
-            match self.signal_count.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let meta = *self.last_meta.lock();
-                    return Some((meta, 1));
+        let mut wakers: Vec<Waker> = Vec::new();
+        let mut woken = 0;
+
+        {
+            let mut state = self.state.lock();
+            state.last_meta = meta;
+
+            while let Some(node) = state.waiters.pop_front() {
+                unsafe {
+                    (*node).enqueued = false;
+                    (*node).next = ptr::null_mut();
+                    (*node).result = Some(IrqWaitResult::ok_n(meta, 1));
+                    if let Some(w) = (*node).waker.take() {
+                        wakers.push(w);
+                    }
                 }
-                Err(_) => continue,
+                woken += 1;
             }
         }
+
+        for w in wakers {
+            w.wake();
+        }
+        woken
     }
 
-    fn register_waker(&self, waker: Waker) {
-        self.waiters.lock().push_back(waker);
+    fn cancel_waiter(&self, node: *mut WaiterNode) {
+        let mut state = self.state.lock();
+        unsafe {
+            if !(*node).enqueued {
+                return;
+            }
+        }
+        let _ = state.waiters.remove(node);
     }
 }
 
@@ -147,7 +271,6 @@ impl Drop for IrqHandleInner {
     }
 }
 
-/// Arc-wrapped handle that can be safely cloned
 struct IrqHandleArc(Arc<IrqHandleInner>);
 
 impl IrqHandleArc {
@@ -166,7 +289,7 @@ impl IrqHandleArc {
     unsafe fn clone_from_raw(ptr: IrqHandlePtr) -> Self {
         let arc = Arc::from_raw(ptr as *const IrqHandleInner);
         let cloned = arc.clone();
-        let _ = Arc::into_raw(arc); // Don't drop the original
+        let _ = Arc::into_raw(arc);
         Self(cloned)
     }
 
@@ -175,14 +298,21 @@ impl IrqHandleArc {
     }
 }
 
-/// Future for waiting on an IRQ signal
 struct IrqWaitFuture {
     handle: IrqHandleArc,
+    waiter: WaiterNode,
+    _pin: PhantomPinned,
 }
+
+unsafe impl Send for IrqWaitFuture {}
 
 impl IrqWaitFuture {
     fn new(handle: IrqHandleArc) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            waiter: WaiterNode::new(),
+            _pin: PhantomPinned,
+        }
     }
 }
 
@@ -193,36 +323,61 @@ impl core::future::Future for IrqWaitFuture {
         mut self: core::pin::Pin<&mut Self>,
         cx: &mut core::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        if self.handle.as_inner().is_closed() {
-            return core::task::Poll::Ready(IrqWaitResult::closed());
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+
+        if let Some(result) = this.waiter.result.take() {
+            return core::task::Poll::Ready(result);
         }
 
-        if let Some((meta, count)) = self.handle.as_inner().try_consume() {
-            return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, count));
-        }
+        {
+            let handle = this.handle.as_inner();
+            let mut state = handle.state.lock();
 
-        self.handle.as_inner().register_waker(cx.waker().clone());
+            if handle.is_closed() {
+                return core::task::Poll::Ready(IrqWaitResult::closed());
+            }
 
-        if self.handle.as_inner().is_closed() {
-            return core::task::Poll::Ready(IrqWaitResult::closed());
-        }
+            let node_ptr: *mut WaiterNode = &mut this.waiter;
 
-        if let Some((meta, count)) = self.handle.as_inner().try_consume() {
-            return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, count));
+            if state.pending_signals > 0 {
+                state.pending_signals -= 1;
+                if this.waiter.enqueued {
+                    let _ = state.waiters.remove(node_ptr);
+                    this.waiter.enqueued = false;
+                }
+                let meta = state.last_meta;
+                return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, 1));
+            }
+
+            if !this.waiter.enqueued {
+                this.waiter.enqueued = true;
+                this.waiter.next = ptr::null_mut();
+                state.waiters.push_back(node_ptr);
+            }
+
+            this.waiter.waker = Some(cx.waker().clone());
         }
 
         core::task::Poll::Pending
     }
 }
 
-/// Create a new IRQ handle with the given drop hook
+impl Drop for IrqWaitFuture {
+    fn drop(&mut self) {
+        if self.waiter.enqueued {
+            let ptr: *mut WaiterNode = &mut self.waiter;
+            self.handle.as_inner().cancel_waiter(ptr);
+            self.waiter.enqueued = false;
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "win64" fn irq_handle_create(drop_hook: DropHook) -> IrqHandlePtr {
     let handle = IrqHandleArc::new(drop_hook);
     handle.into_raw()
 }
 
-/// Clone an IRQ handle (increment refcount)
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_clone(h: IrqHandlePtr) -> IrqHandlePtr {
     if h.is_null() {
@@ -232,84 +387,76 @@ pub unsafe extern "win64" fn irq_handle_clone(h: IrqHandlePtr) -> IrqHandlePtr {
     cloned.into_raw()
 }
 
-/// Drop an IRQ handle (decrement refcount)
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_drop(h: IrqHandlePtr) {
     if h.is_null() {
         return;
     }
     let _ = IrqHandleArc::from_raw(h);
-    // Arc drop will decrement refcount and call drop_hook if needed
 }
 
-/// Unregister the handle (closes it for future waits)
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_unregister(h: IrqHandlePtr) {
     if h.is_null() {
         return;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    handle.as_inner().close();
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    arc.close();
+    let _ = Arc::into_raw(arc);
 }
 
-/// Check if handle is closed
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_is_closed(h: IrqHandlePtr) -> bool {
     if h.is_null() {
         return true;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    let result = handle.as_inner().is_closed();
-    let _ = handle.into_raw(); // Don't drop the clone
-    result
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    let r = arc.is_closed();
+    let _ = Arc::into_raw(arc);
+    r
 }
 
-/// Set user context
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_set_user_ctx(h: IrqHandlePtr, v: usize) {
     if h.is_null() {
         return;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    handle.as_inner().user_ctx.store(v, Ordering::Release);
-    let _ = handle.into_raw();
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    arc.user_ctx.store(v, Ordering::Release);
+    let _ = Arc::into_raw(arc);
 }
 
-/// Get user context
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_get_user_ctx(h: IrqHandlePtr) -> usize {
     if h.is_null() {
         return 0;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    let result = handle.as_inner().user_ctx.load(Ordering::Acquire);
-    let _ = handle.into_raw();
-    result
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    let v = arc.user_ctx.load(Ordering::Acquire);
+    let _ = Arc::into_raw(arc);
+    v
 }
 
-/// Signal the handle once (internal use)
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_signal_one(h: IrqHandlePtr, meta: IrqMeta) {
     if h.is_null() {
         return;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    handle.as_inner().signal_one(meta);
-    let _ = handle.into_raw();
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    arc.signal_one(meta);
+    let _ = Arc::into_raw(arc);
 }
 
-/// Signal the handle n times (internal use)
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_signal_n(h: IrqHandlePtr, meta: IrqMeta, n: u32) {
     if h.is_null() || n == 0 {
         return;
     }
-    let handle = IrqHandleArc::clone_from_raw(h);
-    handle.as_inner().signal_n(meta, n);
-    let _ = handle.into_raw();
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    let _ = arc.signal_n(meta, n as usize);
+    let _ = Arc::into_raw(arc);
 }
 
-/// Async wait for a signal on the handle
 #[unsafe(no_mangle)]
 pub unsafe extern "win64" fn irq_handle_wait_ffi(
     h: IrqHandlePtr,
@@ -320,7 +467,6 @@ pub unsafe extern "win64" fn irq_handle_wait_ffi(
     }
 
     let handle = IrqHandleArc::clone_from_raw(h);
-
     async move { IrqWaitFuture::new(handle).await }.into_ffi()
 }
 
@@ -446,19 +592,12 @@ impl VectorAllocator {
             return false;
         }
         let state = &vector_alloc_table()[vector as usize];
-        if state
+        state
             .allocated
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-        {
-            true
-        } else {
-            false
-        }
     }
 
-    /// Reserve a dynamic vector for registration and take exclusive ownership.
-    /// Returns true if the vector is ready for use.
     fn reserve_for_registration(vector: u8) -> bool {
         if !Self::is_dynamic(vector) {
             return true;
@@ -466,22 +605,16 @@ impl VectorAllocator {
 
         let state = &vector_alloc_table()[vector as usize];
         if !state.allocated.load(Ordering::Acquire) {
-            if state
-                .allocated
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // Someone else just reserved it
-            }
+            let _ =
+                state
+                    .allocated
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
         }
 
-        match state
+        state
             .users
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => true,
-            Err(_) => false,
-        }
+            .is_ok()
     }
 
     fn release_after_unregister(vector: u8) {
@@ -540,7 +673,6 @@ impl IrqManager {
         id: usize,
         exclusive: bool,
     ) -> bool {
-        // Store id -> vector mapping
         for entry in &self.id_map {
             if entry
                 .id
@@ -559,7 +691,6 @@ impl IrqManager {
             return false;
         }
 
-        // SAFETY: We hold the write lock and count < MAX
         unsafe {
             let regs = &slot.regs as *const _ as *mut [IrqReg; MAX_HANDLERS_PER_VECTOR];
             (*regs)[count] = IrqReg {
@@ -574,7 +705,6 @@ impl IrqManager {
     }
 
     fn unregister_id(&self, id: usize) {
-        // Find and clear id -> vector mapping
         let mut vector = None;
         for entry in &self.id_map {
             if entry.id.load(Ordering::Acquire) == id {
@@ -590,12 +720,10 @@ impl IrqManager {
         let _guard = slot.lock.write();
         let count = slot.count.load(Ordering::Acquire);
 
-        // SAFETY: We hold the write lock
         unsafe {
             let regs = &slot.regs as *const _ as *mut [IrqReg; MAX_HANDLERS_PER_VECTOR];
             for i in 0..count {
                 if (*regs)[i].id == id {
-                    // Swap remove
                     if i < count - 1 {
                         (*regs)[i] = (*regs)[count - 1];
                     }
@@ -689,6 +817,7 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 
     handle
 }
+
 fn vector_to_gsi(vector: u8) -> Option<u8> {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
     let gsi = vector.wrapping_sub(base);
@@ -699,8 +828,6 @@ fn vector_to_gsi(vector: u8) -> Option<u8> {
     }
 }
 
-/// Register an ISR for a Global System Interrupt (GSI).
-/// The kernel maps the GSI to an IDT vector and programs the IOAPIC.
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
     if gsi >= 64 {
@@ -738,6 +865,7 @@ pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 
     handle
 }
+
 pub fn irq_dispatch(vector: u8, frame: &mut InterruptStackFrame) {
     IRQ_MANAGER.dispatch(vector, frame);
 }
@@ -760,20 +888,21 @@ pub fn irq_signal_all(handle: IrqHandlePtr, meta: IrqMeta) {
     if handle.is_null() {
         return;
     }
-    let handle = unsafe { IrqHandleArc::clone_from_raw(handle) };
-    handle.as_inner().signal_all(meta);
-    let _ = handle.into_raw();
+    unsafe {
+        let arc = Arc::from_raw(handle as *const IrqHandleInner);
+        let _ = arc.signal_all(meta);
+        let _ = Arc::into_raw(arc);
+    }
 }
 
-/// Allocate a free APIC vector from the dynamic range (0x60-0xEF).
 pub fn irq_alloc_vector() -> Option<u8> {
     VectorAllocator::alloc()
 }
 
-/// Explicitly free a previously allocated APIC vector when no handlers remain.
 pub fn irq_free_vector(vector: u8) -> bool {
     VectorAllocator::free_explicit(vector)
 }
+
 pub const SCHED_IPI_VECTOR: u8 = 0xF2;
 
 // =============================================================================
@@ -1059,8 +1188,6 @@ fn init_idt() -> InterruptDescriptorTable {
         .set_handler_fn(exception_handlers::simd_floating_point_exception);
     idt.virtualization
         .set_handler_fn(exception_handlers::virtualization_exception);
-
-    let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
 
     unsafe {
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()]

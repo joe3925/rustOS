@@ -11,24 +11,18 @@ use kernel_api::x86_64::{PhysAddr, VirtAddr};
 use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 
-// =============================================================================
-// Arena Allocator Constants
-// =============================================================================
-
 /// Number of preallocated slots with 4KB data regions (common I/O size)
 pub const ARENA_PREALLOCATED_SLOTS: usize = 48;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
 pub const ARENA_DYNAMIC_SLOTS: usize = 16;
 
-/// Initial total arena capacity (preallocated + dynamic)
-pub const ARENA_INITIAL_CAPACITY: usize = ARENA_PREALLOCATED_SLOTS + ARENA_DYNAMIC_SLOTS;
-
 /// Maximum arena capacity before overflow requests are not cached
-pub const ARENA_MAX_CAPACITY: usize = 256;
+pub const ARENA_MAX_CAPACITY: usize = 1024;
 
 /// Size of preallocated data regions in bytes
-pub const PREALLOCATED_DATA_SIZE: usize = 4096;
+/// TODO: Changing this value can significantly impact performance maybe should be tunable at runtime?
+pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 
 // =============================================================================
 // Slot State Constants
@@ -160,8 +154,8 @@ impl BlkIoArena {
 
         // Create uninitialized storage arrays
         // SAFETY: We will initialize each slot before use
-        let preallocated_slots: [UnsafeCell<MaybeUninit<PreallocatedSlot>>; ARENA_PREALLOCATED_SLOTS] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+        let preallocated_slots: [UnsafeCell<MaybeUninit<PreallocatedSlot>>;
+            ARENA_PREALLOCATED_SLOTS] = unsafe { MaybeUninit::uninit().assume_init() };
         let dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
@@ -170,7 +164,8 @@ impl BlkIoArena {
             let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
             let header_phys = virt_to_phys(header_va)?;
 
-            let data_va = allocate_auto_kernel_range_mapped(PREALLOCATED_DATA_SIZE as u64, flags).ok()?;
+            let data_va =
+                allocate_auto_kernel_range_mapped(PREALLOCATED_DATA_SIZE as u64, flags).ok()?;
             let data_phys = virt_to_phys(data_va)?;
 
             let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
@@ -307,13 +302,15 @@ impl BlkIoArena {
             ) {
                 Ok(_) => {
                     // Successfully claimed slot
-                    self.preallocated_hint.store(bit_idx.wrapping_add(1), Ordering::Relaxed);
+                    self.preallocated_hint
+                        .store(bit_idx.wrapping_add(1), Ordering::Relaxed);
 
                     // Update slot state with new generation
                     let slot = self.get_preallocated_slot(bit_idx);
                     let old_state = slot.state.load(Ordering::Acquire);
                     let new_gen = unpack_generation(old_state).wrapping_add(1);
-                    slot.state.store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
+                    slot.state
+                        .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
 
                     return Some(BlkIoRequestHandle::Preallocated {
                         arena: self,
@@ -349,22 +346,25 @@ impl BlkIoArena {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    self.dynamic_hint.store(bit_idx.wrapping_add(1), Ordering::Relaxed);
+                    self.dynamic_hint
+                        .store(bit_idx.wrapping_add(1), Ordering::Relaxed);
 
                     let slot = self.get_dynamic_slot(bit_idx);
 
                     // Allocate data buffer on demand
-                    let flags =
-                        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+                    let flags = PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::NO_CACHE;
                     let data_pages = ((data_len as u64) + 4095) & !4095;
-                    let data_va = match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
-                        Ok(va) => va,
-                        Err(_) => {
-                            // Failed to allocate data buffer, return slot to pool
-                            self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
-                            return None;
-                        }
-                    };
+                    let data_va =
+                        match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
+                            Ok(va) => va,
+                            Err(_) => {
+                                // Failed to allocate data buffer, return slot to pool
+                                self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
+                                return None;
+                            }
+                        };
                     let data_phys = match virt_to_phys(data_va) {
                         Some(p) => p,
                         None => {
@@ -383,7 +383,8 @@ impl BlkIoArena {
                     // Update generation
                     let old_state = slot.state.load(Ordering::Acquire);
                     let new_gen = unpack_generation(old_state).wrapping_add(1);
-                    slot.state.store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
+                    slot.state
+                        .store(pack_slot_state(new_gen, SLOT_IN_USE), Ordering::Release);
 
                     return Some(BlkIoRequestHandle::Dynamic {
                         arena: self,
@@ -427,7 +428,8 @@ impl BlkIoArena {
         }
 
         // Mark slot as free (keep generation for ABA detection)
-        slot.state.store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
+        slot.state
+            .store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
 
         // Return to free pool by setting bit
         let mask = 1u64 << idx;
@@ -470,7 +472,8 @@ impl BlkIoArena {
         }
 
         // Mark free and return to pool
-        slot.state.store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
+        slot.state
+            .store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
 
         let mask = 1u64 << idx;
         self.dynamic_bitmap.fetch_or(mask, Ordering::Release);
@@ -509,12 +512,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn header_va(&self) -> VirtAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).header_va
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
-                arena.get_dynamic_slot(*slot_idx as usize).header_va
-            }
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).header_va,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => arena.get_dynamic_slot(*slot_idx as usize).header_va,
             Self::Overflow(req) => req.header_va,
         }
     }
@@ -523,12 +526,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn header_phys(&self) -> PhysAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).header_phys
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
-                arena.get_dynamic_slot(*slot_idx as usize).header_phys
-            }
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).header_phys,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => arena.get_dynamic_slot(*slot_idx as usize).header_phys,
             Self::Overflow(req) => req.header_phys,
         }
     }
@@ -537,10 +540,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn data_va(&self) -> VirtAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).data_va
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).data_va,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
                 let slot = arena.get_dynamic_slot(*slot_idx as usize);
                 VirtAddr::new(slot.data_va.load(Ordering::Acquire))
             }
@@ -552,10 +557,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn data_phys(&self) -> PhysAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).data_phys
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).data_phys,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
                 let slot = arena.get_dynamic_slot(*slot_idx as usize);
                 PhysAddr::new(slot.data_phys.load(Ordering::Acquire))
             }
@@ -568,7 +575,9 @@ impl<'a> BlkIoRequestHandle<'a> {
     pub fn data_len(&self) -> u32 {
         match self {
             Self::Preallocated { data_len, .. } => *data_len,
-            Self::Dynamic { arena, slot_idx, .. } => {
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => {
                 let slot = arena.get_dynamic_slot(*slot_idx as usize);
                 slot.data_len.load(Ordering::Acquire)
             }
@@ -580,12 +589,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn status_va(&self) -> VirtAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).status_va
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
-                arena.get_dynamic_slot(*slot_idx as usize).status_va
-            }
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).status_va,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => arena.get_dynamic_slot(*slot_idx as usize).status_va,
             Self::Overflow(req) => req.status_va,
         }
     }
@@ -594,12 +603,12 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn status_phys(&self) -> PhysAddr {
         match self {
-            Self::Preallocated { arena, slot_idx, .. } => {
-                arena.get_preallocated_slot(*slot_idx as usize).status_phys
-            }
-            Self::Dynamic { arena, slot_idx, .. } => {
-                arena.get_dynamic_slot(*slot_idx as usize).status_phys
-            }
+            Self::Preallocated {
+                arena, slot_idx, ..
+            } => arena.get_preallocated_slot(*slot_idx as usize).status_phys,
+            Self::Dynamic {
+                arena, slot_idx, ..
+            } => arena.get_dynamic_slot(*slot_idx as usize).status_phys,
             Self::Overflow(req) => req.status_phys,
         }
     }
@@ -629,7 +638,10 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn data_slice(&self) -> &[u8] {
         unsafe {
-            core::slice::from_raw_parts(self.data_va().as_u64() as *const u8, self.data_len() as usize)
+            core::slice::from_raw_parts(
+                self.data_va().as_u64() as *const u8,
+                self.data_len() as usize,
+            )
         }
     }
 
@@ -637,7 +649,10 @@ impl<'a> BlkIoRequestHandle<'a> {
     #[inline]
     pub fn data_slice_mut(&mut self) -> &mut [u8] {
         unsafe {
-            core::slice::from_raw_parts_mut(self.data_va().as_u64() as *mut u8, self.data_len() as usize)
+            core::slice::from_raw_parts_mut(
+                self.data_va().as_u64() as *mut u8,
+                self.data_len() as usize,
+            )
         }
     }
 
