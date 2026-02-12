@@ -674,44 +674,51 @@ async fn bench_reads_with_inflight(
     // Main benchmark loop: submit requests up to inflight limit, drain completions
     while completed_count < BENCH_REQUEST_COUNT {
         // Submit new requests until we hit the inflight limit or total count
-        while pending.len() < inflight && submitted_count < BENCH_REQUEST_COUNT {
-            let sector = start_sector + (submitted_count as u64 * sectors_per_request as u64);
+        // Batch submissions and notify once per batch to reduce MMIO overhead
+        let batch_start_tsc = rdtsc();
+        let mut batch_submitted = 0usize;
+        {
+            let mut vq = inner.requestq.lock();
+            let avail_idx_before = vq.avail_idx();
 
-            // Allocate request from arena
-            let io_req = match inner.request_arena.new_request(
-                blk::VIRTIO_BLK_T_IN,
-                sector,
-                BENCH_REQUEST_SIZE,
-            ) {
-                Some(r) => r,
-                None => {
-                    // Arena exhausted, wait for completions
-                    break;
-                }
-            };
+            while pending.len() < inflight && submitted_count < BENCH_REQUEST_COUNT {
+                let sector = start_sector + (submitted_count as u64 * sectors_per_request as u64);
 
-            // Record start time and submit
-            let start_tsc = rdtsc();
-            let head = {
-                let mut vq = inner.requestq.lock();
-                match io_req.submit(&mut vq, false) {
-                    Some(h) => {
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        h
+                // Allocate request from arena
+                let io_req = match inner.request_arena.new_request(
+                    blk::VIRTIO_BLK_T_IN,
+                    sector,
+                    BENCH_REQUEST_SIZE,
+                ) {
+                    Some(r) => r,
+                    None => {
+                        // Arena exhausted, wait for completions
+                        break;
                     }
+                };
+
+                // Submit without notifying yet
+                let head = match io_req.submit(&mut vq, false) {
+                    Some(h) => h,
                     None => {
                         // Queue full, wait for completions
                         break;
                     }
-                }
-            };
+                };
 
-            pending.push(PendingBenchRequest {
-                head,
-                start_tsc,
-                _request: io_req,
-            });
-            submitted_count += 1;
+                pending.push(PendingBenchRequest {
+                    head,
+                    start_tsc: batch_start_tsc,
+                    _request: io_req,
+                });
+                submitted_count += 1;
+                batch_submitted += 1;
+            }
+
+            // Single notify after the batch if we submitted anything and queue needs it
+            if batch_submitted > 0 && vq.needs_notify(avail_idx_before) {
+                vq.notify(inner.notify_base, inner.notify_off_multiplier);
+            }
         }
 
         // Drain completions
@@ -779,8 +786,12 @@ async fn bench_reads_with_inflight(
     Ok(result)
 }
 
+/// Sectors consumed by a single benchmark run (100 MiB / 512 bytes).
+const BENCH_SECTORS_PER_RUN: u64 = BENCH_TOTAL_BYTES / 512;
+
 /// Run a benchmark sweep across multiple inflight levels.
 /// Tests power-of-two levels from 1 to 1024, clamped by hardware capacity.
+/// Each level reads from a different disk region to avoid host/page cache hits.
 async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStatus> {
     const LEVELS: [usize; BENCH_MAX_LEVELS] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
 
@@ -796,8 +807,9 @@ async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStat
 
     let mut result = BenchSweepResult::default();
 
-    // Use sector 0 as starting point for benchmark reads
-    let start_sector: u64 = 0;
+    // Each level uses a different starting sector to avoid host/page cache hits.
+    // This ensures we're measuring actual storage/virtio performance, not cached reads.
+    let mut current_sector: u64 = 0;
 
     for &level in LEVELS.iter() {
         // Clamp level to max supported
@@ -812,11 +824,14 @@ async fn bench_sweep(inner: &DevExtInner) -> Result<BenchSweepResult, DriverStat
             }
         }
 
-        // Run benchmark for this level
-        let level_result = bench_reads_with_inflight(inner, start_sector, clamped_level).await?;
+        // Run benchmark for this level with unique disk region
+        let level_result = bench_reads_with_inflight(inner, current_sector, clamped_level).await?;
 
         result.levels[result.used as usize] = level_result;
         result.used += 1;
+
+        // Advance to next region for the next level to avoid cache hits
+        current_sector += BENCH_SECTORS_PER_RUN;
 
         // Stop if we've hit the cap
         if clamped_level >= max_supported {

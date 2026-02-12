@@ -150,7 +150,7 @@ impl BlkIoArena {
     /// Initialize the arena, allocating all DMA buffers upfront.
     /// Returns None if DMA allocation fails.
     pub fn init() -> Option<Self> {
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         // Create uninitialized storage arrays
         // SAFETY: We will initialize each slot before use
@@ -352,9 +352,7 @@ impl BlkIoArena {
                     let slot = self.get_dynamic_slot(bit_idx);
 
                     // Allocate data buffer on demand
-                    let flags = PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::NO_CACHE;
+                    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
                     let data_pages = ((data_len as u64) + 4095) & !4095;
                     let data_va =
                         match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
@@ -884,7 +882,7 @@ impl BlkIoRequest {
     /// `sector` is the starting 512-byte sector.
     /// `data_len` is the number of bytes to transfer (must be sector-aligned).
     pub fn new(req_type: u32, sector: u64, data_len: u32) -> Option<Self> {
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
         let header_phys = virt_to_phys(header_va)?;
@@ -923,7 +921,7 @@ impl BlkIoRequest {
     /// Internal allocation without header initialization (used by arena overflow).
     /// Header must be set separately via BlkIoRequestHandle::set_header.
     pub(crate) fn new_internal(data_len: u32) -> Option<Self> {
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
         let header_phys = virt_to_phys(header_va)?;

@@ -79,7 +79,7 @@ impl Virtqueue {
         let size = cmp::min(max_size, 256);
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
         let desc_bytes = align_up(size as u64 * 16, 4096);
         let desc_va = allocate_auto_kernel_range_mapped_contiguous(desc_bytes, flags).ok()?;
@@ -226,6 +226,22 @@ impl Virtqueue {
         // Ensure avail ring updates are visible before the MMIO notify.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { core::ptr::write_volatile(addr, self.idx) };
+    }
+
+    /// Check if the queue needs a notification after adding descriptors.
+    /// Returns true if the queue was empty before the current batch of submissions.
+    /// This allows batching multiple submissions with a single notify.
+    pub fn needs_notify(&self, avail_idx_before_batch: u16) -> bool {
+        // Notify if the queue transitioned from empty to non-empty.
+        // The queue was "empty" if avail_idx == last_used_idx before we started submitting.
+        avail_idx_before_batch == self.last_used_idx
+    }
+
+    /// Get the current available ring index. Use this before a batch of submissions
+    /// to determine if a notify is needed afterward.
+    pub fn avail_idx(&self) -> u16 {
+        let avail_base = self.avail_va.as_u64() as *const u16;
+        unsafe { core::ptr::read_volatile(avail_base.add(1)) }
     }
 
     /// Pop completed entries from the used ring.
