@@ -9,9 +9,9 @@ use core::task::{Context, Poll, Waker};
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::util::{get_current_cpu_id, get_current_lapic_id};
 use kernel_api::x86_64::VirtAddr;
-use spin::mutex::SpinMutex;
 use spin::{Mutex, Once};
 
 use crate::blk::BlkIoArena;
@@ -31,7 +31,8 @@ pub enum QueueSelectionStrategy {
 /// Per-queue state: queue, arena, and IRQ handle.
 pub struct QueueState {
     /// The virtqueue for this request queue.
-    pub queue: SpinMutex<Virtqueue>,
+    /// Uses AsyncMutex for better async contention handling on the submission path.
+    pub queue: AsyncMutex<Virtqueue>,
     /// Pre-allocated arena for this queue's BlkIoRequest slots.
     pub arena: BlkIoArena,
     /// Maximum safe data payload per request on this queue (512-byte aligned).
@@ -59,9 +60,8 @@ impl QueueState {
     #[inline]
     fn vq_ref(&self) -> &Virtqueue {
         // SAFETY: We're only accessing atomic fields through immutable references.
-        // The Mutex ensures exclusive access for mutable operations (push_chain, free_chain).
-        // spin::Mutex stores data inline, so we can get a pointer to the inner data.
-        unsafe { &*self.queue.as_mut_ptr() }
+        // The AsyncMutex ensures exclusive access for mutable operations (push_chain, free_chain).
+        unsafe { &*self.queue.as_ptr() }
     }
 
     /// Get the current drain epoch (lock-free).

@@ -25,6 +25,7 @@ use kernel_api::irq::{
     IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
     irq_wait_ok,
 };
+use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::request::RequestData;
@@ -39,7 +40,6 @@ use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::Mutex;
-use spin::mutex::SpinMutex;
 
 use blk::{
     BlkIoArena, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, calculate_per_queue_arena_sizes,
@@ -432,7 +432,10 @@ async fn virtio_pnp_start<'a, 'b>(
                     if let Some(vec) = qs.msix_vector {
                         let _ = irq_free_vector(vec);
                     }
-                    qs.queue.lock().destroy();
+                    qs.queue
+                        .try_lock()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
                 }
                 // Clean up remaining MSI-X allocations
                 for alloc in msix_allocations.iter().skip(i) {
@@ -480,7 +483,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         queue_states.push(QueueState {
-            queue: SpinMutex::new(vq),
+            queue: AsyncMutex::new(vq),
             arena,
             max_request_bytes,
             max_data_segments: max_data_segments as u16,
@@ -496,7 +499,7 @@ async fn virtio_pnp_start<'a, 'b>(
         unsafe {
             pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, idx as u16);
         }
-        let vq = qs.queue.lock();
+        let vq = qs.queue.try_lock().expect("queue not locked during init");
         vq.enable(caps.common_cfg);
     }
 
@@ -517,7 +520,10 @@ async fn virtio_pnp_start<'a, 'b>(
             if let Some(vec) = qs.msix_vector {
                 let _ = irq_free_vector(vec);
             }
-            qs.queue.lock().destroy();
+            qs.queue
+                .try_lock()
+                .expect("queue not locked during cleanup")
+                .destroy();
         }
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unmap_mmio_region(va, sz);
@@ -592,7 +598,10 @@ async fn virtio_pnp_remove<'a, 'b>(
 
                 // Destroy virtqueue
                 {
-                    let vq = qs.queue.lock();
+                    let vq = qs
+                        .queue
+                        .try_lock()
+                        .expect("queue not locked during cleanup");
                     vq.destroy();
                 }
 
@@ -816,7 +825,7 @@ fn rdtsc() -> u64 {
 // =============================================================================
 
 /// Total data to transfer per benchmark run.
-const BENCH_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const BENCH_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 struct BenchConfig {
     /// Target payload size per request (512-byte aligned, fits any queue).
@@ -828,7 +837,7 @@ struct BenchConfig {
 impl BenchConfig {
     fn from_inner(inner: &DevExtInner) -> Self {
         // Use the most conservative per-queue limit so every queue can service the request size.
-        let request_size = 16 * 1024 * 1024;
+        let request_size = 1016 * 1024;
 
         let requests_per_run =
             ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64).max(1) as u32;
@@ -1017,7 +1026,10 @@ async fn bench_sweep(
     pdo: Arc<DeviceObject>,
     inner: &DevExtInner,
 ) -> Result<BenchSweepResult, DriverStatus> {
-    let levels: [usize; _] = [1, 2, 4, 8, 12, 14, 128, 256, 512, 1024];
+    let levels: [usize; _] = [
+        1,
+        //2, 4, 8, 16, 32
+    ];
 
     let bench_cfg = BenchConfig::from_inner(inner);
     let max_supported = bench_cfg.requests_per_run as usize;
@@ -1028,7 +1040,7 @@ async fn bench_sweep(
 
     // Each level uses a different starting sector to avoid host/page cache hits.
     // This ensures we're measuring actual storage/virtio performance, not cached reads.
-    let mut current_sector: u64 = 0;
+    let mut current_sector: u16 = 0;
 
     for &level in levels.iter() {
         // Clamp level to max supported
@@ -1047,7 +1059,7 @@ async fn bench_sweep(
         let level_result = bench_reads_with_inflight(
             pdo.clone(),
             inner,
-            current_sector,
+            current_sector as u64,
             clamped_level,
             &bench_cfg,
         )
@@ -1057,7 +1069,7 @@ async fn bench_sweep(
         result.used += 1;
 
         // Advance to next region for the next level to avoid cache hits
-        current_sector = current_sector.saturating_add(sectors_per_run);
+        current_sector = current_sector.wrapping_add(sectors_per_run as u16);
 
         // Stop if we've hit the cap
         if clamped_level >= max_supported {
@@ -1228,7 +1240,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
             };
 
             let head = {
-                let mut vq = qs.queue.lock();
+                let mut vq = qs.queue.lock().await;
                 match io_req.submit(&mut vq, false) {
                     Some(h) => {
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
@@ -1368,7 +1380,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
             }
 
             let head = {
-                let mut vq = qs.queue.lock();
+                let mut vq = qs.queue.lock().await;
                 match io_req.submit(&mut vq, true) {
                     Some(h) => {
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);

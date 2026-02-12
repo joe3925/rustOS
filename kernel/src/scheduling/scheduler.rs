@@ -2,7 +2,9 @@ use crate::cpu;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
-use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER};
+use crate::drivers::timer_driver::{
+    PER_CORE_SWITCHES, TIMER, IDLE_TRACKING_ENABLED, IDLE_TIME_CYCLES, IDLE_SCHED_IN_CYCLES,
+};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
@@ -567,6 +569,14 @@ impl Scheduler {
         if let Some(prev) = previous {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
 
+            // Account idle time when leaving idle task
+            if prev_is_idle && IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
+                let idle_start = IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).swap(0, Ordering::Relaxed);
+                if idle_start > 0 && now_cycles > idle_start {
+                    IDLE_TIME_CYCLES.get_by_id(cpu_id).fetch_add(now_cycles - idle_start, Ordering::Relaxed);
+                }
+            }
+
             let mut lock_failed = false;
             if let Some(mut guard) = prev.inner.try_write() {
                 guard.save_fpu_state();
@@ -669,6 +679,11 @@ impl Scheduler {
             let mut guard = core.idle_task.inner.write();
             guard.restore_fpu_state();
             guard.mark_scheduled_in(cpu_id, now_cycles);
+        }
+
+        // Record idle start time if tracking is enabled
+        if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).store(now_cycles, Ordering::Relaxed);
         }
 
         sched_state.current = Some(core.idle_task.clone());
@@ -802,6 +817,14 @@ impl Scheduler {
         let now_cycles = cpu::get_cycles();
         if let Some(mut guard) = core.idle_task.inner.try_write() {
             guard.save_fpu_state();
+        }
+
+        // Account idle time when IPI wakes idle core
+        if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
+            let idle_start = IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).swap(0, Ordering::Relaxed);
+            if idle_start > 0 && now_cycles > idle_start {
+                IDLE_TIME_CYCLES.get_by_id(cpu_id).fetch_add(now_cycles - idle_start, Ordering::Relaxed);
+            }
         }
 
         let mut ipi_cand: Option<TaskHandle> = None;

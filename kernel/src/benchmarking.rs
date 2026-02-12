@@ -2705,6 +2705,7 @@ const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 /// Run a benchmark sweep on the VirtIO disk, testing different inflight levels.
 /// Results are printed in milliseconds.
 pub async fn bench_virtio_disk_sweep() {
+    use crate::drivers::timer_driver::{idle_tracking_start, idle_tracking_stop};
     use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
     use kernel_types::request::{RequestData, RequestHandle, RequestType};
     use kernel_types::status::DriverStatus;
@@ -2719,12 +2720,19 @@ pub async fn bench_virtio_disk_sweep() {
 
     println!("[virtio-bench] Starting benchmark sweep on VirtIO disk...");
 
+    // Start idle time tracking
+    idle_tracking_start();
+
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
         RequestData::empty(),
     );
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = PNP_MANAGER.send_request(target, &mut req).await;
+
+    // Stop idle tracking and get result
+    let idle_pct = idle_tracking_stop();
+
     if status != DriverStatus::Success {
         println!("[virtio-bench] IOCTL failed: {:?}", status);
         return;
@@ -2774,12 +2782,14 @@ pub async fn bench_virtio_disk_sweep() {
         );
     }
 
+    println!("[virtio-bench] Aggregate CPU Idle: {:.2}%", idle_pct);
     println!("[virtio-bench] Benchmark complete.");
 }
 
 /// Run a benchmark sweep on the VirtIO disk using polling mode (no IRQ waits).
 /// Results are printed in milliseconds.
 pub async fn bench_virtio_disk_sweep_polling() {
+    use crate::drivers::timer_driver::{idle_tracking_start, idle_tracking_stop};
     use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
     use kernel_types::request::{RequestData, RequestHandle, RequestType};
     use kernel_types::status::DriverStatus;
@@ -2794,12 +2804,19 @@ pub async fn bench_virtio_disk_sweep_polling() {
 
     println!("[virtio-bench-poll] Starting polling mode benchmark sweep on VirtIO disk...");
 
+    // Start idle time tracking
+    idle_tracking_start();
+
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
         RequestData::empty(),
     );
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = PNP_MANAGER.send_request(target, &mut req).await;
+
+    // Stop idle tracking and get result
+    let idle_pct = idle_tracking_stop();
+
     if status != DriverStatus::Success {
         println!("[virtio-bench-poll] IOCTL failed: {:?}", status);
         return;
@@ -2849,6 +2866,7 @@ pub async fn bench_virtio_disk_sweep_polling() {
         );
     }
 
+    println!("[virtio-bench-poll] Aggregate CPU Idle: {:.2}%", idle_pct);
     println!("[virtio-bench-poll] Benchmark complete.");
 }
 

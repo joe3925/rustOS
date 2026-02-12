@@ -69,6 +69,14 @@ impl<T> AsyncMutex<T> {
         }
     }
 
+    /// Returns a raw pointer to the underlying data.
+    /// SAFETY: Caller must ensure proper synchronization. Only use this for
+    /// accessing fields that are already atomic/thread-safe.
+    #[inline]
+    pub fn as_ptr(&self) -> *mut T {
+        self.data.get()
+    }
+
     pub fn try_lock(&self) -> Option<AsyncMutexGuard<'_, T>> {
         if self
             .locked

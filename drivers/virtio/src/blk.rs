@@ -16,20 +16,20 @@ use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 4096);
 
 /// Number of preallocated slots with 4KB data regions (common I/O size)
-pub const ARENA_PREALLOCATED_SLOTS: usize = 1024;
+pub const ARENA_PREALLOCATED_SLOTS: usize = 64;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 128;
+pub const ARENA_DYNAMIC_SLOTS: usize = 0;
 
 /// Maximum arena capacity before overflow requests are not cached
-pub const ARENA_MAX_CAPACITY: usize = 2048;
+pub const ARENA_MAX_CAPACITY: usize = 64;
 
 /// Number of u64 bitmap words needed to track all arena slots
 pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
 /// TODO: Changing this value can significantly impact performance maybe should be tunable at runtime?
-pub const PREALLOCATED_DATA_SIZE: usize = 16 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 1016 * 1024;
 
 // =============================================================================
 // Slot State Constants
