@@ -1739,47 +1739,44 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
 }
 
 #[inline(always)]
-fn ms_fixed_3(micros: u64) -> (u64, u16) {
-    let ms = micros / 1_000;
-    let frac = (micros % 1_000) as u16;
-    (ms, frac)
+fn micros_to_ms(micros: u64) -> f64 {
+    micros as f64 / 1000.0
 }
 
 #[inline(always)]
-fn div_u64_round(n: u64, d: u64) -> u64 {
-    if d == 0 {
-        return 0;
+fn avg_micros_per(total_micros: u64, count: u64) -> f64 {
+    if count == 0 {
+        0.0
+    } else {
+        total_micros as f64 / count as f64
     }
-    (n + (d / 2)) / d
 }
 
 #[inline(always)]
-fn div_u128_round(n: u128, d: u128) -> u128 {
-    if d == 0 {
-        return 0;
+fn nanos_per_call(total_micros: u64, call_count: u64) -> f64 {
+    if call_count == 0 {
+        0.0
+    } else {
+        (total_micros as f64 * 1000.0) / call_count as f64
     }
-    (n + (d / 2)) / d
 }
 
 #[inline(always)]
-fn sub_i64(a: u64, b: u64) -> i64 {
-    a as i64 - b as i64
-}
-
-#[inline(always)]
-fn ratio_1e3(num: u64, den: u64) -> u64 {
+fn safe_ratio(num: u64, den: u64) -> f64 {
     if den == 0 {
-        return 0;
+        0.0
+    } else {
+        num as f64 / den as f64
     }
-    div_u128_round((num as u128) * 1000u128, den as u128) as u64
 }
 
 #[inline(always)]
-fn frac_1e3(part: i64, whole: u64) -> i64 {
-    if whole == 0 {
-        return 0;
+fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
+    if total_micros == 0 {
+        0.0
+    } else {
+        total_ops as f64 * 1_000_000.0 / total_micros as f64
     }
-    ((part as i128) * 1000i128 / (whole as i128)) as i64
 }
 
 pub async fn bench_async_vs_sync_call_latency_async() {
@@ -1837,74 +1834,72 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     let iters_u64 = ITERS as u64;
     let inner_calls_u64 = (ITERS as u64) * (DEPTH as u64);
 
-    let sync_us_per_chain = div_u64_round(sync_us, iters_u64);
-    let async_us_per_chain = div_u64_round(async_us, iters_u64);
-    let blk_us_per_chain = div_u64_round(blk_us, iters_u64);
+    let sync_us_per_chain = avg_micros_per(sync_us, iters_u64);
+    let async_us_per_chain = avg_micros_per(async_us, iters_u64);
+    let blk_us_per_chain = avg_micros_per(blk_us, iters_u64);
 
-    let sync_ns_per_inner =
-        div_u128_round((sync_us as u128) * 1000u128, inner_calls_u64 as u128) as u64;
-    let async_ns_per_inner =
-        div_u128_round((async_us as u128) * 1000u128, inner_calls_u64 as u128) as u64;
+    let sync_ns_per_inner = nanos_per_call(sync_us, inner_calls_u64);
+    let async_ns_per_inner = nanos_per_call(async_us, inner_calls_u64);
 
-    let (sync_ms, sync_ms_frac) = ms_fixed_3(sync_us);
-    let (async_ms, async_ms_frac) = ms_fixed_3(async_us);
-    let (blk_ms, blk_ms_frac) = ms_fixed_3(blk_us);
+    let sync_ms = micros_to_ms(sync_us);
+    let async_ms = micros_to_ms(async_us);
+    let blk_ms = micros_to_ms(blk_us);
 
-    let (q_ms, q_ms_frac) = ms_fixed_3(q_us);
-    let q_us_per_task = div_u64_round(q_us, BLOCK_TASKS as u64);
+    let q_ms = micros_to_ms(q_us);
+    let q_us_per_task = avg_micros_per(q_us, BLOCK_TASKS as u64);
 
     println!("[bench] iters={} depth={}", ITERS, DEPTH);
     println!(
-        "[bench] sync:  total={} .{:03} ms  us/chain={}  ns/inner_call={}",
-        sync_ms, sync_ms_frac, sync_us_per_chain, sync_ns_per_inner
+        "[bench] sync:  total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
+        sync_ms, sync_us_per_chain, sync_ns_per_inner
     );
     println!(
-        "[bench] async: total={} .{:03} ms  us/chain={}  ns/inner_call={}",
-        async_ms, async_ms_frac, async_us_per_chain, async_ns_per_inner
+        "[bench] async: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
+        async_ms, async_us_per_chain, async_ns_per_inner
     );
     println!(
-        "[bench] blk:   total={} .{:03} ms  us/chain={}",
-        blk_ms, blk_ms_frac, blk_us_per_chain
+        "[bench] blk:   total={:.3} ms  us/chain={:.3}",
+        blk_ms, blk_us_per_chain
     );
     println!(
-        "[bench] blkq:  tasks={} total={} .{:03} ms  us/task={}",
-        BLOCK_TASKS, q_ms, q_ms_frac, q_us_per_task
+        "[bench] blkq:  tasks={} total={:.3} ms  us/task={:.3}",
+        BLOCK_TASKS, q_ms, q_us_per_task
     );
 
     // Everything relative to sync baseline
-    let sm_vs_sync = ratio_1e3(async_us, sync_us);
-    let blk_vs_sync = ratio_1e3(blk_us, sync_us);
-    let blk_vs_blkq = ratio_1e3(blk_us, q_us);
+    let sm_vs_sync = safe_ratio(async_us, sync_us);
+    let blk_vs_sync = safe_ratio(blk_us, sync_us);
+    let blk_vs_blkq = safe_ratio(blk_us, q_us);
 
     // Isolate pure overhead costs (us per chain, relative to sync)
-    let sm_overhead_us = sub_i64(async_us_per_chain, sync_us_per_chain);
-    let blk_overhead_us = sub_i64(blk_us_per_chain, sync_us_per_chain);
+    let sm_overhead_us = async_us_per_chain - sync_us_per_chain;
+    let blk_overhead_us = blk_us_per_chain - sync_us_per_chain;
     // pending+wake = blk - async (the spawn/wake cost on top of state machine)
-    let pw_overhead_us = sub_i64(blk_us_per_chain, async_us_per_chain);
+    let pw_overhead_us = blk_us_per_chain - async_us_per_chain;
 
     println!("[bench] --- vs sync baseline ---");
     println!(
-        "[bench] state_machine/sync  = {}.{:03}x  (async overhead: {} us/chain)",
-        sm_vs_sync / 1000,
-        sm_vs_sync % 1000,
+        "[bench] state_machine/sync  = {:.3}x  (async overhead: {:.3} us/chain)",
+        sm_vs_sync,
         sm_overhead_us
     );
     println!(
-        "[bench] blk/sync            = {}.{:03}x  (spawn+wake+sm overhead: {} us/chain)",
-        blk_vs_sync / 1000,
-        blk_vs_sync % 1000,
+        "[bench] blk/sync            = {:.3}x  (spawn+wake+sm overhead: {:.3} us/chain)",
+        blk_vs_sync,
         blk_overhead_us
     );
-    let pw_vs_sync = ratio_1e3(blk_us_per_chain, async_us_per_chain);
+    let pw_vs_sync = if async_us_per_chain == 0.0 {
+        0.0
+    } else {
+        blk_us_per_chain / async_us_per_chain
+    };
     println!(
-        "[bench] pending+wake/sync   = {}.{:03}x  (blk/async, pure spawn+wake cost)",
-        pw_vs_sync / 1000,
-        pw_vs_sync % 1000
+        "[bench] pending+wake/sync   = {:.3}x  (blk/async, pure spawn+wake cost)",
+        pw_vs_sync
     );
     println!(
-        "[bench] blk/blkq            = {}.{:03}x  (sequential blocking vs bulk queue)",
-        blk_vs_blkq / 1000,
-        blk_vs_blkq % 1000
+        "[bench] blk/blkq            = {:.3}x  (sequential blocking vs bulk queue)",
+        blk_vs_blkq
     );
 }
 
@@ -1989,7 +1984,7 @@ pub async fn bench_realistic_traffic_async() {
         TRAFFIC_TOTAL_TASKS, TRAFFIC_WORK_NS, TRAFFIC_ASYNC_DEPTH
     );
     println!(
-        "[traffic] {:>6} {:>10} {:>10} {:>10} {:>10}",
+        "[traffic] {:>6} {:>12} {:>12} {:>12} {:>10}",
         "conc", "total_ms", "us/task", "ops/s", "vs_seq"
     );
 
@@ -2004,17 +1999,13 @@ pub async fn bench_realistic_traffic_async() {
         black_box(traffic_one_request(i).await);
     }
     let seq_us = sw_seq.elapsed_micros();
-    let seq_us_per_task = div_u64_round(seq_us, TRAFFIC_TOTAL_TASKS as u64);
-    let seq_ops_sec = if seq_us == 0 {
-        0
-    } else {
-        (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / seq_us as u128) as u64
-    };
-    let (seq_ms, seq_ms_frac) = ms_fixed_3(seq_us);
+    let seq_us_per_task = avg_micros_per(seq_us, TRAFFIC_TOTAL_TASKS as u64);
+    let seq_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, seq_us);
+    let seq_ms = micros_to_ms(seq_us);
 
     println!(
-        "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {:>10}",
-        1, seq_ms, seq_ms_frac, seq_us_per_task, seq_ops_sec, "1.000x"
+        "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9}",
+        1, seq_ms, seq_us_per_task, seq_ops_sec, "1.000x"
     );
 
     // Concurrent: spawn N tasks at a time, process in waves
@@ -2047,24 +2038,18 @@ pub async fn bench_realistic_traffic_async() {
         let _results = JoinAll::new(all_joins).await;
 
         let conc_us = sw.elapsed_micros();
-        let conc_us_per_task = div_u64_round(conc_us, TRAFFIC_TOTAL_TASKS as u64);
-        let conc_ops_sec = if conc_us == 0 {
-            0
-        } else {
-            (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / conc_us as u128) as u64
-        };
-        let (conc_ms, conc_ms_frac) = ms_fixed_3(conc_us);
-        let speedup = ratio_1e3(seq_us, conc_us);
+        let conc_us_per_task = avg_micros_per(conc_us, TRAFFIC_TOTAL_TASKS as u64);
+        let conc_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, conc_us);
+        let conc_ms = micros_to_ms(conc_us);
+        let speedup = safe_ratio(seq_us, conc_us);
 
         println!(
-            "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
+            "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
             conc,
             conc_ms,
-            conc_ms_frac,
             conc_us_per_task,
             conc_ops_sec,
-            speedup / 1000,
-            speedup % 1000
+            speedup
         );
     }
 
@@ -2095,24 +2080,18 @@ pub async fn bench_realistic_traffic_async() {
         let _results = JoinAll::new(batch_joins).await;
 
         let bulk_us = sw.elapsed_micros();
-        let bulk_us_per_task = div_u64_round(bulk_us, TRAFFIC_TOTAL_TASKS as u64);
-        let bulk_ops_sec = if bulk_us == 0 {
-            0
-        } else {
-            (TRAFFIC_TOTAL_TASKS as u128 * 1_000_000u128 / bulk_us as u128) as u64
-        };
-        let (bulk_ms, bulk_ms_frac) = ms_fixed_3(bulk_us);
-        let speedup = ratio_1e3(seq_us, bulk_us);
+        let bulk_us_per_task = avg_micros_per(bulk_us, TRAFFIC_TOTAL_TASKS as u64);
+        let bulk_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, bulk_us);
+        let bulk_ms = micros_to_ms(bulk_us);
+        let speedup = safe_ratio(seq_us, bulk_us);
 
         println!(
-            "[traffic] {:>6} {:>7}.{:03} {:>10} {:>10} {}.{:03}x",
+            "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
             bs,
             bulk_ms,
-            bulk_ms_frac,
             bulk_us_per_task,
             bulk_ops_sec,
-            speedup / 1000,
-            speedup % 1000
+            speedup
         );
     }
 }

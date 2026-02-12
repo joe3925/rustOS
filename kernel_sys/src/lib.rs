@@ -39,7 +39,7 @@ unsafe extern "win64" {
     pub fn wait_duration(time: Duration);
     pub fn get_rsdp() -> u64;
     pub unsafe fn get_current_cpu_id() -> usize;
-
+    pub unsafe fn get_current_lapic_id() -> usize;
     // Tasking
     pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
@@ -210,7 +210,9 @@ unsafe extern "win64" {
 
     // Routing FFI (sync - for kernel_routing crate)
     pub fn routing_resolve_path_to_device(path: &str) -> Option<IoTarget>;
-    pub fn routing_get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>>;
+    pub fn routing_get_stack_top_from_weak(
+        dev_node_weak: &Weak<DevNode>,
+    ) -> Option<Arc<DeviceObject>>;
 }
 
 #[repr(C)]

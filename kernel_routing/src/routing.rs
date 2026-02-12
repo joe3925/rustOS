@@ -53,10 +53,6 @@ fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceOb
     unsafe { kernel_sys::routing_get_stack_top_from_weak(dev_node_weak) }
 }
 
-// =============================================================================
-// Public API
-// =============================================================================
-
 /// Send a request to a target device.
 /// This is the main entry point for request routing.
 pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> DriverStatus {

@@ -2,17 +2,48 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::io::DiskInfo;
+use kernel_api::util::{get_current_cpu_id, get_current_lapic_id};
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once};
 
 use crate::blk::BlkIoArena;
 use crate::virtqueue::Virtqueue;
+
+/// Strategy for selecting which queue to use for I/O requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueSelectionStrategy {
+    /// Select queue based on current CPU ID (cpu_id % queue_count).
+    /// Best for cache locality when each CPU handles its own I/O.
+    CpuAffinity,
+    /// Round-robin across queues using atomic counter.
+    /// Best for load balancing when I/O is submitted from few CPUs.
+    RoundRobin,
+}
+
+/// Per-queue state: queue, arena, and IRQ handle.
+pub struct QueueState {
+    /// The virtqueue for this request queue.
+    pub queue: Mutex<Virtqueue>,
+    /// Pre-allocated arena for this queue's BlkIoRequest slots.
+    pub arena: BlkIoArena,
+    /// IRQ handle for this queue (MSI-X or shared legacy).
+    pub irq_handle: Option<IrqHandle>,
+    /// MSI-X vector number if MSI-X is being used for this queue.
+    pub msix_vector: Option<u8>,
+    /// MSI-X table entry index for this queue.
+    pub msix_table_index: Option<u16>,
+    /// Number of tasks currently waiting on this queue's interrupt.
+    pub waiting_tasks: AtomicU32,
+}
+
+unsafe impl Send for QueueState {}
+unsafe impl Sync for QueueState {}
 
 /// Device extension for the virtio-blk FDO.
 /// Initialized with empty values in device_add, populated in StartDevice.
@@ -30,22 +61,40 @@ pub struct DevExtInner {
     pub notify_off_multiplier: u32,
     pub isr_cfg: VirtAddr,
     pub device_cfg: VirtAddr,
-    pub requestq: Mutex<Virtqueue>,
-    /// Pre-allocated arena for BlkIoRequest slots (lock-free).
-    pub request_arena: BlkIoArena,
+    /// All request queues (index 0 is always present).
+    pub queues: Vec<QueueState>,
+    /// Number of queues actually in use.
+    pub queue_count: usize,
+    /// Queue selection strategy for I/O requests.
+    pub queue_strategy: QueueSelectionStrategy,
+    /// Round-robin counter (only used if strategy is RoundRobin).
+    pub rr_counter: AtomicUsize,
     pub capacity: u64,
-    pub irq_handle: Option<IrqHandle>,
     pub mapped_bars: Mutex<Vec<(u32, VirtAddr, u64)>>,
-    /// MSI-X vector number if MSI-X is being used, None for legacy/GSI IRQ.
-    pub msix_vector: Option<u8>,
-    /// MSI-X table entry programmed for the request queue (if MSI-X is active).
-    pub msix_table_index: Option<u16>,
     /// Base virtual address of the MSI-X Pending Bit Array region.
     pub msix_pba: Option<VirtAddr>,
     /// Gate that becomes ready when interrupt setup is complete and tested.
     pub irq_ready: InitGate,
-    /// Number of tasks currently waiting for the queue interrupt.
-    pub waiting_tasks: AtomicU32,
+}
+
+impl DevExtInner {
+    /// Select a queue for I/O based on the configured strategy.
+    /// Returns the queue index to use.
+    #[inline]
+    pub fn select_queue(&self) -> usize {
+        match self.queue_strategy {
+            QueueSelectionStrategy::CpuAffinity => get_current_lapic_id() % self.queue_count,
+            QueueSelectionStrategy::RoundRobin => {
+                self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.queue_count
+            }
+        }
+    }
+
+    /// Get a reference to a specific queue state.
+    #[inline]
+    pub fn get_queue(&self, idx: usize) -> &QueueState {
+        &self.queues[idx]
+    }
 }
 
 /// Device extension for the child disk PDO.

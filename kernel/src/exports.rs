@@ -7,8 +7,8 @@ use crate::idt::*;
 use crate::memory::paging::mmio::map_mmio_region;
 use crate::memory::paging::paging::identity_map_page;
 use crate::memory::paging::tables::virt_to_phys;
-use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
+use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped_contiguous;
 use crate::memory::paging::virt_tracker::allocate_kernel_range_mapped;
 use crate::memory::paging::virt_tracker::deallocate_kernel_range;
 use crate::memory::paging::virt_tracker::unmap_range;
@@ -48,6 +48,7 @@ export! {
     unmap_mmio_region,
     virt_to_phys,
     get_current_cpu_id,
+    get_current_lapic_id,
 
     kernel_alloc,
     kernel_free,

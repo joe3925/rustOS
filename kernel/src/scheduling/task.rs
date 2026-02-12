@@ -6,7 +6,7 @@ use crate::memory::paging::virt_tracker::{deallocate_kernel_range, unmap_range};
 use crate::scheduling::runtime;
 use crate::scheduling::runtime::runtime::{yield_now, BLOCKING_POOL, RUNTIME_POOL};
 use crate::scheduling::scheduler::{self, kernel_task_end, Scheduler, SCHEDULER};
-use crate::scheduling::state::{BlockReason, SchedState, State};
+use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::static_handlers::task_yield;
 use crate::structs::thread_pool::ThreadPool;
 use alloc::string::String;
@@ -160,6 +160,7 @@ impl TaskRef {
 pub struct Task {
     pub name: String,
     pub context: State,
+    pub fpu_state: FpuState,
     pub stack_start: u64,
     pub guard_page: u64,
     pub is_user_mode: bool,
@@ -210,6 +211,7 @@ impl Task {
         let inner_task = Task {
             name,
             context: state,
+            fpu_state: FpuState::default(),
             stack_start: stack_top,
             guard_page,
             is_user_mode: true,
@@ -269,6 +271,7 @@ impl Task {
         let inner_task = Task {
             name,
             context: state,
+            fpu_state: FpuState::default(),
             stack_start: stack_top_u64,
             guard_page,
             is_user_mode: false,
@@ -342,6 +345,16 @@ impl Task {
     #[inline(always)]
     pub fn last_cpu(&self) -> usize {
         self.last_cpu.load(Ordering::Relaxed)
+    }
+
+    #[inline(always)]
+    pub fn save_fpu_state(&mut self) {
+        self.fpu_state.save();
+    }
+
+    #[inline(always)]
+    pub fn restore_fpu_state(&mut self) {
+        self.fpu_state.restore();
     }
 }
 

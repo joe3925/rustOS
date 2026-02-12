@@ -79,6 +79,73 @@ impl BlockReason {
     }
 }
 
+#[repr(C, align(16))]
+#[derive(Debug, Clone)]
+pub struct FpuState {
+    area: [u8; 512],
+}
+
+impl FpuState {
+    /// Capture the default FX state while preserving the current CPU state.
+    pub fn new() -> Self {
+        let mut current = FpuState {
+            area: [0u8; 512],
+        };
+        let mut init = FpuState {
+            area: [0u8; 512],
+        };
+
+        unsafe {
+            asm!(
+                "fxsave [{}]",
+                in(reg) current.area.as_mut_ptr(),
+                options(nostack, preserves_flags)
+            );
+            asm!("fninit", options(nostack, preserves_flags));
+            asm!(
+                "fxsave [{}]",
+                in(reg) init.area.as_mut_ptr(),
+                options(nostack, preserves_flags)
+            );
+            asm!(
+                "fxrstor [{}]",
+                in(reg) current.area.as_ptr(),
+                options(nostack, preserves_flags)
+            );
+        }
+
+        init
+    }
+
+    #[inline(always)]
+    pub fn save(&mut self) {
+        unsafe {
+            asm!(
+                "fxsave [{}]",
+                in(reg) self.area.as_mut_ptr(),
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    #[inline(always)]
+    pub fn restore(&self) {
+        unsafe {
+            asm!(
+                "fxrstor [{}]",
+                in(reg) self.area.as_ptr(),
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+impl Default for FpuState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]

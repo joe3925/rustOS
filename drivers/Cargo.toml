@@ -16,7 +16,7 @@ members = [
 resolver = "2"
 
 [profile.dev]
-opt-level = 3
+opt-level = 1
 panic = "abort"
 lto = true
 codegen-units = 1

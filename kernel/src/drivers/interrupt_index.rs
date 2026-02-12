@@ -661,6 +661,7 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
 }
 
 extern "C" fn ap_startup() -> ! {
+    cpu::enable_sse();
     {
         CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();

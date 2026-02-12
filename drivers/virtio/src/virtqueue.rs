@@ -1,4 +1,4 @@
-use core::cmp;
+use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
@@ -57,7 +57,7 @@ pub struct Virtqueue {
     /// Completion status array indexed by descriptor head.
     /// - 0: not completed
     /// - non-zero: completed, value is (len + 1) to distinguish from "not completed"
-    completions: [AtomicU32; 256],
+    completions: Box<[AtomicU32]>,
 
     /// Single-drainer gate: true if a drain operation is in progress.
     /// Only one task should drain at a time to prevent thundering herd.
@@ -82,9 +82,8 @@ impl Virtqueue {
         if max_size == 0 {
             return None;
         }
-        // Keep the ring components within a single 4 KiB page; the allocator guarantees physical
-        // contiguity, and limiting the size keeps metadata compact.
-        let size = cmp::min(max_size, 256);
+        // Use the full queue size advertised by the device.
+        let size = max_size;
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
@@ -115,6 +114,11 @@ impl Virtqueue {
             }
         }
 
+        let completions = core::iter::repeat_with(|| AtomicU32::new(0))
+            .take(size as usize)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         // Cache the per-queue notify offset while this queue is selected.
         let queue_notify_off =
             unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_NOTIFY_OFF) };
@@ -141,7 +145,7 @@ impl Virtqueue {
             free_head: 0,
             num_free: size,
             last_used_idx: 0,
-            completions: core::array::from_fn(|_| AtomicU32::new(0)),
+            completions,
             draining: AtomicBool::new(false),
             drain_epoch: AtomicU64::new(0),
         })

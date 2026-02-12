@@ -543,9 +543,6 @@ impl Scheduler {
             }
         }
 
-        let runtime = RUNTIME_POOL.clone();
-        let _ = runtime.is_shutdown();
-
         let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(task) => task,
             None => return,
@@ -567,12 +564,27 @@ impl Scheduler {
 
         let previous = sched_state.current.take();
 
-        if let Some(ref prev) = previous {
-            if !Arc::ptr_eq(prev, &core.idle_task) {
-                if let Some(t) = prev.inner.try_read() {
-                    t.account_switched_out(now_cycles);
-                }
+        if let Some(prev) = previous {
+            let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
 
+            let mut lock_failed = false;
+            if let Some(mut guard) = prev.inner.try_write() {
+                guard.save_fpu_state();
+                if !prev_is_idle {
+                    guard.account_switched_out(now_cycles);
+                }
+            } else {
+                lock_failed = true;
+            }
+
+            if lock_failed {
+                sched_state.current = Some(prev.clone());
+                core.current_ptr
+                    .store(Arc::as_ptr(&prev) as *mut TaskRef, Ordering::Release);
+                return Some(prev);
+            }
+
+            if !prev_is_idle {
                 match prev.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
                         prev.set_sched_state(SchedState::Runnable);
@@ -638,8 +650,10 @@ impl Scheduler {
                 SchedState::Runnable | SchedState::Running => {
                     cand.set_sched_state(SchedState::Running);
 
-                    if let Some(t) = cand.inner.try_read() {
-                        t.mark_scheduled_in(cpu_id, now_cycles);
+                    {
+                        let mut guard = cand.inner.write();
+                        guard.restore_fpu_state();
+                        guard.mark_scheduled_in(cpu_id, now_cycles);
                     }
 
                     sched_state.current = Some(cand.clone());
@@ -651,8 +665,10 @@ impl Scheduler {
         }
 
         core.idle_task.set_sched_state(SchedState::Running);
-        if let Some(t) = core.idle_task.inner.try_read() {
-            t.mark_scheduled_in(cpu_id, now_cycles);
+        {
+            let mut guard = core.idle_task.inner.write();
+            guard.restore_fpu_state();
+            guard.mark_scheduled_in(cpu_id, now_cycles);
         }
 
         sched_state.current = Some(core.idle_task.clone());
@@ -784,6 +800,9 @@ impl Scheduler {
         }
 
         let now_cycles = cpu::get_cycles();
+        if let Some(mut guard) = core.idle_task.inner.try_write() {
+            guard.save_fpu_state();
+        }
 
         let mut ipi_cand: Option<TaskHandle> = None;
         loop {
@@ -806,8 +825,10 @@ impl Scheduler {
         let next = if let Some(cand) = ipi_cand {
             cand.set_sched_state(SchedState::Running);
 
-            if let Some(t) = cand.inner.try_read() {
-                t.mark_scheduled_in(cpu_id, now_cycles);
+            {
+                let mut guard = cand.inner.write();
+                guard.restore_fpu_state();
+                guard.mark_scheduled_in(cpu_id, now_cycles);
             }
 
             {

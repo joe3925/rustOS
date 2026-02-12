@@ -37,7 +37,7 @@ use crate::{
     console::CONSOLE,
     drivers::{
         driver_install::DriverError,
-        interrupt_index::{self, current_cpu_id},
+        interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::{ACPIImpl, ACPI_TABLES},
     },
@@ -81,6 +81,9 @@ pub extern "win64" fn create_kernel_task(
 pub unsafe extern "win64" fn park_self_and_yield() {
     // TODO:
     todo!()
+}
+pub extern "win64" fn get_current_lapic_id() -> usize {
+    get_current_logical_id() as usize
 }
 
 pub extern "win64" fn wake_task(id: u64) {

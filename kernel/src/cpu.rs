@@ -1,5 +1,6 @@
 use core::arch::{asm, x86_64::_rdtsc};
 use raw_cpuid::{CpuId, CpuIdReaderNative};
+use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
 
 use crate::static_handlers::task_yield;
 
@@ -30,4 +31,21 @@ pub fn wait_cycle_idle(cycles: u128) {
 pub fn get_cpu_info() -> CpuId<CpuIdReaderNative> {
     let info = CpuId::new();
     info
+}
+
+/// Enable SSE/FXSR for the current CPU.
+pub fn enable_sse() {
+    let mut flags = Cr0::read();
+    flags.remove(Cr0Flags::EMULATE_COPROCESSOR);
+    flags.insert(Cr0Flags::MONITOR_COPROCESSOR);
+    unsafe {
+        Cr0::write(flags);
+    }
+
+    let mut flags = Cr4::read();
+    flags.insert(Cr4Flags::OSFXSR);
+    flags.insert(Cr4Flags::OSXMMEXCPT_ENABLE);
+    unsafe {
+        Cr4::write(flags);
+    }
 }

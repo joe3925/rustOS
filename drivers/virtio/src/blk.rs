@@ -115,6 +115,10 @@ pub struct BlkIoArena {
     dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS],
     /// Current count of overflow allocations (for growth tracking)
     overflow_count: AtomicUsize,
+    /// Number of initialized preallocated slots (for capacity reporting)
+    preallocated_count: usize,
+    /// Number of initialized dynamic slots (for capacity reporting)
+    dynamic_count: usize,
 }
 
 // SAFETY: Arena uses atomic operations for all shared state
@@ -154,7 +158,21 @@ impl BlkIoArena {
     /// Initialize the arena, allocating all DMA buffers upfront.
     /// Returns None if DMA allocation fails.
     pub fn init() -> Option<Self> {
+        Self::init_with_capacity(ARENA_PREALLOCATED_SLOTS, ARENA_DYNAMIC_SLOTS)
+    }
+
+    /// Initialize the arena with custom slot counts.
+    /// Used for multiqueue to distribute capacity across queues.
+    /// Slot counts are clamped to the maximum array sizes.
+    pub fn init_with_capacity(
+        preallocated_count: usize,
+        dynamic_count: usize,
+    ) -> Option<Self> {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+
+        // Clamp to maximum array sizes
+        let preallocated_count = preallocated_count.min(ARENA_PREALLOCATED_SLOTS);
+        let dynamic_count = dynamic_count.min(ARENA_DYNAMIC_SLOTS);
 
         // Create uninitialized storage arrays
         // SAFETY: We will initialize each slot before use
@@ -163,8 +181,8 @@ impl BlkIoArena {
         let dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
-        // Initialize preallocated slots with all DMA buffers
-        for i in 0..ARENA_PREALLOCATED_SLOTS {
+        // Initialize preallocated slots with all DMA buffers (only up to requested count)
+        for i in 0..preallocated_count {
             let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
             let header_phys = virt_to_phys(header_va)?;
 
@@ -197,7 +215,7 @@ impl BlkIoArena {
         }
 
         // Initialize dynamic slots (header + status only, data on demand)
-        for i in 0..ARENA_DYNAMIC_SLOTS {
+        for i in 0..dynamic_count {
             let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
             let header_phys = virt_to_phys(header_va)?;
 
@@ -226,11 +244,23 @@ impl BlkIoArena {
             }
         }
 
-        // Set all bits in bitmaps (all slots start free)
-        // For preallocated: bits 0-47 set
-        let preallocated_mask = (1u64 << ARENA_PREALLOCATED_SLOTS) - 1;
-        // For dynamic: bits 0-15 set
-        let dynamic_mask = (1u64 << ARENA_DYNAMIC_SLOTS) - 1;
+        // Set bits in bitmaps only for initialized slots
+        // Use saturating_sub to handle the case where count is 0
+        let preallocated_mask = if preallocated_count >= 64 {
+            u64::MAX
+        } else if preallocated_count == 0 {
+            0
+        } else {
+            (1u64 << preallocated_count) - 1
+        };
+
+        let dynamic_mask = if dynamic_count >= 64 {
+            u64::MAX
+        } else if dynamic_count == 0 {
+            0
+        } else {
+            (1u64 << dynamic_count) - 1
+        };
 
         Some(Self {
             preallocated_bitmap: AtomicU64::new(preallocated_mask),
@@ -240,6 +270,8 @@ impl BlkIoArena {
             preallocated_slots,
             dynamic_slots,
             overflow_count: AtomicUsize::new(0),
+            preallocated_count,
+            dynamic_count,
         })
     }
 
@@ -259,6 +291,12 @@ impl BlkIoArena {
         debug_assert!(idx < ARENA_DYNAMIC_SLOTS);
         // SAFETY: Slot was initialized in init() and index is valid
         unsafe { (*self.dynamic_slots[idx].get()).assume_init_ref() }
+    }
+
+    /// Returns the maximum capacity of this arena (preallocated + dynamic slots).
+    #[inline]
+    pub fn max_capacity(&self) -> usize {
+        self.preallocated_count + self.dynamic_count
     }
 
     /// Allocate a request slot. Returns None only if arena is exhausted
@@ -776,11 +814,35 @@ pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 /// Mandatory for modern virtio-pci devices.
 pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
 
+/// Multiqueue feature bit - device supports multiple request queues.
+pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
+
 const DEVCFG_CAPACITY: usize = 0x00; // u64 — capacity in 512-byte sectors
+const DEVCFG_NUM_QUEUES: usize = 0x08; // u16 — number of request queues (if VIRTIO_BLK_F_MQ)
+
+/// Result of device initialization containing capacity and multiqueue info.
+pub struct DeviceInitResult {
+    /// Disk capacity in 512-byte sectors.
+    pub capacity: u64,
+    /// Number of request queues supported by device (1 if MQ not supported).
+    pub num_queues: u16,
+    /// Whether multiqueue feature was successfully negotiated.
+    pub mq_negotiated: bool,
+}
+
+/// Calculate per-queue arena slot counts to keep total capacity bounded.
+/// Returns (preallocated_per_queue, dynamic_per_queue).
+pub fn calculate_per_queue_arena_sizes(queue_count: usize) -> (usize, usize) {
+    let queue_count = queue_count.max(1);
+    // Divide total slots across queues, with reasonable minimums
+    let prealloc = (ARENA_PREALLOCATED_SLOTS / queue_count).max(4);
+    let dynamic = (ARENA_DYNAMIC_SLOTS / queue_count).max(2);
+    (prealloc, dynamic)
+}
 
 /// Negotiate features and read device configuration.
-/// Returns the disk capacity in 512-byte sectors.
-pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<u64> {
+/// Returns DeviceInitResult with capacity and multiqueue information.
+pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceInitResult> {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 
     unsafe {
@@ -814,8 +876,16 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<u64> {
         return None;
     }
 
-    let supported_features = VIRTIO_F_VERSION_1;
+    // Check if device supports multiqueue
+    let mq_supported = (dev_features & VIRTIO_BLK_F_MQ) != 0;
+
+    // Negotiate VERSION_1 and optionally MQ
+    let mut supported_features = VIRTIO_F_VERSION_1;
+    if mq_supported {
+        supported_features |= VIRTIO_BLK_F_MQ;
+    }
     let driver_features = dev_features & supported_features;
+
     unsafe { pci::common_write_u32(common_cfg, pci::COMMON_DRIVER_FEATURE_SELECT, 0) };
     unsafe {
         pci::common_write_u32(
@@ -849,13 +919,32 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<u64> {
         return None;
     }
 
+    // Check if MQ was actually negotiated (device may have rejected it)
+    let mq_negotiated = mq_supported && (driver_features & VIRTIO_BLK_F_MQ) != 0;
+
     let capacity = unsafe {
         core::ptr::read_volatile(
             (device_cfg.as_u64() as *const u8).add(DEVCFG_CAPACITY) as *const u64
         )
     };
 
-    Some(capacity)
+    // Read num_queues if MQ was negotiated, otherwise default to 1
+    let num_queues = if mq_negotiated {
+        let nq = unsafe {
+            core::ptr::read_volatile(
+                (device_cfg.as_u64() as *const u8).add(DEVCFG_NUM_QUEUES) as *const u16
+            )
+        };
+        nq.max(1)
+    } else {
+        1
+    };
+
+    Some(DeviceInitResult {
+        capacity,
+        num_queues,
+        mq_negotiated,
+    })
 }
 
 /// Set the DRIVER_OK status bit, completing device initialization.
