@@ -11,6 +11,10 @@ use kernel_api::x86_64::{PhysAddr, VirtAddr};
 use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, Virtqueue};
 
+/// Maximum number of descriptors in a single request chain.
+/// header(1) + data segments (up to 64KB / 4KB = 16) + status(1) = 18 max
+pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 18;
+
 /// Number of preallocated slots with 4KB data regions (common I/O size)
 pub const ARENA_PREALLOCATED_SLOTS: usize = 48;
 
@@ -656,18 +660,25 @@ impl<'a> BlkIoRequestHandle<'a> {
 
     /// Build the descriptor chain for this request and push it to the virtqueue.
     /// Returns the head descriptor index.
+    /// Uses a stack-allocated buffer to avoid heap allocation on the hot path.
     pub fn submit(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
         let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
 
-        let mut bufs: Vec<(PhysAddr, u32, u16)> = Vec::new();
-        bufs.push((self.header_phys(), 16, 0u16));
+        // Stack-allocated descriptor buffer to avoid heap allocation
+        let mut bufs: [(PhysAddr, u32, u16); MAX_DESCRIPTORS_PER_REQUEST] =
+            [(PhysAddr::new(0), 0, 0); MAX_DESCRIPTORS_PER_REQUEST];
+        let mut buf_count: usize = 0;
+
+        // Header descriptor
+        bufs[buf_count] = (self.header_phys(), 16, 0u16);
+        buf_count += 1;
 
         let mut offset = 0u64;
         let total = self.data_len() as u64;
         let data_va_base = self.data_va();
         let data_phys_base = self.data_phys();
 
-        while offset < total {
+        while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
             let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
             let phys = match virt_to_phys(vaddr) {
                 Some(p) => p,
@@ -681,7 +692,8 @@ impl<'a> BlkIoRequestHandle<'a> {
             let seg_phys = PhysAddr::new(phys.as_u64());
 
             // Coalesce contiguous physical segments to keep descriptor count low.
-            if let Some(last) = bufs.last_mut() {
+            if buf_count > 0 {
+                let last = &mut bufs[buf_count - 1];
                 let last_end = last.0.as_u64() + last.1 as u64;
                 if last.2 == data_flags && last_end == seg_phys.as_u64() {
                     last.1 = last.1.saturating_add(chunk as u32);
@@ -690,13 +702,16 @@ impl<'a> BlkIoRequestHandle<'a> {
                 }
             }
 
-            bufs.push((seg_phys, chunk as u32, data_flags));
+            bufs[buf_count] = (seg_phys, chunk as u32, data_flags);
+            buf_count += 1;
             offset += chunk;
         }
 
-        bufs.push((self.status_phys(), 1, VRING_DESC_F_WRITE));
+        // Status descriptor
+        bufs[buf_count] = (self.status_phys(), 1, VRING_DESC_F_WRITE);
+        buf_count += 1;
 
-        vq.push_chain(&bufs)
+        vq.push_chain(&bufs[..buf_count])
     }
 }
 
@@ -945,17 +960,24 @@ impl BlkIoRequest {
         })
     }
 
-    /// Build the 3-descriptor chain for this request and push it to the virtqueue.
+    /// Build the descriptor chain for this request and push it to the virtqueue.
     /// Returns the head descriptor index.
+    /// Uses a stack-allocated buffer to avoid heap allocation on the hot path.
     pub fn submit(&self, vq: &mut Virtqueue, is_write: bool) -> Option<u16> {
         let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
 
-        let mut bufs: Vec<(PhysAddr, u32, u16)> = Vec::new();
-        bufs.push((self.header_phys, 16, 0u16));
+        // Stack-allocated descriptor buffer to avoid heap allocation
+        let mut bufs: [(PhysAddr, u32, u16); MAX_DESCRIPTORS_PER_REQUEST] =
+            [(PhysAddr::new(0), 0, 0); MAX_DESCRIPTORS_PER_REQUEST];
+        let mut buf_count: usize = 0;
+
+        // Header descriptor
+        bufs[buf_count] = (self.header_phys, 16, 0u16);
+        buf_count += 1;
 
         let mut offset = 0u64;
         let total = self.data_len as u64;
-        while offset < total {
+        while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
             let vaddr = VirtAddr::new(self.data_va.as_u64() + offset);
             let phys = virt_to_phys(vaddr)?;
             let page_off = (vaddr.as_u64() & 0xFFF) as u64;
@@ -963,7 +985,8 @@ impl BlkIoRequest {
             let seg_phys = PhysAddr::new(phys.as_u64() + page_off);
 
             // Coalesce contiguous physical segments to keep descriptor count low.
-            if let Some(last) = bufs.last_mut() {
+            if buf_count > 0 {
+                let last = &mut bufs[buf_count - 1];
                 let last_end = last.0.as_u64() + last.1 as u64;
                 if last.2 == data_flags && last_end == seg_phys.as_u64() {
                     last.1 = last.1.saturating_add(chunk as u32);
@@ -972,13 +995,16 @@ impl BlkIoRequest {
                 }
             }
 
-            bufs.push((seg_phys, chunk as u32, data_flags));
+            bufs[buf_count] = (seg_phys, chunk as u32, data_flags);
+            buf_count += 1;
             offset += chunk;
         }
 
-        bufs.push((self.status_phys, 1, VRING_DESC_F_WRITE));
+        // Status descriptor
+        bufs[buf_count] = (self.status_phys, 1, VRING_DESC_F_WRITE);
+        buf_count += 1;
 
-        vq.push_chain(&bufs)
+        vq.push_chain(&bufs[..buf_count])
     }
 
     /// Read the status byte from the DMA buffer.

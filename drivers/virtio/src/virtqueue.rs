@@ -274,6 +274,7 @@ impl Virtqueue {
 
     /// Check if head is completed and take the completion (atomic swap to 0).
     /// Returns Some(len) if completed, None if not.
+    /// This is lock-free and can be called without holding the virtqueue mutex.
     pub fn take_completion(&self, head: u16) -> Option<u32> {
         let val = self.completions[head as usize].swap(0, Ordering::AcqRel);
         if val == 0 {
@@ -281,6 +282,22 @@ impl Virtqueue {
         } else {
             Some(val - 1) // Recover original len
         }
+    }
+
+    /// Check if head is completed without taking the completion.
+    /// This is lock-free and useful for polling without consuming the completion.
+    #[inline]
+    pub fn peek_completion(&self, head: u16) -> bool {
+        self.completions[head as usize].load(Ordering::Acquire) != 0
+    }
+
+    /// Check if there are any pending completions in the used ring.
+    /// This is useful for deciding whether to drain before waiting.
+    #[inline]
+    pub fn has_pending_used(&self) -> bool {
+        let used_base = self.used_va.as_u64() as *const u16;
+        let used_idx = unsafe { core::ptr::read_volatile(used_base.add(1)) };
+        self.last_used_idx != used_idx
     }
 
     /// Free a descriptor chain starting from `head`.

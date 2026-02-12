@@ -554,13 +554,28 @@ async fn wait_for_completion(inner: &DevExtInner, head: u16) -> Result<u32, Driv
     };
 
     loop {
-        // Drain used ring and check if our request completed
+        // Fast path: check if already completed (lock-free peek)
         {
-            let mut vq = inner.requestq.lock();
-            vq.drain_used_to_completions();
+            let vq = inner.requestq.lock();
             if let Some(len) = vq.take_completion(head) {
+                // Need to free chain while holding lock
+                drop(vq);
+                let mut vq = inner.requestq.lock();
                 vq.free_chain(head);
                 return Ok(len);
+            }
+        }
+
+        // Drain used ring if there are pending completions
+        {
+            let mut vq = inner.requestq.lock();
+            if vq.has_pending_used() {
+                vq.drain_used_to_completions();
+                // Check again after draining
+                if let Some(len) = vq.take_completion(head) {
+                    vq.free_chain(head);
+                    return Ok(len);
+                }
             }
         }
 
