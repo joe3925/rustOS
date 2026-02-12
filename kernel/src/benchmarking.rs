@@ -2767,17 +2767,29 @@ pub async fn bench_virtio_disk_sweep() {
     }
 
     println!("[virtio-bench] Inflight Sweep Results (100 MiB total, 64 KiB/req):");
-    println!("  Inflight |   Avg (ms) |   Min (ms) |   Max (ms) | Requests");
-    println!("  ---------|------------|------------|------------|----------");
+    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
+    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
 
     for i in 0..result.used as usize {
         let level = &result.levels[i];
+        let total_ms = cycles_to_ms(level.total_time_cycles, tsc_hz);
         let avg_ms = cycles_to_ms(level.avg_cycles, tsc_hz);
+        let p50_ms = cycles_to_ms(level.p50_cycles, tsc_hz);
+        let p99_ms = cycles_to_ms(level.p99_cycles, tsc_hz);
+        let p999_ms = cycles_to_ms(level.p999_cycles, tsc_hz);
         let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
         let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
         println!(
-            "  {:>8} | {:>10.3} | {:>10.3} | {:>10.3} | {:>8}",
-            level.inflight, avg_ms, min_ms, max_ms, level.request_count
+            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
+            level.inflight,
+            total_ms,
+            avg_ms,
+            p50_ms,
+            p99_ms,
+            p999_ms,
+            min_ms,
+            max_ms,
+            level.request_count
         );
     }
 

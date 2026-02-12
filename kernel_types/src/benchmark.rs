@@ -48,6 +48,8 @@ pub struct BenchLevelResult {
     pub inflight: u32,
     /// Number of requests completed
     pub request_count: u32,
+    /// Total wall-clock cycles for the entire run at this inflight level
+    pub total_time_cycles: u64,
     /// Total cycles across all requests
     pub total_cycles: u64,
     /// Average cycles per request
@@ -56,6 +58,12 @@ pub struct BenchLevelResult {
     pub max_cycles: u64,
     /// Minimum cycles for any single request (0 if no samples)
     pub min_cycles: u64,
+    /// Median (p50) latency in cycles
+    pub p50_cycles: u64,
+    /// 99th percentile latency in cycles
+    pub p99_cycles: u64,
+    /// 99.9th percentile latency in cycles
+    pub p999_cycles: u64,
 }
 
 impl Default for BenchSweepResult {

@@ -700,11 +700,18 @@ async fn bench_reads_with_inflight(
     let mut result = BenchLevelResult {
         inflight: inflight as u32,
         request_count: 0,
+        total_time_cycles: 0,
         total_cycles: 0,
         avg_cycles: 0,
         max_cycles: 0,
         min_cycles: u64::MAX,
+        p50_cycles: 0,
+        p99_cycles: 0,
+        p999_cycles: 0,
     };
+
+    let mut lat_samples: Vec<u64> = Vec::with_capacity(BENCH_REQUEST_COUNT);
+    let run_start_tsc = rdtsc();
 
     let mut pending: Vec<PendingBenchRequest<'_>> = Vec::with_capacity(inflight);
     let mut submitted_count: usize = 0;
@@ -808,6 +815,7 @@ async fn bench_reads_with_inflight(
                         result.total_cycles += cycles;
                         result.max_cycles = result.max_cycles.max(cycles);
                         result.min_cycles = result.min_cycles.min(cycles);
+                        lat_samples.push(cycles);
                         result.request_count += 1;
 
                         // Free the descriptor chain
@@ -842,6 +850,7 @@ async fn bench_reads_with_inflight(
                     result.total_cycles += cycles;
                     result.max_cycles = result.max_cycles.max(cycles);
                     result.min_cycles = result.min_cycles.min(cycles);
+                    lat_samples.push(cycles);
                     result.request_count += 1;
 
                     vq.free_chain(pending[i].head);
@@ -877,6 +886,26 @@ async fn bench_reads_with_inflight(
     if result.request_count > 0 {
         result.avg_cycles = result.total_cycles / result.request_count as u64;
     }
+
+    // Percentiles
+    if !lat_samples.is_empty() {
+        lat_samples.sort_unstable();
+        let percentile = |pct: f64| -> u64 {
+            if lat_samples.is_empty() {
+                return 0;
+            }
+            let len = lat_samples.len();
+            let idx = ((len as f64 - 1.0) * pct).round() as usize;
+            lat_samples[idx.min(len - 1)]
+        };
+        result.p50_cycles = percentile(0.50);
+        result.p99_cycles = percentile(0.99);
+        result.p999_cycles = percentile(0.999);
+    }
+
+    // Total wall time for the run (from first submit to last completion)
+    let run_end_tsc = rdtsc();
+    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
 
     // If no samples were collected, set min to 0
     if result.min_cycles == u64::MAX {
