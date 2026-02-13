@@ -16,7 +16,7 @@ use crate::{
     benchmarking::{
         bench_async_vs_sync_call_latency_async, bench_c_drive_io_async,
         bench_realistic_traffic_async, bench_virtio_disk_sweep_both_to_csv,
-        run_virtio_bench_matrix,
+        run_virtio_bench_matrix, run_virtio_bench_matrix_print,
     },
     drivers::{drive::vfs::Vfs, interrupt_index::wait_duration},
     file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
@@ -406,7 +406,7 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         wait_duration(Duration::from_millis(50));
         spawn_detached(async move {
             bench_c_drive_io_async().await;
-            run_virtio_bench_matrix().await;
+            run_virtio_bench_matrix_print().await;
         });
     });
     Ok(())

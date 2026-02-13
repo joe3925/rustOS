@@ -2967,59 +2967,34 @@ pub struct BenchSweepMatrix<'a> {
     pub file_prefix: &'a str,
 }
 
-pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatrix<'_>) {
+/// Result of a single benchmark run iteration.
+pub struct BenchRunResult {
+    pub run_id: u32,
+    pub trial: u32,
+    pub requested: BenchSweepParams,
+    pub both: BenchSweepBothResult,
+    pub tsc_hz: u64,
+}
+
+/// Runs the benchmark matrix and returns all results.
+pub async fn bench_virtio_disk_sweep_both_matrix_run(
+    matrix: &BenchSweepMatrix<'_>,
+) -> Option<Vec<BenchRunResult>> {
     let target = match pnp_get_device_target("VirtIO\\Disk_0") {
         Some(t) => t,
         None => {
             println!("[virtio-bench] VirtIO disk not found");
-            return;
+            return None;
         }
     };
 
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
     if tsc_hz == 0 {
         println!("[virtio-bench] TSC not calibrated");
-        return;
+        return None;
     }
 
-    let mut irq_name = String::new();
-    irq_name.push_str(matrix.file_prefix);
-    irq_name.push_str("virtio_bench_irq_all.csv");
-
-    let mut poll_name = String::new();
-    poll_name.push_str(matrix.file_prefix);
-    poll_name.push_str("virtio_bench_poll_all.csv");
-
-    let mut irq_f = match open_csv_root_c_create(&irq_name).await {
-        Ok(f) => f,
-        Err(e) => {
-            println!("[virtio-bench] Failed opening C:\\{}: {:?}", irq_name, e);
-            return;
-        }
-    };
-
-    let mut poll_f = match open_csv_root_c_create(&poll_name).await {
-        Ok(f) => f,
-        Err(e) => {
-            println!("[virtio-bench] Failed opening C:\\{}: {:?}", poll_name, e);
-            let _ = irq_f.close().await;
-            return;
-        }
-    };
-
-    if write_csv_header_to_file(&mut irq_f).await.is_err() {
-        println!("[virtio-bench] Failed writing header to C:\\{}", irq_name);
-        let _ = irq_f.close().await;
-        let _ = poll_f.close().await;
-        return;
-    }
-    if write_csv_header_to_file(&mut poll_f).await.is_err() {
-        println!("[virtio-bench] Failed writing header to C:\\{}", poll_name);
-        let _ = irq_f.close().await;
-        let _ = poll_f.close().await;
-        return;
-    }
-
+    let mut results = Vec::new();
     let mut run_id: u32 = 0;
 
     let mut fi = 0usize;
@@ -3104,51 +3079,13 @@ pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatri
                                 }
                             };
 
-                            let mut irq_chunk = String::new();
-                            bench_sweep_append_csv_rows(
-                                &mut irq_chunk,
+                            results.push(BenchRunResult {
                                 run_id,
                                 trial,
-                                "irq",
-                                &requested,
-                                &both,
-                                &both.irq,
+                                requested,
+                                both,
                                 tsc_hz,
-                            );
-
-                            let mut poll_chunk = String::new();
-                            bench_sweep_append_csv_rows(
-                                &mut poll_chunk,
-                                run_id,
-                                trial,
-                                "poll",
-                                &requested,
-                                &both,
-                                &both.poll,
-                                tsc_hz,
-                            );
-
-                            if write_csv_chunk_to_file(&mut irq_f, &irq_chunk)
-                                .await
-                                .is_err()
-                            {
-                                println!("[virtio-bench] Failed writing C:\\{}", irq_name);
-                                let _ = irq_f.close().await;
-                                let _ = poll_f.close().await;
-                                return;
-                            }
-                            if write_csv_chunk_to_file(&mut poll_f, &poll_chunk)
-                                .await
-                                .is_err()
-                            {
-                                println!("[virtio-bench] Failed writing C:\\{}", poll_name);
-                                let _ = irq_f.close().await;
-                                let _ = poll_f.close().await;
-                                return;
-                            }
-
-                            let _ = irq_f.flush().await;
-                            let _ = poll_f.flush().await;
+                            });
 
                             run_id = run_id.wrapping_add(1);
                             trial += 1;
@@ -3169,10 +3106,231 @@ pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatri
         fi += 1;
     }
 
+    Some(results)
+}
+
+pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatrix<'_>) {
+    let results = match bench_virtio_disk_sweep_both_matrix_run(matrix).await {
+        Some(r) => r,
+        None => return,
+    };
+
+    let mut irq_name = String::new();
+    irq_name.push_str(matrix.file_prefix);
+    irq_name.push_str("virtio_bench_irq_all.csv");
+
+    let mut poll_name = String::new();
+    poll_name.push_str(matrix.file_prefix);
+    poll_name.push_str("virtio_bench_poll_all.csv");
+
+    let mut irq_f = match open_csv_root_c_create(&irq_name).await {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[virtio-bench] Failed opening C:\\{}: {:?}", irq_name, e);
+            return;
+        }
+    };
+
+    let mut poll_f = match open_csv_root_c_create(&poll_name).await {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[virtio-bench] Failed opening C:\\{}: {:?}", poll_name, e);
+            let _ = irq_f.close().await;
+            return;
+        }
+    };
+
+    if write_csv_header_to_file(&mut irq_f).await.is_err() {
+        println!("[virtio-bench] Failed writing header to C:\\{}", irq_name);
+        let _ = irq_f.close().await;
+        let _ = poll_f.close().await;
+        return;
+    }
+    if write_csv_header_to_file(&mut poll_f).await.is_err() {
+        println!("[virtio-bench] Failed writing header to C:\\{}", poll_name);
+        let _ = irq_f.close().await;
+        let _ = poll_f.close().await;
+        return;
+    }
+
+    for res in &results {
+        let mut irq_chunk = String::new();
+        bench_sweep_append_csv_rows(
+            &mut irq_chunk,
+            res.run_id,
+            res.trial,
+            "irq",
+            &res.requested,
+            &res.both,
+            &res.both.irq,
+            res.tsc_hz,
+        );
+
+        let mut poll_chunk = String::new();
+        bench_sweep_append_csv_rows(
+            &mut poll_chunk,
+            res.run_id,
+            res.trial,
+            "poll",
+            &res.requested,
+            &res.both,
+            &res.both.poll,
+            res.tsc_hz,
+        );
+
+        if write_csv_chunk_to_file(&mut irq_f, &irq_chunk)
+            .await
+            .is_err()
+        {
+            println!("[virtio-bench] Failed writing C:\\{}", irq_name);
+            let _ = irq_f.close().await;
+            let _ = poll_f.close().await;
+            return;
+        }
+        if write_csv_chunk_to_file(&mut poll_f, &poll_chunk)
+            .await
+            .is_err()
+        {
+            println!("[virtio-bench] Failed writing C:\\{}", poll_name);
+            let _ = irq_f.close().await;
+            let _ = poll_f.close().await;
+            return;
+        }
+
+        let _ = irq_f.flush().await;
+        let _ = poll_f.flush().await;
+    }
+
+    let _ = irq_f.close().await;
+    let _ = poll_f.close().await;
+
     println!(
         "[virtio-bench] Wrote C:\\{} and C:\\{}",
         irq_name, poll_name
     );
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        let mut s = String::new();
+        s.push_str(&format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0)));
+        s.push_str(" GiB");
+        s
+    } else if bytes >= 1024 * 1024 {
+        let mut s = String::new();
+        s.push_str(&format!("{:.1}", bytes as f64 / (1024.0 * 1024.0)));
+        s.push_str(" MiB");
+        s
+    } else if bytes >= 1024 {
+        let mut s = String::new();
+        s.push_str(&format!("{:.1}", bytes as f64 / 1024.0));
+        s.push_str(" KiB");
+        s
+    } else {
+        let mut s = String::new();
+        s.push_str(&bytes.to_string());
+        s.push_str(" B");
+        s
+    }
+}
+
+fn print_level_table_row(mode: &str, lvl: &BenchLevelResult, tsc_hz: u64) {
+    let tsc_hz_f = tsc_hz as f64;
+    let avg_ms = (lvl.avg_cycles as f64 / tsc_hz_f) * 1000.0;
+    let p50_ms = (lvl.p50_cycles as f64 / tsc_hz_f) * 1000.0;
+    let p99_ms = (lvl.p99_cycles as f64 / tsc_hz_f) * 1000.0;
+    let p999_ms = (lvl.p999_cycles as f64 / tsc_hz_f) * 1000.0;
+    let min_ms = (lvl.min_cycles as f64 / tsc_hz_f) * 1000.0;
+    let max_ms = (lvl.max_cycles as f64 / tsc_hz_f) * 1000.0;
+    let total_ms = (lvl.total_time_cycles as f64 / tsc_hz_f) * 1000.0;
+
+    let wait_pct = lvl.idle_pct;
+
+    println!(
+        "| {:>4} | {:>8} | {:>10} | {:>10.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>8.3} | {:>6.1}% |",
+        mode,
+        lvl.inflight,
+        lvl.request_count,
+        total_ms,
+        avg_ms,
+        p50_ms,
+        p99_ms,
+        p999_ms,
+        min_ms,
+        max_ms,
+        wait_pct,
+    );
+}
+
+fn print_bench_result_table(res: &BenchRunResult) {
+    let req = &res.requested;
+    let both = &res.both;
+
+    println!();
+    println!(
+        "+-----------------------------------------------------------------------------------+"
+    );
+    println!(
+        "|                          VirtIO Disk Benchmark Results                           |"
+    );
+    println!(
+        "+-----------------------------------------------------------------------------------+"
+    );
+    println!(
+        "| Run ID: {:>4}  | Trial: {:>3}  | Flags: 0x{:04X}                                   |",
+        res.run_id, res.trial, req.flags
+    );
+    println!(
+        "| Total: {:>12}  | Request Size: {:>10}  | Start Sector: {:>10} |",
+        format_size(req.total_bytes),
+        format_size(req.request_size as u64),
+        req.start_sector
+    );
+    println!(
+        "| Queues: {:>2}  | Queue0 Size: {:>4}  | Indirect: {:>3}  | MSI-X: {:>3}             |",
+        both.queue_count,
+        both.queue0_size,
+        if both.indirect_enabled != 0 {
+            "Yes"
+        } else {
+            "No"
+        },
+        if both.msix_enabled != 0 { "Yes" } else { "No" }
+    );
+    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+    println!("| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) | P999(ms) |  Min(ms) |  Max(ms) |  Wait%  |");
+    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+
+    let irq_used = both.irq.used as usize;
+    let mut i = 0usize;
+    while i < irq_used && i < both.irq.levels.len() {
+        print_level_table_row("IRQ", &both.irq.levels[i], res.tsc_hz);
+        i += 1;
+    }
+
+    let poll_used = both.poll.used as usize;
+    i = 0;
+    while i < poll_used && i < both.poll.levels.len() {
+        print_level_table_row("POLL", &both.poll.levels[i], res.tsc_hz);
+        i += 1;
+    }
+
+    println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
+}
+
+/// Runs the benchmark matrix and prints results as a clean user-readable table.
+pub async fn bench_virtio_disk_sweep_both_matrix_to_table(matrix: &BenchSweepMatrix<'_>) {
+    let results = match bench_virtio_disk_sweep_both_matrix_run(matrix).await {
+        Some(r) => r,
+        None => return,
+    };
+
+    for res in &results {
+        print_bench_result_table(res);
+    }
+
+    println!();
+    println!("[virtio-bench] Completed {} benchmark runs", results.len());
 }
 
 pub async fn bench_virtio_disk_sweep_both_to_csv(params: BenchSweepParams) {
@@ -3232,4 +3390,46 @@ pub async fn run_virtio_bench_matrix() {
     };
 
     bench_virtio_disk_sweep_both_matrix_to_csv(&matrix).await;
+}
+pub async fn run_virtio_bench_matrix_print() {
+    let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
+    let total_bytes_list: [u64; 1] = [8 * 1024 * 1024 * 1024];
+
+    let request_size_list: [u32; _] = [
+        // 4 * 1024,
+        // 8 * 1024,
+        16 * 1024,
+        // 64 * 1024,
+        // 256 * 1024,
+        // 1024 * 1024,
+        // 4 * 1024 * 1024,
+    ];
+
+    let start_sector_list: [u64; _] = [
+        0,
+        // 2 * 1024 * 1024,
+        // 4 * 1024 * 1024,
+        // 8 * 1024 * 1024
+    ];
+
+    let max_inflight_list: [u16; _] = [0];
+
+    let matrix = BenchSweepMatrix {
+        version: BENCH_PARAMS_VERSION_1,
+        flags_list: &flags_list,
+        total_bytes_list: &total_bytes_list,
+        request_size_list: &request_size_list,
+        start_sector_list: &start_sector_list,
+        max_inflight_list: &max_inflight_list,
+        trials: 1,
+        discard_first_per_combo: false,
+        file_prefix: "exp1_",
+    };
+
+    bench_virtio_disk_sweep_both_matrix_to_table(&matrix).await;
+}
+fn console_print_header() {
+    let mut hdr = String::new();
+    csv_push_header(&mut hdr);
+    println!("{}", hdr.trim_end_matches('\n'));
 }

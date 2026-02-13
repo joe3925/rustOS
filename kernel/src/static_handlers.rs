@@ -47,7 +47,7 @@ use crate::{
     },
     idt::{
         irq_alloc_vector, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
-        irq_signal_all, irq_signal_n,
+        irq_signal_all, irq_signal_exactly, irq_signal_n,
     },
     memory::{
         allocator::ALLOCATOR,
@@ -122,7 +122,10 @@ pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize
 pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
     unsafe { irq_signal(handle, meta) }
 }
-
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_irq_ensure_signal(handle: IrqHandlePtr, meta: IrqMeta) {
+    irq_signal_exactly(handle, meta);
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
     unsafe { irq_signal_n(handle, meta, n) }

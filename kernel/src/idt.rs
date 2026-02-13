@@ -205,6 +205,32 @@ impl IrqHandleInner {
             w.wake();
         }
     }
+    fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
+        if self.is_closed() {
+            return;
+        }
+
+        let mut waker: Option<Waker> = None;
+        {
+            let mut state = self.state.lock();
+            state.last_meta = meta;
+
+            if let Some(node) = state.waiters.pop_front() {
+                unsafe {
+                    (*node).enqueued = false;
+                    (*node).next = core::ptr::null_mut();
+                    (*node).result = Some(IrqWaitResult::ok_n(meta, 1));
+                    waker = (*node).waker.take();
+                }
+            } else {
+                state.pending_signals = 1;
+            }
+        }
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
     fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
         if n == 0 || self.is_closed() {
             return 0;
@@ -377,7 +403,14 @@ impl core::future::Future for IrqWaitFuture {
                 state.waiters.push_back(node_ptr);
             }
 
-            this.waiter.waker = Some(cx.waker().clone());
+            let cw = cx.waker();
+            let need_update = match this.waiter.waker.as_ref() {
+                Some(w) => !w.will_wake(cw),
+                None => true,
+            };
+            if need_update {
+                this.waiter.waker = Some(cw.clone());
+            }
         }
 
         core::task::Poll::Pending
@@ -466,6 +499,15 @@ pub unsafe extern "win64" fn irq_handle_signal_one(h: IrqHandlePtr, meta: IrqMet
     }
     let arc = Arc::from_raw(h as *const IrqHandleInner);
     arc.signal_one(meta);
+    let _ = Arc::into_raw(arc);
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "win64" fn irq_handle_signal_exactly_one(h: IrqHandlePtr, meta: IrqMeta) {
+    if h.is_null() {
+        return;
+    }
+    let arc = Arc::from_raw(h as *const IrqHandleInner);
+    arc.ensure_signal_exactly_one(meta);
     let _ = Arc::into_raw(arc);
 }
 
@@ -898,7 +940,12 @@ pub fn irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
     }
     unsafe { irq_handle_signal_one(handle, meta) };
 }
-
+pub fn irq_signal_exactly(handle: IrqHandlePtr, meta: IrqMeta) {
+    if handle.is_null() {
+        return;
+    }
+    unsafe { irq_handle_signal_exactly_one(handle, meta) };
+}
 pub fn irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
     if handle.is_null() || n == 0 {
         return;

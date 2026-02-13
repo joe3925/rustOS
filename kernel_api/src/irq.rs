@@ -2,9 +2,9 @@ use core::ptr::NonNull;
 
 use kernel_sys::{
     irq_handle_clone, irq_handle_drop, irq_handle_get_user_ctx, irq_handle_is_closed,
-    irq_handle_set_user_ctx, irq_handle_unregister, irq_handle_wait_ffi, kernel_irq_register,
-    kernel_irq_register_gsi, kernel_irq_signal, kernel_irq_signal_all, kernel_irq_signal_n,
-    kernel_irq_alloc_vector, kernel_irq_free_vector, kernel_apic_cpu_ids,
+    irq_handle_set_user_ctx, irq_handle_unregister, irq_handle_wait_ffi, kernel_apic_cpu_ids,
+    kernel_irq_alloc_vector, kernel_irq_free_vector, kernel_irq_register, kernel_irq_register_gsi,
+    kernel_irq_signal, kernel_irq_signal_all, kernel_irq_signal_n,
 };
 
 use kernel_types::async_ffi::FfiFuture;
@@ -57,6 +57,9 @@ impl IrqHandle {
 
     pub fn wait(&self, meta: IrqMeta) -> FfiFuture<IrqWaitResult> {
         unsafe { irq_handle_wait_ffi(self.as_raw(), meta) }
+    }
+    pub fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
+        unsafe { kernel_irq_signal(self.as_raw(), meta) };
     }
 }
 
