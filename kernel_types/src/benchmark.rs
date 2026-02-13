@@ -27,7 +27,7 @@ pub type BenchTag = &'static str;
 
 /// Result of a full benchmark sweep across multiple inflight levels.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct BenchSweepResult {
     /// Number of levels actually tested
     pub used: u32,
@@ -42,7 +42,7 @@ pub const BENCH_MAX_LEVELS: usize = 11;
 
 /// Result for a single inflight level benchmark.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct BenchLevelResult {
     /// Inflight level tested
     pub inflight: u32,
@@ -77,6 +77,50 @@ impl Default for BenchSweepResult {
         }
     }
 }
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BenchSweepParams {
+    pub version: u32,
+    pub flags: u32,
+    pub total_bytes: u64,
+    pub request_size: u32,
+    pub start_sector: u64,
+    pub max_inflight: u16, // 0 = auto
+    pub _reserved0: u16,
+    pub _reserved1: u32,
+}
+
+impl Default for BenchSweepParams {
+    fn default() -> Self {
+        Self {
+            version: BENCH_PARAMS_VERSION_1,
+            flags: BENCH_FLAG_IRQ | BENCH_FLAG_POLL,
+            total_bytes: 1 * 1024 * 1024 * 1024,
+            request_size: 64 * 1024,
+            start_sector: 0,
+            max_inflight: 0,
+            _reserved0: 0,
+            _reserved1: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BenchSweepBothResult {
+    pub params_used: BenchSweepParams,
+    pub irq: BenchSweepResult,
+    pub poll: BenchSweepResult,
+    pub queue_count: u16,
+    pub queue0_size: u16,
+    pub indirect_enabled: u8,
+    pub msix_enabled: u8,
+    pub _pad0: u16,
+}
+pub const BENCH_PARAMS_VERSION_1: u32 = 1;
+
+pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
+pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
 
 /// Configuration for a benchmark window.
 #[derive(Clone, Debug)]

@@ -618,7 +618,7 @@ pub async fn disk_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if !write_through {
+    if false {
         // Write-back: update cache immediately and complete without hitting the disk.
         {
             let p = req.read();
@@ -714,9 +714,9 @@ pub async fn disk_ioctl<'a, 'b>(
             );
             handle.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
-            if status == DriverStatus::Success {
-                cache_clear(&dx);
-            }
+            // if status == DriverStatus::Success {
+            //     cache_clear(&dx);
+            // }
             DriverStep::complete(status)
         }
         _ => DriverStep::Continue,

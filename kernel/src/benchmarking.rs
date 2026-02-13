@@ -10,7 +10,7 @@ use crate::memory::{
 use crate::scheduling::runtime::runtime::{
     block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
-use crate::static_handlers::wait_duration;
+use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
 use crate::{cpu, print, println, vec};
@@ -27,10 +27,13 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
-use kernel_types::benchmark::{BenchSweepResult, BenchWindowConfig};
+use kernel_types::benchmark::{
+    BenchLevelResult, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
+};
+use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
-use kernel_types::request::TraversalPolicy;
-use kernel_types::status::FileStatus;
+use kernel_types::request::{RequestData, RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
@@ -1781,9 +1784,9 @@ fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
 
 pub async fn bench_async_vs_sync_call_latency_async() {
     let mut warm = 0u64;
-    for _ in 0..10_000 {
-        warm = sync_chain(warm);
-    }
+    // for _ in 0..10_000 {
+    //     warm = sync_chain(warm);
+    // }
 
     let mut warm_async = 0u64;
     for _ in 0..10_000 {
@@ -1799,9 +1802,9 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 
     let mut s = 0u64;
     let sw_sync = Stopwatch::start();
-    for _ in 0..ITERS {
-        s = sync_chain(s);
-    }
+    // for _ in 0..ITERS {
+    //     s = sync_chain(s);
+    // }
     let sync_us = sw_sync.elapsed_micros();
     black_box(s);
 
@@ -1880,13 +1883,11 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     println!("[bench] --- vs sync baseline ---");
     println!(
         "[bench] state_machine/sync  = {:.3}x  (async overhead: {:.3} us/chain)",
-        sm_vs_sync,
-        sm_overhead_us
+        sm_vs_sync, sm_overhead_us
     );
     println!(
         "[bench] blk/sync            = {:.3}x  (spawn+wake+sm overhead: {:.3} us/chain)",
-        blk_vs_sync,
-        blk_overhead_us
+        blk_vs_sync, blk_overhead_us
     );
     let pw_vs_sync = if async_us_per_chain == 0.0 {
         0.0
@@ -1911,7 +1912,7 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 // Runs at varying concurrency levels to find saturation point and measure scheduling overhead.
 
 const TRAFFIC_TOTAL_TASKS: usize = 100_000;
-const TRAFFIC_CONCURRENCY: &[usize] = &[1, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
+const TRAFFIC_CONCURRENCY: &[usize] = &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
 const TRAFFIC_WORK_NS: u64 = 1000; // simulated device work per blocking task
 const TRAFFIC_ASYNC_DEPTH: usize = 10; // async setup + postprocess depth
 
@@ -1989,15 +1990,15 @@ pub async fn bench_realistic_traffic_async() {
     );
 
     // Warmup
-    for i in 0..100u64 {
-        black_box(traffic_one_request(i).await);
-    }
+    // for i in 0..100u64 {
+    //     black_box(traffic_one_request(i).await);
+    // }
 
     // Baseline: fully sequential (concurrency=1)
     let sw_seq = Stopwatch::start();
-    for i in 0..TRAFFIC_TOTAL_TASKS as u64 {
-        black_box(traffic_one_request(i).await);
-    }
+    // for i in 0..TRAFFIC_TOTAL_TASKS as u64 {
+    //     black_box(traffic_one_request(i).await);
+    // }
     let seq_us = sw_seq.elapsed_micros();
     let seq_us_per_task = avg_micros_per(seq_us, TRAFFIC_TOTAL_TASKS as u64);
     let seq_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, seq_us);
@@ -2045,11 +2046,7 @@ pub async fn bench_realistic_traffic_async() {
 
         println!(
             "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
-            conc,
-            conc_ms,
-            conc_us_per_task,
-            conc_ops_sec,
-            speedup
+            conc, conc_ms, conc_us_per_task, conc_ops_sec, speedup
         );
     }
 
@@ -2087,11 +2084,7 @@ pub async fn bench_realistic_traffic_async() {
 
         println!(
             "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
-            bs,
-            bulk_ms,
-            bulk_us_per_task,
-            bulk_ops_sec,
-            speedup
+            bs, bulk_ms, bulk_us_per_task, bulk_ops_sec, speedup
         );
     }
 }
@@ -2689,6 +2682,8 @@ pub async fn benchmark_async_async() {
 // =============================================================================
 
 /// Convert TSC cycles to milliseconds.
+pub const IOCTL_BLOCK_BENCH_SWEEP_BOTH: u32 = 0xB000_8004;
+
 #[inline]
 fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
     if tsc_hz == 0 {
@@ -2697,299 +2692,544 @@ fn cycles_to_ms(cycles: u64, tsc_hz: u64) -> f64 {
     (cycles as f64 / tsc_hz as f64) * 1000.0
 }
 
-/// IOCTL code for triggering the benchmark sweep on virtio-blk PDO (uses IRQ-based waiting).
-const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
-/// IOCTL code for triggering the benchmark sweep in polling mode (no IRQ waits).
-const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
-
-/// Run a benchmark sweep on the VirtIO disk, testing different inflight levels.
-/// Results are printed in milliseconds.
-pub async fn bench_virtio_disk_sweep() {
-    use crate::static_handlers::pnp_get_device_target;
-    use kernel_types::request::{RequestData, RequestHandle, RequestType};
-    use kernel_types::status::DriverStatus;
-
-    let target = match pnp_get_device_target("VirtIO\\Disk_0") {
-        Some(t) => t,
-        None => {
-            println!("[virtio-bench] VirtIO disk not found at VirtIO\\Disk_0");
-            return;
-        }
-    };
-
-    println!("[virtio-bench] Starting benchmark sweep on VirtIO disk...");
-
-    let mut req = RequestHandle::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
-        RequestData::empty(),
-    );
-    req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = PNP_MANAGER.send_request(target, &mut req).await;
-
-    if status != DriverStatus::Success {
-        println!("[virtio-bench] IOCTL failed: {:?}", status);
+fn csv_escape(s: &str, out: &mut String) {
+    let needs = s
+        .as_bytes()
+        .iter()
+        .any(|&b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
+    if !needs {
+        out.push_str(s);
         return;
     }
-
-    let result: BenchSweepResult = {
-        let guard = req.read();
-        match guard.data.view::<BenchSweepResult>() {
-            Some(r) => *r,
-            None => {
-                println!("[virtio-bench] Failed to parse benchmark result");
-                return;
-            }
+    out.push('"');
+    for ch in s.chars() {
+        if ch == '"' {
+            out.push('"');
+            out.push('"');
+        } else {
+            out.push(ch);
         }
-    };
-
-    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
-    if tsc_hz == 0 {
-        println!("[virtio-bench] TSC not calibrated, cannot convert to ms");
-        return;
     }
-
-    println!("[virtio-bench] Inflight Sweep Results (100 MiB total, 64 KiB/req):");
-    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests | Idle (%)");
-    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------|----------");
-
-    for i in 0..result.used as usize {
-        let level = &result.levels[i];
-        let total_ms = cycles_to_ms(level.total_time_cycles, tsc_hz);
-        let avg_ms = cycles_to_ms(level.avg_cycles, tsc_hz);
-        let p50_ms = cycles_to_ms(level.p50_cycles, tsc_hz);
-        let p99_ms = cycles_to_ms(level.p99_cycles, tsc_hz);
-        let p999_ms = cycles_to_ms(level.p999_cycles, tsc_hz);
-        let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
-        let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
-        println!(
-            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8} | {:>8.2}",
-            level.inflight,
-            total_ms,
-            avg_ms,
-            p50_ms,
-            p99_ms,
-            p999_ms,
-            min_ms,
-            max_ms,
-            level.request_count,
-            level.idle_pct
-        );
-    }
-
-    println!("[virtio-bench] Benchmark complete.");
+    out.push('"');
 }
 
-/// Run a benchmark sweep on the VirtIO disk using polling mode (no IRQ waits).
-/// Results are printed in milliseconds.
-pub async fn bench_virtio_disk_sweep_polling() {
-    use crate::static_handlers::pnp_get_device_target;
-    use kernel_types::request::{RequestData, RequestHandle, RequestType};
-    use kernel_types::status::DriverStatus;
-
-    let target = match pnp_get_device_target("VirtIO\\Disk_0") {
-        Some(t) => t,
-        None => {
-            println!("[virtio-bench-poll] VirtIO disk not found at VirtIO\\Disk_0");
-            return;
-        }
-    };
-
-    println!("[virtio-bench-poll] Starting polling mode benchmark sweep on VirtIO disk...");
-
-    let mut req = RequestHandle::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
-        RequestData::empty(),
-    );
-    req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = PNP_MANAGER.send_request(target, &mut req).await;
-
-    if status != DriverStatus::Success {
-        println!("[virtio-bench-poll] IOCTL failed: {:?}", status);
-        return;
+#[inline]
+fn clamp_pct(v: f64) -> f64 {
+    if v < 0.0 {
+        0.0
+    } else if v > 100.0 {
+        100.0
+    } else {
+        v
     }
-
-    let result: BenchSweepResult = {
-        let guard = req.read();
-        match guard.data.view::<BenchSweepResult>() {
-            Some(r) => *r,
-            None => {
-                println!("[virtio-bench-poll] Failed to parse benchmark result");
-                return;
-            }
-        }
-    };
-
-    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
-    if tsc_hz == 0 {
-        println!("[virtio-bench-poll] TSC not calibrated, cannot convert to ms");
-        return;
-    }
-
-    println!("[virtio-bench-poll] Polling Mode Inflight Sweep Results (100 MiB total, 64 KiB/req):");
-    println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests | Idle (%)");
-    println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------|----------");
-
-    for i in 0..result.used as usize {
-        let level = &result.levels[i];
-        let total_ms = cycles_to_ms(level.total_time_cycles, tsc_hz);
-        let avg_ms = cycles_to_ms(level.avg_cycles, tsc_hz);
-        let p50_ms = cycles_to_ms(level.p50_cycles, tsc_hz);
-        let p99_ms = cycles_to_ms(level.p99_cycles, tsc_hz);
-        let p999_ms = cycles_to_ms(level.p999_cycles, tsc_hz);
-        let min_ms = cycles_to_ms(level.min_cycles, tsc_hz);
-        let max_ms = cycles_to_ms(level.max_cycles, tsc_hz);
-        println!(
-            "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8} | {:>8.2}",
-            level.inflight,
-            total_ms,
-            avg_ms,
-            p50_ms,
-            p99_ms,
-            p999_ms,
-            min_ms,
-            max_ms,
-            level.request_count,
-            level.idle_pct
-        );
-    }
-
-    println!("[virtio-bench-poll] Benchmark complete.");
 }
 
-/// Run both IRQ-based and polling mode benchmarks and print comparison.
-pub async fn bench_virtio_disk_sweep_both() {
-    use crate::static_handlers::{pnp_get_device_target, pnp_send_request};
-    use kernel_types::request::{RequestData, RequestHandle, RequestType};
-    use kernel_types::status::DriverStatus;
+fn csv_push_header(out: &mut String) {
+    out.push_str(
+        "run_id,trial,mode,\
+req_version,req_flags,req_total_bytes,req_request_size_bytes,req_start_sector,req_max_inflight,\
+used_version,used_flags,used_total_bytes,used_request_size_bytes,used_start_sector,used_max_inflight,\
+tsc_hz,queue_count,queue0_size,indirect,msix,\
+level_inflight,request_count,total_cycles,total_ms,avg_cycles,avg_ms,p50_cycles,p50_ms,p99_cycles,p99_ms,p999_cycles,p999_ms,\
+min_cycles,min_ms,max_cycles,max_ms,\
+wait_pct,active_pct,throughput_mib_s,iops\n",
+    );
+}
 
+fn csv_push_level(
+    out: &mut String,
+    run_id: u32,
+    trial: u32,
+    mode: &str,
+    requested: &BenchSweepParams,
+    used_params: &BenchSweepParams,
+    tsc_hz: u64,
+    queue_count: u16,
+    queue0_size: u16,
+    indirect_enabled: bool,
+    msix_enabled: bool,
+    lvl: BenchLevelResult,
+) {
+    let total_ms = cycles_to_ms(lvl.total_time_cycles, tsc_hz);
+    let avg_ms = cycles_to_ms(lvl.avg_cycles, tsc_hz);
+    let p50_ms = cycles_to_ms(lvl.p50_cycles, tsc_hz);
+    let p99_ms = cycles_to_ms(lvl.p99_cycles, tsc_hz);
+    let p999_ms = cycles_to_ms(lvl.p999_cycles, tsc_hz);
+    let min_ms = cycles_to_ms(lvl.min_cycles, tsc_hz);
+    let max_ms = cycles_to_ms(lvl.max_cycles, tsc_hz);
+
+    // lvl.idle_pct is actually "wait pct": percent of benchmark wall time spent inside irq_wait().await.
+    let wait_pct = clamp_pct(lvl.idle_pct);
+    let active_pct = 100.0 - wait_pct;
+
+    let secs = total_ms / 1000.0;
+    let throughput_mib_s = if secs > 0.0 {
+        (used_params.total_bytes as f64 / (1024.0 * 1024.0)) / secs
+    } else {
+        0.0
+    };
+    let iops = if secs > 0.0 {
+        (lvl.request_count as f64) / secs
+    } else {
+        0.0
+    };
+
+    out.push_str(&run_id.to_string());
+    out.push(',');
+    out.push_str(&trial.to_string());
+    out.push(',');
+
+    csv_escape(mode, out);
+    out.push(',');
+
+    out.push_str(&requested.version.to_string());
+    out.push(',');
+    out.push_str(&requested.flags.to_string());
+    out.push(',');
+    out.push_str(&requested.total_bytes.to_string());
+    out.push(',');
+    out.push_str(&requested.request_size.to_string());
+    out.push(',');
+    out.push_str(&requested.start_sector.to_string());
+    out.push(',');
+    out.push_str(&requested.max_inflight.to_string());
+    out.push(',');
+
+    out.push_str(&used_params.version.to_string());
+    out.push(',');
+    out.push_str(&used_params.flags.to_string());
+    out.push(',');
+    out.push_str(&used_params.total_bytes.to_string());
+    out.push(',');
+    out.push_str(&used_params.request_size.to_string());
+    out.push(',');
+    out.push_str(&used_params.start_sector.to_string());
+    out.push(',');
+    out.push_str(&used_params.max_inflight.to_string());
+    out.push(',');
+
+    out.push_str(&tsc_hz.to_string());
+    out.push(',');
+    out.push_str(&queue_count.to_string());
+    out.push(',');
+    out.push_str(&queue0_size.to_string());
+    out.push(',');
+    out.push_str(if indirect_enabled { "1" } else { "0" });
+    out.push(',');
+    out.push_str(if msix_enabled { "1" } else { "0" });
+    out.push(',');
+
+    out.push_str(&lvl.inflight.to_string());
+    out.push(',');
+    out.push_str(&lvl.request_count.to_string());
+    out.push(',');
+
+    out.push_str(&lvl.total_time_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.3}", total_ms));
+    out.push(',');
+
+    out.push_str(&lvl.avg_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", avg_ms));
+    out.push(',');
+
+    out.push_str(&lvl.p50_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", p50_ms));
+    out.push(',');
+
+    out.push_str(&lvl.p99_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", p99_ms));
+    out.push(',');
+
+    out.push_str(&lvl.p999_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", p999_ms));
+    out.push(',');
+
+    out.push_str(&lvl.min_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", min_ms));
+    out.push(',');
+
+    out.push_str(&lvl.max_cycles.to_string());
+    out.push(',');
+    out.push_str(&format!("{:.6}", max_ms));
+    out.push(',');
+
+    out.push_str(&format!("{:.3}", wait_pct));
+    out.push(',');
+    out.push_str(&format!("{:.3}", active_pct));
+    out.push(',');
+
+    out.push_str(&format!("{:.3}", throughput_mib_s));
+    out.push(',');
+    out.push_str(&format!("{:.3}", iops));
+    out.push('\n');
+}
+
+fn bench_sweep_append_csv_rows(
+    out: &mut String,
+    run_id: u32,
+    trial: u32,
+    mode: &str,
+    requested: &BenchSweepParams,
+    both: &BenchSweepBothResult,
+    sweep: &BenchSweepResult,
+    tsc_hz: u64,
+) {
+    let indirect = both.indirect_enabled != 0;
+    let msix = both.msix_enabled != 0;
+
+    let used = sweep.used as usize;
+    let mut i = 0usize;
+    while i < used && i < sweep.levels.len() {
+        let lvl = &sweep.levels[i];
+        csv_push_level(
+            out,
+            run_id,
+            trial,
+            mode,
+            requested,
+            &both.params_used,
+            tsc_hz,
+            both.queue_count,
+            both.queue0_size,
+            indirect,
+            msix,
+            *lvl,
+        );
+        i += 1;
+    }
+}
+
+async fn open_csv_root_c_create(name: &str) -> Result<File, FileStatus> {
+    let mut path_str = String::from("C:\\");
+    path_str.push_str(name);
+
+    let path = Path::from_string(&path_str);
+
+    let flags: [OpenFlags; 3] = [
+        OpenFlags::Create,
+        OpenFlags::WriteOnly,
+        OpenFlags::WriteThrough,
+    ];
+
+    File::open(&path, &flags).await
+}
+
+async fn write_csv_header_to_file(f: &mut File) -> Result<(), FileStatus> {
+    let mut hdr = String::new();
+    csv_push_header(&mut hdr);
+    f.append(hdr.as_bytes()).await?;
+    Ok(())
+}
+
+async fn write_csv_chunk_to_file(f: &mut File, chunk: &str) -> Result<(), FileStatus> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    f.append(chunk.as_bytes()).await?;
+    Ok(())
+}
+
+fn build_params(
+    version: u32,
+    flags: u32,
+    total_bytes: u64,
+    request_size: u32,
+    start_sector: u64,
+    max_inflight: u16,
+) -> BenchSweepParams {
+    BenchSweepParams {
+        version,
+        flags,
+        total_bytes,
+        request_size,
+        start_sector,
+        max_inflight,
+        _reserved0: 0,
+        _reserved1: 0,
+    }
+}
+
+pub struct BenchSweepMatrix<'a> {
+    pub version: u32,
+    pub flags_list: &'a [u32],
+    pub total_bytes_list: &'a [u64],
+    pub request_size_list: &'a [u32],
+    pub start_sector_list: &'a [u64],
+    pub max_inflight_list: &'a [u16],
+    pub trials: u32,
+    pub discard_first_per_combo: bool,
+    pub file_prefix: &'a str,
+}
+
+pub async fn bench_virtio_disk_sweep_both_matrix_to_csv(matrix: &BenchSweepMatrix<'_>) {
     let target = match pnp_get_device_target("VirtIO\\Disk_0") {
         Some(t) => t,
         None => {
-            println!("[virtio-bench] VirtIO disk not found at VirtIO\\Disk_0");
+            println!("[virtio-bench] VirtIO disk not found");
             return;
         }
     };
 
     let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
     if tsc_hz == 0 {
-        println!("[virtio-bench] TSC not calibrated, cannot convert to ms");
+        println!("[virtio-bench] TSC not calibrated");
         return;
     }
 
-    // Run IRQ-based benchmark
-    println!("[virtio-bench] Running IRQ-based benchmark...");
-    let mut req_irq = RequestHandle::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP),
-        RequestData::empty(),
-    );
-    req_irq.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status_irq = PNP_MANAGER.send_request(target.clone(), &mut req_irq).await;
+    let mut irq_name = String::new();
+    irq_name.push_str(matrix.file_prefix);
+    irq_name.push_str("virtio_bench_irq_all.csv");
 
-    let result_irq: Option<BenchSweepResult> = if status_irq == DriverStatus::Success {
-        let guard = req_irq.read();
-        guard.data.view::<BenchSweepResult>().copied()
-    } else {
-        println!("[virtio-bench] IRQ benchmark IOCTL failed: {:?}", status_irq);
-        None
+    let mut poll_name = String::new();
+    poll_name.push_str(matrix.file_prefix);
+    poll_name.push_str("virtio_bench_poll_all.csv");
+
+    let mut irq_f = match open_csv_root_c_create(&irq_name).await {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[virtio-bench] Failed opening C:\\{}: {:?}", irq_name, e);
+            return;
+        }
     };
 
-    // Run polling-based benchmark
-    println!("[virtio-bench] Running polling-based benchmark...");
-    let mut req_poll = RequestHandle::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_POLLING),
-        RequestData::empty(),
-    );
-    req_poll.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status_poll = PNP_MANAGER.send_request(target, &mut req_poll).await;
-
-    let result_poll: Option<BenchSweepResult> = if status_poll == DriverStatus::Success {
-        let guard = req_poll.read();
-        guard.data.view::<BenchSweepResult>().copied()
-    } else {
-        println!("[virtio-bench] Polling benchmark IOCTL failed: {:?}", status_poll);
-        None
+    let mut poll_f = match open_csv_root_c_create(&poll_name).await {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[virtio-bench] Failed opening C:\\{}: {:?}", poll_name, e);
+            let _ = irq_f.close().await;
+            return;
+        }
     };
 
-    // Print comparison
-    println!();
-    println!("[virtio-bench] ============================================");
-    println!("[virtio-bench] Benchmark Comparison (100 MiB total, 64 KiB/req)");
-    println!("[virtio-bench] ============================================");
-    println!();
-
-    if let Some(ref irq) = result_irq {
-        println!("[virtio-bench] IRQ Mode Results:");
-        println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
-        println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
-        for i in 0..irq.used as usize {
-            let level = &irq.levels[i];
-            println!(
-                "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
-                level.inflight,
-                cycles_to_ms(level.total_time_cycles, tsc_hz),
-                cycles_to_ms(level.avg_cycles, tsc_hz),
-                cycles_to_ms(level.p50_cycles, tsc_hz),
-                cycles_to_ms(level.p99_cycles, tsc_hz),
-                cycles_to_ms(level.p999_cycles, tsc_hz),
-                cycles_to_ms(level.min_cycles, tsc_hz),
-                cycles_to_ms(level.max_cycles, tsc_hz),
-                level.request_count
-            );
-        }
-        println!();
+    if write_csv_header_to_file(&mut irq_f).await.is_err() {
+        println!("[virtio-bench] Failed writing header to C:\\{}", irq_name);
+        let _ = irq_f.close().await;
+        let _ = poll_f.close().await;
+        return;
+    }
+    if write_csv_header_to_file(&mut poll_f).await.is_err() {
+        println!("[virtio-bench] Failed writing header to C:\\{}", poll_name);
+        let _ = irq_f.close().await;
+        let _ = poll_f.close().await;
+        return;
     }
 
-    if let Some(ref poll) = result_poll {
-        println!("[virtio-bench] Polling Mode Results:");
-        println!("  Inflight |  Total (ms) |   Avg (ms) |   P50 (ms) |   P99 (ms) |  P999 (ms) |   Min (ms) |   Max (ms) | Requests");
-        println!("  ---------|-------------|------------|------------|------------|-------------|------------|------------|----------");
-        for i in 0..poll.used as usize {
-            let level = &poll.levels[i];
-            println!(
-                "  {:>8} | {:>11.3} | {:>10.3} | {:>10.3} | {:>10.3} | {:>11.3} | {:>10.3} | {:>10.3} | {:>8}",
-                level.inflight,
-                cycles_to_ms(level.total_time_cycles, tsc_hz),
-                cycles_to_ms(level.avg_cycles, tsc_hz),
-                cycles_to_ms(level.p50_cycles, tsc_hz),
-                cycles_to_ms(level.p99_cycles, tsc_hz),
-                cycles_to_ms(level.p999_cycles, tsc_hz),
-                cycles_to_ms(level.min_cycles, tsc_hz),
-                cycles_to_ms(level.max_cycles, tsc_hz),
-                level.request_count
-            );
-        }
-        println!();
-    }
+    let mut run_id: u32 = 0;
 
-    // Print side-by-side comparison if both succeeded
-    if let (Some(irq), Some(poll)) = (&result_irq, &result_poll) {
-        println!("[virtio-bench] Side-by-side Comparison (Avg latency in ms):");
-        println!("  Inflight |   IRQ Avg   |  Poll Avg   | Diff (Poll-IRQ) | Speedup");
-        println!("  ---------|-------------|-------------|-----------------|--------");
+    let mut fi = 0usize;
+    while fi < matrix.flags_list.len() {
+        let flags = matrix.flags_list[fi];
 
-        let max_levels = (irq.used as usize).min(poll.used as usize);
-        for i in 0..max_levels {
-            let irq_level = &irq.levels[i];
-            let poll_level = &poll.levels[i];
+        let mut ti = 0usize;
+        while ti < matrix.total_bytes_list.len() {
+            let total_bytes = matrix.total_bytes_list[ti];
 
-            if irq_level.inflight == poll_level.inflight {
-                let irq_avg = cycles_to_ms(irq_level.avg_cycles, tsc_hz);
-                let poll_avg = cycles_to_ms(poll_level.avg_cycles, tsc_hz);
-                let diff = poll_avg - irq_avg;
-                let speedup = if poll_avg > 0.0 { irq_avg / poll_avg } else { 0.0 };
+            let mut ri = 0usize;
+            while ri < matrix.request_size_list.len() {
+                let request_size = matrix.request_size_list[ri];
 
-                println!(
-                    "  {:>8} | {:>11.3} | {:>11.3} | {:>+15.3} | {:>6.2}x",
-                    irq_level.inflight,
-                    irq_avg,
-                    poll_avg,
-                    diff,
-                    speedup
-                );
+                let mut si = 0usize;
+                while si < matrix.start_sector_list.len() {
+                    let start_sector = matrix.start_sector_list[si];
+
+                    let mut mi = 0usize;
+                    while mi < matrix.max_inflight_list.len() {
+                        let max_inflight = matrix.max_inflight_list[mi];
+
+                        let mut trial: u32 = 0;
+                        while trial < matrix.trials {
+                            let requested = build_params(
+                                matrix.version,
+                                flags,
+                                total_bytes,
+                                request_size,
+                                start_sector,
+                                max_inflight,
+                            );
+
+                            if matrix.discard_first_per_combo && trial == 0 {
+                                let mut warm = RequestHandle::new(
+                                    RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_BOTH),
+                                    RequestData::from_t(requested),
+                                );
+                                warm.set_traversal_policy(TraversalPolicy::ForwardLower);
+                                let _ = PNP_MANAGER.send_request(target.clone(), &mut warm).await;
+                                trial += 1;
+                                continue;
+                            }
+
+                            let mut req = RequestHandle::new(
+                                RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_BOTH),
+                                RequestData::from_t(requested),
+                            );
+                            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+                            println!(
+                                "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",
+                                trial, run_id, flags, total_bytes, request_size, start_sector, max_inflight
+                            );
+                            let st = PNP_MANAGER.send_request(target.clone(), &mut req).await;
+                            println!(
+                                "[virtio-bench] Completed trial {} for run_id {} with status: {:?}",
+                                trial, run_id, st
+                            );
+                            if st != DriverStatus::Success {
+                                println!(
+                                    "[virtio-bench] IOCTL_BOTH failed: {:?} (run_id={})",
+                                    st, run_id
+                                );
+                                run_id = run_id.wrapping_add(1);
+                                trial += 1;
+                                continue;
+                            }
+
+                            let both = {
+                                let g = req.read();
+                                match g.data.view::<BenchSweepBothResult>() {
+                                    Some(r) => *r,
+                                    None => {
+                                        println!(
+                                            "[virtio-bench] Failed to parse BenchSweepBothResult (run_id={})",
+                                            run_id
+                                        );
+                                        run_id = run_id.wrapping_add(1);
+                                        trial += 1;
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            let mut irq_chunk = String::new();
+                            bench_sweep_append_csv_rows(
+                                &mut irq_chunk,
+                                run_id,
+                                trial,
+                                "irq",
+                                &requested,
+                                &both,
+                                &both.irq,
+                                tsc_hz,
+                            );
+
+                            let mut poll_chunk = String::new();
+                            bench_sweep_append_csv_rows(
+                                &mut poll_chunk,
+                                run_id,
+                                trial,
+                                "poll",
+                                &requested,
+                                &both,
+                                &both.poll,
+                                tsc_hz,
+                            );
+
+                            if write_csv_chunk_to_file(&mut irq_f, &irq_chunk)
+                                .await
+                                .is_err()
+                            {
+                                println!("[virtio-bench] Failed writing C:\\{}", irq_name);
+                                let _ = irq_f.close().await;
+                                let _ = poll_f.close().await;
+                                return;
+                            }
+                            if write_csv_chunk_to_file(&mut poll_f, &poll_chunk)
+                                .await
+                                .is_err()
+                            {
+                                println!("[virtio-bench] Failed writing C:\\{}", poll_name);
+                                let _ = irq_f.close().await;
+                                let _ = poll_f.close().await;
+                                return;
+                            }
+
+                            let _ = irq_f.flush().await;
+                            let _ = poll_f.flush().await;
+
+                            run_id = run_id.wrapping_add(1);
+                            trial += 1;
+                        }
+
+                        mi += 1;
+                    }
+
+                    si += 1;
+                }
+
+                ri += 1;
             }
+
+            ti += 1;
         }
-        println!();
+
+        fi += 1;
     }
 
-    println!("[virtio-bench] Benchmark comparison complete.");
+    println!(
+        "[virtio-bench] Wrote C:\\{} and C:\\{}",
+        irq_name, poll_name
+    );
+}
+
+pub async fn bench_virtio_disk_sweep_both_to_csv(params: BenchSweepParams) {
+    let flags_list: [u32; 1] = [params.flags];
+    let total_bytes_list: [u64; 1] = [params.total_bytes];
+    let request_size_list: [u32; 1] = [params.request_size];
+    let start_sector_list: [u64; 1] = [params.start_sector];
+    let max_inflight_list: [u16; 1] = [params.max_inflight];
+
+    let matrix = BenchSweepMatrix {
+        version: params.version,
+        flags_list: &flags_list,
+        total_bytes_list: &total_bytes_list,
+        request_size_list: &request_size_list,
+        start_sector_list: &start_sector_list,
+        max_inflight_list: &max_inflight_list,
+        trials: 1,
+        discard_first_per_combo: false,
+        file_prefix: "",
+    };
+
+    bench_virtio_disk_sweep_both_matrix_to_csv(&matrix).await;
+}
+pub async fn run_virtio_bench_matrix() {
+    let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
+    let total_bytes_list: [u64; 1] = [4 * 1024 * 1024 * 1024];
+
+    let request_size_list: [u32; _] = [
+        4 * 1024,
+        8 * 1024,
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    ];
+
+    let start_sector_list: [u64; _] = [
+        0,
+        // 2 * 1024 * 1024,
+        // 4 * 1024 * 1024,
+        // 8 * 1024 * 1024
+    ];
+
+    let max_inflight_list: [u16; _] = [0];
+
+    let matrix = BenchSweepMatrix {
+        version: BENCH_PARAMS_VERSION_1,
+        flags_list: &flags_list,
+        total_bytes_list: &total_bytes_list,
+        request_size_list: &request_size_list,
+        start_sector_list: &start_sector_list,
+        max_inflight_list: &max_inflight_list,
+        trials: 3,
+        discard_first_per_combo: false,
+        file_prefix: "exp1_",
+    };
+
+    bench_virtio_disk_sweep_both_matrix_to_csv(&matrix).await;
 }
