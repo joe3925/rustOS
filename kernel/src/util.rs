@@ -180,12 +180,12 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
-        // install_prepacked_drivers().await;
+        install_prepacked_drivers().await;
         // BOOT_WINDOW.start();
-        // PNP_MANAGER.init_from_registry().await;
-        bench_async_vs_sync_call_latency_async().await;
+        PNP_MANAGER.init_from_registry().await;
+        // bench_async_vs_sync_call_latency_async().await;
 
-        benchmark_async_async().await;
+        // benchmark_async_async().await;
     });
     println!("");
 }

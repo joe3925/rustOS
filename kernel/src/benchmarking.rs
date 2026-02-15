@@ -39,7 +39,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = true;
+const BENCH_ENABLED: bool = false;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;

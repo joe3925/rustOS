@@ -202,16 +202,6 @@ pub struct SlabStats {
     pub fallback_allocations: u64,
 }
 
-#[repr(C, align(64))]
-pub struct TaskSlot {
-    gen_ref: AtomicU32,
-    state: AtomicU8,
-    _pad: [u8; 3],
-    future: UnsafeCell<Option<FutureStorage>>,
-}
-
-unsafe impl Sync for TaskSlot {}
-
 const GEN_SHIFT: u32 = 16;
 const REF_MASK: u32 = 0xFFFF;
 const GEN_MASK: u32 = 0xFFFF;
@@ -231,19 +221,82 @@ fn unpack_ref(packed: u32) -> u32 {
     packed & REF_MASK
 }
 
+const CW_NONE: u8 = 0;
+const CW_UPDATING: u8 = 1;
+const CW_SET: u8 = 2;
+
+#[repr(C, align(64))]
+pub struct TaskSlot {
+    gen_ref: AtomicU32,
+    state: AtomicU8,
+    cached_waker_state: AtomicU8,
+    _pad: [u8; 2],
+    cached_waker: UnsafeCell<MaybeUninit<Waker>>,
+    future: UnsafeCell<Option<FutureStorage>>,
+}
+
+unsafe impl Sync for TaskSlot {}
+
 impl TaskSlot {
     const fn new() -> Self {
         Self {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
-            _pad: [0; 3],
+            cached_waker_state: AtomicU8::new(CW_NONE),
+            _pad: [0; 2],
+            cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
             future: UnsafeCell::new(None),
         }
     }
 
+    #[inline]
+    fn reset_cached_waker(&self) {
+        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn drop_cached_waker_if_set(&self) {
+        let s = self.cached_waker_state.load(Ordering::Acquire);
+        if s == CW_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
+            }
+        }
+        self.cached_waker_state.store(CW_NONE, Ordering::Release);
+    }
+
+    #[inline]
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
         unsafe { *self.future.get() = Some(FutureStorage::new(future)) };
         self.state.store(STATE_QUEUED, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+        loop {
+            let s = self.cached_waker_state.load(Ordering::Acquire);
+            if s == CW_SET {
+                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
+            }
+            if s == CW_UPDATING {
+                spin_loop();
+                continue;
+            }
+            if self
+                .cached_waker_state
+                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            let w = super::waker::create_slab_waker(shard_idx, local_idx, generation);
+            unsafe {
+                (*self.cached_waker.get()).write(w.clone());
+            }
+            self.cached_waker_state.store(CW_SET, Ordering::Release);
+            return w;
+        }
     }
 
     pub fn poll_once(
@@ -368,16 +421,26 @@ impl JoinableStorage {
     }
 }
 
+#[inline]
+fn read_cell_usize(c: &UnsafeCell<usize>) -> usize {
+    unsafe { *c.get() }
+}
+
+#[inline]
+fn write_cell_usize(c: &UnsafeCell<usize>, v: usize) {
+    unsafe { *c.get() = v }
+}
+
 #[repr(C, align(64))]
 pub struct JoinableSlot {
     gen_ref: AtomicU32,
     state: AtomicU8,
     waker_state: AtomicU8,
-    cached_waker_valid: AtomicU8,
+    cached_waker_state: AtomicU8,
     _pad: u8,
-    poll_fn: AtomicUsize,
-    drop_fn: AtomicUsize,
-    result_drop_fn: AtomicUsize,
+    poll_fn: UnsafeCell<usize>,
+    drop_fn: UnsafeCell<usize>,
+    result_drop_fn: UnsafeCell<usize>,
     join_waker: UnsafeCell<MaybeUninit<Waker>>,
     cached_waker: UnsafeCell<MaybeUninit<Waker>>,
     buffer: UnsafeCell<JoinableStorage>,
@@ -391,15 +454,31 @@ impl JoinableSlot {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
             waker_state: AtomicU8::new(WAKER_NONE),
-            cached_waker_valid: AtomicU8::new(0),
+            cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
-            poll_fn: AtomicUsize::new(0),
-            drop_fn: AtomicUsize::new(0),
-            result_drop_fn: AtomicUsize::new(0),
+            poll_fn: UnsafeCell::new(0),
+            drop_fn: UnsafeCell::new(0),
+            result_drop_fn: UnsafeCell::new(0),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
             cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
             buffer: UnsafeCell::new(JoinableStorage::new()),
         }
+    }
+
+    #[inline]
+    fn reset_cached_waker(&self) {
+        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn drop_cached_waker_if_set(&self) {
+        let s = self.cached_waker_state.load(Ordering::Acquire);
+        if s == CW_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
+            }
+        }
+        self.cached_waker_state.store(CW_NONE, Ordering::Release);
     }
 
     pub unsafe fn init_joinable<F, T>(&self, future: F)
@@ -415,25 +494,20 @@ impl JoinableSlot {
         if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
             let ptr = buf_ptr as *mut F;
             core::ptr::write(ptr, future);
-            self.poll_fn
-                .store(poll_and_store_inline::<F, T> as usize, Ordering::Release);
-            self.drop_fn
-                .store(drop_inline::<F> as usize, Ordering::Release);
+            write_cell_usize(&self.poll_fn, poll_and_store_inline::<F, T> as usize);
+            write_cell_usize(&self.drop_fn, drop_inline::<F> as usize);
         } else {
             let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
             let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
             core::ptr::write(ptr, Some(boxed));
-            self.poll_fn
-                .store(poll_and_store_boxed::<T> as usize, Ordering::Release);
-            self.drop_fn
-                .store(drop_boxed_future::<T> as usize, Ordering::Release);
+            write_cell_usize(&self.poll_fn, poll_and_store_boxed::<T> as usize);
+            write_cell_usize(&self.drop_fn, drop_boxed_future::<T> as usize);
         }
 
-        self.result_drop_fn
-            .store(drop_inline::<T> as usize, Ordering::Release);
+        write_cell_usize(&self.result_drop_fn, drop_inline::<T> as usize);
 
         self.waker_state.store(WAKER_NONE, Ordering::Release);
-        self.cached_waker_valid.store(0, Ordering::Release);
+        self.cached_waker_state.store(CW_NONE, Ordering::Release);
 
         self.state.store(STATE_QUEUED, Ordering::Release);
     }
@@ -458,7 +532,7 @@ impl JoinableSlot {
 
         let mut cx = Context::from_waker(waker);
 
-        let poll_fn = self.poll_fn.load(Ordering::Acquire);
+        let poll_fn = read_cell_usize(&self.poll_fn);
         if poll_fn == 0 {
             self.state.store(STATE_COMPLETED, Ordering::Release);
             return true;
@@ -469,7 +543,7 @@ impl JoinableSlot {
         let is_ready = unsafe { poll_fn(self, &mut cx) };
 
         if is_ready {
-            self.poll_fn.store(0, Ordering::Release);
+            write_cell_usize(&self.poll_fn, 0);
             self.state.store(STATE_COMPLETED, Ordering::Release);
             self.wake_join_handle();
             true
@@ -500,7 +574,7 @@ impl JoinableSlot {
         let ptr = (*self.buffer.get()).as_mut_ptr() as *mut T;
         let result = core::ptr::read(ptr);
 
-        self.drop_fn.store(0, Ordering::Release);
+        write_cell_usize(&self.drop_fn, 0);
         result
     }
 
@@ -581,11 +655,9 @@ impl JoinableSlot {
                 unsafe {
                     (*self.join_waker.get()).write(waker.clone());
                 }
-                self.waker_state.store(WAKER_SET, Ordering::Release);
-            } else {
-                self.waker_state.store(WAKER_SET, Ordering::Release);
             }
 
+            self.waker_state.store(WAKER_SET, Ordering::Release);
             break;
         }
 
@@ -607,30 +679,31 @@ impl JoinableSlot {
         }
     }
 
-    pub fn get_or_refresh_cached_waker(
-        &self,
-        shard_idx: usize,
-        local_idx: usize,
-        generation: u32,
-    ) -> Waker {
-        if self.cached_waker_valid.load(Ordering::Acquire) != 0 {
-            let cached = unsafe { (*self.cached_waker.get()).assume_init_ref() };
-            let new = super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation);
-            if cached.will_wake(&new) {
-                return cached.clone();
+    pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+        loop {
+            let s = self.cached_waker_state.load(Ordering::Acquire);
+            if s == CW_SET {
+                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
             }
-            unsafe {
-                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
+            if s == CW_UPDATING {
+                spin_loop();
+                continue;
             }
-            self.cached_waker_valid.store(0, Ordering::Release);
-        }
+            if self
+                .cached_waker_state
+                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
 
-        let waker = super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation);
-        unsafe {
-            (*self.cached_waker.get()).write(waker.clone());
+            let w = super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation);
+            unsafe {
+                (*self.cached_waker.get()).write(w.clone());
+            }
+            self.cached_waker_state.store(CW_SET, Ordering::Release);
+            return w;
         }
-        self.cached_waker_valid.store(1, Ordering::Release);
-        waker
     }
 
     #[inline]
@@ -681,8 +754,8 @@ where
             let result_ptr = buffer_ptr as *mut T;
             core::ptr::write(result_ptr, result);
 
-            let result_drop = slot.result_drop_fn.load(Ordering::Acquire);
-            slot.drop_fn.store(result_drop, Ordering::Release);
+            let result_drop = read_cell_usize(&slot.result_drop_fn);
+            write_cell_usize(&slot.drop_fn, result_drop);
 
             true
         }
@@ -710,8 +783,8 @@ where
             let result_ptr = buffer_ptr as *mut T;
             core::ptr::write(result_ptr, result);
 
-            let result_drop = slot.result_drop_fn.load(Ordering::Acquire);
-            slot.drop_fn.store(result_drop, Ordering::Release);
+            let result_drop = read_cell_usize(&slot.result_drop_fn);
+            write_cell_usize(&slot.drop_fn, result_drop);
 
             true
         }
@@ -786,7 +859,7 @@ impl SlabShard {
             let word = &self.free_bitmap[word_idx];
 
             loop {
-                let bits = word.load(Ordering::Acquire);
+                let bits = word.load(Ordering::Relaxed);
                 if bits == 0 {
                     break;
                 }
@@ -831,7 +904,7 @@ impl SlabShard {
         let bit_idx = slot_idx % 64;
         let mask = 1u64 << bit_idx;
 
-        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Release);
+        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Relaxed);
         self.alloc_hint.store(slot_idx, Ordering::Relaxed);
         self.allocated_count.fetch_sub(1, Ordering::Relaxed);
     }
@@ -907,7 +980,7 @@ impl JoinableShard {
             let word = &self.free_bitmap[word_idx];
 
             loop {
-                let bits = word.load(Ordering::Acquire);
+                let bits = word.load(Ordering::Relaxed);
                 if bits == 0 {
                     break;
                 }
@@ -952,7 +1025,7 @@ impl JoinableShard {
         let bit_idx = slot_idx % 64;
         let mask = 1u64 << bit_idx;
 
-        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Release);
+        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Relaxed);
         self.alloc_hint.store(slot_idx, Ordering::Relaxed);
         self.allocated_count.fetch_sub(1, Ordering::Relaxed);
     }
@@ -1028,6 +1101,8 @@ impl TaskSlab {
                 let slot = shard.get_slot(local_idx)?;
 
                 slot.state.store(STATE_IDLE, Ordering::Relaxed);
+                slot.reset_cached_waker();
+                unsafe { *slot.future.get() = None };
 
                 let old = slot.gen_ref.load(Ordering::Acquire);
                 let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
@@ -1132,6 +1207,7 @@ impl TaskSlab {
                 Ok(_) => {
                     if rc == 1 {
                         unsafe { *slot.future.get() = None };
+                        slot.drop_cached_waker_if_set();
                         slot.state.store(STATE_IDLE, Ordering::Release);
                         shard.deallocate(local_idx);
                     }
@@ -1158,10 +1234,10 @@ impl TaskSlab {
 
                 slot.state.store(STATE_IDLE, Ordering::Relaxed);
                 slot.waker_state.store(WAKER_NONE, Ordering::Relaxed);
-                slot.cached_waker_valid.store(0, Ordering::Relaxed);
-                slot.poll_fn.store(0, Ordering::Relaxed);
-                slot.drop_fn.store(0, Ordering::Relaxed);
-                slot.result_drop_fn.store(0, Ordering::Relaxed);
+                slot.reset_cached_waker();
+                write_cell_usize(&slot.poll_fn, 0);
+                write_cell_usize(&slot.drop_fn, 0);
+                write_cell_usize(&slot.result_drop_fn, 0);
 
                 let old = slot.gen_ref.load(Ordering::Acquire);
                 let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
@@ -1271,21 +1347,16 @@ impl TaskSlab {
             {
                 Ok(_) => {
                     if rc == 1 {
-                        let drop_fn = slot.drop_fn.load(Ordering::Acquire);
+                        let drop_fn = read_cell_usize(&slot.drop_fn);
                         if drop_fn != 0 {
                             unsafe {
-                                let drop_fn: unsafe fn(*mut u8) = core::mem::transmute(drop_fn);
-                                drop_fn((*slot.buffer.get()).as_mut_ptr());
+                                let f: unsafe fn(*mut u8) = core::mem::transmute(drop_fn);
+                                f((*slot.buffer.get()).as_mut_ptr());
                             }
                         }
-                        slot.drop_fn.store(0, Ordering::Release);
+                        write_cell_usize(&slot.drop_fn, 0);
 
-                        if slot.cached_waker_valid.load(Ordering::Acquire) != 0 {
-                            unsafe {
-                                core::ptr::drop_in_place((*slot.cached_waker.get()).as_mut_ptr());
-                            }
-                            slot.cached_waker_valid.store(0, Ordering::Release);
-                        }
+                        slot.drop_cached_waker_if_set();
 
                         let ws = slot.waker_state.load(Ordering::Acquire);
                         if ws == WAKER_SET {
@@ -1295,8 +1366,8 @@ impl TaskSlab {
                         }
                         slot.waker_state.store(WAKER_NONE, Ordering::Release);
 
-                        slot.poll_fn.store(0, Ordering::Release);
-                        slot.result_drop_fn.store(0, Ordering::Release);
+                        write_cell_usize(&slot.poll_fn, 0);
+                        write_cell_usize(&slot.result_drop_fn, 0);
                         slot.state.store(STATE_IDLE, Ordering::Release);
 
                         shard.deallocate(local_idx);
@@ -1512,7 +1583,7 @@ pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
         return;
     };
 
-    let waker = super::waker::create_slab_waker(shard_idx, local_idx, generation);
+    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
 
     let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
 
@@ -1529,7 +1600,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         return;
     };
 
-    loop {
+    for _ in 0..2 {
         if slot.try_enqueue() {
             slab.increment_ref(shard_idx, local_idx, generation);
             let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
@@ -1540,8 +1611,6 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         if slot.try_notify() {
             return;
         }
-
-        spin_loop();
     }
 }
 
@@ -1556,7 +1625,7 @@ pub extern "win64" fn joinable_slab_poll_trampoline(ctx: usize) {
         return;
     };
 
-    let waker = slot.get_or_refresh_cached_waker(shard_idx, local_idx, generation);
+    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
 
     let completed = slot.poll_once_joinable(&waker, shard_idx, local_idx, generation);
 
@@ -1573,7 +1642,7 @@ pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation
         return;
     };
 
-    loop {
+    for _ in 0..2 {
         if slot.try_enqueue() {
             slab.increment_joinable_ref(shard_idx, local_idx, generation);
             let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
@@ -1584,8 +1653,6 @@ pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation
         if slot.try_notify() {
             return;
         }
-
-        spin_loop();
     }
 }
 
