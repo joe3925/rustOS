@@ -3274,7 +3274,7 @@ pub async fn run_virtio_bench_matrix() {
 }
 pub async fn run_virtio_bench_matrix_print() {
     let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
-    let total_bytes_list: [u64; 1] = [512 * 1024 * 1024];
+    let total_bytes_list: [u64; 1] = [9 * 1024 * 1024 * 1024];
 
     let request_size_list: [u32; _] = [
         // 4 * 1024,
