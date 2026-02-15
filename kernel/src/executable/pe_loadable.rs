@@ -7,6 +7,7 @@ use crate::println;
 use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
+use crate::structs::stopwatch::Stopwatch;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::format;
@@ -124,6 +125,7 @@ impl PELoader {
         &mut self,
         program: &mut Program,
     ) -> Result<(ModuleHandle, Vec<(String, usize)>, u64), LoadError> {
+        let sw = Stopwatch::start();
         let opt = self
             .pe
             .header
@@ -276,7 +278,6 @@ impl PELoader {
             range_tracker,
         );
 
-
         // Allocates the image + a guard page + the stack + the heap
         match program.virtual_map_alloc(
             program.image_base,
@@ -296,7 +297,10 @@ impl PELoader {
             },
             0,
             stack_size,
-            self.path.parent().map(|p| p.to_string()).unwrap_or_default(),
+            self.path
+                .parent()
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
             stack_addr,
             0,
         );

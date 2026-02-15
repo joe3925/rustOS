@@ -24,7 +24,7 @@ use crate::{
     println,
     registry::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,
-    util::TOTAL_TIME,
+    util::{BOOT_WINDOW, TOTAL_TIME},
 };
 use crate::{
     drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
@@ -402,6 +402,7 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
         secs, frac, used_mib, used_mib_frac
     );
+    BOOT_WINDOW.stop_and_persist().await;
     spawn_blocking(|| {
         wait_duration(Duration::from_millis(50));
         spawn_detached(async move {

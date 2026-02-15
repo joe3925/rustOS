@@ -241,20 +241,6 @@ pub async fn vol_pdo_read<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
-    let off_res = {
-        let r = req.read();
-        match r.kind {
-            RequestType::Read { offset, len } => {
-                if len == 0 {
-                    Ok(None)
-                } else {
-                    Ok(Some((offset, len, r.traversal_policy)))
-                }
-            }
-            _ => Err(DriverStatus::InvalidParameter),
-        }
-    };
-
     let binding = ext::<VolPdoExt>(&dev);
     let tgt = match binding.backing.get() {
         Some(t) => t.clone(),
@@ -271,23 +257,6 @@ pub async fn vol_pdo_write<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     buf_len: usize,
 ) -> DriverStep {
-    let parsed = {
-        let r = req.read();
-        match r.kind {
-            RequestType::Write {
-                offset,
-                len,
-                flush_write_through,
-            } => {
-                if len == 0 {
-                    Ok((offset, len, flush_write_through, r.traversal_policy))
-                } else {
-                    Ok((offset, len, flush_write_through, r.traversal_policy))
-                }
-            }
-            _ => Err(DriverStatus::InvalidParameter),
-        }
-    };
     if buf_len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }

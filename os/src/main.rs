@@ -50,7 +50,7 @@ fn main() {
                 "-machine",
                 "q35,accel=tcg",
                 "-smp",
-                "2",
+                "1",
                 "-gdb",
                 "tcp::1234",
                 "-S",

@@ -20,6 +20,7 @@ pub use macros::async_ffi;
 pub const ABI_VERSION: u32 = 2;
 
 const SLAB_ALIGN: usize = 64;
+const SLAB_CHECKS: bool = cfg!(debug_assertions);
 
 const fn sel(b: bool) -> usize {
     if b { 1 } else { 0 }
@@ -39,67 +40,92 @@ const fn freelist_tag(word: usize) -> usize {
     word >> FREELIST_IDX_BITS
 }
 
-#[inline(always)]
-unsafe fn freelist_pop<const N: usize>(head: &AtomicUsize, next_base: *mut u16) -> Option<usize> {
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct NextCell {
+    v: u16,
+    _pad: [u8; 62],
+}
+
+impl NextCell {
+    const fn new(v: u16) -> Self {
+        Self { v, _pad: [0; 62] }
+    }
+}
+
+#[repr(C, align(64))]
+struct CachelineAtomicUsize {
+    head: AtomicUsize,
+}
+
+impl CachelineAtomicUsize {
+    const fn new(v: usize) -> Self {
+        Self {
+            head: AtomicUsize::new(v),
+        }
+    }
+}
+
+unsafe fn freelist_pop<const N: usize>(
+    head: &AtomicUsize,
+    next_base: *mut NextCell,
+) -> Option<usize> {
     loop {
         let h = head.load(Ordering::Acquire);
         let idx = freelist_idx(h);
         if idx == FREELIST_NULL {
             return None;
         }
-        if idx >= N {
-            panic!("async-ffi slab freelist corrupt head idx={}", idx);
+
+        if SLAB_CHECKS {
+            debug_assert!(idx < N);
         }
 
-        let next = *next_base.add(idx) as usize;
+        let next = (*next_base.add(idx)).v as usize;
         let tag = freelist_tag(h);
         let newh = freelist_pack(tag.wrapping_add(1), next);
 
-        if head
-            .compare_exchange_weak(h, newh, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return Some(idx);
+        match head.compare_exchange_weak(h, newh, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return Some(idx),
+            Err(_) => core::hint::spin_loop(),
         }
     }
 }
 
-#[inline(always)]
-unsafe fn freelist_push<const N: usize>(head: &AtomicUsize, next_base: *mut u16, idx: usize) {
-    if idx >= N {
-        panic!("async-ffi slab freelist push idx out of range idx={}", idx);
+unsafe fn freelist_push<const N: usize>(head: &AtomicUsize, next_base: *mut NextCell, idx: usize) {
+    if SLAB_CHECKS {
+        debug_assert!(idx < N);
     }
 
     loop {
-        let h = head.load(Ordering::Acquire);
+        let h = head.load(Ordering::Relaxed);
         let head_idx = freelist_idx(h);
-        if head_idx != FREELIST_NULL && head_idx >= N {
-            panic!("async-ffi slab freelist corrupt head idx={}", head_idx);
+
+        if SLAB_CHECKS {
+            debug_assert!(head_idx == FREELIST_NULL || head_idx < N);
         }
 
-        *next_base.add(idx) = head_idx as u16;
+        (*next_base.add(idx)).v = head_idx as u16;
 
         let tag = freelist_tag(h);
         let newh = freelist_pack(tag.wrapping_add(1), idx);
 
-        if head
-            .compare_exchange_weak(h, newh, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            return;
+        match head.compare_exchange_weak(h, newh, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(_) => core::hint::spin_loop(),
         }
     }
 }
 
-const fn make_freelist_next<const N: usize>() -> [u16; N] {
-    let mut out = [0u16; N];
+const fn make_freelist_next<const N: usize>() -> [NextCell; N] {
+    let mut out = [NextCell::new(0); N];
     let mut i = 0usize;
     while i < N {
-        out[i] = if i + 1 < N {
+        out[i] = NextCell::new(if i + 1 < N {
             (i + 1) as u16
         } else {
             FREELIST_NULL as u16
-        };
+        });
         i += 1;
     }
     out
@@ -218,9 +244,9 @@ struct AlignedFutureBuf {
 }
 
 #[cfg(feature = "async-ffi-slab")]
-static FUTURE_SLAB_HEAD: AtomicUsize = AtomicUsize::new(freelist_pack(0, 0));
+static FUTURE_SLAB_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
 #[cfg(feature = "async-ffi-slab")]
-static mut FUTURE_SLAB_NEXT: [u16; ASYNC_FFI_SLAB_SLOTS] =
+static mut FUTURE_SLAB_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
     make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
 #[cfg(feature = "async-ffi-slab")]
 static mut FUTURE_SLAB_BUF: AlignedFutureBuf = AlignedFutureBuf {
@@ -228,18 +254,18 @@ static mut FUTURE_SLAB_BUF: AlignedFutureBuf = AlignedFutureBuf {
 };
 
 #[cfg(feature = "async-ffi-slab")]
-static WAKER_TO_FFI_HEAD: AtomicUsize = AtomicUsize::new(freelist_pack(0, 0));
+static WAKER_TO_FFI_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
 #[cfg(feature = "async-ffi-slab")]
-static mut WAKER_TO_FFI_NEXT: [u16; ASYNC_FFI_SLAB_SLOTS] =
+static mut WAKER_TO_FFI_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
     make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
 #[cfg(feature = "async-ffi-slab")]
 static mut WAKER_TO_FFI_SLAB: [MaybeUninit<RustWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
     [const { MaybeUninit::uninit() }; ASYNC_FFI_SLAB_SLOTS];
 
 #[cfg(feature = "async-ffi-slab")]
-static FFI_TO_WAKER_HEAD: AtomicUsize = AtomicUsize::new(freelist_pack(0, 0));
+static FFI_TO_WAKER_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
 #[cfg(feature = "async-ffi-slab")]
-static mut FFI_TO_WAKER_NEXT: [u16; ASYNC_FFI_SLAB_SLOTS] =
+static mut FFI_TO_WAKER_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
     make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
 #[cfg(feature = "async-ffi-slab")]
 static mut FFI_TO_WAKER_SLAB: [MaybeUninit<FfiWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
@@ -281,7 +307,7 @@ impl<T> FfiPoll<T> {
         if self.tag == 0 {
             Poll::Pending
         } else {
-            Poll::Ready(unsafe { self.value.assume_init() })
+            Poll::Ready(self.value.assume_init())
         }
     }
 }
@@ -348,7 +374,7 @@ impl<T> FfiFuture<T> {
     }
 
     pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
-        unsafe { (self.poll_fn)(self.data, waker) }
+        (self.poll_fn)(self.data, waker)
     }
 }
 
@@ -397,11 +423,12 @@ where
         let align = mem::align_of::<FutureBox<F>>();
 
         if size <= ASYNC_FFI_FUTURE_SLOT_BYTES && align <= SLAB_ALIGN {
-            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut u16;
-            if let Some(i) =
-                unsafe { freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD, next_base) }
+            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut NextCell;
+            if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD.head, next_base)
             {
-                *next_base.add(i) = FREELIST_ALLOC_SENTINEL;
+                if SLAB_CHECKS {
+                    (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
+                }
 
                 let buf_base = core::ptr::addr_of_mut!(FUTURE_SLAB_BUF.buf) as *mut u8;
                 let slot = buf_base.add(i * ASYNC_FFI_FUTURE_SLOT_BYTES);
@@ -446,9 +473,9 @@ where
     }
 
     let fb = data as *mut FutureBox<F>;
-    let w = ffi_waker_to_waker(unsafe { &*waker });
+    let w = ffi_waker_to_waker(&*waker);
     let mut cx = Context::from_waker(&w);
-    let p = Future::poll(unsafe { Pin::new_unchecked(&mut (*fb).future) }, &mut cx);
+    let p = Future::poll(Pin::new_unchecked(&mut (*fb).future), &mut cx);
     FfiPoll::from(p)
 }
 
@@ -466,24 +493,24 @@ where
 
         if p >= base && p < end {
             let off = p - base;
-            if off % ASYNC_FFI_FUTURE_SLOT_BYTES != 0 {
-                panic!("async-ffi: future ptr not on slot boundary");
+            if SLAB_CHECKS {
+                debug_assert!(off % ASYNC_FFI_FUTURE_SLOT_BYTES == 0);
             }
             let idx = off / ASYNC_FFI_FUTURE_SLOT_BYTES;
 
-            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut u16;
-            let mark = *next_base.add(idx);
-            if mark != FREELIST_ALLOC_SENTINEL {
-                panic!("async-ffi: future double-free/corrupt slab idx={}", idx);
+            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut NextCell;
+            if SLAB_CHECKS {
+                let mark = (*next_base.add(idx)).v;
+                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
             }
 
             ptr::drop_in_place(fb);
-            unsafe { freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD, next_base, idx) };
+            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD.head, next_base, idx);
             return;
         }
     }
 
-    drop(unsafe { Box::from_raw(fb) });
+    drop(Box::from_raw(fb));
 }
 
 struct RustWakerBox {
@@ -504,11 +531,11 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
 
     #[cfg(feature = "async-ffi-slab")]
     unsafe {
-        let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut u16;
-        if let Some(i) =
-            unsafe { freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD, next_base) }
-        {
-            *next_base.add(i) = FREELIST_ALLOC_SENTINEL;
+        let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut NextCell;
+        if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD.head, next_base) {
+            if SLAB_CHECKS {
+                (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
+            }
 
             let slab_base =
                 core::ptr::addr_of_mut!(WAKER_TO_FFI_SLAB) as *mut MaybeUninit<RustWakerBox>;
@@ -542,7 +569,7 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
 
 unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
     let b = data as *const RustWakerBox;
-    unsafe { (*b).refs.fetch_add(1, Ordering::Relaxed) };
+    (*b).refs.fetch_add(1, Ordering::Relaxed);
     FfiWaker {
         data,
         vtable: &RUST_WAKER_BOX_VTABLE,
@@ -551,18 +578,18 @@ unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
 
 unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
     let b = data as *const RustWakerBox;
-    unsafe { (*b).waker.wake_by_ref() };
+    (*b).waker.wake_by_ref();
     rust_waker_box_drop(data);
 }
 
 unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
     let b = data as *const RustWakerBox;
-    unsafe { (*b).waker.wake_by_ref() };
+    (*b).waker.wake_by_ref();
 }
 
 unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
     let b = data as *mut RustWakerBox;
-    if unsafe { (*b).refs.fetch_sub(1, Ordering::AcqRel) } != 1 {
+    if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
 
@@ -576,19 +603,19 @@ unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
         if p >= base && p < end {
             let idx = (p - base) / mem::size_of::<MaybeUninit<RustWakerBox>>();
 
-            let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut u16;
-            let mark = *next_base.add(idx);
-            if mark != FREELIST_ALLOC_SENTINEL {
-                panic!("async-ffi: rust waker double-free/corrupt slab idx={}", idx);
+            let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut NextCell;
+            if SLAB_CHECKS {
+                let mark = (*next_base.add(idx)).v;
+                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
             }
 
             ptr::drop_in_place(b);
-            unsafe { freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD, next_base, idx) };
+            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD.head, next_base, idx);
             return;
         }
     }
 
-    drop(unsafe { Box::from_raw(b) });
+    drop(Box::from_raw(b));
 }
 
 struct FfiWakerBox {
@@ -608,11 +635,11 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
 
     #[cfg(feature = "async-ffi-slab")]
     unsafe {
-        let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut u16;
-        if let Some(i) =
-            unsafe { freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD, next_base) }
-        {
-            *next_base.add(i) = FREELIST_ALLOC_SENTINEL;
+        let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut NextCell;
+        if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD.head, next_base) {
+            if SLAB_CHECKS {
+                (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
+            }
 
             let slab_base =
                 core::ptr::addr_of_mut!(FFI_TO_WAKER_SLAB) as *mut MaybeUninit<FfiWakerBox>;
@@ -646,23 +673,23 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
 
 unsafe fn ffi_waker_box_raw_clone(data: *const ()) -> RawWaker {
     let b = data as *const FfiWakerBox;
-    unsafe { (*b).refs.fetch_add(1, Ordering::Relaxed) };
+    (*b).refs.fetch_add(1, Ordering::Relaxed);
     RawWaker::new(data, &FFI_WAKER_BOX_RAW_VTABLE)
 }
 
 unsafe fn ffi_waker_box_raw_wake(data: *const ()) {
-    unsafe { ffi_waker_box_raw_wake_by_ref(data) };
-    unsafe { ffi_waker_box_raw_drop(data) };
+    ffi_waker_box_raw_wake_by_ref(data);
+    ffi_waker_box_raw_drop(data);
 }
 
 unsafe fn ffi_waker_box_raw_wake_by_ref(data: *const ()) {
     let b = data as *const FfiWakerBox;
-    unsafe { (*b).waker.wake_by_ref() };
+    (*b).waker.wake_by_ref();
 }
 
 unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
     let b = data as *mut FfiWakerBox;
-    if unsafe { (*b).refs.fetch_sub(1, Ordering::AcqRel) } != 1 {
+    if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
     }
 
@@ -676,19 +703,19 @@ unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
         if p >= base && p < end {
             let idx = (p - base) / mem::size_of::<MaybeUninit<FfiWakerBox>>();
 
-            let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut u16;
-            let mark = *next_base.add(idx);
-            if mark != FREELIST_ALLOC_SENTINEL {
-                panic!("async-ffi: ffi->waker double-free/corrupt slab idx={}", idx);
+            let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut NextCell;
+            if SLAB_CHECKS {
+                let mark = (*next_base.add(idx)).v;
+                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
             }
 
             ptr::drop_in_place(b);
-            unsafe { freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD, next_base, idx) };
+            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD.head, next_base, idx);
             return;
         }
     }
 
-    drop(unsafe { Box::from_raw(b) });
+    drop(Box::from_raw(b));
 }
 
 #[repr(C)]
@@ -701,7 +728,7 @@ pub struct BorrowingFfiFuture<'a, T> {
 
 impl<'a, T> BorrowingFfiFuture<'a, T> {
     pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
-        unsafe { (self.poll_fn)(self.data, waker) }
+        (self.poll_fn)(self.data, waker)
     }
 }
 
@@ -750,9 +777,9 @@ where
     }
 
     let f = data as *mut F;
-    let w = ffi_waker_to_waker(unsafe { &*waker });
+    let w = ffi_waker_to_waker(&*waker);
     let mut cx = Context::from_waker(&w);
-    let p = Future::poll(unsafe { Pin::new_unchecked(&mut *f) }, &mut cx);
+    let p = Future::poll(Pin::new_unchecked(&mut *f), &mut cx);
     FfiPoll::from(p)
 }
 

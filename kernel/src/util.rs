@@ -83,20 +83,21 @@ pub static BOOTSET: &[BootPkg] = boot_packages![
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-// lazy_static! {
-//     pub static ref GLOBAL_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
-//         name: "global",
-//         folder: "C:\\system\\logs",
-//         log_samples: false,
-//         log_spans: true,
-//         log_mem_on_persist: true,
-//         end_on_drop: false,
-//         timeout_ms: None,
-//         auto_persist_secs: None,
-//         sample_reserve: 256,
-//         span_reserve: 256,
-//     });
-// }
+lazy_static! {
+    pub static ref BOOT_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
+        name: "global",
+        folder: "C:\\system\\logs",
+        log_samples: false,
+        log_spans: true,
+        log_mem_on_persist: true,
+        end_on_drop: false,
+        timeout_ms: None,
+        auto_persist_secs: None,
+        sample_reserve: 256,
+        span_reserve: 256,
+        disable_per_core: true
+    });
+}
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -181,7 +182,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
 
     spawn_detached(async move {
         install_prepacked_drivers().await;
-
+        BOOT_WINDOW.start();
         PNP_MANAGER.init_from_registry().await;
         // bench_async_vs_sync_call_latency_async().await;
         // bench_realistic_traffic_async().await;

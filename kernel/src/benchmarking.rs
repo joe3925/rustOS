@@ -3,6 +3,7 @@ use crate::drivers::interrupt_index::{self, TSC_HZ};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::file_system::file::File;
+use crate::memory::allocator::ALLOCATOR;
 use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
@@ -38,7 +39,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -1642,14 +1643,13 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
         return Err(());
     }
 
-    file.write(data).await.map_err(|_| ())?;
+    file.append(data).await.map_err(|_| ())?;
     file.close().await;
     Ok(())
 }
 
 pub fn used_memory() -> usize {
-    // HEAP_SIZE - ALLOCATOR.free_memory()
-    0
+    HEAP_SIZE as usize - ALLOCATOR.free_memory()
 }
 
 const DEPTH: usize = 1_000;

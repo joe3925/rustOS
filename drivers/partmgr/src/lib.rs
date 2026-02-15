@@ -4,10 +4,11 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
+use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
 use core::ptr;
 use core::sync::atomic::AtomicBool;
-use kernel_api::device::{DevExtRef, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::{
     DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo, Synchronization,
 };
@@ -78,6 +79,7 @@ struct PartDevExt {
     end_lba: Once<u64>,
     block_size: Once<u32>,
     part: Once<PartitionInfo>,
+    parent: Once<Weak<DevNode>>,
 }
 
 #[request_handler]
@@ -99,21 +101,10 @@ async fn partition_pdo_query_resources<'a, 'b>(
 }
 
 async fn send_req_parent<'h, 'd>(
-    dev: &Arc<DeviceObject>,
+    parent: &Weak<DevNode>,
     req: &'h mut RequestHandle<'d>,
 ) -> DriverStatus {
-    let parent = dev
-        .dev_node
-        .get()
-        .unwrap()
-        .upgrade()
-        .unwrap()
-        .parent
-        .get()
-        .unwrap()
-        .clone();
-
-    pnp_send_request_to_stack_top(parent, req).await
+    pnp_send_request_to_stack_top(parent.clone(), req).await
 }
 #[request_handler]
 pub async fn partition_pdo_read<'a, 'b>(
@@ -163,7 +154,7 @@ pub async fn partition_pdo_read<'a, 'b>(
         len: buf_len,
     };
 
-    let status = send_req_parent(&device, request).await;
+    let status = send_req_parent(&dx.parent.get().unwrap(), request).await;
 
     DriverStep::complete(status)
 }
@@ -223,7 +214,7 @@ pub async fn partition_pdo_write<'a, 'b>(
         flush_write_through,
     };
 
-    let status = send_req_parent(&device, request).await;
+    let status = send_req_parent(&dx.parent.get().unwrap(), request).await;
 
     DriverStep::complete(status)
 }
@@ -412,6 +403,17 @@ pub async fn partmgr_pnp_query_devrels<'a, 'b>(
         pext.start_lba.call_once(|| e.first_lba);
         pext.end_lba.call_once(|| e.last_lba);
         pext.block_size.call_once(|| sec_sz_u32.max(1));
+        pext.parent.call_once(|| {
+            pdo.dev_node
+                .get()
+                .unwrap()
+                .upgrade()
+                .unwrap()
+                .parent
+                .get()
+                .unwrap()
+                .clone()
+        });
 
         let part_pi = PartitionInfo {
             disk: *di,
