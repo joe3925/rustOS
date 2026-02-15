@@ -2,9 +2,8 @@ extern crate rand_xoshiro;
 
 use crate::alloc::format;
 use crate::benchmarking::{
-    bench_async_vs_sync_call_latency, bench_async_vs_sync_call_latency_async,
-    bench_realistic_traffic, bench_realistic_traffic_async, benchmark_async, benchmark_async_async,
-    BenchWindow,
+    bench_async_vs_sync_call_latency, bench_async_vs_sync_call_latency_async, benchmark_async,
+    benchmark_async_async, BenchWindow,
 };
 use crate::boot_packages;
 use crate::console::Screen;
@@ -181,13 +180,12 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
-        install_prepacked_drivers().await;
-        BOOT_WINDOW.start();
-        PNP_MANAGER.init_from_registry().await;
-        // bench_async_vs_sync_call_latency_async().await;
-        // bench_realistic_traffic_async().await;
+        // install_prepacked_drivers().await;
+        // BOOT_WINDOW.start();
+        // PNP_MANAGER.init_from_registry().await;
+        bench_async_vs_sync_call_latency_async().await;
 
-        // benchmark_async_async().await;
+        benchmark_async_async().await;
     });
     println!("");
 }

@@ -1660,7 +1660,6 @@ const BLOCK_TASKS: usize = 50_000;
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
         bench_async_vs_sync_call_latency_async().await;
-        bench_realistic_traffic_async().await;
     });
 }
 
@@ -1784,9 +1783,9 @@ fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
 
 pub async fn bench_async_vs_sync_call_latency_async() {
     let mut warm = 0u64;
-    // for _ in 0..10_000 {
-    //     warm = sync_chain(warm);
-    // }
+    for _ in 0..10_000 {
+        warm = sync_chain(warm);
+    }
 
     let mut warm_async = 0u64;
     for _ in 0..10_000 {
@@ -1802,9 +1801,9 @@ pub async fn bench_async_vs_sync_call_latency_async() {
 
     let mut s = 0u64;
     let sw_sync = Stopwatch::start();
-    // for _ in 0..ITERS {
-    //     s = sync_chain(s);
-    // }
+    for _ in 0..ITERS {
+        s = sync_chain(s);
+    }
     let sync_us = sw_sync.elapsed_micros();
     black_box(s);
 
@@ -1915,13 +1914,6 @@ const TRAFFIC_TOTAL_TASKS: usize = 100_000;
 const TRAFFIC_CONCURRENCY: &[usize] = &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
 const TRAFFIC_WORK_NS: u64 = 1000; // simulated device work per blocking task
 const TRAFFIC_ASYNC_DEPTH: usize = 10; // async setup + postprocess depth
-
-pub fn bench_realistic_traffic() {
-    spawn_detached(async {
-        bench_realistic_traffic_async().await;
-    });
-}
-
 #[inline(never)]
 fn traffic_blocking_work(seed: u64) -> u64 {
     // Simulate real device work: spin for TRAFFIC_WORK_NS then do a small compute
@@ -1976,117 +1968,6 @@ async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
         results.push(traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await);
     }
     results
-}
-
-pub async fn bench_realistic_traffic_async() {
-    println!("[traffic] === realistic traffic benchmark ===");
-    println!(
-        "[traffic] tasks={} work_ns={} async_depth={}",
-        TRAFFIC_TOTAL_TASKS, TRAFFIC_WORK_NS, TRAFFIC_ASYNC_DEPTH
-    );
-    println!(
-        "[traffic] {:>6} {:>12} {:>12} {:>12} {:>10}",
-        "conc", "total_ms", "us/task", "ops/s", "vs_seq"
-    );
-
-    // Warmup
-    // for i in 0..100u64 {
-    //     black_box(traffic_one_request(i).await);
-    // }
-
-    // Baseline: fully sequential (concurrency=1)
-    let sw_seq = Stopwatch::start();
-    // for i in 0..TRAFFIC_TOTAL_TASKS as u64 {
-    //     black_box(traffic_one_request(i).await);
-    // }
-    let seq_us = sw_seq.elapsed_micros();
-    let seq_us_per_task = avg_micros_per(seq_us, TRAFFIC_TOTAL_TASKS as u64);
-    let seq_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, seq_us);
-    let seq_ms = micros_to_ms(seq_us);
-
-    println!(
-        "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9}",
-        1, seq_ms, seq_us_per_task, seq_ops_sec, "1.000x"
-    );
-
-    // Concurrent: spawn N tasks at a time, process in waves
-    for &conc in TRAFFIC_CONCURRENCY {
-        if conc <= 1 {
-            continue;
-        }
-
-        let mut done = 0usize;
-        let gate = Arc::new(AtomicBool::new(false));
-        let mut all_joins = Vec::new();
-
-        while done < TRAFFIC_TOTAL_TASKS {
-            let batch = (TRAFFIC_TOTAL_TASKS - done).min(conc);
-            for j in 0..batch {
-                let seed = (done + j) as u64;
-                let gate = gate.clone();
-                all_joins.push(spawn(async move {
-                    while !gate.load(Ordering::Acquire) {
-                        ready().await;
-                    }
-                    traffic_one_request(seed).await
-                }));
-            }
-            done += batch;
-        }
-
-        let sw = Stopwatch::start();
-        gate.store(true, Ordering::Release);
-        let _results = JoinAll::new(all_joins).await;
-
-        let conc_us = sw.elapsed_micros();
-        let conc_us_per_task = avg_micros_per(conc_us, TRAFFIC_TOTAL_TASKS as u64);
-        let conc_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, conc_us);
-        let conc_ms = micros_to_ms(conc_us);
-        let speedup = safe_ratio(seq_us, conc_us);
-
-        println!(
-            "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
-            conc, conc_ms, conc_us_per_task, conc_ops_sec, speedup
-        );
-    }
-
-    // Bulk queue test: batch all blocking work together
-    println!("[traffic] --- bulk queue (batch blocking phase) ---");
-    let batch_sizes: &[usize] = &[64, 256, 1024, TRAFFIC_TOTAL_TASKS];
-    for &bs in batch_sizes {
-        // Pre-build all seed batches, then gate execution
-        let gate = Arc::new(AtomicBool::new(false));
-        let mut batch_joins = Vec::new();
-        let mut done = 0usize;
-
-        while done < TRAFFIC_TOTAL_TASKS {
-            let batch = (TRAFFIC_TOTAL_TASKS - done).min(bs);
-            let seeds: Vec<u64> = (done..done + batch).map(|i| i as u64).collect();
-            let gate = gate.clone();
-            batch_joins.push(spawn(async move {
-                while !gate.load(Ordering::Acquire) {
-                    ready().await;
-                }
-                traffic_batch_request(seeds).await
-            }));
-            done += batch;
-        }
-
-        let sw = Stopwatch::start();
-        gate.store(true, Ordering::Release);
-        let _results = JoinAll::new(batch_joins).await;
-
-        let bulk_us = sw.elapsed_micros();
-        let bulk_us_per_task = avg_micros_per(bulk_us, TRAFFIC_TOTAL_TASKS as u64);
-        let bulk_ops_sec = ops_per_sec_from_micros(TRAFFIC_TOTAL_TASKS as u64, bulk_us);
-        let bulk_ms = micros_to_ms(bulk_us);
-        let speedup = safe_ratio(seq_us, bulk_us);
-
-        println!(
-            "[traffic] {:>6} {:>12.3} {:>12.3} {:>12.1} {:>9.3}x",
-            bs, bulk_ms, bulk_us_per_task, bulk_ops_sec, speedup
-        );
-    }
 }
 
 // =====================
