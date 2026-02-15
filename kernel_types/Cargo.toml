@@ -18,3 +18,28 @@ bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",
     "derive",
 ] }
+[features]
+macros = []
+
+async-ffi-slab = []
+
+async-ffi-slab-slots-16 = ["async-ffi-slab"]
+async-ffi-slab-slots-32 = ["async-ffi-slab"]
+async-ffi-slab-slots-64 = ["async-ffi-slab"]
+async-ffi-slab-slots-128 = ["async-ffi-slab"]
+async-ffi-slab-slots-256 = ["async-ffi-slab"]
+async-ffi-slab-slots-512 = ["async-ffi-slab"]
+async-ffi-slab-slots-1024 = ["async-ffi-slab"]
+async-ffi-slab-slots-2048 = ["async-ffi-slab"]
+async-ffi-slab-slots-4096 = ["async-ffi-slab"]
+async-ffi-slab-slots-8192 = ["async-ffi-slab"]
+
+async-ffi-slab-slot-bytes-256 = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-512 = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-1k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-2k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-4k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-8k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-16k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-32k = ["async-ffi-slab"]
+async-ffi-slab-slot-bytes-64k = ["async-ffi-slab"]

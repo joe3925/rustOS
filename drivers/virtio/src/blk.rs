@@ -19,7 +19,7 @@ pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 409
 pub const ARENA_PREALLOCATED_SLOTS: usize = 256;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 1024;
+pub const ARENA_DYNAMIC_SLOTS: usize = 16;
 
 /// Maximum arena capacity before overflow requests are not cached
 pub const ARENA_MAX_CAPACITY: usize = 5096;
@@ -29,7 +29,7 @@ pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
 
 /// Size of preallocated data regions in bytes
 /// Tuned for interrupt benchmark: smaller requests = more I/O ops = more interrupts
-pub const PREALLOCATED_DATA_SIZE: usize = 4 * 1024 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 16 * 1024;
 
 /// Calculate the required indirect table size in bytes for a given data length.
 /// Returns a page-aligned size (minimum 4KB) to satisfy allocation requirements.

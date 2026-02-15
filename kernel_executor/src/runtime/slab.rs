@@ -18,7 +18,7 @@ const MAX_SLOTS_PER_SHARD: usize = 4096;
 const DEFAULT_JOINABLE_SLOTS_PER_SHARD: usize = 64;
 const MAX_JOINABLE_SLOTS_PER_SHARD: usize = 1024;
 
-pub const INLINE_FUTURE_SIZE: usize = 512;
+pub const INLINE_FUTURE_SIZE: usize = 5096;
 pub const JOINABLE_STORAGE_SIZE: usize = 480;
 
 pub const INLINE_FUTURE_ALIGN: usize = 8;
@@ -423,28 +423,25 @@ impl JoinableSlot {
             let ptr = (*self.buffer.get()).as_mut_ptr() as *mut F;
             core::ptr::write(ptr, future);
             // Store the type-erased poll function that handles both polling and result storage
-            self.poll_fn.store(
-                poll_and_store_inline::<F, T> as usize,
-                Ordering::Release,
-            );
-            self.drop_fn.store(drop_inline::<F> as usize, Ordering::Release);
+            self.poll_fn
+                .store(poll_and_store_inline::<F, T> as usize, Ordering::Release);
+            self.drop_fn
+                .store(drop_inline::<F> as usize, Ordering::Release);
         } else {
             // Box the future (shouldn't happen if caller checked size)
             let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
-            let ptr = (*self.buffer.get()).as_mut_ptr() as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
+            let ptr = (*self.buffer.get()).as_mut_ptr()
+                as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
             core::ptr::write(ptr, Some(boxed));
-            self.poll_fn.store(
-                poll_and_store_boxed::<T> as usize,
-                Ordering::Release,
-            );
-            self.drop_fn.store(
-                drop_boxed_future::<T> as usize,
-                Ordering::Release,
-            );
+            self.poll_fn
+                .store(poll_and_store_boxed::<T> as usize, Ordering::Release);
+            self.drop_fn
+                .store(drop_boxed_future::<T> as usize, Ordering::Release);
         }
 
         // Store the result drop function for later use
-        self.result_drop_fn.store(drop_inline::<T> as usize, Ordering::Release);
+        self.result_drop_fn
+            .store(drop_inline::<T> as usize, Ordering::Release);
 
         // Reset waker state
         self.waker_state.store(WAKER_NONE, Ordering::Release);
@@ -514,7 +511,8 @@ impl JoinableSlot {
                 self.state.store(STATE_QUEUED, Ordering::Release);
                 let slab = get_task_slab();
                 slab.increment_joinable_ref(shard_idx, local_idx, generation);
-                let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
+                let encoded =
+                    encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
                 submit_global(joinable_slab_poll_trampoline, encoded);
             }
 
@@ -630,7 +628,12 @@ impl JoinableSlot {
     #[inline]
     pub fn try_enqueue(&self) -> bool {
         self.state
-            .compare_exchange(STATE_IDLE, STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 
@@ -887,7 +890,11 @@ impl JoinableShard {
             for i in 0..num_words {
                 let slots_in_word = if i == num_words - 1 {
                     let rem = num_slots % 64;
-                    if rem == 0 { 64 } else { rem }
+                    if rem == 0 {
+                        64
+                    } else {
+                        rem
+                    }
                 } else {
                     64
                 };
@@ -1283,9 +1290,7 @@ impl TaskSlab {
                         // Drop cached waker if valid
                         if slot.cached_waker_valid.load(Ordering::Acquire) != 0 {
                             unsafe {
-                                core::ptr::drop_in_place(
-                                    (*slot.cached_waker.get()).as_mut_ptr(),
-                                );
+                                core::ptr::drop_in_place((*slot.cached_waker.get()).as_mut_ptr());
                             }
                             slot.cached_waker_valid.store(0, Ordering::Release);
                         }
@@ -1413,8 +1418,7 @@ impl<'a> JoinableSlotHandle<'a> {
                 self.generation,
             );
 
-            let encoded =
-                encode_joinable_slab_ptr(self.shard_idx, self.local_idx, self.generation);
+            let encoded = encode_joinable_slab_ptr(self.shard_idx, self.local_idx, self.generation);
             submit_global(joinable_slab_poll_trampoline, encoded);
         }
 

@@ -123,6 +123,16 @@ pub extern "win64" fn allocate_kernel_range_mapped(
 pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<VirtAddr> {
     let aligned_size = align_up_4k(size);
 
+    if alignment < 0x1000 {
+        return None;
+    }
+    if (alignment & (alignment - 1)) != 0 {
+        return None;
+    }
+    if (alignment & 0xFFF) != 0 {
+        return None;
+    }
+
     if alignment > 0x1000 {
         let extra = alignment - 0x1000;
         let total_request = aligned_size + extra;
@@ -132,7 +142,6 @@ pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<V
         let aligned_addr = (addr.as_u64() + alignment - 1) & !(alignment - 1);
 
         let wasted_before = aligned_addr - addr.as_u64();
-
         if wasted_before > 0 {
             KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), wasted_before);
         }
@@ -146,11 +155,9 @@ pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<V
         Some(VirtAddr::new(aligned_addr))
     } else {
         let addr = KERNEL_RANGE_TRACKER.alloc_auto(aligned_size)?;
-        debug_assert_eq!(addr.as_u64() & 0xFFF, 0);
         Some(addr)
     }
 }
-
 pub fn allocate_auto_kernel_range_mapped_aligned(
     size: u64,
     alignment: u64,

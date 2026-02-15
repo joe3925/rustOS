@@ -1,3 +1,4 @@
+// lib.rs (or main driver file)
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
@@ -12,9 +13,9 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 
 use dev_ext::{
-    DevExt, PciPdoExt, PrtEntry, build_resources_blob, hwids_for, instance_path_for,
-    load_segments_from_parent, name_for, parse_ecam_segments_from_blob, parse_prt_from_blob,
-    scan_ecam_bus,
+    DevExt, McfgSegment, PciPdoExt, PrtEntry, build_resources_blob, ecam_bus_base_from_segment,
+    hwids_for, instance_path_for, load_segments_from_parent, map_ecam_bus, map_ecam_segment_range,
+    name_for, parse_ecam_segments_from_blob, parse_prt_from_blob, scan_ecam_bus_mapped,
 };
 
 use kernel_api::{
@@ -25,6 +26,7 @@ use kernel_api::{
         pnp::DeviceIds,
         request::RequestData,
     },
+    memory::unmap_mmio_region,
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
@@ -48,6 +50,7 @@ fn panic(info: &PanicInfo) -> ! {
         panic_common(MOD_NAME, info)
     }
 }
+
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, bus_driver_device_add);
@@ -122,7 +125,6 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
             return DriverStep::Continue;
         }
     } else {
-        // Fallback derive segments from parent using platform-specific probe
         let segs = load_segments_from_parent(&device).await;
         if let Ok(ext) = device.try_devext::<DevExt>() {
             if !segs.is_empty() {
@@ -158,10 +160,23 @@ fn resolve_gsi(p: &mut PciPdoExt, prt: &[PrtEntry]) {
     if p.irq_pin == 0 {
         return;
     }
-    let prt_pin = p.irq_pin - 1; // PCI irq_pin is 1-based, PRT pin is 0-based
+    let prt_pin = p.irq_pin - 1;
     if let Some(entry) = prt.iter().find(|e| e.device == p.dev && e.pin == prt_pin) {
         p.irq_gsi = Some(entry.gsi);
     }
+}
+
+#[derive(Clone, Copy)]
+struct MapToUnmap {
+    base: kernel_api::x86_64::VirtAddr,
+    size: u64,
+}
+
+#[derive(Clone, Copy)]
+struct BusWork {
+    seg: McfgSegment,
+    bus: u8,
+    bus_base: kernel_api::x86_64::VirtAddr,
 }
 
 pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
@@ -207,37 +222,75 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
         return DriverStatus::Success;
     }
 
-    let mut joins = Vec::new();
-    for seg in segments.unwrap() {
-        for bus in seg.start_bus..=seg.end_bus {
-            let seg_copy = seg;
-            let prt_copy = prt_arc.clone();
-            joins.push(spawn_blocking(move || {
-                let mut devices = match scan_ecam_bus(&seg_copy, bus) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        println!(
-                            "[PCI] failed to scan segment {} bus {}: {:?}",
-                            seg_copy.seg, bus, e
-                        );
-                        Vec::new()
-                    }
-                };
+    let mut unmaps: Vec<MapToUnmap> = Vec::new();
+    let mut work: Vec<BusWork> = Vec::new();
 
-                if !prt_copy.is_empty() {
-                    for p in devices.iter_mut() {
-                        resolve_gsi(p, prt_copy.as_ref());
+    for seg in segments.unwrap() {
+        match map_ecam_segment_range(&seg) {
+            Ok(map) => {
+                unmaps.push(MapToUnmap {
+                    base: map.base,
+                    size: map.size,
+                });
+                for bus in seg.start_bus..=seg.end_bus {
+                    let bus_base = ecam_bus_base_from_segment(map, bus);
+                    work.push(BusWork { seg, bus, bus_base });
+                }
+            }
+            Err(e) => {
+                println!(
+                    "[PCI] segment {} bulk ECAM map failed ({:?}); falling back to per-bus maps",
+                    seg.seg, e
+                );
+                for bus in seg.start_bus..=seg.end_bus {
+                    match map_ecam_bus(&seg, bus) {
+                        Ok((bus_base, sz)) => {
+                            unmaps.push(MapToUnmap {
+                                base: bus_base,
+                                size: sz,
+                            });
+                            work.push(BusWork { seg, bus, bus_base });
+                        }
+                        Err(be) => {
+                            println!(
+                                "[PCI] failed to map segment {} bus {}: {:?}",
+                                seg.seg, bus, be
+                            );
+                        }
                     }
                 }
-                devices
-            }));
+            }
         }
+    }
+
+    let mut joins = Vec::new();
+    for w in work {
+        let seg_copy = w.seg;
+        let bus = w.bus;
+        let bus_base = w.bus_base;
+        let prt_copy = prt_arc.clone();
+
+        joins.push(spawn_blocking(move || {
+            let mut devices = scan_ecam_bus_mapped(&seg_copy, bus, bus_base);
+
+            if !prt_copy.is_empty() {
+                for p in devices.iter_mut() {
+                    resolve_gsi(p, prt_copy.as_ref());
+                }
+            }
+
+            devices
+        }));
     }
 
     for join in joins {
         for p in join.await {
             make_pdo_for_function(&devnode, &p);
         }
+    }
+
+    for m in unmaps {
+        let _ = unmap_mmio_region(m.base, m.size);
     }
 
     DriverStatus::Success
@@ -287,8 +340,6 @@ pub async fn pci_pdo_query_id<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    use kernel_api::pnp::QueryIdType;
-
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),
@@ -361,6 +412,7 @@ pub async fn pci_pdo_start<'a, 'b>(
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }
+
 #[request_handler]
 pub async fn pci_pdo_query_devrels<'a, 'b>(
     _dev: Arc<DeviceObject>,

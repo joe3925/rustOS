@@ -24,7 +24,7 @@ lto = true
 opt-level = "z"
 
 [dependencies]
-kernel_api = { path = "../../kernel_api" }
+kernel_api = { workspace = true }
 aml = "0.16.4"
 
 spin = { version = "0.10", default-features = false, features = ["mutex"] }

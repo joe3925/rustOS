@@ -42,7 +42,11 @@ bincode = { version = "2.0.1", default-features = false, features = [
 buddy_system_allocator = "0.11.0"
 baby-mimalloc = { version = "*", features = ["spin_mutex", "deferred_free"] }
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
-kernel_types = { path = "../kernel_types" }
+kernel_types = { path = "../kernel_types", default-features = false, features = [
+    "async-ffi-slab",
+    "async-ffi-slab-slots-512",
+    "async-ffi-slab-slot-bytes-64k",
+] }
 kernel_routing = { path = "../kernel_routing", default-features = false, features = [
     "kernel_link",
 ] }

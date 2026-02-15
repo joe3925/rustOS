@@ -14,7 +14,12 @@ members = [
     "volmgr",
 ]
 resolver = "2"
-
+[workspace.dependencies]
+kernel_api = { path = "../kernel_api", default-features = false, features = [
+    "async-ffi-slab",
+    "async-ffi-slab-slots-256",
+    "async-ffi-slab-slot-bytes-64k",
+] }
 [profile.dev]
 opt-level = 3
 panic = "abort"

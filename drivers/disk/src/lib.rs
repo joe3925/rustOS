@@ -618,7 +618,7 @@ pub async fn disk_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if false {
+    if !write_through {
         // Write-back: update cache immediately and complete without hitting the disk.
         {
             let p = req.read();

@@ -3,8 +3,8 @@
 #![feature(try_trait_v2)]
 #![feature(negative_impls)]
 #![feature(auto_traits)]
-#![feature(specialization)]
 #![feature(const_type_name)]
+#![allow(static_mut_refs)]
 extern crate alloc;
 
 pub mod async_ffi;
@@ -21,7 +21,7 @@ pub mod status;
 use alloc::sync::Arc;
 use x86_64::VirtAddr;
 
-use crate::async_ffi::{BorrowingFfiFuture, FfiFuture};
+use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
 use crate::request::{Request, RequestHandle};
@@ -38,20 +38,20 @@ pub type EvtIoRead = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
     usize,
-) -> BorrowingFfiFuture<'b, DriverStep>;
+) -> FfiFuture<DriverStep>;
 pub type EvtIoWrite = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
     usize,
-) -> BorrowingFfiFuture<'b, DriverStep>;
+) -> FfiFuture<DriverStep>;
 pub type EvtIoDeviceControl = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'b, DriverStep>;
+) -> FfiFuture<DriverStep>;
 pub type EvtIoFs = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'b, DriverStep>;
+) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine =
@@ -59,6 +59,6 @@ pub type CompletionRoutine =
 pub type PnpMinorCallback = for<'a, 'b> extern "win64" fn(
     Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
-) -> BorrowingFfiFuture<'b, DriverStep>;
+) -> FfiFuture<DriverStep>;
 
 pub type DpcFn = extern "win64" fn(usize);

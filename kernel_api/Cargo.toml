@@ -17,3 +17,31 @@ kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types" }
 kernel_sys = { path = "../kernel_sys" }
 kernel_routing = { path = "../kernel_routing" }
+
+[features]
+default = ["async-ffi-slab-default"]
+
+async-ffi-slab-default = ["async-ffi-slab"]
+
+async-ffi-slab = ["kernel_types/async-ffi-slab"]
+
+async-ffi-slab-slots-16 = ["kernel_types/async-ffi-slab-slots-16"]
+async-ffi-slab-slots-32 = ["kernel_types/async-ffi-slab-slots-32"]
+async-ffi-slab-slots-64 = ["kernel_types/async-ffi-slab-slots-64"]
+async-ffi-slab-slots-128 = ["kernel_types/async-ffi-slab-slots-128"]
+async-ffi-slab-slots-256 = ["kernel_types/async-ffi-slab-slots-256"]
+async-ffi-slab-slots-512 = ["kernel_types/async-ffi-slab-slots-512"]
+async-ffi-slab-slots-1024 = ["kernel_types/async-ffi-slab-slots-1024"]
+async-ffi-slab-slots-2048 = ["kernel_types/async-ffi-slab-slots-2048"]
+async-ffi-slab-slots-4096 = ["kernel_types/async-ffi-slab-slots-4096"]
+async-ffi-slab-slots-8192 = ["kernel_types/async-ffi-slab-slots-8192"]
+
+async-ffi-slab-slot-bytes-256 = ["kernel_types/async-ffi-slab-slot-bytes-256"]
+async-ffi-slab-slot-bytes-512 = ["kernel_types/async-ffi-slab-slot-bytes-512"]
+async-ffi-slab-slot-bytes-1k = ["kernel_types/async-ffi-slab-slot-bytes-1k"]
+async-ffi-slab-slot-bytes-2k = ["kernel_types/async-ffi-slab-slot-bytes-2k"]
+async-ffi-slab-slot-bytes-4k = ["kernel_types/async-ffi-slab-slot-bytes-4k"]
+async-ffi-slab-slot-bytes-8k = ["kernel_types/async-ffi-slab-slot-bytes-8k"]
+async-ffi-slab-slot-bytes-16k = ["kernel_types/async-ffi-slab-slot-bytes-16k"]
+async-ffi-slab-slot-bytes-32k = ["kernel_types/async-ffi-slab-slot-bytes-32k"]
+async-ffi-slab-slot-bytes-64k = ["kernel_types/async-ffi-slab-slot-bytes-64k"]

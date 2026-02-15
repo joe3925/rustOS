@@ -57,6 +57,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use crossbeam_queue::ArrayQueue;
+use kernel_types::async_ffi::FutureExt;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;

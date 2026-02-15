@@ -218,9 +218,9 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     sig.asyncness = None;
     sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
 
-    // Set the return type to BorrowingFfiFuture<'a, DriverStep>
+    // Set the return type to FfiFuture<DriverStep>
     sig.output = syn::parse_quote!(
-        -> ::kernel_api::async_ffi::BorrowingFfiFuture<#req_lt, ::kernel_api::pnp::DriverStep>
+        -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
     );
 
     let original_stmts = &body.stmts;
