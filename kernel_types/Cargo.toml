@@ -43,3 +43,16 @@ async-ffi-slab-slot-bytes-8k = ["async-ffi-slab"]
 async-ffi-slab-slot-bytes-16k = ["async-ffi-slab"]
 async-ffi-slab-slot-bytes-32k = ["async-ffi-slab"]
 async-ffi-slab-slot-bytes-64k = ["async-ffi-slab"]
+[profile.dev]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

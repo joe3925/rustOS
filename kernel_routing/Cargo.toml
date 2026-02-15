@@ -17,3 +17,16 @@ ffi = ["dep:kernel_sys"]
 kernel_sys = { path = "../kernel_sys", optional = true }
 kernel_types = { path = "../kernel_types" }
 spin = "0.10.0"
+[profile.dev]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

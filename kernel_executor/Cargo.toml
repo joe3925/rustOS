@@ -12,3 +12,16 @@ kernel_types = { path = "../kernel_types" }
 crossbeam-queue = { version = "0.3.12", default-features = false, features = [
     "alloc",
 ] }
+[profile.dev]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true

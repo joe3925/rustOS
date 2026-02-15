@@ -95,7 +95,15 @@ impl<T> AsyncMutex<T> {
     pub fn lock(&self) -> AsyncMutexLockFuture<'_, T> {
         AsyncMutexLockFuture { m: self }
     }
-
+    #[inline]
+    pub fn lock_blocking(&self) -> AsyncMutexGuard<'_, T> {
+        loop {
+            if let Some(g) = self.try_lock() {
+                return g;
+            }
+            core::hint::spin_loop();
+        }
+    }
     fn unlock(&self) {
         self.unlock_and_wake_one();
     }

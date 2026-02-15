@@ -19,17 +19,15 @@ pub const MAX_DESCRIPTORS_PER_REQUEST: usize = 2 + (PREALLOCATED_DATA_SIZE / 409
 pub const ARENA_PREALLOCATED_SLOTS: usize = 256;
 
 /// Number of dynamic slots (arbitrary data size, mapped on demand)
-pub const ARENA_DYNAMIC_SLOTS: usize = 16;
+pub const ARENA_DYNAMIC_SLOTS: usize = 0;
 
 /// Maximum arena capacity before overflow requests are not cached
 pub const ARENA_MAX_CAPACITY: usize = 5096;
 
 /// Number of u64 bitmap words needed to track all arena slots
-pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY / 64;
+pub const ARENA_BITMAP_WORDS: usize = (ARENA_MAX_CAPACITY + 63) / 64;
 
-/// Size of preallocated data regions in bytes
-/// Tuned for interrupt benchmark: smaller requests = more I/O ops = more interrupts
-pub const PREALLOCATED_DATA_SIZE: usize = 16 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 
 /// Calculate the required indirect table size in bytes for a given data length.
 /// Returns a page-aligned size (minimum 4KB) to satisfy allocation requirements.
@@ -197,48 +195,61 @@ impl BlkIoArena {
     /// Slot counts are clamped to the maximum array sizes.
     pub fn init_with_capacity(preallocated_count: usize, dynamic_count: usize) -> Option<Self> {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let page: usize = 4096;
 
-        // Clamp to maximum array sizes
         let preallocated_count = preallocated_count.min(ARENA_PREALLOCATED_SLOTS);
         let dynamic_count = dynamic_count.min(ARENA_DYNAMIC_SLOTS);
 
-        // Create uninitialized storage arrays
-        // SAFETY: We will initialize each slot before use
         let preallocated_slots: [UnsafeCell<MaybeUninit<PreallocatedSlot>>;
             ARENA_PREALLOCATED_SLOTS] = unsafe { MaybeUninit::uninit().assume_init() };
         let dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS] =
             unsafe { MaybeUninit::uninit().assume_init() };
 
-        // Allocate one large block for all preallocated indirect tables.
-        // Handle both cases: tables smaller than a page (pack multiple) or larger (multiple pages per table).
-        let (indirect_pages_va, indirect_pages_count) = if preallocated_count > 0 {
-            let total_bytes = preallocated_count * PREALLOCATED_INDIRECT_TABLE_SIZE;
-            let pages_needed = (total_bytes + 4095) / 4096;
-            let va = allocate_auto_kernel_range_mapped((pages_needed * 4096) as u64, flags).ok()?;
+        let data_stride: usize = (PREALLOCATED_DATA_SIZE + (page - 1)) & !(page - 1);
+
+        let mut pre_hdr_bytes: usize = 0;
+        let mut pre_data_off: usize = 0;
+        let mut pre_status_off: usize = 0;
+        let mut pre_indirect_off: usize = 0;
+        let mut pre_indirect_bytes: usize = 0;
+
+        let (prealloc_base_va, prealloc_pages_count) = if preallocated_count > 0 {
+            pre_hdr_bytes = preallocated_count.checked_mul(page)?;
+            let data_bytes = preallocated_count.checked_mul(data_stride)?;
+            let status_bytes = preallocated_count.checked_mul(page)?;
+            pre_indirect_bytes =
+                preallocated_count.checked_mul(PREALLOCATED_INDIRECT_TABLE_SIZE)?;
+
+            pre_data_off = pre_hdr_bytes;
+            pre_status_off = pre_hdr_bytes.checked_add(data_bytes)?;
+            pre_indirect_off = pre_status_off.checked_add(status_bytes)?;
+
+            let total_bytes = pre_indirect_off.checked_add(pre_indirect_bytes)?;
+            let pages_needed = total_bytes.checked_add(page - 1)? / page;
+
+            let va = allocate_auto_kernel_range_mapped((pages_needed * page) as u64, flags).ok()?;
             (Some(va), pages_needed)
         } else {
             (None, 0)
         };
 
-        // Initialize preallocated slots with all DMA buffers (only up to requested count)
         for i in 0..preallocated_count {
-            let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+            let base = prealloc_base_va.unwrap().as_u64();
+
+            let header_va = VirtAddr::new(base + (i * page) as u64);
             let header_phys = virt_to_phys(header_va)?;
 
-            let data_va =
-                allocate_auto_kernel_range_mapped(PREALLOCATED_DATA_SIZE as u64, flags).ok()?;
+            let data_va = VirtAddr::new(base + (pre_data_off + i * data_stride) as u64);
             let data_phys = virt_to_phys(data_va)?;
 
-            let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+            let status_va = VirtAddr::new(base + (pre_status_off + i * page) as u64);
             let status_phys = virt_to_phys(status_va)?;
 
-            // Assign a slice of the indirect table allocation to this slot.
-            // Each table is at offset i * PREALLOCATED_INDIRECT_TABLE_SIZE from the base.
-            let table_offset = i * PREALLOCATED_INDIRECT_TABLE_SIZE;
-            let table_va = VirtAddr::new(indirect_pages_va.unwrap().as_u64() + table_offset as u64);
+            let table_va = VirtAddr::new(
+                base + (pre_indirect_off + i * PREALLOCATED_INDIRECT_TABLE_SIZE) as u64,
+            );
             let table_phys = virt_to_phys(table_va)?;
 
-            // Initialize status sentinel
             unsafe {
                 core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF);
             }
@@ -255,21 +266,32 @@ impl BlkIoArena {
                 indirect_table_phys: table_phys,
             };
 
-            // SAFETY: We own this slot and are initializing it
             unsafe {
                 (*preallocated_slots[i].get()).write(slot);
             }
         }
 
-        // Initialize dynamic slots (header + status only, data and indirect table on demand)
+        let mut dyn_stride: usize = 0;
+        let (dynamic_pages_va, dynamic_pages_count) = if dynamic_count > 0 {
+            dyn_stride = page * 2;
+
+            let total_bytes = dynamic_count.checked_mul(dyn_stride)?;
+            let pages_needed = total_bytes.checked_add(page - 1)? / page;
+
+            let va = allocate_auto_kernel_range_mapped((pages_needed * page) as u64, flags).ok()?;
+            (Some(va), pages_needed)
+        } else {
+            (None, 0)
+        };
+
         for i in 0..dynamic_count {
-            let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+            let base = dynamic_pages_va.unwrap().as_u64();
+            let header_va = VirtAddr::new(base + (i * dyn_stride) as u64);
             let header_phys = virt_to_phys(header_va)?;
 
-            let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+            let status_va = VirtAddr::new(header_va.as_u64() + page as u64);
             let status_phys = virt_to_phys(status_va)?;
 
-            // Initialize status sentinel
             unsafe {
                 core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF);
             }
@@ -288,13 +310,11 @@ impl BlkIoArena {
                 indirect_table_len: AtomicU32::new(0),
             };
 
-            // SAFETY: We own this slot and are initializing it
             unsafe {
                 (*dynamic_slots[i].get()).write(slot);
             }
         }
 
-        // Initialize bitmap arrays - set bits for initialized slots (1 = free)
         let preallocated_bitmap: [AtomicU64; ARENA_BITMAP_WORDS] =
             core::array::from_fn(|word_idx| {
                 let start_slot = word_idx * 64;
@@ -334,8 +354,9 @@ impl BlkIoArena {
             overflow_count: AtomicUsize::new(0),
             preallocated_count,
             dynamic_count,
-            indirect_pages_va,
-            indirect_pages_count,
+
+            indirect_pages_va: prealloc_base_va,
+            indirect_pages_count: prealloc_pages_count,
         })
     }
 
@@ -683,6 +704,27 @@ impl BlkIoArena {
         }
 
         Some(handle)
+    }
+    // TODO: maybe can be generalized to write
+    #[inline]
+    pub fn new_request_read(
+        &self,
+        req_type: u32,
+        sector: u64,
+        data_len: u32,
+    ) -> Option<BlkIoRequestHandle<'_>> {
+        let handle = self.allocate(data_len)?;
+        handle.set_header(req_type, sector);
+        Some(handle)
+    }
+}
+impl Drop for BlkIoArena {
+    fn drop(&mut self) {
+        if let Some(base) = self.indirect_pages_va {
+            let bytes = (self.indirect_pages_count as u64) * 4096;
+            unsafe { unmap_range(base, bytes) };
+            unsafe { deallocate_kernel_range(base, bytes) };
+        }
     }
 }
 
@@ -1155,11 +1197,8 @@ pub const VIRTIO_F_INDIRECT_DESC: u64 = 1u64 << 28;
 /// Size of indirect descriptor table for preallocated slots.
 /// Calculated from PREALLOCATED_DATA_SIZE: header(1) + data_pages + status(1) descriptors * 16 bytes each.
 /// No power-of-2 rounding needed - just use exact size (each descriptor is 16 bytes).
-pub const PREALLOCATED_INDIRECT_TABLE_SIZE: usize = {
-    let data_pages = (PREALLOCATED_DATA_SIZE + 4095) / 4096;
-    let descriptors_needed = 1 + data_pages + 1; // header + data + status
-    descriptors_needed * 16
-};
+pub const PREALLOCATED_INDIRECT_TABLE_SIZE: usize =
+    calculate_indirect_table_size(PREALLOCATED_DATA_SIZE as u32) as usize; // >= 4096
 
 const DEVCFG_CAPACITY: usize = 0x00; // u64 — capacity in 512-byte sectors
 const DEVCFG_NUM_QUEUES: usize = 0x08; // u16 — number of request queues (if VIRTIO_BLK_F_MQ)

@@ -933,7 +933,7 @@ async fn bench_reads_direct(
                     continue;
                 }
 
-                let io_req = match qs.arena.new_request(
+                let io_req = match qs.arena.new_request_read(
                     VIRTIO_BLK_T_IN,
                     current_sector,
                     bench_cfg.request_size,

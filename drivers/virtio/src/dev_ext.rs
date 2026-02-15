@@ -8,8 +8,8 @@ use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::util::{get_current_cpu_id, get_current_lapic_id};
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once};
