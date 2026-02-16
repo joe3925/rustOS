@@ -27,3 +27,4 @@ opt-level = "z"
 kernel_api = { workspace = true }
 bitflags = "2.6.0"
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
+heapless = { version = "0.9", default-features = false }

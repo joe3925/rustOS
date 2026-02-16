@@ -5,6 +5,7 @@
 extern crate alloc;
 
 use crate::alloc::vec;
+use crate::cache::VolumeCache;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::mem;
 use core::sync::atomic::AtomicUsize;
@@ -13,6 +14,8 @@ use core::sync::atomic::Ordering::Relaxed;
 use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::{mem::size_of, panic::PanicInfo};
+use kernel_api::runtime::spawn;
+
 use kernel_api::acpi::handler;
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
@@ -36,14 +39,16 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::println;
 use kernel_api::request::{Request, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
+
 use spin::Once;
 use spin::RwLock;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
+mod cache;
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -53,6 +58,7 @@ fn panic(info: &PanicInfo) -> ! {
         panic_common(MOD_NAME, info)
     }
 }
+
 #[repr(C)]
 #[derive(Default)]
 struct VolExt {
@@ -64,13 +70,157 @@ struct VolExt {
 pub fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get partmgr dev ext")
 }
+
 #[repr(C)]
 #[derive(Default)]
 struct VolPdoExt {
     backing: Once<IoTarget>,
     part: Once<PartitionInfo>,
+    cache: Once<RwLock<cache::VolumeCache>>,
 }
 
+#[repr(C)]
+struct ReadCacheCtx {
+    cache: *const RwLock<cache::VolumeCache>,
+    tgt: IoTarget,
+    dev: Arc<DeviceObject>,
+    offset: u64,
+    len: usize,
+}
+
+#[repr(C)]
+struct WriteThroughCacheCtx {
+    cache: *const RwLock<cache::VolumeCache>,
+    offset: u64,
+    dev: Arc<DeviceObject>,
+    tgt: IoTarget,
+    len: usize,
+}
+
+extern "win64" fn vol_cache_read_completion(req: &mut Request, ctx: usize) -> DriverStatus {
+    let ctx_box = unsafe { Box::from_raw(ctx as *mut ReadCacheCtx) };
+
+    let cache_ptr = ctx_box.cache;
+    let tgt = ctx_box.tgt.clone();
+    let fill_offset = ctx_box.offset;
+    let fill_len = ctx_box.len;
+
+    let cache_lock = unsafe { &*cache_ptr };
+
+    if req.status != DriverStatus::Success {
+        return req.status;
+    }
+
+    let data = req.data_slice();
+    if fill_len > data.len() {
+        return req.status;
+    }
+
+    let mut should_flush = false;
+    {
+        let mut cache = cache_lock.write();
+        match cache.fill_clean(fill_offset, &data[..fill_len]) {
+            Ok(()) => {}
+            Err(cache::CacheError::CacheFull) => {
+                if let Ok(pct) = cache.dirty_percent() {
+                    let dirty_bytes_est =
+                        ((pct as f64) * (20.0 * 1024.0 * 1024.0) / 100.0) as usize;
+
+                    if pct > 60.0 || dirty_bytes_est >= fill_len {
+                        should_flush = true;
+                    }
+                }
+            }
+            Err(cache::CacheError::UnalignedRange) => {}
+            Err(_) => {
+                // TODO: decide whether to ignore, invalidate, or treat as bug.
+            }
+        }
+    }
+
+    if should_flush {
+        let tgt_task = tgt.clone();
+        let dev_clone = ctx_box.dev.clone();
+        let fill_offset_task = fill_offset;
+        let data_task: alloc::vec::Vec<u8> = data[..fill_len].to_vec(); // own the bytes
+
+        spawn(async move {
+            let dev_ext = dev_clone.try_devext::<VolPdoExt>().unwrap();
+            let _ = cache::VolumeCache::flush_dirty_for_new(
+                dev_ext.cache.get().unwrap(),
+                tgt_task.clone(),
+                fill_offset_task,
+                data_task.into(),
+            )
+            .await;
+        });
+    }
+
+    req.status
+}
+
+extern "win64" fn vol_cache_write_through_completion(
+    req: &mut Request,
+    ctx: usize,
+) -> DriverStatus {
+    let ctx_box = unsafe { Box::from_raw(ctx as *mut WriteThroughCacheCtx) };
+
+    let cache_lock = unsafe { &*ctx_box.cache };
+
+    if req.status != DriverStatus::Success {
+        return req.status;
+    }
+
+    let tgt = ctx_box.tgt.clone();
+    let fill_offset = ctx_box.offset;
+    let fill_len = ctx_box.len;
+
+    let data = req.data_slice();
+    if fill_len > data.len() {
+        return req.status;
+    }
+
+    let mut should_flush = false;
+    {
+        let mut cache = cache_lock.write();
+
+        match cache.fill_clean(fill_offset, &data[..fill_len]) {
+            Ok(()) => {}
+            Err(cache::CacheError::CacheFull) => {
+                if let Ok(pct) = cache.dirty_percent() {
+                    let dirty_bytes_est =
+                        ((pct as f64) * (20.0 * 1024.0 * 1024.0) / 100.0) as usize;
+
+                    if pct > 60.0 || dirty_bytes_est >= fill_len {
+                        should_flush = true;
+                    }
+                }
+            }
+            Err(cache::CacheError::UnalignedRange) => {}
+            Err(_) => {}
+        }
+    }
+
+    if should_flush {
+        let tgt_task = tgt.clone();
+        let dev_clone = ctx_box.dev.clone();
+        let fill_offset_task = fill_offset;
+        let data_task: alloc::vec::Vec<u8> = data[..fill_len].to_vec();
+
+        spawn(async move {
+            let dev_ext = dev_clone.try_devext::<VolPdoExt>().unwrap();
+            let _ = cache::VolumeCache::flush_dirty_for_new(
+                dev_ext.cache.get().unwrap(),
+                tgt_task,
+                fill_offset_task,
+                data_task.into(),
+            )
+            .await;
+        });
+    }
+
+    req.status
+}
 #[inline]
 fn guid_to_string(g: &[u8; 16]) -> String {
     let d1 = u32::from_le_bytes([g[0], g[1], g[2], g[3]]);
@@ -152,6 +302,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
 
     DriverStep::Continue
 }
+
 #[request_handler]
 pub async fn vol_enumerate_devices<'a, 'b>(
     device: Arc<DeviceObject>,
@@ -216,8 +367,10 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
+
     let mut init = DeviceInit::new(io_table, Some(pnp_vtable));
     init.set_dev_ext_default::<VolPdoExt>();
+
     let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(
         &parent_dn,
         name,
@@ -232,22 +385,81 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         ext::<VolPdoExt>(&pdo)
             .part
             .call_once(|| dx.part.get().unwrap().clone());
+
+        let sector_size = pi.disk.physical_block_size as usize;
+
+        ext::<VolPdoExt>(&pdo).cache.call_once(|| {
+            let mut c = cache::VolumeCache::new(20 * 1024 * 1024);
+
+            // TODO: block size policy should be configurable per volume.
+            c.set_block_size(1024 * 64, sector_size).unwrap();
+
+            RwLock::new(c)
+        });
     }
+
     DriverStep::Continue
 }
+
 #[request_handler]
 pub async fn vol_pdo_read<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
-    _buf_len: usize,
+    buf_len: usize,
 ) -> DriverStep {
-    let binding = ext::<VolPdoExt>(&dev);
-    let tgt = match binding.backing.get() {
-        Some(t) => t.clone(),
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+    let tgt = {
+        let dx = ext::<VolPdoExt>(&dev);
+        match dx.backing.get() {
+            Some(t) => t.clone(),
+            None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        }
     };
-    let status = pnp_send_request(tgt, req).await;
 
+    let (offset, len_req) = {
+        let r = req.read();
+        match r.kind {
+            RequestType::Read { offset, len } => (offset, len),
+            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        }
+    };
+
+    let mut len = len_req;
+    len = core::cmp::min(len, buf_len);
+    len = core::cmp::min(len, req.read().data_len());
+
+    if len == 0 {
+        return DriverStep::complete(DriverStatus::Success);
+    }
+
+    if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
+        {
+            let cache = cache_lock.read();
+            let mut w = req.write();
+            let dst = &mut w.data_slice_mut()[..len];
+
+            if cache.lookup(offset, dst).is_ok() {
+                w.status = DriverStatus::Success;
+                return DriverStep::complete(DriverStatus::Success);
+            }
+        }
+
+        {
+            let cache_ptr = cache_lock as *const RwLock<cache::VolumeCache>;
+            let ctx = Box::new(ReadCacheCtx {
+                cache: cache_ptr,
+                offset,
+                len,
+                tgt: tgt.clone(),
+                dev: dev.clone(),
+            });
+            let ctx_ptr = Box::into_raw(ctx) as usize;
+
+            let mut w = req.write();
+            w.add_completion(vol_cache_read_completion, ctx_ptr);
+        }
+    }
+
+    let status = pnp_send_request(tgt, req).await;
     DriverStep::complete(status)
 }
 
@@ -257,20 +469,115 @@ pub async fn vol_pdo_write<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     buf_len: usize,
 ) -> DriverStep {
-    if buf_len == 0 {
+    let tgt = {
+        let dx = ext::<VolPdoExt>(&dev);
+        match dx.backing.get() {
+            Some(t) => t.clone(),
+            None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        }
+    };
+
+    let (offset, len_req, flush_write_through) = match req.read().kind {
+        RequestType::Write {
+            offset,
+            len,
+            flush_write_through,
+        } => (offset, len, flush_write_through),
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
+
+    let mut len = len_req;
+    len = core::cmp::min(len, buf_len);
+    len = core::cmp::min(len, req.read().data_len());
+
+    if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let binding = ext::<VolPdoExt>(&dev);
-    let tgt = match binding.backing.get() {
-        Some(t) => t,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
+    if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
+        if !flush_write_through {
+            let res = {
+                let mut cache = cache_lock.write();
+                let r = req.read();
+                let src = &r.data_slice()[..len];
+                cache.upsert_dirty(offset, src)
+            };
 
-    let status = pnp_send_request(tgt.clone(), req).await;
+            match res {
+                Ok(()) => {
+                    let mut w = req.write();
+                    w.status = DriverStatus::Success;
+                    return DriverStep::complete(DriverStatus::Success);
+                }
+                Err(cache::CacheError::CacheFull) => {
+                    let should_flush = cache_lock
+                        .read()
+                        .dirty_percent()
+                        .ok()
+                        .map(|pct| {
+                            pct > 60.0 || (pct / 100.0) * (20 * 1024 * 1024) as f32 >= len as f32
+                        })
+                        .unwrap_or(false);
 
+                    if should_flush {
+                        let data_copy: alloc::vec::Vec<u8> = {
+                            let r = req.read();
+                            r.data_slice()[..len].to_vec()
+                        };
+
+                        let dev_clone = dev.clone();
+                        let tgt_clone = tgt.clone();
+                        let offset_clone = offset;
+
+                        spawn(async move {
+                            let dev_ext = dev_clone.try_devext::<VolPdoExt>().unwrap();
+                            if let Some(lock) = dev_ext.cache.get() {
+                                let _ = cache::VolumeCache::flush_dirty_for_new(
+                                    lock,
+                                    tgt_clone,
+                                    offset_clone,
+                                    data_copy.into(),
+                                )
+                                .await;
+                            }
+                        });
+
+                        let cache_ptr = cache_lock as *const RwLock<cache::VolumeCache>;
+                        let ctx = Box::new(WriteThroughCacheCtx {
+                            cache: cache_ptr,
+                            tgt: tgt.clone(),
+                            dev: dev.clone(),
+                            offset,
+                            len,
+                        });
+                        let ctx_ptr = Box::into_raw(ctx) as usize;
+
+                        let mut w = req.write();
+                        w.add_completion(vol_cache_write_through_completion, ctx_ptr);
+                    }
+                }
+                Err(_) => {}
+            }
+        } else {
+            let cache_ptr = cache_lock as *const RwLock<cache::VolumeCache>;
+            let ctx = Box::new(WriteThroughCacheCtx {
+                cache: cache_ptr,
+                tgt: tgt.clone(),
+                dev: dev.clone(),
+                offset,
+                len,
+            });
+            let ctx_ptr = Box::into_raw(ctx) as usize;
+
+            let mut w = req.write();
+            w.add_completion(vol_cache_write_through_completion, ctx_ptr);
+        }
+    }
+
+    let status = pnp_send_request(tgt, req).await;
     DriverStep::complete(status)
 }
+
 #[request_handler]
 async fn vol_pdo_query_resources<'a, 'b>(
     pdo: Arc<DeviceObject>,
