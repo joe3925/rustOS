@@ -76,8 +76,7 @@ pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 150_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
-    "acpi", "pci", //"ide",
-    "disk", "partmgr", "volmgr", "mountmgr", "fat32", //"i8042",
+    "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", //"i8042",
     "virtio"
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);

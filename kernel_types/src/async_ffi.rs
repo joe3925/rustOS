@@ -44,12 +44,11 @@ const fn freelist_tag(word: usize) -> usize {
 #[derive(Clone, Copy)]
 struct NextCell {
     v: u16,
-    _pad: [u8; 62],
 }
 
 impl NextCell {
     const fn new(v: u16) -> Self {
-        Self { v, _pad: [0; 62] }
+        Self { v }
     }
 }
 
@@ -66,12 +65,14 @@ impl CachelineAtomicUsize {
     }
 }
 
+#[inline(always)]
 unsafe fn freelist_pop<const N: usize>(
     head: &AtomicUsize,
     next_base: *mut NextCell,
 ) -> Option<usize> {
+    let mut h = head.load(Ordering::Relaxed);
+
     loop {
-        let h = head.load(Ordering::Acquire);
         let idx = freelist_idx(h);
         if idx == FREELIST_NULL {
             return None;
@@ -87,24 +88,27 @@ unsafe fn freelist_pop<const N: usize>(
 
         match head.compare_exchange_weak(h, newh, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => return Some(idx),
-            Err(_) => core::hint::spin_loop(),
+            Err(v) => {
+                h = v;
+                core::hint::spin_loop();
+            }
         }
     }
 }
-
+#[inline(always)]
 unsafe fn freelist_push<const N: usize>(head: &AtomicUsize, next_base: *mut NextCell, idx: usize) {
     if SLAB_CHECKS {
         debug_assert!(idx < N);
     }
 
+    let mut h = head.load(Ordering::Relaxed);
+
     loop {
-        let h = head.load(Ordering::Relaxed);
         let head_idx = freelist_idx(h);
 
         if SLAB_CHECKS {
             debug_assert!(head_idx == FREELIST_NULL || head_idx < N);
         }
-
         (*next_base.add(idx)).v = head_idx as u16;
 
         let tag = freelist_tag(h);
@@ -112,11 +116,13 @@ unsafe fn freelist_push<const N: usize>(head: &AtomicUsize, next_base: *mut Next
 
         match head.compare_exchange_weak(h, newh, Ordering::Release, Ordering::Relaxed) {
             Ok(_) => return,
-            Err(_) => core::hint::spin_loop(),
+            Err(v) => {
+                h = v;
+                core::hint::spin_loop();
+            }
         }
     }
 }
-
 const fn make_freelist_next<const N: usize>() -> [NextCell; N] {
     let mut out = [NextCell::new(0); N];
     let mut i = 0usize;
