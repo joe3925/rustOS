@@ -18,6 +18,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 pub use macros::async_ffi;
 
 pub const ABI_VERSION: u32 = 2;
+const ASYNC_FFI_SLAB_WORDS: usize = (ASYNC_FFI_SLAB_SLOTS + USIZE_BITS - 1) / USIZE_BITS;
 
 const SLAB_ALIGN: usize = 64;
 const SLAB_CHECKS: bool = cfg!(debug_assertions);
@@ -26,115 +27,121 @@ const fn sel(b: bool) -> usize {
     if b { 1 } else { 0 }
 }
 
-const FREELIST_IDX_BITS: usize = 16;
-const FREELIST_NULL: usize = (1usize << FREELIST_IDX_BITS) - 1; // 0xFFFF
-const FREELIST_ALLOC_SENTINEL: u16 = (FREELIST_NULL - 1) as u16; // 0xFFFE
-
-const fn freelist_pack(tag: usize, idx: usize) -> usize {
-    (tag << FREELIST_IDX_BITS) | (idx & FREELIST_NULL)
-}
-const fn freelist_idx(word: usize) -> usize {
-    word & FREELIST_NULL
-}
-const fn freelist_tag(word: usize) -> usize {
-    word >> FREELIST_IDX_BITS
-}
-
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-struct NextCell {
-    v: u16,
-}
-
-impl NextCell {
-    const fn new(v: u16) -> Self {
-        Self { v }
-    }
-}
-
 #[repr(C, align(64))]
 struct CachelineAtomicUsize {
-    head: AtomicUsize,
+    v: AtomicUsize,
 }
 
 impl CachelineAtomicUsize {
     const fn new(v: usize) -> Self {
         Self {
-            head: AtomicUsize::new(v),
+            v: AtomicUsize::new(v),
         }
     }
 }
 
-#[inline(always)]
-unsafe fn freelist_pop<const N: usize>(
-    head: &AtomicUsize,
-    next_base: *mut NextCell,
-) -> Option<usize> {
-    let mut h = head.load(Ordering::Relaxed);
+const USIZE_BITS: usize = usize::BITS as usize;
 
-    loop {
-        let idx = freelist_idx(h);
-        if idx == FREELIST_NULL {
-            return None;
+#[repr(C, align(64))]
+#[repr(C, align(64))]
+struct BitmapFreelist<const N: usize, const W: usize> {
+    words: [AtomicUsize; W],
+}
+
+impl<const N: usize, const W: usize> BitmapFreelist<N, W> {
+    const fn new() -> Self {
+        Self {
+            words: [const { AtomicUsize::new(0) }; W],
         }
+    }
 
+    #[inline(always)]
+    fn push(&self, idx: usize) {
         if SLAB_CHECKS {
             debug_assert!(idx < N);
         }
+        let wi = idx / USIZE_BITS;
+        let bi = idx % USIZE_BITS;
+        if SLAB_CHECKS {
+            debug_assert!(wi < W);
+        }
+        let mask = 1usize << bi;
 
-        let next = (*next_base.add(idx)).v as usize;
-        let tag = freelist_tag(h);
-        let newh = freelist_pack(tag.wrapping_add(1), next);
-
-        match head.compare_exchange_weak(h, newh, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return Some(idx),
-            Err(v) => {
-                h = v;
-                core::hint::spin_loop();
-            }
+        let prev = self.words[wi].fetch_or(mask, Ordering::Release);
+        if SLAB_CHECKS {
+            debug_assert!((prev & mask) == 0, "double free");
         }
     }
-}
-#[inline(always)]
-unsafe fn freelist_push<const N: usize>(head: &AtomicUsize, next_base: *mut NextCell, idx: usize) {
-    if SLAB_CHECKS {
-        debug_assert!(idx < N);
-    }
 
-    let mut h = head.load(Ordering::Relaxed);
+    #[inline(always)]
+    fn pop(&self) -> Option<usize> {
+        let mut wi = 0usize;
+
+        while wi < W {
+            let w = &self.words[wi];
+            let mut cur = w.load(Ordering::Relaxed);
+
+            while cur != 0 {
+                let bit = cur.trailing_zeros() as usize;
+                let mask = 1usize << bit;
+                let new = cur & !mask;
+
+                match w.compare_exchange_weak(cur, new, Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => {
+                        let idx = wi * USIZE_BITS + bit;
+                        if idx < N {
+                            return Some(idx);
+                        } else {
+                            // This can only happen in the last word when N is not word-aligned.
+                            // Clear stray bits by continuing; allocator will never hand out idx>=N again.
+                            cur = new;
+                            continue;
+                        }
+                    }
+                    Err(v) => cur = v,
+                }
+            }
+
+            wi += 1;
+        }
+
+        None
+    }
+}
+
+/// Allocate a slot index.
+///
+/// Strategy:
+/// 1) Try to pop from the bitmap of freed slots.
+/// 2) If empty, bump the watermark to allocate a fresh slot.
+#[inline(always)]
+fn slot_alloc<const N: usize, const W: usize>(
+    free: &BitmapFreelist<N, W>,
+    watermark: &AtomicUsize,
+) -> Option<usize> {
+    if let Some(i) = free.pop() {
+        return Some(i);
+    }
 
     loop {
-        let head_idx = freelist_idx(h);
-
-        if SLAB_CHECKS {
-            debug_assert!(head_idx == FREELIST_NULL || head_idx < N);
-        }
-        (*next_base.add(idx)).v = head_idx as u16;
-
-        let tag = freelist_tag(h);
-        let newh = freelist_pack(tag.wrapping_add(1), idx);
-
-        match head.compare_exchange_weak(h, newh, Ordering::Release, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(v) => {
-                h = v;
-                core::hint::spin_loop();
+        let wm = watermark.load(Ordering::Relaxed);
+        if wm >= N {
+            if let Some(i) = free.pop() {
+                return Some(i);
             }
+            return None;
+        }
+
+        match watermark.compare_exchange_weak(wm, wm + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(wm),
+            Err(_) => core::hint::spin_loop(),
         }
     }
 }
-const fn make_freelist_next<const N: usize>() -> [NextCell; N] {
-    let mut out = [NextCell::new(0); N];
-    let mut i = 0usize;
-    while i < N {
-        out[i] = NextCell::new(if i + 1 < N {
-            (i + 1) as u16
-        } else {
-            FREELIST_NULL as u16
-        });
-        i += 1;
-    }
-    out
+
+#[inline(always)]
+fn slot_free<const N: usize, const W: usize>(free: &BitmapFreelist<N, W>, idx: usize) {
+    free.push(idx);
 }
 
 // ---------- slots selection ----------
@@ -227,9 +234,6 @@ If you are overriding defaults, set default-features = false on the dependency."
     if ASYNC_FFI_SLAB_SLOTS == 0 {
         panic!("ASYNC_FFI_SLAB_SLOTS must be non-zero.");
     }
-    if ASYNC_FFI_SLAB_SLOTS >= FREELIST_NULL {
-        panic!("ASYNC_FFI_SLAB_SLOTS must be < 65535.");
-    }
     if ASYNC_FFI_SLAB_SLOT_BYTES == 0 {
         panic!("ASYNC_FFI_SLAB_SLOT_BYTES must be non-zero.");
     }
@@ -249,30 +253,33 @@ struct AlignedFutureBuf {
     buf: [u8; ASYNC_FFI_SLAB_TOTAL_BYTES],
 }
 
+// -- FUTURE SLAB --
 #[cfg(feature = "async-ffi-slab")]
-static FUTURE_SLAB_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
+static FUTURE_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
+    BitmapFreelist::new();
 #[cfg(feature = "async-ffi-slab")]
-static mut FUTURE_SLAB_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
-    make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
+static FUTURE_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
 #[cfg(feature = "async-ffi-slab")]
 static mut FUTURE_SLAB_BUF: AlignedFutureBuf = AlignedFutureBuf {
     buf: [0; ASYNC_FFI_SLAB_TOTAL_BYTES],
 };
 
+// -- WAKER_TO_FFI SLAB --
 #[cfg(feature = "async-ffi-slab")]
-static WAKER_TO_FFI_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
+static WAKER_TO_FFI_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
+    BitmapFreelist::new();
 #[cfg(feature = "async-ffi-slab")]
-static mut WAKER_TO_FFI_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
-    make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
+static WAKER_TO_FFI_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
 #[cfg(feature = "async-ffi-slab")]
 static mut WAKER_TO_FFI_SLAB: [MaybeUninit<RustWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
     [const { MaybeUninit::uninit() }; ASYNC_FFI_SLAB_SLOTS];
 
+// -- FFI_TO_WAKER SLAB --
 #[cfg(feature = "async-ffi-slab")]
-static FFI_TO_WAKER_HEAD: CachelineAtomicUsize = CachelineAtomicUsize::new(freelist_pack(0, 0));
+static FFI_TO_WAKER_FREE: BitmapFreelist<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS> =
+    BitmapFreelist::new();
 #[cfg(feature = "async-ffi-slab")]
-static mut FFI_TO_WAKER_NEXT: [NextCell; ASYNC_FFI_SLAB_SLOTS] =
-    make_freelist_next::<ASYNC_FFI_SLAB_SLOTS>();
+static FFI_TO_WAKER_WATERMARK: CachelineAtomicUsize = CachelineAtomicUsize::new(0);
 #[cfg(feature = "async-ffi-slab")]
 static mut FFI_TO_WAKER_SLAB: [MaybeUninit<FfiWakerBox>; ASYNC_FFI_SLAB_SLOTS] =
     [const { MaybeUninit::uninit() }; ASYNC_FFI_SLAB_SLOTS];
@@ -429,13 +436,10 @@ where
         let align = mem::align_of::<FutureBox<F>>();
 
         if size <= ASYNC_FFI_FUTURE_SLOT_BYTES && align <= SLAB_ALIGN {
-            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut NextCell;
-            if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD.head, next_base)
-            {
-                if SLAB_CHECKS {
-                    (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
-                }
-
+            if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
+                &FUTURE_FREE,
+                &FUTURE_WATERMARK.v,
+            ) {
                 let buf_base = core::ptr::addr_of_mut!(FUTURE_SLAB_BUF.buf) as *mut u8;
                 let slot = buf_base.add(i * ASYNC_FFI_FUTURE_SLOT_BYTES);
                 data_ptr = slot as *mut FutureBox<F>;
@@ -504,14 +508,9 @@ where
             }
             let idx = off / ASYNC_FFI_FUTURE_SLOT_BYTES;
 
-            let next_base = core::ptr::addr_of_mut!(FUTURE_SLAB_NEXT) as *mut NextCell;
-            if SLAB_CHECKS {
-                let mark = (*next_base.add(idx)).v;
-                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
-            }
-
             ptr::drop_in_place(fb);
-            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FUTURE_SLAB_HEAD.head, next_base, idx);
+            slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&FUTURE_FREE, idx);
+
             return;
         }
     }
@@ -537,12 +536,10 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
 
     #[cfg(feature = "async-ffi-slab")]
     unsafe {
-        let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut NextCell;
-        if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD.head, next_base) {
-            if SLAB_CHECKS {
-                (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
-            }
-
+        if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
+            &WAKER_TO_FFI_FREE,
+            &WAKER_TO_FFI_WATERMARK.v,
+        ) {
             let slab_base =
                 core::ptr::addr_of_mut!(WAKER_TO_FFI_SLAB) as *mut MaybeUninit<RustWakerBox>;
             ptr_box = slab_base.add(i) as *mut RustWakerBox;
@@ -607,16 +604,12 @@ unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
         let p = b as usize;
 
         if p >= base && p < end {
-            let idx = (p - base) / mem::size_of::<MaybeUninit<RustWakerBox>>();
-
-            let next_base = core::ptr::addr_of_mut!(WAKER_TO_FFI_NEXT) as *mut NextCell;
-            if SLAB_CHECKS {
-                let mark = (*next_base.add(idx)).v;
-                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
-            }
+            const SLOT_SIZE: usize = mem::size_of::<MaybeUninit<RustWakerBox>>();
+            let idx = (p - base) / SLOT_SIZE;
 
             ptr::drop_in_place(b);
-            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&WAKER_TO_FFI_HEAD.head, next_base, idx);
+            slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&WAKER_TO_FFI_FREE, idx);
+
             return;
         }
     }
@@ -641,12 +634,10 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
 
     #[cfg(feature = "async-ffi-slab")]
     unsafe {
-        let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut NextCell;
-        if let Some(i) = freelist_pop::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD.head, next_base) {
-            if SLAB_CHECKS {
-                (*next_base.add(i)).v = FREELIST_ALLOC_SENTINEL;
-            }
-
+        if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
+            &FFI_TO_WAKER_FREE,
+            &FFI_TO_WAKER_WATERMARK.v,
+        ) {
             let slab_base =
                 core::ptr::addr_of_mut!(FFI_TO_WAKER_SLAB) as *mut MaybeUninit<FfiWakerBox>;
             ptr_box = slab_base.add(i) as *mut FfiWakerBox;
@@ -707,16 +698,11 @@ unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
         let p = b as usize;
 
         if p >= base && p < end {
-            let idx = (p - base) / mem::size_of::<MaybeUninit<FfiWakerBox>>();
-
-            let next_base = core::ptr::addr_of_mut!(FFI_TO_WAKER_NEXT) as *mut NextCell;
-            if SLAB_CHECKS {
-                let mark = (*next_base.add(idx)).v;
-                debug_assert!(mark == FREELIST_ALLOC_SENTINEL);
-            }
+            const SLOT_SIZE: usize = mem::size_of::<MaybeUninit<FfiWakerBox>>();
+            let idx = (p - base) / SLOT_SIZE;
 
             ptr::drop_in_place(b);
-            freelist_push::<ASYNC_FFI_SLAB_SLOTS>(&FFI_TO_WAKER_HEAD.head, next_base, idx);
+            slot_free::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(&FFI_TO_WAKER_FREE, idx);
             return;
         }
     }

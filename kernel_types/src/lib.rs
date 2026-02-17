@@ -5,6 +5,7 @@
 #![feature(auto_traits)]
 #![feature(const_type_name)]
 #![allow(static_mut_refs)]
+#![feature(generic_const_exprs)]
 extern crate alloc;
 
 pub mod async_ffi;

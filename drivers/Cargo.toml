@@ -18,7 +18,7 @@ resolver = "2"
 kernel_api = { path = "../kernel_api", default-features = false, features = [
     "async-ffi-slab",
     "async-ffi-slab-slots-256",
-    "async-ffi-slab-slot-bytes-256",
+    "async-ffi-slab-slot-bytes-8k",
 ] }
 [profile.dev]
 opt-level = 3

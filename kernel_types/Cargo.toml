@@ -18,6 +18,10 @@ bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",
     "derive",
 ] }
+crossbeam-queue = { version = "0.3", default-features = false, features = [
+    "alloc",
+] }
+
 [features]
 macros = []
 

@@ -440,7 +440,8 @@ impl Vfs {
     }
 
     pub async fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsReadResult {
                     data: Vec::new(),
@@ -475,7 +476,9 @@ impl Vfs {
     }
 
     pub async fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsWriteResult {
                     written: 0,
@@ -506,7 +509,8 @@ impl Vfs {
     }
 
     pub async fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsSeekResult {
                     pos: 0,
@@ -537,7 +541,8 @@ impl Vfs {
     }
 
     pub async fn flush(&self, mut p: FsFlushParams) -> (FsFlushResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsFlushResult {
                     error: Some(FileStatus::PathNotFound),
@@ -566,7 +571,8 @@ impl Vfs {
     }
 
     pub async fn get_info(&self, mut p: FsGetInfoParams) -> (FsGetInfoResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsGetInfoResult {
                     size: 0,
@@ -698,7 +704,8 @@ impl Vfs {
     }
 
     pub async fn set_len(&self, mut p: FsSetLenParams) -> (FsSetLenResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsSetLenResult {
                     error: Some(FileStatus::PathNotFound),
@@ -727,7 +734,9 @@ impl Vfs {
     }
 
     pub async fn append(&self, mut p: FsAppendParams) -> (FsAppendResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsAppendResult {
                     written: 0,
@@ -760,7 +769,8 @@ impl Vfs {
     }
 
     pub async fn zero_range(&self, mut p: FsZeroRangeParams) -> (FsZeroRangeResult, DriverStatus) {
-        let Some(h) = self.handles.read().get(&p.fs_file_id).cloned() else {
+        let binding = self.handles.read();
+        let Some(h) = binding.get(&p.fs_file_id) else {
             return (
                 FsZeroRangeResult {
                     error: Some(FileStatus::PathNotFound),
