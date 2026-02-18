@@ -377,10 +377,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         ext::<VolPdoExt>(&pdo)
             .part
             .call_once(|| dx.part.get().unwrap().clone());
-        // Temporary: keep caching disabled; flip this to true when ready to re-enable.
         ext::<VolPdoExt>(&pdo)
             .caching_enabled
-            .store(true, Ordering::Release);
+            .store(false, Ordering::Release);
 
         let sector_size = pi.disk.physical_block_size as usize;
 

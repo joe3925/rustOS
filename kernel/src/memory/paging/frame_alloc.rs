@@ -59,10 +59,16 @@ impl BootInfoFrameAllocator {
         BootInfoFrameAllocator {}
     }
 
-    pub fn allocate_contiguous_frames(num_frames: usize) -> Option<PhysAddr> {
-        if num_frames == 0 {
+    /// Allocate `num_frames` physically contiguous 4KiB frames, aligned to
+    /// `align_frames` frame boundary (e.g. 512 for 2MiB, 1 for no extra alignment).
+    pub fn allocate_contiguous_frames_aligned(
+        num_frames: usize,
+        align_frames: usize,
+    ) -> Option<PhysAddr> {
+        if num_frames == 0 || align_frames == 0 {
             return None;
         }
+        debug_assert!(align_frames.is_power_of_two());
 
         let mut bm = MEMORY_BITMAP.lock();
         let total_frames = bm.len() * 64;
@@ -77,12 +83,15 @@ impl BootInfoFrameAllocator {
             .iter()
             .filter(|r| r.kind == MemoryRegionKind::Usable)
         {
-            let mut start_frame = usize::max((region.start >> 12) as usize, LOW_FRAMES);
+            let region_start = usize::max((region.start >> 12) as usize, LOW_FRAMES);
             let end_frame = (region.end >> 12) as usize;
 
-            if start_frame >= end_frame {
+            if region_start >= end_frame {
                 continue;
             }
+
+            // Round up to alignment boundary
+            let mut start_frame = (region_start + align_frames - 1) & !(align_frames - 1);
 
             while start_frame + num_frames <= end_frame {
                 if range_is_free(&*bm, start_frame, num_frames) {
@@ -94,15 +103,16 @@ impl BootInfoFrameAllocator {
                     return Some(PhysAddr::new(phys));
                 }
 
-                if bm[start_frame / 64] == u64::MAX {
-                    start_frame = ((start_frame / 64) + 1) * 64;
-                } else {
-                    start_frame += 1;
-                }
+                // Skip to next aligned position
+                start_frame += align_frames;
             }
         }
 
         None
+    }
+
+    pub fn allocate_contiguous_frames(num_frames: usize) -> Option<PhysAddr> {
+        Self::allocate_contiguous_frames_aligned(num_frames, 1)
     }
 
     pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {

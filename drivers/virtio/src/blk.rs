@@ -2,7 +2,8 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, unmap_range,
+    PageTableFlags, allocate_auto_kernel_range_mapped,
+    allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range, unmap_range,
     virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
@@ -211,7 +212,10 @@ impl BlkIoArena {
         let mut pre_indirect_off: usize = 0;
         let mut pre_indirect_bytes: usize = 0;
 
-        let (prealloc_base_va, prealloc_pages_count) = if preallocated_count > 0 {
+        // Single physically contiguous allocation for all preallocated slots.
+        // This lets the hot path use base_phys + offset instead of per-page virt_to_phys.
+        let (prealloc_base_va, prealloc_base_phys, prealloc_pages_count) = if preallocated_count > 0
+        {
             pre_hdr_bytes = preallocated_count.checked_mul(page)?;
             let data_bytes = preallocated_count.checked_mul(data_stride)?;
             let status_bytes = preallocated_count.checked_mul(page)?;
@@ -225,28 +229,34 @@ impl BlkIoArena {
             let total_bytes = pre_indirect_off.checked_add(pre_indirect_bytes)?;
             let pages_needed = total_bytes.checked_add(page - 1)? / page;
 
-            let va = allocate_auto_kernel_range_mapped((pages_needed * page) as u64, flags).ok()?;
-            (Some(va), pages_needed)
+            let va =
+                allocate_auto_kernel_range_mapped_contiguous((pages_needed * page) as u64, flags)
+                    .ok()?;
+            let phys = virt_to_phys(va)?;
+            (Some(va), Some(phys), pages_needed)
         } else {
-            (None, 0)
+            (None, None, 0)
         };
 
         for i in 0..preallocated_count {
             let base = prealloc_base_va.unwrap().as_u64();
+            let base_phys = prealloc_base_phys.unwrap().as_u64();
 
-            let header_va = VirtAddr::new(base + (i * page) as u64);
-            let header_phys = virt_to_phys(header_va)?;
+            let hdr_off = (i * page) as u64;
+            let header_va = VirtAddr::new(base + hdr_off);
+            let header_phys = PhysAddr::new(base_phys + hdr_off);
 
-            let data_va = VirtAddr::new(base + (pre_data_off + i * data_stride) as u64);
-            let data_phys = virt_to_phys(data_va)?;
+            let data_off = (pre_data_off + i * data_stride) as u64;
+            let data_va = VirtAddr::new(base + data_off);
+            let data_phys = PhysAddr::new(base_phys + data_off);
 
-            let status_va = VirtAddr::new(base + (pre_status_off + i * page) as u64);
-            let status_phys = virt_to_phys(status_va)?;
+            let status_off = (pre_status_off + i * page) as u64;
+            let status_va = VirtAddr::new(base + status_off);
+            let status_phys = PhysAddr::new(base_phys + status_off);
 
-            let table_va = VirtAddr::new(
-                base + (pre_indirect_off + i * PREALLOCATED_INDIRECT_TABLE_SIZE) as u64,
-            );
-            let table_phys = virt_to_phys(table_va)?;
+            let indirect_off = (pre_indirect_off + i * PREALLOCATED_INDIRECT_TABLE_SIZE) as u64;
+            let table_va = VirtAddr::new(base + indirect_off);
+            let table_phys = PhysAddr::new(base_phys + indirect_off);
 
             unsafe {
                 core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF);
@@ -974,33 +984,12 @@ impl<'a> BlkIoRequestHandle<'a> {
         bufs[buf_count] = (self.header_phys(), 16, 0u16);
         buf_count += 1;
 
-        let mut offset = 0u64;
         let total = self.data_len() as u64;
-        let data_va_base = self.data_va();
-        let _data_phys_base = self.data_phys();
+        let data_phys_base = self.data_phys();
 
-        while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
-            let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
-            let phys = virt_to_phys(vaddr).expect("Todo");
-            let page_off = vaddr.as_u64() & 0xFFF;
-            let chunk = core::cmp::min(4096u64 - page_off, total - offset);
-            let seg_phys = PhysAddr::new(phys.as_u64());
-
-            // Coalesce contiguous physical segments to keep descriptor count low.
-            if buf_count > 0 {
-                let last = &mut bufs[buf_count - 1];
-                let last_end = last.0.as_u64() + last.1 as u64;
-                if last.2 == data_flags && last_end == seg_phys.as_u64() {
-                    last.1 = last.1.saturating_add(chunk as u32);
-                    offset += chunk;
-                    continue;
-                }
-            }
-
-            bufs[buf_count] = (seg_phys, chunk as u32, data_flags);
-            buf_count += 1;
-            offset += chunk;
-        }
+        // Data buffer is physically contiguous, so emit a single descriptor.
+        bufs[buf_count] = (data_phys_base, total as u32, data_flags);
+        buf_count += 1;
 
         // Status descriptor
         bufs[buf_count] = (self.status_phys(), 1, VRING_DESC_F_WRITE);
@@ -1042,62 +1031,17 @@ impl<'a> BlkIoRequestHandle<'a> {
         );
         desc_count += 1;
 
-        // Write data descriptors into table with coalescing
-        let mut offset = 0u64;
+        // Data buffer is physically contiguous — single descriptor.
         let total = self.data_len() as u64;
-        let data_va_base = self.data_va();
-        let _data_phys_base = self.data_phys();
+        let data_phys_base = self.data_phys();
 
-        // Track current segment for coalescing
-        let mut seg_start_phys: u64 = 0;
-        let mut seg_len: u32 = 0;
-
-        while offset < total {
-            let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
-            let phys = virt_to_phys(vaddr).expect("Todo").as_u64();
-            let page_off = vaddr.as_u64() & 0xFFF;
-            let chunk = core::cmp::min(4096 - page_off, total - offset) as u32;
-
-            if seg_len == 0 {
-                // Start a new segment
-                seg_start_phys = phys;
-                seg_len = chunk;
-            } else if seg_start_phys + seg_len as u64 == phys {
-                // Contiguous with current segment, coalesce
-                seg_len = seg_len.saturating_add(chunk);
-            } else {
-                // Non-contiguous, flush current segment and start new one
-                if desc_count >= table_capacity - 1 {
-                    return None; // Not enough space
-                }
-                write_desc(
-                    desc_count,
-                    seg_start_phys,
-                    seg_len,
-                    data_flags | VRING_DESC_F_NEXT,
-                );
-                desc_count += 1;
-
-                seg_start_phys = phys;
-                seg_len = chunk;
-            }
-
-            offset += chunk as u64;
-        }
-
-        // Flush final data segment if any
-        if seg_len > 0 {
-            if desc_count >= table_capacity - 1 {
-                return None; // Not enough space
-            }
-            write_desc(
-                desc_count,
-                seg_start_phys,
-                seg_len,
-                data_flags | VRING_DESC_F_NEXT,
-            );
-            desc_count += 1;
-        }
+        write_desc(
+            desc_count,
+            data_phys_base.as_u64(),
+            total as u32,
+            data_flags | VRING_DESC_F_NEXT,
+        );
+        desc_count += 1;
 
         // Write status descriptor into table
         if desc_count >= table_capacity {
