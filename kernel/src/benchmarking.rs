@@ -2341,7 +2341,7 @@ pub async fn bench_c_drive_io_async() {
     }
 
     // Baseline: measure fs_seek dispatch cost (no actual I/O) via 10k zero-offset seeks.
-    let seek_iters: u64 = 10_000;
+    let seek_iters: u64 = 500_000;
     let seek_sw = Stopwatch::start();
     let mut seek_ok = true;
     for _ in 0..seek_iters {

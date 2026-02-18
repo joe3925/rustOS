@@ -1,0 +1,17 @@
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "check": {
+          "allTargets": false,
+        },
+        "checkOnSave": true,
+        "linkedProjects": [
+          "drivers/Cargo.toml",
+          "kernel/Cargo.toml",
+          "Cargo.toml",
+        ],
+      },
+    },
+  },
+}

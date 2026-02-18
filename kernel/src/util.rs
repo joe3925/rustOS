@@ -196,7 +196,6 @@ pub extern "win64" fn trigger_guard_page_overflow() -> ! {
         .expect("no current task");
     let guard = task.inner.read().guard_page;
     let target = (guard + 0x800) & !0xFu64;
-
     unsafe {
         asm!(
             "mov rsp, {0}",

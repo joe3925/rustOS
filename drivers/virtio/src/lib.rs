@@ -7,6 +7,7 @@ extern crate alloc;
 mod blk;
 mod dev_ext;
 mod pci;
+mod temp_benchmark;
 mod virtqueue;
 
 use alloc::{sync::Arc, vec, vec::Vec};
@@ -16,8 +17,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchLevelResult,
-    BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
+    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
@@ -41,6 +41,10 @@ use kernel_api::util::panic_common;
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::Mutex;
+use temp_benchmark::{
+    IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
+    bench_sweep, bench_sweep_params, sanitize_bench_params,
+};
 
 use blk::{
     BlkIoArena, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, calculate_per_queue_arena_sizes,
@@ -665,7 +669,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     );
 }
 
-struct WaitTasksGuard<'a> {
+pub(crate) struct WaitTasksGuard<'a> {
     counter: &'a AtomicU32,
 }
 impl<'a> WaitTasksGuard<'a> {
@@ -762,9 +766,6 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
 }
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
-const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
-
 #[inline]
 fn rdtsc() -> u64 {
     let lo: u32;
@@ -780,413 +781,6 @@ fn rdtsc() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-const BENCH_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
-struct BenchConfig {
-    request_size: u32,
-    requests_per_run: u32,
-    max_queue_inflight: u16,
-}
-impl BenchConfig {
-    fn from_inner_params(inner: &DevExtInner, params: &BenchSweepParams) -> Self {
-        let request_size = params.request_size;
-
-        let requests_per_run =
-            ((params.total_bytes + request_size as u64 - 1) / request_size as u64).max(1) as u32;
-
-        let max_queue_inflight =
-            bench_max_inflight_queue0(inner, request_size, inner.indirect_desc_enabled) as u16;
-
-        Self {
-            request_size,
-            requests_per_run,
-            max_queue_inflight,
-        }
-    }
-}
-#[inline]
-fn percentile_index_permille(len: usize, permille: u32) -> usize {
-    if len <= 1 {
-        return 0;
-    }
-    let n = (len - 1) as u64;
-    let num = n * permille as u64 + 500;
-    let idx = (num / 1000) as usize;
-    if idx >= len { len - 1 } else { idx }
-}
-
-#[inline]
-fn bench_descs_per_request(use_indirect: bool, request_size: u32) -> usize {
-    if use_indirect {
-        return 1;
-    }
-    let pages = ((request_size as usize) + 4095) / 4096;
-    1 + pages + 1
-}
-
-#[inline]
-fn bench_max_inflight_queue0(inner: &DevExtInner, request_size: u32, use_indirect: bool) -> usize {
-    let qs = inner.get_queue(0);
-    let vq = unsafe { &*qs.queue.as_ptr() };
-    let qsz = vq.size as usize;
-    let dpr = bench_descs_per_request(use_indirect, request_size);
-    if dpr == 0 {
-        return 1;
-    }
-    if !use_indirect && dpr > qsz {
-        return 0;
-    }
-    let max = qsz / dpr;
-    max.max(1)
-}
-
-impl BenchConfig {
-    fn from_inner(inner: &DevExtInner) -> Self {
-        let request_size = PREALLOCATED_DATA_SIZE as u32;
-
-        let requests_per_run =
-            ((BENCH_TOTAL_BYTES + request_size as u64 - 1) / request_size as u64).max(1) as u32;
-
-        let max_queue_inflight =
-            bench_max_inflight_queue0(inner, request_size, inner.indirect_desc_enabled) as u16;
-
-        Self {
-            request_size,
-            requests_per_run,
-            max_queue_inflight,
-        }
-    }
-}
-
-struct BenchInflightSlot<'a> {
-    io_req: blk::BlkIoRequestHandle<'a>,
-    head: u16,
-    start_tsc: u64,
-}
-
-async fn bench_reads_direct(
-    inner: &DevExtInner,
-    start_sector: u64,
-    inflight: usize,
-    bench_cfg: &BenchConfig,
-    use_interrupts: bool,
-) -> Result<BenchLevelResult, DriverStatus> {
-    inner.irq_ready.wait().await;
-
-    let qs = inner.get_queue(0);
-    let use_indirect = inner.indirect_desc_enabled;
-
-    let max_inflight = bench_max_inflight_queue0(inner, bench_cfg.request_size, use_indirect);
-    if max_inflight == 0 {
-        return Err(DriverStatus::InvalidParameter);
-    }
-
-    let effective_inflight = inflight.min(max_inflight).max(1);
-    let total_requests = bench_cfg.requests_per_run;
-
-    let mut result = BenchLevelResult {
-        inflight: effective_inflight as u32,
-        request_count: 0,
-        total_time_cycles: 0,
-        total_cycles: 0,
-        avg_cycles: 0,
-        max_cycles: 0,
-        min_cycles: u64::MAX,
-        p50_cycles: 0,
-        p99_cycles: 0,
-        p999_cycles: 0,
-        idle_pct: 0.0,
-    };
-
-    let sectors_per_request = (bench_cfg.request_size as u64) >> 9;
-    let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
-
-    let meta = IrqMeta {
-        tag: 0,
-        data: [0; 3],
-    };
-
-    let mut slots: Vec<Option<BenchInflightSlot<'_>>> = Vec::with_capacity(effective_inflight);
-    for _ in 0..effective_inflight {
-        slots.push(None);
-    }
-
-    let run_start_tsc = rdtsc();
-
-    let mut irq_wait_wall_cycles: u64 = 0;
-
-    let mut submitted: u32 = 0;
-    let mut completed: u32 = 0;
-    let mut current_sector = start_sector;
-
-    while completed < total_requests {
-        let mut submitted_this_round: u32 = 0;
-
-        {
-            let mut vq = qs.queue.lock().await;
-
-            for slot in slots.iter_mut() {
-                if submitted >= total_requests {
-                    break;
-                }
-                if slot.is_some() {
-                    continue;
-                }
-
-                let io_req = match qs.arena.new_request_read(
-                    VIRTIO_BLK_T_IN,
-                    current_sector,
-                    bench_cfg.request_size,
-                ) {
-                    Some(r) => r,
-                    None => break,
-                };
-
-                let head = match io_req.submit(&mut vq, false, use_indirect) {
-                    Some(h) => h,
-                    None => break,
-                };
-
-                let start_tsc = rdtsc();
-
-                *slot = Some(BenchInflightSlot {
-                    io_req,
-                    head,
-                    start_tsc,
-                });
-
-                submitted += 1;
-                submitted_this_round += 1;
-                current_sector = current_sector.saturating_add(sectors_per_request);
-            }
-
-            if submitted_this_round != 0 {
-                vq.notify(inner.notify_base, inner.notify_off_multiplier);
-            }
-        }
-
-        let mut made_progress = false;
-
-        if qs.try_acquire_drainer() {
-            let drained = qs.drain_used_to_completions_lockfree();
-            qs.release_drainer();
-            if drained != 0 {
-                made_progress = true;
-            }
-        }
-
-        for slot in slots.iter_mut() {
-            let Some(s) = slot.take() else { continue };
-
-            let len_opt = qs.take_completion(s.head);
-            if len_opt.is_none() {
-                *slot = Some(s);
-                continue;
-            }
-
-            let end_tsc = rdtsc();
-
-            if s.io_req.status() != VIRTIO_BLK_S_OK {
-                return Err(DriverStatus::DeviceError);
-            }
-
-            qs.defer_free_chain(s.head);
-
-            lat_samples.push(end_tsc.saturating_sub(s.start_tsc));
-
-            completed += 1;
-            made_progress = true;
-        }
-
-        if completed >= total_requests {
-            break;
-        }
-        if made_progress {
-            continue;
-        }
-
-        let have_inflight = slots.iter().any(|s| s.is_some());
-        if !have_inflight {
-            spin_loop();
-            continue;
-        }
-
-        if use_interrupts {
-            if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
-
-                let t0 = rdtsc();
-                let wait_result = irq_handle.wait(meta).await;
-                let t1 = rdtsc();
-
-                irq_wait_wall_cycles = irq_wait_wall_cycles.saturating_add(t1.saturating_sub(t0));
-
-                if !irq_wait_ok(wait_result) {
-                    return Err(DriverStatus::DeviceError);
-                }
-            } else {
-                spin_loop();
-            }
-        } else {
-            spin_loop();
-        }
-    }
-
-    let run_end_tsc = rdtsc();
-
-    result.request_count = lat_samples.len() as u32;
-    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
-    result.total_cycles = result.total_time_cycles;
-
-    if result.total_time_cycles != 0 {
-        let pct = (irq_wait_wall_cycles as f64) * 100.0 / (result.total_time_cycles as f64);
-        result.idle_pct = if pct < 0.0 {
-            0.0
-        } else if pct > 100.0 {
-            100.0
-        } else {
-            pct
-        };
-    } else {
-        result.idle_pct = 0.0;
-    }
-
-    if !lat_samples.is_empty() {
-        let sum_lat: u64 = lat_samples.iter().copied().sum();
-        lat_samples.sort_unstable();
-
-        result.max_cycles = *lat_samples.last().unwrap_or(&0);
-        result.min_cycles = *lat_samples.first().unwrap_or(&0);
-        result.avg_cycles = sum_lat / lat_samples.len() as u64;
-
-        let p50i = percentile_index_permille(lat_samples.len(), 500);
-        let p99i = percentile_index_permille(lat_samples.len(), 990);
-        let p999i = percentile_index_permille(lat_samples.len(), 999);
-
-        result.p50_cycles = lat_samples[p50i];
-        result.p99_cycles = lat_samples[p99i];
-        result.p999_cycles = lat_samples[p999i];
-    } else {
-        result.min_cycles = 0;
-    }
-
-    Ok(result)
-}
-async fn bench_sweep_params(
-    inner: &DevExtInner,
-    params: &BenchSweepParams,
-    use_interrupts: bool,
-) -> Result<BenchSweepResult, DriverStatus> {
-    let bench_cfg = BenchConfig::from_inner_params(inner, params);
-
-    let max_inflight = (params.max_inflight as usize).max(1);
-    let max_inflight = max_inflight
-        .min(bench_cfg.max_queue_inflight as usize)
-        .max(1);
-
-    let sectors_per_run =
-        ((bench_cfg.request_size as u64) >> 9).saturating_mul(bench_cfg.requests_per_run as u64);
-
-    let mut levels: Vec<usize> = Vec::new();
-    let mut lvl = 1usize;
-
-    let max_levels = BenchSweepResult::default().levels.len();
-    while lvl < max_inflight && levels.len() + 1 < max_levels {
-        levels.push(lvl);
-        let next = lvl.saturating_mul(2);
-        if next == lvl {
-            break;
-        }
-        lvl = next;
-    }
-    if levels.len() < max_levels && *levels.last().unwrap_or(&0) != max_inflight {
-        levels.push(max_inflight);
-    }
-
-    let mut result = BenchSweepResult::default();
-    let mut current_sector: u64 = params.start_sector;
-    println!(
-        "Starting benchmark sweep with request size {} bytes, total bytes {} ({} sectors), max inflight {}, levels: {:?}",
-        bench_cfg.request_size,
-        params.total_bytes,
-        params.total_bytes >> 9,
-        max_inflight,
-        levels
-    );
-    for level in levels {
-        if (result.used as usize) >= result.levels.len() {
-            break;
-        }
-
-        let level_result =
-            bench_reads_direct(inner, current_sector, level, &bench_cfg, use_interrupts).await?;
-
-        result.levels[result.used as usize] = level_result;
-        result.used += 1;
-
-        if level >= max_inflight {
-            break;
-        }
-    }
-
-    Ok(result)
-}
-fn sanitize_bench_params(inner: &DevExtInner, mut p: BenchSweepParams) -> BenchSweepParams {
-    if p.version != BENCH_PARAMS_VERSION_1 {
-        p = BenchSweepParams::default();
-    }
-
-    if p.request_size == 0 {
-        p.request_size = 64 * 1024;
-    }
-    p.request_size &= !511;
-    if p.request_size < 512 {
-        p.request_size = 512;
-    }
-
-    if p.total_bytes == 0 {
-        p.total_bytes = p.request_size as u64;
-    }
-    if p.total_bytes < p.request_size as u64 {
-        p.total_bytes = p.request_size as u64;
-    }
-
-    let max_auto =
-        bench_max_inflight_queue0(inner, p.request_size, inner.indirect_desc_enabled) as u16;
-
-    if max_auto == 0 {
-        p.max_inflight = 1;
-        return p;
-    }
-
-    if p.max_inflight == 0 {
-        p.max_inflight = max_auto;
-    } else {
-        p.max_inflight = p.max_inflight.min(max_auto).max(1);
-    }
-
-    p
-}
-async fn bench_sweep(
-    inner: &DevExtInner,
-    use_interrupts: bool,
-) -> Result<BenchSweepResult, DriverStatus> {
-    let p = sanitize_bench_params(inner, BenchSweepParams::default());
-    bench_sweep_params(inner, &p, use_interrupts).await
-}
-const BENCH_SPIN_CHUNK: u32 = 256;
-
-#[inline]
-fn bench_spin_chunk_and_count(busy_cycles: &mut u64) {
-    let t0 = rdtsc();
-    let mut i = 0u32;
-    while i < BENCH_SPIN_CHUNK {
-        spin_loop();
-        i += 1;
-    }
-    let t1 = rdtsc();
-    *busy_cycles = busy_cycles.saturating_add(t1.saturating_sub(t0));
-}
 #[request_handler]
 pub async fn virtio_pdo_start<'a, 'b>(
     _dev: Arc<DeviceObject>,

@@ -1,0 +1,20 @@
+[
+  {
+    "label": "build all",
+    "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }",
+  },
+  {
+    "label": "build kernel",
+    "command": "cd os; if ($?) { cargo build }",
+  },
+  {
+    "label": "dbg full chain",
+    "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 1 -gdb 'tcp::1234' -S -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk' }",
+    "allow_concurrent_runs": false,
+  },
+  {
+    "label": "dbg kernel chain",
+    "command": "cd os; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 1 -gdb 'tcp::1234' -S -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk' }",
+    "allow_concurrent_runs": false,
+  },
+]
