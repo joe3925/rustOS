@@ -46,10 +46,8 @@ mod cache;
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 
 #[repr(C)]
@@ -243,7 +241,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn vol_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
@@ -382,7 +380,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         // Temporary: keep caching disabled; flip this to true when ready to re-enable.
         ext::<VolPdoExt>(&pdo)
             .caching_enabled
-            .store(false, Ordering::Release);
+            .store(true, Ordering::Release);
 
         let sector_size = pi.disk.physical_block_size as usize;
 

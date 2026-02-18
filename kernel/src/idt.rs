@@ -1264,13 +1264,11 @@ fn init_idt() -> InterruptDescriptorTable {
             .set_stack_index(TIMER_IST_INDEX);
     }
     for (vec, stub) in IRQ_VECTOR_STUBS {
-        unsafe {
-            idt[*vec].set_handler_fn(*stub);
-        }
+        idt[*vec].set_handler_fn(*stub);
     }
 
     unsafe {
-        idt[SCHED_IPI_VECTOR ]
+        idt[SCHED_IPI_VECTOR]
             .set_handler_addr(VirtAddr::new(ipi_entry as *const () as u64))
             .set_stack_index(YIELD_IST_INDEX);
 

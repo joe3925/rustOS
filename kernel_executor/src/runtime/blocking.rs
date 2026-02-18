@@ -17,7 +17,7 @@ const STATE_COMPLETE: u8 = 1;
 const STATE_CONSUMED: u8 = 2;
 const STATE_RUNNING: u8 = 3;
 
-struct SharedTaskHeader<R> {
+pub struct SharedTaskHeader<R> {
     result: UnsafeCell<MaybeUninit<R>>,
     state: AtomicU8,
     waker: Mutex<Option<Waker>>,
@@ -171,7 +171,12 @@ where
     // re-enters with the same ctx, bail out instead of double-running and panicking.
     if header
         .state
-        .compare_exchange(STATE_PENDING, STATE_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(
+            STATE_PENDING,
+            STATE_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
         .is_err()
     {
         return;

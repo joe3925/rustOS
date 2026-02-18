@@ -10,7 +10,7 @@ use kernel_api::status::DriverStatus;
 
 use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::dev_ext::DevExtInner;
-use crate::{WaitTasksGuard, rdtsc, wait_for_completion};
+use crate::{WaitTasksGuard, rdtsc};
 
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
@@ -29,11 +29,9 @@ impl BenchConfig {
         let max_q = bench_max_inflight_queue0(inner, request_size, inner.indirect_desc_enabled);
         let max_queue_inflight = params.max_inflight.min(max_q as u16).max(1);
 
-        let total_bytes = params
-            .total_bytes
-            .max(request_size as u64)
-            .min((PREALLOCATED_DATA_SIZE as u64) * 1024);
-        let requests_per_run = total_bytes.div_ceil(request_size as u64)
+        let total_bytes = params.total_bytes.max(request_size as u64);
+        let requests_per_run = total_bytes
+            .div_ceil(request_size as u64)
             .max(1)
             .min(u32::MAX as u64) as u32;
 
@@ -49,7 +47,7 @@ fn bench_descs_per_request(use_indirect: bool, request_size: u32) -> usize {
     if !use_indirect {
         return 2 + (request_size as usize).div_ceil(4096);
     }
-    3 // header + data + status
+    1 // indirect table uses a single virtqueue descriptor
 }
 
 fn bench_max_inflight_queue0(inner: &DevExtInner, request_size: u32, use_indirect: bool) -> usize {
@@ -65,11 +63,8 @@ async fn bench_reads_direct(
     bench_cfg: &BenchConfig,
     use_interrupts: bool,
 ) -> Result<BenchLevelResult, DriverStatus> {
-    let max_inflight =
-        bench_max_inflight_queue0(inner, bench_cfg.request_size, use_interrupts) as u32;
     let mut result = BenchLevelResult::default();
     result.inflight = inflight as u32;
-    result.inflight = max_inflight;
     struct BenchInflight<'a> {
         start_tsc: u64,
         head: u16,
@@ -84,7 +79,6 @@ async fn bench_reads_direct(
     let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
     let mut current_sector = start_sector;
     let mut completed = 0u32;
-    let mut made_progress = true;
     let mut irq_wait_wall_cycles = 0u64;
     let run_start_tsc = rdtsc();
 
@@ -93,18 +87,12 @@ async fn bench_reads_direct(
         data: [0; 3],
     };
 
-    loop {
-        if completed >= total_requests {
-            break;
-        }
+    while completed < total_requests {
+        // === Phase 1: Submit a full batch ===
+        let batch_size = (total_requests - completed).min(inflight as u32) as usize;
+        let mut batch_submitted = 0usize;
 
-        // Issue more requests up to the inflight limit
-        let len = slots.len();
-        for slot in slots.iter_mut() {
-            if slot.is_some() {
-                continue;
-            }
-
+        for slot in slots.iter_mut().take(batch_size) {
             let io_req = match bench_queue.arena.new_request(
                 VIRTIO_BLK_T_IN,
                 current_sector,
@@ -118,10 +106,7 @@ async fn bench_reads_direct(
                 let mut vq = bench_queue.queue.lock().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
-                    Some(h) => {
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        h
-                    }
+                    Some(h) => h,
                     None => break,
                 }
             };
@@ -133,66 +118,72 @@ async fn bench_reads_direct(
                 io_req,
             });
             current_sector = current_sector.saturating_add((bench_cfg.request_size as u64) >> 9);
-            if completed + (len as u32) >= total_requests {
-                break;
-            }
+            batch_submitted += 1;
         }
 
-        made_progress = false;
-        for slot in slots.iter_mut() {
-            let Some(s) = slot.take() else { continue };
-
-            let len_opt = wait_for_completion(bench_queue, s.head).await.ok();
-            if len_opt.is_none() {
-                *slot = Some(s);
-                continue;
-            }
-
-            let end_tsc = rdtsc();
-
-            if s.io_req.status() != VIRTIO_BLK_S_OK {
-                return Err(DriverStatus::DeviceError);
-            }
-
-            bench_queue.defer_free_chain(s.head);
-
-            lat_samples.push(end_tsc.saturating_sub(s.start_tsc));
-
-            completed += 1;
-            made_progress = true;
-        }
-
-        if completed >= total_requests {
+        if batch_submitted == 0 {
             break;
         }
-        if made_progress {
-            continue;
+
+        // === Phase 2: Notify once for the entire batch ===
+        {
+            let vq = bench_queue.queue.lock().await;
+            vq.notify(inner.notify_base, inner.notify_off_multiplier);
         }
 
-        let have_inflight = slots.iter().any(|s| s.is_some());
-        if !have_inflight {
-            spin_loop();
-            continue;
-        }
+        // === Phase 3: Wait for ALL submitted requests to complete ===
+        let mut batch_completed = 0usize;
+        while batch_completed < batch_submitted {
+            // Wait for the device to signal completions
+            if use_interrupts {
+                if let Some(irq_handle) = unsafe { &*bench_queue.irq_handle.get() } {
+                    let _guard = WaitTasksGuard::new(&bench_queue.waiting_tasks);
 
-        if use_interrupts {
-            if let Some(irq_handle) = unsafe { &*bench_queue.irq_handle.get() } {
-                let _guard = WaitTasksGuard::new(&bench_queue.waiting_tasks);
+                    let t0 = rdtsc();
+                    let wait_result = irq_handle.wait(meta).await;
+                    let t1 = rdtsc();
 
-                let t0 = rdtsc();
-                let wait_result = irq_handle.wait(meta).await;
-                let t1 = rdtsc();
+                    irq_wait_wall_cycles =
+                        irq_wait_wall_cycles.saturating_add(t1.saturating_sub(t0));
 
-                irq_wait_wall_cycles = irq_wait_wall_cycles.saturating_add(t1.saturating_sub(t0));
-
-                if !irq_wait_ok(wait_result) {
-                    return Err(DriverStatus::DeviceError);
+                    if !irq_wait_ok(wait_result) {
+                        return Err(DriverStatus::DeviceError);
+                    }
+                } else {
+                    spin_loop();
                 }
             } else {
-                spin_loop();
+                // Polling mode: spin until something appears in the used ring
+                while !bench_queue.has_pending_used() {
+                    spin_loop();
+                }
             }
-        } else {
-            spin_loop();
+
+            // Drain and reap whatever completed
+            bench_queue.drain_used_to_completions_lockfree();
+
+            for slot in slots.iter_mut().take(batch_submitted) {
+                let Some(s) = slot.take() else { continue };
+
+                let len_opt = bench_queue.take_completion(s.head);
+                if len_opt.is_none() {
+                    *slot = Some(s);
+                    continue;
+                }
+
+                let end_tsc = rdtsc();
+
+                if s.io_req.status() != VIRTIO_BLK_S_OK {
+                    bench_queue.defer_free_chain(s.head);
+                    return Err(DriverStatus::DeviceError);
+                }
+
+                bench_queue.defer_free_chain(s.head);
+                lat_samples.push(end_tsc.saturating_sub(s.start_tsc));
+
+                batch_completed += 1;
+                completed += 1;
+            }
         }
     }
 

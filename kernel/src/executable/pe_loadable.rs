@@ -306,8 +306,8 @@ impl PELoader {
         if (self.needs_relocation()) {
             self.relocate()?;
         }
-        self.resolve_imports(&mut program).await;
-        self.patch_imports(&mut program);
+        let _ = self.resolve_imports(&mut program).await;
+        let _ = self.patch_imports(&mut program);
 
         unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
 

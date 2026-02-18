@@ -179,9 +179,7 @@ impl SlabConfigBuilder {
     }
 
     pub fn capacity(mut self, total: usize) -> Self {
-        self.config.slots_per_shard = total.div_ceil(NUM_SHARDS)
-            .min(MAX_SLOTS_PER_SHARD)
-            .max(64);
+        self.config.slots_per_shard = total.div_ceil(NUM_SHARDS).min(MAX_SLOTS_PER_SHARD).max(64);
         self
     }
 
@@ -500,13 +498,19 @@ impl JoinableSlot {
         if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
             let ptr = buf_ptr as *mut F;
             core::ptr::write(ptr, future);
-            write_cell_usize(&self.poll_fn, poll_and_store_inline::<F, T> as *const () as usize);
+            write_cell_usize(
+                &self.poll_fn,
+                poll_and_store_inline::<F, T> as *const () as usize,
+            );
             write_cell_usize(&self.drop_fn, drop_inline::<F> as *const () as usize);
         } else {
             let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
             let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
             core::ptr::write(ptr, Some(boxed));
-            write_cell_usize(&self.poll_fn, poll_and_store_boxed::<T> as *const () as usize);
+            write_cell_usize(
+                &self.poll_fn,
+                poll_and_store_boxed::<T> as *const () as usize,
+            );
             write_cell_usize(&self.drop_fn, drop_boxed_future::<T> as *const () as usize);
         }
 

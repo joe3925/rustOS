@@ -5,7 +5,7 @@ use fatfs::FsOptions;
 use spin::RwLock;
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS,
+    GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         async_types::AsyncMutex,
@@ -82,7 +82,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
     };
 
     match code {
-        _IOCTL_FS_IDENTIFY => {
+        IOCTL_FS_IDENTIFY => {
             let mut r = req.write();
             let id_opt = r.take_data::<FsIdentify>();
             drop(r);
@@ -220,7 +220,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn fs_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     _dev_init: &mut DeviceInit,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)

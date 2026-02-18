@@ -1621,7 +1621,7 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
     }
 
     file.append(data).await.map_err(|_| ())?;
-    file.close().await;
+    let _ = file.close().await;
     Ok(())
 }
 
@@ -2312,8 +2312,7 @@ pub async fn bench_c_drive_io_async() {
         );
     }
 
-    // Baseline: measure fs_seek dispatch cost (no actual I/O) via 10k zero-offset seeks.
-    let seek_iters: u64 = 500_000;
+    let seek_iters: u64 = 10_000;
     let seek_sw = Stopwatch::start();
     let mut seek_ok = true;
     for _ in 0..seek_iters {
@@ -3135,9 +3134,9 @@ fn print_bench_result_table(res: &BenchRunResult) {
     );
     println!(
         "| Total: {:>12}  | Request Size: {:>10}  | Start Sector: {:>10} |",
-        format_size(req.total_bytes),
-        format_size(req.request_size as u64),
-        req.start_sector
+        format_size(both.params_used.total_bytes),
+        format_size(both.params_used.request_size as u64),
+        both.params_used.start_sector
     );
     println!(
         "| Queues: {:>2}  | Queue0 Size: {:>4}  | Indirect: {:>3}  | MSI-X: {:>3}             |",
@@ -3246,16 +3245,16 @@ pub async fn run_virtio_bench_matrix() {
 }
 pub async fn run_virtio_bench_matrix_print() {
     let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
-    let total_bytes_list: [u64; 1] = [9 * 1024 * 1024 * 1024];
+    let total_bytes_list: [u64; 1] = [10 * 1024 * 1024 * 1024];
 
     let request_size_list: [u32; _] = [
         // 4 * 1024,
         // 8 * 1024,
         // 16 * 1024,
-        64 * 1024,
+        //64 * 1024,
         // 256 * 1024,
         // 1024 * 1024,
-        // 4 * 1024 * 1024,
+        4 * 1024 * 1024,
     ];
 
     let start_sector_list: [u64; _] = [

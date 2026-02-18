@@ -25,7 +25,7 @@ pub const ARENA_MAX_CAPACITY: usize = 5096;
 /// Number of u64 bitmap words needed to track all arena slots
 pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY.div_ceil(64);
 
-pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 4 * 1024 * 1024;
 
 /// Calculate the required indirect table size in bytes for a given data length.
 /// Returns a page-aligned size (minimum 4KB) to satisfy allocation requirements.
@@ -387,9 +387,10 @@ impl BlkIoArena {
     pub fn allocate(&self, data_len: u32) -> Option<BlkIoRequestHandle<'_>> {
         // Fast path: if data fits in 4KB, try preallocated slots first
         if data_len <= PREALLOCATED_DATA_SIZE as u32
-            && let Some(handle) = self.try_allocate_preallocated(data_len) {
-                return Some(handle);
-            }
+            && let Some(handle) = self.try_allocate_preallocated(data_len)
+        {
+            return Some(handle);
+        }
 
         // Try dynamic slots (can handle any size)
         if let Some(handle) = self.try_allocate_dynamic(data_len) {
@@ -720,7 +721,7 @@ impl Drop for BlkIoArena {
         if let Some(base) = self.indirect_pages_va {
             let bytes = (self.indirect_pages_count as u64) * 4096;
             unsafe { unmap_range(base, bytes) };
-            unsafe { deallocate_kernel_range(base, bytes) };
+            deallocate_kernel_range(base, bytes);
         }
     }
 }
@@ -981,7 +982,7 @@ impl<'a> BlkIoRequestHandle<'a> {
         while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
             let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
             let phys = virt_to_phys(vaddr).expect("Todo");
-            let page_off = (vaddr.as_u64() & 0xFFF);
+            let page_off = vaddr.as_u64() & 0xFFF;
             let chunk = core::cmp::min(4096u64 - page_off, total - offset);
             let seg_phys = PhysAddr::new(phys.as_u64());
 
@@ -1026,7 +1027,7 @@ impl<'a> BlkIoRequestHandle<'a> {
             (*desc).addr = addr;
             (*desc).len = len;
             (*desc).flags = flags;
-            (*desc).next = (idx + 1);
+            (*desc).next = idx + 1;
         };
 
         // Write header descriptor into table
@@ -1149,9 +1150,10 @@ impl<'a> Drop for BlkIoRequestHandle<'a> {
                     unmap_range(req.data_va, data_pages.max(4096));
                     unmap_range(req.status_va, 4096);
                     if let Some(va) = req.indirect_table_va
-                        && req.indirect_table_len > 0 {
-                            unmap_range(va, req.indirect_table_len as u64);
-                        }
+                        && req.indirect_table_len > 0
+                    {
+                        unmap_range(va, req.indirect_table_len as u64);
+                    }
                 }
             }
         }

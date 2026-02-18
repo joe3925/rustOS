@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{quote, quote_spanned};
-use syn::{parse_macro_input, FnArg, ItemFn, Lifetime, Pat, ReturnType, Type};
+use quote::quote;
+use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
 
 #[proc_macro_attribute]
 pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -58,53 +58,6 @@ fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
 
         if type_is_mut_ref_request_handle(&pat_ty.ty) {
             return Some(pat_ident.ident.clone());
-        }
-    }
-    None
-}
-
-/// Extract the lifetime used on `RequestHandle<'a>` if present.
-fn extract_request_handle_lifetime(ty: &Type) -> Option<Lifetime> {
-    match ty {
-        Type::Reference(r) => extract_request_handle_lifetime(&r.elem),
-        Type::Paren(p) => extract_request_handle_lifetime(&p.elem),
-        Type::Group(g) => extract_request_handle_lifetime(&g.elem),
-        Type::Path(p) => {
-            let seg = p.path.segments.last()?;
-            match &seg.arguments {
-                syn::PathArguments::AngleBracketed(ab) => {
-                    for arg in ab.args.iter() {
-                        if let syn::GenericArgument::Lifetime(lt) = arg {
-                            return Some(lt.clone());
-                        }
-                    }
-                }
-                _ => {}
-            }
-            None
-        }
-        _ => None,
-    }
-}
-
-/// Extract the borrow lifetime from `&'b mut T` if present.
-fn extract_borrow_lifetime(ty: &Type) -> Option<Lifetime> {
-    match ty {
-        Type::Reference(r) => r.lifetime.clone(),
-        Type::Paren(p) => extract_borrow_lifetime(&p.elem),
-        Type::Group(g) => extract_borrow_lifetime(&g.elem),
-        _ => None,
-    }
-}
-
-/// Find the borrow lifetime attached to the `&'b mut RequestHandle<'a>` parameter, if any.
-/// Returns the borrow lifetime `'b`, not the inner `RequestHandle<'a>` lifetime.
-fn find_request_handle_borrow_lifetime(sig: &syn::Signature) -> Option<Lifetime> {
-    for arg in sig.inputs.iter() {
-        let FnArg::Typed(pat_ty) = arg else { continue };
-
-        if type_is_mut_ref_request_handle(&pat_ty.ty) {
-            return extract_borrow_lifetime(&pat_ty.ty);
         }
     }
     None
@@ -213,9 +166,6 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
 
     let fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
-    // Use the borrow lifetime ('b in `&'b mut RequestHandle<'a>`) for the future
-    let req_lt = find_request_handle_borrow_lifetime(sig)
-        .unwrap_or_else(|| Lifetime::new("'static", Span::call_site()));
 
     // Remove async keyword
     sig.asyncness = None;

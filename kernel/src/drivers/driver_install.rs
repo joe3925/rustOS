@@ -219,7 +219,7 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
                         } else if let Some(di) = inner(vv).as_integer() {
                             if let Some(u) = deint_to_u32(di) {
                                 values.push((k.to_string(), Data::U32(u)));
-                            } 
+                            }
                         }
                     }
                 }
@@ -524,7 +524,7 @@ pub async fn install_prepacked_drivers() -> Result<(), DriverError> {
         };
 
         let toml_path = Path::from_string(&alloc::format!("{pkg_path}/{toml_name}"));
-        install_driver_toml(toml_path).await;
+        let _ = install_driver_toml(toml_path).await;
         // match install_driver_toml(&toml_path).await {
         //     Ok(_) => {
         //         println!("Installed {}", toml_path);

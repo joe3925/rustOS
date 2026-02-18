@@ -1,4 +1,4 @@
-use core::{arch::asm, time::Duration};
+use core::time::Duration;
 
 use alloc::boxed::Box;
 

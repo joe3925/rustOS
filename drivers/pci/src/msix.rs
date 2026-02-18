@@ -9,8 +9,7 @@ use kernel_api::request::RequestHandle;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
-use crate::dev_ext::{BarKind, MsixInfo, PciPdoExt};
-use kernel_api::println;
+use crate::dev_ext::{BarKind, PciPdoExt};
 
 /// Single MSI-X entry setup request from child driver.
 #[derive(Clone, Copy, Debug)]
@@ -132,15 +131,15 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_>)
         }
 
         // Read back and verify
-        let rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
-        let rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
-        let rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
+        let _rb_addr = unsafe { read_volatile((entry_va + 0) as *const u32) };
+        let _rb_data = unsafe { read_volatile((entry_va + 8) as *const u32) };
+        let _rb_ctrl = unsafe { read_volatile((entry_va + 12) as *const u32) };
     }
 
     let cfg_va = match map_mmio_region(PhysAddr::new(ext.cfg_phys), 4096) {
         Ok(va) => va,
         Err(_) => {
-            unsafe { unmap_mmio_region(table_va, table_region_size) };
+            let _ = unmap_mmio_region(table_va, table_region_size);
             return DriverStep::complete(DriverStatus::InsufficientResources);
         }
     };
@@ -150,19 +149,17 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_>)
     let cmd = unsafe { cfg_read16(cfg_va, 0x04) };
 
     unsafe { cfg_write16(cfg_va, 0x04, cmd | 0x06) };
-    let cmd_after = unsafe { cfg_read16(cfg_va, 0x04) };
+    let _cmd_after = unsafe { cfg_read16(cfg_va, 0x04) };
 
     let msg_ctrl_offset = msix.cap_offset + 2;
     let msg_ctrl = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
 
     let new_msg_ctrl = (msg_ctrl | (1 << 15)) & !(1 << 14); // Enable MSI-X, clear Function Mask
     unsafe { cfg_write16(cfg_va, msg_ctrl_offset, new_msg_ctrl) };
-    let msg_ctrl_after = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
+    let _msg_ctrl_after = unsafe { cfg_read16(cfg_va, msg_ctrl_offset) };
 
-    unsafe {
-        unmap_mmio_region(cfg_va, 4096);
-        unmap_mmio_region(table_va, table_region_size);
-    }
+    let _ = unmap_mmio_region(cfg_va, 4096);
+    let _ = unmap_mmio_region(table_va, table_region_size);
 
     DriverStep::complete(DriverStatus::Success)
 }

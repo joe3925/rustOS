@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![feature(core_intrinsics)]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
 extern crate alloc;
@@ -28,6 +27,7 @@ use spin::RwLock;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
+use core::panic;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 #[cfg(not(test))]
@@ -35,7 +35,7 @@ use core::panic::PanicInfo;
 fn panic(info: &PanicInfo) -> ! {
     use kernel_api::util::panic_common;
 
-    unsafe { panic_common(MOD_NAME, info) }
+    panic_common(MOD_NAME, info)
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
@@ -44,7 +44,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
@@ -137,7 +137,7 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
         Ok(va) => va,
         Err(e) => {
             kernel_api::println!("[ACPI] map_aml: map_mmio_region failed: {:?}", e);
-            core::intrinsics::abort();
+            panic!("Failed to map AML table");
         }
     };
 

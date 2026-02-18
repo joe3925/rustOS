@@ -264,7 +264,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
             )
         }
     };
-    th.inner.read().parent_pid != caller_pid;
+    let _ = th.inner.read().parent_pid != caller_pid;
     let tid = th.task_id();
     match SCHEDULER.delete_task(tid) {
         Ok(_) => 0,
@@ -292,7 +292,9 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     };
     let managed = { caller.read().managed_threads.lock().len() };
     let stack = if let Some(range) = caller.write().tracker.alloc_auto(stack_size) {
-        unsafe { caller.write().virtual_map(range, stack_size as usize) };
+        unsafe {
+            let _ = caller.write().virtual_map(range, stack_size as usize);
+        };
         range + stack_size
     } else {
         return make_err(

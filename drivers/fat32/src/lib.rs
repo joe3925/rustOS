@@ -11,10 +11,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 
 mod control;

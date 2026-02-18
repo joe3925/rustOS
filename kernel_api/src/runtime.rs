@@ -14,7 +14,7 @@ use kernel_sys::{
     kernel_spawn_blocking_raw, kernel_spawn_detached_ffi, kernel_spawn_ffi,
     try_steal_blocking_one as sys_try_steal_blocking_one,
 };
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_ffi::FutureExt;
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel).
 pub fn spawn<F>(future: F)

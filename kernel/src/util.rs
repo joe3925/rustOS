@@ -5,8 +5,9 @@ use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
-    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns,
-    calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
+    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns, calibrate_tsc, current_cpu_id,
+    get_current_logical_id, init_percpu_gs, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind,
+    LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -23,9 +24,7 @@ use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
-use crate::scheduling::runtime::runtime::{
-    init_executor_platform, spawn_detached,
-};
+use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
@@ -160,9 +159,9 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
-        install_prepacked_drivers().await;
+        let _ = install_prepacked_drivers().await;
         // BOOT_WINDOW.start();
-        PNP_MANAGER.init_from_registry().await;
+        let _ = PNP_MANAGER.init_from_registry().await;
         // bench_async_vs_sync_call_latency_async().await;
 
         // benchmark_async_async().await;
@@ -221,8 +220,9 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         println!("\n=== KERNEL PANIC [{}] ===", mod_name);
         println!("\n{}", info);
         unsafe {
-            if let Some(a) = APIC.lock()
-                .as_ref() { a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi) }
+            if let Some(a) = APIC.lock().as_ref() {
+                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
+            }
         }
 
         halt_loop()

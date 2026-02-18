@@ -601,7 +601,7 @@ impl PnpManager {
         };
 
         let mut dev_init = DeviceInit::new(IoVtable::new(), None);
-        let step = cb(drv.clone(), &mut dev_init);
+        let step = cb(drv, &mut dev_init);
 
         match step {
             DriverStep::Pending => return None,
@@ -739,8 +739,7 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 data_out: RequestData::empty(),
             };
-            let mut start_request =
-                RequestHandle::new_pnp(pnp_payload, RequestData::empty());
+            let mut start_request = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.write().add_completion(Self::start_io, ctx);
@@ -785,9 +784,7 @@ impl PnpManager {
 
                 spawn_detached(async move {
                     let mut handle = RequestHandle::Shared(shared);
-                    let _ = &PNP_MANAGER
-                        .send_request(top_device, &mut handle)
-                        .await;
+                    let _ = &PNP_MANAGER.send_request(top_device, &mut handle).await;
                 });
             }
         } else {
@@ -930,9 +927,7 @@ impl PnpManager {
         link_path: String,
     ) -> Result<(), OmError> {
         let target = alloc::format!("\\Device\\{}\\Top", instance_path);
-        OBJECT_MANAGER
-            .symlink(&link_path, target, true)
-            .map(|_| ())
+        OBJECT_MANAGER.symlink(&link_path, target, true).map(|_| ())
     }
 
     pub fn remove_symlink(&self, link_path: String) -> Result<(), OmError> {

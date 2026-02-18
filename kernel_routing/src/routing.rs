@@ -215,17 +215,16 @@ async fn call_device_handler(
                 }
             }
         }
-
         match invoke_io_handler(&dev, handle, &kind).await {
-            DriverStep::Pending => {
+            Some(DriverStep::Pending) => {
                 handle.write().status = DriverStatus::PendingStep;
                 return DriverStep::Pending;
             }
-            DriverStep::Complete { status } => {
+            Some(DriverStep::Complete { status }) => {
                 handle.write().status = status;
                 return DriverStep::complete(complete_request(handle));
             }
-            DriverStep::Continue => {
+            Some(DriverStep::Continue) | None => {
                 let next = match policy {
                     TraversalPolicy::ForwardLower => dev
                         .lower_device
@@ -259,11 +258,9 @@ async fn invoke_io_handler(
     dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_>,
     kind: &RequestType,
-) -> DriverStep {
+) -> Option<DriverStep> {
     let Some(h) = dev.dev_init.io_vtable.get_for(kind) else {
-        return DriverStep::Complete {
-            status: DriverStatus::NotImplemented,
-        };
+        return None;
     };
 
     let result = h.handler.invoke(dev, handle).await;
@@ -275,7 +272,7 @@ async fn invoke_io_handler(
         _ => {}
     }
 
-    result
+    Some(result)
 }
 
 async fn pnp_minor_dispatch(

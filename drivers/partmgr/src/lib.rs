@@ -44,7 +44,7 @@ pub unsafe extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverSt
 }
 
 pub extern "win64" fn partmgr_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     init: &mut DeviceInit,
 ) -> DriverStep {
     init.set_dev_ext_default::<PartMgrExt>();

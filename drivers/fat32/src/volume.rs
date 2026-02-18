@@ -61,13 +61,13 @@ fn take_typed_params<T: 'static>(req: &mut RequestHandle<'_>) -> Result<T, Drive
 }
 
 fn map_fatfs_err(e: &FsError) -> FileStatus {
-    use fatfs::Error::*;
     match e {
-        NotFound => FileStatus::PathNotFound,
-        AlreadyExists => FileStatus::FileAlreadyExist,
-        InvalidInput => FileStatus::BadPath,
-        _NoSpace => FileStatus::NoSpace,
-        CorruptedFileSystem => FileStatus::CorruptFilesystem,
+        fatfs::Error::NotFound => FileStatus::PathNotFound,
+        fatfs::Error::AlreadyExists => FileStatus::FileAlreadyExist,
+        fatfs::Error::InvalidInput => FileStatus::BadPath,
+        fatfs::Error::NotEnoughSpace => FileStatus::NoSpace,
+        fatfs::Error::CorruptedFileSystem => FileStatus::CorruptFilesystem,
+        _ => FileStatus::UnknownFail,
     }
 }
 

@@ -9,20 +9,17 @@ use kernel_types::{
     status::{DriverStatus, FileStatus, RegError},
 };
 
+use crate::file_system::file_provider::provider;
 use crate::{
-    benchmarking::{
-        bench_c_drive_io_async,
-        run_virtio_bench_matrix_print,
-    },
+    benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     drivers::interrupt_index::wait_duration,
-    file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
+    file_system::file_provider::{self, install_file_provider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
     registry::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,
     util::TOTAL_TIME,
 };
-use crate::file_system::file_provider::provider;
 
 #[derive(Debug)]
 pub struct File {
@@ -366,7 +363,9 @@ async fn ensure_dir(path: &Path) {
 }
 
 async fn file_exists(path: &Path) -> bool {
-    File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await.is_ok()
+    File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly])
+        .await
+        .is_ok()
 }
 
 pub async fn switch_to_vfs() -> Result<(), RegError> {

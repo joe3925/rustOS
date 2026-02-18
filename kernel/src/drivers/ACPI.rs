@@ -89,7 +89,7 @@ impl AcpiHandler for ACPIImpl {
     }
 
     fn unmap_physical_region<T>(region: &PhysicalMapping<Self, T>) {
-        unmap_mmio_region(
+        let _ = unmap_mmio_region(
             VirtAddr::new(region.virtual_start().as_ptr() as u64),
             region.region_length() as u64,
         );

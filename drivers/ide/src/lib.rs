@@ -39,10 +39,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
@@ -90,7 +88,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn ide_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut vt = PnpVtable::new();

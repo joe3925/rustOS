@@ -5,6 +5,7 @@ use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
+    println,
     request::{RequestHandle, RequestType, SharedRequest, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
@@ -145,13 +146,10 @@ impl BlockDev {
         if st == DriverStatus::Success {
             let guard = req.shared.read();
             buf.copy_from_slice(guard.data.as_slice());
+            return Ok(());
         }
-
-        if st == DriverStatus::Success {
-            Ok(())
-        } else {
-            Err(st)
-        }
+        println!("Error: {:#?}", st);
+        Err(st)
     }
 
     /// Write from a buffer using pre-allocated request (allocation-free after warmup)
@@ -197,6 +195,7 @@ impl BlockDev {
         if st == DriverStatus::Success {
             Ok(())
         } else {
+            println!("Error: {:#?}", st);
             Err(st)
         }
     }

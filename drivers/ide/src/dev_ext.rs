@@ -18,19 +18,17 @@ pub struct Ports {
 
 impl Ports {
     pub fn new(io_base: u16, ctrl_base: u16) -> Self {
-        unsafe {
-            Self {
-                data: Port::new(io_base),
-                error: Port::new(io_base + 1),
-                sector_count: Port::new(io_base + 2),
-                lba_lo: Port::new(io_base + 3),
-                lba_mid: Port::new(io_base + 4),
-                lba_hi: Port::new(io_base + 5),
-                drive_head: Port::new(io_base + 6),
-                command: Port::new(io_base + 7),
-                control: Port::new(ctrl_base),
-                alternative_command: Port::new(ctrl_base),
-            }
+        Self {
+            data: Port::new(io_base),
+            error: Port::new(io_base + 1),
+            sector_count: Port::new(io_base + 2),
+            lba_lo: Port::new(io_base + 3),
+            lba_mid: Port::new(io_base + 4),
+            lba_hi: Port::new(io_base + 5),
+            drive_head: Port::new(io_base + 6),
+            command: Port::new(io_base + 7),
+            control: Port::new(ctrl_base),
+            alternative_command: Port::new(ctrl_base),
         }
     }
 }

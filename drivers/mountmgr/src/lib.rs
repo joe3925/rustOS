@@ -19,7 +19,8 @@ use core::{
 use spin::{Once, RwLock};
 
 use kernel_api::{
-    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE,
+    GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY,
+    IOCTL_MOUNTMGR_REGISTER_FS, IOCTL_MOUNTMGR_RESYNC, IOCTL_MOUNTMGR_UNMOUNT,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
     kernel_types::{
@@ -89,10 +90,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 
 #[unsafe(no_mangle)]
@@ -117,7 +116,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn volclass_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
@@ -157,7 +156,7 @@ pub async fn volclass_ioctl<'a, 'b>(
     };
 
     match code {
-        _IOCTL_MOUNTMGR_UNMOUNT => {
+        IOCTL_MOUNTMGR_UNMOUNT => {
             let target = {
                 let r = req.read();
                 string_from_req(&r).unwrap_or_default()
@@ -176,13 +175,13 @@ pub async fn volclass_ioctl<'a, 'b>(
             w.status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
-        _IOCTL_MOUNTMGR_QUERY => {
+        IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
             w.set_data_bytes(build_status_blob(&dev));
             drop(w);
             DriverStep::complete(DriverStatus::Success)
         }
-        _IOCTL_MOUNTMGR_RESYNC => {
+        IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev.clone()).await;
             // Enumerate all volumes and assign labels on-demand
@@ -191,7 +190,7 @@ pub async fn volclass_ioctl<'a, 'b>(
             w.status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
-        _IOCTL_MOUNTMGR_LIST_FS => {
+        IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
             w.set_data_bytes(list_fs_blob());
             drop(w);
@@ -212,22 +211,20 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
     };
 
     match code {
-        _IOCTL_MOUNTMGR_REGISTER_FS => {
+        IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
                 let r = req.read();
                 string_from_req(&r)
             };
             match tag {
                 Some(t) if !t.is_empty() => {
-                    unsafe {
-                        let mut wr = FS_REGISTERED.write();
-                        if !wr.iter().any(|s| s == &t) {
-                            wr.push(t);
-                        }
-                        drop(wr);
-                        let _ = refresh_fs_registry_from_registry().await;
-                        spawn_detached(rescan_all_volumes());
+                    let mut wr = FS_REGISTERED.write();
+                    if !wr.iter().any(|s| s == &t) {
+                        wr.push(t);
                     }
+                    drop(wr);
+                    let _ = refresh_fs_registry_from_registry().await;
+                    spawn_detached(rescan_all_volumes());
                     DriverStep::complete(DriverStatus::Success)
                 }
                 _ => DriverStep::complete(DriverStatus::InvalidParameter),
@@ -253,7 +250,7 @@ fn init_volume_dx(dev: &Arc<DeviceObject>) {
     dx.public_link.call_once(|| make_volume_link_name(vid));
     dx.vid.call_once(|| vid);
 
-    let mut v = unsafe { VOLUMES.write() };
+    let mut v = VOLUMES.write();
     if !v.iter().any(|d| Arc::ptr_eq(d, dev)) {
         v.push(dev.clone());
     }
@@ -474,13 +471,11 @@ async fn try_bind_filesystems_for_parent_fdo(
     false
 }
 fn svc_for_tag(tag: &str) -> Option<String> {
-    unsafe {
-        FS_REGISTRY
-            .read()
-            .iter()
-            .find(|r| r.tag == tag)
-            .map(|r| r.svc.clone())
-    }
+    FS_REGISTRY
+        .read()
+        .iter()
+        .find(|r| r.tag == tag)
+        .map(|r| r.svc.clone())
 }
 
 fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
@@ -611,7 +606,6 @@ fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {
             let mod_ok = fs_check_open(&link, "system/mod").await;
             let inf_ok = fs_check_open(&link, "system/toml").await;
             let reg_dir_ok = fs_check_open(&link, "system/registry").await;
-
             if mod_ok && inf_ok && reg_dir_ok {
                 let _ = attempt_boot_bind(&inst, &link, &sid).await;
             }

@@ -8,7 +8,7 @@ extern crate alloc;
 mod dev_ext;
 mod msix;
 
-use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
@@ -33,7 +33,7 @@ use kernel_api::{
         pnp_forward_request_to_next_lower,
     },
     println,
-    request::{Request, RequestHandle, RequestType},
+    request::{RequestHandle, RequestType},
     request_handler,
     runtime::spawn_blocking,
     status::DriverStatus,
@@ -45,10 +45,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 
 #[unsafe(no_mangle)]
@@ -58,7 +56,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut vt = PnpVtable::new();

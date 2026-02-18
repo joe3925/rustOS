@@ -52,8 +52,6 @@ use blk::{
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
 
-use crate::blk::PREALLOCATED_DATA_SIZE;
-
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
@@ -78,7 +76,7 @@ fn continue_req(req: &mut RequestHandle) -> DriverStep {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe { panic_common(MOD_NAME, info) }
+    panic_common(MOD_NAME, info)
 }
 
 #[unsafe(no_mangle)]
@@ -88,7 +86,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn virtio_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let io_vt = IoVtable::new();

@@ -26,7 +26,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn bus_driver_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();

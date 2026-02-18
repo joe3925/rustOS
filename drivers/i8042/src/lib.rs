@@ -25,10 +25,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 #[panic_handler]
 #[cfg(not(test))]
 fn panic(info: &PanicInfo) -> ! {
-    unsafe {
-        use kernel_api::util::panic_common;
-        panic_common(MOD_NAME, info)
-    }
+    use kernel_api::util::panic_common;
+    panic_common(MOD_NAME, info)
 }
 #[repr(C)]
 pub struct DevExt {
@@ -49,7 +47,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
 }
 
 pub extern "win64" fn ps2_device_add(
-    _driver: Arc<DriverObject>,
+    _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp = PnpVtable::new();
@@ -161,16 +159,14 @@ fn make_child_pdo(
     let mut child_init = DeviceInit::new(IoVtable::new(), Some(vt));
     child_init.set_dev_ext_from(Ps2ChildExt { is_kbd });
 
-    let (_dn, _pdo) = unsafe {
-        pnp_create_child_devnode_and_pdo_with_init(
-            parent,
-            name.into(),
-            instance_id.into(),
-            ids,
-            None,
-            child_init,
-        )
-    };
+    let (_dn, _pdo) = pnp_create_child_devnode_and_pdo_with_init(
+        parent,
+        name.into(),
+        instance_id.into(),
+        ids,
+        None,
+        child_init,
+    );
 }
 
 #[request_handler]

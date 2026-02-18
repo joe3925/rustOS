@@ -108,7 +108,7 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
-    unsafe { irq_register(vector, isr, ctx) }
+    irq_register(vector, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
@@ -118,7 +118,7 @@ pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
-    unsafe { irq_signal(handle, meta) }
+    irq_signal(handle, meta)
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_ensure_signal(handle: IrqHandlePtr, meta: IrqMeta) {
@@ -126,7 +126,7 @@ pub extern "win64" fn kernel_irq_ensure_signal(handle: IrqHandlePtr, meta: IrqMe
 }
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
-    unsafe { irq_signal_n(handle, meta, n) }
+    irq_signal_n(handle, meta, n)
 }
 
 #[unsafe(no_mangle)]

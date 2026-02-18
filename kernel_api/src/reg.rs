@@ -1,12 +1,7 @@
-use core::future::IntoFuture;
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use kernel_sys as ffi;
-use kernel_types::{
-    async_ffi::FfiFuture,
-    status::{Data, RegError},
-};
+use kernel_types::status::{Data, RegError};
 
 pub async fn get_value(key_path: &str, name: &str) -> Option<Data> {
     unsafe { ffi::reg_get_value(key_path, name).await }
