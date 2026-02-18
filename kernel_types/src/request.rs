@@ -516,7 +516,8 @@ impl Request {
             panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
         }
 
-        let request = Self {
+        
+        Self {
             kind,
             data,
             completed: false,
@@ -527,8 +528,7 @@ impl Request {
             completion_context: 0,
 
             waker: None,
-        };
-        request
+        }
     }
 
     /// Create a PnP request.
@@ -680,7 +680,7 @@ impl Request {
     }
     #[inline]
     fn complete_for_drop(&mut self) {
-        let (status, waker) = {
+        let (_status, waker) = {
             if self.completed {
                 return;
             }
@@ -832,7 +832,7 @@ impl<'a> Deref for HandleReadGuard<'a> {
     fn deref(&self) -> &Request {
         match self {
             HandleReadGuard::Stack(r) => r,
-            HandleReadGuard::Shared(g) => &*g,
+            HandleReadGuard::Shared(g) => g,
         }
     }
 }
@@ -851,7 +851,7 @@ impl<'a> Deref for HandleWriteGuard<'a> {
     fn deref(&self) -> &Request {
         match self {
             HandleWriteGuard::Stack(r) => r,
-            HandleWriteGuard::Shared(g) => &*g,
+            HandleWriteGuard::Shared(g) => g,
         }
     }
 }
@@ -1009,9 +1009,9 @@ impl RequestHandle<'static> {
 impl<'a> RequestHandleResult<'a> {
     pub fn status(&self) -> DriverStatus {
         match self.step {
-            DriverStep::Complete { status } => return status,
-            DriverStep::Continue => return todo!(),
-            DriverStep::Pending => return DriverStatus::PendingStep,
+            DriverStep::Complete { status } => status,
+            DriverStep::Continue => todo!(),
+            DriverStep::Pending => DriverStatus::PendingStep,
         }
     }
 }

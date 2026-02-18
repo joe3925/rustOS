@@ -5,7 +5,6 @@
 extern crate alloc;
 
 use core::panic::PanicInfo;
-use kernel_api::println;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 

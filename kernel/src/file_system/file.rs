@@ -1,12 +1,9 @@
 use alloc::{
-    borrow::Cow,
-    boxed::Box,
-    format,
     string::{String, ToString},
     vec::Vec,
 };
-use core::{cmp::PartialEq, time::Duration};
-use kernel_executor::runtime::runtime::{spawn, spawn_blocking};
+use core::time::Duration;
+use kernel_executor::runtime::runtime::spawn_blocking;
 use kernel_types::{
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
@@ -14,23 +11,18 @@ use kernel_types::{
 
 use crate::{
     benchmarking::{
-        bench_async_vs_sync_call_latency_async, bench_c_drive_io_async,
-        bench_virtio_disk_sweep_both_to_csv, run_virtio_bench_matrix,
+        bench_c_drive_io_async,
         run_virtio_bench_matrix_print,
     },
-    drivers::{drive::vfs::Vfs, interrupt_index::wait_duration},
+    drivers::interrupt_index::wait_duration,
     file_system::file_provider::{self, install_file_provider, FileProvider, ProviderKind},
     memory::paging::frame_alloc::USED_MEMORY,
     println,
     registry::rebind_and_persist_after_provider_switch,
     scheduling::runtime::runtime::spawn_detached,
-    util::{BOOT_WINDOW, TOTAL_TIME},
+    util::TOTAL_TIME,
 };
-use crate::{
-    drivers::{driver_install::install_prepacked_drivers, pnp::manager::PNP_MANAGER},
-    file_system::file_provider::provider,
-    registry::is_first_boot,
-};
+use crate::file_system::file_provider::provider;
 
 #[derive(Debug)]
 pub struct File {
@@ -96,7 +88,7 @@ impl File {
     }
 
     pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
-        let write_through = flags.iter().any(|f| *f == OpenFlags::WriteThrough);
+        let write_through = flags.contains(&OpenFlags::WriteThrough);
         let (res, st) = file_provider::provider()
             .open_path(path, flags, write_through)
             .await;
@@ -374,10 +366,7 @@ async fn ensure_dir(path: &Path) {
 }
 
 async fn file_exists(path: &Path) -> bool {
-    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await.is_ok()
 }
 
 pub async fn switch_to_vfs() -> Result<(), RegError> {

@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -6,7 +5,6 @@ use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped, deallocate_kernel_range, unmap_range,
     virt_to_phys,
 };
-use kernel_api::println;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::pci;
@@ -25,7 +23,7 @@ pub const ARENA_DYNAMIC_SLOTS: usize = 0;
 pub const ARENA_MAX_CAPACITY: usize = 5096;
 
 /// Number of u64 bitmap words needed to track all arena slots
-pub const ARENA_BITMAP_WORDS: usize = (ARENA_MAX_CAPACITY + 63) / 64;
+pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY.div_ceil(64);
 
 pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 
@@ -35,7 +33,7 @@ pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 #[inline]
 pub const fn calculate_indirect_table_size(data_len: u32) -> u64 {
     // Worst case: 1 descriptor per 4KB page (no coalescing)
-    let data_pages = (data_len as u64 + 4095) / 4096;
+    let data_pages = (data_len as u64).div_ceil(4096);
     // header(1) + data_pages + status(1)
     let descriptors_needed = 1 + data_pages + 1;
     let bytes_needed = descriptors_needed * 16;
@@ -272,7 +270,7 @@ impl BlkIoArena {
         }
 
         let mut dyn_stride: usize = 0;
-        let (dynamic_pages_va, dynamic_pages_count) = if dynamic_count > 0 {
+        let (dynamic_pages_va, _dynamic_pages_count) = if dynamic_count > 0 {
             dyn_stride = page * 2;
 
             let total_bytes = dynamic_count.checked_mul(dyn_stride)?;
@@ -388,11 +386,10 @@ impl BlkIoArena {
     /// AND overflow allocation fails.
     pub fn allocate(&self, data_len: u32) -> Option<BlkIoRequestHandle<'_>> {
         // Fast path: if data fits in 4KB, try preallocated slots first
-        if data_len <= PREALLOCATED_DATA_SIZE as u32 {
-            if let Some(handle) = self.try_allocate_preallocated(data_len) {
+        if data_len <= PREALLOCATED_DATA_SIZE as u32
+            && let Some(handle) = self.try_allocate_preallocated(data_len) {
                 return Some(handle);
             }
-        }
 
         // Try dynamic slots (can handle any size)
         if let Some(handle) = self.try_allocate_dynamic(data_len) {
@@ -691,7 +688,7 @@ impl BlkIoArena {
         sector: u64,
         data_len: u32,
     ) -> Option<BlkIoRequestHandle<'_>> {
-        let mut handle = self.allocate(data_len)?;
+        let handle = self.allocate(data_len)?;
         handle.set_header(req_type, sector);
 
         // Zero the data buffer
@@ -979,12 +976,12 @@ impl<'a> BlkIoRequestHandle<'a> {
         let mut offset = 0u64;
         let total = self.data_len() as u64;
         let data_va_base = self.data_va();
-        let data_phys_base = self.data_phys();
+        let _data_phys_base = self.data_phys();
 
         while offset < total && buf_count < MAX_DESCRIPTORS_PER_REQUEST - 1 {
             let vaddr = VirtAddr::new(data_va_base.as_u64() + offset);
             let phys = virt_to_phys(vaddr).expect("Todo");
-            let page_off = (vaddr.as_u64() & 0xFFF) as u64;
+            let page_off = (vaddr.as_u64() & 0xFFF);
             let chunk = core::cmp::min(4096u64 - page_off, total - offset);
             let seg_phys = PhysAddr::new(phys.as_u64());
 
@@ -1029,7 +1026,7 @@ impl<'a> BlkIoRequestHandle<'a> {
             (*desc).addr = addr;
             (*desc).len = len;
             (*desc).flags = flags;
-            (*desc).next = (idx + 1) as u16;
+            (*desc).next = (idx + 1);
         };
 
         // Write header descriptor into table
@@ -1048,7 +1045,7 @@ impl<'a> BlkIoRequestHandle<'a> {
         let mut offset = 0u64;
         let total = self.data_len() as u64;
         let data_va_base = self.data_va();
-        let data_phys_base = self.data_phys();
+        let _data_phys_base = self.data_phys();
 
         // Track current segment for coalescing
         let mut seg_start_phys: u64 = 0;
@@ -1151,11 +1148,10 @@ impl<'a> Drop for BlkIoRequestHandle<'a> {
                     let data_pages = ((req.data_len as u64) + 4095) & !4095;
                     unmap_range(req.data_va, data_pages.max(4096));
                     unmap_range(req.status_va, 4096);
-                    if let Some(va) = req.indirect_table_va {
-                        if req.indirect_table_len > 0 {
+                    if let Some(va) = req.indirect_table_va
+                        && req.indirect_table_len > 0 {
                             unmap_range(va, req.indirect_table_len as u64);
                         }
-                    }
                 }
             }
         }

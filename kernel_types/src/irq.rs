@@ -265,14 +265,14 @@ impl<'a, T> Deref for IrqSafeMutexGuard<'a, T> {
 
     #[inline(always)]
     fn deref(&self) -> &T {
-        &*self.guard
+        &self.guard
     }
 }
 
 impl<'a, T> DerefMut for IrqSafeMutexGuard<'a, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.guard
+        &mut self.guard
     }
 }
 
@@ -404,7 +404,7 @@ impl<'a, T> Deref for IrqSafeRwLockReadGuard<'a, T> {
 
     #[inline(always)]
     fn deref(&self) -> &T {
-        &*self.guard
+        &self.guard
     }
 }
 
@@ -423,14 +423,14 @@ impl<'a, T> Deref for IrqSafeRwLockWriteGuard<'a, T> {
 
     #[inline(always)]
     fn deref(&self) -> &T {
-        &*self.guard
+        &self.guard
     }
 }
 
 impl<'a, T> DerefMut for IrqSafeRwLockWriteGuard<'a, T> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.guard
+        &mut self.guard
     }
 }
 

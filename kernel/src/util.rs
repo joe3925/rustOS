@@ -1,62 +1,44 @@
 extern crate rand_xoshiro;
 
-use crate::alloc::format;
-use crate::benchmarking::{
-    bench_async_vs_sync_call_latency, bench_async_vs_sync_call_latency_async, benchmark_async,
-    benchmark_async_async, BenchWindow,
-};
+use crate::benchmarking::BenchWindow;
 use crate::boot_packages;
 use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
-    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ms, apic_program_period_ns,
-    calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, set_current_cpu_id,
-    wait_duration, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
+    apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns,
+    calibrate_tsc, current_cpu_id, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::drivers::timer_driver::{
-    NUM_CORES, PER_CORE_SWITCHES, ROT_TICKET, TIMER, TIMER_TIME_SCHED,
-};
+use crate::drivers::timer_driver::NUM_CORES;
 use crate::executable::program::{Program, PROGRAM_MANAGER};
 use crate::exports::EXPORTS;
-use crate::file_system::file::File;
 use crate::file_system::file_provider::{install_file_provider, ProviderKind};
-use crate::file_system::{bootstrap_filesystem::BootstrapProvider, file_provider};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
-use crate::memory::paging::frame_alloc::{total_usable_bytes, BootInfoFrameAllocator, USED_MEMORY};
+use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
-use crate::registry::is_first_boot;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::{
-    init_executor_platform, spawn, spawn_blocking, spawn_detached,
+    init_executor_platform, spawn_detached,
 };
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use crate::{cpu, println, BOOT_INFO};
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use bootloader_api::BootInfo;
 use core::arch::asm;
-use core::future::Future;
-use core::hint::black_box;
 use core::mem::size_of;
 use core::panic::PanicInfo;
-use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use core::task::{Context, Poll};
-use core::time::Duration;
-use crossbeam_queue::ArrayQueue;
-use kernel_types::async_ffi::FutureExt;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
@@ -64,7 +46,6 @@ use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
-use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
 pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
@@ -240,9 +221,8 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         println!("\n=== KERNEL PANIC [{}] ===", mod_name);
         println!("\n{}", info);
         unsafe {
-            APIC.lock()
-                .as_ref()
-                .map(|a| a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi));
+            if let Some(a) = APIC.lock()
+                .as_ref() { a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi) }
         }
 
         halt_loop()

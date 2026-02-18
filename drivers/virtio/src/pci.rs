@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use kernel_api::memory::{map_mmio_region, virt_to_phys};
+use kernel_api::memory::map_mmio_region;
 use kernel_api::pnp::ResourceKind;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -98,11 +98,10 @@ pub fn find_legacy_irq_line(resources: &[PciResource]) -> Option<u8> {
 pub fn map_memory_bars(resources: &[PciResource]) -> Vec<(u32, VirtAddr, u64)> {
     let mut mapped = Vec::new();
     for r in resources {
-        if r.kind == ResourceKind::Memory as u32 && r.length > 0 {
-            if let Ok(va) = map_mmio_region(PhysAddr::new(r.start), r.length) {
+        if r.kind == ResourceKind::Memory as u32 && r.length > 0
+            && let Ok(va) = map_mmio_region(PhysAddr::new(r.start), r.length) {
                 mapped.push((r.index, va, r.length));
             }
-        }
     }
     mapped
 }
@@ -164,7 +163,7 @@ pub fn parse_virtio_caps(
             let cfg_type = unsafe { core::ptr::read_volatile(base.add(ptr + 3)) };
             let bar = unsafe { core::ptr::read_volatile(base.add(ptr + 4)) };
             let offset = unsafe { core::ptr::read_volatile(base.add(ptr + 8) as *const u32) };
-            let length = unsafe { core::ptr::read_volatile(base.add(ptr + 12) as *const u32) };
+            let _length = unsafe { core::ptr::read_volatile(base.add(ptr + 12) as *const u32) };
 
             // Find the mapped BAR
             if let Some((_idx, bar_va, _sz)) =

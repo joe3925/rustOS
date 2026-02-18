@@ -4,13 +4,10 @@ use core::ptr::copy_nonoverlapping;
 use crate::file_system::file::File;
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
-use crate::scheduling::scheduler::{self, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
 use crate::structs::stopwatch::Stopwatch;
-use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,15 +18,14 @@ use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::Module;
 use kernel_types::status::PageMapError;
-use spin::mutex::Mutex;
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::mapper::MapToError;
-use x86_64::structures::paging::{PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{PageTable, PhysFrame};
 use x86_64::VirtAddr;
 
-use super::program::{HandleTable, Program, PROGRAM_MANAGER};
+use super::program::{Program, PROGRAM_MANAGER};
 
 pub struct PELoader {
     buffer: Box<[u8]>,
@@ -361,7 +357,7 @@ impl PELoader {
         let heap_size = opt_hdr.windows_fields.size_of_heap_reserve;
         let image_size = opt_hdr.windows_fields.size_of_image as u64;
 
-        return Ok((image_size + 0x1000 + stack_size + heap_size) as usize);
+        Ok((image_size + 0x1000 + stack_size + heap_size) as usize)
     }
 
     pub fn load_sections(&self) -> Result<(), LoadError> {
@@ -398,7 +394,7 @@ impl PELoader {
             .header
             .optional_header
             .ok_or(LoadError::MissingSections)?;
-        let old_base = opt_hdr.windows_fields.image_base as u64;
+        let old_base = opt_hdr.windows_fields.image_base;
         let delta = self.current_base.as_u64().wrapping_sub(old_base);
 
         let relocs = self

@@ -2,7 +2,7 @@ use bootloader::{BootConfig, UefiBoot};
 use std::{
     env, fs,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
 };
 
 fn main() {
@@ -27,7 +27,7 @@ fn main() {
     let asm_bin = target_dir.parent().unwrap().join("ap_startup.bin");
 
     let status = Command::new("nasm")
-        .args(&["-f", "bin", "-o"])
+        .args(["-f", "bin", "-o"])
         .arg(&asm_bin)
         .arg(&asm_src)
         .status()

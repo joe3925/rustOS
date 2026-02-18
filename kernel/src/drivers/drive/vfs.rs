@@ -1,6 +1,5 @@
-use alloc::boxed::Box;
 use alloc::string::ToString;
-use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::io::IoTarget;
@@ -254,7 +253,7 @@ impl Vfs {
             }
 
             let (inner_res, st) =
-                call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
+                call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
             if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                 return (inner_res, st);
             }
@@ -283,7 +282,7 @@ impl Vfs {
                 self,
                 &symlink,
                 fs_path.clone(),
-                p.flags.clone(),
+                p.flags,
                 p.write_through,
             )
             .await;
@@ -351,7 +350,7 @@ impl Vfs {
                 }
 
                 let (inner_res, st2) =
-                    call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
+                    call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
                 if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                     return (inner_res, st2);
                 }
@@ -380,7 +379,7 @@ impl Vfs {
         } else {
             // Open, ReadOnly, WriteOnly, ReadWrite - just open
             let (inner_res, st) =
-                call_open(self, &symlink, fs_path, p.flags.clone(), p.write_through).await;
+                call_open(self, &symlink, fs_path, p.flags, p.write_through).await;
             if matches!(inner_res.error, Some(e) if e != FileStatus::Success) {
                 return (inner_res, st);
             }

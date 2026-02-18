@@ -14,7 +14,6 @@ use alloc::{
 };
 use core::{
     panic::PanicInfo,
-    ptr,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use spin::{Once, RwLock};
@@ -25,7 +24,7 @@ use kernel_api::{
     fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
-        io::{FsIdentify, IoTarget, IoType, IoVtable, Synchronization},
+        io::{FsIdentify, IoType, IoVtable, Synchronization},
         pnp::DeviceIds,
         request::RequestData,
     },
@@ -40,7 +39,7 @@ use kernel_api::{
     reg::{self, switch_to_vfs_async},
     request::{Request, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
-    runtime::{spawn, spawn_detached},
+    runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
 };
 
@@ -152,13 +151,13 @@ pub async fn volclass_ioctl<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let code = match { req.read().kind } {
+    let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
         _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
     match code {
-        IOCTL_MOUNTMGR_UNMOUNT => {
+        _IOCTL_MOUNTMGR_UNMOUNT => {
             let target = {
                 let r = req.read();
                 string_from_req(&r).unwrap_or_default()
@@ -177,13 +176,13 @@ pub async fn volclass_ioctl<'a, 'b>(
             w.status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
-        IOCTL_MOUNTMGR_QUERY => {
+        _IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
             w.set_data_bytes(build_status_blob(&dev));
             drop(w);
             DriverStep::complete(DriverStatus::Success)
         }
-        IOCTL_MOUNTMGR_RESYNC => {
+        _IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
             mount_if_unmounted(dev).await;
             // Enumerate all volumes and assign labels on-demand
@@ -192,7 +191,7 @@ pub async fn volclass_ioctl<'a, 'b>(
             w.status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
-        IOCTL_MOUNTMGR_LIST_FS => {
+        _IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
             w.set_data_bytes(list_fs_blob());
             drop(w);
@@ -207,13 +206,13 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
     _dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let code = match { req.read().kind } {
+    let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
         _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
     match code {
-        IOCTL_MOUNTMGR_REGISTER_FS => {
+        _IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
                 let r = req.read();
                 string_from_req(&r)
@@ -599,7 +598,7 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
     {
         return true;
     }
-    return false;
+    false
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {
@@ -734,7 +733,7 @@ async fn assign_boot_drive_letter(
     fs_mount_link: &str,
 ) -> Result<(), RegError> {
     let ch = (letter as char).to_ascii_uppercase();
-    if ch < 'A' || ch > 'Z' {
+    if !('A'..='Z').contains(&ch) {
         return Ok(());
     }
 

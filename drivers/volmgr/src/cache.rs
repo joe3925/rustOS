@@ -17,7 +17,7 @@ const MIN_BLOCK_SIZE: usize = 4096;
 const MAX_ENTRIES: usize = 8192;
 
 const MAX_SECTORS_PER_BLOCK: usize = 256;
-const MASK_WORDS: usize = (MAX_SECTORS_PER_BLOCK + 63) / 64;
+const MASK_WORDS: usize = MAX_SECTORS_PER_BLOCK.div_ceil(64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheError {
@@ -100,7 +100,7 @@ impl VolumeCache {
         if block_size < MIN_BLOCK_SIZE {
             return Err(CacheError::BlockSizeTooSmall);
         }
-        if sector_size == 0 || block_size % sector_size != 0 {
+        if sector_size == 0 || !block_size.is_multiple_of(sector_size) {
             return Err(CacheError::BlockSizeMisaligned);
         }
 
@@ -205,7 +205,7 @@ impl VolumeCache {
         if len == 0 {
             return Ok(());
         }
-        if offset % (self.sector_size as u64) != 0 || (len as usize) % self.sector_size != 0 {
+        if !offset.is_multiple_of(self.sector_size as u64) || !(len as usize).is_multiple_of(self.sector_size) {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -296,7 +296,7 @@ impl VolumeCache {
             let within_len = (seg_hi - seg_lo) as usize;
 
             let start_sector = within_lo / self.sector_size;
-            let end_sector = (within_lo + within_len + self.sector_size - 1) / self.sector_size;
+            let end_sector = (within_lo + within_len).div_ceil(self.sector_size);
 
             if end_sector > self.sectors_per_block {
                 return Err(CacheError::InternalInconsistent);
@@ -337,7 +337,7 @@ impl VolumeCache {
         if data.is_empty() {
             return Ok(());
         }
-        if offset % (self.sector_size as u64) != 0 || data.len() % self.sector_size != 0 {
+        if !offset.is_multiple_of(self.sector_size as u64) || !data.len().is_multiple_of(self.sector_size) {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -457,7 +457,7 @@ impl VolumeCache {
             return Ok(());
         }
 
-        if offset % (self.sector_size as u64) != 0 || data.len() % self.sector_size != 0 {
+        if !offset.is_multiple_of(self.sector_size as u64) || !data.len().is_multiple_of(self.sector_size) {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -879,8 +879,8 @@ impl VolumeCache {
                         !still_dirty
                     };
 
-                    if should_evict {
-                        if let Some(removed_entry_idx) = cache.map.remove(&block_idx) {
+                    if should_evict
+                        && let Some(removed_entry_idx) = cache.map.remove(&block_idx) {
                             let removed_ei = removed_entry_idx as usize;
                             if removed_ei >= cache.entries.len() {
                                 return Err(CacheError::InternalInconsistent);
@@ -888,7 +888,6 @@ impl VolumeCache {
                             cache.entries[removed_ei].reset();
                             cache.free.push(removed_entry_idx);
                         }
-                    }
 
                     remaining_sectors -= sectors_to_clear;
                     sector_cursor = sector_cursor

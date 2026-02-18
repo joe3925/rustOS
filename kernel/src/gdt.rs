@@ -5,10 +5,8 @@ use spin::Mutex;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::VirtAddr;
 
 use crate::cpu::get_cpu_info;
-use crate::memory::paging::paging::align_up_2mib;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::structs::per_cpu_vec::PerCpuVec;
@@ -30,6 +28,12 @@ pub struct GDTTracker {
     pub size: usize,
 }
 unsafe impl Send for GDTTracker {}
+impl Default for GDTTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GDTTracker {
     pub fn new() -> Self {
         let base = allocate_auto_kernel_range_mapped(
@@ -103,8 +107,8 @@ impl GDTTracker {
             .get_feature_info()
             .expect("NO CPUID")
             .initial_local_apic_id() as usize;
-        self.gdt_array.set_by_id(id, gdt_ptr_base, || core::ptr::null());
-        self.selectors_per_cpu.set_by_id(id, selectors, || Selectors::default());
+        self.gdt_array.set_by_id(id, gdt_ptr_base, core::ptr::null);
+        self.selectors_per_cpu.set_by_id(id, selectors, Selectors::default);
     }
 }
 pub struct Selectors {

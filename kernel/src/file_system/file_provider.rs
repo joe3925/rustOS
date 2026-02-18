@@ -1,12 +1,10 @@
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU8, Ordering};
 use spin::Lazy;
 
 use kernel_types::{
     async_ffi::FfiFuture,
     fs::{Path, *},
-    request::Request,
-    status::{DriverStatus, FileStatus},
+    status::DriverStatus,
 };
 
 // These must exist somewhere in your crate and implement `FileProvider`.

@@ -18,7 +18,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 pub use macros::async_ffi;
 
 pub const ABI_VERSION: u32 = 2;
-const ASYNC_FFI_SLAB_WORDS: usize = (ASYNC_FFI_SLAB_SLOTS + USIZE_BITS - 1) / USIZE_BITS;
+const ASYNC_FFI_SLAB_WORDS: usize = ASYNC_FFI_SLAB_SLOTS.div_ceil(USIZE_BITS);
 
 const SLAB_ALIGN: usize = 64;
 const SLAB_CHECKS: bool = cfg!(debug_assertions);
@@ -237,7 +237,7 @@ If you are overriding defaults, set default-features = false on the dependency."
     if ASYNC_FFI_SLAB_SLOT_BYTES == 0 {
         panic!("ASYNC_FFI_SLAB_SLOT_BYTES must be non-zero.");
     }
-    if (ASYNC_FFI_SLAB_SLOT_BYTES % SLAB_ALIGN) != 0 {
+    if !ASYNC_FFI_SLAB_SLOT_BYTES.is_multiple_of(SLAB_ALIGN) {
         panic!("async-ffi slab slot bytes must be a multiple of SLAB_ALIGN (64).");
     }
     if ASYNC_FFI_SLAB_SLOTS > (usize::MAX / ASYNC_FFI_SLAB_SLOT_BYTES) {
@@ -316,13 +316,13 @@ impl<T> FfiPoll<T> {
         self.tag == 1
     }
 
-    pub unsafe fn into_poll(self) -> Poll<T> {
+    pub unsafe fn into_poll(self) -> Poll<T> { unsafe {
         if self.tag == 0 {
             Poll::Pending
         } else {
             Poll::Ready(self.value.assume_init())
         }
-    }
+    }}
 }
 
 impl<T> From<Poll<T>> for FfiPoll<T> {
@@ -386,9 +386,9 @@ impl<T> FfiFuture<T> {
         self.data.is_null()
     }
 
-    pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
+    pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> { unsafe {
         (self.poll_fn)(self.data, waker)
-    }
+    }}
 }
 
 impl<T> Drop for FfiFuture<T> {
@@ -435,8 +435,8 @@ where
         let size = mem::size_of::<FutureBox<F>>();
         let align = mem::align_of::<FutureBox<F>>();
 
-        if size <= ASYNC_FFI_FUTURE_SLOT_BYTES && align <= SLAB_ALIGN {
-            if let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
+        if size <= ASYNC_FFI_FUTURE_SLOT_BYTES && align <= SLAB_ALIGN
+            && let Some(i) = slot_alloc::<ASYNC_FFI_SLAB_SLOTS, ASYNC_FFI_SLAB_WORDS>(
                 &FUTURE_FREE,
                 &FUTURE_WATERMARK.v,
             ) {
@@ -447,7 +447,6 @@ where
                 let f = fut.take().unwrap();
                 ptr::write(data_ptr, FutureBox { future: f });
             }
-        }
     }
 
     if data_ptr.is_null() {
@@ -477,7 +476,7 @@ unsafe extern "win64" fn future_box_poll<F>(
 ) -> FfiPoll<F::Output>
 where
     F: Future,
-{
+{ unsafe {
     if waker.is_null() {
         return FfiPoll::pending();
     }
@@ -487,12 +486,12 @@ where
     let mut cx = Context::from_waker(&w);
     let p = Future::poll(Pin::new_unchecked(&mut (*fb).future), &mut cx);
     FfiPoll::from(p)
-}
+}}
 
 unsafe extern "win64" fn future_box_drop<F>(data: *mut ())
 where
     F: Future,
-{
+{ unsafe {
     let fb = data as *mut FutureBox<F>;
 
     #[cfg(feature = "async-ffi-slab")]
@@ -504,7 +503,7 @@ where
         if p >= base && p < end {
             let off = p - base;
             if SLAB_CHECKS {
-                debug_assert!(off % ASYNC_FFI_FUTURE_SLOT_BYTES == 0);
+                debug_assert!(off.is_multiple_of(ASYNC_FFI_FUTURE_SLOT_BYTES));
             }
             let idx = off / ASYNC_FFI_FUTURE_SLOT_BYTES;
 
@@ -516,7 +515,7 @@ where
     }
 
     drop(Box::from_raw(fb));
-}
+}}
 
 struct RustWakerBox {
     refs: AtomicUsize,
@@ -570,27 +569,27 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
+unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker { unsafe {
     let b = data as *const RustWakerBox;
     (*b).refs.fetch_add(1, Ordering::Relaxed);
     FfiWaker {
         data,
         vtable: &RUST_WAKER_BOX_VTABLE,
     }
-}
+}}
 
-unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) {
+unsafe extern "win64" fn rust_waker_box_wake(data: *const ()) { unsafe {
     let b = data as *const RustWakerBox;
     (*b).waker.wake_by_ref();
     rust_waker_box_drop(data);
-}
+}}
 
-unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) {
+unsafe extern "win64" fn rust_waker_box_wake_by_ref(data: *const ()) { unsafe {
     let b = data as *const RustWakerBox;
     (*b).waker.wake_by_ref();
-}
+}}
 
-unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
+unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) { unsafe {
     let b = data as *mut RustWakerBox;
     if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
@@ -615,7 +614,7 @@ unsafe extern "win64" fn rust_waker_box_drop(data: *const ()) {
     }
 
     drop(Box::from_raw(b));
-}
+}}
 
 struct FfiWakerBox {
     refs: AtomicUsize,
@@ -668,23 +667,23 @@ fn ffi_waker_to_waker(w: &FfiWaker) -> Waker {
     }
 }
 
-unsafe fn ffi_waker_box_raw_clone(data: *const ()) -> RawWaker {
+unsafe fn ffi_waker_box_raw_clone(data: *const ()) -> RawWaker { unsafe {
     let b = data as *const FfiWakerBox;
     (*b).refs.fetch_add(1, Ordering::Relaxed);
     RawWaker::new(data, &FFI_WAKER_BOX_RAW_VTABLE)
-}
+}}
 
-unsafe fn ffi_waker_box_raw_wake(data: *const ()) {
+unsafe fn ffi_waker_box_raw_wake(data: *const ()) { unsafe {
     ffi_waker_box_raw_wake_by_ref(data);
     ffi_waker_box_raw_drop(data);
-}
+}}
 
-unsafe fn ffi_waker_box_raw_wake_by_ref(data: *const ()) {
+unsafe fn ffi_waker_box_raw_wake_by_ref(data: *const ()) { unsafe {
     let b = data as *const FfiWakerBox;
     (*b).waker.wake_by_ref();
-}
+}}
 
-unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
+unsafe fn ffi_waker_box_raw_drop(data: *const ()) { unsafe {
     let b = data as *mut FfiWakerBox;
     if (*b).refs.fetch_sub(1, Ordering::AcqRel) != 1 {
         return;
@@ -708,7 +707,7 @@ unsafe fn ffi_waker_box_raw_drop(data: *const ()) {
     }
 
     drop(Box::from_raw(b));
-}
+}}
 
 #[repr(C)]
 pub struct BorrowingFfiFuture<'a, T> {
@@ -719,9 +718,9 @@ pub struct BorrowingFfiFuture<'a, T> {
 }
 
 impl<'a, T> BorrowingFfiFuture<'a, T> {
-    pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
+    pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> { unsafe {
         (self.poll_fn)(self.data, waker)
-    }
+    }}
 }
 
 pub trait BorrowingFutureExt: Future {
@@ -763,7 +762,7 @@ unsafe extern "win64" fn borrowing_future_poll<F>(
 ) -> FfiPoll<F::Output>
 where
     F: Future,
-{
+{ unsafe {
     if waker.is_null() {
         return FfiPoll::pending();
     }
@@ -773,7 +772,7 @@ where
     let mut cx = Context::from_waker(&w);
     let p = Future::poll(Pin::new_unchecked(&mut *f), &mut cx);
     FfiPoll::from(p)
-}
+}}
 
 impl<'a, T> Future for BorrowingFfiFuture<'a, T> {
     type Output = T;

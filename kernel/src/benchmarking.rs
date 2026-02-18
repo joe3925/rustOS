@@ -9,14 +9,13 @@ use crate::memory::{
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
 use crate::scheduling::runtime::runtime::{
-    block_on, spawn, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
+    block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
-use crate::{cpu, print, println, vec};
+use crate::{cpu, println, vec};
 
-use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -79,18 +78,13 @@ enum BenchEventKind {
     Metrics,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 enum BenchEventData {
+    #[default]
     None,
     Sample(BenchSampleEvent),
     Span(BenchSpanEvent),
     Metrics(BenchMetricsEvent),
-}
-
-impl Default for BenchEventData {
-    fn default() -> Self {
-        BenchEventData::None
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -221,13 +215,13 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(|| used_memory()) as u64;
+    let heap_used = interrupts::without_interrupts(used_memory) as u64;
 
     let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
-    let total_bytes = total_usable_bytes() as u64;
+    let total_bytes = total_usable_bytes();
 
-    let heap_total_bytes = HEAP_SIZE as u64;
+    let heap_total_bytes = HEAP_SIZE;
 
     let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
@@ -311,13 +305,13 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
         return;
     }
 
-    let heap_used = interrupts::without_interrupts(|| used_memory()) as u64;
+    let heap_used = interrupts::without_interrupts(used_memory) as u64;
 
     let mut used_bytes = USED_MEMORY.load(Ordering::SeqCst) as u64;
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
-    let total_bytes = total_usable_bytes() as u64;
+    let total_bytes = total_usable_bytes();
 
-    let heap_total_bytes = HEAP_SIZE as u64;
+    let heap_total_bytes = HEAP_SIZE;
 
     let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
@@ -351,7 +345,7 @@ pub fn bench_submit_rip_sample_current_core(rip: u64, stack_ptr: *const u64, sta
     if !BENCH_ENABLED {
         return;
     }
-    return;
+    todo!();
     if !BENCH_READY.load(Ordering::Acquire) {
         return;
     }
@@ -362,7 +356,7 @@ pub fn bench_submit_rip_sample_current_core(rip: u64, stack_ptr: *const u64, sta
         unsafe { core::slice::from_raw_parts(stack_ptr, stack_len) }
     };
 
-    let core_id = interrupt_index::current_cpu_id() as usize;
+    let core_id = interrupt_index::current_cpu_id();
     let ts = bench_now_ns();
 
     let mut sample = BenchSampleEvent {
@@ -400,7 +394,7 @@ fn bench_log_span_begin(span_id: u32, tag: &'static str, object_id: u64) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id() as usize;
+    let core_id = interrupt_index::current_cpu_id();
     let ts = bench_now_ns();
 
     let event = BenchEvent {
@@ -424,7 +418,7 @@ pub fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
         return;
     }
 
-    let core_id = interrupt_index::current_cpu_id() as usize;
+    let core_id = interrupt_index::current_cpu_id();
     let ts = bench_now_ns();
 
     let event = BenchEvent {
@@ -607,10 +601,8 @@ async fn compute_next_window_suffix_async(windows_root_avg: &str, name: &str) ->
             has_base = true;
             continue;
         }
-        if e.starts_with(name) {
-            let rest = &e[name.len()..];
-            if rest.starts_with('-') {
-                let suffix = &rest[1..];
+        if let Some(rest) = e.strip_prefix(name) {
+            if let Some(suffix) = rest.strip_prefix('-') {
                 if let Ok(n) = suffix.parse::<u32>() {
                     if n > max_suffix {
                         max_suffix = n;
@@ -789,9 +781,9 @@ fn write_sample_row(
 }
 
 fn write_metrics_row(row: &mut String, run_id: u32, ts: u64, core_id: u16, m: &BenchMetricsEvent) {
-    let _ = core::write!(
+    let _ = writeln!(
         row,
-        "{},{},{},{},{},{},{},{},{}\n",
+        "{},{},{},{},{},{},{},{},{}",
         run_id,
         ts,
         core_id,
@@ -813,15 +805,10 @@ fn write_span_row(
     start_ts: u64,
     dur: u64,
 ) {
-    let _ = core::write!(
+    let _ = writeln!(
         row,
-        "{},{},0x{:016x},{},{},{}\n",
-        run_id,
-        tag,
-        object_id,
-        start_core,
-        start_ts,
-        dur
+        "{},{},0x{:016x},{},{},{}",
+        run_id, tag, object_id, start_core, start_ts, dur
     );
 }
 pub async fn build_exports_for_window(
@@ -879,7 +866,7 @@ pub async fn build_exports_for_window(
 
     let mut gather_joins = Vec::with_capacity(ncores);
     for core in 0..ncores {
-        let st = state.clone();
+        let st = state;
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
         gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
@@ -943,12 +930,8 @@ pub async fn build_exports_for_window(
 
     let desired_chunks = ncores.max(4);
     let min_chunk_size = 256usize;
-    let chunks = core::cmp::min(
-        desired_chunks,
-        (total_events + min_chunk_size - 1) / min_chunk_size,
-    )
-    .max(1);
-    let chunk_size = (total_events + chunks - 1) / chunks;
+    let chunks = core::cmp::min(desired_chunks, total_events.div_ceil(min_chunk_size)).max(1);
+    let chunk_size = total_events.div_ceil(chunks);
 
     let mut out = Vec::with_capacity(chunks);
     for _ in 0..chunks {
@@ -976,7 +959,7 @@ pub async fn build_exports_for_window(
         let scan_core = iter.core;
         let ev = iter.pop().unwrap();
 
-        if global_idx % shrink_interval == 0 {
+        if global_idx.is_multiple_of(shrink_interval) {
             iter.shrink_consumed();
         }
 
@@ -1427,13 +1410,11 @@ impl BenchWindow {
                                 return (false, target, header_written);
                             }
                             header_written = true;
-                        } else {
-                            if append_named_file(&path, &file_name, rows.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (false, target, header_written);
-                            }
+                        } else if append_named_file(&path, &file_name, rows.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return (false, target, header_written);
                         }
                     }
 
@@ -1476,13 +1457,11 @@ impl BenchWindow {
                                 return (false, target, header_written);
                             }
                             header_written = true;
-                        } else {
-                            if append_named_file(&path, &file_name, rows.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (false, target, header_written);
-                            }
+                        } else if append_named_file(&path, &file_name, rows.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return (false, target, header_written);
                         }
                     }
 
@@ -1525,13 +1504,11 @@ impl BenchWindow {
                                 return (false, target, header_written);
                             }
                             header_written = true;
-                        } else {
-                            if append_named_file(&path, &file_name, rows.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (false, target, header_written);
-                            }
+                        } else if append_named_file(&path, &file_name, rows.as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return (false, target, header_written);
                         }
                     }
 
@@ -1712,11 +1689,10 @@ async fn async_chain(mut x: u64) -> u64 {
 #[inline(never)]
 async fn blocking_chain(x: u64) -> u64 {
     spawn_blocking(move || {
-        let ret = sync_chain(x);
         // if ret % 10_000 == 0 {
         //     println!("blocking done num: {}", ret);
         // }
-        ret
+        sync_chain(x)
     })
     .await
 }
@@ -1727,11 +1703,10 @@ async fn blocking_queue_stress(seed: u64) -> u64 {
     for i in 0..BLOCK_TASKS {
         let x = seed.wrapping_add(i as u64);
         funcs.push(move || {
-            let ret = sync_chain(x);
             // if ret % 10_000 == 0 {
             //     println!("blocking done num: {}", ret);
             // }
-            ret
+            sync_chain(x)
         });
     }
 
@@ -2024,8 +1999,8 @@ fn should_keep_sample(sample_idx: usize, total_target: usize) -> bool {
     if total_target <= BENCH_MAX_LAT_SAMPLES {
         return true;
     }
-    let stride = (total_target + BENCH_MAX_LAT_SAMPLES - 1) / BENCH_MAX_LAT_SAMPLES;
-    sample_idx % stride == 0
+    let stride = total_target.div_ceil(BENCH_MAX_LAT_SAMPLES);
+    sample_idx.is_multiple_of(stride)
 }
 
 #[inline(always)]
@@ -2056,13 +2031,10 @@ async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
 }
 
 async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), FileStatus> {
-    match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
-        Ok(f) => {
-            if f.size != 0 {
-                return Ok(());
-            }
+    if let Ok(f) = File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
+        if f.size != 0 {
+            return Ok(());
         }
-        Err(_) => {}
     }
 
     let mut f = open_for_append(path).await?;
@@ -2357,7 +2329,7 @@ pub async fn bench_c_drive_io_async() {
         let seek_ops_sec = if seek_ns == 0 {
             0
         } else {
-            (seek_iters.saturating_mul(1_000_000_000) / seek_ns) as u64
+            (seek_iters.saturating_mul(1_000_000_000) / seek_ns)
         };
         let ops_1 = seek_ops_sec;
         let ops_5 = seek_ops_sec / 5;

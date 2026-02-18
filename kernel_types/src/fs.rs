@@ -361,19 +361,17 @@ impl Path {
                 };
             }
             if b.get(2) == Some(&b'\\') || b.get(2) == Some(&b'/') {
-                return Self::from_string(raw);
+                Self::from_string(raw)
+            } else if let Some(base) = base {
+                let mut out = base.clone();
+                out.symlink = Some(d);
+                out.join(&raw[2..])
             } else {
-                if let Some(base) = base {
-                    let mut out = base.clone();
-                    out.symlink = Some(d);
-                    out.join(&raw[2..])
-                } else {
-                    panic!("Relative path {} given with no base", raw);
-                }
+                panic!("Relative path {} given with no base", raw);
             }
         } else if b.first() == Some(&b'\\') || b.first() == Some(&b'/') {
             if let Some(base) = base {
-                let mut out = Self {
+                let out = Self {
                     symlink: base.symlink,
                     components: Vec::new(),
                 };
@@ -381,12 +379,10 @@ impl Path {
             } else {
                 panic!("Root-relative {} given with no base drive", raw);
             }
+        } else if let Some(base) = base {
+            base.clone().join(raw)
         } else {
-            if let Some(base) = base {
-                base.clone().join(raw)
-            } else {
-                panic!("Relative path {} given with no base", raw);
-            }
+            panic!("Relative path {} given with no base", raw);
         }
     }
 

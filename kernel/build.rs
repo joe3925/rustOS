@@ -9,7 +9,7 @@ fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(
     let contents = fs::read_to_string(exports_path)
         .map_err(|e| format!("Failed to read {}: {}", exports_path.display(), e))?;
 
-    let export_block = contents
+    let _export_block = contents
         .lines()
         .find(|line| line.trim_start().starts_with("export!"))
         .ok_or("export! macro not found")?;

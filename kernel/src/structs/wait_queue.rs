@@ -34,7 +34,7 @@ impl WaitQueue {
     }
 
     pub fn enqueue_current(&self) -> bool {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id();
         let current = match SCHEDULER.get_current_task(cpu_id) {
             Some(t) => t,
             None => return false,
@@ -90,7 +90,7 @@ impl WaitQueue {
     }
 
     pub fn is_current_enqueued(&self) -> bool {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id();
         let current = match SCHEDULER.get_current_task(cpu_id) {
             Some(t) => t,
             None => return false,
@@ -99,7 +99,7 @@ impl WaitQueue {
     }
 
     pub fn clear_current_if_queued(&self) -> bool {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id();
         let current = match SCHEDULER.get_current_task(cpu_id) {
             Some(t) => t,
             None => return false,

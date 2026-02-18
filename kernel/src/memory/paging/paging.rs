@@ -98,38 +98,36 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     // Constants
-    const GiB: u64 = 1 << 30;
-    const MiB2: u64 = 2 * 1024 * 1024;
-    const KiB4: u64 = 4 * 1024;
+    const GI_B: u64 = 1 << 30;
+    const MI_B2: u64 = 2 * 1024 * 1024;
+    const KI_B4: u64 = 4 * 1024;
 
     let mut cur = virtual_addr;
     let mut remaining = align_up_4k(size);
 
     while remaining > 0 {
         // Try 1 GiB page
-        if remaining >= GiB && (cur.as_u64() & (GiB - 1)) == 0 {
-            if unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur) {
-                cur += GiB;
-                remaining -= GiB;
+        if remaining >= GI_B && (cur.as_u64() & (GI_B - 1)) == 0
+            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur) {
+                cur += GI_B;
+                remaining -= GI_B;
                 continue;
             }
-        }
 
         // Try 2 MiB page
-        if remaining >= MiB2 && (cur.as_u64() & (MiB2 - 1)) == 0 {
-            if unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur) {
-                cur += MiB2;
-                remaining -= MiB2;
+        if remaining >= MI_B2 && (cur.as_u64() & (MI_B2 - 1)) == 0
+            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur) {
+                cur += MI_B2;
+                remaining -= MI_B2;
                 continue;
             }
-        }
 
         // Fall back to 4 KiB page
         if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {
             // nothing else to do
         }
-        cur += KiB4;
-        remaining -= KiB4;
+        cur += KI_B4;
+        remaining -= KI_B4;
     }
 }
 

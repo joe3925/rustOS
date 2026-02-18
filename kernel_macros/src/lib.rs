@@ -225,11 +225,10 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
 
     let original_stmts = &body.stmts;
 
-    let new_body = quote_spanned! {body.brace_token.span.join() =>
+    let new_body = quote! {
         {
             ::kernel_api::async_ffi::FutureExt::into_ffi(
                 async move {
-                    //#[cfg(debug_assertions)]
                     let _bench_span = {
                         let __obj: u64 = #obj_expr;
                         ::kernel_api::benchmark::span(

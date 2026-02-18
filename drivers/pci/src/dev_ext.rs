@@ -1,14 +1,13 @@
 // dev_ext.rs
 #![allow(dead_code)]
 
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
-use kernel_api::memory::{map_mmio_region, unmap_mmio_region, unmap_range};
+use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
 use kernel_api::request::{Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
@@ -183,16 +182,16 @@ unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
 }
 
 #[inline]
-unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 {
+unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 { unsafe {
     let p = (base.as_u64() + off as u64) as *const u32;
     core::ptr::read_volatile(p)
-}
+}}
 
 #[inline]
-unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
+unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) { unsafe {
     let p = (base.as_u64() + off as u64) as *mut u32;
     core::ptr::write_volatile(p, v);
-}
+}}
 
 #[inline]
 pub fn map_cfg_page(
@@ -594,7 +593,7 @@ pub fn parse_ecam_segments_from_blob(blob: &[u8]) -> Vec<McfgSegment> {
                     break;
                 }
                 let base = u64::from_le_bytes([
-                    blob[off + 0],
+                    blob[off],
                     blob[off + 1],
                     blob[off + 2],
                     blob[off + 3],
@@ -683,21 +682,21 @@ fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
         | ((bus as u32) << 16)
         | ((dev as u32) << 11)
         | ((func as u32) << 8)
-        | (((offset as u32) & !3) as u32)
+        | ((offset as u32) & !3)
 }
 
 #[inline]
-unsafe fn outl(port: u16, val: u32) {
+unsafe fn outl(port: u16, val: u32) { unsafe {
     asm!(
         "out dx, eax",
         in("dx") port,
         in("eax") val,
         options(nostack, preserves_flags)
     );
-}
+}}
 
 #[inline]
-unsafe fn inl(port: u16) -> u32 {
+unsafe fn inl(port: u16) -> u32 { unsafe {
     let v: u32;
     asm!(
         "in eax, dx",
@@ -706,19 +705,19 @@ unsafe fn inl(port: u16) -> u32 {
         options(nostack, preserves_flags)
     );
     v
-}
+}}
 
 #[inline]
-unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 { unsafe {
     outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
     inl(PCI_CFG1_DATA)
-}
+}}
 
 #[inline]
-unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
+unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) { unsafe {
     outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
     outl(PCI_CFG1_DATA, val);
-}
+}}
 
 #[inline]
 fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
@@ -735,7 +734,7 @@ fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> u32 {
     }
 }
 
-unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> {
+unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> { unsafe {
     let status = (cfg1_read32_unlocked(bus, dev, func, 0x04) >> 16) as u16;
     if (status & (1 << 4)) == 0 {
         return None;
@@ -772,7 +771,7 @@ unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<Msi
         cap_ptr = next_ptr;
     }
     None
-}
+}}
 
 pub fn header_type_legacy(bus: u8, dev: u8) -> Option<u8> {
     let vid = cfg1_read32(bus, dev, 0, 0x00) & 0xFFFF;

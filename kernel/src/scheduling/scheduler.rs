@@ -3,13 +3,12 @@ use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
 use crate::drivers::timer_driver::{
-    PER_CORE_SWITCHES, TIMER, IDLE_TRACKING_ENABLED, IDLE_TIME_CYCLES, IDLE_SCHED_IN_CYCLES,
+    TIMER, IDLE_TRACKING_ENABLED, IDLE_TIME_CYCLES, IDLE_SCHED_IN_CYCLES,
 };
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
-use crate::scheduling::runtime::runtime::{yield_now, RUNTIME_POOL};
-use crate::scheduling::scheduler;
+use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 use crate::util::KERNEL_INITIALIZED;
@@ -28,7 +27,7 @@ use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
 use x86_64::instructions::interrupts::without_interrupts;
-use x86_64::instructions::{hlt, interrupts};
+use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
 
 const BALANCE_INTERVAL_TICKS: usize = 150;
@@ -244,7 +243,7 @@ impl Scheduler {
         let Some(core) = self.core(cpu) else {
             panic!("enqueue_to_core_ipi: cpu {} not initialized", cpu);
         };
-        if let Some(_) = core.ipi_queue.push(task).err() {
+        if core.ipi_queue.push(task).err().is_some() {
             panic!("ipi queue overflow on cpu {cpu}");
         }
         core.load.fetch_add(1, Ordering::Release);
@@ -257,7 +256,7 @@ impl Scheduler {
         load: &AtomicUsize,
         task: TaskHandle,
     ) {
-        if let Some(_) = queue.push(task).err() {
+        if queue.push(task).err().is_some() {
             panic!("run queue overflow on cpu {cpu}");
         }
         load.fetch_add(1, Ordering::Release);
@@ -274,7 +273,7 @@ impl Scheduler {
                 continue;
             };
 
-            if best_load.map_or(true, |b| load < b) {
+            if best_load.is_none_or(|b| load < b) {
                 best_load = Some(load);
                 best = i;
                 if load == 0 {
@@ -288,10 +287,7 @@ impl Scheduler {
 
     fn core_load_unlocked(&self, i: usize) -> Option<usize> {
         let core = self.core(i)?;
-        let guard = match core.sched_lock.try_read() {
-            Some(g) => g,
-            None => return None,
-        };
+        let guard = core.sched_lock.try_read()?;
 
         let rq_len = core.run_queue.len();
         let ipi_len = core.ipi_queue.len();
@@ -377,14 +373,12 @@ impl Scheduler {
 
                             if let Some(best_core) = self.core(best_cpu) {
                                 unsafe {
-                                    APIC.lock().as_ref().map(|a| {
-                                        a.lapic.send_ipi(
+                                    if let Some(a) = APIC.lock().as_ref() { a.lapic.send_ipi(
                                             IpiDest::ApicId(best_core.lapic_id),
                                             IpiKind::Fixed {
                                                 vector: SCHED_IPI_VECTOR,
                                             },
-                                        )
-                                    });
+                                        ) }
                                 }
                             }
                         } else {
@@ -448,7 +442,7 @@ impl Scheduler {
     }
 
     pub fn park_current(&self, reason: BlockReason) {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;
         };
@@ -484,7 +478,7 @@ impl Scheduler {
     }
 
     pub fn park_current_if(&self, reason: BlockReason, should_park: bool) {
-        let cpu_id = current_cpu_id() as usize;
+        let cpu_id = current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;
         };
@@ -618,9 +612,8 @@ impl Scheduler {
                         } else if prev
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
                             .is_ok()
-                        {
-                            if prev.consume_permit() {
-                                if prev
+                            && prev.consume_permit()
+                                && prev
                                     .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
                                     .is_ok()
                                 {
@@ -632,8 +625,6 @@ impl Scheduler {
                                         prev.clone(),
                                     );
                                 }
-                            }
-                        }
                     }
                     SchedState::Blocked => {}
                     SchedState::Terminated => {}
@@ -886,7 +877,7 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let cpu_id = current_cpu_id() as usize;
+    let cpu_id = current_cpu_id();
     SCHEDULER.on_ipi(state, cpu_id);
 }
 
@@ -895,7 +886,7 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let cpu_id = current_cpu_id() as usize;
+    let cpu_id = current_cpu_id();
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
 
@@ -985,7 +976,7 @@ pub extern "win64" fn yield_interrupt_entry() {
 pub fn kernel_task_end() -> ! {
     interrupts::without_interrupts(|| {
         let task = SCHEDULER
-            .get_current_task(current_cpu_id() as usize)
+            .get_current_task(current_cpu_id())
             .unwrap();
         task.terminate();
     });

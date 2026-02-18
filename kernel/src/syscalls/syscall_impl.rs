@@ -5,7 +5,6 @@ use crate::executable::program::{
 use crate::file_system::file::File;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
-use crate::println;
 use crate::scheduling::runtime::runtime::block_on;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
@@ -15,7 +14,7 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
-use x86_64::instructions::{hlt, interrupts};
+use x86_64::instructions::hlt;
 
 use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};
 
@@ -24,7 +23,7 @@ fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Obj
     if let Ok(o) = OBJECT_MANAGER.open(path.clone()) {
         return o.clone();
     }
-    let _ = OBJECT_MANAGER.mkdir_p("\\Process".to_string());
+    let _ = OBJECT_MANAGER.mkdir_p("\\Process");
     let obj = Object::with_name(
         ObjectTag::Program,
         pid.to_string(),
@@ -118,14 +117,14 @@ fn resolve_with_working_dir(caller: &ProgramHandle, raw: &str) -> Path {
 }
 #[inline(always)]
 fn is_user_addr(addr: u64) -> bool {
-    addr < KERNEL_SPACE_BASE && addr >= 0x1000
+    (0x1000..KERNEL_SPACE_BASE).contains(&addr)
 }
 #[inline(always)]
 pub fn user_ptr_ok<T>(ptr: *const T, bytes: usize) -> bool {
     let a = ptr as u64;
     is_user_addr(a)
         && a.checked_add(bytes as u64)
-            .map_or(false, |end| is_user_addr(end - 1))
+            .is_some_and(|end| is_user_addr(end - 1))
 }
 #[inline(always)]
 fn user_ptr<T>(ptr: *const T) -> bool {
@@ -265,7 +264,7 @@ pub(crate) fn sys_destroy_task(task_handle: UserHandle) -> u64 {
             )
         }
     };
-    if th.inner.read().parent_pid != caller_pid {}
+    th.inner.read().parent_pid != caller_pid;
     let tid = th.task_id();
     match SCHEDULER.delete_task(tid) {
         Ok(_) => 0,
@@ -343,7 +342,7 @@ pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
     };
 
     {
-        let mut prog = handle.write();
+        let prog = handle.write();
         let va = match prog.tracker.alloc_auto(len as u64) {
             Some(v) => v,
             None => return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, len as u32),
@@ -414,7 +413,7 @@ pub(crate) fn list_dir(path: *const u8) -> u64 {
     let total = bytes.len() + 1;
 
     let va = {
-        let mut prog = caller.write();
+        let prog = caller.write();
         let Some(dst) = prog.tracker.alloc_auto(total as u64) else {
             return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
         };
@@ -897,7 +896,7 @@ pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {
     let total = bytes.len() + 1;
 
     let va = {
-        let mut pg = caller.write();
+        let pg = caller.write();
         let Some(dst) = pg.tracker.alloc_auto(total as u64) else {
             return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
         };

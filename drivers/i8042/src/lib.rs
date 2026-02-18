@@ -4,7 +4,7 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, Ordering},
@@ -68,7 +68,7 @@ pub async fn ps2_start<'a, 'b>(
     dev: Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    if let Ok(mut ext) = dev.try_devext::<DevExt>() {
+    if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
             ext.have_kbd.store(have_kbd, Ordering::Release);
@@ -244,7 +244,7 @@ const I8042_CMD: u16 = 0x64;
 const STS_OBF: u8 = 1 << 0;
 const STS_IBF: u8 = 1 << 1;
 
-unsafe fn inb(p: u16) -> u8 {
+unsafe fn inb(p: u16) -> u8 { unsafe {
     let v: u8;
     #[cfg(target_arch = "x86_64")]
     core::arch::asm!("in al, dx", in("dx") p, out("al") v, options(nomem, nostack, preserves_flags));
@@ -254,17 +254,17 @@ unsafe fn inb(p: u16) -> u8 {
         v = 0;
     }
     v
-}
-unsafe fn outb(p: u16, v: u8) {
+}}
+unsafe fn outb(p: u16, v: u8) { unsafe {
     #[cfg(target_arch = "x86_64")]
     core::arch::asm!("out dx, al", in("dx") p, in("al") v, options(nomem, nostack, preserves_flags));
     #[cfg(not(target_arch = "x86_64"))]
     {
         let _ = (p, v);
     }
-}
+}}
 
-unsafe fn wait_ibf_clear(timeout_iters: u32) -> bool {
+unsafe fn wait_ibf_clear(timeout_iters: u32) -> bool { unsafe {
     let mut i = 0;
     while i < timeout_iters {
         if (inb(I8042_STS) & STS_IBF) == 0 {
@@ -273,8 +273,8 @@ unsafe fn wait_ibf_clear(timeout_iters: u32) -> bool {
         i += 1;
     }
     false
-}
-unsafe fn wait_obf_set(timeout_iters: u32) -> Option<u8> {
+}}
+unsafe fn wait_obf_set(timeout_iters: u32) -> Option<u8> { unsafe {
     let mut i = 0;
     while i < timeout_iters {
         if (inb(I8042_STS) & STS_OBF) != 0 {
@@ -283,8 +283,8 @@ unsafe fn wait_obf_set(timeout_iters: u32) -> Option<u8> {
         i += 1;
     }
     None
-}
-unsafe fn flush_ob(timeout_iters: u32) {
+}}
+unsafe fn flush_ob(timeout_iters: u32) { unsafe {
     let mut i = 0;
     while i < timeout_iters {
         if (inb(I8042_STS) & STS_OBF) == 0 {
@@ -293,27 +293,27 @@ unsafe fn flush_ob(timeout_iters: u32) {
         let _ = inb(I8042_DATA);
         i += 1;
     }
-}
+}}
 
-unsafe fn cmd(c: u8) -> bool {
+unsafe fn cmd(c: u8) -> bool { unsafe {
     if !wait_ibf_clear(100000) {
         return false;
     }
     outb(I8042_CMD, c);
     true
-}
-unsafe fn write_data(v: u8) -> bool {
+}}
+unsafe fn write_data(v: u8) -> bool { unsafe {
     if !wait_ibf_clear(100000) {
         return false;
     }
     outb(I8042_DATA, v);
     true
-}
-unsafe fn read_data() -> Option<u8> {
+}}
+unsafe fn read_data() -> Option<u8> { unsafe {
     wait_obf_set(100000)
-}
+}}
 
-unsafe fn probe_i8042() -> (bool, bool) {
+unsafe fn probe_i8042() -> (bool, bool) { unsafe {
     let _ = cmd(0xAD);
     let _ = cmd(0xA7);
     flush_ob(10000);
@@ -365,4 +365,4 @@ unsafe fn probe_i8042() -> (bool, bool) {
     }
 
     (have_kbd, have_mouse)
-}
+}}

@@ -1,8 +1,3 @@
-//! Request routing logic - compiled per-driver to eliminate one FFI future boundary.
-//!
-//! When compiled with the `kernel_link` feature (for use in the kernel itself),
-//! this module uses direct linker seams instead of FFI calls.
-
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::Ordering;
@@ -90,7 +85,6 @@ pub async fn send_request_to_next_lower(
     from: Arc<DeviceObject>,
     handle: &mut RequestHandle<'_>,
 ) -> DriverStatus {
-    // Direct field access - no FFI overhead
     let Some(target_dev) = from.lower_device.get() else {
         return DriverStatus::NoSuchDevice;
     };
@@ -103,7 +97,6 @@ pub async fn send_request_to_next_upper(
     from: Arc<DeviceObject>,
     handle: &mut RequestHandle<'_>,
 ) -> DriverStatus {
-    // Direct field access - no FFI overhead
     let Some(target_dev_weak) = from.upper_device.get() else {
         return DriverStatus::NoSuchDevice;
     };
@@ -159,7 +152,7 @@ pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
         if let Some(fp) = guard.completion_routine.take() {
             let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
             let context = guard.completion_context;
-            guard.status = f(&mut *guard, context);
+            guard.status = f(&mut guard, context);
         }
 
         if guard.status == DriverStatus::ContinueStep {
@@ -177,10 +170,6 @@ pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
 
     status
 }
-
-// =============================================================================
-// Internal implementation
-// =============================================================================
 
 async fn call_device_handler(
     mut dev: Arc<DeviceObject>,
@@ -213,7 +202,6 @@ async fn call_device_handler(
                         return DriverStep::complete(complete_request(handle));
                     }
 
-                    // Direct field access - no FFI overhead
                     match dev.lower_device.get() {
                         Some(n) => {
                             dev = n.clone();
@@ -228,15 +216,7 @@ async fn call_device_handler(
             }
         }
 
-        let step = match {
-            let h: &mut RequestHandle<'_> = handle;
-            invoke_io_handler(&dev, h, &kind).await
-        } {
-            Some(step) => step,
-            None => DriverStep::Continue,
-        };
-
-        match step {
+        match invoke_io_handler(&dev, handle, &kind).await {
             DriverStep::Pending => {
                 handle.write().status = DriverStatus::PendingStep;
                 return DriverStep::Pending;
@@ -246,7 +226,6 @@ async fn call_device_handler(
                 return DriverStep::complete(complete_request(handle));
             }
             DriverStep::Continue => {
-                // Direct field access - no FFI overhead
                 let next = match policy {
                     TraversalPolicy::ForwardLower => dev
                         .lower_device
@@ -280,9 +259,11 @@ async fn invoke_io_handler(
     dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_>,
     kind: &RequestType,
-) -> Option<DriverStep> {
+) -> DriverStep {
     let Some(h) = dev.dev_init.io_vtable.get_for(kind) else {
-        return None;
+        return DriverStep::Complete {
+            status: DriverStatus::NotImplemented,
+        };
     };
 
     let result = h.handler.invoke(dev.clone(), handle).await;
@@ -294,7 +275,7 @@ async fn invoke_io_handler(
         _ => {}
     }
 
-    Some(result)
+    result
 }
 
 async fn pnp_minor_dispatch(

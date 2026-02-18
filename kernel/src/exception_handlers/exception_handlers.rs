@@ -1,7 +1,5 @@
 use crate::memory::paging::{stack::KERNEL_STACK_MAX_BYTES, tables::kernel_cr3};
-use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::task::Task;
 use crate::static_handlers::get_current_cpu_id;
 use crate::util::PANIC_ACTIVE;
 use alloc::fmt;

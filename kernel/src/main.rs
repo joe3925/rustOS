@@ -40,19 +40,14 @@ mod static_handlers;
 mod structs;
 mod syscalls;
 mod util;
-use crate::memory::paging::tables::kernel_cr3;
 use crate::util::{panic_common, KERNEL_INITIALIZED};
 
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use alloc::{format, vec};
 use bootloader_api::config::Mapping;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
 use core::panic::PanicInfo;
-use core::sync::atomic::Ordering;
 use lazy_static::lazy_static;
-use x86_64::registers::control::Cr3;
 
 static mut BOOT_INFO: Option<&'static mut BootInfo> = None;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -64,7 +59,7 @@ fn panic(info: &PanicInfo) -> ! {
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::FixedAddress(0xFFFF_8000_0000_0000));
-    config.kernel_stack_size = 1 * 1024 * 1024;
+    config.kernel_stack_size = 1024 * 1024;
     config.mappings.kernel_stack = Mapping::Dynamic;
     config.mappings.framebuffer = Mapping::Dynamic;
     config.mappings.dynamic_range_start = Some(0xFFFF_8100_0000_0000);
@@ -77,7 +72,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(_start, config = &BOOTLOADER_CONFIG);
 
 fn _start(boot_info_local: &'static mut BootInfo) -> ! {
-    reserve_low_2mib(&mut *boot_info_local.memory_regions);
+    reserve_low_2mib(&mut boot_info_local.memory_regions);
     unsafe {
         BOOT_INFO = Some(boot_info_local);
     }
@@ -139,8 +134,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     if let Some(low_part) = need_insert {
         if let Some(idx) = free_idx {
             regions[idx] = low_part;
-        } else {
-        }
+        } 
     }
 
     if !tagged_any {
@@ -155,7 +149,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
 }
 
 pub extern "win64" fn function(x: i64) -> i64 {
-    return (x - 10) / 10;
+    (x - 10) / 10
 }
 #[cfg(test)]
 pub fn test_runner(tests: &[&dyn Fn()]) {
@@ -174,7 +168,7 @@ macro_rules! export {
         lazy_static::lazy_static! {
             pub static ref EXPORTS: Vec<(String, usize)> = vec![
                 $(
-                    (stringify!($name).to_string(), get_rva($name as usize)),
+                    (stringify!($name).to_string(), get_rva($name as *const () as usize)),
                 )*
             ];
         }

@@ -25,13 +25,12 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{Request, RequestHandle, RequestType};
+use kernel_api::request::{RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
 use spin::Mutex;
-use spin::rwlock::RwLock;
 
 use dev_ext::{DevExt, Ports};
 
@@ -646,7 +645,7 @@ fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [
     let mut off = 0usize;
 
     let total_sectors = sectors;
-    let bps = if total_sectors != 0 {
+    let _bps = if total_sectors != 0 {
         out.len() / total_sectors as usize
     } else {
         512
@@ -715,7 +714,7 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
     let mut off = 0usize;
 
     let total_sectors = sectors;
-    let bps = if total_sectors != 0 {
+    let _bps = if total_sectors != 0 {
         data.len() / total_sectors as usize
     } else {
         512

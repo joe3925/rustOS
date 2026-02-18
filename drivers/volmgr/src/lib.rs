@@ -5,18 +5,11 @@
 extern crate alloc;
 
 use crate::alloc::vec;
-use crate::cache::VolumeCache;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
-use core::mem;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::Ordering::Acquire;
-use core::sync::atomic::Ordering::Relaxed;
-use core::sync::atomic::Ordering::Release;
 use core::sync::atomic::{AtomicBool, Ordering};
-use core::{mem::size_of, panic::PanicInfo};
+use core::panic::PanicInfo;
 use kernel_api::runtime::spawn;
 
-use kernel_api::acpi::handler;
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
@@ -39,7 +32,7 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::request::{Request, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{Request, RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -286,7 +279,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let mut dx = ext::<VolExt>(&dev);
+    let dx = ext::<VolExt>(&dev);
     let status = query_req.read().status;
     if status != DriverStatus::Success {
         return DriverStep::complete(status);
@@ -440,8 +433,8 @@ pub async fn vol_pdo_read<'a, 'b>(
         .caching_enabled
         .load(Ordering::Acquire);
 
-    if cache_enabled {
-        if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
+    if cache_enabled
+        && let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
             {
                 let cache = cache_lock.read();
                 let mut w = req.write();
@@ -468,7 +461,6 @@ pub async fn vol_pdo_read<'a, 'b>(
                 w.add_completion(vol_cache_read_completion, ctx_ptr);
             }
         }
-    }
 
     let status = pnp_send_request(tgt, req).await;
     DriverStep::complete(status)
@@ -509,8 +501,8 @@ pub async fn vol_pdo_write<'a, 'b>(
         .caching_enabled
         .load(Ordering::Acquire);
 
-    if cache_enabled {
-        if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
+    if cache_enabled
+        && let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
             if !flush_write_through {
                 let res = {
                     let mut cache = cache_lock.write();
@@ -590,7 +582,6 @@ pub async fn vol_pdo_write<'a, 'b>(
                 w.add_completion(vol_cache_write_through_completion, ctx_ptr);
             }
         }
-    }
 
     let status = pnp_send_request(tgt, req).await;
     DriverStep::complete(status)

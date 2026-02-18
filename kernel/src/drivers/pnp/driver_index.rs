@@ -1,9 +1,7 @@
-use crate::drivers::driver_install::{self, DriverError};
+use crate::drivers::driver_install::{self};
 use crate::registry::reg::{get_value, list_keys};
-use crate::registry::{self as reg};
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
-use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use kernel_types::device::DriverPackage;
 use kernel_types::fs::Path;
 use kernel_types::pnp::BootType;
@@ -145,7 +143,7 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
             let sc = rank(kind, pkg.start);
             idx.by_id
                 .entry(id)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(DriverBinding {
                     pkg: pkg.clone(),
                     kind,

@@ -111,7 +111,7 @@ impl<T> AsyncMutex<T> {
     pub fn unlock_and_wake_one(&self) {
         self.locked.store(false, Ordering::Release);
         let mut w = self.waiters.lock();
-        wake_one(&mut *w);
+        wake_one(&mut w);
     }
 
     pub async fn lock_owned(self: Arc<Self>) -> AsyncMutexOwnedGuard<T> {
@@ -150,12 +150,12 @@ impl<'a, T> Future for AsyncMutexLockFuture<'a, T> {
 
         {
             let mut w = self.m.waiters.lock();
-            push_waker(&mut *w, cx.waker());
+            push_waker(&mut w, cx.waker());
         }
 
         if let Some(g) = self.m.try_lock() {
             let mut w = self.m.waiters.lock();
-            remove_waker(&mut *w, cx.waker());
+            remove_waker(&mut w, cx.waker());
             return Poll::Ready(g);
         }
 
@@ -291,7 +291,7 @@ impl<T> AsyncRwLock<T> {
         if now == 0 {
             let mut ww = self.w_waiters.lock();
             if !ww.is_empty() {
-                wake_one(&mut *ww);
+                wake_one(&mut ww);
             }
         }
     }
@@ -302,13 +302,13 @@ impl<T> AsyncRwLock<T> {
         {
             let mut ww = self.w_waiters.lock();
             if !ww.is_empty() {
-                wake_one(&mut *ww);
+                wake_one(&mut ww);
                 return;
             }
         }
 
         let mut rw = self.r_waiters.lock();
-        wake_all(&mut *rw);
+        wake_all(&mut rw);
     }
 
     pub async fn read_owned(self: Arc<Self>) -> AsyncRwLockOwnedReadGuard<T> {
@@ -366,12 +366,12 @@ impl<'a, T> Future for AsyncRwLockReadFuture<'a, T> {
 
         {
             let mut rw = self.l.r_waiters.lock();
-            push_waker(&mut *rw, cx.waker());
+            push_waker(&mut rw, cx.waker());
         }
 
         if let Some(g) = self.l.try_read() {
             let mut rw = self.l.r_waiters.lock();
-            remove_waker(&mut *rw, cx.waker());
+            remove_waker(&mut rw, cx.waker());
             return Poll::Ready(g);
         }
 
@@ -389,12 +389,12 @@ impl<'a, T> Future for AsyncRwLockWriteFuture<'a, T> {
 
         {
             let mut ww = self.l.w_waiters.lock();
-            push_waker(&mut *ww, cx.waker());
+            push_waker(&mut ww, cx.waker());
         }
 
         if let Some(g) = self.l.try_write() {
             let mut ww = self.l.w_waiters.lock();
-            remove_waker(&mut *ww, cx.waker());
+            remove_waker(&mut ww, cx.waker());
             return Poll::Ready(g);
         }
 

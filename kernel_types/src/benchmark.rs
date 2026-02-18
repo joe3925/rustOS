@@ -95,7 +95,7 @@ impl Default for BenchSweepParams {
         Self {
             version: BENCH_PARAMS_VERSION_1,
             flags: BENCH_FLAG_IRQ | BENCH_FLAG_POLL,
-            total_bytes: 1 * 1024 * 1024 * 1024,
+            total_bytes: 1024 * 1024 * 1024,
             request_size: 64 * 1024,
             start_sector: 0,
             max_inflight: 0,

@@ -5,12 +5,11 @@ use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
-use crate::scheduling::runtime::runtime::{spawn, spawn_detached};
+use crate::scheduling::runtime::runtime::spawn_detached;
 use alloc::string::ToString;
 use alloc::vec;
-use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
-use kernel_executor::runtime::runtime::block_on;
 use kernel_types::device::{
     DevNode, DevNodeState, DeviceInit, DeviceObject, DeviceStack, DriverObject, DriverPackage,
     DriverRuntime, DriverState, StackLayer,
@@ -20,7 +19,7 @@ use kernel_types::io::{IoTarget, IoVtable};
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
-use kernel_types::request::{Request, RequestData, RequestHandle, SharedRequest};
+use kernel_types::request::{Request, RequestData, RequestHandle};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -184,7 +183,7 @@ impl PnpManager {
         dev_node.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Device");
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
         let pdo_obj = Object::with_name(
             ObjectTag::Device,
@@ -212,7 +211,7 @@ impl PnpManager {
         dev_node.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dev_node.instance_path);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Device");
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
         let pdo_obj = Object::with_name(
             ObjectTag::Device,
@@ -233,7 +232,7 @@ impl PnpManager {
     async fn bind_device(&self, dn: &Arc<DevNode>) -> Result<(), DriverError> {
         let mut func_pkg: Option<Arc<DriverPackage>> = None;
 
-        if let Some(hwid) = dn.ids.hardware.get(0) {
+        if let Some(hwid) = dn.ids.hardware.first() {
             if hwid.starts_with("ROOT\\") {
                 if let Some(driver_name) = hwid.split('\\').nth(1) {
                     if let Some(pkg) = self.hw.read().by_driver.get(driver_name) {
@@ -373,7 +372,7 @@ impl PnpManager {
             let key = idx::escape_key(id);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/hwid/{key}/{pos}");
-                if let Some(children) = list_keys(&base).await.ok() {
+                if let Ok(children) = list_keys(&base).await {
                     for svc_path in children {
                         let order = match get_value(&svc_path, "Order").await {
                             Some(Data::U32(v)) => v,
@@ -400,7 +399,7 @@ impl PnpManager {
             let key = idx::escape_key(class);
             for pos in ["lower", "upper"] {
                 let base = alloc::format!("SYSTEM/CurrentControlSet/Filters/class/{key}/{pos}");
-                if let Some(children) = list_keys(&base).await.ok() {
+                if let Ok(children) = list_keys(&base).await {
                     for svc_path in children {
                         let order = match get_value(&svc_path, "Order").await {
                             Some(Data::U32(v)) => v,
@@ -452,7 +451,7 @@ impl PnpManager {
                 idx::escape_key(function_service),
                 pos
             );
-            if let Some(children) = list_keys(&base).await.ok() {
+            if let Ok(children) = list_keys(&base).await {
                 for svc_path in children {
                     let order = match get_value(&svc_path, "Order").await {
                         Some(Data::U32(v)) => v,
@@ -611,7 +610,7 @@ impl PnpManager {
         }
 
         let devobj = DeviceObject::new(dev_init);
-        devobj.attach_devnode(&dn);
+        devobj.attach_devnode(dn);
 
         if let Some(lower) = below {
             DeviceObject::set_lower_upper(&devobj, lower);
@@ -786,7 +785,7 @@ impl PnpManager {
 
                 spawn_detached(async move {
                     let mut handle = RequestHandle::Shared(shared);
-                    let _ = (&*PNP_MANAGER)
+                    let _ = &PNP_MANAGER
                         .send_request(top_device, &mut handle)
                         .await;
                 });
@@ -852,7 +851,7 @@ impl PnpManager {
             prog.load_module(pkg.image_path.clone()).await?
         };
 
-        let _ = OBJECT_MANAGER.mkdir_p("\\Modules".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Modules");
         let mod_obj = Object::with_name(
             ObjectTag::Module,
             pkg.name.clone(),
@@ -868,7 +867,7 @@ impl PnpManager {
         });
         let drv_obj = DriverObject::allocate(rt, pkg.name.clone());
 
-        let _ = OBJECT_MANAGER.mkdir_p("\\Drivers".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Drivers");
         let any: ObjRef = drv_obj.clone();
         let drv_om = Object::with_name(
             ObjectTag::Generic,
@@ -914,14 +913,14 @@ impl PnpManager {
 
     pub fn create_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
         OBJECT_MANAGER
-            .symlink(link_path.to_string(), target_path.to_string(), true)
+            .symlink(&link_path, target_path.to_string(), true)
             .map(|_| ())
     }
 
     pub fn replace_symlink(&self, link_path: String, target_path: String) -> Result<(), OmError> {
-        let _ = OBJECT_MANAGER.unlink(link_path.to_string());
+        let _ = OBJECT_MANAGER.unlink(&link_path);
         OBJECT_MANAGER
-            .symlink(link_path.to_string(), target_path.to_string(), true)
+            .symlink(&link_path, target_path.to_string(), true)
             .map(|_| ())
     }
 
@@ -932,12 +931,12 @@ impl PnpManager {
     ) -> Result<(), OmError> {
         let target = alloc::format!("\\Device\\{}\\Top", instance_path);
         OBJECT_MANAGER
-            .symlink(link_path.to_string(), target, true)
+            .symlink(&link_path, target, true)
             .map(|_| ())
     }
 
     pub fn remove_symlink(&self, link_path: String) -> Result<(), OmError> {
-        OBJECT_MANAGER.unlink(link_path.to_string())
+        OBJECT_MANAGER.unlink(&link_path)
     }
 
     pub fn resolve_targetio_from_symlink(&self, mut p: String) -> Option<IoTarget> {
@@ -1071,7 +1070,7 @@ impl PnpManager {
             let indent = make_indent(depth);
             let state = dn.get_state();
             let class = dn.class.as_deref().unwrap_or("-");
-            let hwid = dn.ids.hardware.get(0).map(|s| s.as_str()).unwrap_or("-");
+            let hwid = dn.ids.hardware.first().map(|s| s.as_str()).unwrap_or("-");
             crate::println!(
                 "{}{}  [{}]  class={}  inst={}  hwid={}",
                 indent,
@@ -1141,7 +1140,6 @@ impl PnpManager {
                     .as_ref()
                     .and_then(|s| s.get_top_device_object())
             })
-            .map(|dev_obj| dev_obj)
     }
 
     pub async fn create_devnode_over_pdo_with_function(
@@ -1173,7 +1171,7 @@ impl PnpManager {
         dn.set_pdo(pdo.clone());
 
         let base = alloc::format!("\\Device\\{}", dn.instance_path);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Device".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Device");
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
         let pdo_obj = Object::with_name(
             ObjectTag::Device,
@@ -1304,7 +1302,7 @@ impl PnpManager {
         let dev = DeviceObject::new(init);
 
         let base = alloc::format!("\\Device\\Control\\{}", name);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Device\\Control".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Device\\Control");
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
 
         let obj = Object::with_name(

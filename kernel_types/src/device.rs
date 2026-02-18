@@ -125,6 +125,12 @@ pub struct DeviceStack {
     pub upper: Vec<StackLayer>,
 }
 
+impl Default for DeviceStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceStack {
     pub fn new() -> Self {
         Self {

@@ -1,5 +1,4 @@
 use crate::memory::paging::mmio::{map_mmio_region, unmap_mmio_region};
-use crate::memory::paging::virt_tracker::unmap_range;
 use crate::util::boot_info;
 use acpi;
 use acpi::platform::interrupt::Apic;
@@ -48,14 +47,14 @@ impl ACPI {
         let arc_tab = Arc::new(tables);
         ACPI { tables: arc_tab }
     }
-    pub fn get_interrupt_model(&self) -> Option<Apic<Global>> {
+    pub fn get_interrupt_model(&self) -> Option<Apic<'_, Global>> {
         let platform_info = self.tables.platform_info().ok()?;
         match &platform_info.interrupt_model {
             InterruptModel::Apic(apic) => Some(apic.clone()),
             _ => None,
         }
     }
-    pub fn get_plat_info(&self) -> Option<PlatformInfo<Global>> {
+    pub fn get_plat_info(&self) -> Option<PlatformInfo<'_, Global>> {
         self.tables.platform_info().ok()
     }
     pub fn get_tables(&self) -> Arc<AcpiTables<ACPIImpl>> {

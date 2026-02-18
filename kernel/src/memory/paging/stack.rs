@@ -1,26 +1,20 @@
-use alloc::collections::linked_list::LinkedList;
 use kernel_types::status::PageMapError;
-use spin::Mutex;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
-use crate::util::boot_info;
-use crate::{
-    memory::paging::{
-        frame_alloc::BootInfoFrameAllocator,
+use crate::memory::paging::{
         paging::{align_up_4k, map_kernel_range},
-        tables::init_mapper,
         virt_tracker::{allocate_auto_kernel_range_aligned, unmap_range},
-    },
-    println,
-};
+    };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
+#[derive(Default)]
 pub enum StackSize {
     Tiny = 4 * 1024,
     Small = 8 * 1024,
     Medium = 16 * 1024,
     Large = 64 * 1024,
+    #[default]
     Huge16M = 16 * 1024 * 1024,
     Huge2M = 2 * 1024 * 1024,
     Huge1G = 1024 * 1024 * 1024,
@@ -47,11 +41,6 @@ impl StackSize {
     }
 }
 
-impl Default for StackSize {
-    fn default() -> Self {
-        StackSize::Huge16M
-    }
-}
 
 const GUARD_4K: u64 = 0x1000;
 pub const KERNEL_STACK_MAX: StackSize = StackSize::Huge2M;

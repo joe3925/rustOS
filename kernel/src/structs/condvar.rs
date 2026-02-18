@@ -1,6 +1,6 @@
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
-use crate::structs::sleep_mutex::{SleepMutex, SleepMutexGuard};
+use crate::structs::sleep_mutex::SleepMutexGuard;
 use crate::structs::wait_queue::WaitQueue;
 
 /// Condition variable for blocking tasks until a predicate is satisfied.

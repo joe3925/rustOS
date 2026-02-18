@@ -5,16 +5,15 @@ use core::{
     time::Duration,
 };
 
-use acpi::{AcpiTable, AcpiTables};
+use acpi::AcpiTables;
 use alloc::{
-    boxed::Box,
     collections::btree_map::BTreeMap,
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
 use kernel_types::{
-    async_ffi::{BorrowingFfiFuture, FfiFuture, FutureExt},
+    async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
@@ -23,11 +22,11 @@ use kernel_types::{
     io::IoTarget,
     irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
-    request::{Request, RequestHandle},
+    request::RequestHandle,
     status::{Data, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
-use spin::{Mutex, Once, RwLock};
+use spin::{Mutex, Once};
 use x86_64::VirtAddr;
 
 use crate::{
@@ -43,7 +42,7 @@ use crate::{
     },
     file_system::{
         file::{self, File},
-        file_provider::{self, VFS_PROVIDER},
+        file_provider::VFS_PROVIDER,
     },
     idt::{
         irq_alloc_vector, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
@@ -58,7 +57,7 @@ use crate::{
         self,
         global_async::GlobalAsyncExecutor,
         runtime::runtime::{
-            block_on as kernel_block_on, spawn as kernel_spawn,
+            block_on as kernel_block_on,
             spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
             BLOCKING_POOL, RUNTIME_POOL,
         },

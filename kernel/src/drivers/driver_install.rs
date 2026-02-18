@@ -1,6 +1,5 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::executable::pe_loadable::LoadError;
-use crate::{format, println};
 use alloc::{string::String, vec::Vec};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::pnp::BootType;
@@ -104,12 +103,12 @@ impl From<LoadError> for DriverError {
     }
 }
 #[inline(always)]
-fn inner<'a, T>(s: &'a Spanned<T>) -> &'a T {
+fn inner<T>(s: &Spanned<T>) -> &T {
     s.get_ref()
 }
 
 pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
-    let mut f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
+    let f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
     let bytes = f.read().await?;
     let src = core::str::from_utf8(&bytes).map_err(|_| FileStatus::InternalError)?;
 
@@ -151,7 +150,7 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
                 .filter_map(|val| inner(val).as_str().map(ToString::to_string))
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(Vec::new);
+        .unwrap_or_default();
 
     let class = tbl
         .get("class")
@@ -220,8 +219,7 @@ pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
                         } else if let Some(di) = inner(vv).as_integer() {
                             if let Some(u) = deint_to_u32(di) {
                                 values.push((k.to_string(), Data::U32(u)));
-                            } else {
-                            }
+                            } 
                         }
                     }
                 }

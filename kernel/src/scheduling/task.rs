@@ -2,21 +2,15 @@ use crate::cpu::get_cpu_info;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
-use crate::memory::paging::virt_tracker::{deallocate_kernel_range, unmap_range};
-use crate::scheduling::runtime;
-use crate::scheduling::runtime::runtime::{yield_now, BLOCKING_POOL, RUNTIME_POOL};
-use crate::scheduling::scheduler::{self, kernel_task_end, Scheduler, SCHEDULER};
+use crate::memory::paging::virt_tracker::unmap_range;
+use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
-use crate::static_handlers::task_yield;
-use crate::structs::thread_pool::ThreadPool;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::naked_asm;
-use core::hint::black_box;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use spin::RwLock;
-use x86_64::instructions::hlt;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
@@ -201,7 +195,7 @@ impl Task {
         state.rflags = 0x0000_0202;
 
         unsafe {
-            *(state.rsp as *mut u64) = kernel_task_end as u64;
+            *(state.rsp as *mut u64) = kernel_task_end as *const () as u64;
         }
 
         let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
@@ -261,7 +255,7 @@ impl Task {
         state.rflags = 0x0000_0202;
 
         unsafe {
-            *(state.rsp as *mut u64) = kernel_task_end as u64;
+            *(state.rsp as *mut u64) = kernel_task_end as *const () as u64;
         }
 
         let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
@@ -319,7 +313,7 @@ impl Task {
             None => return Ok(false),
         };
 
-        let _ = unsafe { map_kernel_range(VirtAddr::new(base), PAGE_SIZE, flags) }?;
+        unsafe { map_kernel_range(VirtAddr::new(base), PAGE_SIZE, flags) }?;
         self.guard_page = next_guard;
         Ok(true)
     }

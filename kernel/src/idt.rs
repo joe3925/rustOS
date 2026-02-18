@@ -1260,7 +1260,7 @@ fn init_idt() -> InterruptDescriptorTable {
 
     unsafe {
         idt[drivers::interrupt_index::InterruptIndex::Timer.as_u8()]
-            .set_handler_addr(VirtAddr::new(timer_interrupt_entry as u64))
+            .set_handler_addr(VirtAddr::new(timer_interrupt_entry as *const () as u64))
             .set_stack_index(TIMER_IST_INDEX);
     }
     for (vec, stub) in IRQ_VECTOR_STUBS {
@@ -1270,12 +1270,12 @@ fn init_idt() -> InterruptDescriptorTable {
     }
 
     unsafe {
-        idt[SCHED_IPI_VECTOR as u8]
-            .set_handler_addr(VirtAddr::new(ipi_entry as u64))
+        idt[SCHED_IPI_VECTOR ]
+            .set_handler_addr(VirtAddr::new(ipi_entry as *const () as u64))
             .set_stack_index(YIELD_IST_INDEX);
 
         idt[0x80]
-            .set_handler_addr(VirtAddr::new(yield_interrupt_entry as u64))
+            .set_handler_addr(VirtAddr::new(yield_interrupt_entry as *const () as u64))
             .set_stack_index(YIELD_IST_INDEX);
     }
 

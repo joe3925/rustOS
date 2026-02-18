@@ -6,8 +6,6 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
-use kernel_api::println;
-use kernel_api::runtime::spawn_blocking;
 
 use fatfs::{
     Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
@@ -68,7 +66,7 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         NotFound => FileStatus::PathNotFound,
         AlreadyExists => FileStatus::FileAlreadyExist,
         InvalidInput => FileStatus::BadPath,
-        NoSpace => FileStatus::NoSpace,
+        _NoSpace => FileStatus::NoSpace,
         CorruptedFileSystem => FileStatus::CorruptFilesystem,
     }
 }
@@ -108,7 +106,7 @@ fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
 fn handle_seek_request(
     dev: &Arc<DeviceObject>,
     req: &mut RequestHandle<'_>,
-    fs: &mut Fs,
+    _fs: &mut Fs,
 ) -> DriverStatus {
     let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
         Ok(p) => p,
@@ -475,7 +473,7 @@ fn handle_fs_request(
                         Err(st) => return st,
                     };
 
-                    let (path, is_dir, size_cached) = {
+                    let (_path, is_dir, size_cached) = {
                         let tbl = vdx.table.read();
                         match tbl.get(&params.fs_file_id) {
                             Some(ctx) => (ctx.path.clone(), ctx.is_dir, ctx.size),

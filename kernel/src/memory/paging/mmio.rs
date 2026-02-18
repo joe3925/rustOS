@@ -85,7 +85,7 @@ pub extern "win64" fn map_mmio_region_aligned(
     let total_size = align_up_4k(mmio_size + off);
 
     let virtual_addr = allocate_auto_kernel_range_aligned(total_size, va_alignment)
-        .ok_or_else(|| PageMapError::NoMemory())?;
+        .ok_or(PageMapError::NoMemory())?;
 
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());

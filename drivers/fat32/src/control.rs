@@ -1,14 +1,14 @@
 use alloc::{
     boxed::Box,
     collections::btree_map::BTreeMap,
-    string::{String, ToString},
+    string::ToString,
     sync::Arc,
     vec::Vec,
 };
 use core::mem::{align_of, size_of};
-use core::sync::atomic::{AtomicBool, AtomicU64};
+use core::sync::atomic::AtomicU64;
 use fatfs::FsOptions;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_MOUNTMGR_REGISTER_FS,
@@ -24,7 +24,7 @@ use kernel_api::{
         pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
     println,
-    request::{Request, RequestHandle, RequestType, TraversalPolicy},
+    request::{RequestHandle, RequestType, TraversalPolicy},
     request_handler,
     runtime::{spawn_blocking, spawn_detached},
     status::DriverStatus,
@@ -67,7 +67,7 @@ fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
         return Err(DriverStatus::InvalidParameter);
     }
     let ptr = bytes.as_ptr();
-    if (ptr as usize) % align_of::<T>() != 0 {
+    if !(ptr as usize).is_multiple_of(align_of::<T>()) {
         drop(bytes);
         return Err(DriverStatus::InvalidParameter);
     }
@@ -82,13 +82,13 @@ pub async fn fs_root_ioctl<'a, 'b>(
     _dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let code = match { req.read().kind } {
+    let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
         _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
 
     match code {
-        IOCTL_FS_IDENTIFY => {
+        _IOCTL_FS_IDENTIFY => {
             let mut r = req.write();
             let id_opt = r.take_data::<FsIdentify>();
             drop(r);
@@ -112,8 +112,8 @@ pub async fn fs_root_ioctl<'a, 'b>(
             let mut sector_size: Option<u16> = None;
             let mut total_sectors: Option<u64> = None;
 
-            if st == DriverStatus::Success {
-                if let Some(pnp) = query.write().pnp.as_mut() {
+            if st == DriverStatus::Success
+                && let Some(pnp) = query.write().pnp.as_mut() {
                     let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
                     if pi_opt.is_none() {
                         let raw = pnp.data_out.take_bytes();
@@ -132,7 +132,6 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         });
                     }
                 }
-            }
             let (sector_size, total_sectors) = match (sector_size, total_sectors) {
                 (Some(sz), Some(ts)) => (sz, ts),
                 _ => {

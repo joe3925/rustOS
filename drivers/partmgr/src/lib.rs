@@ -19,7 +19,7 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
     pnp_send_request_to_stack_top,
 };
-use kernel_api::request::{Request, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
@@ -128,10 +128,10 @@ pub async fn partition_pdo_read<'a, 'b>(
                     Err(DriverStatus::InvalidParameter)
                 } else {
                     let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                    if (offset as u64) + (buf_len as u64) > part_bytes {
+                    if offset + (buf_len as u64) > part_bytes {
                         Err(DriverStatus::InvalidParameter)
-                    } else if (offset as u64) % block_size != 0
-                        || (buf_len as u64) % block_size != 0
+                    } else if offset % block_size != 0
+                        || !(buf_len as u64).is_multiple_of(block_size)
                     {
                         Err(DriverStatus::InvalidParameter)
                     } else {
@@ -154,7 +154,7 @@ pub async fn partition_pdo_read<'a, 'b>(
         len: buf_len,
     };
 
-    let status = send_req_parent(&dx.parent.get().unwrap(), request).await;
+    let status = send_req_parent(dx.parent.get().unwrap(), request).await;
 
     DriverStep::complete(status)
 }
@@ -185,10 +185,10 @@ pub async fn partition_pdo_write<'a, 'b>(
                     Err(DriverStatus::InvalidParameter)
                 } else {
                     let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                    if (offset as u64) + (buf_len as u64) > part_bytes {
+                    if offset + (buf_len as u64) > part_bytes {
                         Err(DriverStatus::InvalidParameter)
-                    } else if (offset as u64) % block_size != 0
-                        || (buf_len as u64) % block_size != 0
+                    } else if offset % block_size != 0
+                        || !(buf_len as u64).is_multiple_of(block_size)
                     {
                         Err(DriverStatus::InvalidParameter)
                     } else {
@@ -214,7 +214,7 @@ pub async fn partition_pdo_write<'a, 'b>(
         flush_write_through,
     };
 
-    let status = send_req_parent(&dx.parent.get().unwrap(), request).await;
+    let status = send_req_parent(dx.parent.get().unwrap(), request).await;
 
     DriverStep::complete(status)
 }

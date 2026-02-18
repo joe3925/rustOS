@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kernel_types::{
     device::{DevNode, DevNodeState, DeviceObject, DeviceStack},
     pnp::DeviceIds,
-    EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Once, RwLock};
 

@@ -223,7 +223,7 @@ impl<T: Send + 'static> JoinableTask<T> {
 
     pub fn update_waker(&self, waker: &Waker) {
         let mut guard = self.waker.lock();
-        if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
+        if guard.as_ref().is_none_or(|w| !w.will_wake(waker)) {
             *guard = Some(waker.clone());
         }
     }

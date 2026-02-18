@@ -2,7 +2,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use kernel_types::irq::IrqSafeMutex;
-use spin::Mutex;
 use x86_64::{
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
     PhysAddr,

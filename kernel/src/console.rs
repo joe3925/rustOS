@@ -2,21 +2,17 @@ use crate::util::boot_info;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
 use core::fmt::{self, Write};
-use core::ops::{Deref, DerefMut};
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::{
-    Dimensions, DrawTarget, OriginDimensions, PixelColor, Point, RgbColor, Size,
+    DrawTarget, OriginDimensions, Point, RgbColor, Size,
 };
 use kernel_types::irq::IrqSafeMutex;
 
-use embedded_graphics::primitives::Rectangle;
 use embedded_graphics::text::{Baseline, Text, TextStyle, TextStyleBuilder};
 use embedded_graphics::Drawable;
 use lazy_static::lazy_static;
-use spin::{Mutex, MutexGuard};
-use x86_64::instructions::interrupts;
 const FONT_HEIGHT: usize = 18;
 const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;
@@ -381,10 +377,7 @@ impl Console {
             let take = self.pending.len().min(avail);
             let chunk = &self.pending[..take];
 
-            let s = match core::str::from_utf8(chunk) {
-                Ok(v) => v,
-                Err(_) => "?",
-            };
+            let s = core::str::from_utf8(chunk).unwrap_or("?");
 
             let p = Point::new(self.cursor_pose.x as i32, self.cursor_pose.y as i32);
             let _ = Text::with_text_style(s, p, self.style, self.text_style).draw(&mut self.screen);

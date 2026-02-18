@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
+    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous,
     unmap_range, virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};

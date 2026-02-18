@@ -1,10 +1,8 @@
-use crate::benchmarking::bench_submit_rip_sample_current_core;
-use crate::cpu;
 use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
 use crate::drivers::interrupt_index::{
-    current_cpu_id, get_current_logical_id, send_eoi, send_eoi_timer, InterruptIndex,
+    current_cpu_id, send_eoi_timer,
 };
-use crate::scheduling::scheduler::{self, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::structs::stopwatch::Stopwatch;
@@ -50,7 +48,7 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     }
 
     TIMER.fetch_add(1, Ordering::Relaxed);
-    let cpu_id = current_cpu_id() as usize;
+    let cpu_id = current_cpu_id();
     let sw = Stopwatch::start();
 
     SCHEDULER.on_timer_tick(state, cpu_id);

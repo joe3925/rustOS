@@ -175,7 +175,8 @@ pub struct State {
 impl State {
     #[inline(always)]
     pub fn new(rax: u64) -> Self {
-        let mut state = State {
+        
+        State {
             rax: 0,
             rbx: 0,
             rcx: 0,
@@ -196,8 +197,7 @@ impl State {
             rflags: 0,
             cs: 0,
             ss: 0,
-        };
-        state
+        }
     }
     pub fn update_from_interrupt(&mut self, rip: u64, rsp: u64, rflags: u64, cs: u64, ss: u64) {
         self.rip = rip;

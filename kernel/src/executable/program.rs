@@ -12,30 +12,27 @@ use spin::{Mutex, RwLock};
 use x86_64::{
     instructions::hlt,
     registers::control::Cr3,
-    structures::paging::{mapper::MapToError, Page, PageTableFlags, PhysFrame, Size4KiB},
+    structures::paging::{PageTableFlags, PhysFrame},
     VirtAddr,
 };
 
 use crate::{
     executable::pe_loadable::PELoader,
-    memory::paging::paging::{map_page, map_range_with_huge_pages},
+    memory::paging::paging::map_range_with_huge_pages,
     object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
-    scheduling::{
-        scheduler::{self, Scheduler},
-        task::TaskHandle,
-    },
-    util::{generate_guid, random_number},
+    scheduling::task::TaskHandle,
+    util::generate_guid,
 };
 use crate::{
     memory::paging::{
         frame_alloc::BootInfoFrameAllocator, paging::unmap_range_unchecked, tables::init_mapper,
     },
-    scheduling::{scheduler::SCHEDULER, task::Task},
+    scheduling::scheduler::SCHEDULER,
     structs::range_tracker::RangeTracker,
     util::boot_info,
 };
 
-use super::pe_loadable::{self, LoadError};
+use super::pe_loadable::LoadError;
 
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
@@ -395,7 +392,7 @@ impl Program {
             queue: VecDeque::new(),
         }));
         let base = alloc::format!("\\Proc\\{}\\Queues", self.pid);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Proc".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Proc");
         let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Proc\\{}", self.pid));
         let _ = OBJECT_MANAGER.mkdir_p(base.clone());
 
@@ -437,7 +434,7 @@ impl Program {
                 .find(|r| {
                     r.msg_id == msg.id
                         && r.from_pid
-                            .map_or(true, |pid| msg.sender.is_some() && r.from_pid == Some(pid))
+                            .is_none_or(|pid| msg.sender.is_some() && r.from_pid == Some(pid))
                 })
                 .cloned()
         };
@@ -460,9 +457,8 @@ impl Program {
                     self.default_queue.write().queue.push_back(msg);
                 }
 
-                let mut task = th;
+                let task = th;
                 if task.is_terminated() {
-                    return;
                 }
             }
         }
@@ -495,7 +491,7 @@ impl ProgramManager {
         self.programs.write().insert(pid, handle.clone());
 
         let proc_dir = alloc::format!("\\Proc\\{}", pid);
-        let _ = OBJECT_MANAGER.mkdir_p("\\Proc".to_string());
+        let _ = OBJECT_MANAGER.mkdir_p("\\Proc");
         let _ = OBJECT_MANAGER.mkdir_p(proc_dir.clone());
 
         let prog_obj = Object::with_name(

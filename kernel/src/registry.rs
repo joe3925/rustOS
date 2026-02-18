@@ -3,7 +3,6 @@ use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
-    vec,
     vec::Vec,
 };
 use bincode::{Decode, Encode};
@@ -221,7 +220,7 @@ fn apply_delta(reg: &mut Registry, delta: &RegDelta) {
 /// Load snapshot from disk
 async fn load_snapshot() -> Option<Registry> {
     let snap_path = snap_path();
-    let mut f = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Open])
+    let f = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Open])
         .await
         .ok()?;
     let buf = f.read().await.ok()?;
@@ -748,7 +747,7 @@ pub mod reg {
 
         let key = walk(&reg.root, base_norm).ok_or(RegError::KeyNotFound)?;
         let mut out = Vec::new();
-        for (val_name, _) in &key.values {
+        for val_name in key.values.keys() {
             out.push(join(base_norm, val_name));
         }
         Ok(out)
@@ -790,7 +789,7 @@ pub mod reg {
                 diff_maps(&child_path, &Key::empty(), sub_to, out);
             }
         }
-        for (name, _) in &from.sub_keys {
+        for name in from.sub_keys.keys() {
             if !to.sub_keys.contains_key(name) {
                 let child_path = if base_path.is_empty() {
                     name.clone()

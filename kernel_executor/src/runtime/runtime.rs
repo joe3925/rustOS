@@ -275,7 +275,7 @@ impl JoinAllShared {
 
     fn update_parent(&self, waker: &Waker) {
         let mut guard = self.parent.lock();
-        if guard.as_ref().map_or(true, |w| !w.will_wake(waker)) {
+        if guard.as_ref().is_none_or(|w| !w.will_wake(waker)) {
             *guard = Some(waker.clone());
         }
     }

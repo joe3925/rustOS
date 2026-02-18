@@ -1,4 +1,3 @@
-use crate::static_handlers::task_yield;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use crate::{
@@ -6,7 +5,7 @@ use crate::{
         heap::{HEAP_SIZE, HEAP_START},
         paging::{
             frame_alloc::BootInfoFrameAllocator,
-            paging::{map_range_with_huge_pages, unmap_range_impl},
+            paging::unmap_range_impl,
             tables::init_mapper,
         },
     },
@@ -15,8 +14,7 @@ use crate::{
 use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
-use core::mem::{align_of, size_of};
-use core::ptr::{self, null_mut, NonNull};
+use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::paging::{mapper::MapToError, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
@@ -110,7 +108,7 @@ impl<A> Locked<A> {
         }
     }
 
-    pub fn lock(&self) -> spin::MutexGuard<A> {
+    pub fn lock(&self) -> spin::MutexGuard<'_, A> {
         self.inner.lock()
     }
 }
@@ -134,7 +132,7 @@ impl SegAllocator {
         }
 
         unsafe {
-            if !ensure_header_mapped(HEAP_START as usize) {
+            if !ensure_header_mapped(HEAP_START) {
                 return;
             }
 
@@ -173,7 +171,7 @@ impl SegAllocator {
         (*node_ptr).next = old_next;
         prev_ref.next = Some(&mut *node_ptr);
 
-        let mut cur_ptr: *mut ListNode = node_ptr;
+        let cur_ptr: *mut ListNode = node_ptr;
 
         if let Some(next_ref) = (*cur_ptr).next.as_mut() {
             let next_ptr = &mut **next_ref as *mut ListNode;
@@ -589,7 +587,7 @@ impl BuddyLocked {
         if !self.init.load(Ordering::Acquire) {
             without_interrupts(|| {
                 if !self.init.load(Ordering::Acquire) {
-                    let heap_start = HEAP_START as usize;
+                    let heap_start = HEAP_START;
                     let heap_size = HEAP_SIZE as usize;
                     self.inner.lock().init(heap_start, heap_size);
                     self.init.store(true, Ordering::Release);

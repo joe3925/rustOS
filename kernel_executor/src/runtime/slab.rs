@@ -165,6 +165,12 @@ pub struct SlabConfigBuilder {
     config: SlabConfig,
 }
 
+impl Default for SlabConfigBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlabConfigBuilder {
     pub fn new() -> Self {
         Self {
@@ -173,7 +179,7 @@ impl SlabConfigBuilder {
     }
 
     pub fn capacity(mut self, total: usize) -> Self {
-        self.config.slots_per_shard = ((total + NUM_SHARDS - 1) / NUM_SHARDS)
+        self.config.slots_per_shard = total.div_ceil(NUM_SHARDS)
             .min(MAX_SLOTS_PER_SHARD)
             .max(64);
         self
@@ -494,17 +500,17 @@ impl JoinableSlot {
         if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
             let ptr = buf_ptr as *mut F;
             core::ptr::write(ptr, future);
-            write_cell_usize(&self.poll_fn, poll_and_store_inline::<F, T> as usize);
-            write_cell_usize(&self.drop_fn, drop_inline::<F> as usize);
+            write_cell_usize(&self.poll_fn, poll_and_store_inline::<F, T> as *const () as usize);
+            write_cell_usize(&self.drop_fn, drop_inline::<F> as *const () as usize);
         } else {
             let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
             let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
             core::ptr::write(ptr, Some(boxed));
-            write_cell_usize(&self.poll_fn, poll_and_store_boxed::<T> as usize);
-            write_cell_usize(&self.drop_fn, drop_boxed_future::<T> as usize);
+            write_cell_usize(&self.poll_fn, poll_and_store_boxed::<T> as *const () as usize);
+            write_cell_usize(&self.drop_fn, drop_boxed_future::<T> as *const () as usize);
         }
 
-        write_cell_usize(&self.result_drop_fn, drop_inline::<T> as usize);
+        write_cell_usize(&self.result_drop_fn, drop_inline::<T> as *const () as usize);
 
         self.waker_state.store(WAKER_NONE, Ordering::Release);
         self.cached_waker_state.store(CW_NONE, Ordering::Release);
@@ -808,7 +814,7 @@ struct SlabShard {
 impl SlabShard {
     fn new(num_slots: usize) -> Self {
         let num_slots = num_slots.min(MAX_SLOTS_PER_SHARD).max(64);
-        let num_words = (num_slots + 63) / 64;
+        let num_words = num_slots.div_ceil(64);
 
         let mut bitmap = Vec::with_capacity(num_words);
         for _ in 0..num_words {
@@ -929,7 +935,7 @@ struct JoinableShard {
 impl JoinableShard {
     fn new(num_slots: usize) -> Self {
         let num_slots = num_slots.min(MAX_JOINABLE_SLOTS_PER_SHARD).max(32);
-        let num_words = (num_slots + 63) / 64;
+        let num_words = num_slots.div_ceil(64);
 
         let mut bitmap = Vec::with_capacity(num_words);
         for _ in 0..num_words {

@@ -1,20 +1,16 @@
 use alloc::{
-    boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
-    sync::Arc,
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::file_system::file;
 use crate::file_system::file_provider::FileProvider;
 use crate::util::BootPkg;
 use kernel_types::{
     async_ffi::{FfiFuture, FutureExt},
     fs::{Path, *},
-    request::Request,
     status::{DriverStatus, FileStatus},
 };
 
@@ -155,7 +151,7 @@ impl<'a> BootstrapProvider<'a> {
             n.get_mut(&norm_upcase(DRIVER_ROOT))
                 .unwrap()
                 .children
-                .insert(bp.name.clone().to_string(), ddir.clone());
+                .insert(bp.name.to_string(), ddir.clone());
 
             let toml_name = alloc::format!("{}.toml", bp.name);
             let dll_name = alloc::format!("{}.dll", bp.name);

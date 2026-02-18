@@ -1,4 +1,3 @@
-use core::{mem::MaybeUninit, sync::atomic::AtomicBool};
 
 use alloc::sync::Arc;
 use aml::AmlContext;

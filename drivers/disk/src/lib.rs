@@ -95,7 +95,7 @@ pub async fn disk_read<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
-    let (off, total) = match { req.read().kind } {
+    let (off, total) = match req.read().kind {
         RequestType::Read { offset, len } => (offset, len),
         _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
     };
@@ -105,11 +105,10 @@ pub async fn disk_read<'a, 'b>(
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(Ordering::Acquire) {
-        if let Err(st) = query_props_sync(&dev).await {
+    if !dx.props_ready.load(Ordering::Acquire)
+        && let Err(st) = query_props_sync(&dev).await {
             return kernel_api::pnp::DriverStep::complete(st);
         }
-    }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
@@ -120,7 +119,7 @@ pub async fn disk_read<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
-    let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
+    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
     if !aligned {
         req.write().status = DriverStatus::InvalidParameter;
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
@@ -136,7 +135,7 @@ pub async fn disk_write<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
-    let (off, total) = match { req.read().kind } {
+    let (off, total) = match req.read().kind {
         RequestType::Write {
             offset,
             len,
@@ -150,11 +149,10 @@ pub async fn disk_write<'a, 'b>(
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(Ordering::Acquire) {
-        if let Err(st) = query_props_sync(&dev).await {
+    if !dx.props_ready.load(Ordering::Acquire)
+        && let Err(st) = query_props_sync(&dev).await {
             return kernel_api::pnp::DriverStep::complete(st);
         }
-    }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
@@ -165,7 +163,7 @@ pub async fn disk_write<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
-    let aligned = (off % bs == 0) && ((total as u64) % bs == 0);
+    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
     if !aligned {
         req.write().status = DriverStatus::InvalidParameter;
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
@@ -180,7 +178,7 @@ pub async fn disk_ioctl<'a, 'b>(
     dev: Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> kernel_api::pnp::DriverStep {
-    let code = match { req.read().kind } {
+    let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
         _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
     };

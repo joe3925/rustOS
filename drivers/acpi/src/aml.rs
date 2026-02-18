@@ -260,19 +260,18 @@ pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<Str
     }
 
     let mut hid: Option<String> = None;
-    if let Ok(hid_path) = AmlName::from_str(&(dev.as_string() + "._HID")) {
-        if let Some(v) = read_obj(ctx, &hid_path) {
+    if let Ok(hid_path) = AmlName::from_str(&(dev.as_string() + "._HID"))
+        && let Some(v) = read_obj(ctx, &hid_path) {
             match v {
                 AmlValue::String(s) => hid = Some(format!("ACPI\\{}", s)),
                 AmlValue::Integer(i) => hid = Some(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
                 _ => {}
             }
         }
-    }
 
     let mut cids: Vec<String> = Vec::new();
-    if let Ok(cid_path) = AmlName::from_str(&(dev.as_string() + "._CID")) {
-        if let Some(v) = read_obj(ctx, &cid_path) {
+    if let Ok(cid_path) = AmlName::from_str(&(dev.as_string() + "._CID"))
+        && let Some(v) = read_obj(ctx, &cid_path) {
             match v {
                 AmlValue::String(s) => cids.push(format!("ACPI\\{}", s)),
                 AmlValue::Integer(i) => cids.push(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
@@ -290,7 +289,6 @@ pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<Str
                 _ => {}
             }
         }
-    }
 
     if let Some(h) = &hid {
         cids.retain(|x| x != h);
@@ -404,7 +402,7 @@ pub fn create_pnp_bus_from_acpi(
     ext.prt = evaluate_prt(&mut ctx, &dev_name);
     init.set_dev_ext_from(ext);
 
-    let (_dn, mut pdo) = pnp_create_child_devnode_and_pdo_with_init(
+    let (_dn, _pdo) = pnp_create_child_devnode_and_pdo_with_init(
         parent_dev_node,
         short_name,
         instance_path,
@@ -466,9 +464,9 @@ fn ser_irq(vector: u32, level: bool, sharable: bool) -> [u8; 12] {
 fn read_int_method(ctx: &mut AmlContext, dev: &AmlName, suffix: &str) -> Option<u64> {
     let p = AmlName::from_str(&(dev.as_string() + "." + suffix)).ok()?;
     match ctx.namespace.get_by_path(&p).ok()? {
-        AmlValue::Integer(n) => Some(*n as u64),
+        AmlValue::Integer(n) => Some(*n ),
         AmlValue::Method { .. } => match ctx.invoke_method(&p, Args::EMPTY).ok()? {
-            AmlValue::Integer(n) => Some(n as u64),
+            AmlValue::Integer(n) => Some(n),
             _ => None,
         },
         _ => None,
@@ -682,8 +680,8 @@ fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
             let body = &bytes[3..3 + len];
             let typ = b0 & 0x7F;
 
-            if matches!(typ, 0x07 | 0x08 | 0x0A) {
-                if body.len() >= 6 + 2 * 5 {
+            if matches!(typ, 0x07 | 0x08 | 0x0A)
+                && body.len() >= 6 + 2 * 5 {
                     let res_ty = body[0];
                     let mut off = 3;
                     let mut rd = |n: usize| {
@@ -708,7 +706,6 @@ fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
                         hi = Some(eb);
                     }
                 }
-            }
             bytes = &bytes[3 + len..];
         } else {
             let len = (b0 & 0x07) as usize;
@@ -888,7 +885,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
                         let mask = u16::from_le_bytes([body[0], body[1]]);
                         if mask != 0 {
                             let info = if len >= 3 { Some(body[2]) } else { None };
-                            let vector = mask.trailing_zeros().min(15) as u32;
+                            let vector = mask.trailing_zeros().min(15);
                             let level = info.map(|i| (i & 0x01) == 0).unwrap_or(false);
                             let sharable = info.map(|i| (i & (1 << 4)) != 0).unwrap_or(false);
                             tlv(
@@ -951,7 +948,7 @@ pub async fn acpi_pdo_query_resources<'a, 'b>(
     let ctx_lock = &pext.ctx;
 
     let mut guard = ctx_lock.write();
-    let mut blob = build_query_resources_blob(&mut *guard, &pext.acpi_path).unwrap_or_default();
+    let mut blob = build_query_resources_blob(&mut guard, &pext.acpi_path).unwrap_or_default();
     drop(guard);
 
     if !pext.ecam.is_empty() {
@@ -984,7 +981,7 @@ pub async fn acpi_pdo_query_id<'a, 'b>(
 
     let ctx_lock = &pext.ctx;
     let mut guard = ctx_lock.write();
-    let (hid_opt, mut cids) = read_ids(&mut *guard, &pext.acpi_path);
+    let (hid_opt, mut cids) = read_ids(&mut guard, &pext.acpi_path);
     drop(guard);
 
     let mut status = DriverStatus::Success;

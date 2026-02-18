@@ -2,14 +2,13 @@ use alloc::vec::Vec;
 use core::hint::spin_loop;
 
 use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1, BenchLevelResult,
-    BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
+    BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::irq::irq_wait_ok;
 use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::status::DriverStatus;
 
-use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::dev_ext::DevExtInner;
 use crate::{WaitTasksGuard, rdtsc, wait_for_completion};
 
@@ -34,7 +33,7 @@ impl BenchConfig {
             .total_bytes
             .max(request_size as u64)
             .min((PREALLOCATED_DATA_SIZE as u64) * 1024);
-        let requests_per_run = ((total_bytes + (request_size as u64) - 1) / request_size as u64)
+        let requests_per_run = total_bytes.div_ceil(request_size as u64)
             .max(1)
             .min(u32::MAX as u64) as u32;
 
@@ -48,7 +47,7 @@ impl BenchConfig {
 
 fn bench_descs_per_request(use_indirect: bool, request_size: u32) -> usize {
     if !use_indirect {
-        return 2 + ((request_size as usize + 4095) / 4096);
+        return 2 + (request_size as usize).div_ceil(4096);
     }
     3 // header + data + status
 }
@@ -106,7 +105,7 @@ async fn bench_reads_direct(
                 continue;
             }
 
-            let mut io_req = match bench_queue.arena.new_request(
+            let io_req = match bench_queue.arena.new_request(
                 VIRTIO_BLK_T_IN,
                 current_sector,
                 bench_cfg.request_size,
@@ -141,7 +140,7 @@ async fn bench_reads_direct(
 
         made_progress = false;
         for slot in slots.iter_mut() {
-            let Some(mut s) = slot.take() else { continue };
+            let Some(s) = slot.take() else { continue };
 
             let len_opt = wait_for_completion(bench_queue, s.head).await.ok();
             if len_opt.is_none() {
@@ -261,7 +260,7 @@ pub async fn bench_sweep_params(
     }
 
     let mut result = BenchSweepResult::default();
-    let mut current_sector: u64 = params.start_sector;
+    let current_sector: u64 = params.start_sector;
     for level in levels {
         if (result.used as usize) >= result.levels.len() {
             break;

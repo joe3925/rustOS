@@ -57,4 +57,4 @@ pub use exec_runtime::spawn_blocking;
 pub use exec_runtime::spawn_blocking_many;
 pub use exec_runtime::spawn_detached;
 pub use exec_runtime::try_steal_blocking_one;
-pub use exec_runtime::{BlockingJoin, JoinAll, JoinHandle};
+pub use exec_runtime::JoinAll;

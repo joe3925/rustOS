@@ -2,7 +2,7 @@ use crate::cpu::{self, get_cpu_info};
 use crate::drivers::interrupt_index::ApicErrors::{
     AlreadyInit, BadInterruptModel, NoACPI, NoCPUID, NotAvailable,
 };
-use crate::drivers::timer_driver::{set_num_cores, NUM_CORES};
+use crate::drivers::timer_driver::set_num_cores;
 use crate::drivers::ACPI::ACPI_TABLES;
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
@@ -14,7 +14,7 @@ use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::syscalls::syscall::syscall_init;
 use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
-use crate::{println, KERNEL_INITIALIZED};
+use crate::KERNEL_INITIALIZED;
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
 use alloc::boxed::Box;
@@ -23,7 +23,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use core::{mem, ptr};
-use lazy_static::lazy_static;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -416,7 +415,7 @@ impl LocalApic for Lapic {
         let mut lo = 0u32;
         match kind {
             IpiKind::Fixed { vector } => {
-                lo = (0b000 << 8) | (vector as u32);
+                lo = (vector as u32);
             }
             IpiKind::Nmi => {
                 lo = 0b100 << 8;
@@ -425,7 +424,7 @@ impl LocalApic for Lapic {
                 lo = (0b101 << 8) | (1 << 14) | (1 << 15);
             }
             IpiKind::InitDeassert => {
-                lo = (0b101 << 8) | (0 << 14) | (1 << 15);
+                lo = (0b101 << 8) | (1 << 15);
             }
             IpiKind::Startup { vector_phys_addr } => {
                 let v = ((vector_phys_addr.as_u64() >> 12) & 0xFF) as u32;
@@ -614,7 +613,7 @@ impl ApicImpl {
                     .as_u64();
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
 
-                ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as u64);
+                ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as *const () as u64);
                 ptr::write_unaligned(
                     info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16,
                     longmode_gdt.limit,
@@ -682,12 +681,12 @@ extern "C" fn ap_startup() -> ! {
 
         syscall_init();
         apic_calibrate_ticks_per_ns_via_wait(10);
-        apic_program_period_ns(APIC_START_PERIOD as u64);
+        apic_program_period_ns(APIC_START_PERIOD);
         SCHEDULER.init_core(current_cpu_id());
         CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
 
-    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {}
+    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) { core::hint::spin_loop() }
     x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();
@@ -807,6 +806,5 @@ pub extern "C" fn send_eoi_timer() {
         unsafe {
             ((base as *mut u32).add(APICOffset::Eoi as usize / 4)).write_volatile(0);
         }
-        return;
     }
 }
