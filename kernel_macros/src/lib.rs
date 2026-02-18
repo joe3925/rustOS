@@ -157,7 +157,7 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
                     continue;
                 }
 
-                // Disallow reference types (including non-mut RequestHandle)
+                // Allow shared refs to Arc<_>; disallow other reference types
                 if let Type::Reference(ty_ref) = &*pat_ty.ty {
                     if type_is_request_handle_path(&ty_ref.elem) {
                         return Err(syn::Error::new_spanned(
@@ -165,10 +165,13 @@ fn validate_function(func: &ItemFn) -> syn::Result<()> {
                             "#[request_handler] RequestHandle must be passed as &mut RequestHandle",
                         ));
                     }
+                    if type_is_arc(&ty_ref.elem) {
+                        continue;
+                    }
                     return Err(syn::Error::new_spanned(
-                        ty_ref,
-                        "#[request_handler] handler parameters must be owned types (no references); use Arc<T> etc. instead",
-                    ));
+                    ty_ref,
+                    "#[request_handler] handler parameters must be owned types; only &Arc<T> references are allowed",
+                ));
                 }
 
                 if !matches!(*pat_ty.pat, Pat::Ident(_)) {
@@ -269,6 +272,7 @@ fn choose_object_id_expr(sig: &syn::Signature) -> TokenStream2 {
 
 fn type_is_arc(ty: &Type) -> bool {
     match ty {
+        Type::Reference(r) => type_is_arc(&r.elem),
         Type::Path(p) => p
             .path
             .segments

@@ -176,7 +176,7 @@ async fn setup_msix_via_pci(
 
 #[request_handler]
 async fn virtio_pnp_start<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let mut query_req = RequestHandle::new_pnp(
@@ -556,7 +556,7 @@ async fn virtio_pnp_start<'a, 'b>(
 
 #[request_handler]
 async fn virtio_pnp_remove<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
@@ -601,7 +601,7 @@ async fn virtio_pnp_remove<'a, 'b>(
 
 #[request_handler]
 async fn virtio_pnp_query_devrels<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
@@ -783,7 +783,7 @@ fn rdtsc() -> u64 {
 
 #[request_handler]
 pub async fn virtio_pdo_start<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
@@ -791,7 +791,7 @@ pub async fn virtio_pdo_start<'a, 'b>(
 
 #[request_handler]
 pub async fn virtio_pdo_query_id<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
@@ -825,7 +825,7 @@ pub async fn virtio_pdo_query_id<'a, 'b>(
 
 #[request_handler]
 pub async fn virtio_pdo_query_resources<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -868,11 +868,11 @@ fn get_parent_inner(
 
 #[request_handler]
 pub async fn virtio_pdo_read<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
-    let (_parent, inner) = match get_parent_inner(&pdo) {
+    let (_parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
@@ -995,11 +995,11 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
 #[request_handler]
 pub async fn virtio_pdo_write<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
-    let (_parent, inner) = match get_parent_inner(&pdo) {
+    let (_parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
@@ -1122,7 +1122,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
 #[request_handler]
 pub async fn virtio_pdo_ioctl<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match {
@@ -1140,7 +1140,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         IOCTL_BLOCK_FLUSH => complete_req(req, DriverStatus::Success),
 
         IOCTL_BLOCK_BENCH_SWEEP => {
-            let (_parent, inner) = match get_parent_inner(&pdo) {
+            let (_parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };
@@ -1157,7 +1157,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         }
 
         IOCTL_BLOCK_BENCH_SWEEP_POLLING => {
-            let (_parent, inner) = match get_parent_inner(&pdo) {
+            let (_parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };
@@ -1174,7 +1174,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         }
 
         IOCTL_BLOCK_BENCH_SWEEP_BOTH => {
-            let (_parent, inner) = match get_parent_inner(&pdo) {
+            let (_parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };

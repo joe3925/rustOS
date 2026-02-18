@@ -83,7 +83,7 @@ pub extern "win64" fn disk_device_add(
 
 #[request_handler]
 async fn disk_pnp_remove<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> kernel_api::pnp::DriverStep {
     kernel_api::pnp::DriverStep::Continue
@@ -91,7 +91,7 @@ async fn disk_pnp_remove<'a, 'b>(
 
 #[request_handler]
 pub async fn disk_read<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
@@ -106,9 +106,10 @@ pub async fn disk_read<'a, 'b>(
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(Ordering::Acquire)
-        && let Err(st) = query_props_sync(&dev).await {
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
+        && let Err(st) = query_props_sync(&dev).await
+    {
+        return kernel_api::pnp::DriverStep::complete(st);
+    }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
@@ -131,7 +132,7 @@ pub async fn disk_read<'a, 'b>(
 
 #[request_handler]
 pub async fn disk_write<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
@@ -150,9 +151,10 @@ pub async fn disk_write<'a, 'b>(
 
     let dx = disk_ext(&dev);
     if !dx.props_ready.load(Ordering::Acquire)
-        && let Err(st) = query_props_sync(&dev).await {
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
+        && let Err(st) = query_props_sync(&dev).await
+    {
+        return kernel_api::pnp::DriverStep::complete(st);
+    }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     if bs == 0 {
@@ -175,7 +177,7 @@ pub async fn disk_write<'a, 'b>(
 
 #[request_handler]
 pub async fn disk_ioctl<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> kernel_api::pnp::DriverStep {
     let code = match req.read().kind {
@@ -196,7 +198,7 @@ pub async fn disk_ioctl<'a, 'b>(
                 RequestData::empty(),
             );
 
-            let st = pnp_forward_request_to_next_lower(dev, &mut ch).await;
+            let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
             if st != DriverStatus::Success {
                 return kernel_api::pnp::DriverStep::complete(st);
             }

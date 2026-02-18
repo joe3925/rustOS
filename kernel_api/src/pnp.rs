@@ -12,13 +12,12 @@ pub use kernel_types::pnp::*;
 // Re-export routing functions from kernel_routing crate
 // These now compile per-driver, eliminating one FFI future boundary
 pub use kernel_routing::{
+    complete_request as pnp_complete_request, ioctl_via_symlink as pnp_ioctl_via_symlink,
     send_request as pnp_send_request,
     send_request_to_next_lower as pnp_forward_request_to_next_lower,
     send_request_to_next_upper as pnp_forward_request_to_next_upper,
-    send_request_via_symlink as pnp_send_request_via_symlink,
     send_request_to_stack_top as pnp_send_request_to_stack_top,
-    ioctl_via_symlink as pnp_ioctl_via_symlink,
-    complete_request as pnp_complete_request,
+    send_request_via_symlink as pnp_send_request_via_symlink,
 };
 
 pub fn create_pdo(
@@ -90,7 +89,7 @@ pub fn pnp_remove_symlink(link_path: String) -> DriverStatus {
 pub fn pnp_add_class_listener(
     class: String,
     callback: ClassAddCallback,
-    dev_obj: Arc<DeviceObject>,
+    dev_obj: &Arc<DeviceObject>,
 ) {
     unsafe { kernel_sys::pnp_add_class_listener(class, callback, dev_obj) }
 }

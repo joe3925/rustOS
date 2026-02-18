@@ -57,9 +57,8 @@ use crate::{
         self,
         global_async::GlobalAsyncExecutor,
         runtime::runtime::{
-            block_on as kernel_block_on,
-            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
-            BLOCKING_POOL, RUNTIME_POOL,
+            block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
+            spawn_detached as kernel_spawn_detached, BLOCKING_POOL, RUNTIME_POOL,
         },
         scheduler::{TaskError, SCHEDULER},
         task::Task,
@@ -276,17 +275,19 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_forward_request_to_next_lower<'h, 'd>(
-    from: Arc<DeviceObject>,
+    from: &Arc<DeviceObject>,
     handle: &'h mut RequestHandle<'d>,
 ) -> FfiFuture<DriverStatus> {
+    let from = from.clone();
     async move { PNP_MANAGER.send_request_to_next_lower(from, handle).await }.into_ffi()
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_forward_request_to_next_upper<'h, 'd>(
-    from: Arc<DeviceObject>,
+    from: &Arc<DeviceObject>,
     handle: &'h mut RequestHandle<'d>,
 ) -> FfiFuture<DriverStatus> {
+    let from = from.clone();
     async move { PNP_MANAGER.send_request_to_next_upper(from, handle).await }.into_ffi()
 }
 
@@ -396,9 +397,10 @@ pub extern "win64" fn pnp_create_child_devnode_and_pdo_with_init(
 
 #[no_mangle]
 pub extern "win64" fn InvalidateDeviceRelations(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     relation: DeviceRelationType,
 ) -> FfiFuture<DriverStatus> {
+    let device = device.clone();
     async move {
         let Some(dn) = device.dev_node.get() else {
             return DriverStatus::NoSuchDevice;
@@ -479,7 +481,7 @@ pub extern "win64" fn pnp_create_control_device_and_link(
 pub extern "win64" fn pnp_add_class_listener(
     class: String,
     callback: ClassAddCallback,
-    dev_obj: Arc<DeviceObject>,
+    dev_obj: &Arc<DeviceObject>,
 ) {
     PNP_MANAGER.add_class_listener(class, dev_obj.clone(), callback);
 }

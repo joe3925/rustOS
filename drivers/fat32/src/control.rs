@@ -1,10 +1,4 @@
-use alloc::{
-    boxed::Box,
-    collections::btree_map::BTreeMap,
-    string::ToString,
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::ToString, sync::Arc, vec::Vec};
 use core::mem::{align_of, size_of};
 use core::sync::atomic::AtomicU64;
 use fatfs::FsOptions;
@@ -79,7 +73,7 @@ fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
 
 #[request_handler]
 pub async fn fs_root_ioctl<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match req.read().kind {
@@ -113,25 +107,26 @@ pub async fn fs_root_ioctl<'a, 'b>(
             let mut total_sectors: Option<u64> = None;
 
             if st == DriverStatus::Success
-                && let Some(pnp) = query.write().pnp.as_mut() {
-                    let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
-                    if pi_opt.is_none() {
-                        let raw = pnp.data_out.take_bytes();
-                        pi_opt = from_boxed_bytes::<PartitionInfo>(raw).ok();
-                    }
-
-                    if let Some(pi) = pi_opt {
-                        sector_size = Some(if pi.disk.logical_block_size != 0 {
-                            pi.disk.logical_block_size as u16
-                        } else {
-                            512
-                        });
-
-                        total_sectors = pi.gpt_entry.map(|ent| {
-                            ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
-                        });
-                    }
+                && let Some(pnp) = query.write().pnp.as_mut()
+            {
+                let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
+                if pi_opt.is_none() {
+                    let raw = pnp.data_out.take_bytes();
+                    pi_opt = from_boxed_bytes::<PartitionInfo>(raw).ok();
                 }
+
+                if let Some(pi) = pi_opt {
+                    sector_size = Some(if pi.disk.logical_block_size != 0 {
+                        pi.disk.logical_block_size as u16
+                    } else {
+                        512
+                    });
+
+                    total_sectors = pi
+                        .gpt_entry
+                        .map(|ent| ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1));
+                }
+            }
             let (sector_size, total_sectors) = match (sector_size, total_sectors) {
                 (Some(sz), Some(ts)) => (sz, ts),
                 _ => {

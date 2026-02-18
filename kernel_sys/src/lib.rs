@@ -164,7 +164,7 @@ unsafe extern "win64" {
     pub fn pnp_add_class_listener(
         class: String,
         callback: ClassAddCallback,
-        dev_obj: Arc<DeviceObject>,
+        dev_obj: &Arc<DeviceObject>,
     );
 
     pub fn pnp_create_devnode_over_pdo_with_function(
@@ -178,7 +178,7 @@ unsafe extern "win64" {
     ) -> FfiFuture<Result<(Arc<DevNode>, Arc<DeviceObject>), DriverError>>;
 
     pub fn InvalidateDeviceRelations(
-        device: Arc<DeviceObject>,
+        device: &Arc<DeviceObject>,
         relation: DeviceRelationType,
     ) -> FfiFuture<DriverStatus>;
 

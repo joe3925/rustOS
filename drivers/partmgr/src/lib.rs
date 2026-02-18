@@ -84,7 +84,7 @@ struct PartDevExt {
 
 #[request_handler]
 async fn partition_pdo_query_resources<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     request: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     {
@@ -108,7 +108,7 @@ async fn send_req_parent<'h, 'd>(
 }
 #[request_handler]
 pub async fn partition_pdo_read<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     request: &'b mut RequestHandle<'a>,
     buf_len: usize,
 ) -> DriverStep {
@@ -161,7 +161,7 @@ pub async fn partition_pdo_read<'a, 'b>(
 
 #[request_handler]
 pub async fn partition_pdo_write<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     request: &'b mut RequestHandle<'a>,
     buf_len: usize,
 ) -> DriverStep {
@@ -220,7 +220,7 @@ pub async fn partition_pdo_write<'a, 'b>(
 }
 #[request_handler]
 pub async fn partmgr_start<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
@@ -264,7 +264,7 @@ async fn read_from_lower_async(
 
 #[request_handler]
 pub async fn partmgr_pnp_query_devrels<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     request: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let relation = { request.read().pnp.as_ref().unwrap().relation };

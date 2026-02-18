@@ -93,7 +93,7 @@ impl IoType {
     #[inline]
     pub async fn invoke(
         &self,
-        dev: Arc<DeviceObject>,
+        dev: &Arc<DeviceObject>,
         handle: &mut RequestHandle<'_>,
     ) -> DriverStep {
         match *self {

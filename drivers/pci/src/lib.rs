@@ -79,7 +79,7 @@ pub extern "win64" fn bus_driver_device_add(
 
 #[request_handler]
 pub async fn pci_bus_pnp_start<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let mut query_handle = RequestHandle::new_pnp(
@@ -140,7 +140,7 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
 
 #[request_handler]
 pub async fn pci_bus_pnp_query_devrels<'a, 'b>(
-    device: Arc<DeviceObject>,
+    device: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
@@ -337,7 +337,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 
 #[request_handler]
 pub async fn pci_pdo_query_id<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
@@ -382,7 +382,7 @@ pub async fn pci_pdo_query_id<'a, 'b>(
 
 #[request_handler]
 pub async fn pci_pdo_query_resources<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
@@ -407,7 +407,7 @@ pub async fn pci_pdo_query_resources<'a, 'b>(
 
 #[request_handler]
 pub async fn pci_pdo_start<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
@@ -415,7 +415,7 @@ pub async fn pci_pdo_start<'a, 'b>(
 
 #[request_handler]
 pub async fn pci_pdo_query_devrels<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
@@ -423,7 +423,7 @@ pub async fn pci_pdo_query_devrels<'a, 'b>(
 
 #[request_handler]
 pub async fn pci_pdo_ioctl<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match {
@@ -438,7 +438,7 @@ pub async fn pci_pdo_ioctl<'a, 'b>(
     };
 
     match code {
-        IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev, req).await,
+        IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
         _ => DriverStep::complete(DriverStatus::NotImplemented),
     }
 }

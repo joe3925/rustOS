@@ -137,18 +137,18 @@ pub extern "win64" fn volclass_device_add(
 
 #[request_handler]
 pub async fn volclass_start<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
-    spawn_detached(mount_if_unmounted(dev));
+    spawn_detached(mount_if_unmounted(dev.clone()));
     DriverStep::Continue
 }
 
 #[request_handler]
 pub async fn volclass_ioctl<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match req.read().kind {
@@ -184,7 +184,7 @@ pub async fn volclass_ioctl<'a, 'b>(
         }
         _IOCTL_MOUNTMGR_RESYNC => {
             let _ = refresh_fs_registry_from_registry().await;
-            mount_if_unmounted(dev).await;
+            mount_if_unmounted(dev.clone()).await;
             // Enumerate all volumes and assign labels on-demand
             enumerate_and_assign_all_labels().await;
             let mut w = req.write();
@@ -203,7 +203,7 @@ pub async fn volclass_ioctl<'a, 'b>(
 
 #[request_handler]
 pub async fn volclass_ctrl_ioctl<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let code = match req.read().kind {

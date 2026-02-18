@@ -36,21 +36,21 @@ pub type EvtDriverUnload =
     extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
 pub type EvtIoRead = for<'a, 'b> extern "win64" fn(
-    Arc<DeviceObject>,
+    &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
     usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoWrite = for<'a, 'b> extern "win64" fn(
-    Arc<DeviceObject>,
+    &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
     usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoDeviceControl = for<'a, 'b> extern "win64" fn(
-    Arc<DeviceObject>,
+    &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoFs = for<'a, 'b> extern "win64" fn(
-    Arc<DeviceObject>,
+    &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
 ) -> FfiFuture<DriverStep>;
 
@@ -58,7 +58,7 @@ pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: 
 pub type CompletionRoutine =
     extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
 pub type PnpMinorCallback = for<'a, 'b> extern "win64" fn(
-    Arc<DeviceObject>,
+    &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
 ) -> FfiFuture<DriverStep>;
 

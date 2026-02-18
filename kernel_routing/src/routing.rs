@@ -266,7 +266,7 @@ async fn invoke_io_handler(
         };
     };
 
-    let result = h.handler.invoke(dev.clone(), handle).await;
+    let result = h.handler.invoke(dev, handle).await;
 
     match h.synchronization {
         Synchronization::Sync | Synchronization::Async => {
@@ -301,7 +301,7 @@ async fn pnp_minor_dispatch(
         .as_ref()
         .and_then(|vt| vt.get(minor))
     {
-        let mut step = cb(device.clone(), handle).await;
+        let mut step = cb(device, handle).await;
         if matches!(
             step,
             DriverStep::Complete {

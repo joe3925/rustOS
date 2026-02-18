@@ -109,7 +109,7 @@ pub extern "win64" fn ide_device_add(
 
 #[request_handler]
 async fn ide_pnp_start<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let mut child_handle = RequestHandle::new_pnp(
@@ -159,7 +159,7 @@ async fn ide_pnp_start<'a, 'b>(
 
 #[request_handler]
 async fn ide_pnp_query_devrels<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
@@ -295,7 +295,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
 
 #[request_handler]
 pub async fn ide_pdo_read<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
@@ -368,7 +368,7 @@ pub async fn ide_pdo_read<'a, 'b>(
 
 #[request_handler]
 pub async fn ide_pdo_write<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
@@ -442,7 +442,7 @@ pub async fn ide_pdo_write<'a, 'b>(
 
 #[request_handler]
 pub async fn ide_pdo_internal_ioctl<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -856,7 +856,7 @@ fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
 
 #[request_handler]
 pub async fn ide_pdo_query_id<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     use QueryIdType::*;
@@ -895,7 +895,7 @@ pub async fn ide_pdo_query_id<'a, 'b>(
 
 #[request_handler]
 pub async fn ide_pdo_query_resources<'a, 'b>(
-    pdo: Arc<DeviceObject>,
+    pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -924,7 +924,7 @@ pub async fn ide_pdo_query_resources<'a, 'b>(
 
 #[request_handler]
 pub async fn ide_pdo_start<'a, 'b>(
-    _pdo: Arc<DeviceObject>,
+    _pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)

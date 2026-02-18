@@ -715,7 +715,7 @@ fn handle_fs_request(
 
 #[request_handler]
 pub async fn fs_op_dispatch<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let fs_arc = {

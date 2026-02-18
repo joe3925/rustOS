@@ -261,34 +261,36 @@ pub fn read_ids(ctx: &mut AmlContext, dev: &AmlName) -> (Option<String>, Vec<Str
 
     let mut hid: Option<String> = None;
     if let Ok(hid_path) = AmlName::from_str(&(dev.as_string() + "._HID"))
-        && let Some(v) = read_obj(ctx, &hid_path) {
-            match v {
-                AmlValue::String(s) => hid = Some(format!("ACPI\\{}", s)),
-                AmlValue::Integer(i) => hid = Some(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
-                _ => {}
-            }
+        && let Some(v) = read_obj(ctx, &hid_path)
+    {
+        match v {
+            AmlValue::String(s) => hid = Some(format!("ACPI\\{}", s)),
+            AmlValue::Integer(i) => hid = Some(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
+            _ => {}
         }
+    }
 
     let mut cids: Vec<String> = Vec::new();
     if let Ok(cid_path) = AmlName::from_str(&(dev.as_string() + "._CID"))
-        && let Some(v) = read_obj(ctx, &cid_path) {
-            match v {
-                AmlValue::String(s) => cids.push(format!("ACPI\\{}", s)),
-                AmlValue::Integer(i) => cids.push(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
-                AmlValue::Package(pk) => {
-                    for it in pk.iter() {
-                        match it {
-                            AmlValue::String(s) => cids.push(format!("ACPI\\{}", s.clone())),
-                            AmlValue::Integer(i) => {
-                                cids.push(format!("ACPI\\{}", pnp_id_from_u32(*i as u32)))
-                            }
-                            _ => {}
+        && let Some(v) = read_obj(ctx, &cid_path)
+    {
+        match v {
+            AmlValue::String(s) => cids.push(format!("ACPI\\{}", s)),
+            AmlValue::Integer(i) => cids.push(format!("ACPI\\{}", pnp_id_from_u32(i as u32))),
+            AmlValue::Package(pk) => {
+                for it in pk.iter() {
+                    match it {
+                        AmlValue::String(s) => cids.push(format!("ACPI\\{}", s.clone())),
+                        AmlValue::Integer(i) => {
+                            cids.push(format!("ACPI\\{}", pnp_id_from_u32(*i as u32)))
                         }
+                        _ => {}
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
+    }
 
     if let Some(h) = &hid {
         cids.retain(|x| x != h);
@@ -464,7 +466,7 @@ fn ser_irq(vector: u32, level: bool, sharable: bool) -> [u8; 12] {
 fn read_int_method(ctx: &mut AmlContext, dev: &AmlName, suffix: &str) -> Option<u64> {
     let p = AmlName::from_str(&(dev.as_string() + "." + suffix)).ok()?;
     match ctx.namespace.get_by_path(&p).ok()? {
-        AmlValue::Integer(n) => Some(*n ),
+        AmlValue::Integer(n) => Some(*n),
         AmlValue::Method { .. } => match ctx.invoke_method(&p, Args::EMPTY).ok()? {
             AmlValue::Integer(n) => Some(n),
             _ => None,
@@ -680,32 +682,31 @@ fn bus_range_from_crs(ctx: &mut AmlContext, dev: &AmlName) -> Option<(u8, u8)> {
             let body = &bytes[3..3 + len];
             let typ = b0 & 0x7F;
 
-            if matches!(typ, 0x07 | 0x08 | 0x0A)
-                && body.len() >= 6 + 2 * 5 {
-                    let res_ty = body[0];
-                    let mut off = 3;
-                    let mut rd = |n: usize| {
-                        let mut t = [0u8; 8];
-                        t[..n].copy_from_slice(&body[off..off + n]);
-                        off += n;
-                        u64::from_le_bytes(t)
+            if matches!(typ, 0x07 | 0x08 | 0x0A) && body.len() >= 6 + 2 * 5 {
+                let res_ty = body[0];
+                let mut off = 3;
+                let mut rd = |n: usize| {
+                    let mut t = [0u8; 8];
+                    t[..n].copy_from_slice(&body[off..off + n]);
+                    off += n;
+                    u64::from_le_bytes(t)
+                };
+                let _gran = rd(2);
+                let min = rd(2);
+                let max = rd(2);
+                let tra = rd(2);
+                let lenv = rd(2);
+                if res_ty == 2 {
+                    let sb = (min + tra) as u8;
+                    let eb = if lenv == 0 {
+                        max as u8
+                    } else {
+                        (min + tra + lenv - 1) as u8
                     };
-                    let _gran = rd(2);
-                    let min = rd(2);
-                    let max = rd(2);
-                    let tra = rd(2);
-                    let lenv = rd(2);
-                    if res_ty == 2 {
-                        let sb = (min + tra) as u8;
-                        let eb = if lenv == 0 {
-                            max as u8
-                        } else {
-                            (min + tra + lenv - 1) as u8
-                        };
-                        lo = Some(sb);
-                        hi = Some(eb);
-                    }
+                    lo = Some(sb);
+                    hi = Some(eb);
                 }
+            }
             bytes = &bytes[3 + len..];
         } else {
             let len = (b0 & 0x07) as usize;
@@ -940,7 +941,7 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 
 #[request_handler]
 pub async fn acpi_pdo_query_resources<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
@@ -972,7 +973,7 @@ pub async fn acpi_pdo_query_resources<'a, 'b>(
 
 #[request_handler]
 pub async fn acpi_pdo_query_id<'a, 'b>(
-    dev: Arc<DeviceObject>,
+    dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
@@ -1022,7 +1023,7 @@ pub async fn acpi_pdo_query_id<'a, 'b>(
 
 #[request_handler]
 pub async fn acpi_pdo_start<'a, 'b>(
-    _dev: Arc<DeviceObject>,
+    _dev: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
