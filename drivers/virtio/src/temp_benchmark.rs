@@ -88,7 +88,6 @@ async fn bench_reads_direct(
     };
 
     while completed < total_requests {
-        // === Phase 1: Submit a full batch ===
         let batch_size = (total_requests - completed).min(inflight as u32) as usize;
         let mut batch_submitted = 0usize;
 
@@ -125,7 +124,6 @@ async fn bench_reads_direct(
             break;
         }
 
-        // === Phase 2: Notify once for the entire batch ===
         {
             let vq = bench_queue.queue.lock().await;
             vq.notify(inner.notify_base, inner.notify_off_multiplier);

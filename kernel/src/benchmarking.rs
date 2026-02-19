@@ -11,11 +11,12 @@ use crate::memory::{
 use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
-use crate::static_handlers::{pnp_get_device_target, wait_duration};
+use crate::static_handlers::{idle_tracking_stop, pnp_get_device_target, wait_duration};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
 use crate::{cpu, println, vec};
 
+use crate::drivers::timer_driver::idle_tracking_start;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -36,7 +37,6 @@ use kernel_types::request::{RequestData, RequestHandle, RequestType, TraversalPo
 use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
-
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 const BENCH_ENABLED: bool = false;
 
@@ -2069,13 +2069,15 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 40 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
+    8 * 1024 * 1024,
+    16 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -2141,7 +2143,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
+            //OpenFlags::WriteThrough,
         ],
     )
     .await
@@ -3251,10 +3253,10 @@ pub async fn run_virtio_bench_matrix_print() {
         // 4 * 1024,
         // 8 * 1024,
         // 16 * 1024,
-        //64 * 1024,
+        64 * 1024,
         // 256 * 1024,
         // 1024 * 1024,
-        4 * 1024 * 1024,
+        //4 * 1024 * 1024,
     ];
 
     let start_sector_list: [u64; _] = [
@@ -3277,7 +3279,6 @@ pub async fn run_virtio_bench_matrix_print() {
         discard_first_per_combo: false,
         file_prefix: "exp1_",
     };
-
     bench_virtio_disk_sweep_both_matrix_to_table(&matrix).await;
 }
 fn console_print_header() {

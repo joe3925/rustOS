@@ -1,7 +1,5 @@
 use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
-use crate::drivers::interrupt_index::{
-    current_cpu_id, send_eoi_timer,
-};
+use crate::drivers::interrupt_index::{current_cpu_id, send_eoi_timer};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
 use crate::structs::per_cpu_vec::PerCpuVec;
@@ -74,7 +72,9 @@ pub fn idle_tracking_start() {
     let n = NUM_CORES.load(Ordering::Relaxed);
     for i in 0..n {
         IDLE_TIME_CYCLES.get_by_id(i).store(0, Ordering::Relaxed);
-        IDLE_SCHED_IN_CYCLES.get_by_id(i).store(0, Ordering::Relaxed);
+        IDLE_SCHED_IN_CYCLES
+            .get_by_id(i)
+            .store(0, Ordering::Relaxed);
     }
     IDLE_TRACKING_START.store(crate::cpu::get_cycles(), Ordering::Release);
     IDLE_TRACKING_ENABLED.store(true, Ordering::Release);

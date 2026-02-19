@@ -139,7 +139,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 }
             };
 
-            let options = FsOptions::new();
+            let options = FsOptions::new().update_accessed_date(false).strict(false);
             let target_clone = id.volume_fdo.clone();
             let result = spawn_blocking(move || {
                 fatfs::FileSystem::new(

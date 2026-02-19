@@ -138,22 +138,21 @@ impl File {
     }
 
     pub async fn make_dir(path: &Path) -> Result<(), FileStatus> {
-        if path.symlink.is_none() && path.components.is_empty() {
-            return Err(FileStatus::BadPath);
-        }
+        let drive = match path.symlink {
+            Some(d) => d,
+            None => return Err(FileStatus::BadPath),
+        };
 
         if path.components.is_empty() {
             return Ok(());
         }
 
-        // Create each directory in the path incrementally
-        let mut cur_path = Path {
-            symlink: path.symlink,
-            components: Vec::new(),
-        };
+        let mut cur_path = Path::from_symlink(drive);
+        let raw = path.as_str();
 
-        for comp in &path.components {
-            cur_path.components.push(comp.clone());
+        for sp in &path.components {
+            let comp = &raw[sp.start..sp.end];
+            cur_path.push(comp);
 
             let (r, st) = file_provider::provider().make_dir_path(&cur_path).await;
             if st != DriverStatus::Success {

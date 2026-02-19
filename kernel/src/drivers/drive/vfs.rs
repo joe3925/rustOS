@@ -50,12 +50,15 @@ impl Vfs {
     }
 
     pub fn set_label(&self, label: String, mount_symlink: String) {
+        let tgt = PNP_MANAGER.resolve_targetio_from_symlink(mount_symlink.clone());
         let mut map = self.label_map.write();
         if let Some(old) = map.insert(label, mount_symlink.clone()) {
+            // drop old map entry from target cache
             self.target_cache.write().remove(&old);
         }
         drop(map);
-        if let Some(tgt) = PNP_MANAGER.resolve_targetio_from_symlink(mount_symlink.clone()) {
+        if let Some(tgt) = tgt {
+            // mount_symlink is consumed here — no further clone needed
             self.target_cache.write().insert(mount_symlink, tgt);
         }
     }
@@ -71,10 +74,11 @@ impl Vfs {
         let mut out: Vec<MountedVolume> = Vec::with_capacity(labels.len());
 
         for (label, mount_symlink) in labels.iter() {
+            let symlink = mount_symlink.clone();
             out.push(MountedVolume {
                 label: label.clone(),
-                mount_symlink: mount_symlink.clone(),
-                object_name: mount_symlink.clone(),
+                object_name: symlink.clone(),
+                mount_symlink: symlink,
             });
         }
 
@@ -91,26 +95,24 @@ impl Vfs {
         }
     }
 
-    fn resolve_path(&self, user_path: &Path) -> Result<(String, Path), FileStatus> {
+    fn resolve_path(&self, user_path: Path) -> Result<(String, Path), FileStatus> {
         if user_path.symlink.is_none() && user_path.components.is_empty() {
             return Err(FileStatus::BadPath);
         }
 
-        // Build the fs_path from components (without drive)
-        let fs_path = Path {
-            symlink: None,
-            components: user_path.components.clone(),
-        };
-
         // Resolve drive letter to symlink
         if let Some(d) = user_path.symlink {
-            let label = alloc::format!("{}:", d);
-            let symlink = match self.label_map.read().get(&label) {
+            let label_buf: [u8; 2] = [d as u8, b':'];
+            // SAFETY: d is a validated ASCII drive letter, so [d, ':'] is valid UTF-8
+            let label_str = unsafe { core::str::from_utf8_unchecked(&label_buf) };
+            let symlink = match self.label_map.read().get(label_str) {
                 Some(s) => s.clone(),
                 None => {
                     alloc::format!("\\GLOBAL\\StorageDevices\\{}", d)
                 }
             };
+            // Build the fs_path from components (without drive)
+            let fs_path = user_path.with_symlink(None);
             return Ok((symlink, fs_path));
         }
 
@@ -163,7 +165,7 @@ impl Vfs {
     }
 
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(&p.path) {
+        let (symlink, fs_path) = match self.resolve_path(p.path) {
             Ok(v) => v,
             Err(e) => {
                 return (
@@ -278,14 +280,8 @@ impl Vfs {
                 DriverStatus::Success,
             )
         } else if has_create {
-            let (try_open, st) = call_open(
-                self,
-                &symlink,
-                fs_path.clone(),
-                p.flags,
-                p.write_through,
-            )
-            .await;
+            let (try_open, st) =
+                call_open(self, &symlink, fs_path.clone(), p.flags, p.write_through).await;
             if st != DriverStatus::Success {
                 return (try_open, st);
             }
@@ -420,7 +416,7 @@ impl Vfs {
             fs_file_id: h.inner_id,
         };
         let res: Result<FsCloseResult, DriverStatus> = self
-            .call_fs(&h.volume_symlink, h.target.clone(), FsOp::Close, inner)
+            .call_fs(&h.volume_symlink, h.target, FsOp::Close, inner)
             .await;
         match res {
             Ok(mut r) => {
@@ -606,7 +602,7 @@ impl Vfs {
     }
 
     pub async fn create(&self, mut p: FsCreateParams) -> (FsCreateResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(&p.path) {
+        let (symlink, fs_path) = match self.resolve_path(p.path) {
             Ok(v) => v,
             Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
         };
@@ -631,11 +627,11 @@ impl Vfs {
     }
 
     pub async fn rename(&self, mut p: FsRenameParams) -> (FsRenameResult, DriverStatus) {
-        let (src_symlink, src_rel) = match self.resolve_path(&p.src) {
+        let (src_symlink, src_rel) = match self.resolve_path(p.src) {
             Ok(v) => v,
             Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
         };
-        let (dst_symlink, dst_rel) = match self.resolve_path(&p.dst) {
+        let (dst_symlink, dst_rel) = match self.resolve_path(p.dst) {
             Ok(v) => v,
             Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
         };
@@ -669,7 +665,7 @@ impl Vfs {
     }
 
     pub async fn list_dir(&self, mut p: FsListDirParams) -> (FsListDirResult, DriverStatus) {
-        let (symlink, fs_path) = match self.resolve_path(&p.path) {
+        let (symlink, fs_path) = match self.resolve_path(p.path) {
             Ok(v) => v,
             Err(e) => {
                 return (

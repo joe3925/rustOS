@@ -379,7 +379,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
             .call_once(|| dx.part.get().unwrap().clone());
         ext::<VolPdoExt>(&pdo)
             .caching_enabled
-            .store(false, Ordering::Release);
+            .store(true, Ordering::Release);
 
         let sector_size = pi.disk.physical_block_size as usize;
 

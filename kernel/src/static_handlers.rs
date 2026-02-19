@@ -57,7 +57,8 @@ use crate::{
         self,
         global_async::GlobalAsyncExecutor,
         runtime::runtime::{
-            block_on as kernel_block_on, spawn_blocking as kernel_spawn_blocking,
+            block_on as kernel_block_on, spawn as kernel_spawn,
+            spawn_blocking as kernel_spawn_blocking,
             spawn_detached as kernel_spawn_detached, BLOCKING_POOL, RUNTIME_POOL,
         },
         scheduler::{TaskError, SCHEDULER},
@@ -587,6 +588,12 @@ pub extern "win64" fn vfs_notify_label_unpublished(label_ptr: *const u8, label_l
 #[no_mangle]
 pub extern "win64" fn kernel_spawn_ffi(fut: FfiFuture<()>) {
     scheduling::runtime::ffi_spawn::kernel_spawn_ffi_internal(fut);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()> {
+    let handle = kernel_spawn(fut);
+    handle.into_ffi()
 }
 
 #[no_mangle]

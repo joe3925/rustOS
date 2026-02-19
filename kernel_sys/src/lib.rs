@@ -207,6 +207,7 @@ unsafe extern "win64" {
 
     // Async Runtime (global)
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
+    pub fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()>;
     pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_ffi(fut: FfiFuture<()>);

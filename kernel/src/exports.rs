@@ -101,6 +101,7 @@ export! {
     reg_list_values,
 
     kernel_spawn_ffi,
+    kernel_spawn_joinable_ffi,
     kernel_async_submit,
     kernel_spawn_detached_ffi,
     kernel_block_on_ffi,

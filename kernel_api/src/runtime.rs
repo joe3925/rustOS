@@ -14,7 +14,7 @@ use kernel_sys::{
     kernel_spawn_blocking_raw, kernel_spawn_detached_ffi, kernel_spawn_ffi,
     try_steal_blocking_one as sys_try_steal_blocking_one,
 };
-use kernel_types::async_ffi::FutureExt;
+use kernel_types::async_ffi::{FfiWaker, FfiWakerVTable, FutureExt};
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel).
 pub fn spawn<F>(future: F)
@@ -32,23 +32,65 @@ where
     unsafe { kernel_spawn_detached_ffi(future.into_ffi()) };
 }
 
-/// Block the current thread until the future completes using a local waker and optional stealing from the kernel blocking pool.
+/// Block the current thread until the future completes 
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let mut pinned = Box::pin(future);
-    let notify = Arc::new(ThreadNotify::new());
-    let waker = Waker::from(notify.clone());
-    let mut cx = Context::from_waker(&waker);
+    let mut ffi_fut = future.into_ffi();
+    let ready = AtomicBool::new(false);
+
+    let vtable: &'static FfiWakerVTable = &BLOCK_ON_WAKER_VTABLE;
+    let ffi_waker = FfiWaker {
+        data: &ready as *const AtomicBool as *const (),
+        vtable,
+    };
 
     loop {
-        match pinned.as_mut().poll(&mut cx) {
-            Poll::Ready(out) => return out,
-            Poll::Pending => {
-                if !notify.take_ready() {
-                    let _ = unsafe { sys_try_steal_blocking_one() };
-                }
+        let poll = unsafe { ffi_fut.poll(&ffi_waker as *const FfiWaker) };
+        if poll.is_ready() {
+            // SAFETY: we just checked is_ready
+            match unsafe { poll.into_poll() } {
+                Poll::Ready(v) => return v,
+                Poll::Pending => unreachable!(),
             }
         }
+        if !ready.swap(false, Ordering::AcqRel) {
+            let _ = unsafe { sys_try_steal_blocking_one() };
+        }
     }
+}
+
+/// Static vtable for the block_on FfiWaker. The data pointer is a raw pointer
+/// to a stack-local AtomicBool, so clone just copies the pointer (no refcount needed
+/// since the bool outlives all waker copies within block_on).
+static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
+    clone: block_on_waker_clone,
+    wake: block_on_waker_wake,
+    wake_by_ref: block_on_waker_wake_by_ref,
+    drop: block_on_waker_drop,
+};
+
+unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
+    FfiWaker {
+        data,
+        vtable: &BLOCK_ON_WAKER_VTABLE,
+    }
+}
+
+unsafe extern "win64" fn block_on_waker_wake(data: *const ()) {
+    unsafe {
+        let ready = &*(data as *const AtomicBool);
+        ready.store(true, Ordering::Release);
+    }
+}
+
+unsafe extern "win64" fn block_on_waker_wake_by_ref(data: *const ()) {
+    unsafe {
+        let ready = &*(data as *const AtomicBool);
+        ready.store(true, Ordering::Release);
+    }
+}
+
+unsafe extern "win64" fn block_on_waker_drop(_data: *const ()) {
+    // No-op: the AtomicBool lives on the block_on stack frame.
 }
 
 /// Minimal blocking join handle executed on the kernel blocking pool.
@@ -142,28 +184,3 @@ pub fn try_steal_blocking_one() -> bool {
     unsafe { sys_try_steal_blocking_one() }
 }
 
-struct ThreadNotify {
-    ready: AtomicBool,
-}
-
-impl ThreadNotify {
-    fn new() -> Self {
-        Self {
-            ready: AtomicBool::new(false),
-        }
-    }
-
-    fn take_ready(&self) -> bool {
-        self.ready.swap(false, Ordering::AcqRel)
-    }
-}
-
-impl Wake for ThreadNotify {
-    fn wake(self: Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.ready.store(true, Ordering::Release);
-    }
-}

@@ -26,7 +26,7 @@ pub const ARENA_MAX_CAPACITY: usize = 5096;
 /// Number of u64 bitmap words needed to track all arena slots
 pub const ARENA_BITMAP_WORDS: usize = ARENA_MAX_CAPACITY.div_ceil(64);
 
-pub const PREALLOCATED_DATA_SIZE: usize = 4 * 1024 * 1024;
+pub const PREALLOCATED_DATA_SIZE: usize = 64 * 1024;
 
 /// Calculate the required indirect table size in bytes for a given data length.
 /// Returns a page-aligned size (minimum 4KB) to satisfy allocation requirements.

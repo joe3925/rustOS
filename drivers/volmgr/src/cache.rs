@@ -205,7 +205,9 @@ impl VolumeCache {
         if len == 0 {
             return Ok(());
         }
-        if !offset.is_multiple_of(self.sector_size as u64) || !(len as usize).is_multiple_of(self.sector_size) {
+        if !offset.is_multiple_of(self.sector_size as u64)
+            || !(len as usize).is_multiple_of(self.sector_size)
+        {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -337,7 +339,9 @@ impl VolumeCache {
         if data.is_empty() {
             return Ok(());
         }
-        if !offset.is_multiple_of(self.sector_size as u64) || !data.len().is_multiple_of(self.sector_size) {
+        if !offset.is_multiple_of(self.sector_size as u64)
+            || !data.len().is_multiple_of(self.sector_size)
+        {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -457,7 +461,9 @@ impl VolumeCache {
             return Ok(());
         }
 
-        if !offset.is_multiple_of(self.sector_size as u64) || !data.len().is_multiple_of(self.sector_size) {
+        if !offset.is_multiple_of(self.sector_size as u64)
+            || !data.len().is_multiple_of(self.sector_size)
+        {
             return Err(CacheError::UnalignedRange);
         }
 
@@ -799,7 +805,6 @@ impl VolumeCache {
                 .checked_mul(sector_size as u128)
                 .ok_or(CacheError::RangeOverflow)? as u64;
 
-            // NOTE: we intentionally pass the full `io_buf` (capacity buffer) and rely on `len`.
             let mut write_req = RequestHandle::new(
                 RequestType::Write {
                     offset: write_offset_bytes,
@@ -879,15 +884,14 @@ impl VolumeCache {
                         !still_dirty
                     };
 
-                    if should_evict
-                        && let Some(removed_entry_idx) = cache.map.remove(&block_idx) {
-                            let removed_ei = removed_entry_idx as usize;
-                            if removed_ei >= cache.entries.len() {
-                                return Err(CacheError::InternalInconsistent);
-                            }
-                            cache.entries[removed_ei].reset();
-                            cache.free.push(removed_entry_idx);
+                    if should_evict && let Some(removed_entry_idx) = cache.map.remove(&block_idx) {
+                        let removed_ei = removed_entry_idx as usize;
+                        if removed_ei >= cache.entries.len() {
+                            return Err(CacheError::InternalInconsistent);
                         }
+                        cache.entries[removed_ei].reset();
+                        cache.free.push(removed_entry_idx);
+                    }
 
                     remaining_sectors -= sectors_to_clear;
                     sector_cursor = sector_cursor
