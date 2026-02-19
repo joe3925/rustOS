@@ -43,6 +43,8 @@ struct CacheEntry {
     valid: [u64; MASK_WORDS],
     dirty: [u64; MASK_WORDS],
     in_use: bool,
+    generation: u64,
+    flushing: bool,
 }
 
 impl Default for CacheEntry {
@@ -52,6 +54,8 @@ impl Default for CacheEntry {
             valid: [0u64; MASK_WORDS],
             dirty: [0u64; MASK_WORDS],
             in_use: false,
+            generation: 0,
+            flushing: false,
         }
     }
 }
@@ -557,6 +561,7 @@ impl VolumeCache {
 
             mask_set_range(&mut ent.valid, start_sector, end_sector);
             mask_set_range(&mut ent.dirty, start_sector, end_sector);
+            ent.generation = ent.generation.wrapping_add(1);
 
             b = b.wrapping_add(1);
             if b == 0 {
@@ -598,11 +603,33 @@ impl VolumeCache {
         Ok(pct as f32)
     }
     pub async fn flush_dirty(cache_lock: &RwLock<Self>, tgt: IoTarget) -> Result<(), CacheError> {
+        #[derive(Clone, Copy)]
+        struct FlushSegment {
+            block_idx: u64,
+            entry_idx: u32,
+            start_sector: usize,
+            sector_count: usize,
+            entry_gen: u64,
+        }
+
+        fn clear_flushing(lock: &RwLock<VolumeCache>, segments: &[FlushSegment]) {
+            let mut cache = lock.write();
+            for seg in segments {
+                let ei = seg.entry_idx as usize;
+                if ei < cache.entries.len() {
+                    cache.entries[ei].flushing = false;
+                }
+            }
+        }
+
         let mut io_buf: Box<[u8]> = Box::new([]);
 
         loop {
-            let (run_start_sector, run_sector_count, sector_size, sectors_per_block, block_size) = {
-                let cache = cache_lock.read();
+            let mut segments: Vec<FlushSegment> = Vec::new();
+            let mut need_retry = false;
+
+            let (run_start_sector, run_sector_count, sector_size, block_size) = {
+                let mut cache = cache_lock.write();
 
                 if cache.block_size == 0 || cache.sector_size == 0 || cache.sectors_per_block == 0 {
                     return Err(CacheError::NotConfigured);
@@ -616,6 +643,9 @@ impl VolumeCache {
                     }
 
                     let ent = &cache.entries[ei];
+                    if ent.flushing {
+                        continue;
+                    }
                     if !ent.in_use || ent.block_idx != *block_idx {
                         return Err(CacheError::InternalInconsistent);
                     }
@@ -662,6 +692,10 @@ impl VolumeCache {
                     }
 
                     let ent = &cache.entries[ei];
+                    if ent.flushing {
+                        i += 1;
+                        continue;
+                    }
                     if !ent.in_use || ent.block_idx != block_idx {
                         return Err(CacheError::InternalInconsistent);
                     }
@@ -722,35 +756,21 @@ impl VolumeCache {
                     return Err(CacheError::InternalInconsistent);
                 }
 
-                (
-                    best_start,
-                    (best_end - best_start) as usize,
-                    cache.sector_size,
-                    cache.sectors_per_block,
-                    cache.block_size,
-                )
-            };
+                let rs = best_start;
+                let rc = (best_end - best_start) as usize;
+                let ss = cache.sector_size;
+                let bs = cache.block_size;
 
-            let write_len_bytes = run_sector_count
-                .checked_mul(sector_size)
-                .ok_or(CacheError::RangeOverflow)?;
-
-            if io_buf.len() < write_len_bytes {
-                io_buf = alloc::vec![0u8; write_len_bytes].into_boxed_slice();
-            }
-
-            {
-                let cache = cache_lock.read();
-
-                let mut dst_byte = 0usize;
-                let mut remaining_sectors = run_sector_count;
-                let mut sector_cursor = run_start_sector;
+                let mut remaining_sectors = rc;
+                let mut sector_cursor = rs;
+                let mut conflict = false;
 
                 while remaining_sectors != 0 {
-                    let block_idx = sector_cursor / (sectors_per_block as u64);
-                    let sector_in_block = (sector_cursor % (sectors_per_block as u64)) as usize;
+                    let block_idx = sector_cursor / (cache.sectors_per_block as u64);
+                    let sector_in_block =
+                        (sector_cursor % (cache.sectors_per_block as u64)) as usize;
 
-                    let sectors_left_in_block = sectors_per_block - sector_in_block;
+                    let sectors_left_in_block = cache.sectors_per_block - sector_in_block;
                     let sectors_to_copy = if remaining_sectors < sectors_left_in_block {
                         remaining_sectors
                     } else {
@@ -766,20 +786,90 @@ impl VolumeCache {
                         return Err(CacheError::InternalInconsistent);
                     }
 
+                    let ent = &mut cache.entries[ei];
+                    if !ent.in_use || ent.block_idx != block_idx {
+                        return Err(CacheError::InternalInconsistent);
+                    }
+
+                    if ent.flushing {
+                        conflict = true;
+                        break;
+                    }
+
+                    ent.flushing = true;
+
+                    segments.push(FlushSegment {
+                        block_idx,
+                        entry_idx,
+                        start_sector: sector_in_block,
+                        sector_count: sectors_to_copy,
+                        entry_gen: ent.generation,
+                    });
+
+                    remaining_sectors -= sectors_to_copy;
+                    sector_cursor = sector_cursor
+                        .checked_add(sectors_to_copy as u64)
+                        .ok_or(CacheError::RangeOverflow)?;
+                }
+
+                if conflict {
+                    for seg in &segments {
+                        let ei = seg.entry_idx as usize;
+                        if ei < cache.entries.len() {
+                            cache.entries[ei].flushing = false;
+                        }
+                    }
+                    segments.clear();
+                    need_retry = true;
+                    (0, 0, 0, 0)
+                } else {
+                    (rs, rc, ss, bs)
+                }
+            };
+
+            if need_retry {
+                continue;
+            }
+
+            if segments.is_empty() {
+                // all dirty blocks were busy; try again
+                continue;
+            }
+
+            let write_len_bytes = run_sector_count
+                .checked_mul(sector_size)
+                .ok_or(CacheError::RangeOverflow)?;
+
+            if io_buf.len() < write_len_bytes {
+                io_buf = alloc::vec![0u8; write_len_bytes].into_boxed_slice();
+            }
+
+            let mut dst_byte = 0usize;
+            for seg in &segments {
+                let bytes_to_copy = seg
+                    .sector_count
+                    .checked_mul(sector_size)
+                    .ok_or(CacheError::RangeOverflow)?;
+
+                {
+                    let cache = cache_lock.read();
+
+                    let ei = seg.entry_idx as usize;
+                    if ei >= cache.entries.len() {
+                        clear_flushing(cache_lock, &segments);
+                        return Err(CacheError::InternalInconsistent);
+                    }
+
                     let block_base_byte = ei
                         .checked_mul(block_size)
                         .ok_or(CacheError::RangeOverflow)?;
 
                     let src_byte = block_base_byte
                         .checked_add(
-                            sector_in_block
+                            seg.start_sector
                                 .checked_mul(sector_size)
                                 .ok_or(CacheError::RangeOverflow)?,
                         )
-                        .ok_or(CacheError::RangeOverflow)?;
-
-                    let bytes_to_copy = sectors_to_copy
-                        .checked_mul(sector_size)
                         .ok_or(CacheError::RangeOverflow)?;
 
                     let src_end = src_byte
@@ -787,18 +877,17 @@ impl VolumeCache {
                         .ok_or(CacheError::RangeOverflow)?;
 
                     if src_end > cache.backing.len() || dst_byte + bytes_to_copy > io_buf.len() {
+                        clear_flushing(cache_lock, &segments);
                         return Err(CacheError::InternalInconsistent);
                     }
 
                     io_buf[dst_byte..dst_byte + bytes_to_copy]
                         .copy_from_slice(&cache.backing[src_byte..src_end]);
-
-                    dst_byte += bytes_to_copy;
-                    remaining_sectors -= sectors_to_copy;
-                    sector_cursor = sector_cursor
-                        .checked_add(sectors_to_copy as u64)
-                        .ok_or(CacheError::RangeOverflow)?;
                 }
+
+                dst_byte = dst_byte
+                    .checked_add(bytes_to_copy)
+                    .ok_or(CacheError::RangeOverflow)?;
             }
 
             let write_offset_bytes = (run_start_sector as u128)
@@ -822,81 +911,64 @@ impl VolumeCache {
             };
 
             if status != DriverStatus::Success {
+                clear_flushing(cache_lock, &segments);
                 return Err(CacheError::IoFailed(status));
             }
 
             {
                 let mut cache = cache_lock.write();
 
-                let mut remaining_sectors = run_sector_count;
-                let mut sector_cursor = run_start_sector;
-
-                while remaining_sectors != 0 {
-                    let block_idx = sector_cursor / (cache.sectors_per_block as u64);
-                    let sector_in_block =
-                        (sector_cursor % (cache.sectors_per_block as u64)) as usize;
-
-                    let sectors_left_in_block = cache.sectors_per_block - sector_in_block;
-                    let sectors_to_clear = if remaining_sectors < sectors_left_in_block {
-                        remaining_sectors
-                    } else {
-                        sectors_left_in_block
-                    };
-
-                    let entry_idx = match cache.map.get(&block_idx) {
-                        Some(x) => *x,
-                        None => {
-                            remaining_sectors -= sectors_to_clear;
-                            sector_cursor = sector_cursor
-                                .checked_add(sectors_to_clear as u64)
-                                .ok_or(CacheError::RangeOverflow)?;
-                            continue;
-                        }
-                    };
-
-                    let ei = entry_idx as usize;
+                for seg in &segments {
+                    let ei = seg.entry_idx as usize;
                     if ei >= cache.entries.len() {
-                        return Err(CacheError::InternalInconsistent);
+                        continue;
                     }
 
-                    let should_evict = {
-                        let ent = &mut cache.entries[ei];
-                        if !ent.in_use || ent.block_idx != block_idx {
-                            return Err(CacheError::InternalInconsistent);
+                    let ent = &mut cache.entries[ei];
+                    if !ent.in_use || ent.block_idx != seg.block_idx {
+                        ent.flushing = false;
+                        continue;
+                    }
+
+                    if ent.generation != seg.entry_gen {
+                        ent.flushing = false;
+                        continue;
+                    }
+
+                    mask_clear_range(
+                        &mut ent.dirty,
+                        seg.start_sector,
+                        seg.start_sector + seg.sector_count,
+                    );
+
+                    let mut still_dirty = false;
+                    let mut w = 0usize;
+                    while w < MASK_WORDS {
+                        if ent.dirty[w] != 0 {
+                            still_dirty = true;
+                            break;
                         }
+                        w += 1;
+                    }
 
-                        mask_clear_range(
-                            &mut ent.dirty,
-                            sector_in_block,
-                            sector_in_block + sectors_to_clear,
-                        );
-
-                        let mut still_dirty = false;
-                        let mut w = 0usize;
-                        while w < MASK_WORDS {
-                            if ent.dirty[w] != 0 {
-                                still_dirty = true;
-                                break;
+                    if !still_dirty {
+                        if let Some(removed_entry_idx) = cache.map.remove(&seg.block_idx) {
+                            let removed_ei = removed_entry_idx as usize;
+                            if removed_ei < cache.entries.len() {
+                                cache.entries[removed_ei].reset();
+                                cache.free.push(removed_entry_idx);
                             }
-                            w += 1;
                         }
-
-                        !still_dirty
-                    };
-
-                    if should_evict && let Some(removed_entry_idx) = cache.map.remove(&block_idx) {
-                        let removed_ei = removed_entry_idx as usize;
-                        if removed_ei >= cache.entries.len() {
-                            return Err(CacheError::InternalInconsistent);
-                        }
-                        cache.entries[removed_ei].reset();
-                        cache.free.push(removed_entry_idx);
+                    } else {
+                        ent.flushing = false;
                     }
+                }
 
-                    remaining_sectors -= sectors_to_clear;
-                    sector_cursor = sector_cursor
-                        .checked_add(sectors_to_clear as u64)
-                        .ok_or(CacheError::RangeOverflow)?;
+                for seg in &segments {
+                    let ei = seg.entry_idx as usize;
+                    if ei < cache.entries.len() && cache.entries[ei].in_use {
+                        cache.entries[ei].flushing = false;
+                    }
                 }
             }
         }
