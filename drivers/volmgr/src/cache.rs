@@ -17,6 +17,13 @@ pub trait CacheIndex<V>: Send {
     fn for_each<FN>(&self, f: FN)
     where
         FN: FnMut(u64, &V);
+
+    /// Visit up to `limit` entries starting at logical position `start`.
+    /// Returns the number of entries walked (<= limit). Ordering follows the
+    /// underlying index iteration order.
+    fn for_each_chunk<FN>(&self, start: usize, limit: usize, f: FN) -> usize
+    where
+        FN: FnMut(u64, &V);
 }
 
 pub trait CacheIndexFactory<V>: Clone + Send + Sync + 'static {
@@ -95,6 +102,25 @@ where
         for (k, v) in self.inner.iter() {
             f(*k, v);
         }
+    }
+
+    #[inline]
+    fn for_each_chunk<FN>(&self, start: usize, limit: usize, mut f: FN) -> usize
+    where
+        FN: FnMut(u64, &V),
+    {
+        let mut walked = 0usize;
+        for (idx, (k, v)) in self.inner.iter().enumerate() {
+            if idx < start {
+                continue;
+            }
+            if walked >= limit {
+                break;
+            }
+            walked += 1;
+            f(*k, v);
+        }
+        walked
     }
 }
 

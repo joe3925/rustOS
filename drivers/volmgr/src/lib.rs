@@ -10,6 +10,8 @@ use crate::alloc::vec;
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
+use kernel_api::async_ffi::FfiFuture;
+use kernel_api::async_ffi::FutureExt;
 
 use futures::future::BoxFuture;
 
@@ -48,7 +50,7 @@ mod cache_core;
 mod cache_traits;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
-const BLOCK_SIZE: usize = 512;
+const BLOCK_SIZE: usize = 1024 * 16;
 
 struct CacheBackend {
     target: IoTarget,
@@ -63,12 +65,8 @@ impl CacheBackend {
 impl VolumeCacheBackend for CacheBackend {
     type Error = DriverStatus;
 
-    fn read_block<'a>(
-        &'a self,
-        lba: u64,
-        out: &'a mut [u8],
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move {
+    fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
             let offset = lba * BLOCK_SIZE as u64;
             let len = out.len();
             let mut req = RequestHandle::new(
@@ -84,15 +82,12 @@ impl VolumeCacheBackend for CacheBackend {
             let data = guard.data_slice();
             out.copy_from_slice(&data[..len]);
             Ok(())
-        })
+        }
+        .into_ffi()
     }
 
-    fn write_block<'a>(
-        &'a self,
-        lba: u64,
-        data: &'a [u8],
-    ) -> BoxFuture<'a, Result<(), Self::Error>> {
-        Box::pin(async move {
+    fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
             let offset = lba * BLOCK_SIZE as u64;
             let len = data.len();
             let buf = RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice());
@@ -110,11 +105,12 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(status);
             }
             Ok(())
-        })
+        }
+        .into_ffi()
     }
 
-    fn flush_device(&self) -> BoxFuture<'_, Result<(), Self::Error>> {
-        Box::pin(async move {
+    fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
             let mut req = RequestHandle::new(RequestType::Flush, RequestData::empty());
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_send_request(self.target.clone(), &mut req).await;
@@ -122,7 +118,8 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(status);
             }
             Ok(())
-        })
+        }
+        .into_ffi()
     }
 }
 
@@ -329,11 +326,10 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         let pdx = ext::<VolPdoExt>(&pdo);
         let tgt_clone = tgt.clone();
         pdx.backing.call_once(|| tgt);
-        pdx.part
-            .call_once(|| dx.part.get().unwrap().clone());
+        pdx.part.call_once(|| dx.part.get().unwrap().clone());
 
         let backend = Arc::new(CacheBackend::new(tgt_clone));
-        let cfg = CacheConfig::new(8192); // 4MB cache (8192 x 512-byte blocks)
+        let cfg = CacheConfig::new(1024 * 1024 * 20 / BLOCK_SIZE);
         if let Ok(cache) = VolCache::new(backend, cfg) {
             pdx.cache.call_once(|| Arc::new(cache));
         }
