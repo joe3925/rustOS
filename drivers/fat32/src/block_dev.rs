@@ -1,6 +1,7 @@
 use alloc::{vec, vec::Vec};
 use core::cmp::min;
 
+use core::sync::atomic::Ordering;
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
@@ -10,6 +11,8 @@ use kernel_api::{
     runtime::block_on,
     status::DriverStatus,
 };
+
+use crate::volume::VolCtrlDevExt;
 
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
@@ -347,6 +350,13 @@ impl Write for BlockDev {
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
+        let ext = self.volume.try_devext::<VolCtrlDevExt>();
+        if let Some(ext) = ext.ok() {
+            ext.should_flush.store(true, Ordering::SeqCst);
+        } else {
+            return Err(());
+        }
+
         Ok(())
     }
 }

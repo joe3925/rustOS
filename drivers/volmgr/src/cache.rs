@@ -637,151 +637,122 @@ impl VolumeCache {
         Ok(())
     }
 
-    /// Async wrapper that stages evictions, copies evicted bytes outside the
-    /// write lock, then performs the clean fill.
+    /// Async wrapper that stages evictions, copies evicted bytes, finalizes,
+    /// and performs the clean fill — all under a single write lock to prevent
+    /// TOCTOU races with concurrent dirty writes.
     pub async fn fill_clean_async(
         cache_lock: &AsyncRwLock<Self>,
         offset: u64,
         data: &[u8],
     ) -> Result<Vec<EvictedEntry>, CacheError> {
+        let mut cache = cache_lock.write().await;
+
+        if cache.block_size == 0 {
+            return Err(CacheError::NotConfigured);
+        }
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !offset.is_multiple_of(cache.sector_size as u64)
+            || !data.len().is_multiple_of(cache.sector_size)
         {
-            let cache = cache_lock.read().await;
-            if cache.block_size == 0 {
-                return Err(CacheError::NotConfigured);
+            return Err(CacheError::UnalignedRange);
+        }
+
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(CacheError::RangeOverflow)?;
+
+        let bs_u64 = cache.block_size as u64;
+        let first = offset / bs_u64;
+        let last = (end - 1) / bs_u64;
+
+        let mut needed_new = 0usize;
+        let mut b = first;
+        while b <= last {
+            if !cache.map.contains_key(&b) {
+                needed_new += 1;
             }
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
-            if !offset.is_multiple_of(cache.sector_size as u64)
-                || !data.len().is_multiple_of(cache.sector_size)
-            {
-                return Err(CacheError::UnalignedRange);
+            b = b.wrapping_add(1);
+            if b == 0 {
+                return Err(CacheError::RangeOverflow);
             }
         }
 
-        // Stage evictions under the write lock.
-        let staged = {
-            let mut cache = cache_lock.write().await;
-
-            let end = offset
-                .checked_add(data.len() as u64)
-                .ok_or(CacheError::RangeOverflow)?;
-
-            let bs_u64 = cache.block_size as u64;
-            let first = offset / bs_u64;
-            let last = (end - 1) / bs_u64;
-
-            let mut needed_new = 0usize;
-            let mut b = first;
-            while b <= last {
-                if !cache.map.contains_key(&b) {
-                    needed_new += 1;
-                }
-                b = b.wrapping_add(1);
-                if b == 0 {
-                    return Err(CacheError::RangeOverflow);
-                }
+        let free_len = cache.free.len();
+        if needed_new > free_len {
+            let missing = needed_new - free_len;
+            let staged = cache.stage_evictions(missing);
+            if staged.len() < missing {
+                return Err(CacheError::CacheFull);
             }
-
-            let mut staged = Vec::new();
-            let free_len = cache.free.len();
-            if needed_new > free_len {
-                let missing = needed_new - free_len;
-                staged = cache.stage_evictions(missing);
-                if staged.len() < missing {
-                    return Err(CacheError::CacheFull);
-                }
-            }
-            staged
-        };
-
-        // Copy evicted bytes and finalize in a single write lock acquisition.
-        let copied = {
-            let mut cache = cache_lock.write().await;
-            cache.copy_staged_data(&staged)
-        };
-
-        // Finalize and perform the fill with free slots available.
-        let evicted = {
-            let mut cache = cache_lock.write().await;
+            let copied = cache.copy_staged_data(&staged);
             let evicted = cache.finalize_evictions(copied);
             cache.fill_clean_no_evict(offset, data)?;
-            evicted
-        };
+            return Ok(evicted);
+        }
 
-        Ok(evicted)
+        cache.fill_clean_no_evict(offset, data)?;
+        Ok(Vec::new())
     }
 
-    /// Async wrapper that stages evictions, copies dirty bytes outside the
-    /// write lock, then performs the dirty upsert.
+    /// Async wrapper that stages evictions, copies dirty bytes, finalizes,
+    /// and performs the dirty upsert — all under a single write lock to prevent
+    /// TOCTOU races with concurrent operations.
     pub async fn upsert_dirty_async(
         cache_lock: &AsyncRwLock<Self>,
         offset: u64,
         data: &[u8],
     ) -> Result<Vec<EvictedEntry>, CacheError> {
+        let mut cache = cache_lock.write().await;
+
+        if cache.block_size == 0 {
+            return Err(CacheError::NotConfigured);
+        }
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !offset.is_multiple_of(cache.sector_size as u64)
+            || !data.len().is_multiple_of(cache.sector_size)
         {
-            let cache = cache_lock.read().await;
-            if cache.block_size == 0 {
-                return Err(CacheError::NotConfigured);
+            return Err(CacheError::UnalignedRange);
+        }
+
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(CacheError::RangeOverflow)?;
+
+        let bs_u64 = cache.block_size as u64;
+        let first = offset / bs_u64;
+        let last = (end - 1) / bs_u64;
+
+        let mut needed_new = 0usize;
+        let mut b = first;
+        while b <= last {
+            if !cache.map.contains_key(&b) {
+                needed_new += 1;
             }
-            if data.is_empty() {
-                return Ok(Vec::new());
-            }
-            if !offset.is_multiple_of(cache.sector_size as u64)
-                || !data.len().is_multiple_of(cache.sector_size)
-            {
-                return Err(CacheError::UnalignedRange);
+            b = b.wrapping_add(1);
+            if b == 0 {
+                return Err(CacheError::RangeOverflow);
             }
         }
 
-        let staged = {
-            let mut cache = cache_lock.write().await;
-
-            let end = offset
-                .checked_add(data.len() as u64)
-                .ok_or(CacheError::RangeOverflow)?;
-
-            let bs_u64 = cache.block_size as u64;
-            let first = offset / bs_u64;
-            let last = (end - 1) / bs_u64;
-
-            let mut needed_new = 0usize;
-            let mut b = first;
-            while b <= last {
-                if !cache.map.contains_key(&b) {
-                    needed_new += 1;
-                }
-                b = b.wrapping_add(1);
-                if b == 0 {
-                    return Err(CacheError::RangeOverflow);
-                }
+        let free_len = cache.free.len();
+        if needed_new > free_len {
+            let missing = needed_new - free_len;
+            let staged = cache.stage_evictions(missing);
+            if staged.len() < missing {
+                return Err(CacheError::CacheFull);
             }
-
-            let mut staged = Vec::new();
-            let free_len = cache.free.len();
-            if needed_new > free_len {
-                let missing = needed_new - free_len;
-                staged = cache.stage_evictions(missing);
-                if staged.len() < missing {
-                    return Err(CacheError::CacheFull);
-                }
-            }
-            staged
-        };
-
-        let copied = {
-            let mut cache = cache_lock.write().await;
-            cache.copy_staged_data(&staged)
-        };
-
-        let evicted = {
-            let mut cache = cache_lock.write().await;
+            let copied = cache.copy_staged_data(&staged);
             let evicted = cache.finalize_evictions(copied);
             cache.upsert_dirty_no_evict(offset, data)?;
-            evicted
-        };
+            return Ok(evicted);
+        }
 
-        Ok(evicted)
+        cache.upsert_dirty_no_evict(offset, data)?;
+        Ok(Vec::new())
     }
 
     pub fn dirty_bytes(&self) -> usize {
@@ -1041,10 +1012,11 @@ impl VolumeCache {
         self.evicted_run_scratch = v;
     }
 
-    /// Spawn a fire-and-forget write task for each coalesced evicted run.
+    /// Write all coalesced evicted runs to disk, awaiting completion.
     /// Must be called **after** releasing the cache write lock.
     /// Returns the drained Vec shell for recycling via `recycle_evicted_scratch`.
-    pub fn spawn_evicted_writes(mut runs: Vec<EvictedRun>, tgt: IoTarget) -> Vec<EvictedRun> {
+    pub async fn write_evicted_runs(mut runs: Vec<EvictedRun>, tgt: IoTarget) -> Vec<EvictedRun> {
+        let mut handles = Vec::new();
         for run in runs.drain(..) {
             if run.data.is_empty() {
                 continue;
@@ -1052,7 +1024,7 @@ impl VolumeCache {
             let tgt_clone = tgt.clone();
             let start = run.start_offset;
             let data = run.data;
-            spawn_detached(async move {
+            handles.push(spawn(async move {
                 let write_len = data.len();
 
                 let mut write_req = RequestHandle::new(
@@ -1065,7 +1037,10 @@ impl VolumeCache {
                 );
 
                 let _ = pnp_send_request(tgt_clone, &mut write_req).await;
-            });
+            }));
+        }
+        for handle in handles {
+            handle.await;
         }
         runs
     }
@@ -1295,31 +1270,18 @@ impl VolumeCache {
                         sectors_per_block
                     };
 
-                    let mut remove_block: Option<u64> = None;
                     {
                         let ent = &mut cache.entries[entry_idx];
 
                         if run_ok && ent.generation == ent.flushing_gen {
                             mask_clear_range(&mut ent.dirty, start_sector, end_sector);
-
-                            let fully_clean = ent.dirty.iter().all(|&w| w == 0);
-                            if fully_clean {
-                                remove_block = Some(ent.block_idx);
-                            }
                         }
 
                         ent.flushing = false;
                         ent.flushing_gen = 0;
-                    }
-
-                    if let Some(blk) = remove_block {
-                        if let Some(removed) = cache.map.remove(&blk) {
-                            let removed_ei = removed as usize;
-                            if removed_ei < cache.entries.len() {
-                                cache.entries[removed_ei].reset();
-                                cache.free.push(removed);
-                            }
-                        }
+                        // Keep fully-clean entries in the cache — they are
+                        // still valuable for read hits. The CLOCK eviction
+                        // policy will reclaim them when space is needed.
                     }
                 }
             }

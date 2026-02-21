@@ -323,19 +323,40 @@ pub async fn vol_pdo_read<'a, 'b>(
             }
 
             // Fill cache with the data we just read; evict cold entries if needed.
+            // We must await evicted writes BEFORE filling, so the disk is
+            // up-to-date before we treat the disk data as authoritative for
+            // non-dirty sectors.
             let data: alloc::vec::Vec<u8> = req.read().data_slice()[..len].to_vec();
-            let fill_result = cache::VolumeCache::fill_clean_async(cache_lock, offset, &data).await;
-            match fill_result {
+            let fill_ok = match cache::VolumeCache::fill_clean_async(cache_lock, offset, &data).await {
                 Ok(evicted) => {
                     flush_evicted_entries(cache_lock, evicted, tgt.clone()).await;
+                    true
                 }
                 Err(cache::CacheError::CacheFull) => {
                     // All entries were flushing; nudge the coordinator.
                     if should_flush(cache_lock, len).await {
                         try_spawn_flush(&dev, tgt);
                     }
+                    false
                 }
-                Err(_) => {}
+                Err(_) => false,
+            };
+
+            // Now that fill_clean_async merged disk data with dirty sectors
+            // in the cache (skipping dirty sectors), re-read from the cache
+            // to get the correct merged view (dirty writes + clean disk data).
+            // Only attempt this if the fill succeeded; otherwise the disk
+            // data already in the request buffer is the best we have.
+            if fill_ok {
+                let cache = cache_lock.read().await;
+                let mut w = req.write();
+                let dst = &mut w.data_slice_mut()[..len];
+                if cache.lookup(offset, dst).is_err() {
+                    // Lookup failed (e.g. entry was evicted between fill and
+                    // here). Restore the original disk data so we don't return
+                    // a partially-overwritten buffer.
+                    dst.copy_from_slice(&data);
+                }
             }
 
             return DriverStep::complete(status);
@@ -495,7 +516,7 @@ async fn vol_pdo_query_resources<'a, 'b>(
 // ---------------------------------------------------------------------------
 
 /// Coalesce evicted entries into contiguous runs under the write lock,
-/// then spawn fire-and-forget write tasks after releasing it.
+/// then write them to disk and await completion before returning.
 async fn flush_evicted_entries(
     cache_lock: &AsyncRwLock<cache::VolumeCache>,
     evicted: Vec<cache::EvictedEntry>,
@@ -505,7 +526,7 @@ async fn flush_evicted_entries(
         let mut cache = cache_lock.write().await;
         cache.coalesce_evicted(evicted)
     };
-    let shell = cache::VolumeCache::spawn_evicted_writes(runs, tgt);
+    let shell = cache::VolumeCache::write_evicted_runs(runs, tgt).await;
     {
         let mut cache = cache_lock.write().await;
         cache.recycle_evicted_scratch(shell);

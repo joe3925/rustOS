@@ -389,10 +389,6 @@ impl core::future::Future for IrqWaitFuture {
 
             if state.pending_signals > 0 {
                 state.pending_signals -= 1;
-                if this.waiter.enqueued {
-                    let _ = state.waiters.remove(node_ptr);
-                    this.waiter.enqueued = false;
-                }
                 let meta = state.last_meta;
                 return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, 1));
             }

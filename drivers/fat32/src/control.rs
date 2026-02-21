@@ -1,6 +1,6 @@
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::ToString, sync::Arc, vec::Vec};
 use core::mem::{align_of, size_of};
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
 use spin::RwLock;
 
@@ -158,6 +158,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
                         volume_target: id.volume_fdo.clone(),
+                        should_flush: AtomicBool::new(false),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);

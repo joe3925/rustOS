@@ -2188,14 +2188,6 @@ pub async fn bench_c_drive_io_async() {
     for &chunk_sz in DISK_BENCH_SIZES {
         let ops = (DISK_BENCH_TOTAL_BYTES / chunk_sz).max(1);
 
-        if let Err(e) = file.set_len(0).await {
-            println!(
-                "[disk-bench] reset length failed for size {}: {:?}",
-                chunk_sz, e
-            );
-            continue;
-        }
-
         let mut chunk = vec![0u8; chunk_sz];
 
         let sw_write = Stopwatch::start();

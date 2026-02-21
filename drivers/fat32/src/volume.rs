@@ -3,7 +3,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 
@@ -49,6 +49,7 @@ pub struct VolCtrlDevExt {
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
+    pub should_flush: AtomicBool,
 }
 
 pub struct FileCtx {
@@ -109,10 +110,10 @@ fn handle_seek_request(
     dev: &Arc<DeviceObject>,
     req: &mut RequestHandle<'_>,
     _fs: &mut Fs,
-) -> (DriverStatus, bool) {
+) -> DriverStatus {
     let params: FsSeekParams = match take_typed_params::<FsSeekParams>(req) {
         Ok(p) => p,
-        Err(st) => return (st, false),
+        Err(st) => return st,
     };
 
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
@@ -146,14 +147,14 @@ fn handle_seek_request(
             error: Some(e),
         }),
     }
-    (DriverStatus::Success, false)
+    DriverStatus::Success
 }
 
 fn handle_fs_request(
     dev: &Arc<DeviceObject>,
     req: &mut RequestHandle<'_>,
     fs: &mut Fs,
-) -> (DriverStatus, bool) {
+) -> DriverStatus {
     let kind = { req.read().kind };
 
     match kind {
@@ -164,7 +165,7 @@ fn handle_fs_request(
                 FsOp::Open => {
                     let params: FsOpenParams = match take_typed_params::<FsOpenParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let path_str = params.path.as_str();
@@ -211,7 +212,7 @@ fn handle_fs_request(
                                 size: 0,
                                 error: Some(map_fatfs_err(&e)),
                             });
-                            return (DriverStatus::Success, false);
+                            return DriverStatus::Success;
                         }
                     };
 
@@ -222,13 +223,13 @@ fn handle_fs_request(
                         size,
                         error: None,
                     });
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Close => {
                     let params: FsCloseParams = match take_typed_params::<FsCloseParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -243,13 +244,13 @@ fn handle_fs_request(
                     let mut r = req.write();
                     let res = FsCloseResult { error: err };
                     r.set_data_t(res);
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Read => {
                     let params: FsReadParams = match take_typed_params::<FsReadParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let data_or_err = {
@@ -295,15 +296,14 @@ fn handle_fs_request(
                             error: Some(status),
                         }),
                     }
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Write => {
                     let params: FsWriteParams = match take_typed_params::<FsWriteParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
-                    let write_through = params.write_through;
 
                     let write_res: Result<usize, FileStatus> = {
                         let tbl = vdx.table.read();
@@ -317,10 +317,16 @@ fn handle_fs_request(
                                         Err(map_fatfs_err(&e))
                                     } else {
                                         match file.write_all(&params.data) {
-                                            Ok(()) => match file.flush() {
-                                                Ok(()) => Ok(n),
-                                                Err(e) => Err(map_fatfs_err(&e)),
-                                            },
+                                            Ok(()) => {
+                                                if params.write_through {
+                                                    match file.flush() {
+                                                        Ok(()) => Ok(n),
+                                                        Err(e) => Err(map_fatfs_err(&e)),
+                                                    }
+                                                } else {
+                                                    Ok(n)
+                                                }
+                                            }
                                             Err(e) => Err(map_fatfs_err(&e)),
                                         }
                                     }
@@ -329,8 +335,6 @@ fn handle_fs_request(
                             },
                         }
                     };
-
-                    let needs_flush = write_through && write_res.is_ok();
 
                     // Update position/size on success
                     if let Ok(written) = write_res {
@@ -356,7 +360,7 @@ fn handle_fs_request(
                         }),
                     }
 
-                    (DriverStatus::Success, needs_flush)
+                    DriverStatus::Success
                 }
 
                 FsOp::Seek => handle_seek_request(dev, req, fs),
@@ -364,7 +368,7 @@ fn handle_fs_request(
                 FsOp::Flush => {
                     let params: FsFlushParams = match take_typed_params::<FsFlushParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -381,13 +385,13 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     r.set_data_t(FsFlushResult { error: err });
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Create => {
                     let params: FsCreateParams = match take_typed_params::<FsCreateParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -399,13 +403,13 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     r.set_data_t(FsCreateResult { error: err });
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Rename => {
                     let params: FsRenameParams = match take_typed_params::<FsRenameParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let err = match rename_entry(&mut *fs, &params.src, &params.dst) {
@@ -423,13 +427,13 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     r.set_data_t(FsRenameResult { error: err });
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::ReadDir => {
                     let params: FsListDirParams = match take_typed_params::<FsListDirParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let names_or_err = { list_names(&mut *fs, &params.path) };
@@ -442,13 +446,13 @@ fn handle_fs_request(
                             error: Some(map_fatfs_err(&e)),
                         }),
                     }
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::GetInfo => {
                     let params: FsGetInfoParams = match take_typed_params::<FsGetInfoParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let result = {
@@ -462,7 +466,7 @@ fn handle_fs_request(
                                     attrs: 0,
                                     error: Some(FileStatus::PathNotFound),
                                 });
-                                return (DriverStatus::Success, false);
+                                return DriverStatus::Success;
                             }
                             Some(ctx) if ctx.is_dir => {
                                 Ok((true, 0u64, u8::from(FileAttribute::Directory)))
@@ -490,13 +494,13 @@ fn handle_fs_request(
                             });
                         }
                     }
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::SetLen => {
                     let params: FsSetLenParams = match take_typed_params::<FsSetLenParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
 
                     let err = {
@@ -531,15 +535,14 @@ fn handle_fs_request(
                             }
                         }
                     }
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
                 FsOp::Append => {
                     let params: FsAppendParams = match take_typed_params::<FsAppendParams>(req) {
                         Ok(p) => p,
-                        Err(st) => return (st, false),
+                        Err(st) => return st,
                     };
-                    let write_through = params.write_through;
 
                     let result: Result<(usize, u64), FileStatus> = {
                         let tbl = vdx.table.read();
@@ -553,10 +556,16 @@ fn handle_fs_request(
                                         Ok(_) => {
                                             let n = params.data.len();
                                             match file.write_all(&params.data) {
-                                                Ok(()) => match file.flush() {
-                                                    Ok(()) => Ok((n, start_off + n as u64)),
-                                                    Err(e) => Err(map_fatfs_err(&e)),
-                                                },
+                                                Ok(()) => {
+                                                    if params.write_through {
+                                                        match file.flush() {
+                                                            Ok(()) => Ok((n, start_off + n as u64)),
+                                                            Err(e) => Err(map_fatfs_err(&e)),
+                                                        }
+                                                    } else {
+                                                        Ok((n, start_off + n as u64))
+                                                    }
+                                                }
                                                 Err(e) => Err(map_fatfs_err(&e)),
                                             }
                                         }
@@ -567,8 +576,6 @@ fn handle_fs_request(
                             },
                         }
                     };
-
-                    let needs_flush = write_through && result.is_ok();
 
                     // Update position/size on success
                     if let Ok((_, new_size)) = result {
@@ -592,14 +599,14 @@ fn handle_fs_request(
                             error: Some(status),
                         }),
                     }
-                    (DriverStatus::Success, needs_flush)
+                    DriverStatus::Success
                 }
 
                 FsOp::ZeroRange => {
                     let params: FsZeroRangeParams =
                         match take_typed_params::<FsZeroRangeParams>(req) {
                             Ok(p) => p,
-                            Err(st) => return (st, false),
+                            Err(st) => return st,
                         };
 
                     let err = {
@@ -642,14 +649,14 @@ fn handle_fs_request(
 
                     let mut r = req.write();
                     r.set_data_t(FsZeroRangeResult { error: err });
-                    (DriverStatus::Success, false)
+                    DriverStatus::Success
                 }
 
-                FsOp::SetInfo | FsOp::Delete => (DriverStatus::NotImplemented, false),
+                FsOp::SetInfo | FsOp::Delete => DriverStatus::NotImplemented,
             }
         }
-        RequestType::DeviceControl(_) => (DriverStatus::NotImplemented, false),
-        _ => (DriverStatus::InvalidParameter, false),
+        RequestType::DeviceControl(_) => DriverStatus::NotImplemented,
+        _ => DriverStatus::InvalidParameter,
     }
 }
 
@@ -664,20 +671,19 @@ pub async fn fs_op_dispatch<'a, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let (fs_arc, volume_target) = {
-        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-        (vdx.fs.clone(), vdx.volume_target.clone())
-    };
+    let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+    let fs_arc = vdx.fs.clone();
+    let volume_target = vdx.volume_target.clone();
     let mut fs_guard = fs_arc.lock_owned().await;
 
-    let (status, needs_flush_dirty) = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+    let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         handle_seek_request(&dev, req, &mut fs_guard)
     } else {
         // Todo: change this to spawn blocking when I fix request promotion
         handle_fs_request(&dev, req, &mut fs_guard)
     };
 
-    if needs_flush_dirty {
+    if vdx.should_flush.swap(false, Ordering::AcqRel) && false {
         let _ = send_flush_dirty(&volume_target).await;
     }
 

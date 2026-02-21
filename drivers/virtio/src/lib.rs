@@ -14,7 +14,8 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
 
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
@@ -37,7 +38,7 @@ use kernel_api::pnp::{
 };
 use kernel_api::request::{RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
-use kernel_api::util::panic_common;
+use kernel_api::util::{panic_common, wait_duration};
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::Mutex;
@@ -56,6 +57,10 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const INVALID_HEAD: u16 = 0xFFFF;
+const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 20;
+
+// Configurable busy-spin duration before blocking on interrupts.
+static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
 
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
     {
@@ -725,6 +730,26 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
     }
 }
 
+/// Update the spin duration (in nanoseconds) performed before waiting on an interrupt.
+/// Setting this to 0 disables pre-wait spinning.
+pub fn set_wait_spin_ns(ns: u64) {
+    SPIN_BEFORE_WAIT_NS.store(ns, Ordering::Relaxed);
+}
+
+#[inline]
+fn current_spin_ns() -> u64 {
+    SPIN_BEFORE_WAIT_NS.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn spin_for_ns(ns: u64) {
+    if ns == 0 {
+        return;
+    }
+
+    wait_duration(Duration::from_nanos(ns));
+}
+
 async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverStatus> {
     let meta = IrqMeta {
         tag: 0,
@@ -732,9 +757,6 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
     };
 
     let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
-
-    let mut spins: u32 = 0;
-    const SPIN_BEFORE_WAIT: u32 = 0;
 
     loop {
         let epoch_before = qs.drain_epoch();
@@ -751,7 +773,6 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             let drained = qs.drain_used_to_completions_lockfree();
             if drained > 0 {
                 made_progress = true;
-                spins = 0;
 
                 if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                     let waiters = qs.waiting_tasks.load(Ordering::Acquire);
@@ -782,17 +803,18 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
 
         let epoch_after = qs.drain_epoch();
         if epoch_after != epoch_before {
-            spins = 0;
             continue;
         }
 
-        if spins < SPIN_BEFORE_WAIT {
-            spins += 1;
-            spin_loop();
-            continue;
-        }
+        let spin_ns = current_spin_ns();
+        if spin_ns > 0 {
+            spin_for_ns(spin_ns);
 
-        spins = 0;
+            if let Some(len) = qs.take_completion(head) {
+                qs.defer_free_chain(head);
+                return Ok(len);
+            }
+        }
 
         if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
             let wait_result = irq_handle.wait(meta).await;
