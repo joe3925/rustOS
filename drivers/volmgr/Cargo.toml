@@ -29,3 +29,4 @@ bitflags = "2.6.0"
 futures = { version = "0.3", default-features = false, features = ["alloc"] }
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
 heapless = { version = "0.9", default-features = false }
+schnellru = "0.2.4"

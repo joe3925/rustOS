@@ -19,6 +19,8 @@
 #![feature(adt_const_params)]
 #![feature(pointer_is_aligned_to)]
 #![feature(linked_list_cursors)]
+#![allow(async_fn_in_trait)]
+
 extern crate alloc;
 
 pub mod gdt;
@@ -134,7 +136,7 @@ fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     if let Some(low_part) = need_insert {
         if let Some(idx) = free_idx {
             regions[idx] = low_part;
-        } 
+        }
     }
 
     if !tagged_any {

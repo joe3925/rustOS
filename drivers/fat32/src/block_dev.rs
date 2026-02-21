@@ -1,7 +1,8 @@
 use alloc::{vec, vec::Vec};
 use core::cmp::min;
 
-use core::sync::atomic::Ordering;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
@@ -11,8 +12,6 @@ use kernel_api::{
     runtime::block_on,
     status::DriverStatus,
 };
-
-use crate::volume::VolCtrlDevExt;
 
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
@@ -51,6 +50,8 @@ pub struct BlockDev {
     read_request: PreallocatedRequest,
     /// Pre-allocated request for write operations
     write_request: PreallocatedRequest,
+    /// Shared flush flag with VolCtrlDevExt
+    pub(crate) should_flush: Arc<AtomicBool>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -71,7 +72,7 @@ impl IoBase for BlockDev {
 }
 
 impl BlockDev {
-    pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64) -> Self {
+    pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64, should_flush: Arc<AtomicBool>) -> Self {
         Self {
             volume,
             sector_size,
@@ -80,6 +81,7 @@ impl BlockDev {
             sector_buf: vec![0u8; sector_size as usize],
             read_request: PreallocatedRequest::new(),
             write_request: PreallocatedRequest::new(),
+            should_flush,
         }
     }
 
@@ -350,13 +352,7 @@ impl Write for BlockDev {
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        let ext = self.volume.try_devext::<VolCtrlDevExt>();
-        if let Some(ext) = ext.ok() {
-            ext.should_flush.store(true, Ordering::SeqCst);
-        } else {
-            return Err(());
-        }
-
+        self.should_flush.store(true, Ordering::SeqCst);
         Ok(())
     }
 }

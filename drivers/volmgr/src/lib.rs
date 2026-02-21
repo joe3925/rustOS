@@ -2,19 +2,19 @@
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+#![allow(async_fn_in_trait)]
+
 extern crate alloc;
 
 use crate::alloc::vec;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
-use kernel_api::irq::apic_cpu_ids;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::async_types::AsyncRwLock;
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -39,9 +39,10 @@ use kernel_api::status::DriverStatus;
 
 use spin::Once;
 
-static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
-
 mod cache;
+mod cache_core;
+mod cache_traits;
+static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -66,10 +67,6 @@ pub fn ext<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 struct VolPdoExt {
     backing: Once<IoTarget>,
     part: Once<PartitionInfo>,
-    cache: Once<AsyncRwLock<cache::VolumeCache>>,
-    caching_enabled: AtomicBool,
-    flush_running: AtomicBool,
-    max_inflight: Once<usize>,
 }
 
 impl Default for VolPdoExt {
@@ -77,10 +74,6 @@ impl Default for VolPdoExt {
         Self {
             backing: Once::new(),
             part: Once::new(),
-            cache: Once::new(),
-            caching_enabled: AtomicBool::new(false),
-            flush_running: AtomicBool::new(false),
-            max_inflight: Once::new(),
         }
     }
 }
@@ -250,20 +243,6 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         ext::<VolPdoExt>(&pdo)
             .part
             .call_once(|| dx.part.get().unwrap().clone());
-        ext::<VolPdoExt>(&pdo)
-            .caching_enabled
-            .store(true, Ordering::Release);
-
-        let sector_size = pi.disk.physical_block_size as usize;
-
-        ext::<VolPdoExt>(&pdo).cache.call_once(|| {
-            let mut c = cache::VolumeCache::new(20 * 1024 * 1024);
-            c.set_block_size(1024 * 64, sector_size).unwrap();
-            AsyncRwLock::new(c)
-        });
-        ext::<VolPdoExt>(&pdo)
-            .max_inflight
-            .call_once(|| 3 * apic_cpu_ids().len().max(0));
     }
 
     DriverStep::Continue
@@ -297,70 +276,6 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
-    }
-
-    let cache_enabled = ext::<VolPdoExt>(&dev)
-        .caching_enabled
-        .load(Ordering::Acquire);
-
-    if cache_enabled {
-        if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
-            // Fast path: cache hit
-            {
-                let cache = cache_lock.read().await;
-                let mut w = req.write();
-                let dst = &mut w.data_slice_mut()[..len];
-                if cache.lookup(offset, dst).is_ok() {
-                    w.status = DriverStatus::Success;
-                    return DriverStep::complete(DriverStatus::Success);
-                }
-            }
-
-            // Miss: forward to backing device
-            let status = pnp_send_request(tgt.clone(), req).await;
-            if status != DriverStatus::Success {
-                return DriverStep::complete(status);
-            }
-
-            // Fill cache with the data we just read; evict cold entries if needed.
-            // We must await evicted writes BEFORE filling, so the disk is
-            // up-to-date before we treat the disk data as authoritative for
-            // non-dirty sectors.
-            let data: alloc::vec::Vec<u8> = req.read().data_slice()[..len].to_vec();
-            let fill_ok = match cache::VolumeCache::fill_clean_async(cache_lock, offset, &data).await {
-                Ok(evicted) => {
-                    flush_evicted_entries(cache_lock, evicted, tgt.clone()).await;
-                    true
-                }
-                Err(cache::CacheError::CacheFull) => {
-                    // All entries were flushing; nudge the coordinator.
-                    if should_flush(cache_lock, len).await {
-                        try_spawn_flush(&dev, tgt);
-                    }
-                    false
-                }
-                Err(_) => false,
-            };
-
-            // Now that fill_clean_async merged disk data with dirty sectors
-            // in the cache (skipping dirty sectors), re-read from the cache
-            // to get the correct merged view (dirty writes + clean disk data).
-            // Only attempt this if the fill succeeded; otherwise the disk
-            // data already in the request buffer is the best we have.
-            if fill_ok {
-                let cache = cache_lock.read().await;
-                let mut w = req.write();
-                let dst = &mut w.data_slice_mut()[..len];
-                if cache.lookup(offset, dst).is_err() {
-                    // Lookup failed (e.g. entry was evicted between fill and
-                    // here). Restore the original disk data so we don't return
-                    // a partially-overwritten buffer.
-                    dst.copy_from_slice(&data);
-                }
-            }
-
-            return DriverStep::complete(status);
-        }
     }
 
     let status = pnp_send_request(tgt, req).await;
@@ -398,95 +313,25 @@ pub async fn vol_pdo_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let cache_enabled = ext::<VolPdoExt>(&dev)
-        .caching_enabled
-        .load(Ordering::Acquire);
-
-    if cache_enabled {
-        if let Some(cache_lock) = ext::<VolPdoExt>(&dev).cache.get() {
-            if !flush_write_through {
-                // Write-back: absorb into cache, evicting cold entries if needed.
-                let src_buf: alloc::vec::Vec<u8> = {
-                    let r = req.read();
-                    r.data_slice()[..len].to_vec()
-                };
-                match cache::VolumeCache::upsert_dirty_async(cache_lock, offset, &src_buf).await {
-                    Ok(evicted) => {
-                        flush_evicted_entries(cache_lock, evicted, tgt.clone()).await;
-                        let mut w = req.write();
-                        w.status = DriverStatus::Success;
-                        return DriverStep::complete(DriverStatus::Success);
-                    }
-                    Err(cache::CacheError::CacheFull) => {
-                        // All entries were flushing; fall through to write-through.
-                        if should_flush(cache_lock, len).await {
-                            try_spawn_flush(&dev, tgt.clone());
-                        }
-                    }
-                    Err(_) => {}
-                }
-            } else {
-                // Write-through: forward, then populate cache with the written data.
-                let status = pnp_send_request(tgt.clone(), req).await;
-                if status == DriverStatus::Success {
-                    let data: alloc::vec::Vec<u8> = req.read().data_slice()[..len].to_vec();
-                    match cache::VolumeCache::fill_clean_async(cache_lock, offset, &data).await {
-                        Ok(evicted) => {
-                            flush_evicted_entries(cache_lock, evicted, tgt.clone()).await;
-                        }
-                        Err(cache::CacheError::CacheFull) => {
-                            if should_flush(cache_lock, len).await {
-                                try_spawn_flush(&dev, tgt);
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                }
-                return DriverStep::complete(status);
-            }
-        }
-    }
-
     let status = pnp_send_request(tgt, req).await;
     DriverStep::complete(status)
-}
-
-/// Flush all dirty cache entries to the backing device (used by explicit Flush IRP).
-/// Bypasses the 50 MiB cap — drains everything.
-pub async fn flush_volume_cache(dev: &Arc<DeviceObject>) -> DriverStatus {
-    let dx = ext::<VolPdoExt>(dev);
-
-    let tgt = match dx.backing.get() {
-        Some(t) => t.clone(),
-        None => return DriverStatus::NoSuchDevice,
-    };
-
-    let cache_addr = match dx.cache.get() {
-        Some(c) => c as *const AsyncRwLock<cache::VolumeCache> as usize,
-        None => return DriverStatus::Success,
-    };
-
-    // Pass None for limit_bytes so the explicit flush drains everything.
-    // SAFETY: cache_addr points into VolPdoExt which is kept alive by the Arc<DeviceObject>
-    // that the caller holds, so it outlives this await.
-    match cache::VolumeCache::flush_dirty(cache_addr, tgt, None, *dx.max_inflight.get().unwrap())
-        .await
-    {
-        Ok(()) => DriverStatus::Success,
-        Err(_) => DriverStatus::Unsuccessful,
-    }
 }
 
 #[request_handler]
 pub async fn vol_pdo_flush<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let status = flush_volume_cache(dev).await;
-    if status != DriverStatus::Success {
-        return DriverStep::complete(status);
-    }
-    DriverStep::Continue
+    let tgt = {
+        let dx = ext::<VolPdoExt>(dev);
+        match dx.backing.get() {
+            Some(t) => t.clone(),
+            None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        }
+    };
+
+    let status = pnp_send_request(tgt, req).await;
+    DriverStep::complete(status)
 }
 
 #[request_handler]
@@ -509,61 +354,4 @@ async fn vol_pdo_query_resources<'a, 'b>(
     };
 
     DriverStep::complete(status)
-}
-
-// ---------------------------------------------------------------------------
-// Flush helpers (non-public, live here so lib.rs stays handler-only)
-// ---------------------------------------------------------------------------
-
-/// Coalesce evicted entries into contiguous runs under the write lock,
-/// then write them to disk and await completion before returning.
-async fn flush_evicted_entries(
-    cache_lock: &AsyncRwLock<cache::VolumeCache>,
-    evicted: Vec<cache::EvictedEntry>,
-    tgt: IoTarget,
-) {
-    let runs = {
-        let mut cache = cache_lock.write().await;
-        cache.coalesce_evicted(evicted)
-    };
-    let shell = cache::VolumeCache::write_evicted_runs(runs, tgt).await;
-    {
-        let mut cache = cache_lock.write().await;
-        cache.recycle_evicted_scratch(shell);
-    }
-}
-
-/// Returns true if a background flush should be triggered given the current
-/// cache state and the size of the incoming data that didn't fit.
-async fn should_flush(cache_lock: &AsyncRwLock<cache::VolumeCache>, incoming_len: usize) -> bool {
-    let cache = cache_lock.read().await;
-    let dirty = cache.dirty_bytes();
-    let dirty_runs = cache.dirty_run_hint();
-    let max_bytes = 20 * 1024 * 1024usize;
-    // Flush if more than 60% of the cache is dirty, dirty data >= incoming,
-    // or too many fragmented dirty runs (many small writes).
-    dirty >= incoming_len
-        || dirty * 100 / max_bytes > 60
-        || (dirty_runs > 16 && dirty * 4 >= max_bytes) // lots of runs and 25% full
-}
-
-/// Attempt to spawn a background flush coordinator. If one is already running,
-/// this is a no-op. The coordinator and all logic live in cache.rs.
-///
-/// # Safety
-/// Both pointers are derived from VolPdoExt fields that live as long as the
-/// Arc<DeviceObject>. The spawned coordinator task must not outlive the device.
-fn try_spawn_flush(dev: &Arc<DeviceObject>, tgt: IoTarget) {
-    let dx = ext::<VolPdoExt>(dev);
-    let cache_addr = match dx.cache.get() {
-        Some(c) => c as *const AsyncRwLock<cache::VolumeCache> as usize,
-        None => return,
-    };
-    let flush_addr = &dx.flush_running as *const AtomicBool as usize;
-    cache::VolumeCache::try_spawn_flush(
-        cache_addr,
-        tgt,
-        flush_addr,
-        dx.max_inflight.get().copied().unwrap(),
-    );
 }

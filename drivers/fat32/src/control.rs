@@ -141,9 +141,11 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
             let options = FsOptions::new().update_accessed_date(false).strict(false);
             let target_clone = id.volume_fdo.clone();
+            let should_flush = Arc::new(AtomicBool::new(false));
+            let should_flush_blk = should_flush.clone();
             let result = spawn_blocking(move || {
                 fatfs::FileSystem::new(
-                    BlockDev::new(target_clone, sector_size, total_sectors),
+                    BlockDev::new(target_clone, sector_size, total_sectors, should_flush_blk),
                     options,
                 )
             })
@@ -158,7 +160,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
                         volume_target: id.volume_fdo.clone(),
-                        should_flush: AtomicBool::new(false),
+                        should_flush,
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);

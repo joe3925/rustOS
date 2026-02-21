@@ -49,7 +49,7 @@ pub struct VolCtrlDevExt {
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
-    pub should_flush: AtomicBool,
+    pub should_flush: Arc<AtomicBool>,
 }
 
 pub struct FileCtx {
@@ -683,7 +683,7 @@ pub async fn fs_op_dispatch<'a, 'b>(
         handle_fs_request(&dev, req, &mut fs_guard)
     };
 
-    if vdx.should_flush.swap(false, Ordering::AcqRel) && false {
+    if vdx.should_flush.swap(false, Ordering::AcqRel) {
         let _ = send_flush_dirty(&volume_target).await;
     }
 
