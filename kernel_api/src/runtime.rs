@@ -11,17 +11,18 @@ use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
 use kernel_sys::{
-    kernel_spawn_blocking_raw, kernel_spawn_detached_ffi, kernel_spawn_ffi,
+    kernel_spawn_blocking_raw, kernel_spawn_detached_ffi, kernel_spawn_joinable_ffi,
     try_steal_blocking_one as sys_try_steal_blocking_one,
 };
-use kernel_types::async_ffi::{FfiWaker, FfiWakerVTable, FutureExt};
+use kernel_types::async_ffi::{FfiFuture, FfiWaker, FfiWakerVTable, FutureExt};
 
-/// Spawn an async task on the kernel executor (shared singleton in the kernel).
-pub fn spawn<F>(future: F)
+/// Spawn an async task on the kernel executor (shared singleton in the kernel) and
+/// return a join handle that can be awaited for completion.
+pub fn spawn<F>(future: F) -> FfiFuture<()>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    unsafe { kernel_spawn_ffi(future.into_ffi()) };
+    unsafe { kernel_spawn_joinable_ffi(future.into_ffi()) }
 }
 
 /// Spawn a detached async task (fire-and-forget).
@@ -32,7 +33,7 @@ where
     unsafe { kernel_spawn_detached_ffi(future.into_ffi()) };
 }
 
-/// Block the current thread until the future completes 
+/// Block the current thread until the future completes
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut ffi_fut = future.into_ffi();
     let ready = AtomicBool::new(false);
@@ -183,4 +184,3 @@ where
 pub fn try_steal_blocking_one() -> bool {
     unsafe { sys_try_steal_blocking_one() }
 }
-
