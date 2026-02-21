@@ -157,6 +157,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         fs: Arc::new(AsyncMutex::new(fs)),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
+                        volume_target: id.volume_fdo.clone(),
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);

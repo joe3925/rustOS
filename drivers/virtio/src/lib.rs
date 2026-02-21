@@ -457,8 +457,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let max_data_segments = core::cmp::min(
             blk::MAX_DESCRIPTORS_PER_REQUEST.saturating_sub(2),
             vq_capacity.saturating_sub(2),
-        )
-        .max(1);
+        );
 
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 

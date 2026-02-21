@@ -53,6 +53,10 @@ pub type EvtIoFs = for<'a, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
     &'b mut RequestHandle<'a>,
 ) -> FfiFuture<DriverStep>;
+pub type EvtIoFlush = for<'a, 'b> extern "win64" fn(
+    &Arc<DeviceObject>,
+    &'b mut RequestHandle<'a>,
+) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
 pub type CompletionRoutine =

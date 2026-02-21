@@ -23,22 +23,22 @@
       "target modules load --file \"pci.dll\" .text 0xffff900002693000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/virtio.dll\"",
-      "target modules load --file \"virtio.dll\" .text 0xffff900012ab5000",
+      "target modules load --file \"virtio.dll\" .text 0xffff900012ab6000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/disk.dll\"",
-      "target modules load --file \"disk.dll\" .text 0xffff9000933f5000",
+      "target modules load --file \"disk.dll\" .text 0xffff9000141f6000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/partmgr.dll\"",
-      "target modules load --file \"partmgr.dll\" .text 0xffff90009360c000",
+      "target modules load --file \"partmgr.dll\" .text 0xffff90001440d000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/volmgr.dll\"",
-      "target modules load --file \"volmgr.dll\" .text 0xffff900093829000",
+      "target modules load --file \"volmgr.dll\" .text 0xffff90001462a000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/mountmgr.dll\"",
-      "target modules load --file \"mountmgr.dll\" .text 0xffff900093a52000",
+      "target modules load --file \"mountmgr.dll\" .text 0xffff90001485e000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/fat32.dll\"",
-      "target modules load --file \"fat32.dll\" .text 0xffff900093c8a000",
+      "target modules load --file \"fat32.dll\" .text 0xffff900014a96000",
     ],
     "sourceLanguages": ["rust"],
   },

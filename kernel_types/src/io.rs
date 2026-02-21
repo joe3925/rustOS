@@ -1,7 +1,7 @@
 use crate::device::DeviceObject;
 use crate::pnp::DriverStep;
 use crate::request::{RequestHandle, RequestType};
-use crate::{EvtIoDeviceControl, EvtIoFs, EvtIoRead, EvtIoWrite};
+use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
@@ -77,6 +77,7 @@ pub enum IoType {
     Write(EvtIoWrite),
     DeviceControl(EvtIoDeviceControl),
     Fs(EvtIoFs),
+    Flush(EvtIoFlush),
 }
 
 impl IoType {
@@ -87,6 +88,7 @@ impl IoType {
             IoType::Write(_) => 1,
             IoType::DeviceControl(_) => 2,
             IoType::Fs(_) => 3,
+            IoType::Flush(_) => 4,
         }
     }
 
@@ -103,6 +105,7 @@ impl IoType {
             }
             IoType::DeviceControl(h) => h(dev, handle).await,
             IoType::Fs(h) => h(dev, handle).await,
+            IoType::Flush(h) => h(dev, handle).await,
         }
     }
 
@@ -113,6 +116,7 @@ impl IoType {
             RequestType::Write { .. } => Some(1),
             RequestType::DeviceControl(_) => Some(2),
             RequestType::Fs(_) => Some(3),
+            RequestType::Flush | RequestType::FlushDirty => Some(4),
             _ => None,
         }
     }
@@ -152,7 +156,7 @@ pub struct IoVtable {
 impl IoVtable {
     #[inline]
     pub fn new() -> Self {
-        let n = 4;
+        let n = 5;
         Self {
             handlers: alloc::vec![None; n],
         }

@@ -8,7 +8,7 @@ use crate::static_handlers::{print, task_yield};
 use crate::structs::thread_pool::{Job as TpJob, ThreadPool};
 
 lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(1));
+    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(3));
     pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(1));
 }
 

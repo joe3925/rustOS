@@ -32,6 +32,8 @@ enum StorageMode {
     HeapTyped = 1,
     /// Data is heap-allocated as raw bytes (from Box<[u8]>, reconstruct on drop)
     HeapBytes = 2,
+    /// Data is borrowed from an external buffer (raw pointer, no deallocation)
+    BorrowedBytes = 3,
 }
 
 /// Aligned inline buffer for small data
@@ -177,6 +179,24 @@ impl RequestData {
         }
     }
 
+    /// Create a `RequestData` that borrows an external byte buffer.
+    ///
+    /// # Safety
+    /// The caller must guarantee that the memory region `[ptr, ptr + len)` remains
+    /// valid and readable for the entire lifetime of this `RequestData` and any
+    /// `RequestHandle` that contains it.
+    pub unsafe fn from_borrowed_bytes(ptr: *const u8, len: usize) -> Self {
+        Self {
+            inline: InlineBuffer::new(),
+            heap_ptr: ptr as *mut u8,
+            heap_layout: Layout::new::<()>(),
+            tag: None,
+            dropper: noop_dropper,
+            size: len,
+            mode: StorageMode::BorrowedBytes,
+        }
+    }
+
     pub fn from_t<T: 'static>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
@@ -245,7 +265,7 @@ impl RequestData {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts(self.inline.as_ptr(), self.size)
             },
-            StorageMode::HeapTyped | StorageMode::HeapBytes => {
+            StorageMode::HeapTyped | StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
                 if self.heap_ptr.is_null() {
                     &[]
                 } else {
@@ -261,7 +281,7 @@ impl RequestData {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size)
             },
-            StorageMode::HeapTyped | StorageMode::HeapBytes => {
+            StorageMode::HeapTyped | StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
                 if self.heap_ptr.is_null() {
                     &mut []
                 } else {
@@ -283,7 +303,7 @@ impl RequestData {
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
             StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes => return None, // Can't view bytes as typed
+            StorageMode::HeapBytes | StorageMode::BorrowedBytes => return None,
         };
 
         if ptr.is_null() {
@@ -301,7 +321,7 @@ impl RequestData {
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
             StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes => return None, // Can't view bytes as typed
+            StorageMode::HeapBytes | StorageMode::BorrowedBytes => return None,
         };
 
         if ptr.is_null() {
@@ -339,7 +359,7 @@ impl RequestData {
 
                 value
             }
-            StorageMode::HeapBytes => {
+            StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
                 // Cannot take typed value from raw bytes
                 return None;
             }
@@ -407,6 +427,19 @@ impl RequestData {
                     }
                 }
             }
+            StorageMode::BorrowedBytes => {
+                // Must copy — we don't own the memory
+                if self.heap_ptr.is_null() || self.size == 0 {
+                    Box::new([])
+                } else {
+                    let mut vec = Vec::with_capacity(self.size);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(self.heap_ptr, vec.as_mut_ptr(), self.size);
+                        vec.set_len(self.size);
+                    }
+                    vec.into_boxed_slice()
+                }
+            }
         };
 
         // Reset to empty state
@@ -451,6 +484,9 @@ impl Drop for RequestData {
                     }
                 }
             }
+            StorageMode::BorrowedBytes => {
+                // Borrowed — caller owns the memory, nothing to free.
+            }
         }
     }
 }
@@ -479,6 +515,8 @@ pub enum RequestType {
         len: usize,
         flush_write_through: bool,
     },
+    Flush,
+    FlushDirty,
     DeviceControl(u32),
     Fs(FsOp),
     Pnp,
@@ -516,7 +554,6 @@ impl Request {
             panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
         }
 
-        
         Self {
             kind,
             data,
