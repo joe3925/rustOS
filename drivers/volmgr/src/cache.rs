@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use kernel_api::util::random_number;
 use schnellru::{LruMap, Unlimited};
 
 pub use crate::cache_core::VolumeCache;
@@ -34,8 +35,14 @@ pub struct DefaultIndex<V> {
 impl<V> DefaultIndex<V> {
     #[inline]
     pub fn new() -> Self {
+        let seed = [
+            random_number(),
+            random_number(),
+            random_number(),
+            random_number(),
+        ];
         Self {
-            inner: LruMap::new(Unlimited),
+            inner: LruMap::with_seed(Unlimited, seed),
         }
     }
 }
