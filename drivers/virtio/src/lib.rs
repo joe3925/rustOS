@@ -470,6 +470,7 @@ async fn virtio_pnp_start<'a, 'b>(
             msix_vector,
             msix_table_index,
             waiting_tasks: AtomicU32::new(0),
+            submitting_tasks: AtomicU32::new(0),
             use_indirect: init_result.indirect_desc_supported,
         });
     }
@@ -679,6 +680,48 @@ impl<'a> WaitTasksGuard<'a> {
 impl<'a> Drop for WaitTasksGuard<'a> {
     fn drop(&mut self) {
         self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Tracks concurrent submitters on a queue so only the last one kicks.
+pub(crate) struct SubmitTasksGuard<'a> {
+    counter: &'a AtomicU32,
+    active: bool,
+}
+impl<'a> SubmitTasksGuard<'a> {
+    #[inline]
+    fn new(counter: &'a AtomicU32) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter,
+            active: true,
+        }
+    }
+
+    /// Decrement the counter and notify if we're the last submitter or we must force a kick.
+    #[inline]
+    fn finish_and_maybe_notify(
+        &mut self,
+        qs: &QueueState,
+        notify_base: VirtAddr,
+        notify_off_multiplier: u32,
+        force_notify: bool,
+    ) {
+        if !self.active {
+            return;
+        }
+        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        if force_notify || prev == 1 {
+            qs.vq_ref().notify(notify_base, notify_off_multiplier);
+        }
+        self.active = false;
+    }
+}
+impl<'a> Drop for SubmitTasksGuard<'a> {
+    fn drop(&mut self) {
+        if self.active {
+            self.counter.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -932,17 +975,34 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let head = {
+            let (head, queue_full_after_submit) = {
                 let mut vq = qs.queue.lock().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        h
+                        let queue_full = vq.num_free == 0;
+                        (Some(h), queue_full)
                     }
-                    None => continue,
+                    None => {
+                        // Queue is full (or no descriptors). Kick immediately so completions free space.
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        (None, false)
+                    }
                 }
             };
+
+            let head = match head {
+                Some(h) => h,
+                None => continue,
+            };
+
+            let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
+            submit_guard.finish_and_maybe_notify(
+                qs,
+                inner.notify_base,
+                inner.notify_off_multiplier,
+                queue_full_after_submit,
+            );
 
             let _ = match wait_for_completion(qs, head).await {
                 Ok(l) => l,
@@ -1065,17 +1125,34 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
-            let head = {
+            let (head, queue_full_after_submit) = {
                 let mut vq = qs.queue.lock().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        h
+                        let queue_full = vq.num_free == 0;
+                        (Some(h), queue_full)
                     }
-                    None => continue,
+                    None => {
+                        // Virtqueue out of descriptors: kick immediately so completions can free space.
+                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                        (None, false)
+                    }
                 }
             };
+
+            let head = match head {
+                Some(h) => h,
+                None => continue,
+            };
+
+            let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
+            submit_guard.finish_and_maybe_notify(
+                qs,
+                inner.notify_base,
+                inner.notify_off_multiplier,
+                queue_full_after_submit,
+            );
 
             let _ = match wait_for_completion(qs, head).await {
                 Ok(l) => l,

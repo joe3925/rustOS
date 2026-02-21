@@ -51,6 +51,7 @@ struct CacheEntry {
     in_use: bool,
     generation: u64,
     flushing: bool,
+    flushing_gen: u64,
     ref_bit: bool,  // CLOCK reference bit
     evicting: bool, // staged for eviction; slot not reusable until finalized
 }
@@ -64,6 +65,7 @@ impl Default for CacheEntry {
             in_use: false,
             generation: 0,
             flushing: false,
+            flushing_gen: 0,
             ref_bit: false,
             evicting: false,
         }
@@ -130,7 +132,6 @@ pub struct VolumeCache {
 
     // Scratch buffers reused by flush paths to avoid per-iteration allocations.
     dirty_block_scratch: Vec<u64>,
-    segment_scratch: Vec<FlushSegment>,
     staged_copy_scratch: Vec<(StagedEviction, Box<[u8]>)>,
     evicted_run_scratch: Vec<EvictedRun>,
 }
@@ -150,7 +151,6 @@ impl VolumeCache {
             map: Box::new(FnvIndexMap::<u64, u32, MAX_ENTRIES>::new()),
             clock_hand: 0,
             dirty_block_scratch: Vec::new(),
-            segment_scratch: Vec::new(),
             staged_copy_scratch: Vec::new(),
             evicted_run_scratch: Vec::new(),
         }
@@ -1079,14 +1079,20 @@ impl VolumeCache {
     /// of the spawned task (i.e., they must be stored in the device extension,
     /// which is Arc-refcounted and lives as long as the device).
     /// Both addresses are raw pointers smuggled as `usize` for `Send + 'static`.
-    pub fn try_spawn_flush(cache_addr: usize, tgt: IoTarget, flush_addr: usize) {
+    pub fn try_spawn_flush(
+        cache_addr: usize,
+        tgt: IoTarget,
+        flush_addr: usize,
+        max_inflight: usize,
+    ) {
         let flag = unsafe { &*(flush_addr as *const AtomicBool) };
         if flag
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             spawn_detached(async move {
-                let _ = Self::flush_dirty(cache_addr, tgt, Some(FLUSH_LIMIT_BYTES)).await;
+                let _ =
+                    Self::flush_dirty(cache_addr, tgt, Some(FLUSH_LIMIT_BYTES), max_inflight).await;
                 let flag = unsafe { &*(flush_addr as *const AtomicBool) };
                 flag.store(false, Ordering::Release);
             });
@@ -1114,42 +1120,28 @@ impl VolumeCache {
         cache_lock: usize, // raw pointer smuggled as usize to satisfy Send + 'static
         tgt: IoTarget,
         limit_bytes: Option<usize>,
+        max_inflight: usize,
     ) -> Result<(), CacheError> {
         // SAFETY: caller guarantees the pointed-to AsyncRwLock outlives this future.
         let cache_lock_ref = unsafe { &*(cache_lock as *const AsyncRwLock<Self>) };
-        let max_inflight = (apic_cpu_ids().len() * 3).max(1);
 
         // --- Phase 1: Collect ALL dirty jobs under one write lock ---
-        let (all_jobs, backing_ptr) = {
+        let (all_runs, backing_ptr, block_size, sector_size, sectors_per_block) = {
             let mut cache = cache_lock_ref.write().await;
             let backing_ptr = cache.backing.as_ptr() as usize;
-            let mut all_jobs: Vec<FlushJob> = Vec::new();
+            let mut all_runs: Vec<RunInfo> = Vec::new();
             let mut total_bytes = 0usize;
+            let block_size = cache.block_size;
+            let sector_size = cache.sector_size;
+            let sectors_per_block = cache.sectors_per_block;
 
             loop {
                 let run = find_next_dirty_run(&mut cache);
                 match run {
                     None => break,
                     Some(run_info) => {
-                        for seg in &run_info.segments {
-                            let ei = seg.entry_idx as usize;
-                            let backing_offset = ei * cache.block_size
-                                + seg.start_sector * cache.sector_size;
-                            let data_len = seg.sector_count * cache.sector_size;
-                            let disk_offset = seg.block_idx * cache.block_size as u64
-                                + (seg.start_sector * cache.sector_size) as u64;
-
-                            all_jobs.push(FlushJob {
-                                backing_offset,
-                                data_len,
-                                disk_offset,
-                                entry_gen: seg.entry_gen,
-                            });
-                        }
-
                         total_bytes += run_info.byte_len;
-                        recycle_segments(&mut cache, run_info);
-
+                        all_runs.push(run_info);
                         if let Some(limit) = limit_bytes {
                             if total_bytes >= limit {
                                 break;
@@ -1159,52 +1151,108 @@ impl VolumeCache {
                 }
             }
 
-            (all_jobs, backing_ptr)
+            (
+                all_runs,
+                backing_ptr,
+                block_size,
+                sector_size,
+                sectors_per_block,
+            )
         };
 
-        if all_jobs.is_empty() {
+        if all_runs.is_empty() {
             return Ok(());
         }
 
         // --- Phase 2: Split jobs across max_inflight workers, spawn, await ---
-        let num_workers = max_inflight.min(all_jobs.len());
-        let results = Arc::new(spin::Mutex::new(vec![false; all_jobs.len()]));
+        let num_workers = max_inflight.min(all_runs.len());
+        let results = Arc::new(spin::Mutex::new(vec![false; all_runs.len()]));
+        let runs = Arc::new(all_runs);
 
         // Divide jobs into `num_workers` roughly-equal chunks.
-        let chunk_size = (all_jobs.len() + num_workers - 1) / num_workers;
+        let chunk_size = (runs.len() + num_workers - 1) / num_workers;
         let mut handles = Vec::with_capacity(num_workers);
         let mut start = 0;
 
-        while start < all_jobs.len() {
-            let end = (start + chunk_size).min(all_jobs.len());
-            // Copy the chunk of jobs (FlushJob is small, Copy-able).
-            let chunk: Vec<FlushJob> = all_jobs[start..end].to_vec();
-            let base_idx = start;
+        while start < runs.len() {
+            let end = (start + chunk_size).min(runs.len());
             let tgt_clone = tgt.clone();
             let bp = backing_ptr;
             let results_clone = results.clone();
+            let runs_clone = runs.clone();
+            let base_idx = start;
+            let end_idx = end;
+            let block_size = block_size;
+            let sector_size = sector_size;
+            let sectors_per_block = sectors_per_block;
+            let cache_lock_ref = cache_lock_ref;
 
             let handle = spawn(async move {
-                for (i, job) in chunk.iter().enumerate() {
-                    // SAFETY: backing slab is stable (never reallocated after init).
-                    // Flushing blocks won't be evicted. If re-dirtied, generation
-                    // mismatch handles it.
-                    let data_ptr = unsafe { (bp as *const u8).add(job.backing_offset) };
-                    let req_data =
-                        unsafe { RequestData::from_borrowed_bytes(data_ptr, job.data_len) };
+                for run_idx in base_idx..end_idx {
+                    let run = &runs_clone[run_idx];
+                    let mut run_ok = true;
 
-                    let mut write_req = RequestHandle::new(
-                        RequestType::Write {
-                            offset: job.disk_offset,
-                            len: job.data_len,
-                            flush_write_through: true,
-                        },
-                        req_data,
-                    );
+                    for i in 0..run.block_count {
+                        let block_idx = run.start_block + i as u64;
+                        let (entry_idx, start_sector, end_sector) = {
+                            let cache = cache_lock_ref.read().await;
+                            let entry_idx = match cache.map.get(&block_idx) {
+                                Some(v) => *v as usize,
+                                None => {
+                                    run_ok = false;
+                                    break;
+                                }
+                            };
+                            if entry_idx >= cache.entries.len() {
+                                run_ok = false;
+                                break;
+                            }
+                            let ent = &cache.entries[entry_idx];
+                            if !ent.flushing {
+                                run_ok = false;
+                                break;
+                            }
+                            let start_sector = if i == 0 { run.first_start_sector } else { 0 };
+                            let end_sector = if i + 1 == run.block_count {
+                                run.last_end_sector
+                            } else {
+                                sectors_per_block
+                            };
+                            (entry_idx, start_sector, end_sector)
+                        };
 
-                    let status = pnp_send_request(tgt_clone.clone(), &mut write_req).await;
-                    if status == DriverStatus::Success {
-                        results_clone.lock()[base_idx + i] = true;
+                        // SAFETY: backing slab is stable (never reallocated after init).
+                        // Flushing blocks won't be evicted. If re-dirtied, generation
+                        // mismatch handles it.
+                        let entry_idx_usize = entry_idx as usize;
+                        let backing_offset =
+                            entry_idx_usize * block_size + start_sector * sector_size;
+                        let data_len = (end_sector - start_sector) * sector_size;
+                        let disk_offset =
+                            block_idx * block_size as u64 + (start_sector * sector_size) as u64;
+
+                        let data_ptr = unsafe { (bp as *const u8).add(backing_offset) };
+                        let req_data =
+                            unsafe { RequestData::from_borrowed_bytes(data_ptr, data_len) };
+
+                        let mut write_req = RequestHandle::new(
+                            RequestType::Write {
+                                offset: disk_offset,
+                                len: data_len,
+                                flush_write_through: true,
+                            },
+                            req_data,
+                        );
+
+                        let status = pnp_send_request(tgt_clone.clone(), &mut write_req).await;
+                        if status != DriverStatus::Success {
+                            run_ok = false;
+                            break;
+                        }
+                    }
+
+                    if run_ok {
+                        results_clone.lock()[run_idx] = true;
                     }
                 }
             });
@@ -1221,46 +1269,58 @@ impl VolumeCache {
         let ok = Arc::try_unwrap(results)
             .map(|m| m.into_inner())
             .unwrap_or_else(|arc| arc.lock().clone());
+        let all_runs = Arc::try_unwrap(runs).expect("all_runs Arc still has references");
 
         // --- Phase 3: Update cache state under write lock ---
         {
             let mut cache = cache_lock_ref.write().await;
-            let block_size = cache.block_size;
-            let sector_size = cache.sector_size;
+            let sectors_per_block = cache.sectors_per_block;
 
-            for (idx, job) in all_jobs.iter().enumerate() {
-                let ei = job.backing_offset / block_size;
-                if ei >= cache.entries.len() {
-                    continue;
-                }
-
-                if ok[idx] {
-                    let sector_start = (job.backing_offset % block_size) / sector_size;
-                    let sector_end = sector_start + job.data_len / sector_size;
-
-                    let ent = &mut cache.entries[ei];
-
-                    // Only clear dirty bits if the block wasn't re-dirtied.
-                    if ent.generation == job.entry_gen {
-                        mask_clear_range(&mut ent.dirty, sector_start, sector_end);
-
-                        let fully_clean = ent.dirty.iter().all(|&w| w == 0);
-                        if fully_clean {
-                            let block_idx = ent.block_idx;
-                            if let Some(removed) = cache.map.remove(&block_idx) {
-                                let removed_ei = removed as usize;
-                                if removed_ei < cache.entries.len() {
-                                    cache.entries[removed_ei].reset();
-                                    cache.free.push(removed);
-                                }
-                            }
-                            continue;
-                        }
+            for (idx, run) in all_runs.iter().enumerate() {
+                let run_ok = ok[idx];
+                for i in 0..run.block_count {
+                    let block_idx = run.start_block + i as u64;
+                    let entry_idx = match cache.map.get(&block_idx) {
+                        Some(v) => *v as usize,
+                        None => continue,
+                    };
+                    if entry_idx >= cache.entries.len() {
+                        continue;
                     }
 
-                    ent.flushing = false;
-                } else {
-                    cache.entries[ei].flushing = false;
+                    let start_sector = if i == 0 { run.first_start_sector } else { 0 };
+                    let end_sector = if i + 1 == run.block_count {
+                        run.last_end_sector
+                    } else {
+                        sectors_per_block
+                    };
+
+                    let mut remove_block: Option<u64> = None;
+                    {
+                        let ent = &mut cache.entries[entry_idx];
+
+                        if run_ok && ent.generation == ent.flushing_gen {
+                            mask_clear_range(&mut ent.dirty, start_sector, end_sector);
+
+                            let fully_clean = ent.dirty.iter().all(|&w| w == 0);
+                            if fully_clean {
+                                remove_block = Some(ent.block_idx);
+                            }
+                        }
+
+                        ent.flushing = false;
+                        ent.flushing_gen = 0;
+                    }
+
+                    if let Some(blk) = remove_block {
+                        if let Some(removed) = cache.map.remove(&blk) {
+                            let removed_ei = removed as usize;
+                            if removed_ei < cache.entries.len() {
+                                cache.entries[removed_ei].reset();
+                                cache.free.push(removed);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1273,32 +1333,18 @@ impl VolumeCache {
 // Internal flush helpers
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
-struct FlushSegment {
-    block_idx: u64,
-    entry_idx: u32,
-    start_sector: usize,
-    sector_count: usize,
-    entry_gen: u64,
-}
-
-/// A single zero-copy write job dispatched during flush.
-/// Each job maps to one contiguous region in the cache backing slab.
-#[derive(Clone, Copy)]
-struct FlushJob {
-    backing_offset: usize,
-    data_len: usize,
-    disk_offset: u64,
-    entry_gen: u64,
-}
-
+#[derive(Debug, Clone, Copy)]
 struct RunInfo {
-    segments: Vec<FlushSegment>,
+    start_block: u64,
+    block_count: usize,
+    first_start_sector: usize,
+    last_end_sector: usize,
     byte_len: usize,
 }
 
 /// Scan the cache map in iteration order and find the first contiguous run of
-/// dirty sectors. Marks all blocks in the run as `flushing = true`.
+/// dirty sectors. Marks all blocks in the run as `flushing = true` and stores
+/// the generation to detect re-dirty during flush.
 /// Returns `None` if no unflushed dirty blocks exist.
 fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
     if cache.block_size == 0 || cache.sector_size == 0 {
@@ -1309,7 +1355,6 @@ fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
     let sector_size = cache.sector_size;
 
     // Collect dirty, non-flushing block indices in sorted order.
-    // Reuse a single allocation for dirty block tracking across flush scans.
     let dirty_blocks = &mut cache.dirty_block_scratch;
     dirty_blocks.clear();
     dirty_blocks.reserve(cache.map.len());
@@ -1330,29 +1375,24 @@ fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
 
     dirty_blocks.sort_unstable();
 
-    // Walk sorted blocks building a contiguous run.
-    // A run continues as long as blocks are adjacent AND the next block has
-    // dirty sectors starting at sector 0 (so the sectors are truly contiguous
-    // across the block boundary at the byte level).
-    let segments = &mut cache.segment_scratch;
-    segments.clear();
-    segments.reserve(dirty_blocks.len());
+    let mut start_block = 0u64;
+    let mut block_count: usize = 0;
+    let mut first_start_sector: usize = 0;
+    let mut last_end_sector: usize = 0;
     let mut total_sectors: usize = 0;
     let mut prev_block: Option<u64> = None;
 
     for &block_idx in dirty_blocks.iter() {
         let entry_idx = match cache.map.get(&block_idx) {
-            Some(&ei) => ei,
+            Some(&ei) => ei as usize,
             None => break,
         };
-        let ei = entry_idx as usize;
-        let ent = &cache.entries[ei];
+        let ent = &mut cache.entries[entry_idx];
 
         if !ent.in_use || ent.block_idx != block_idx || ent.flushing {
             break;
         }
 
-        // Find the first dirty sector in this block
         let first_dirty = (0..sectors_per_block).find(|&s| mask_test_bit(&ent.dirty, s));
         let first_dirty = match first_dirty {
             Some(s) => s,
@@ -1360,15 +1400,14 @@ fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
         };
 
         if let Some(prev) = prev_block {
-            // Must be adjacent and dirty from sector 0 to keep the run contiguous.
             if block_idx != prev + 1 || first_dirty != 0 {
                 break;
             }
         } else {
-            // First block in the run.
+            start_block = block_idx;
+            first_start_sector = first_dirty;
         }
 
-        // Find the last consecutive dirty sector in this block
         let last_dirty_exclusive = {
             let mut end = first_dirty + 1;
             while end < sectors_per_block && mask_test_bit(&ent.dirty, end) {
@@ -1377,17 +1416,13 @@ fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
             end
         };
 
-        segments.push(FlushSegment {
-            block_idx,
-            entry_idx,
-            start_sector: first_dirty,
-            sector_count: last_dirty_exclusive - first_dirty,
-            entry_gen: ent.generation,
-        });
+        ent.flushing = true;
+        ent.flushing_gen = ent.generation;
 
         total_sectors += last_dirty_exclusive - first_dirty;
+        block_count += 1;
+        last_end_sector = last_dirty_exclusive;
 
-        // If the run ends before the end of this block, stop here
         if last_dirty_exclusive < sectors_per_block {
             break;
         }
@@ -1395,34 +1430,17 @@ fn find_next_dirty_run(cache: &mut VolumeCache) -> Option<RunInfo> {
         prev_block = Some(block_idx);
     }
 
-    if segments.is_empty() {
+    if block_count == 0 {
         return None;
     }
 
-    // Mark all blocks in the run as flushing
-    for seg in segments.iter() {
-        let ei = seg.entry_idx as usize;
-        if ei < cache.entries.len() {
-            cache.entries[ei].flushing = true;
-        }
-    }
-
-    let run_segments = core::mem::take(segments);
-
-    let byte_len = total_sectors * sector_size;
-
     Some(RunInfo {
-        segments: run_segments,
-        byte_len,
+        start_block,
+        block_count,
+        first_start_sector,
+        last_end_sector,
+        byte_len: total_sectors * sector_size,
     })
-}
-
-/// Return a consumed RunInfo's segments Vec to the cache's scratch buffer.
-fn recycle_segments(cache: &mut VolumeCache, mut run: RunInfo) {
-    if cache.segment_scratch.capacity() == 0 {
-        run.segments.clear();
-        cache.segment_scratch = run.segments;
-    }
 }
 
 // ---------------------------------------------------------------------------

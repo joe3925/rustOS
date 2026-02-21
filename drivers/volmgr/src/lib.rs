@@ -8,6 +8,7 @@ use crate::alloc::vec;
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
+use kernel_api::irq::apic_cpu_ids;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
@@ -68,6 +69,7 @@ struct VolPdoExt {
     cache: Once<AsyncRwLock<cache::VolumeCache>>,
     caching_enabled: AtomicBool,
     flush_running: AtomicBool,
+    max_inflight: Once<usize>,
 }
 
 impl Default for VolPdoExt {
@@ -78,6 +80,7 @@ impl Default for VolPdoExt {
             cache: Once::new(),
             caching_enabled: AtomicBool::new(false),
             flush_running: AtomicBool::new(false),
+            max_inflight: Once::new(),
         }
     }
 }
@@ -258,6 +261,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
             c.set_block_size(1024 * 64, sector_size).unwrap();
             AsyncRwLock::new(c)
         });
+        ext::<VolPdoExt>(&pdo)
+            .max_inflight
+            .call_once(|| 3 * apic_cpu_ids().len().max(0));
     }
 
     DriverStep::Continue
@@ -442,7 +448,9 @@ pub async fn flush_volume_cache(dev: &Arc<DeviceObject>) -> DriverStatus {
     // Pass None for limit_bytes so the explicit flush drains everything.
     // SAFETY: cache_addr points into VolPdoExt which is kept alive by the Arc<DeviceObject>
     // that the caller holds, so it outlives this await.
-    match cache::VolumeCache::flush_dirty(cache_addr, tgt, None).await {
+    match cache::VolumeCache::flush_dirty(cache_addr, tgt, None, *dx.max_inflight.get().unwrap())
+        .await
+    {
         Ok(()) => DriverStatus::Success,
         Err(_) => DriverStatus::Unsuccessful,
     }
@@ -531,5 +539,10 @@ fn try_spawn_flush(dev: &Arc<DeviceObject>, tgt: IoTarget) {
         None => return,
     };
     let flush_addr = &dx.flush_running as *const AtomicBool as usize;
-    cache::VolumeCache::try_spawn_flush(cache_addr, tgt, flush_addr);
+    cache::VolumeCache::try_spawn_flush(
+        cache_addr,
+        tgt,
+        flush_addr,
+        dx.max_inflight.get().copied().unwrap(),
+    );
 }

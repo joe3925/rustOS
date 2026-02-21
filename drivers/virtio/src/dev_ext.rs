@@ -48,6 +48,8 @@ pub struct QueueState {
     pub msix_table_index: Option<u16>,
     /// Number of tasks currently waiting on this queue's interrupt.
     pub waiting_tasks: AtomicU32,
+    /// Number of tasks currently submitting on this queue (for notify batching).
+    pub submitting_tasks: AtomicU32,
     /// Whether to use indirect descriptors on this queue.
     pub use_indirect: bool,
 }
@@ -60,7 +62,7 @@ impl QueueState {
     /// SAFETY: Caller must only call methods that use atomics and don't mutate
     /// the free list (free_head, num_free).
     #[inline]
-    fn vq_ref(&self) -> &Virtqueue {
+    pub fn vq_ref(&self) -> &Virtqueue {
         // SAFETY: We're only accessing atomic fields through immutable references.
         // The AsyncMutex ensures exclusive access for mutable operations (push_chain, free_chain).
         unsafe { &*self.queue.as_ptr() }
