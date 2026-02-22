@@ -44,7 +44,6 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
     let sw = Stopwatch::start();

@@ -6,16 +6,16 @@ USE16
 
 trampoline:
     jmp short startup_ap
-    times 8 - ($ - trampoline) nop      
+    times 8 - ($ - trampoline) nop
 
-    .pagemap       dq 0     
-    .gdtr_limit    dw 0     
-    .gdtr_base     dq 0     
-    .temp_stack    dd 0     
-    .start_stack   dq 0     
+    .pagemap       dq 0
+    .gdtr_limit    dw 0
+    .gdtr_base     dq 0
+    .temp_stack    dd 0
+    .start_stack   dq 0
     .start_address dq 0
     .longmode_limit dw 0
-    .longmode_base dq 0      
+    .longmode_base dq 0
 
 startup_ap:
     cli
@@ -23,14 +23,14 @@ startup_ap:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, word [trampoline.temp_stack] 
+    mov sp, word [trampoline.temp_stack]
 
     mov eax, dword [trampoline.pagemap]
-    mov cr3, eax    
+    mov cr3, eax
 
     mov eax, cr0
-    and al, 11110011b 
-    or al, 00100010b 
+    and al, 11110011b
+    or al, 00100010b
     mov cr0, eax
 
     mov eax, cr4
@@ -39,7 +39,7 @@ startup_ap:
 
     fninit
 
-    lgdt [gdtr]     
+    lgdt [gdtr]
 
     mov ecx, 0xC0000080                   ; IA32_EFER MSR
     rdmsr
@@ -67,8 +67,8 @@ long_mode_entry:
 
     lgdt [trampoline.longmode_limit]
 
-    mov rax, [trampoline.start_address]    
-    jmp rax                               
+    mov rax, [trampoline.start_address]
+    jmp rax
 
 struc GDTEntry
     .limitl resw 1

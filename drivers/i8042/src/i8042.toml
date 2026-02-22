@@ -2,4 +2,4 @@ image = "i8042.dll"
 start = "demand"
 role = "function"
 class = ""
-hwids = ["ACPI\\PNP0303", "ACPI\\PNP0F13", "ACPI\\I8042"]
+hwids = ["ACPI\\I8042"]

@@ -3,7 +3,7 @@ use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
 use crate::drivers::timer_driver::{
-    TIMER, IDLE_TRACKING_ENABLED, IDLE_TIME_CYCLES, IDLE_SCHED_IN_CYCLES,
+    IDLE_SCHED_IN_CYCLES, IDLE_TIME_CYCLES, IDLE_TRACKING_ENABLED, TIMER,
 };
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
@@ -26,8 +26,8 @@ use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use spin::RwLock;
-use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::instructions::interrupts;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::registers::control::Cr3;
 
 const BALANCE_INTERVAL_TICKS: usize = 150;
@@ -373,12 +373,14 @@ impl Scheduler {
 
                             if let Some(best_core) = self.core(best_cpu) {
                                 unsafe {
-                                    if let Some(a) = APIC.lock().as_ref() { a.lapic.send_ipi(
+                                    if let Some(a) = APIC.lock().as_ref() {
+                                        a.lapic.send_ipi(
                                             IpiDest::ApicId(best_core.lapic_id),
                                             IpiKind::Fixed {
                                                 vector: SCHED_IPI_VECTOR,
                                             },
-                                        ) }
+                                        )
+                                    }
                                 }
                             }
                         } else {
@@ -565,9 +567,13 @@ impl Scheduler {
 
             // Account idle time when leaving idle task
             if prev_is_idle && IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-                let idle_start = IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).swap(0, Ordering::Relaxed);
+                let idle_start = IDLE_SCHED_IN_CYCLES
+                    .get_by_id(cpu_id)
+                    .swap(0, Ordering::Relaxed);
                 if idle_start > 0 && now_cycles > idle_start {
-                    IDLE_TIME_CYCLES.get_by_id(cpu_id).fetch_add(now_cycles - idle_start, Ordering::Relaxed);
+                    IDLE_TIME_CYCLES
+                        .get_by_id(cpu_id)
+                        .fetch_add(now_cycles - idle_start, Ordering::Relaxed);
                 }
             }
 
@@ -613,18 +619,18 @@ impl Scheduler {
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
                             .is_ok()
                             && prev.consume_permit()
-                                && prev
-                                    .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
-                                    .is_ok()
-                                {
-                                    //prev.set_block_reason(BlockReason::None);
-                                    Self::push_runqueue_or_panic(
-                                        cpu_id,
-                                        &core.run_queue,
-                                        &core.load,
-                                        prev.clone(),
-                                    );
-                                }
+                            && prev
+                                .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
+                                .is_ok()
+                        {
+                            //prev.set_block_reason(BlockReason::None);
+                            Self::push_runqueue_or_panic(
+                                cpu_id,
+                                &core.run_queue,
+                                &core.load,
+                                prev.clone(),
+                            );
+                        }
                     }
                     SchedState::Blocked => {}
                     SchedState::Terminated => {}
@@ -674,7 +680,9 @@ impl Scheduler {
 
         // Record idle start time if tracking is enabled
         if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).store(now_cycles, Ordering::Relaxed);
+            IDLE_SCHED_IN_CYCLES
+                .get_by_id(cpu_id)
+                .store(now_cycles, Ordering::Relaxed);
         }
 
         sched_state.current = Some(core.idle_task.clone());
@@ -812,9 +820,13 @@ impl Scheduler {
 
         // Account idle time when IPI wakes idle core
         if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            let idle_start = IDLE_SCHED_IN_CYCLES.get_by_id(cpu_id).swap(0, Ordering::Relaxed);
+            let idle_start = IDLE_SCHED_IN_CYCLES
+                .get_by_id(cpu_id)
+                .swap(0, Ordering::Relaxed);
             if idle_start > 0 && now_cycles > idle_start {
-                IDLE_TIME_CYCLES.get_by_id(cpu_id).fetch_add(now_cycles - idle_start, Ordering::Relaxed);
+                IDLE_TIME_CYCLES
+                    .get_by_id(cpu_id)
+                    .fetch_add(now_cycles - idle_start, Ordering::Relaxed);
             }
         }
 
@@ -975,9 +987,7 @@ pub extern "win64" fn yield_interrupt_entry() {
 
 pub fn kernel_task_end() -> ! {
     interrupts::without_interrupts(|| {
-        let task = SCHEDULER
-            .get_current_task(current_cpu_id())
-            .unwrap();
+        let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
     });
     loop {
