@@ -57,7 +57,8 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const INVALID_HEAD: u16 = 0xFFFF;
-const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 20;
+const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 400;
+const SPIN_WAIT_SLICE_NS: u64 = 50;
 
 // Configurable busy-spin duration before blocking on interrupts.
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
@@ -808,11 +809,17 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
 
         let spin_ns = current_spin_ns();
         if spin_ns > 0 {
-            spin_for_ns(spin_ns);
+            let mut remaining_ns = spin_ns;
 
-            if let Some(len) = qs.take_completion(head) {
-                qs.defer_free_chain(head);
-                return Ok(len);
+            while remaining_ns > 0 {
+                if let Some(len) = qs.take_completion(head) {
+                    qs.defer_free_chain(head);
+                    return Ok(len);
+                }
+
+                let slice = remaining_ns.min(SPIN_WAIT_SLICE_NS);
+                spin_for_ns(slice);
+                remaining_ns -= slice;
             }
         }
 
