@@ -23,7 +23,6 @@ use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::io::PartitionInfo;
-use kernel_api::kernel_types::io::Synchronization;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::DeviceRelationType;
@@ -302,9 +301,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     };
 
     let mut io_table = IoVtable::new();
-    io_table.set(IoType::Read(vol_pdo_read), Synchronization::Sync, 0);
-    io_table.set(IoType::Write(vol_pdo_write), Synchronization::Sync, 0);
-    io_table.set(IoType::Flush(vol_pdo_flush), Synchronization::Sync, 0);
+    io_table.set(IoType::Read(vol_pdo_read), 0);
+    io_table.set(IoType::Write(vol_pdo_write), 0);
+    io_table.set(IoType::Flush(vol_pdo_flush), 0);
 
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);

@@ -1,4 +1,5 @@
 use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_types::object_manager::ObjectTag;
 
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
@@ -19,7 +20,7 @@ use x86_64::{
 use crate::{
     executable::pe_loadable::PELoader,
     memory::paging::paging::map_range_with_huge_pages,
-    object_manager::{Object, ObjectPayload, ObjectTag, OBJECT_MANAGER},
+    object_manager::{Object, ObjectPayload, OBJECT_MANAGER},
     scheduling::task::TaskHandle,
     util::generate_guid,
 };
@@ -458,8 +459,7 @@ impl Program {
                 }
 
                 let task = th;
-                if task.is_terminated() {
-                }
+                if task.is_terminated() {}
             }
         }
     }

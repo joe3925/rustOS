@@ -26,7 +26,7 @@ use kernel_api::irq::{
     irq_wait_ok,
 };
 use kernel_api::kernel_types::async_types::AsyncMutex;
-use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
+use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -632,13 +632,9 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     };
 
     let mut io_vt = IoVtable::new();
-    io_vt.set(IoType::Read(virtio_pdo_read), Synchronization::Async, 0);
-    io_vt.set(IoType::Write(virtio_pdo_write), Synchronization::Async, 0);
-    io_vt.set(
-        IoType::DeviceControl(virtio_pdo_ioctl),
-        Synchronization::Async,
-        0,
-    );
+    io_vt.set(IoType::Read(virtio_pdo_read), 0);
+    io_vt.set(IoType::Write(virtio_pdo_write), 0);
+    io_vt.set(IoType::DeviceControl(virtio_pdo_ioctl), 0);
 
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);

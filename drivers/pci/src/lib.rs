@@ -22,7 +22,7 @@ use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        io::{IoType, IoVtable, Synchronization},
+        io::{IoType, IoVtable},
         pnp::DeviceIds,
         request::RequestData,
     },
@@ -311,11 +311,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     );
 
     let mut io_vt = IoVtable::new();
-    io_vt.set(
-        IoType::DeviceControl(pci_pdo_ioctl),
-        Synchronization::Async,
-        0,
-    );
+    io_vt.set(IoType::DeviceControl(pci_pdo_ioctl), 0);
 
     let mut child_init = DeviceInit::new(io_vt, Some(vt));
     child_init.set_dev_ext_from(*p);

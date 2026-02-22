@@ -4,15 +4,13 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use kernel_api::kernel_types::async_types::AsyncMutex;
-use kernel_api::kernel_types::fs::Path;
-
 use fatfs::{
     Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
     NullTimeProvider, Read, Seek, SeekFrom, Write,
 };
-
-use spin::RwLock;
+use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_api::kernel_types::fs::Path;
+use spin::{Mutex, RwLock};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::io::IoTarget;
@@ -45,7 +43,7 @@ type FsError = FatError<<FatDev as IoBase>::Error>;
 
 #[repr(C)]
 pub struct VolCtrlDevExt {
-    pub fs: Arc<AsyncMutex<Fs>>,
+    pub fs: Arc<Mutex<Fs>>,
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
@@ -674,7 +672,7 @@ pub async fn fs_op_dispatch<'a, 'b>(
     let vdx = ext_mut::<VolCtrlDevExt>(&dev);
     let fs_arc = vdx.fs.clone();
     let volume_target = vdx.volume_target.clone();
-    let mut fs_guard = fs_arc.lock_owned().await;
+    let mut fs_guard = fs_arc.lock();
 
     let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         handle_seek_request(&dev, req, &mut fs_guard)

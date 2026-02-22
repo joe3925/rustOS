@@ -2,7 +2,10 @@ use super::driver_index::{self as idx, HwIndex};
 use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
-use crate::object_manager::{ObjRef, Object, ObjectPayload, ObjectTag, OmError, OBJECT_MANAGER};
+use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
+use kernel_types::object_manager::ObjectTag;
+use kernel_types::object_manager::OmError;
+
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
 use crate::scheduling::runtime::runtime::spawn_detached;

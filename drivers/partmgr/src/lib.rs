@@ -10,7 +10,7 @@ use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::io::{
-    DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo, Synchronization,
+    DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -370,8 +370,8 @@ pub async fn partmgr_pnp_query_devrels<'a, 'b>(
         }
 
         let mut io_vt = IoVtable::new();
-        io_vt.set(IoType::Read(partition_pdo_read), Synchronization::Sync, 0);
-        io_vt.set(IoType::Write(partition_pdo_write), Synchronization::Sync, 0);
+        io_vt.set(IoType::Read(partition_pdo_read), 0);
+        io_vt.set(IoType::Write(partition_pdo_write), 0);
 
         let mut child_init = DeviceInit::new(io_vt, None);
 

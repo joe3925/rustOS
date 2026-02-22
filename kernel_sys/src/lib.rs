@@ -15,6 +15,7 @@ use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
 use kernel_types::irq::{DropHook, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult};
+use kernel_types::object_manager::OmError;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::PageTableFlags;
@@ -145,9 +146,12 @@ unsafe extern "win64" {
     pub fn pnp_bind_and_start(dn: &Arc<DevNode>) -> FfiFuture<Result<(), DriverError>>;
     pub fn pnp_get_device_target(instance_path: &str) -> Option<IoTarget>;
 
-    pub fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus;
-    pub fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus;
-    pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus;
+    pub fn pnp_create_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
+    pub fn pnp_replace_symlink(link_path: String, target_path: String) -> Result<(), OmError>;
+    pub fn pnp_create_device_symlink_top(
+        instance_path: String,
+        link_path: String,
+    ) -> Result<(), kernel_types::object_manager::OmError>;
     pub fn pnp_remove_symlink(link_path: String) -> DriverStatus;
 
     pub fn pnp_load_service(name: String) -> FfiFuture<Option<Arc<DriverObject>>>;

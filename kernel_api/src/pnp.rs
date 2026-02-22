@@ -70,15 +70,24 @@ pub fn pnp_create_control_device_and_link(
     unsafe { kernel_sys::pnp_create_control_device_and_link(name, init, link) }
 }
 
-pub fn pnp_create_symlink(link: String, target: String) -> DriverStatus {
+pub fn pnp_create_symlink(
+    link: String,
+    target: String,
+) -> Result<(), kernel_types::object_manager::OmError> {
     unsafe { kernel_sys::pnp_create_symlink(link, target) }
 }
 
-pub fn pnp_replace_symlink(link: String, target: String) -> DriverStatus {
+pub fn pnp_replace_symlink(
+    link: String,
+    target: String,
+) -> Result<(), kernel_types::object_manager::OmError> {
     unsafe { kernel_sys::pnp_replace_symlink(link, target) }
 }
 
-pub fn pnp_create_device_symlink_top(instance_path: String, link_path: String) -> DriverStatus {
+pub fn pnp_create_device_symlink_top(
+    instance_path: String,
+    link_path: String,
+) -> Result<(), kernel_types::object_manager::OmError> {
     unsafe { kernel_sys::pnp_create_device_symlink_top(instance_path, link_path) }
 }
 

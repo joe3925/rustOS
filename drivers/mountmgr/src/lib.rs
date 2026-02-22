@@ -25,7 +25,7 @@ use kernel_api::{
     fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
-        io::{FsIdentify, IoType, IoVtable, Synchronization},
+        io::{FsIdentify, IoType, IoVtable},
         pnp::DeviceIds,
         request::RequestData,
     },
@@ -99,11 +99,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, volclass_device_add);
 
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(
-        IoType::DeviceControl(volclass_ctrl_ioctl),
-        Synchronization::Sync,
-        0,
-    );
+    io_vtable.set(IoType::DeviceControl(volclass_ctrl_ioctl), 0);
 
     let init = DeviceInit::new(io_vtable, None);
     let _ctrl = pnp_create_control_device_and_link(
@@ -122,11 +118,9 @@ pub extern "win64" fn volclass_device_add(
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, volclass_start);
 
-    dev_init.io_vtable.set(
-        IoType::DeviceControl(volclass_ioctl),
-        Synchronization::Sync,
-        0,
-    );
+    dev_init
+        .io_vtable
+        .set(IoType::DeviceControl(volclass_ioctl), 0);
 
     dev_init.set_dev_ext_default::<VolFdoExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);

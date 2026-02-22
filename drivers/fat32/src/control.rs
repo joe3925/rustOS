@@ -2,14 +2,14 @@ use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::ToString, sync
 use core::mem::{align_of, size_of};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
-use spin::RwLock;
+use spin::{Mutex, RwLock};
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         async_types::AsyncMutex,
-        io::{FsIdentify, IoType, IoVtable, PartitionInfo, Synchronization},
+        io::{FsIdentify, IoType, IoVtable, PartitionInfo},
         request::RequestData,
     },
     pnp::{
@@ -153,10 +153,10 @@ pub async fn fs_root_ioctl<'a, 'b>(
             match result {
                 Ok(fs) => {
                     let mut io_vtable = IoVtable::new();
-                    io_vtable.set(IoType::Fs(fs_op_dispatch), Synchronization::Sync, 0);
+                    io_vtable.set(IoType::Fs(fs_op_dispatch), 1);
 
                     let ext = VolCtrlDevExt {
-                        fs: Arc::new(AsyncMutex::new(fs)),
+                        fs: Arc::new(Mutex::new(fs)),
                         next_id: AtomicU64::new(1),
                         table: RwLock::new(BTreeMap::new()),
                         volume_target: id.volume_fdo.clone(),
@@ -195,11 +195,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(
-        IoType::DeviceControl(fs_root_ioctl),
-        Synchronization::Sync,
-        0,
-    );
+    io_vtable.set(IoType::DeviceControl(fs_root_ioctl), 0);
     let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();

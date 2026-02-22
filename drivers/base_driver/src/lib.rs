@@ -30,6 +30,7 @@ pub extern "win64" fn bus_driver_device_add(
     dev_init_ptr: &mut DeviceInit,
 ) -> DriverStep {
     let mut pnp_vtable = PnpVtable::new();
+    println!("BaseBusDriver: EvtDeviceAdd called.\n");
     pnp_vtable.set(PnpMinorFunction::StartDevice, bus_driver_prepare_hardware);
     dev_init_ptr.pnp_vtable = Some(pnp_vtable);
     DriverStep::complete(DriverStatus::Success)
@@ -37,10 +38,9 @@ pub extern "win64" fn bus_driver_device_add(
 
 #[request_handler]
 pub async fn bus_driver_prepare_hardware<'a, 'b>(
-    device: &Arc<DeviceObject>,
+    _device: &Arc<DeviceObject>,
     _req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
-    let _ = device; // suppress unused for now
     DriverStep::complete(DriverStatus::Success)
 }

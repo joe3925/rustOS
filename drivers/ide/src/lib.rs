@@ -17,7 +17,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable, Synchronization};
+use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
@@ -252,13 +252,9 @@ fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
     };
 
     let mut io_vtable = IoVtable::new();
-    io_vtable.set(IoType::Read(ide_pdo_read), Synchronization::Sync, 0);
-    io_vtable.set(IoType::Write(ide_pdo_write), Synchronization::Sync, 0);
-    io_vtable.set(
-        IoType::DeviceControl(ide_pdo_internal_ioctl),
-        Synchronization::Sync,
-        0,
-    );
+    io_vtable.set(IoType::Read(ide_pdo_read), 0);
+    io_vtable.set(IoType::Write(ide_pdo_write), 0);
+    io_vtable.set(IoType::DeviceControl(ide_pdo_internal_ioctl), 0);
 
     let mut pvt = PnpVtable::new();
     pvt.set(PnpMinorFunction::QueryId, ide_pdo_query_id);

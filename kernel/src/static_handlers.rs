@@ -4,6 +4,7 @@ use core::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
+use kernel_types::object_manager::OmError;
 
 use acpi::AcpiTables;
 use alloc::{
@@ -58,8 +59,8 @@ use crate::{
         global_async::GlobalAsyncExecutor,
         runtime::runtime::{
             block_on as kernel_block_on, spawn as kernel_spawn,
-            spawn_blocking as kernel_spawn_blocking,
-            spawn_detached as kernel_spawn_detached, BLOCKING_POOL, RUNTIME_POOL,
+            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
+            BLOCKING_POOL, RUNTIME_POOL,
         },
         scheduler::{TaskError, SCHEDULER},
         task::Task,
@@ -416,36 +417,28 @@ pub extern "win64" fn InvalidateDeviceRelations(
     .into_ffi()
 }
 
-#[inline]
-fn map_om_result(res: Result<(), crate::object_manager::OmError>) -> DriverStatus {
-    use crate::object_manager::OmError as OE;
-    match res {
-        Ok(()) => DriverStatus::Success,
-        Err(OE::InvalidPath) => DriverStatus::InvalidParameter,
-        Err(OE::NotFound) => DriverStatus::NoSuchDevice,
-        Err(OE::AlreadyExists) => DriverStatus::Unsuccessful,
-        Err(
-            OE::NotDirectory | OE::IsDirectory | OE::IsSymlink | OE::Unsupported | OE::LoopDetected,
-        ) => DriverStatus::Unsuccessful,
-    }
+#[unsafe(no_mangle)]
+pub extern "win64" fn pnp_create_symlink(
+    link_path: String,
+    target_path: String,
+) -> Result<(), OmError> {
+    PNP_MANAGER.create_symlink(link_path, target_path)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn pnp_create_symlink(link_path: String, target_path: String) -> DriverStatus {
-    map_om_result(PNP_MANAGER.create_symlink(link_path, target_path))
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_replace_symlink(link_path: String, target_path: String) -> DriverStatus {
-    map_om_result(PNP_MANAGER.replace_symlink(link_path, target_path))
+pub extern "win64" fn pnp_replace_symlink(
+    link_path: String,
+    target_path: String,
+) -> Result<(), OmError> {
+    PNP_MANAGER.replace_symlink(link_path, target_path)
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_create_device_symlink_top(
     instance_path: String,
     link_path: String,
-) -> DriverStatus {
-    map_om_result(PNP_MANAGER.create_device_symlink_top(instance_path, link_path))
+) -> Result<(), OmError> {
+    PNP_MANAGER.create_device_symlink_top(instance_path, link_path)
 }
 
 #[unsafe(no_mangle)]

@@ -1,8 +1,12 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::Ordering;
+use core::task::{Context, Poll, Waker};
 use kernel_types::device::{DevNode, DeviceObject};
-use kernel_types::io::{IoTarget, Synchronization};
+use kernel_types::io::{IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
 use kernel_types::request::{
     Request, RequestCompletionHandle, RequestHandle, RequestType, TraversalPolicy,
@@ -263,15 +267,9 @@ async fn invoke_io_handler(
         return None;
     };
 
+    let guard = acquire_slot(h).await;
     let result = h.handler.invoke(dev, handle).await;
-
-    match h.synchronization {
-        Synchronization::Sync | Synchronization::Async => {
-            h.running_request.fetch_sub(1, Ordering::Release);
-        }
-        _ => {}
-    }
-
+    drop(guard);
     Some(result)
 }
 
@@ -315,4 +313,109 @@ async fn pnp_minor_dispatch(
     }
 
     DriverStep::Continue
+}
+
+// =============================================================================
+// Synchronization helpers
+// =============================================================================
+
+fn push_waker(list: &mut Vec<Waker>, w: &Waker) {
+    for slot in list.iter_mut() {
+        if slot.will_wake(w) {
+            *slot = w.clone();
+            return;
+        }
+    }
+    list.push(w.clone());
+}
+
+fn remove_waker(list: &mut Vec<Waker>, w: &Waker) {
+    let mut i = 0usize;
+    while i < list.len() {
+        if list[i].will_wake(w) {
+            list.swap_remove(i);
+            return;
+        }
+        i += 1;
+    }
+}
+
+fn wake_one(list: &mut Vec<Waker>) {
+    if let Some(w) = list.pop() {
+        w.wake();
+    }
+}
+
+struct SlotAcquireFuture<'a> {
+    handler: &'a IoHandler,
+}
+
+impl Future for SlotAcquireFuture<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let h = self.handler;
+
+        if h.depth == 0 {
+            return Poll::Ready(());
+        }
+
+        loop {
+            let cur = h.running_request.load(Ordering::Acquire);
+            if cur < h.depth as u64 {
+                if h.running_request
+                    .compare_exchange(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Poll::Ready(());
+                }
+                continue;
+            }
+
+            {
+                let mut w = h.waiters.lock();
+                push_waker(&mut w, cx.waker());
+            }
+
+            // Re-check after enqueue to avoid lost wakeup.
+            let cur = h.running_request.load(Ordering::Acquire);
+            if cur < h.depth as u64
+                && h.running_request
+                    .compare_exchange(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let mut w = h.waiters.lock();
+                remove_waker(&mut w, cx.waker());
+                return Poll::Ready(());
+            }
+
+            return Poll::Pending;
+        }
+    }
+}
+
+struct SlotGuard<'a> {
+    handler: &'a IoHandler,
+    tracked: bool,
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if !self.tracked {
+            return;
+        }
+        self.handler.running_request.fetch_sub(1, Ordering::Release);
+        let mut w = self.handler.waiters.lock();
+        wake_one(&mut w);
+    }
+}
+
+async fn acquire_slot(handler: &IoHandler) -> SlotGuard<'_> {
+    let tracked = handler.depth != 0;
+
+    if tracked {
+        SlotAcquireFuture { handler }.await;
+    }
+
+    SlotGuard { handler, tracked }
 }

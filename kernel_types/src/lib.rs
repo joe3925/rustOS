@@ -16,6 +16,7 @@ pub mod fs;
 pub mod io;
 pub mod irq;
 pub mod memory;
+pub mod object_manager;
 pub mod pnp;
 pub mod request;
 pub mod status;

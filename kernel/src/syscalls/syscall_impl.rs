@@ -14,9 +14,10 @@ use alloc::slice;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
+use kernel_types::object_manager::ObjectTag;
 use x86_64::instructions::hlt;
 
-use crate::object_manager::{Object, ObjectPayload, ObjectTag, TaskQueueRef, OBJECT_MANAGER};
+use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
 
 fn ensure_process_object(pid: u64, prog: &ProgramHandle) -> alloc::sync::Arc<Object> {
     let path = alloc::format!("\\Process\\{}", pid);

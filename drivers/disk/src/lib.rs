@@ -15,7 +15,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        io::{DiskInfo, IoType, Synchronization},
+        io::{DiskInfo, IoType},
         request::RequestData,
     },
     pnp::{
@@ -63,15 +63,9 @@ pub extern "win64" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> kernel_api::pnp::DriverStep {
-    dev_init
-        .io_vtable
-        .set(IoType::Read(disk_read), Synchronization::Sync, 0);
-    dev_init
-        .io_vtable
-        .set(IoType::Write(disk_write), Synchronization::Sync, 0);
-    dev_init
-        .io_vtable
-        .set(IoType::DeviceControl(disk_ioctl), Synchronization::Sync, 0);
+    dev_init.io_vtable.set(IoType::Read(disk_read), 0);
+    dev_init.io_vtable.set(IoType::Write(disk_write), 0);
+    dev_init.io_vtable.set(IoType::DeviceControl(disk_ioctl), 0);
 
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::RemoveDevice, disk_pnp_remove);

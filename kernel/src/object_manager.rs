@@ -11,6 +11,8 @@ use core::{
     hash::{BuildHasherDefault, Hasher},
     sync::atomic::{AtomicU64, Ordering},
 };
+use kernel_types::object_manager::ObjectTag;
+use kernel_types::object_manager::OmError;
 
 use hashbrown::HashMap;
 use kernel_types::device::{DeviceObject, ModuleHandle};
@@ -22,31 +24,6 @@ use crate::scheduling::scheduler::TaskHandle;
 
 pub type TaskQueueRef = Arc<RwLock<MessageQueue>>;
 pub type ObjRef = Arc<dyn Any + Send + Sync>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OmError {
-    InvalidPath,
-    NotFound,
-    AlreadyExists,
-    NotDirectory,
-    IsDirectory,
-    IsSymlink,
-    LoopDetected,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectTag {
-    Directory,
-    Symlink,
-    Generic,
-
-    Program,
-    Thread,
-    Queue,
-    Module,
-    Device,
-}
 
 #[derive(Default)]
 struct Fnv1aHasher {

@@ -6,7 +6,7 @@ edition = "2024"
 autotests = false
 
 [lib]
-name = "BASE"
+name = "base_driver"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 test = false

@@ -5,6 +5,8 @@ use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
+use core::task::Waker;
+use spin::Mutex as SpinMutex;
 pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]
@@ -70,7 +72,7 @@ pub struct GptPartitionEntry {
     pub name_utf16: [u16; 36],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub enum IoType {
     Read(EvtIoRead),
@@ -123,26 +125,19 @@ impl IoType {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub enum Synchronization {
-    Sync,
-    Async,
-    FireAndForget,
-}
-
 #[derive(Clone)]
-#[repr(C)]
 pub struct IoHandler {
     pub handler: IoType,
-    pub synchronization: Synchronization,
+    /// 0 = unlimited, 1 = serialized, >1 = bounded async queue depth
     pub depth: usize,
     pub running_request: Arc<AtomicU64>,
+    pub waiters: Arc<SpinMutex<Vec<Waker>>>,
 }
 
 impl core::fmt::Debug for IoHandler {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IoHandler")
-            .field("synchronization", &self.synchronization)
+            .field("depth", &self.depth)
             .finish()
     }
 }
@@ -163,14 +158,14 @@ impl IoVtable {
     }
 
     #[inline]
-    pub fn set(&mut self, cb: IoType, synchronization: Synchronization, depth: usize) {
+    pub fn set(&mut self, cb: IoType, depth: usize) {
         let i = cb.slot();
         if i < self.handlers.len() {
             self.handlers[i] = Some(IoHandler {
                 handler: cb,
-                synchronization,
                 depth,
                 running_request: Arc::new(AtomicU64::new(0)),
+                waiters: Arc::new(SpinMutex::new(Vec::new())),
             });
         }
     }
