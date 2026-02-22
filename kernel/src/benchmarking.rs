@@ -2069,15 +2069,15 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 80 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
-    8 * 1024 * 1024,
-    16 * 1024 * 1024,
+    // 8 * 1024 * 1024,
+    // 16 * 1024 * 1024,
 ];
 
 #[inline(always)]

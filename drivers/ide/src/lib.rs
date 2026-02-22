@@ -1,3 +1,5 @@
+// TODO: legacy driver so not the biggest prio but there is a memory corruption race condition somewhere that needs to be fixed.
+// the race can be triggered by sending a request then awaiting it and so on for a while. It will occur at some point shows as a GPF.
 #![no_std]
 #![no_main]
 #![feature(const_option_ops)]
@@ -17,7 +19,9 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::irq::{IrqHandle, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
+use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
@@ -30,9 +34,8 @@ use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
-use spin::Mutex;
 
-use dev_ext::{DevExt, Ports};
+use dev_ext::{ControllerState, DevExt, Ports};
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
@@ -71,6 +74,30 @@ fn continue_req(req: &mut RequestHandle) -> DriverStep {
         w.status = DriverStatus::ContinueStep;
     }
     DriverStep::Continue
+}
+
+/// IDE interrupt service routine.
+/// `ctx` = I/O base port address, used to read the status register and clear the IRQ.
+extern "win64" fn ide_isr(
+    _vector: u8,
+    _cpu: u32,
+    _frame: *mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    handle: IrqHandlePtr,
+    ctx: usize,
+) -> bool {
+    // Read the status register to acknowledge/clear the IDE interrupt.
+    let io_base = ctx as u16;
+    let mut status_port: Port<u8> = Port::new(io_base + 7);
+    let _status = unsafe { status_port.read() };
+
+    if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
+        h.signal_one(IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        });
+        core::mem::forget(h);
+    }
+    true
 }
 
 #[repr(C)]
@@ -134,14 +161,41 @@ async fn ide_pnp_start<'a, 'b>(
 
         let dx = dev.try_devext::<DevExt>().expect("ide: FDO DevExt missing");
 
-        let cb = bars.cmd as u16;
-        let ctl = bars.ctl as u16;
+        let cb = bars.cmd;
+        let ctl = bars.ctl;
         let alt = ctl.wrapping_add(2);
 
         {
-            let mut p = dx.ports.lock();
-            *p = Ports::new(cb, alt);
-            unsafe { p.control.write(0x02) };
+            let mut ctrl = dx.controller.lock().await;
+            ctrl.ports = Ports::new(cb, alt);
+        }
+
+        // Register IRQ handler
+        let irq_handle = if let Some(gsi) = bars.gsi {
+            if gsi < 64 {
+                irq_register_isr_gsi(gsi as u8, ide_isr, cb as usize)
+            } else {
+                None
+            }
+        } else if let Some(line) = bars.irq_line {
+            if line < 16 {
+                let vector = 0x20 + line;
+                irq_register_isr(vector, ide_isr, cb as usize)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        unsafe {
+            *dx.irq_handle.get() = irq_handle;
+        }
+
+        // Enable interrupts: clear nIEN bit (write 0x00 instead of 0x02)
+        {
+            let mut ctrl = dx.controller.lock().await;
+            unsafe { ctrl.ports.control.write(0x00) };
         }
 
         dx.present.store(true, Ordering::Release);
@@ -168,35 +222,6 @@ async fn ide_pnp_query_devrels<'a, 'b>(
     continue_req(req)
 }
 
-fn acquire_controller(dx: &DevExt) {
-    while dx
-        .busy
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        //unsafe { wait_ms(1) };
-    }
-}
-
-fn release_controller(dx: &DevExt) {
-    dx.busy.store(false, Ordering::Release);
-}
-
-struct ControllerGuard<'a>(&'a DevExt);
-
-impl<'a> ControllerGuard<'a> {
-    fn new(dx: &'a DevExt) -> Self {
-        acquire_controller(dx);
-        Self(dx)
-    }
-}
-
-impl<'a> Drop for ControllerGuard<'a> {
-    fn drop(&mut self) {
-        release_controller(self.0);
-    }
-}
-
 fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
     let dx = parent
         .try_devext::<DevExt>()
@@ -206,25 +231,30 @@ fn ide_enumerate_bus(parent: &Arc<DeviceObject>) {
         return;
     }
 
-    let _guard = ControllerGuard::new(&dx);
+    // Probe and identify drives while holding the controller lock.
+    let mut ctrl = dx.controller.lock_blocking();
+    let master_words = ata_identify_words_sync(&mut ctrl.ports, 0xE0);
+    let slave_words = ata_identify_words_sync(&mut ctrl.ports, 0xF0);
+    drop(ctrl);
 
-    if ata_probe_drive(&dx, 0xE0) {
-        create_child_pdo(parent, 0, 0);
+    // Create PDOs outside the lock.
+    if master_words.is_some() {
+        create_child_pdo(parent, 0, 0, master_words);
     }
-    if ata_probe_drive(&dx, 0xF0) {
-        create_child_pdo(parent, 0, 1);
+    if slave_words.is_some() {
+        create_child_pdo(parent, 0, 1, slave_words);
     }
 
     dx.enumerated.store(true, Ordering::Release);
 }
 
-fn create_child_pdo(parent: &Arc<DeviceObject>, channel: u8, drive: u8) {
-    let dx = parent
-        .try_devext::<DevExt>()
-        .expect("ide: FDO DevExt missing");
-
+fn create_child_pdo(
+    parent: &Arc<DeviceObject>,
+    channel: u8,
+    drive: u8,
+    id_words_opt: Option<[u16; 256]>,
+) {
     let dh = if drive == 0 { 0xE0 } else { 0xF0 };
-    let id_words_opt = ata_identify_words(&dx, dh);
 
     let (hardware, compatible) = if let Some(words) = id_words_opt {
         let model = id_string(&words[27..=46]);
@@ -345,19 +375,24 @@ pub async fn ide_pdo_read<'a, 'b>(
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
-    let status = {
-        let _guard = ControllerGuard::new(&dx);
-        let mut w = req.write();
-        let buf = &mut w.data_slice_mut()[..len];
+    let irq = unsafe { dx.irq() };
 
-        if ata_pio_read(&dx, dh, lba as u32, sectors, buf) {
+    let mut ctrl = dx.controller.lock().await;
+    let mut w = req.write();
+    let buf = &mut w.data_slice_mut()[..len];
+
+    let ok = ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
+    drop(ctrl);
+    drop(w);
+
+    complete_req(
+        req,
+        if ok {
             DriverStatus::Success
         } else {
             DriverStatus::Unsuccessful
-        }
-    };
-
-    complete_req(req, status)
+        },
+    )
 }
 
 #[request_handler]
@@ -418,20 +453,24 @@ pub async fn ide_pdo_write<'a, 'b>(
     }
 
     let dh = cdx.dh.load(Ordering::Acquire);
-    let status = {
-        let _guard = ControllerGuard::new(&dx);
+    let irq = unsafe { dx.irq() };
 
-        let r = req.read();
-        let buf = &r.data_slice()[..len];
+    let mut ctrl = dx.controller.lock().await;
+    let r = req.read();
+    let buf = &r.data_slice()[..len];
 
-        if ata_pio_write(&dx, dh, lba as u32, sectors, buf) {
+    let ok = ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
+    drop(ctrl);
+    drop(r);
+
+    complete_req(
+        req,
+        if ok {
             DriverStatus::Success
         } else {
             DriverStatus::Unsuccessful
-        }
-    };
-
-    complete_req(req, status)
+        },
+    )
 }
 
 #[request_handler]
@@ -468,14 +507,13 @@ pub async fn ide_pdo_internal_ioctl<'a, 'b>(
 
     match code {
         IOCTL_BLOCK_FLUSH => {
-            let _guard = ControllerGuard::new(&dx);
+            let irq = unsafe { dx.irq() };
+            let mut ctrl = dx.controller.lock().await;
 
-            {
-                let mut p = dx.ports.lock();
-                unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
-            }
+            unsafe { ctrl.ports.command.write(ATA_CMD_FLUSH_CACHE) };
 
-            let ok = wait_not_busy(&dx.ports, TIMEOUT_MS);
+            let ok = wait_not_busy_async(&mut ctrl.ports, irq, TIMEOUT_MS).await;
+            drop(ctrl);
 
             if ok {
                 complete_req(req, DriverStatus::Success)
@@ -492,6 +530,8 @@ struct IdeBars {
     cmd: u16,
     ctl: u16,
     bm: u16,
+    gsi: Option<u32>,
+    irq_line: Option<u8>,
 }
 
 fn parse_ide_bars(blob: &[u8]) -> IdeBars {
@@ -500,6 +540,7 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
     if blob.len() < 12 || &blob[0..4] != b"RSRC" {
         bars.cmd = 0x1F0;
         bars.ctl = 0x3F4;
+        bars.irq_line = Some(14);
         return bars;
     }
 
@@ -529,6 +570,15 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
             blob[off + 23],
         ]);
         off += 24;
+
+        if kind == ResourceKind::Gsi as u32 {
+            bars.gsi = Some(start as u32);
+            continue;
+        }
+        if kind == ResourceKind::Interrupt as u32 {
+            bars.irq_line = Some(start as u8);
+            continue;
+        }
 
         if kind != ResourceKind::Port as u32 {
             continue;
@@ -560,6 +610,9 @@ fn parse_ide_bars(blob: &[u8]) -> IdeBars {
             0x170 => 0x374,
             v => v.wrapping_add(2),
         };
+    }
+    if bars.gsi.is_none() && bars.irq_line.is_none() {
+        bars.irq_line = Some(if bars.cmd == 0x170 { 15 } else { 14 });
     }
 
     bars
@@ -596,104 +649,90 @@ fn id_string(words: &[u16]) -> String {
     out
 }
 
-fn ata_identify_words(dx: &DevExt, dh: u8) -> Option<[u16; 256]> {
-    if !wait_not_busy(&dx.ports, TIMEOUT_MS) {
+fn ata_identify_words_sync(ports: &mut Ports, dh: u8) -> Option<[u16; 256]> {
+    if !wait_not_busy_sync(ports, TIMEOUT_MS) {
         return None;
     }
 
-    {
-        let mut p = dx.ports.lock();
-        unsafe { p.drive_head.write(dh) };
-        io_wait_400ns(&mut p.control);
-        unsafe { p.command.write(ATA_CMD_IDENTIFY) };
-    }
+    unsafe { ports.drive_head.write(dh) };
+    io_wait_400ns(&mut ports.control);
+    unsafe { ports.command.write(ATA_CMD_IDENTIFY) };
 
-    if !wait_ready(&dx.ports, TIMEOUT_MS) {
+    if !wait_ready_sync(ports, TIMEOUT_MS) {
         return None;
     }
 
-    {
-        let mut p = dx.ports.lock();
-        let st = unsafe { p.command.read() };
-        if st == 0 || (st & ATA_SR_ERR) != 0 {
-            return None;
-        }
-
-        if (st & ATA_SR_DRQ) == 0 {
-            return None;
-        }
-
-        let mut words = [0u16; 256];
-        for i in 0..256 {
-            words[i] = unsafe { p.data.read() };
-        }
-        Some(words)
+    let st = unsafe { ports.command.read() };
+    if st == 0 || (st & ATA_SR_ERR) != 0 {
+        return None;
     }
+
+    if (st & ATA_SR_DRQ) == 0 {
+        return None;
+    }
+
+    let mut words = [0u16; 256];
+    for i in 0..256 {
+        words[i] = unsafe { ports.data.read() };
+    }
+    Some(words)
 }
 
-fn ata_probe_drive(dx: &DevExt, dh: u8) -> bool {
-    ata_identify_words(dx, dh).is_some()
+fn ata_probe_drive_sync(ports: &mut Ports, dh: u8) -> bool {
+    ata_identify_words_sync(ports, dh).is_some()
 }
 
-fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [u8]) -> bool {
+async fn ata_pio_read_async(
+    ctrl: &mut ControllerState,
+    irq: &Option<IrqHandle>,
+    dh: u8,
+    mut lba: u32,
+    mut sectors: u32,
+    out: &mut [u8],
+) -> bool {
     let mut off = 0usize;
-
-    let total_sectors = sectors;
-    let _bps = if total_sectors != 0 {
-        out.len() / total_sectors as usize
-    } else {
-        512
-    };
+    let p = &mut ctrl.ports;
 
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
 
-        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
             return false;
         }
 
-        {
-            let mut p = dx.ports.lock();
-            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-            unsafe { p.drive_head.write(devsel) };
-            io_wait_400ns(&mut p.control);
-        }
+        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+        unsafe { p.drive_head.write(devsel) };
+        io_wait_400ns(&mut p.control);
 
-        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
             return false;
         }
 
-        {
-            let mut p = dx.ports.lock();
-            unsafe {
-                p.sector_count.write(sc);
-                p.lba_lo.write((lba & 0xFF) as u8);
-                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-                p.command.write(ATA_CMD_READ_SECTORS);
-            }
+        unsafe {
+            p.sector_count.write(sc);
+            p.lba_lo.write((lba & 0xFF) as u8);
+            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+            p.command.write(ATA_CMD_READ_SECTORS);
         }
 
         for _ in 0..chunk {
-            if !wait_drq_set(&dx.ports, TIMEOUT_MS) {
+            if !wait_drq_async(p, irq, TIMEOUT_MS).await {
                 return false;
             }
-            {
-                let mut p = dx.ports.lock();
-                let st = unsafe { p.command.read() };
-                if (st & ATA_SR_DRQ) == 0 {
-                    return false;
-                }
-                if off + 512 > out.len() {
-                    return false;
-                }
-                for _ in 0..256 {
-                    let w: u16 = unsafe { p.data.read() };
-                    out[off] = (w & 0xFF) as u8;
-                    out[off + 1] = (w >> 8) as u8;
-                    off += 2;
-                }
+            let st = unsafe { p.command.read() };
+            if (st & ATA_SR_DRQ) == 0 {
+                return false;
+            }
+            if off + 512 > out.len() {
+                return false;
+            }
+            for _ in 0..256 {
+                let w: u16 = unsafe { p.data.read() };
+                out[off] = (w & 0xFF) as u8;
+                out[off + 1] = (w >> 8) as u8;
+                off += 2;
             }
         }
 
@@ -704,58 +743,62 @@ fn ata_pio_read(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, out: &mut [
     true
 }
 
-fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8]) -> bool {
+async fn ata_pio_write_async(
+    ctrl: &mut ControllerState,
+    irq: &Option<IrqHandle>,
+    dh: u8,
+    mut lba: u32,
+    mut sectors: u32,
+    data: &[u8],
+) -> bool {
     let mut off = 0usize;
-
-    let total_sectors = sectors;
-    let _bps = if total_sectors != 0 {
-        data.len() / total_sectors as usize
-    } else {
-        512
-    };
+    let p = &mut ctrl.ports;
 
     while sectors > 0 {
         let chunk = core::cmp::min(sectors, 256);
         let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
 
-        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
             return false;
         }
 
-        {
-            let mut p = dx.ports.lock();
-            let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-            unsafe { p.drive_head.write(devsel) };
-            io_wait_400ns(&mut p.control);
-        }
+        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+        unsafe { p.drive_head.write(devsel) };
+        io_wait_400ns(&mut p.control);
 
-        if !wait_ready(&dx.ports, TIMEOUT_MS) {
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
             return false;
         }
 
-        {
-            let mut p = dx.ports.lock();
-            unsafe {
-                p.sector_count.write(sc);
-                p.lba_lo.write((lba & 0xFF) as u8);
-                p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-                p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-                p.command.write(ATA_CMD_WRITE_SECTORS);
+        unsafe {
+            p.sector_count.write(sc);
+            p.lba_lo.write((lba & 0xFF) as u8);
+            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+            p.command.write(ATA_CMD_WRITE_SECTORS);
+        }
+
+        for sec_idx in 0..chunk {
+            if sec_idx == 0 {
+                // First sector: DRQ is immediate after command, no IRQ fires.
+                if !wait_drq_poll_brief(p) {
+                    return false;
+                }
+            } else {
+                // Subsequent sectors: wait for IRQ signaling device ready.
+                if !wait_drq_async(p, irq, TIMEOUT_MS).await {
+                    return false;
+                }
             }
-        }
 
-        for _ in 0..chunk {
-            if !wait_drq_set(&dx.ports, TIMEOUT_MS) {
+            if off + 512 > data.len() {
                 return false;
             }
-            {
-                let mut p = dx.ports.lock();
-                for _ in 0..256 {
-                    let lo = data[off] as u16;
-                    let hi = data[off + 1] as u16;
-                    unsafe { p.data.write(lo | (hi << 8)) };
-                    off += 2;
-                }
+            for _ in 0..256 {
+                let lo = data[off] as u16;
+                let hi = data[off + 1] as u16;
+                unsafe { p.data.write(lo | (hi << 8)) };
+                off += 2;
             }
         }
 
@@ -763,16 +806,14 @@ fn ata_pio_write(dx: &DevExt, dh: u8, mut lba: u32, mut sectors: u32, data: &[u8
         sectors -= chunk;
     }
 
-    if !wait_not_busy(&dx.ports, TIMEOUT_MS) {
+    // Wait for final write to complete
+    if !wait_not_busy_async(p, irq, TIMEOUT_MS).await {
         return false;
     }
 
-    {
-        let mut p = dx.ports.lock();
-        unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
-    }
-
-    wait_not_busy(&dx.ports, TIMEOUT_MS)
+    // Flush cache
+    unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
+    wait_not_busy_async(p, irq, TIMEOUT_MS).await
 }
 
 fn disk_info_from_identify(words: &[u16; 256]) -> DiskInfo {
@@ -803,47 +844,149 @@ fn io_wait_400ns(alt: &mut Port<u8>) {
     }
 }
 
-fn wait_not_busy(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
+// ── Synchronous wait helpers (used during enumeration, before IRQ is available) ──
+
+fn wait_not_busy_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
     for _ in 0..timeout_ms {
-        {
-            let mut p = ports.lock();
-            let s = unsafe { p.command.read() };
+        let s = unsafe { ports.command.read() };
+        if (s & ATA_SR_BSY) == 0 {
+            return true;
+        }
+        wait_duration(Duration::from_millis(1));
+    }
+    false
+}
+
+fn wait_ready_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
+    for _ in 0..timeout_ms {
+        let s = unsafe { ports.command.read() };
+        if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
+            return true;
+        }
+        wait_duration(Duration::from_millis(1));
+    }
+    false
+}
+
+fn wait_drq_sync(ports: &mut Ports, timeout_ms: u64) -> bool {
+    for _ in 0..timeout_ms {
+        let s = unsafe { ports.command.read() };
+        if (s & ATA_SR_BSY) != 0 {
+        } else if (s & ATA_SR_ERR) != 0 {
+            return false;
+        } else if (s & ATA_SR_DRQ) != 0 {
+            return true;
+        }
+        wait_duration(Duration::from_millis(1));
+    }
+    false
+}
+
+// ── Async interrupt-driven wait helpers ──
+
+async fn wait_not_busy_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+    let s = unsafe { ports.command.read() };
+    if (s & ATA_SR_BSY) == 0 {
+        return true;
+    }
+
+    if let Some(handle) = irq {
+        let meta = IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        };
+        for _ in 0..(timeout_ms / 10).max(1) {
+            let result = handle.wait(meta).await;
+            if !irq_wait_ok(result) {
+                return false;
+            }
+            let s = unsafe { ports.command.read() };
             if (s & ATA_SR_BSY) == 0 {
                 return true;
             }
         }
-        wait_duration(Duration::from_millis(1));
+        false
+    } else {
+        wait_not_busy_sync(ports, timeout_ms)
     }
-    false
 }
 
-fn wait_ready(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
-    for _ in 0..timeout_ms {
-        {
-            let mut p = ports.lock();
-            let s = unsafe { p.command.read() };
+async fn wait_ready_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+    let s = unsafe { ports.command.read() };
+    if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
+        return true;
+    }
+
+    if let Some(handle) = irq {
+        let meta = IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        };
+        for _ in 0..(timeout_ms / 10).max(1) {
+            let result = handle.wait(meta).await;
+            if !irq_wait_ok(result) {
+                return false;
+            }
+            let s = unsafe { ports.command.read() };
             if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRDY) != 0 {
                 return true;
             }
         }
-        wait_duration(Duration::from_millis(1));
+        false
+    } else {
+        wait_ready_sync(ports, timeout_ms)
     }
-    false
 }
 
-fn wait_drq_set(ports: &Mutex<Ports>, timeout_ms: u64) -> bool {
-    for _ in 0..timeout_ms {
-        {
-            let mut p = ports.lock();
-            let s = unsafe { p.command.read() };
-            if (s & ATA_SR_BSY) != 0 {
-            } else if (s & ATA_SR_ERR) != 0 {
+async fn wait_drq_async(ports: &mut Ports, irq: &Option<IrqHandle>, timeout_ms: u64) -> bool {
+    let s = unsafe { ports.command.read() };
+    if (s & ATA_SR_BSY) == 0 {
+        if (s & ATA_SR_ERR) != 0 {
+            return false;
+        }
+        if (s & ATA_SR_DRQ) != 0 {
+            return true;
+        }
+    }
+
+    if let Some(handle) = irq {
+        let meta = IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        };
+        for _ in 0..(timeout_ms / 10).max(1) {
+            let result = handle.wait(meta).await;
+            if !irq_wait_ok(result) {
                 return false;
-            } else if (s & ATA_SR_DRQ) != 0 {
+            }
+            let s = unsafe { ports.command.read() };
+            if (s & ATA_SR_BSY) != 0 {
+                continue;
+            }
+            if (s & ATA_SR_ERR) != 0 {
+                return false;
+            }
+            if (s & ATA_SR_DRQ) != 0 {
                 return true;
             }
         }
-        wait_duration(Duration::from_millis(1));
+        false
+    } else {
+        wait_drq_sync(ports, timeout_ms)
+    }
+}
+
+/// Brief synchronous poll for DRQ — used for the first sector of a WRITE command
+/// where the ATA spec says no IRQ fires.
+fn wait_drq_poll_brief(ports: &mut Ports) -> bool {
+    for _ in 0..1000u32 {
+        let s = unsafe { ports.command.read() };
+        if (s & ATA_SR_BSY) == 0 && (s & ATA_SR_DRQ) != 0 {
+            return true;
+        }
+        if (s & ATA_SR_ERR) != 0 {
+            return false;
+        }
     }
     false
 }

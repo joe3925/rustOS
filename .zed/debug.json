@@ -6,7 +6,8 @@
     "program": "$ZED_WORKTREE_ROOT/target/debug/kernel.efi",
     "cwd": "$ZED_WORKTREE_ROOT",
     "build": {
-      "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 1 -gdb 'tcp::1234' -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk' }",
+      //"command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 1 -gdb 'tcp::1234' -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk' }",
+      "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'type=pc,accel=tcg' -smp 8 -gdb 'tcp::1234' -S -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=ide' }",
     },
 
     "initCommands": [
@@ -38,7 +39,7 @@
       "target modules load --file \"mountmgr.dll\" .text 0xffff900015061000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/fat32.dll\"",
-      "target modules load --file \"fat32.dll\" .text 0xffff900015299000",
+      "target modules load --file \"fat32.dll\" .text 0xffff90000ff7b000",
     ],
     "sourceLanguages": ["rust"],
   },

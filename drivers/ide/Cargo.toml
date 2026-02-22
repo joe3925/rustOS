@@ -25,4 +25,3 @@ opt-level = "z"
 
 [dependencies]
 kernel_api = { workspace = true }
-spin = { version = "0.10", default-features = false, features = ["mutex"] }
