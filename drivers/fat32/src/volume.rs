@@ -662,7 +662,7 @@ fn handle_fs_request(
 }
 
 async fn send_flush_dirty(volume_target: &IoTarget) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(RequestType::FlushDirty, RequestData::empty());
+    let mut flush_req = RequestHandle::new(RequestType::Flush, RequestData::empty());
     flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(volume_target.clone(), &mut flush_req).await
 }
@@ -690,6 +690,7 @@ pub async fn fs_op_dispatch<'a, 'b>(
             req.write().status = status;
             return DriverStep::complete(status);
         }
+
         let _ = send_flush_dirty(&volume_target).await;
     }
 

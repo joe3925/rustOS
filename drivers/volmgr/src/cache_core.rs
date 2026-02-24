@@ -6,6 +6,7 @@ use core::cmp::min;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use kernel_api::println;
 
 use futures::future::join_all;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
@@ -839,6 +840,7 @@ where
             if cache.flush_shards_streaming_all(parallel).await.is_ok() {
                 let _ = backend.flush_device().await;
             }
+            println!("flush done");
         });
     }
 

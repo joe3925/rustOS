@@ -64,9 +64,9 @@ lazy_static! {
     pub static ref BOOT_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
         name: "global",
         folder: "C:\\system\\logs",
-        log_samples: false,
-        log_spans: true,
-        log_mem_on_persist: true,
+        log_samples: true,
+        log_spans: false,
+        log_mem_on_persist: false,
         end_on_drop: false,
         timeout_ms: None,
         auto_persist_secs: None,
@@ -113,7 +113,6 @@ pub unsafe fn init() {
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
 
-    // BSP APIC calibration (moved here so current_cpu_id() works)
     apic_calibrate_ticks_per_ns_via_wait(10);
     apic_program_period_ns(APIC_START_PERIOD);
     SCHEDULER.init_core(current_cpu_id());
@@ -158,6 +157,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     let _pid = PROGRAM_MANAGER.add_program(program);
 
     spawn_detached(async move {
+        BOOT_WINDOW.start();
         let _ = install_prepacked_drivers().await;
         // BOOT_WINDOW.start();
         let _ = PNP_MANAGER.init_from_registry().await;

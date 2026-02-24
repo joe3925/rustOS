@@ -38,7 +38,7 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -345,7 +345,6 @@ pub fn bench_submit_rip_sample_current_core(rip: u64, stack_ptr: *const u64, sta
     if !BENCH_ENABLED {
         return;
     }
-    todo!();
     if !BENCH_READY.load(Ordering::Acquire) {
         return;
     }
@@ -1609,9 +1608,10 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
 
     let file_path = Path::from_string(&format!("{path}\\{file_name}"));
 
-    let mut file = match File::open(&file_path, &[OpenFlags::Create]).await {
+    let mut file = match File::open(&file_path, &[OpenFlags::Create, OpenFlags::WriteThrough]).await
+    {
         Ok(f) => f,
-        Err(_) => File::open(&file_path, &[OpenFlags::Open])
+        Err(_) => File::open(&file_path, &[OpenFlags::Open, OpenFlags::WriteThrough])
             .await
             .map_err(|_| ())?,
     };
@@ -2069,7 +2069,7 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 40 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,

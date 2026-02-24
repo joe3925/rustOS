@@ -1,4 +1,6 @@
+use crate::benchmarking::bench_submit_rip_sample_current_core;
 use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
+
 use crate::drivers::interrupt_index::{current_cpu_id, send_eoi_timer};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::State;
@@ -49,7 +51,9 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let sw = Stopwatch::start();
 
     SCHEDULER.on_timer_tick(state, cpu_id);
-    // unsafe { bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), 8) };
+    // TODO: interrupt can occur when the stack is smaller then stack len. For now don't dump stack
+    unsafe { bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), 0) };
+
     let dt = sw.elapsed_nanos() as usize;
     TIMER_TIME_SCHED.get().fetch_add(dt, Ordering::Relaxed);
 }
