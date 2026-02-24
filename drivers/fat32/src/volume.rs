@@ -10,6 +10,7 @@ use fatfs::{
 };
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
+use kernel_api::println;
 use spin::{Mutex, RwLock};
 
 use kernel_api::device::DeviceObject;
@@ -682,6 +683,11 @@ pub async fn fs_op_dispatch<'a, 'b>(
     };
 
     if vdx.should_flush.swap(false, Ordering::AcqRel) {
+        if matches!(req.read().kind, RequestType::Fs(FsOp::Read)) {
+            // TODO: not sure why this case happens fix this at some point.
+            req.write().status = status;
+            return DriverStep::complete(status);
+        }
         let _ = send_flush_dirty(&volume_target).await;
     }
 

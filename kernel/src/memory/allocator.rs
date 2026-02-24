@@ -4,9 +4,7 @@ use crate::{
     memory::{
         heap::{HEAP_SIZE, HEAP_START},
         paging::{
-            frame_alloc::BootInfoFrameAllocator,
-            paging::unmap_range_impl,
-            tables::init_mapper,
+            frame_alloc::BootInfoFrameAllocator, paging::unmap_range_impl, tables::init_mapper,
         },
     },
     scheduling::runtime::runtime::yield_now,
@@ -56,6 +54,10 @@ impl YieldingMimalloc {
                 core::hint::spin_loop();
             }
         }
+    }
+    #[inline(always)]
+    pub fn free_memory(&self) -> usize {
+        0
     }
 }
 
