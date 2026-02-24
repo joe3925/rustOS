@@ -53,11 +53,26 @@ const BLOCK_SIZE: usize = 1024 * 16;
 
 struct CacheBackend {
     target: IoTarget,
+    /// Total addressable bytes for the volume (computed from partition info).
+    volume_bytes: u64,
 }
 
 impl CacheBackend {
-    fn new(target: IoTarget) -> Self {
-        Self { target }
+    fn new(target: IoTarget, volume_bytes: u64) -> Self {
+        Self {
+            target,
+            volume_bytes,
+        }
+    }
+
+    #[inline]
+    fn block_len(&self, lba: u64) -> Option<usize> {
+        let start = lba.checked_mul(BLOCK_SIZE as u64)?;
+        if start >= self.volume_bytes {
+            return None;
+        }
+        let remaining = self.volume_bytes - start;
+        Some(core::cmp::min(remaining, BLOCK_SIZE as u64) as usize)
     }
 }
 
@@ -66,8 +81,10 @@ impl VolumeCacheBackend for CacheBackend {
 
     fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>> {
         async move {
+            let block_len = self.block_len(lba).ok_or(DriverStatus::InvalidParameter)?;
+
             let offset = lba * BLOCK_SIZE as u64;
-            let len = out.len();
+            let len = block_len;
             let mut req = RequestHandle::new(
                 RequestType::Read { offset, len },
                 RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
@@ -77,9 +94,15 @@ impl VolumeCacheBackend for CacheBackend {
             if status != DriverStatus::Success {
                 return Err(status);
             }
-            let guard = req.read();
-            let data = guard.data_slice();
-            out.copy_from_slice(&data[..len]);
+            {
+                let guard = req.read();
+                let data = guard.data_slice();
+                out[..len].copy_from_slice(&data[..len]);
+            }
+
+            if len < out.len() {
+                out[len..].fill(0);
+            }
             Ok(())
         }
         .into_ffi()
@@ -87,13 +110,14 @@ impl VolumeCacheBackend for CacheBackend {
 
     fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>> {
         async move {
+            let block_len = self.block_len(lba).ok_or(DriverStatus::InvalidParameter)?;
+
             let offset = lba * BLOCK_SIZE as u64;
-            let len = data.len();
-            let buf = RequestData::from_boxed_bytes(data.to_vec().into_boxed_slice());
+            let buf = RequestData::from_boxed_bytes(data[..block_len].to_vec().into_boxed_slice());
             let mut req = RequestHandle::new(
                 RequestType::Write {
                     offset,
-                    len,
+                    len: block_len,
                     flush_write_through: false,
                 },
                 buf,
@@ -148,6 +172,7 @@ struct VolPdoExt {
     backing: Once<IoTarget>,
     part: Once<PartitionInfo>,
     cache: Once<Arc<VolCache>>,
+    len_bytes: Once<u64>,
 }
 
 impl Default for VolPdoExt {
@@ -156,6 +181,7 @@ impl Default for VolPdoExt {
             backing: Once::new(),
             part: Once::new(),
             cache: Once::new(),
+            len_bytes: Once::new(),
         }
     }
 }
@@ -179,6 +205,20 @@ fn guid_to_string(g: &[u8; 16]) -> String {
         g[14],
         g[15]
     )
+}
+
+#[inline]
+fn partition_len_bytes(pi: &PartitionInfo) -> Option<u64> {
+    let sector_sz = pi.disk.logical_block_size as u64;
+    let ent = pi.gpt_entry?;
+
+    if sector_sz == 0 {
+        return None;
+    }
+
+    let sectors = ent.last_lba.checked_sub(ent.first_lba)?.saturating_add(1);
+
+    sectors.checked_mul(sector_sz)
 }
 
 #[unsafe(no_mangle)]
@@ -324,13 +364,19 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     if let Some(tgt) = pnp_get_device_target(&parent_dn.instance_path) {
         let pdx = ext::<VolPdoExt>(&pdo);
         let tgt_clone = tgt.clone();
-        pdx.backing.call_once(|| tgt);
-        pdx.part.call_once(|| dx.part.get().unwrap().clone());
+        let part_info = dx.part.get().unwrap().clone();
+        let vol_len = partition_len_bytes(&part_info).unwrap_or(0);
 
-        let backend = Arc::new(CacheBackend::new(tgt_clone));
-        let cfg = CacheConfig::new(1024 * 1024 * 20 / BLOCK_SIZE);
-        if let Ok(cache) = VolCache::new(backend, cfg) {
-            pdx.cache.call_once(|| Arc::new(cache));
+        pdx.backing.call_once(|| tgt);
+        pdx.part.call_once(|| part_info);
+        pdx.len_bytes.call_once(|| vol_len);
+
+        if vol_len != 0 {
+            let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
+            let cfg = CacheConfig::new(1024 * 1024 * 20 / BLOCK_SIZE);
+            if let Ok(cache) = VolCache::new(backend, cfg) {
+                pdx.cache.call_once(|| Arc::new(cache));
+            }
         }
     }
 
@@ -350,6 +396,11 @@ pub async fn vol_pdo_read<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
+    let vol_len = match dx.len_bytes.get() {
+        Some(v) => *v,
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+    };
+
     let (offset, len_req) = {
         let r = req.read();
         match r.kind {
@@ -358,9 +409,21 @@ pub async fn vol_pdo_read<'a, 'b>(
         }
     };
 
+    if offset >= vol_len {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+
+    if offset
+        .checked_add(len_req as u64)
+        .map_or(true, |end| end > vol_len)
+    {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
     len = core::cmp::min(len, req.read().data_len());
+    len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
@@ -388,6 +451,11 @@ pub async fn vol_pdo_write<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
+    let vol_len = match dx.len_bytes.get() {
+        Some(v) => *v,
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+    };
+
     let (offset, len_req, flush_write_through) = match req.read().kind {
         RequestType::Write {
             offset,
@@ -397,9 +465,21 @@ pub async fn vol_pdo_write<'a, 'b>(
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
+    if offset >= vol_len {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+
+    if offset
+        .checked_add(len_req as u64)
+        .map_or(true, |end| end > vol_len)
+    {
+        return DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
     len = core::cmp::min(len, req.read().data_len());
+    len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);

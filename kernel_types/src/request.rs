@@ -179,20 +179,21 @@ impl RequestData {
         }
     }
 
-    /// Create a `RequestData` that borrows an external byte buffer.
+    /// Borrow a typed value without taking ownership.
     ///
     /// # Safety
-    /// The caller must guarantee that the memory region `[ptr, ptr + len)` remains
-    /// valid and readable for the entire lifetime of this `RequestData` and any
-    /// `RequestHandle` that contains it.
-    pub unsafe fn from_borrowed_bytes(ptr: *const u8, len: usize) -> Self {
+    /// The caller must guarantee that `ptr` points to a valid instance of `T` that
+    /// remains alive and correctly aligned for the full lifetime of this
+    /// `RequestData` and any `RequestHandle` that contains it.
+    pub unsafe fn from_borrowed_t<T: Send + 'static>(ptr: &'static mut T) -> Self {
         Self {
             inline: InlineBuffer::new(),
-            heap_ptr: ptr as *mut u8,
-            heap_layout: Layout::new::<()>(),
-            tag: None,
+            heap_ptr: (ptr as *mut T) as *mut u8,
+            // Stored for metadata only; we never deallocate borrowed data.
+            heap_layout: Layout::new::<T>(),
+            tag: Some(type_tag::<T>()),
             dropper: noop_dropper,
-            size: len,
+            size: size_of::<T>(),
             mode: StorageMode::BorrowedBytes,
         }
     }
@@ -548,6 +549,23 @@ pub struct Request {
 }
 
 impl Request {
+    /// Ensure all payloads are owned (no borrowed pointers). Copies borrowed buffers.
+    pub fn safe(&mut self) {
+        fn ensure_owned(data: &mut RequestData) {
+            if matches!(data.mode, StorageMode::BorrowedBytes) {
+                // take_bytes() will copy for borrowed storage, yielding owned Box<[u8]>.
+                let owned = data.take_bytes();
+                *data = RequestData::from_boxed_bytes(owned);
+            }
+        }
+
+        ensure_owned(&mut self.data);
+
+        if let Some(pnp) = self.pnp.as_mut() {
+            ensure_owned(&mut pnp.data_out);
+        }
+    }
+
     /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
     pub(crate) fn new(kind: RequestType, data: RequestData) -> Self {
         if matches!(kind, RequestType::Pnp) {
@@ -985,11 +1003,13 @@ impl<'a> RequestHandle<'a> {
     pub fn promote(&mut self) {
         match self {
             RequestHandle::Stack(req_ref) => {
+                req_ref.safe(); // The request may now live longer then the caller expects, so ensure all payloads are owned and safe to move to heap.
                 let request = core::mem::replace(*req_ref, Request::empty());
                 *self = RequestHandle::Shared(SharedRequest::new(request));
             }
-            RequestHandle::Owned(_) => {
+            RequestHandle::Owned(req_ref) => {
                 // Take ownership of the request and wrap in SharedRequest
+                req_ref.safe();
                 let old = core::mem::replace(self, RequestHandle::Owned(Request::empty()));
                 if let RequestHandle::Owned(request) = old {
                     *self = RequestHandle::Shared(SharedRequest::new(request));

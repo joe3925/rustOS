@@ -54,6 +54,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "array-init"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
 name = "base_driver"
 version = "0.1.0"
 dependencies = [
@@ -313,6 +319,7 @@ dependencies = [
 name = "kernel_routing"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "kernel_sys",
  "kernel_types",
  "spin",
@@ -333,6 +340,7 @@ name = "kernel_types"
 version = "0.1.0"
 dependencies = [
  "acpi 5.2.0",
+ "array-init",
  "bincode",
  "crossbeam-queue",
  "spin",

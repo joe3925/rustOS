@@ -1,10 +1,10 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
+use crossbeam_queue::SegQueue;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
@@ -15,10 +15,6 @@ use kernel_types::status::DriverStatus;
 
 pub type CompletionRoutine =
     extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
-
-// =============================================================================
-// Linker seams - these are resolved at link time when kernel_link is enabled
-// =============================================================================
 
 #[cfg(feature = "kernel_link")]
 unsafe extern "Rust" {
@@ -37,10 +33,6 @@ fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
 fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>> {
     unsafe { routing_get_stack_top_from_weak_impl(dev_node_weak) }
 }
-
-// =============================================================================
-// FFI calls - used when compiled into drivers (not kernel)
-// =============================================================================
 
 #[cfg(not(feature = "kernel_link"))]
 fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
@@ -319,28 +311,7 @@ async fn pnp_minor_dispatch(
 // Synchronization helpers
 // =============================================================================
 
-fn push_waker(list: &mut Vec<Waker>, w: &Waker) {
-    for slot in list.iter_mut() {
-        if slot.will_wake(w) {
-            *slot = w.clone();
-            return;
-        }
-    }
-    list.push(w.clone());
-}
-
-fn remove_waker(list: &mut Vec<Waker>, w: &Waker) {
-    let mut i = 0usize;
-    while i < list.len() {
-        if list[i].will_wake(w) {
-            list.swap_remove(i);
-            return;
-        }
-        i += 1;
-    }
-}
-
-fn wake_one(list: &mut Vec<Waker>) {
+fn wake_one(list: &SegQueue<Waker>) {
     if let Some(w) = list.pop() {
         w.wake();
     }
@@ -372,23 +343,8 @@ impl Future for SlotAcquireFuture<'_> {
                 continue;
             }
 
-            {
-                let mut w = h.waiters.lock();
-                push_waker(&mut w, cx.waker());
-            }
-
-            // Re-check after enqueue to avoid lost wakeup.
-            let cur = h.running_request.load(Ordering::Acquire);
-            if cur < h.depth as u64
-                && h.running_request
-                    .compare_exchange(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let mut w = h.waiters.lock();
-                remove_waker(&mut w, cx.waker());
-                return Poll::Ready(());
-            }
-
+            // Unable to acquire: enqueue current waker and yield.
+            h.waiters.push(cx.waker().clone());
             return Poll::Pending;
         }
     }
@@ -405,8 +361,7 @@ impl Drop for SlotGuard<'_> {
             return;
         }
         self.handler.running_request.fetch_sub(1, Ordering::Release);
-        let mut w = self.handler.waiters.lock();
-        wake_one(&mut w);
+        wake_one(&self.handler.waiters);
     }
 }
 

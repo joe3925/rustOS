@@ -74,10 +74,6 @@ pub async fn ps2_start<'a, 'b>(
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
             let (have_kbd, have_mouse) = unsafe { probe_i8042() };
-            println!(
-                "i8042: probe complete, have_kbd={}, have_mouse={}\n",
-                have_kbd, have_mouse
-            );
             ext.have_kbd.store(have_kbd, Ordering::Release);
             ext.have_mouse.store(have_mouse, Ordering::Release);
         }

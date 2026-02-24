@@ -34,6 +34,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dcfed56ad506cb2c684a14971b8861fdc3baaaae314b9e5f9bb532cbe3ba7a4f"
 
 [[package]]
+name = "array-init"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d62b7694a562cdf5a74227903507c56ab2cc8bdd1f781ed5cb4cf9c9f810bfc"
+
+[[package]]
 name = "autocfg"
 version = "1.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -368,6 +374,7 @@ dependencies = [
 name = "kernel_routing"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "kernel_sys",
  "kernel_types",
  "spin 0.10.0",
@@ -388,6 +395,7 @@ name = "kernel_types"
 version = "0.1.0"
 dependencies = [
  "acpi",
+ "array-init",
  "bincode",
  "crossbeam-queue",
  "spin 0.10.0",

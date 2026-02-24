@@ -6,7 +6,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
+use crossbeam_queue::SegQueue;
 use spin::Mutex as SpinMutex;
+use spin::Once;
 pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]
@@ -125,13 +127,12 @@ impl IoType {
 }
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct IoHandler {
     pub handler: IoType,
     /// 0 = unlimited, 1 = serialized, >1 = bounded async queue depth
     pub depth: usize,
-    pub running_request: Arc<AtomicU64>,
-    pub waiters: Arc<SpinMutex<Vec<Waker>>>,
+    pub running_request: AtomicU64,
+    pub waiters: SegQueue<Waker>,
 }
 
 impl core::fmt::Debug for IoHandler {
@@ -145,7 +146,7 @@ impl core::fmt::Debug for IoHandler {
 #[derive(Debug)]
 #[repr(C)]
 pub struct IoVtable {
-    pub handlers: Vec<Option<IoHandler>>,
+    pub handlers: [Once<IoHandler>; 5],
 }
 
 impl IoVtable {
@@ -153,25 +154,28 @@ impl IoVtable {
     pub fn new() -> Self {
         let n = 5;
         Self {
-            handlers: alloc::vec![None; n],
+            handlers: array_init::array_init(|_| Once::new()),
         }
     }
 
     #[inline]
-    pub fn set(&mut self, cb: IoType, depth: usize) {
+    pub fn set(&self, cb: IoType, depth: usize) {
         let i = cb.slot();
-        if i < self.handlers.len() {
-            self.handlers[i] = Some(IoHandler {
-                handler: cb,
-                depth,
-                running_request: Arc::new(AtomicU64::new(0)),
-                waiters: Arc::new(SpinMutex::new(Vec::new())),
-            });
+        if i >= self.handlers.len() {
+            return;
         }
+
+        let _ = self.handlers[i].call_once(|| IoHandler {
+            handler: cb,
+            depth,
+            running_request: AtomicU64::new(0),
+            waiters: SegQueue::new(),
+        });
     }
 
     #[inline]
     pub fn get_for(&self, r: &RequestType) -> Option<&IoHandler> {
-        IoType::slot_for_request(r).and_then(|i| self.handlers.get(i)?.as_ref())
+        let i = IoType::slot_for_request(r)?;
+        self.handlers.get(i)?.get()
     }
 }

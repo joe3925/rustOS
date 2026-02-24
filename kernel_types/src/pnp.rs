@@ -3,6 +3,8 @@ use crate::request::RequestData;
 use crate::status::DriverStatus;
 use alloc::string::String;
 use alloc::vec::Vec;
+use array_init::array_init;
+use spin::Once;
 
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -71,34 +73,31 @@ impl PnpMinorFunction {
 #[repr(C)]
 #[derive(Debug)]
 pub struct PnpVtable {
-    pub handlers: Vec<Option<PnpMinorCallback>>,
+    pub handlers: [Once<PnpMinorCallback>; PNP_MINOR_COUNT],
 }
+
+const PNP_MINOR_COUNT: usize = core::mem::variant_count::<PnpMinorFunction>();
 
 impl PnpVtable {
     #[inline]
     pub fn new() -> Self {
-        let n = core::mem::variant_count::<PnpMinorFunction>();
         Self {
-            handlers: alloc::vec![None; n],
+            handlers: array_init(|_| Once::new()),
         }
     }
 
     #[inline]
-    pub fn set(&mut self, m: PnpMinorFunction, cb: PnpMinorCallback) {
+    pub fn set(&self, m: PnpMinorFunction, cb: PnpMinorCallback) {
         let i = m as usize;
         if i < self.handlers.len() {
-            self.handlers[i] = Some(cb);
+            let _ = self.handlers[i].call_once(|| cb);
         }
     }
 
     #[inline]
     pub fn get(&self, m: PnpMinorFunction) -> Option<PnpMinorCallback> {
         let i = m as usize;
-        if i < self.handlers.len() {
-            self.handlers[i]
-        } else {
-            None
-        }
+        self.handlers.get(i).and_then(|h| h.get().copied())
     }
 }
 

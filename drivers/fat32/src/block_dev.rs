@@ -1,5 +1,5 @@
 use alloc::{vec, vec::Vec};
-use core::cmp::min;
+use core::{cmp::min, mem::transmute};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -15,41 +15,13 @@ use kernel_api::{
 
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
-/// Pre-allocated request storage for allocation-free I/O operations.
-/// The RequestData owns the buffer. We only replace it with a larger one
-/// if a request needs more space than currently allocated.
-struct PreallocatedRequest {
-    /// The shared request handle, pre-promoted to avoid allocation on each I/O
-    shared: SharedRequest,
-    /// Current capacity of the buffer owned by RequestData
-    current_capacity: usize,
-}
-
-impl PreallocatedRequest {
-    fn new() -> Self {
-        // Create a minimal request that we'll reuse
-        let handle = RequestHandle::new(
-            RequestType::Read { offset: 0, len: 0 },
-            RequestData::empty(),
-        );
-        Self {
-            shared: handle.into_shared(),
-            current_capacity: 0,
-        }
-    }
-}
-
 pub struct BlockDev {
     volume: IoTarget,
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
-    /// Small buffer only for unaligned partial-sector reads/writes
-    sector_buf: Vec<u8>,
-    /// Pre-allocated request for read operations
-    read_request: PreallocatedRequest,
-    /// Pre-allocated request for write operations
-    write_request: PreallocatedRequest,
+    /// Scratch buffer used for partial-sector R/W to avoid per-call allocations.
+    scratch: Vec<u8>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
 }
@@ -72,15 +44,37 @@ impl IoBase for BlockDev {
 }
 
 impl BlockDev {
-    pub fn new(volume: IoTarget, sector_size: u16, total_sectors: u64, should_flush: Arc<AtomicBool>) -> Self {
+    #[inline]
+    unsafe fn borrowed_reqdata_from_mut(buf: &mut [u8]) -> RequestData {
+        // Extend the lifetime to 'static for the duration of the request.
+        let static_ref: &'static mut u8 = transmute(buf.as_mut_ptr());
+        let mut data = RequestData::from_borrowed_t(static_ref);
+        data.set_len(buf.len());
+        data
+    }
+
+    #[inline]
+    unsafe fn borrowed_reqdata_from(buf: &[u8]) -> RequestData {
+        // Read-only borrow; lower drivers must not mutate.
+        let static_ref: &'static mut u8 = transmute(buf.as_ptr() as *mut u8);
+        let mut data = RequestData::from_borrowed_t(static_ref);
+        data.set_len(buf.len());
+        data
+    }
+
+    pub fn new(
+        volume: IoTarget,
+        sector_size: u16,
+        total_sectors: u64,
+        should_flush: Arc<AtomicBool>,
+    ) -> Self {
+        let scratch = vec![0u8; sector_size as usize];
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
-            sector_buf: vec![0u8; sector_size as usize],
-            read_request: PreallocatedRequest::new(),
-            write_request: PreallocatedRequest::new(),
+            scratch,
             should_flush,
         }
     }
@@ -96,16 +90,6 @@ impl BlockDev {
     }
 
     #[inline]
-    fn clamp_len(&self, want: usize) -> usize {
-        let cap = self.capacity_bytes();
-        if self.pos >= cap {
-            return 0;
-        }
-        let remain = (cap - self.pos) as usize;
-        min(remain, want)
-    }
-
-    #[inline]
     fn lba_of(&self, byte_off: u64) -> u64 {
         byte_off / self.sector_size as u64
     }
@@ -115,87 +99,52 @@ impl BlockDev {
         (byte_off % self.sector_size as u64) as usize
     }
 
-    /// Read into a buffer using pre-allocated request (allocation-free after warmup)
+    /// Read into a buffer using pre-allocated request
     async fn pnp_read_into(
         volume: &IoTarget,
-        req: &mut PreallocatedRequest,
         offset: u64,
         buf: &mut [u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
 
-        // Reset the request for reuse
-        {
-            let mut guard = req.shared.write();
-            guard.kind = RequestType::Read { offset, len };
-            guard.completed = false;
-            guard.status = DriverStatus::ContinueStep;
-            guard.traversal_policy = TraversalPolicy::ForwardLower;
-            guard.completion_routine = None;
-            guard.completion_context = 0;
-            guard.waker = None;
+        let mut req = unsafe {
+            RequestHandle::new(
+                RequestType::Read { offset, len },
+                Self::borrowed_reqdata_from_mut(buf),
+            )
+        };
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            // Only allocate a new buffer if we need more space than current capacity
-            if len > req.current_capacity {
-                guard.data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-                req.current_capacity = len;
-            } else {
-                // Reusing existing buffer - update the size field to match current request
-                guard.data.set_len(len);
-            }
-        }
-
-        let mut handle = RequestHandle::Shared(req.shared.clone());
-        let st = pnp_send_request(volume.clone(), &mut handle).await;
+        let st = pnp_send_request(volume.clone(), &mut req).await;
 
         if st == DriverStatus::Success {
-            let guard = req.shared.read();
-            buf.copy_from_slice(guard.data.as_slice());
             return Ok(());
         }
         println!("Error: {:#?}", st);
         Err(st)
     }
 
-    /// Write from a buffer using pre-allocated request (allocation-free after warmup)
+    /// Write from a buffer using pre-allocated request
     async fn pnp_write_from(
         volume: &IoTarget,
-        req: &mut PreallocatedRequest,
         offset: u64,
         buf: &[u8],
     ) -> Result<(), DriverStatus> {
         let len = buf.len();
 
-        // Reset the request for reuse
-        {
-            let mut guard = req.shared.write();
-            guard.kind = RequestType::Write {
-                offset,
-                len,
-                flush_write_through: false,
-            };
-            guard.completed = false;
-            guard.status = DriverStatus::ContinueStep;
-            guard.traversal_policy = TraversalPolicy::ForwardLower;
-            guard.completion_routine = None;
-            guard.completion_context = 0;
-            guard.waker = None;
+        let mut req = unsafe {
+            RequestHandle::new(
+                RequestType::Write {
+                    offset,
+                    len,
+                    flush_write_through: false,
+                },
+                Self::borrowed_reqdata_from(buf),
+            )
+        };
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            // Only allocate a new buffer if we need more space than current capacity
-            if len > req.current_capacity {
-                guard.data = RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice());
-                req.current_capacity = len;
-            } else {
-                // Reusing existing buffer - update the size field to match current request
-                guard.data.set_len(len);
-            }
-
-            // Copy source data into the buffer
-            guard.data.as_mut_slice().copy_from_slice(buf);
-        }
-
-        let mut handle = RequestHandle::Shared(req.shared.clone());
-        let st = pnp_send_request(volume.clone(), &mut handle).await;
+        let st = pnp_send_request(volume.clone(), &mut req).await;
 
         if st == DriverStatus::Success {
             Ok(())
@@ -205,138 +154,144 @@ impl BlockDev {
         }
     }
 
-    fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, BlkError> {
-        let to_read = self.clamp_len(dst.len());
-        if to_read == 0 {
+    fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, DriverStatus> {
+        let mut remaining = dst.len();
+        if remaining == 0 {
             return Ok(0);
         }
 
-        let bps = self.bps();
-        let mut remaining = to_read;
-        let mut out_off = 0usize;
-
-        while remaining != 0 {
-            let pos = self.pos;
-            let lba = self.lba_of(pos);
-            let in_off = self.in_sector_off(pos);
-            let room = bps - in_off;
-
-            // Unaligned or partial sector read - must use sector buffer
-            if in_off != 0 || remaining < bps {
-                let sector_off = lba * bps as u64;
-
-                // Minimal async closure - only capture what's needed for the I/O
-                let volume = &self.volume;
-                let req = &mut self.read_request;
-                let sector_buf = &mut self.sector_buf[..bps];
-                block_on(async { Self::pnp_read_into(volume, req, sector_off, sector_buf).await })
-                    .map_err(BlkError::from)?;
-
-                let take = min(remaining, room);
-                dst[out_off..out_off + take]
-                    .copy_from_slice(&self.sector_buf[in_off..in_off + take]);
-                self.pos += take as u64;
-                out_off += take;
-                remaining -= take;
-                continue;
-            }
-
-            // Aligned read - read into destination buffer
-            let full_sectors = remaining / bps;
-            let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
-            let chunk_sectors = min(full_sectors, max_sectors);
-            let chunk_bytes = chunk_sectors * bps;
-
-            let byte_off = lba * bps as u64;
-
-            let volume = &self.volume;
-            let req = &mut self.read_request;
-            let dst_slice = &mut dst[out_off..out_off + chunk_bytes];
-            block_on(async { Self::pnp_read_into(volume, req, byte_off, dst_slice).await })
-                .map_err(BlkError::from)?;
-
-            self.pos += chunk_bytes as u64;
-            out_off += chunk_bytes;
-            remaining -= chunk_bytes;
+        let cap_bytes = self.capacity_bytes();
+        if self.pos >= cap_bytes {
+            return Ok(0);
         }
 
-        Ok(to_read)
+        // Clamp reads that would pass the end of the device.
+        remaining = min(remaining, (cap_bytes - self.pos) as usize);
+        let mut written = 0usize;
+        let mut cur_off = self.pos;
+        let bps = self.bps();
+        let volume = &self.volume;
+
+        // Handle leading partial sector, if any.
+        let in_sector = self.in_sector_off(cur_off);
+        if in_sector != 0 {
+            let lba_base = cur_off - in_sector as u64;
+            let take = min(bps - in_sector, remaining);
+            let scratch = &mut self.scratch[..bps];
+
+            block_on(async { Self::pnp_read_into(volume, lba_base, scratch).await })?;
+            dst[..take].copy_from_slice(&scratch[in_sector..in_sector + take]);
+
+            cur_off += take as u64;
+            written += take;
+            remaining -= take;
+        }
+
+        // Whole aligned sectors can stream directly into destination in chunks.
+        let aligned_bytes = remaining - (remaining % bps);
+        if aligned_bytes != 0 {
+            let mut done = 0;
+            while done < aligned_bytes {
+                // Cap each IO to MAX_CHUNK_BYTES while staying sector aligned.
+                let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
+                let chunk = if max_chunk == 0 {
+                    // Fallback for unusually large sector sizes.
+                    min(bps, aligned_bytes - done)
+                } else {
+                    min(max_chunk, aligned_bytes - done)
+                };
+                let dst_slice = &mut dst[written + done..written + done + chunk];
+                block_on(async { Self::pnp_read_into(volume, cur_off, dst_slice).await })?;
+
+                cur_off += chunk as u64;
+                done += chunk;
+            }
+            written += aligned_bytes;
+            remaining -= aligned_bytes;
+        }
+
+        // Trailing partial sector.
+        if remaining != 0 {
+            let scratch = &mut self.scratch[..bps];
+            block_on(async { Self::pnp_read_into(volume, cur_off, scratch).await })?;
+            dst[written..written + remaining].copy_from_slice(&scratch[..remaining]);
+
+            cur_off += remaining as u64;
+            written += remaining;
+        }
+
+        self.pos = cur_off;
+        Ok(written)
     }
 
-    fn write_bytes(&mut self, src: &[u8]) -> Result<usize, BlkError> {
-        let to_write = self.clamp_len(src.len());
-        if to_write == 0 {
+    fn write_bytes(&mut self, src: &[u8]) -> Result<usize, DriverStatus> {
+        let mut remaining = src.len();
+        if remaining == 0 {
             return Ok(0);
         }
 
-        let bps = self.bps();
-        let mut remaining = to_write;
-        let mut in_off_src = 0usize;
-
-        while remaining != 0 {
-            let pos = self.pos;
-            let lba = self.lba_of(pos);
-            let in_off = self.in_sector_off(pos);
-            let room = bps - in_off;
-
-            // Unaligned or partial sector write - need read-modify-write
-            if in_off != 0 || remaining < bps {
-                let sector_off = lba * bps as u64;
-
-                // Read existing sector - minimal async closure
-                {
-                    let volume = &self.volume;
-                    let req = &mut self.read_request;
-                    let sector_buf = &mut self.sector_buf[..bps];
-                    block_on(async {
-                        Self::pnp_read_into(volume, req, sector_off, sector_buf).await
-                    })
-                    .map_err(BlkError::from)?;
-                }
-
-                // Modify
-                let take = min(remaining, room);
-                self.sector_buf[in_off..in_off + take]
-                    .copy_from_slice(&src[in_off_src..in_off_src + take]);
-
-                // Write back - minimal async closure
-                {
-                    let volume = &self.volume;
-                    let req = &mut self.write_request;
-                    let sector_buf = &self.sector_buf[..bps];
-                    block_on(async {
-                        Self::pnp_write_from(volume, req, sector_off, sector_buf).await
-                    })
-                    .map_err(BlkError::from)?;
-                }
-
-                self.pos += take as u64;
-                in_off_src += take;
-                remaining -= take;
-                continue;
-            }
-
-            // Aligned write - write from source
-            let full_sectors = remaining / bps;
-            let max_sectors = (MAX_CHUNK_BYTES / bps).max(1);
-            let chunk_sectors = min(full_sectors, max_sectors);
-            let chunk_bytes = chunk_sectors * bps;
-
-            let byte_off = lba * bps as u64;
-
-            // Minimal async closure - only capture what's needed for the I/O
-            let volume = &self.volume;
-            let req = &mut self.write_request;
-            let src_slice = &src[in_off_src..in_off_src + chunk_bytes];
-            block_on(async { Self::pnp_write_from(volume, req, byte_off, src_slice).await })
-                .map_err(BlkError::from)?;
-
-            self.pos += chunk_bytes as u64;
-            in_off_src += chunk_bytes;
-            remaining -= chunk_bytes;
+        let cap_bytes = self.capacity_bytes();
+        if self.pos >= cap_bytes {
+            return Ok(0);
         }
 
-        Ok(to_write)
+        // Clamp writes beyond end of device.
+        remaining = min(remaining, (cap_bytes - self.pos) as usize);
+        let mut written = 0usize;
+        let mut cur_off = self.pos;
+        let bps = self.bps();
+        let volume = &self.volume;
+
+        // Leading partial sector (read-modify-write).
+        let in_sector = self.in_sector_off(cur_off);
+        if in_sector != 0 {
+            let lba_base = cur_off - in_sector as u64;
+            let write_len = min(bps - in_sector, remaining);
+            let scratch = &mut self.scratch[..bps];
+
+            block_on(async { Self::pnp_read_into(volume, lba_base, scratch).await })?;
+            scratch[in_sector..in_sector + write_len].copy_from_slice(&src[..write_len]);
+            block_on(async { Self::pnp_write_from(volume, lba_base, scratch).await })?;
+
+            cur_off += write_len as u64;
+            written += write_len;
+            remaining -= write_len;
+        }
+
+        // Aligned middle portion.
+        let aligned_bytes = remaining - (remaining % bps);
+        if aligned_bytes != 0 {
+            let mut done = 0;
+            while done < aligned_bytes {
+                let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
+                let chunk = if max_chunk == 0 {
+                    min(bps, aligned_bytes - done)
+                } else {
+                    min(max_chunk, aligned_bytes - done)
+                };
+                let src_slice = &src[written + done..written + done + chunk];
+                block_on(async { Self::pnp_write_from(volume, cur_off, src_slice).await })?;
+
+                cur_off += chunk as u64;
+                done += chunk;
+            }
+            written += aligned_bytes;
+            remaining -= aligned_bytes;
+        }
+
+        // Trailing partial sector (read-modify-write).
+        if remaining != 0 {
+            let scratch = &mut self.scratch[..bps];
+            block_on(async { Self::pnp_read_into(volume, cur_off, scratch).await })?;
+            scratch[..remaining].copy_from_slice(&src[written..written + remaining]);
+            block_on(async { Self::pnp_write_from(volume, cur_off, scratch).await })?;
+
+            cur_off += remaining as u64;
+            written += remaining;
+        }
+
+        self.pos = cur_off;
+        Ok(written)
     }
 }
 

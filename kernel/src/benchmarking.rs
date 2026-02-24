@@ -2069,15 +2069,17 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 40 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
-    // 8 * 1024 * 1024,
+    8 * 1024 * 1024,
     // 16 * 1024 * 1024,
+    // 32 * 1024 * 1024,
+    // 1024 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -2186,15 +2188,21 @@ pub async fn bench_c_drive_io_async() {
     let mut read_throughput: Vec<f64> = Vec::new();
 
     for &chunk_sz in DISK_BENCH_SIZES {
+        if let Err(e) = file.set_len(0).await {
+            println!("[disk-bench] failed to truncate benchmark file: {:?}", e);
+            return;
+        }
         let ops = (DISK_BENCH_TOTAL_BYTES / chunk_sz).max(1);
 
         let mut chunk = vec![0u8; chunk_sz];
 
         let sw_write = Stopwatch::start();
+        let mut write_elapsed = 0;
         let mut total_written = 0u64;
         println!("starting chunk size: {}", chunk_sz);
         for op in 0..ops {
             chunk[..8].copy_from_slice(&(op as u64).to_le_bytes());
+            let sw_write = Stopwatch::start();
             match file.append(&chunk).await {
                 Ok(_) => {
                     total_written = total_written.saturating_add(chunk_sz as u64);
@@ -2207,8 +2215,8 @@ pub async fn bench_c_drive_io_async() {
                     continue;
                 }
             }
+            write_elapsed += sw_write.elapsed_nanos();
         }
-        let write_elapsed = sw_write.elapsed_nanos();
         let write_mib_s = mib_per_sec(total_written, write_elapsed);
         let per_write_ns = write_elapsed / ops as u64;
 
