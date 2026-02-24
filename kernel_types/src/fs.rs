@@ -1,5 +1,6 @@
 use crate::status::FileStatus;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
 #[repr(C)]
@@ -168,12 +169,12 @@ pub struct FsReadResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FsWriteParams {
+#[derive(Debug, Clone, Copy)]
+pub struct FsWriteParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
     pub write_through: bool,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
 }
 
 #[repr(C)]
@@ -287,10 +288,10 @@ pub struct FsSetLenResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FsAppendParams {
+#[derive(Debug, Clone, Copy)]
+pub struct FsAppendParams<'a> {
     pub fs_file_id: u64,
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
     pub write_through: bool,
 }
 

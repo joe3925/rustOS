@@ -130,18 +130,17 @@ impl Vfs {
         Some(tgt)
     }
 
-    async fn call_fs<TParam, TResult>(
+    async fn call_fs_with_data<TResult>(
         &self,
         volume_symlink: &str,
         target: Option<IoTarget>,
         op: FsOp,
-        param: TParam,
+        data: RequestData,
     ) -> Result<TResult, DriverStatus>
     where
-        TParam: 'static,
         TResult: 'static,
     {
-        let mut handle = RequestHandle::new(RequestType::Fs(op), RequestData::from_t(param));
+        let mut handle = RequestHandle::new(RequestType::Fs(op), data);
         handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = if let Some(tgt) = target {
@@ -162,6 +161,21 @@ impl Vfs {
             .take_data::<TResult>()
             .ok_or(DriverStatus::InvalidParameter);
         ret
+    }
+
+    async fn call_fs<TParam, TResult>(
+        &self,
+        volume_symlink: &str,
+        target: Option<IoTarget>,
+        op: FsOp,
+        param: TParam,
+    ) -> Result<TResult, DriverStatus>
+    where
+        TParam: 'static,
+        TResult: 'static,
+    {
+        self.call_fs_with_data(volume_symlink, target, op, RequestData::from_t(param))
+            .await
     }
 
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
@@ -470,7 +484,7 @@ impl Vfs {
         }
     }
 
-    pub async fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
+    pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
         let binding = self.handles.read();
 
         let Some(h) = binding.get(&p.fs_file_id) else {
@@ -484,11 +498,11 @@ impl Vfs {
         };
         p.fs_file_id = h.inner_id;
         match self
-            .call_fs::<FsWriteParams, FsWriteResult>(
+            .call_fs_with_data::<FsWriteResult>(
                 &h.volume_symlink,
                 h.target.clone(),
                 FsOp::Write,
-                p,
+                RequestData::from_fs_write_params(p),
             )
             .await
         {
@@ -728,7 +742,7 @@ impl Vfs {
         }
     }
 
-    pub async fn append(&self, mut p: FsAppendParams) -> (FsAppendResult, DriverStatus) {
+    pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
         let binding = self.handles.read();
 
         let Some(h) = binding.get(&p.fs_file_id) else {
@@ -743,11 +757,11 @@ impl Vfs {
         };
         p.fs_file_id = h.inner_id;
         match self
-            .call_fs::<FsAppendParams, FsAppendResult>(
+            .call_fs_with_data::<FsAppendResult>(
                 &h.volume_symlink,
                 h.target.clone(),
                 FsOp::Append,
-                p,
+                RequestData::from_fs_append_params(p),
             )
             .await
         {
@@ -858,7 +872,6 @@ impl FileProvider for Vfs {
         write_through: bool,
     ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-        let data = data.to_vec();
 
         this.write(FsWriteParams {
             fs_file_id: file_id,
@@ -956,7 +969,6 @@ impl FileProvider for Vfs {
         write_through: bool,
     ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-        let data = data.to_vec();
 
         this.append(FsAppendParams {
             fs_file_id: file_id,

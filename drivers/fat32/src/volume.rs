@@ -58,7 +58,7 @@ pub struct FileCtx {
     size: u64,
 }
 
-fn take_typed_params<T: 'static>(req: &mut RequestHandle<'_>) -> Result<T, DriverStatus> {
+fn take_typed_params<T>(req: &mut RequestHandle<'_>) -> Result<T, DriverStatus> {
     let mut r = req.write();
     r.take_data::<T>().ok_or(DriverStatus::InvalidParameter)
 }
@@ -299,10 +299,11 @@ fn handle_fs_request(
                 }
 
                 FsOp::Write => {
-                    let params: FsWriteParams = match take_typed_params::<FsWriteParams>(req) {
-                        Ok(p) => p,
-                        Err(st) => return st,
-                    };
+                    let params: FsWriteParams<'_> =
+                        match take_typed_params::<FsWriteParams<'_>>(req) {
+                            Ok(p) => p,
+                            Err(st) => return st,
+                        };
 
                     let write_res: Result<usize, FileStatus> = {
                         let tbl = vdx.table.read();
@@ -538,10 +539,11 @@ fn handle_fs_request(
                 }
 
                 FsOp::Append => {
-                    let params: FsAppendParams = match take_typed_params::<FsAppendParams>(req) {
-                        Ok(p) => p,
-                        Err(st) => return st,
-                    };
+                    let params: FsAppendParams<'_> =
+                        match take_typed_params::<FsAppendParams<'_>>(req) {
+                            Ok(p) => p,
+                            Err(st) => return st,
+                        };
 
                     let result: Result<(usize, u64), FileStatus> = {
                         let tbl = vdx.table.read();

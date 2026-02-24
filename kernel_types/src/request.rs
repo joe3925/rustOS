@@ -111,7 +111,7 @@ unsafe impl Send for RequestData {}
 unsafe impl Sync for RequestData {}
 // TODO: better hashing is probably possible to reduce the case where 2 types have the same name.
 #[inline]
-pub const fn type_tag<T: 'static>() -> u64 {
+pub const fn type_tag<T>() -> u64 {
     const fn fnv1a(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0x817776954A86F58E;
         let mut i = 0;
@@ -292,11 +292,11 @@ impl RequestData {
         }
     }
 
-    fn matches<T: 'static>(&self) -> bool {
+    fn matches<T>(&self) -> bool {
         self.tag == Some(type_tag::<T>()) && self.size == size_of::<T>()
     }
 
-    pub fn view<T: 'static>(&self) -> Option<&T> {
+    pub fn view<T>(&self) -> Option<&T> {
         if !self.matches::<T>() {
             return None;
         }
@@ -314,7 +314,7 @@ impl RequestData {
         Some(unsafe { &*(ptr as *const T) })
     }
 
-    pub fn view_mut<T: 'static>(&mut self) -> Option<&mut T> {
+    pub fn view_mut<T>(&mut self) -> Option<&mut T> {
         if !self.matches::<T>() {
             return None;
         }
@@ -332,7 +332,7 @@ impl RequestData {
         Some(unsafe { &mut *(ptr as *mut T) })
     }
 
-    pub fn try_take<T: 'static>(&mut self) -> Option<T> {
+    pub fn try_take<T>(&mut self) -> Option<T> {
         if !self.matches::<T>() {
             return None;
         }
@@ -374,6 +374,115 @@ impl RequestData {
         self.dropper = noop_dropper;
 
         Some(value)
+    }
+
+    /// Create request data for filesystem writes without copying the payload buffer.
+    ///
+    /// This mirrors `from_t` but accepts `FsWriteParams<'a>` which contains a borrowed slice.
+    /// The caller must ensure the referenced buffer lives at least as long as the request.
+    pub fn from_fs_write_params<'a>(value: crate::fs::FsWriteParams<'a>) -> Self {
+        let size = size_of::<crate::fs::FsWriteParams<'a>>();
+        let align = align_of::<crate::fs::FsWriteParams<'a>>();
+
+        fn typed_dropper(ptr: *mut u8) {
+            unsafe {
+                core::ptr::drop_in_place(ptr as *mut crate::fs::FsWriteParams<'static>);
+            }
+        }
+
+        if size <= INLINE_THRESHOLD && align <= INLINE_ALIGN {
+            // INLINE PATH: Copy value into inline buffer
+            let mut result = Self {
+                inline: InlineBuffer::new(),
+                heap_ptr: null_mut(),
+                heap_layout: Layout::new::<()>(),
+                tag: Some(type_tag::<crate::fs::FsWriteParams<'a>>()),
+                dropper: typed_dropper,
+                size,
+                mode: StorageMode::Inline,
+            };
+
+            unsafe {
+                let dst = result.inline.as_mut_ptr() as *mut crate::fs::FsWriteParams<'a>;
+                core::ptr::write(dst, value);
+            }
+
+            result
+        } else {
+            // HEAP PATH: Allocate with correct Layout
+            let layout = Layout::new::<crate::fs::FsWriteParams<'a>>();
+            let ptr = unsafe { alloc::alloc::alloc(layout) };
+
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+
+            unsafe {
+                core::ptr::write(ptr as *mut crate::fs::FsWriteParams<'a>, value);
+            }
+
+            Self {
+                inline: InlineBuffer::new(),
+                heap_ptr: ptr,
+                heap_layout: layout,
+                tag: Some(type_tag::<crate::fs::FsWriteParams<'a>>()),
+                dropper: typed_dropper,
+                size,
+                mode: StorageMode::HeapTyped,
+            }
+        }
+    }
+
+    /// Create request data for filesystem appends without copying the payload buffer.
+    /// Same rules as `from_fs_write_params` regarding the lifetime of the slice.
+    pub fn from_fs_append_params<'a>(value: crate::fs::FsAppendParams<'a>) -> Self {
+        let size = size_of::<crate::fs::FsAppendParams<'a>>();
+        let align = align_of::<crate::fs::FsAppendParams<'a>>();
+
+        fn typed_dropper(ptr: *mut u8) {
+            unsafe {
+                core::ptr::drop_in_place(ptr as *mut crate::fs::FsAppendParams<'static>);
+            }
+        }
+
+        if size <= INLINE_THRESHOLD && align <= INLINE_ALIGN {
+            let mut result = Self {
+                inline: InlineBuffer::new(),
+                heap_ptr: null_mut(),
+                heap_layout: Layout::new::<()>(),
+                tag: Some(type_tag::<crate::fs::FsAppendParams<'a>>()),
+                dropper: typed_dropper,
+                size,
+                mode: StorageMode::Inline,
+            };
+
+            unsafe {
+                let dst = result.inline.as_mut_ptr() as *mut crate::fs::FsAppendParams<'a>;
+                core::ptr::write(dst, value);
+            }
+
+            result
+        } else {
+            let layout = Layout::new::<crate::fs::FsAppendParams<'a>>();
+            let ptr = unsafe { alloc::alloc::alloc(layout) };
+            if ptr.is_null() {
+                alloc::alloc::handle_alloc_error(layout);
+            }
+
+            unsafe {
+                core::ptr::write(ptr as *mut crate::fs::FsAppendParams<'a>, value);
+            }
+
+            Self {
+                inline: InlineBuffer::new(),
+                heap_ptr: ptr,
+                heap_layout: layout,
+                tag: Some(type_tag::<crate::fs::FsAppendParams<'a>>()),
+                dropper: typed_dropper,
+                size,
+                mode: StorageMode::HeapTyped,
+            }
+        }
     }
 
     pub fn take_bytes(&mut self) -> Box<[u8]> {
@@ -664,17 +773,17 @@ impl Request {
     }
 
     #[inline]
-    pub fn view_data<T: 'static>(&self) -> Option<&T> {
+    pub fn view_data<T>(&self) -> Option<&T> {
         self.data.view::<T>()
     }
 
     #[inline]
-    pub fn view_data_mut<T: 'static>(&mut self) -> Option<&mut T> {
+    pub fn view_data_mut<T>(&mut self) -> Option<&mut T> {
         self.data.view_mut::<T>()
     }
 
     #[inline]
-    pub fn take_data<T: 'static>(&mut self) -> Option<T> {
+    pub fn take_data<T>(&mut self) -> Option<T> {
         self.data.try_take::<T>()
     }
 
