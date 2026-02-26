@@ -1,3 +1,4 @@
+use crate::block_dev::flush;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -319,10 +320,8 @@ fn handle_fs_request(
                                         match file.write_all(&params.data) {
                                             Ok(()) => {
                                                 if params.write_through {
-                                                    match file.flush() {
-                                                        Ok(()) => Ok(n),
-                                                        Err(e) => Err(map_fatfs_err(&e)),
-                                                    }
+                                                    flush(&vdx);
+                                                    Ok(n)
                                                 } else {
                                                     Ok(n)
                                                 }
@@ -382,7 +381,7 @@ fn handle_fs_request(
                             },
                         }
                     };
-
+                    flush(&vdx);
                     let mut r = req.write();
                     r.set_data_t(FsFlushResult { error: err });
                     DriverStatus::Success
@@ -511,10 +510,10 @@ fn handle_fs_request(
                             Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
                                 Ok(mut file) => match file.seek(SeekFrom::Start(params.new_size)) {
                                     Ok(_) => match file.truncate() {
-                                        Ok(()) => match file.flush() {
-                                            Ok(()) => None,
-                                            Err(e) => Some(map_fatfs_err(&e)),
-                                        },
+                                        Ok(()) => {
+                                            flush(&vdx);
+                                            None
+                                        }
                                         Err(e) => Some(map_fatfs_err(&e)),
                                     },
                                     Err(e) => Some(map_fatfs_err(&e)),
@@ -559,10 +558,8 @@ fn handle_fs_request(
                                             match file.write_all(&params.data) {
                                                 Ok(()) => {
                                                     if params.write_through {
-                                                        match file.flush() {
-                                                            Ok(()) => Ok((n, start_off + n as u64)),
-                                                            Err(e) => Err(map_fatfs_err(&e)),
-                                                        }
+                                                        flush(&vdx);
+                                                        Ok((n, start_off + n as u64))
                                                     } else {
                                                         Ok((n, start_off + n as u64))
                                                     }
@@ -631,10 +628,10 @@ fn handle_fs_request(
                                                 Ok(_) => {
                                                     let zeros = vec![0u8; zero_len as usize];
                                                     match file.write_all(&zeros) {
-                                                        Ok(()) => match file.flush() {
-                                                            Ok(()) => None,
-                                                            Err(e) => Some(map_fatfs_err(&e)),
-                                                        },
+                                                        Ok(()) => {
+                                                            flush(&vdx);
+                                                            None
+                                                        }
                                                         Err(e) => Some(map_fatfs_err(&e)),
                                                     }
                                                 }
@@ -662,7 +659,7 @@ fn handle_fs_request(
 }
 
 async fn send_flush_dirty(volume_target: &IoTarget) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(RequestType::Flush, RequestData::empty());
+    let mut flush_req = RequestHandle::new(RequestType::FlushDirty, RequestData::empty());
     flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(volume_target.clone(), &mut flush_req).await
 }
@@ -685,12 +682,6 @@ pub async fn fs_op_dispatch<'a, 'b>(
     };
 
     if vdx.should_flush.swap(false, Ordering::AcqRel) {
-        if matches!(req.read().kind, RequestType::Fs(FsOp::Read)) {
-            // TODO: not sure why this case happens fix this at some point.
-            req.write().status = status;
-            return DriverStep::complete(status);
-        }
-
         let _ = send_flush_dirty(&volume_target).await;
     }
 

@@ -57,10 +57,9 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const INVALID_HEAD: u16 = 0xFFFF;
-const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 400;
+const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 600;
 const SPIN_WAIT_SLICE_NS: u64 = 50;
 
-// Configurable busy-spin duration before blocking on interrupts.
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
 
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {

@@ -10,6 +10,7 @@ use kernel_api::println;
 
 use futures::future::join_all;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
+use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 
 use super::cache::{
@@ -827,7 +828,7 @@ where
         Ok(removed)
     }
 
-    async fn flush_background_pass(&self) {
+    fn flush_background_pass(&self) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -840,8 +841,23 @@ where
             if cache.flush_shards_streaming_all(parallel).await.is_ok() {
                 let _ = backend.flush_device().await;
             }
-            println!("flush done");
         });
+    }
+    async fn flush_async(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let backend = Arc::clone(&self.backend);
+        let cache = Arc::clone(self);
+        let parallel = self.cfg.flush_parallelism;
+
+        spawn(async move {
+            if cache.flush_shards_streaming_all(parallel).await.is_ok() {
+                let _ = backend.flush_device().await;
+            }
+        })
+        .await;
     }
 
     async fn stats(&self) -> CacheStats {

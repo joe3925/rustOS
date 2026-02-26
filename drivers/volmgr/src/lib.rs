@@ -515,7 +515,7 @@ pub async fn vol_pdo_flush<'a, 'b>(
     let is_dirty_only = matches!(req.read().kind, RequestType::FlushDirty);
 
     if is_dirty_only {
-        cache.flush_background_pass().await;
+        cache.flush_async().await;
         DriverStep::complete(DriverStatus::Success)
     } else {
         match cache.flush().await {

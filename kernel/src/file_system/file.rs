@@ -83,6 +83,9 @@ impl File {
         }
         Ok(())
     }
+    pub fn set_write_through(&mut self, enable: bool) {
+        self.write_through = enable;
+    }
 
     pub async fn open(path: &Path, flags: &[OpenFlags]) -> Result<Self, FileStatus> {
         let write_through = flags.contains(&OpenFlags::WriteThrough);

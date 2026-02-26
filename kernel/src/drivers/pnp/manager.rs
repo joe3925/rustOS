@@ -633,95 +633,131 @@ impl PnpManager {
         Some(devobj)
     }
 
-    async fn ensure_function_attached(&self, dn: &Arc<DevNode>, stk: &mut DeviceStack) -> bool {
-        if stk
-            .function
-            .as_ref()
-            .and_then(|l| l.devobj.as_ref())
-            .is_some()
-        {
-            return true;
-        }
-        let class = match dn.class.as_deref() {
-            Some(c) => c,
-            None => return false,
-        };
-        let pkg = match self.resolve_class_driver(Some(class)).await {
-            Ok(Some(p)) => p,
-            _ => return false,
-        };
-        let drv = match self.ensure_loaded(&pkg).await {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let mut below = dn.get_pdo();
-        for l in &stk.lower {
-            if let Some(d) = &l.devobj {
-                below = Some(d.clone());
-            }
-        }
-        if let Some(devobj) = self.attach_one_above(dn, below, &drv) {
-            stk.function = Some(StackLayer {
+    /// Attach a function driver inferred from the device class when no explicit function driver
+    /// produced a device object. Runs without holding the devnode stack lock.
+    async fn attach_class_function(
+        &self,
+        dn: &Arc<DevNode>,
+        below: Option<Arc<DeviceObject>>,
+    ) -> Option<StackLayer> {
+        let class = dn.class.as_deref()?;
+        let pkg = self.resolve_class_driver(Some(class)).await.ok()??;
+        let drv = self.ensure_loaded(&pkg).await.ok()?;
+
+        self.attach_one_above(dn, below, &drv)
+            .map(|devobj| StackLayer {
                 driver: drv,
                 devobj: Some(devobj),
-            });
-            true
-        } else {
-            false
-        }
+            })
     }
 
     async fn start_stack(&self, dn: &Arc<DevNode>) {
-        let top_of_stack: Option<Arc<DeviceObject>> = {
-            let mut guard = dn.stack.write();
-            let stk = guard.as_mut().unwrap();
-
-            {
-                let mut prev_do: Option<Arc<DeviceObject>> = dn.get_pdo();
-
-                let mut attach = |layer: &mut StackLayer| {
-                    if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &layer.driver)
-                    {
-                        layer.devobj = Some(devobj.clone());
-                        prev_do = Some(devobj);
-                    }
-                };
-
-                for layer in &mut stk.lower {
-                    attach(layer);
-                }
-                if let Some(layer) = stk.function.as_mut() {
-                    attach(layer);
-                }
-                for layer in &mut stk.upper {
-                    attach(layer);
-                }
+        let pdo = match dn.get_pdo() {
+            Some(p) => p,
+            None => {
+                dn.set_state(DevNodeState::Faulted);
+                return;
             }
+        };
 
-            let have_function = self.ensure_function_attached(dn, stk).await;
-            if !have_function {
+        // Snapshot driver layers without holding the write lock during driver callbacks.
+        let (lower_drivers, function_driver, upper_drivers) = {
+            let guard = dn.stack.read();
+            let stk = match guard.as_ref() {
+                Some(s) => s,
+                None => {
+                    dn.set_state(DevNodeState::Faulted);
+                    return;
+                }
+            };
+            (
+                stk.lower
+                    .iter()
+                    .map(|l| l.driver.clone())
+                    .collect::<Vec<_>>(),
+                stk.function.as_ref().map(|l| l.driver.clone()),
+                stk.upper
+                    .iter()
+                    .map(|l| l.driver.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // Stage attachments outside of the stack lock.
+        let mut prev_do: Option<Arc<DeviceObject>> = Some(pdo.clone());
+
+        let mut lower_layers: Vec<StackLayer> = Vec::with_capacity(lower_drivers.len());
+        for drv in lower_drivers {
+            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
+                prev_do = Some(devobj.clone());
+                lower_layers.push(StackLayer {
+                    driver: drv,
+                    devobj: Some(devobj),
+                });
+            }
+        }
+
+        let mut function_layer: Option<StackLayer> = None;
+        if let Some(drv) = function_driver {
+            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
+                prev_do = Some(devobj.clone());
+                function_layer = Some(StackLayer {
+                    driver: drv,
+                    devobj: Some(devobj),
+                });
+            }
+        }
+
+        let mut upper_layers: Vec<StackLayer> = Vec::with_capacity(upper_drivers.len());
+        for drv in upper_drivers {
+            if let Some(devobj) = self.attach_one_above(dn, prev_do.clone(), &drv) {
+                prev_do = Some(devobj.clone());
+                upper_layers.push(StackLayer {
+                    driver: drv,
+                    devobj: Some(devobj),
+                });
+            }
+        }
+
+        // If no function was attached, try class fallback.
+        if function_layer.is_none() {
+            if let Some(layer) = self.attach_class_function(dn, prev_do.clone()).await {
+                prev_do = layer.devobj.clone();
+                function_layer = Some(layer);
+            }
+        }
+
+        let top_of_stack: Option<Arc<DeviceObject>> = if function_layer.is_none() {
+            let mut guard = dn.stack.write();
+            if let Some(stk) = guard.as_mut() {
                 stk.lower.clear();
                 stk.upper.clear();
                 stk.function = None;
-                None
-            } else {
-                stk.lower.retain(|l| l.devobj.is_some());
-                stk.upper.retain(|l| l.devobj.is_some());
-                let mut current_bottom = dn.get_pdo();
-                let all = stk
-                    .lower
-                    .iter()
-                    .chain(stk.function.iter())
-                    .chain(stk.upper.iter());
-                for layer in all {
-                    let current_do = layer.devobj.as_ref().unwrap();
+            }
+            None
+        } else {
+            let mut guard = dn.stack.write();
+            let stk = guard.as_mut().unwrap();
+
+            stk.lower = lower_layers;
+            stk.function = function_layer;
+            stk.upper = upper_layers;
+
+            let mut current_bottom = Some(pdo.clone());
+            for layer in stk
+                .lower
+                .iter()
+                .chain(stk.function.iter())
+                .chain(stk.upper.iter())
+            {
+                if let Some(current_do) = layer.devobj.as_ref() {
                     if let Some(bottom) = current_bottom {
                         DeviceObject::set_lower_upper(current_do, bottom.clone());
                     }
                     current_bottom = Some(current_do.clone());
                 }
-                current_bottom
             }
+            current_bottom
         };
 
         if let Some(top_device) = top_of_stack {

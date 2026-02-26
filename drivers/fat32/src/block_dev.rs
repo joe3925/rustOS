@@ -13,6 +13,8 @@ use kernel_api::{
     status::DriverStatus,
 };
 
+use crate::volume::VolCtrlDevExt;
+
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
 pub struct BlockDev {
@@ -307,9 +309,11 @@ impl Write for BlockDev {
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        self.should_flush.store(true, Ordering::SeqCst);
         Ok(())
     }
+}
+pub fn flush(vdx: &VolCtrlDevExt) {
+    vdx.should_flush.store(true, Ordering::SeqCst);
 }
 
 impl Seek for BlockDev {

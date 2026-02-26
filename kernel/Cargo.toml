@@ -17,6 +17,7 @@ bitflags = "2.6.0"
 strum = { version = "0.24", default-features = false, features = ["derive"] }
 strum_macros = "0.24"
 embedded-crc32c = "0.1"
+async-lock = { version = "3.4.0", default-features = false }
 rand_xoshiro = { version = "0.7.0", default-features = false }
 rand_core = "0.9.0"
 crc-any = "2.0.0"

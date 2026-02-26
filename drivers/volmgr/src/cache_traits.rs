@@ -88,8 +88,8 @@ pub trait VolumeCacheOps {
     async fn invalidate_range(&self, offset: u64, len: usize) -> Result<usize, Self::Error>;
     async fn drop_clean(&self) -> Result<usize, Self::Error>;
 
-    async fn flush_background_pass(&self);
-
+    fn flush_background_pass(&self);
+    async fn flush_async(&self);
     async fn stats(&self) -> CacheStats;
     async fn cached_blocks(&self) -> usize;
 }

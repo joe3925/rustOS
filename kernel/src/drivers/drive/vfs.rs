@@ -1,11 +1,12 @@
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use async_lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
-use spin::RwLock;
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::file_system::file_provider::FileProvider;
@@ -40,6 +41,26 @@ pub struct Vfs {
 }
 
 impl Vfs {
+    #[inline]
+    fn blocking_read<'a, T>(&self, lock: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
+        loop {
+            if let Some(g) = lock.try_read() {
+                return g;
+            }
+            spin_loop();
+        }
+    }
+
+    #[inline]
+    fn blocking_write<'a, T>(&self, lock: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
+        loop {
+            if let Some(g) = lock.try_write() {
+                return g;
+            }
+            spin_loop();
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             label_map: RwLock::new(BTreeMap::new()),
@@ -51,26 +72,27 @@ impl Vfs {
 
     pub fn set_label(&self, label: String, mount_symlink: String) {
         let tgt = PNP_MANAGER.resolve_targetio_from_symlink(mount_symlink.clone());
-        let mut map = self.label_map.write();
+        let mut map = self.blocking_write(&self.label_map);
         if let Some(old) = map.insert(label, mount_symlink.clone()) {
             // drop old map entry from target cache
-            self.target_cache.write().remove(&old);
+            self.blocking_write(&self.target_cache).remove(&old);
         }
         drop(map);
         if let Some(tgt) = tgt {
             // mount_symlink is consumed here — no further clone needed
-            self.target_cache.write().insert(mount_symlink, tgt);
+            self.blocking_write(&self.target_cache)
+                .insert(mount_symlink, tgt);
         }
     }
 
     pub fn remove_label(&self, label: &str) {
-        if let Some(old) = self.label_map.write().remove(label) {
-            self.target_cache.write().remove(&old);
+        if let Some(old) = self.blocking_write(&self.label_map).remove(label) {
+            self.blocking_write(&self.target_cache).remove(&old);
         }
     }
 
     pub async fn list_mounted_volumes(&self) -> (Vec<MountedVolume>, DriverStatus) {
-        let labels = self.label_map.read();
+        let labels = self.label_map.read().await;
         let mut out: Vec<MountedVolume> = Vec::with_capacity(labels.len());
 
         for (label, mount_symlink) in labels.iter() {
@@ -105,7 +127,7 @@ impl Vfs {
             let label_buf: [u8; 2] = [d as u8, b':'];
             // SAFETY: d is a validated ASCII drive letter, so [d, ':'] is valid UTF-8
             let label_str = unsafe { core::str::from_utf8_unchecked(&label_buf) };
-            let symlink = match self.label_map.read().get(label_str) {
+            let symlink = match self.blocking_read(&self.label_map).get(label_str) {
                 Some(s) => s.clone(),
                 None => {
                     alloc::format!("\\GLOBAL\\StorageDevices\\{}", d)
@@ -120,12 +142,11 @@ impl Vfs {
     }
 
     fn resolve_target(&self, symlink: &str) -> Option<IoTarget> {
-        if let Some(t) = self.target_cache.read().get(symlink).cloned() {
+        if let Some(t) = self.blocking_read(&self.target_cache).get(symlink).cloned() {
             return Some(t);
         }
         let tgt = PNP_MANAGER.resolve_targetio_from_symlink(symlink.to_string())?;
-        self.target_cache
-            .write()
+        self.blocking_write(&self.target_cache)
             .insert(symlink.to_string(), tgt.clone());
         Some(tgt)
     }
@@ -275,7 +296,7 @@ impl Vfs {
             }
             let tgt = self.resolve_target(&symlink);
             let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-            self.handles.write().insert(
+            self.handles.write().await.insert(
                 vhid,
                 VfsHandle {
                     volume_symlink: symlink,
@@ -302,7 +323,7 @@ impl Vfs {
             if try_open.error.is_none() {
                 let tgt = self.resolve_target(&symlink);
                 let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                self.handles.write().insert(
+                self.handles.write().await.insert(
                     vhid,
                     VfsHandle {
                         volume_symlink: symlink,
@@ -366,7 +387,7 @@ impl Vfs {
                 }
                 let tgt = self.resolve_target(&symlink);
                 let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-                self.handles.write().insert(
+                self.handles.write().await.insert(
                     vhid,
                     VfsHandle {
                         volume_symlink: symlink,
@@ -395,7 +416,7 @@ impl Vfs {
             }
             let tgt = self.resolve_target(&symlink);
             let vhid = self.next_vh.fetch_add(1, Ordering::AcqRel).max(1);
-            self.handles.write().insert(
+            self.handles.write().await.insert(
                 vhid,
                 VfsHandle {
                     volume_symlink: symlink,
@@ -417,7 +438,7 @@ impl Vfs {
     }
 
     pub async fn close(&self, p: FsCloseParams) -> (FsCloseResult, DriverStatus) {
-        let Some(h) = self.handles.write().remove(&p.fs_file_id) else {
+        let Some(h) = self.handles.write().await.remove(&p.fs_file_id) else {
             return (
                 FsCloseResult {
                     error: Some(FileStatus::PathNotFound),
@@ -449,8 +470,11 @@ impl Vfs {
     }
 
     pub async fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
+        let Some(h) = h else {
             return (
                 FsReadResult {
                     data: Vec::new(),
@@ -485,9 +509,12 @@ impl Vfs {
     }
 
     pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
-        let binding = self.handles.read();
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
 
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let Some(h) = h else {
             return (
                 FsWriteResult {
                     written: 0,
@@ -518,24 +545,23 @@ impl Vfs {
     }
 
     pub async fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
-            return (
-                FsSeekResult {
-                    pos: 0,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+        let (target, symlink) = {
+            let binding = self.handles.read().await;
+            if let Some(h) = binding.get(&p.fs_file_id) {
+                p.fs_file_id = h.inner_id;
+                (h.target.clone(), h.volume_symlink.clone())
+            } else {
+                return (
+                    FsSeekResult {
+                        pos: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                );
+            }
         };
-        p.fs_file_id = h.inner_id;
         match self
-            .call_fs::<FsSeekParams, FsSeekResult>(
-                &h.volume_symlink,
-                h.target.clone(),
-                FsOp::Seek,
-                p,
-            )
+            .call_fs::<FsSeekParams, FsSeekResult>(symlink.as_str(), target, FsOp::Seek, p)
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -550,8 +576,11 @@ impl Vfs {
     }
 
     pub async fn flush(&self, mut p: FsFlushParams) -> (FsFlushResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
+        let Some(h) = h else {
             return (
                 FsFlushResult {
                     error: Some(FileStatus::PathNotFound),
@@ -580,8 +609,11 @@ impl Vfs {
     }
 
     pub async fn get_info(&self, mut p: FsGetInfoParams) -> (FsGetInfoResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
+        let Some(h) = h else {
             return (
                 FsGetInfoResult {
                     size: 0,
@@ -713,8 +745,11 @@ impl Vfs {
     }
 
     pub async fn set_len(&self, mut p: FsSetLenParams) -> (FsSetLenResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
+        let Some(h) = h else {
             return (
                 FsSetLenResult {
                     error: Some(FileStatus::PathNotFound),
@@ -743,9 +778,12 @@ impl Vfs {
     }
 
     pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
-        let binding = self.handles.read();
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
 
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let Some(h) = h else {
             return (
                 FsAppendResult {
                     written: 0,
@@ -778,8 +816,11 @@ impl Vfs {
     }
 
     pub async fn zero_range(&self, mut p: FsZeroRangeParams) -> (FsZeroRangeResult, DriverStatus) {
-        let binding = self.handles.read();
-        let Some(h) = binding.get(&p.fs_file_id) else {
+        let h = {
+            let binding = self.handles.read().await;
+            binding.get(&p.fs_file_id).cloned()
+        };
+        let Some(h) = h else {
             return (
                 FsZeroRangeResult {
                     error: Some(FileStatus::PathNotFound),
