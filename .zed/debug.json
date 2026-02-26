@@ -30,16 +30,16 @@
       "target modules load --file \"disk.dll\" .text 0xffff900014c0b000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/partmgr.dll\"",
-      "target modules load --file \"partmgr.dll\" .text 0xffff900014e23000",
+      "target modules load --file \"partmgr.dll\" .text 0xffff900014e66000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/volmgr.dll\"",
-      "target modules load --file \"volmgr.dll\" .text 0xffff900015041000",
+      "target modules load --file \"volmgr.dll\" .text 0xffff90001508d000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/mountmgr.dll\"",
-      "target modules load --file \"mountmgr.dll\" .text 0xffff900015274000",
+      "target modules load --file \"mountmgr.dll\" .text 0xffff9000152cd000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/fat32.dll\"",
-      "target modules load --file \"fat32.dll\" .text 0xffff9000154ac000",
+      "target modules load --file \"fat32.dll\" .text 0xffff900015511000",
     ],
     "sourceLanguages": ["rust"],
   },

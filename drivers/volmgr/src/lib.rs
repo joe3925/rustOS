@@ -12,6 +12,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
+use kernel_api::println;
 
 use futures::future::BoxFuture;
 
@@ -124,6 +125,21 @@ impl VolumeCacheBackend for CacheBackend {
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_send_request(self.target.clone(), &mut req).await;
+            if status != DriverStatus::Success {
+                return Err(status);
+            }
+            Ok(())
+        }
+        .into_ffi()
+    }
+
+    fn write_request<'a>(
+        &'a self,
+        req: &'a mut RequestHandle<'_>,
+    ) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            let status = pnp_send_request(self.target.clone(), req).await;
             if status != DriverStatus::Success {
                 return Err(status);
             }
@@ -513,7 +529,6 @@ pub async fn vol_pdo_flush<'a, 'b>(
     };
 
     let is_dirty_only = matches!(req.read().kind, RequestType::FlushDirty);
-
     if is_dirty_only {
         cache.flush_async().await;
         DriverStep::complete(DriverStatus::Success)

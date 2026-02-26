@@ -42,6 +42,12 @@ impl Try for DriverStatus {
     }
 }
 
+impl From<i32> for DriverStatus {
+    #[inline]
+    fn from(v: i32) -> Self {
+        DriverStatus::try_from(v).unwrap_or(DriverStatus::Unsuccessful)
+    }
+}
 impl<T> FromResidual<DriverStatus> for Result<T, DriverStatus> {
     #[inline]
     fn from_residual(r: DriverStatus) -> Self {

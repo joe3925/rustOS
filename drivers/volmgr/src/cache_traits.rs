@@ -1,5 +1,5 @@
-use futures::future::BoxFuture;
-use kernel_api::async_ffi::{BorrowingFfiFuture, FfiFuture};
+use kernel_api::async_ffi::FfiFuture;
+use kernel_api::request::RequestHandle;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
@@ -64,6 +64,10 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
 
     fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>>;
     fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>>;
+    fn write_request<'a>(
+        &'a self,
+        req: &'a mut RequestHandle<'_>,
+    ) -> FfiFuture<Result<(), Self::Error>>;
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
 }
 

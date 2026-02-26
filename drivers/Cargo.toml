@@ -21,10 +21,10 @@ kernel_api = { path = "../kernel_api", default-features = false, features = [
     "async-ffi-slab-slot-bytes-8k",
 ] }
 [profile.dev]
-opt-level = 3
+opt-level = 1
 panic = "abort"
-lto = true
-codegen-units = 1
+lto = false
+codegen-units = 16
 debug = true
 
 [profile.release]

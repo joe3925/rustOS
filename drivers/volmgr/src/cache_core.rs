@@ -6,10 +6,11 @@ use core::cmp::min;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use kernel_api::println;
-
-use futures::future::join_all;
+use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
+use kernel_api::kernel_types::request::RequestData;
+use kernel_api::println;
+use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 
@@ -164,6 +165,33 @@ enum WriteAcquire<const BLOCK_SIZE: usize> {
     Direct(Arc<Page<BLOCK_SIZE>>),
 }
 
+struct FlushScratch<const BLOCK_SIZE: usize> {
+    batch: Vec<(u64, Arc<Page<BLOCK_SIZE>>)>,
+    joins: Vec<FfiFuture<()>>,
+}
+
+impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
+    fn new(join_cap: usize) -> Self {
+        let capacity = if join_cap == 0 { 1 } else { join_cap };
+        Self {
+            batch: Vec::new(),
+            joins: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.batch.clear();
+        self.joins.clear();
+    }
+
+    fn ensure_join_capacity(&mut self, requested: usize) {
+        let target = if requested == 0 { 1 } else { requested };
+        if self.joins.capacity() < target {
+            self.joins.reserve(target - self.joins.capacity());
+        }
+    }
+}
+
 // pooled page vectors removed; streaming batching used instead.
 
 pub struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
@@ -176,6 +204,7 @@ where
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     closed: AtomicBool,
+    flush_scratch: AsyncMutex<FlushScratch<BLOCK_SIZE>>,
     _index_factory: PhantomData<F>,
 }
 
@@ -227,6 +256,7 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             closed: AtomicBool::new(false),
+            flush_scratch: AsyncMutex::new(FlushScratch::new(cfg.flush_parallelism)),
             _index_factory: PhantomData,
         })
     }
@@ -445,15 +475,25 @@ where
         let wb_gen = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_gen, Ordering::Release);
 
-        let snapshot = {
+        let mut req = RequestHandle::new(
+            RequestType::Write {
+                offset: lba * BLOCK_SIZE as u64,
+                len: BLOCK_SIZE,
+                flush_write_through: false,
+            },
+            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
+        );
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+        {
+            let mut req_w = req.write();
+            let dst = req_w.data_slice_mut();
             let data = page.data.read().await;
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            buf.copy_from_slice(&data.bytes[..]);
-            buf
-        };
+            dst.copy_from_slice(&data.bytes[..]);
+        }
 
         let write_res = backend
-            .write_block(lba, &snapshot[..])
+            .write_request(&mut req)
             .await
             .map_err(CacheError::Backend);
 
@@ -475,94 +515,107 @@ where
             }
         }
     }
-
+    /// Joins is a vector with len equal to the desired parallelism, used to track in-flight flush tasks.
     async fn flush_pages_parallel(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
         pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
-        parallelism: usize,
+        joins: &mut Vec<FfiFuture<()>>,
     ) -> Result<(), CacheError<B::Error>> {
         if pages.is_empty() {
             return Ok(());
         }
 
-        let width = if parallelism == 0 { 1 } else { parallelism };
-        let mut pos = 0usize;
-        let mut batch = Vec::with_capacity(width);
+        let mut width = joins.capacity();
+        if width == 0 {
+            width = 1;
+        }
+        if width > pages.len() {
+            width = pages.len();
+        }
 
-        while pos < pages.len() {
-            let end = min(pos + width, pages.len());
-            batch.clear();
+        joins.clear();
 
-            let mut i = pos;
-            while i < end {
-                let (lba, page) = &pages[i];
-                batch.push(Self::flush_page_task(
-                    Arc::clone(&backend),
-                    Arc::clone(&stats),
-                    *lba,
-                    Arc::clone(page),
-                ));
+        let n = pages.len();
+        let chunk = (n + width - 1) / width;
 
-                i += 1;
+        let pages_ptr_usize = pages.as_ptr() as usize;
+        let pages_len = n;
+
+        for w in 0..width {
+            let start = w * chunk;
+            let end = core::cmp::min(start + chunk, n);
+            if start >= end {
+                break;
             }
 
-            let results = join_all(batch.drain(..)).await;
-            for res in results {
-                res?;
-            }
+            let backend = Arc::clone(&backend);
+            let stats = Arc::clone(&stats);
 
-            pos = end;
+            let j = spawn(async move {
+                let pages_ptr = pages_ptr_usize as *const (u64, Arc<Page<BLOCK_SIZE>>);
+                let pages_slice: &[(u64, Arc<Page<BLOCK_SIZE>>)] =
+                    unsafe { core::slice::from_raw_parts(pages_ptr, pages_len) };
+
+                for i in start..end {
+                    let (lba, page) = pages_slice[i].clone();
+                    let _ =
+                        Self::flush_page_task(Arc::clone(&backend), Arc::clone(&stats), lba, page)
+                            .await;
+                }
+            });
+            joins.push(j);
+        }
+
+        for j in joins.drain(..) {
+            j.await;
         }
 
         Ok(())
     }
-
     async fn flush_shard_streaming(
         &self,
         shard_idx: usize,
         block_range: Option<&Range<u64>>,
         parallelism: usize,
     ) -> Result<(), CacheError<B::Error>> {
-        let width = if parallelism == 0 { 1 } else { parallelism };
-        let mut cursor = 0usize;
+        let mut scratch = self.flush_scratch.lock().await;
+        scratch.reset();
+        scratch.ensure_join_capacity(parallelism);
 
-        loop {
-            let mut batch: Vec<(u64, Arc<Page<BLOCK_SIZE>>)> = Vec::with_capacity(width);
+        {
+            let shard = self.shards[shard_idx].lock().await;
+            let needed = shard.index.len();
+            let current = scratch.batch.capacity();
+            if current < needed {
+                scratch.batch.reserve(needed - current);
+            }
 
-            let walked = {
-                let shard = self.shards[shard_idx].lock().await;
-                shard.index.for_each_chunk(cursor, width, |k, v| {
-                    if block_range.map_or(true, |r| k >= r.start && k < r.end) {
-                        batch.push((k, Arc::clone(v)));
-                    }
-                })
-            };
-
-            cursor += walked;
-
-            if batch.is_empty() {
-                if walked == 0 {
-                    break;
+            shard.index.for_each_chunk(0, usize::MAX, |k, v| {
+                if block_range.map_or(true, |r| k >= r.start && k < r.end) {
+                    scratch.batch.push((k, Arc::clone(v)));
                 }
-            } else {
-                Self::flush_pages_parallel(
-                    Arc::clone(&self.backend),
-                    Arc::clone(&self.stats),
-                    &batch,
-                    parallelism,
-                )
-                .await?;
-            }
-
-            if walked == 0 {
-                break;
-            }
+            });
         }
+
+        if scratch.batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut joins = core::mem::take(&mut scratch.joins);
+        Self::flush_pages_parallel(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.stats),
+            &scratch.batch,
+            &mut joins,
+        )
+        .await?;
+        scratch.joins = joins;
+
+        scratch.reset();
 
         Ok(())
     }
-
     async fn flush_shards_streaming_all(
         self: &Arc<Self>,
         parallelism: usize,
@@ -581,7 +634,6 @@ where
         block_range: Range<u64>,
     ) -> Result<(), CacheError<B::Error>> {
         self.check_open()?;
-
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
             self.flush_shard_streaming(shard_idx, Some(&block_range), self.cfg.flush_parallelism)
@@ -597,7 +649,6 @@ where
 
     async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
         self.check_open()?;
-
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
             self.flush_shard_streaming(shard_idx, None, self.cfg.flush_parallelism)
