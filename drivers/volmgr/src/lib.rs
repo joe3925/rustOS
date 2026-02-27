@@ -6,15 +6,11 @@
 
 extern crate alloc;
 
-use crate::alloc::vec;
-use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
-use kernel_api::println;
-
-use futures::future::BoxFuture;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
@@ -44,10 +40,12 @@ use kernel_api::status::DriverStatus;
 use spin::Once;
 
 use crate::cache::{CacheConfig, CacheError, VolumeCache, VolumeCacheBackend, VolumeCacheOps};
+use crate::request_pool::RequestPool;
 
 mod cache;
 mod cache_core;
 mod cache_traits;
+mod request_pool;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const BLOCK_SIZE: usize = 1024 * 16;
@@ -56,13 +54,19 @@ struct CacheBackend {
     target: IoTarget,
     /// Total addressable bytes for the volume (computed from partition info).
     volume_bytes: u64,
+    request_pool: Arc<RequestPool<BLOCK_SIZE>>,
 }
 
 impl CacheBackend {
-    fn new(target: IoTarget, volume_bytes: u64) -> Self {
+    fn new(
+        target: IoTarget,
+        volume_bytes: u64,
+        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
+    ) -> Self {
         Self {
             target,
             volume_bytes,
+            request_pool,
         }
     }
 
@@ -86,12 +90,23 @@ impl VolumeCacheBackend for CacheBackend {
 
             let offset = lba * BLOCK_SIZE as u64;
             let len = block_len;
-            let mut req = RequestHandle::new(
-                RequestType::Read { offset, len },
-                RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
-            );
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+
+            let mut pooled = self.request_pool.acquire();
+            let req = pooled.handle_mut();
+
+            {
+                let mut w = req.write();
+                w.kind = RequestType::Read { offset, len };
+                w.traversal_policy = TraversalPolicy::ForwardLower;
+                w.completed = false;
+                w.status = DriverStatus::ContinueStep;
+                w.completion_routine = None;
+                w.completion_context = 0;
+                w.waker = None;
+                w.data.set_len(len);
+            }
+
+            let status = pnp_send_request(self.target.clone(), req).await;
             if status != DriverStatus::Success {
                 return Err(status);
             }
@@ -114,17 +129,28 @@ impl VolumeCacheBackend for CacheBackend {
             let block_len = self.block_len(lba).ok_or(DriverStatus::InvalidParameter)?;
 
             let offset = lba * BLOCK_SIZE as u64;
-            let buf = RequestData::from_boxed_bytes(data[..block_len].to_vec().into_boxed_slice());
-            let mut req = RequestHandle::new(
-                RequestType::Write {
+            let mut pooled = self.request_pool.acquire();
+            let req = pooled.handle_mut();
+
+            {
+                let mut w = req.write();
+                w.kind = RequestType::Write {
                     offset,
                     len: block_len,
                     flush_write_through: false,
-                },
-                buf,
-            );
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+                };
+                w.traversal_policy = TraversalPolicy::ForwardLower;
+                w.completed = false;
+                w.status = DriverStatus::ContinueStep;
+                w.completion_routine = None;
+                w.completion_context = 0;
+                w.waker = None;
+                w.data.set_len(block_len);
+                let dst = w.data_slice_mut();
+                dst[..block_len].copy_from_slice(&data[..block_len]);
+            }
+
+            let status = pnp_send_request(self.target.clone(), req).await;
             if status != DriverStatus::Success {
                 return Err(status);
             }
@@ -150,9 +176,22 @@ impl VolumeCacheBackend for CacheBackend {
 
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
         async move {
-            let mut req = RequestHandle::new(RequestType::Flush, RequestData::empty());
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+            let mut pooled = self.request_pool.acquire();
+            let req = pooled.handle_mut();
+
+            {
+                let mut w = req.write();
+                w.kind = RequestType::Flush;
+                w.traversal_policy = TraversalPolicy::ForwardLower;
+                w.completed = false;
+                w.status = DriverStatus::ContinueStep;
+                w.completion_routine = None;
+                w.completion_context = 0;
+                w.waker = None;
+                w.data.set_len(0);
+            }
+
+            let status = pnp_send_request(self.target.clone(), req).await;
             if status != DriverStatus::Success {
                 return Err(status);
             }
@@ -388,9 +427,14 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         pdx.len_bytes.call_once(|| vol_len);
 
         if vol_len != 0 {
-            let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
+            let request_pool = Arc::new(RequestPool::<BLOCK_SIZE>::new());
+            let backend = Arc::new(CacheBackend::new(
+                tgt_clone,
+                vol_len,
+                Arc::clone(&request_pool),
+            ));
             let cfg = CacheConfig::new(1024 * 1024 * 20 / BLOCK_SIZE);
-            if let Ok(cache) = VolCache::new(backend, cfg) {
+            if let Ok(cache) = VolCache::new(backend, cfg, request_pool) {
                 pdx.cache.call_once(|| Arc::new(cache));
             }
         }

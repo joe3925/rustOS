@@ -1,6 +1,5 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
 use core::marker::PhantomData;
@@ -8,11 +7,12 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
-use kernel_api::kernel_types::request::RequestData;
-use kernel_api::println;
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
+use kernel_api::status::DriverStatus;
+
+use crate::request_pool::RequestPool;
 
 use super::cache::{
     CacheConfig, CacheError, CacheIndex, CacheIndexFactory, CacheStats, DefaultIndexFactory,
@@ -205,6 +205,7 @@ where
     stats: Arc<StatsInner>,
     closed: AtomicBool,
     flush_scratch: AsyncMutex<FlushScratch<BLOCK_SIZE>>,
+    request_pool: Arc<RequestPool<BLOCK_SIZE>>,
     _index_factory: PhantomData<F>,
 }
 
@@ -212,8 +213,12 @@ impl<B, const BLOCK_SIZE: usize> VolumeCache<B, BLOCK_SIZE, DefaultIndexFactory>
 where
     B: VolumeCacheBackend,
 {
-    pub fn new(backend: Arc<B>, cfg: CacheConfig) -> Result<Self, CacheError<B::Error>> {
-        Self::new_with_index(backend, cfg, DefaultIndexFactory)
+    pub fn new(
+        backend: Arc<B>,
+        cfg: CacheConfig,
+        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
+    ) -> Result<Self, CacheError<B::Error>> {
+        Self::new_with_index(backend, cfg, request_pool, DefaultIndexFactory)
     }
 }
 
@@ -225,6 +230,7 @@ where
     pub fn new_with_index(
         backend: Arc<B>,
         mut cfg: CacheConfig,
+        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
         factory: F,
     ) -> Result<Self, CacheError<B::Error>> {
         if BLOCK_SIZE == 0 || cfg.capacity_blocks == 0 {
@@ -257,6 +263,7 @@ where
             stats: Arc::new(StatsInner::new()),
             closed: AtomicBool::new(false),
             flush_scratch: AsyncMutex::new(FlushScratch::new(cfg.flush_parallelism)),
+            request_pool,
             _index_factory: PhantomData,
         })
     }
@@ -430,15 +437,30 @@ where
         lba: u64,
         page: &Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
-        let snapshot = {
+        let mut pooled = self.request_pool.acquire();
+        let req = pooled.handle_mut();
+
+        {
+            let mut w = req.write();
+            w.kind = RequestType::Write {
+                offset: lba * BLOCK_SIZE as u64,
+                len: BLOCK_SIZE,
+                flush_write_through: false,
+            };
+            w.traversal_policy = TraversalPolicy::ForwardLower;
+            w.completed = false;
+            w.status = DriverStatus::ContinueStep;
+            w.completion_routine = None;
+            w.completion_context = 0;
+            w.waker = None;
+            w.data.set_len(BLOCK_SIZE);
+            let dst = w.data_slice_mut();
             let data = page.data.read().await;
-            let mut buf = vec![0u8; BLOCK_SIZE];
-            buf.copy_from_slice(&data.bytes[..]);
-            buf
-        };
+            dst.copy_from_slice(&data.bytes[..]);
+        }
 
         self.backend
-            .write_block(lba, &snapshot[..])
+            .write_request(req)
             .await
             .map_err(CacheError::Backend)?;
 
@@ -451,6 +473,7 @@ where
     async fn flush_page_task(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
+        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
         lba: u64,
         page: Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
@@ -475,25 +498,31 @@ where
         let wb_gen = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_gen, Ordering::Release);
 
-        let mut req = RequestHandle::new(
-            RequestType::Write {
-                offset: lba * BLOCK_SIZE as u64,
-                len: BLOCK_SIZE,
-                flush_write_through: false,
-            },
-            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
-        );
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
+        let mut pooled = request_pool.acquire();
+        let req = pooled.handle_mut();
 
         {
             let mut req_w = req.write();
+            req_w.kind = RequestType::Write {
+                offset: lba * BLOCK_SIZE as u64,
+                len: BLOCK_SIZE,
+                flush_write_through: false,
+            };
+            req_w.traversal_policy = TraversalPolicy::ForwardLower;
+            req_w.completed = false;
+            req_w.status = DriverStatus::ContinueStep;
+            req_w.completion_routine = None;
+            req_w.completion_context = 0;
+            req_w.waker = None;
+            req_w.data.set_len(BLOCK_SIZE);
+
             let dst = req_w.data_slice_mut();
             let data = page.data.read().await;
             dst.copy_from_slice(&data.bytes[..]);
         }
 
         let write_res = backend
-            .write_request(&mut req)
+            .write_request(req)
             .await
             .map_err(CacheError::Backend);
 
@@ -519,6 +548,7 @@ where
     async fn flush_pages_parallel(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
+        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
         pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
         joins: &mut Vec<FfiFuture<()>>,
     ) -> Result<(), CacheError<B::Error>> {
@@ -551,6 +581,7 @@ where
 
             let backend = Arc::clone(&backend);
             let stats = Arc::clone(&stats);
+            let request_pool = Arc::clone(&request_pool);
 
             let j = spawn(async move {
                 let pages_ptr = pages_ptr_usize as *const (u64, Arc<Page<BLOCK_SIZE>>);
@@ -559,9 +590,14 @@ where
 
                 for i in start..end {
                     let (lba, page) = pages_slice[i].clone();
-                    let _ =
-                        Self::flush_page_task(Arc::clone(&backend), Arc::clone(&stats), lba, page)
-                            .await;
+                    let _ = Self::flush_page_task(
+                        Arc::clone(&backend),
+                        Arc::clone(&stats),
+                        Arc::clone(&request_pool),
+                        lba,
+                        page,
+                    )
+                    .await;
                 }
             });
             joins.push(j);
@@ -606,6 +642,7 @@ where
         Self::flush_pages_parallel(
             Arc::clone(&self.backend),
             Arc::clone(&self.stats),
+            Arc::clone(&self.request_pool),
             &scratch.batch,
             &mut joins,
         )
