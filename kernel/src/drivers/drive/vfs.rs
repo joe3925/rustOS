@@ -1,9 +1,9 @@
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
-use async_lock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
+use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
 use kernel_types::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
@@ -34,15 +34,15 @@ struct VfsHandle {
 /// Resolves labels to mount symlinks and forwards FsOps to FS drivers.
 /// Keeps a VFS-handle -> FS-handle table.
 pub struct Vfs {
-    label_map: RwLock<BTreeMap<String, String>>,
-    target_cache: RwLock<BTreeMap<String, IoTarget>>,
+    label_map: AsyncRwLock<BTreeMap<String, String>>,
+    target_cache: AsyncRwLock<BTreeMap<String, IoTarget>>,
     next_vh: AtomicU64,
-    handles: RwLock<BTreeMap<u64, VfsHandle>>,
+    handles: AsyncRwLock<BTreeMap<u64, VfsHandle>>,
 }
 
 impl Vfs {
     #[inline]
-    fn blocking_read<'a, T>(&self, lock: &'a RwLock<T>) -> RwLockReadGuard<'a, T> {
+    fn blocking_read<'a, T>(&self, lock: &'a AsyncRwLock<T>) -> AsyncRwLockReadGuard<'a, T> {
         loop {
             if let Some(g) = lock.try_read() {
                 return g;
@@ -52,7 +52,7 @@ impl Vfs {
     }
 
     #[inline]
-    fn blocking_write<'a, T>(&self, lock: &'a RwLock<T>) -> RwLockWriteGuard<'a, T> {
+    fn blocking_write<'a, T>(&self, lock: &'a AsyncRwLock<T>) -> AsyncRwLockWriteGuard<'a, T> {
         loop {
             if let Some(g) = lock.try_write() {
                 return g;
@@ -63,10 +63,10 @@ impl Vfs {
 
     pub fn new() -> Self {
         Self {
-            label_map: RwLock::new(BTreeMap::new()),
-            target_cache: RwLock::new(BTreeMap::new()),
+            label_map: AsyncRwLock::new(BTreeMap::new()),
+            target_cache: AsyncRwLock::new(BTreeMap::new()),
             next_vh: AtomicU64::new(1),
-            handles: RwLock::new(BTreeMap::new()),
+            handles: AsyncRwLock::new(BTreeMap::new()),
         }
     }
 
@@ -470,31 +470,39 @@ impl Vfs {
     }
 
     pub async fn read(&self, p: FsReadParams) -> (FsReadResult, DriverStatus) {
-        let h = {
+        let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
+            if let Some(h) = binding.get(&p.fs_file_id) {
+                (
+                    h.target.clone(),
+                    h.inner_id,
+                    h.volume_symlink.as_str() as *const str,
+                )
+            } else {
+                return (
+                    FsReadResult {
+                        data: Vec::new(),
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                );
+            }
         };
-        let Some(h) = h else {
-            return (
-                FsReadResult {
-                    data: Vec::new(),
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
-        };
+
         let inner = FsReadParams {
-            fs_file_id: h.inner_id,
+            fs_file_id: inner_id,
             offset: p.offset,
             len: p.len,
         };
+
+        let symlink: &str = if target.is_some() {
+            ""
+        } else {
+            unsafe { &*symlink_ptr }
+        };
+
         match self
-            .call_fs::<FsReadParams, FsReadResult>(
-                &h.volume_symlink,
-                h.target.clone(),
-                FsOp::Read,
-                inner,
-            )
+            .call_fs::<FsReadParams, FsReadResult>(symlink, target, FsOp::Read, inner)
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -509,25 +517,37 @@ impl Vfs {
     }
 
     pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
-        let h = {
+        let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
+            if let Some(h) = binding.get(&p.fs_file_id) {
+                (
+                    h.target.clone(),
+                    h.inner_id,
+                    h.volume_symlink.as_str() as *const str,
+                )
+            } else {
+                return (
+                    FsWriteResult {
+                        written: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                );
+            }
         };
 
-        let Some(h) = h else {
-            return (
-                FsWriteResult {
-                    written: 0,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+        p.fs_file_id = inner_id;
+
+        let symlink: &str = if target.is_some() {
+            ""
+        } else {
+            unsafe { &*symlink_ptr }
         };
-        p.fs_file_id = h.inner_id;
+
         match self
             .call_fs_with_data::<FsWriteResult>(
-                &h.volume_symlink,
-                h.target.clone(),
+                symlink,
+                target,
                 FsOp::Write,
                 RequestData::from_fs_write_params(p),
             )
@@ -545,11 +565,14 @@ impl Vfs {
     }
 
     pub async fn seek(&self, mut p: FsSeekParams) -> (FsSeekResult, DriverStatus) {
-        let (target, symlink) = {
+        let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
-                p.fs_file_id = h.inner_id;
-                (h.target.clone(), h.volume_symlink.clone())
+                (
+                    h.target.clone(),
+                    h.inner_id,
+                    h.volume_symlink.as_str() as *const str,
+                )
             } else {
                 return (
                     FsSeekResult {
@@ -560,8 +583,17 @@ impl Vfs {
                 );
             }
         };
+
+        p.fs_file_id = inner_id;
+
+        let symlink: &str = if target.is_some() {
+            ""
+        } else {
+            unsafe { &*symlink_ptr }
+        };
+
         match self
-            .call_fs::<FsSeekParams, FsSeekResult>(symlink.as_str(), target, FsOp::Seek, p)
+            .call_fs::<FsSeekParams, FsSeekResult>(symlink, target, FsOp::Seek, p)
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -776,28 +808,39 @@ impl Vfs {
             ),
         }
     }
-
     pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
-        let h = {
+        let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
-            binding.get(&p.fs_file_id).cloned()
+            if let Some(h) = binding.get(&p.fs_file_id) {
+                (
+                    h.target.clone(),
+                    h.inner_id,
+                    h.volume_symlink.as_str() as *const str,
+                )
+            } else {
+                return (
+                    FsAppendResult {
+                        written: 0,
+                        new_size: 0,
+                        error: Some(FileStatus::PathNotFound),
+                    },
+                    DriverStatus::Success,
+                );
+            }
         };
 
-        let Some(h) = h else {
-            return (
-                FsAppendResult {
-                    written: 0,
-                    new_size: 0,
-                    error: Some(FileStatus::PathNotFound),
-                },
-                DriverStatus::Success,
-            );
+        p.fs_file_id = inner_id;
+
+        let symlink: &str = if target.is_some() {
+            ""
+        } else {
+            unsafe { &*symlink_ptr }
         };
-        p.fs_file_id = h.inner_id;
+
         match self
             .call_fs_with_data::<FsAppendResult>(
-                &h.volume_symlink,
-                h.target.clone(),
+                symlink,
+                target,
                 FsOp::Append,
                 RequestData::from_fs_append_params(p),
             )

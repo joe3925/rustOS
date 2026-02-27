@@ -3,11 +3,12 @@ use alloc::{
     vec::Vec,
 };
 use core::time::Duration;
-use kernel_executor::runtime::runtime::spawn_blocking;
+use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
 use kernel_types::{
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
 };
+use rand_core::block;
 
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
@@ -337,10 +338,8 @@ impl Drop for File {
         if id == 0 {
             return;
         }
-
-        spawn_detached(async move {
-            let _ = file_provider::provider().close_handle(id).await;
-        });
+        // TODO: find a way so this doesnt block
+        block_on(file_provider::provider().close_handle(id));
     }
 }
 
