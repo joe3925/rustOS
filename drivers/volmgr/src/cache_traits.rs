@@ -48,6 +48,17 @@ pub enum CacheError<E> {
     Closed,
 }
 
+impl<E: Clone> Clone for CacheError<E> {
+    fn clone(&self) -> Self {
+        match self {
+            CacheError::Backend(e) => CacheError::Backend(e.clone()),
+            CacheError::InvalidConfig => CacheError::InvalidConfig,
+            CacheError::OffsetOverflow => CacheError::OffsetOverflow,
+            CacheError::Closed => CacheError::Closed,
+        }
+    }
+}
+
 /// Backend I/O interface used by the cache.
 ///
 /// Implement this on your volume device wrapper (or a small adapter around it).

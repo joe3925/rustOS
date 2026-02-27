@@ -5,6 +5,7 @@ use core::cmp::min;
 use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
 use kernel_api::request::{RequestType, TraversalPolicy};
@@ -192,6 +193,12 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
     }
 }
 
+pub(crate) struct FlushJobHandle<E> {
+    id: u64,
+    future: Shared<FfiFuture<()>>,
+    result: Arc<AsyncMutex<Option<Result<(), CacheError<E>>>>>,
+}
+
 // pooled page vectors removed; streaming batching used instead.
 
 pub struct VolumeCache<B, const BLOCK_SIZE: usize, F = DefaultIndexFactory>
@@ -204,6 +211,8 @@ where
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     closed: AtomicBool,
+    flush_job: AsyncMutex<Option<Arc<FlushJobHandle<B::Error>>>>,
+    flush_job_id: AtomicU64,
     flush_scratch: AsyncMutex<FlushScratch<BLOCK_SIZE>>,
     request_pool: Arc<RequestPool<BLOCK_SIZE>>,
     _index_factory: PhantomData<F>,
@@ -262,6 +271,8 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             closed: AtomicBool::new(false),
+            flush_job: AsyncMutex::new(None),
+            flush_job_id: AtomicU64::new(0),
             flush_scratch: AsyncMutex::new(FlushScratch::new(cfg.flush_parallelism)),
             request_pool,
             _index_factory: PhantomData,
@@ -666,6 +677,89 @@ where
         Ok(())
     }
 
+    async fn has_dirty_pages(&self) -> bool {
+        let mut shard_idx = 0usize;
+        while shard_idx < self.shards.len() {
+            let shard = self.shards[shard_idx].lock().await;
+            let mut found = false;
+            shard.index.for_each(|_, page| {
+                if !found && page.dirty.load(Ordering::Acquire) {
+                    found = true;
+                }
+            });
+            if found {
+                return true;
+            }
+            shard_idx += 1;
+        }
+        false
+    }
+
+    async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
+        loop {
+            self.flush_internal_all().await?;
+            if !self.has_dirty_pages().await {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_flush_job(&self, id: u64) {
+        let mut job = self.flush_job.lock().await;
+        if job.as_ref().map(|h| h.id == id).unwrap_or(false) {
+            job.take();
+        }
+    }
+
+    pub(crate) async fn ensure_flush_job(self: &Arc<Self>) -> Arc<FlushJobHandle<B::Error>> {
+        let mut job_guard = self.flush_job.lock().await;
+        if let Some(handle) = job_guard.as_ref() {
+            return Arc::clone(handle);
+        }
+
+        let id = self
+            .flush_job_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+
+        let result_slot = Arc::new(AsyncMutex::new(None));
+        let result_slot_clone = Arc::clone(&result_slot);
+        let cache = Arc::clone(self);
+
+        let job_future = spawn(async move {
+            let outcome = cache.flush_until_clean().await;
+            let mut slot = result_slot_clone.lock().await;
+            *slot = Some(outcome);
+            cache.finish_flush_job(id).await;
+        })
+        .shared();
+
+        let handle = Arc::new(FlushJobHandle {
+            id,
+            future: job_future.clone(),
+            result: result_slot,
+        });
+
+        *job_guard = Some(Arc::clone(&handle));
+        handle
+    }
+
+    pub(crate) async fn wait_for_flush_job(self: &Arc<Self>) -> Result<(), CacheError<B::Error>>
+    where
+        B::Error: Clone,
+    {
+        let handle = self.ensure_flush_job().await;
+        handle.future.clone().await;
+        handle
+            .result
+            .lock()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap_or(Ok(()))
+    }
+
     async fn flush_internal_range(
         &self,
         block_range: Range<u64>,
@@ -739,7 +833,7 @@ where
     }
 
     pub async fn close_and_flush(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_internal_all().await?;
+        self.flush_until_clean().await?;
         self.closed.store(true, Ordering::Release);
         Ok(())
     }
@@ -777,6 +871,7 @@ where
 impl<B, const BLOCK_SIZE: usize, F> VolumeCacheOps for Arc<VolumeCache<B, BLOCK_SIZE, F>>
 where
     B: VolumeCacheBackend,
+    B::Error: Clone,
     F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
 {
     type Error = CacheError<B::Error>;
@@ -921,14 +1016,9 @@ where
             return;
         }
 
-        let backend = Arc::clone(&self.backend);
         let cache = Arc::clone(self);
-        let parallel = self.cfg.flush_parallelism;
-
         spawn_detached(async move {
-            if cache.flush_shards_streaming_all(parallel).await.is_ok() {
-                let _ = backend.flush_device().await;
-            }
+            let _ = cache.ensure_flush_job().await;
         });
     }
     async fn flush_async(&self) {
@@ -936,16 +1026,7 @@ where
             return;
         }
 
-        let backend = Arc::clone(&self.backend);
-        let cache = Arc::clone(self);
-        let parallel = self.cfg.flush_parallelism;
-
-        spawn(async move {
-            if cache.flush_shards_streaming_all(parallel).await.is_ok() {
-                let _ = backend.flush_device().await;
-            }
-        })
-        .await;
+        let _ = self.ensure_flush_job().await;
     }
 
     async fn stats(&self) -> CacheStats {

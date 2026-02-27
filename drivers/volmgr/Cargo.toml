@@ -25,7 +25,10 @@ opt-level = "z"
 
 [dependencies]
 kernel_api = { workspace = true }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
+futures = { version = "0.3", default-features = false, features = [
+    "alloc",
+    "spin",
+] }
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
 schnellru = { version = "0.2.4", default-features = false }
 crossbeam-queue = { version = "0.3", default-features = false, features = [

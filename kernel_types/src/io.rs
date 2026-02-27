@@ -3,11 +3,9 @@ use crate::pnp::DriverStep;
 use crate::request::{RequestHandle, RequestType};
 use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::AtomicU64;
 use core::task::Waker;
 use crossbeam_queue::SegQueue;
-use spin::Mutex as SpinMutex;
 use spin::Once;
 pub type IoTarget = Arc<DeviceObject>;
 
@@ -120,7 +118,7 @@ impl IoType {
             RequestType::Write { .. } => Some(1),
             RequestType::DeviceControl(_) => Some(2),
             RequestType::Fs(_) => Some(3),
-            RequestType::Flush | RequestType::FlushDirty => Some(4),
+            RequestType::Flush { .. } | RequestType::FlushDirty { .. } => Some(4),
             _ => None,
         }
     }
@@ -152,7 +150,6 @@ pub struct IoVtable {
 impl IoVtable {
     #[inline]
     pub fn new() -> Self {
-        let n = 5;
         Self {
             handlers: array_init::array_init(|_| Once::new()),
         }

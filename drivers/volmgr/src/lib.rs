@@ -181,7 +181,7 @@ impl VolumeCacheBackend for CacheBackend {
 
             {
                 let mut w = req.write();
-                w.kind = RequestType::Flush;
+                w.kind = RequestType::Flush { should_block: true };
                 w.traversal_policy = TraversalPolicy::ForwardLower;
                 w.completed = false;
                 w.status = DriverStatus::ContinueStep;
@@ -572,16 +572,22 @@ pub async fn vol_pdo_flush<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let is_dirty_only = matches!(req.read().kind, RequestType::FlushDirty);
-    if is_dirty_only {
-        cache.flush_async().await;
-        DriverStep::complete(DriverStatus::Success)
-    } else {
-        match cache.flush().await {
+    let should_block = match req.read().kind {
+        RequestType::Flush { should_block } | RequestType::FlushDirty { should_block } => {
+            should_block
+        }
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
+
+    if should_block {
+        match cache.wait_for_flush_job().await {
             Ok(()) => DriverStep::complete(DriverStatus::Success),
             Err(CacheError::Backend(s)) => DriverStep::complete(s),
             Err(_) => DriverStep::complete(DriverStatus::Unsuccessful),
         }
+    } else {
+        let _ = cache.ensure_flush_job().await;
+        DriverStep::complete(DriverStatus::Success)
     }
 }
 

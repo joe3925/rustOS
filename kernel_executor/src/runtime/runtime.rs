@@ -18,7 +18,7 @@ use crate::platform::{platform, Job};
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of};
 
-use super::slab::{get_task_slab, JOINABLE_STORAGE_SIZE, INLINE_FUTURE_ALIGN};
+use super::slab::{get_task_slab, INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
 use super::task::{FutureTask, JoinableTask, TaskPoll};
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
@@ -54,8 +54,10 @@ where
     let slab = get_task_slab();
 
     // Check if both future and result fit in slab storage
-    let future_fits = size_of::<F>() <= JOINABLE_STORAGE_SIZE && align_of::<F>() <= INLINE_FUTURE_ALIGN;
-    let result_fits = size_of::<T>() <= JOINABLE_STORAGE_SIZE && align_of::<T>() <= INLINE_FUTURE_ALIGN;
+    let future_fits =
+        size_of::<F>() <= JOINABLE_STORAGE_SIZE && align_of::<F>() <= INLINE_FUTURE_ALIGN;
+    let result_fits =
+        size_of::<T>() <= JOINABLE_STORAGE_SIZE && align_of::<T>() <= INLINE_FUTURE_ALIGN;
 
     if future_fits && result_fits {
         if let Some(slot_handle) = slab.allocate_joinable() {
@@ -131,11 +133,9 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
                 }
 
                 let slab = get_task_slab();
-                let Some(slot) = slab.get_joinable_slot(
-                    *shard_idx as usize,
-                    *local_idx as usize,
-                    *generation,
-                ) else {
+                let Some(slot) =
+                    slab.get_joinable_slot(*shard_idx as usize, *local_idx as usize, *generation)
+                else {
                     panic!("JoinHandle slot freed prematurely");
                 };
 
