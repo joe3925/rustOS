@@ -5,9 +5,7 @@ use core::fmt::{self, Write};
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::prelude::{
-    DrawTarget, OriginDimensions, Point, RgbColor, Size,
-};
+use embedded_graphics::prelude::{DrawTarget, OriginDimensions, Point, RgbColor, Size};
 use kernel_types::irq::IrqSafeMutex;
 
 use embedded_graphics::text::{Baseline, Text, TextStyle, TextStyleBuilder};

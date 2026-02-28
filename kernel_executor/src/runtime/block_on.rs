@@ -49,10 +49,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     loop {
         match Pin::new(&mut pinned).as_mut().poll(&mut cx) {
             Poll::Ready(out) => return out,
-            Poll::Pending => {
-                if !notify.take_ready()
-                    && !try_steal_blocking_one() {}
-            }
+            Poll::Pending => if !notify.take_ready() && !try_steal_blocking_one() {},
         }
     }
 }

@@ -313,7 +313,11 @@ async fn replay_wal(reg: &mut Registry) -> u64 {
     let wal_path = wal_path();
     let f = match File::open(
         &wal_path,
-        &[OpenFlags::ReadWrite, OpenFlags::Open, OpenFlags::WriteThrough],
+        &[
+            OpenFlags::ReadWrite,
+            OpenFlags::Open,
+            OpenFlags::WriteThrough,
+        ],
     )
     .await
     {

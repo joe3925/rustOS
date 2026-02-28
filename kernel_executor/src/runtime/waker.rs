@@ -291,7 +291,12 @@ static JOINABLE_SLAB_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
 /// Creates a waker for a joinable slab task. Waker operations are refcount-free.
 pub fn create_joinable_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
     let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-    unsafe { Waker::from_raw(RawWaker::new(encoded as *const (), &JOINABLE_SLAB_WAKER_VTABLE)) }
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            encoded as *const (),
+            &JOINABLE_SLAB_WAKER_VTABLE,
+        ))
+    }
 }
 
 unsafe fn joinable_slab_clone_waker(ptr: *const ()) -> RawWaker {

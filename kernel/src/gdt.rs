@@ -108,7 +108,8 @@ impl GDTTracker {
             .expect("NO CPUID")
             .initial_local_apic_id() as usize;
         self.gdt_array.set_by_id(id, gdt_ptr_base, core::ptr::null);
-        self.selectors_per_cpu.set_by_id(id, selectors, Selectors::default);
+        self.selectors_per_cpu
+            .set_by_id(id, selectors, Selectors::default);
     }
 }
 pub struct Selectors {

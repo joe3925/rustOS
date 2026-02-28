@@ -184,7 +184,12 @@ impl TaskPoll for FutureTask {
 
     fn try_start_inline_poll(&self) -> bool {
         self.state
-            .compare_exchange(STATE_IDLE, STATE_POLLING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 }
@@ -367,7 +372,12 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
 
     fn try_start_inline_poll(&self) -> bool {
         self.state
-            .compare_exchange(STATE_IDLE, STATE_POLLING, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
     }
 }

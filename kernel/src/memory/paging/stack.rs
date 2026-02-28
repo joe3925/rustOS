@@ -2,9 +2,9 @@ use kernel_types::status::PageMapError;
 use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
 use crate::memory::paging::{
-        paging::{align_up_4k, map_kernel_range},
-        virt_tracker::{allocate_auto_kernel_range_aligned, unmap_range},
-    };
+    paging::{align_up_4k, map_kernel_range},
+    virt_tracker::{allocate_auto_kernel_range_aligned, unmap_range},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u64)]
@@ -40,7 +40,6 @@ impl StackSize {
         }
     }
 }
-
 
 const GUARD_4K: u64 = 0x1000;
 pub const KERNEL_STACK_MAX: StackSize = StackSize::Huge2M;

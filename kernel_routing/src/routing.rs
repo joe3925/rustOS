@@ -18,6 +18,8 @@ pub type CompletionRoutine =
 
 #[cfg(feature = "kernel_link")]
 unsafe extern "Rust" {
+    // Linker seam for kernel print
+    fn routing_print_impl(s: &str);
     fn routing_resolve_path_to_device_impl(path: &str) -> Option<IoTarget>;
     fn routing_get_stack_top_from_weak_impl(
         dev_node_weak: &Weak<DevNode>,
@@ -27,6 +29,11 @@ unsafe extern "Rust" {
 #[cfg(feature = "kernel_link")]
 fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
     unsafe { routing_resolve_path_to_device_impl(path) }
+}
+
+#[cfg(feature = "kernel_link")]
+pub fn print(s: &str) {
+    unsafe { routing_print_impl(s) }
 }
 
 #[cfg(feature = "kernel_link")]
@@ -40,8 +47,23 @@ fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
 }
 
 #[cfg(not(feature = "kernel_link"))]
+pub fn print(s: &str) {
+    unsafe { kernel_sys::print(s) }
+}
+
+#[cfg(not(feature = "kernel_link"))]
 fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>> {
     unsafe { kernel_sys::routing_get_stack_top_from_weak(dev_node_weak) }
+}
+
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::print("\n");
+    };
+    ($($arg:tt)*) => {
+        $crate::print(&alloc::format!("{}\n", core::format_args!($($arg)*)));
+    };
 }
 
 /// Send a request to a target device.

@@ -107,20 +107,24 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
 
     while remaining > 0 {
         // Try 1 GiB page
-        if remaining >= GI_B && (cur.as_u64() & (GI_B - 1)) == 0
-            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur) {
-                cur += GI_B;
-                remaining -= GI_B;
-                continue;
-            }
+        if remaining >= GI_B
+            && (cur.as_u64() & (GI_B - 1)) == 0
+            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur)
+        {
+            cur += GI_B;
+            remaining -= GI_B;
+            continue;
+        }
 
         // Try 2 MiB page
-        if remaining >= MI_B2 && (cur.as_u64() & (MI_B2 - 1)) == 0
-            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur) {
-                cur += MI_B2;
-                remaining -= MI_B2;
-                continue;
-            }
+        if remaining >= MI_B2
+            && (cur.as_u64() & (MI_B2 - 1)) == 0
+            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur)
+        {
+            cur += MI_B2;
+            remaining -= MI_B2;
+            continue;
+        }
 
         // Fall back to 4 KiB page
         if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {

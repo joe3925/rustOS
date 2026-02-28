@@ -1,9 +1,5 @@
 use bootloader::{BootConfig, UefiBoot};
-use std::{
-    env, fs,
-    path::PathBuf,
-    process::Command,
-};
+use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     let kernel_path =

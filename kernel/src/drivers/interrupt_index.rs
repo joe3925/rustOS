@@ -613,7 +613,10 @@ impl ApicImpl {
                     .as_u64();
                 ptr::write_unaligned(info.add(START_STACK_OFF) as *mut u64, stack_top);
 
-                ptr::write_unaligned(info.add(START_ADDR_OFF) as *mut u64, ap_startup as *const () as u64);
+                ptr::write_unaligned(
+                    info.add(START_ADDR_OFF) as *mut u64,
+                    ap_startup as *const () as u64,
+                );
                 ptr::write_unaligned(
                     info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16,
                     longmode_gdt.limit,
@@ -686,7 +689,9 @@ extern "C" fn ap_startup() -> ! {
         CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
 
-    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) { core::hint::spin_loop() }
+    while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
+        core::hint::spin_loop()
+    }
     x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();

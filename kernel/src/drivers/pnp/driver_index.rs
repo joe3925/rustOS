@@ -141,14 +141,11 @@ pub async fn build_hw_index() -> Result<HwIndex, RegError> {
             let id = canonicalize_id(raw);
             let kind = classify_id(&id);
             let sc = rank(kind, pkg.start);
-            idx.by_id
-                .entry(id)
-                .or_default()
-                .push(DriverBinding {
-                    pkg: pkg.clone(),
-                    kind,
-                    score: sc,
-                });
+            idx.by_id.entry(id).or_default().push(DriverBinding {
+                pkg: pkg.clone(),
+                kind,
+                score: sc,
+            });
         }
     }
     for (_id, vec) in idx.by_id.iter_mut() {

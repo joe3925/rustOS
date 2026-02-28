@@ -1,8 +1,8 @@
 pub(crate) mod aligned_buffer;
 pub mod channel;
 pub mod condvar;
-pub mod mpmc;
 pub(crate) mod linked_list;
+pub mod mpmc;
 pub(crate) mod per_cpu_vec;
 pub mod range_tracker;
 pub mod sleep_mutex;

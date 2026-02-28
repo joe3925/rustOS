@@ -1,3 +1,4 @@
+use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::{stack::KERNEL_STACK_MAX_BYTES, tables::kernel_cr3};
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;
@@ -117,7 +118,7 @@ pub(crate) extern "x86-interrupt" fn page_fault(
                     }
                 }
 
-                if fault < gp {
+                if fault >= gp - StackSize::Huge2M.as_bytes() {
                     unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
                     panic!(
                         "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",

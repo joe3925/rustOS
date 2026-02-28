@@ -88,12 +88,8 @@ pub struct FpuState {
 impl FpuState {
     /// Capture the default FX state while preserving the current CPU state.
     pub fn new() -> Self {
-        let mut current = FpuState {
-            area: [0u8; 512],
-        };
-        let mut init = FpuState {
-            area: [0u8; 512],
-        };
+        let mut current = FpuState { area: [0u8; 512] };
+        let mut init = FpuState { area: [0u8; 512] };
 
         unsafe {
             asm!(
@@ -175,7 +171,6 @@ pub struct State {
 impl State {
     #[inline(always)]
     pub fn new(rax: u64) -> Self {
-        
         State {
             rax: 0,
             rbx: 0,

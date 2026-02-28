@@ -1,5 +1,5 @@
 use alloc::{vec, vec::Vec};
-use core::{cmp::min, mem::transmute};
+use core::{cmp::min, mem};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -8,7 +8,7 @@ use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
     println,
-    request::{RequestHandle, RequestType, SharedRequest, TraversalPolicy},
+    request::{RequestHandle, RequestType, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
@@ -24,6 +24,9 @@ pub struct BlockDev {
     pos: u64,
     /// Scratch buffer used for partial-sector R/W to avoid per-call allocations.
     scratch: Vec<u8>,
+    /// Preallocated owned requests with fixed backing storage.
+    read_req: RequestHandle<'static>,
+    write_req: RequestHandle<'static>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
 }
@@ -46,24 +49,6 @@ impl IoBase for BlockDev {
 }
 
 impl BlockDev {
-    #[inline]
-    unsafe fn borrowed_reqdata_from_mut(buf: &mut [u8]) -> RequestData {
-        // Extend the lifetime to 'static for the duration of the request.
-        let static_ref: &'static mut u8 = transmute(buf.as_mut_ptr());
-        let mut data = RequestData::from_borrowed_t(static_ref);
-        data.set_len(buf.len());
-        data
-    }
-
-    #[inline]
-    unsafe fn borrowed_reqdata_from(buf: &[u8]) -> RequestData {
-        // Read-only borrow; lower drivers must not mutate.
-        let static_ref: &'static mut u8 = transmute(buf.as_ptr() as *mut u8);
-        let mut data = RequestData::from_borrowed_t(static_ref);
-        data.set_len(buf.len());
-        data
-    }
-
     pub fn new(
         volume: IoTarget,
         sector_size: u16,
@@ -71,12 +56,34 @@ impl BlockDev {
         should_flush: Arc<AtomicBool>,
     ) -> Self {
         let scratch = vec![0u8; sector_size as usize];
+        // Allocate max-sized data buffers once; reuse without shrinking.
+        let read_req = {
+            let data = RequestData::from_boxed_bytes(vec![0u8; MAX_CHUNK_BYTES].into_boxed_slice());
+            let mut req = RequestHandle::new(RequestType::Read { offset: 0, len: 0 }, data);
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            req
+        };
+        let write_req = {
+            let data = RequestData::from_boxed_bytes(vec![0u8; MAX_CHUNK_BYTES].into_boxed_slice());
+            let mut req = RequestHandle::new(
+                RequestType::Write {
+                    offset: 0,
+                    len: 0,
+                    flush_write_through: false,
+                },
+                data,
+            );
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            req
+        };
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
             scratch,
+            read_req,
+            write_req,
             should_flush,
         }
     }
@@ -101,58 +108,92 @@ impl BlockDev {
         (byte_off % self.sector_size as u64) as usize
     }
 
-    /// Read into a buffer using pre-allocated request
-    async fn pnp_read_into(
-        volume: &IoTarget,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> Result<(), DriverStatus> {
-        let len = buf.len();
-
-        let mut req = unsafe {
-            RequestHandle::new(
-                RequestType::Read { offset, len },
-                Self::borrowed_reqdata_from_mut(buf),
-            )
-        };
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-        let st = pnp_send_request(volume.clone(), &mut req).await;
-
-        if st == DriverStatus::Success {
-            return Ok(());
+    #[inline]
+    fn prep_read_req(&mut self, offset: u64, len: usize) -> &mut RequestHandle<'static> {
+        match &mut self.read_req {
+            RequestHandle::Owned(r) => {
+                debug_assert!(len <= MAX_CHUNK_BYTES);
+                r.kind = RequestType::Read { offset, len };
+                r.data.set_len(len);
+                r.completed = false;
+                r.status = DriverStatus::ContinueStep;
+                r.traversal_policy = TraversalPolicy::ForwardLower;
+                r.pnp = None;
+                r.completion_routine = None;
+                r.completion_context = 0;
+                r.waker = None;
+            }
+            _ => unreachable!(),
         }
-        println!("Error: {:#?}", st);
-        Err(st)
+        &mut self.read_req
     }
 
-    /// Write from a buffer using pre-allocated request
-    async fn pnp_write_from(
-        volume: &IoTarget,
+    #[inline]
+    fn prep_write_req(
+        &mut self,
         offset: u64,
-        buf: &[u8],
-    ) -> Result<(), DriverStatus> {
-        let len = buf.len();
-
-        let mut req = unsafe {
-            RequestHandle::new(
-                RequestType::Write {
+        src: &[u8],
+        flush_write_through: bool,
+    ) -> &mut RequestHandle<'static> {
+        match &mut self.write_req {
+            RequestHandle::Owned(r) => {
+                let len = src.len();
+                debug_assert!(len <= MAX_CHUNK_BYTES);
+                r.kind = RequestType::Write {
                     offset,
                     len,
-                    flush_write_through: false,
-                },
-                Self::borrowed_reqdata_from(buf),
-            )
+                    flush_write_through,
+                };
+                r.data.set_len(len);
+                r.data.as_mut_slice()[..len].copy_from_slice(src);
+                r.completed = false;
+                r.status = DriverStatus::ContinueStep;
+                r.traversal_policy = TraversalPolicy::ForwardLower;
+                r.pnp = None;
+                r.completion_routine = None;
+                r.completion_context = 0;
+                r.waker = None;
+            }
+            _ => unreachable!(),
+        }
+        &mut self.write_req
+    }
+
+    /// Prepare and dispatch a read using the owned read request.
+    async fn pnp_read_into(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), DriverStatus> {
+        let len = dst.len();
+        let volume = self.volume.clone();
+        let status = {
+            let req = self.prep_read_req(offset, len);
+            let st = pnp_send_request(volume, req).await;
+            if st == DriverStatus::Success {
+                let w = req.write();
+                dst.copy_from_slice(&w.data.as_slice()[..len]);
+            }
+            st
         };
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let st = pnp_send_request(volume.clone(), &mut req).await;
-
-        if st == DriverStatus::Success {
+        if status == DriverStatus::Success {
             Ok(())
         } else {
-            println!("Error: {:#?}", st);
-            Err(st)
+            println!("Error: {:#?}", status);
+            Err(status)
+        }
+    }
+
+    /// Prepare and dispatch a write using the owned write request.
+    async fn pnp_write_from(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
+        let volume = self.volume.clone();
+        let status = {
+            let req = self.prep_write_req(offset, src, false);
+            pnp_send_request(volume, req).await
+        };
+
+        if status == DriverStatus::Success {
+            Ok(())
+        } else {
+            println!("Error: {:#?}", status);
+            Err(status)
         }
     }
 
@@ -172,16 +213,19 @@ impl BlockDev {
         let mut written = 0usize;
         let mut cur_off = self.pos;
         let bps = self.bps();
-        let volume = &self.volume;
+        let mut scratch_buf = mem::take(&mut self.scratch);
+        if scratch_buf.len() < bps {
+            scratch_buf.resize(bps, 0);
+        }
 
         // Handle leading partial sector, if any.
         let in_sector = self.in_sector_off(cur_off);
         if in_sector != 0 {
             let lba_base = cur_off - in_sector as u64;
             let take = min(bps - in_sector, remaining);
-            let scratch = &mut self.scratch[..bps];
+            let scratch = &mut scratch_buf[..bps];
 
-            block_on(async { Self::pnp_read_into(volume, lba_base, scratch).await })?;
+            block_on(self.pnp_read_into(lba_base, scratch))?;
             dst[..take].copy_from_slice(&scratch[in_sector..in_sector + take]);
 
             cur_off += take as u64;
@@ -203,7 +247,7 @@ impl BlockDev {
                     min(max_chunk, aligned_bytes - done)
                 };
                 let dst_slice = &mut dst[written + done..written + done + chunk];
-                block_on(async { Self::pnp_read_into(volume, cur_off, dst_slice).await })?;
+                block_on(self.pnp_read_into(cur_off, dst_slice))?;
 
                 cur_off += chunk as u64;
                 done += chunk;
@@ -214,8 +258,8 @@ impl BlockDev {
 
         // Trailing partial sector.
         if remaining != 0 {
-            let scratch = &mut self.scratch[..bps];
-            block_on(async { Self::pnp_read_into(volume, cur_off, scratch).await })?;
+            let scratch = &mut scratch_buf[..bps];
+            block_on(self.pnp_read_into(cur_off, scratch))?;
             dst[written..written + remaining].copy_from_slice(&scratch[..remaining]);
 
             cur_off += remaining as u64;
@@ -223,6 +267,7 @@ impl BlockDev {
         }
 
         self.pos = cur_off;
+        self.scratch = scratch_buf;
         Ok(written)
     }
 
@@ -242,18 +287,21 @@ impl BlockDev {
         let mut written = 0usize;
         let mut cur_off = self.pos;
         let bps = self.bps();
-        let volume = &self.volume;
+        let mut scratch_buf = mem::take(&mut self.scratch);
+        if scratch_buf.len() < bps {
+            scratch_buf.resize(bps, 0);
+        }
 
         // Leading partial sector (read-modify-write).
         let in_sector = self.in_sector_off(cur_off);
         if in_sector != 0 {
             let lba_base = cur_off - in_sector as u64;
             let write_len = min(bps - in_sector, remaining);
-            let scratch = &mut self.scratch[..bps];
+            let scratch = &mut scratch_buf[..bps];
 
-            block_on(async { Self::pnp_read_into(volume, lba_base, scratch).await })?;
+            block_on(self.pnp_read_into(lba_base, scratch))?;
             scratch[in_sector..in_sector + write_len].copy_from_slice(&src[..write_len]);
-            block_on(async { Self::pnp_write_from(volume, lba_base, scratch).await })?;
+            block_on(self.pnp_write_from(lba_base, scratch))?;
 
             cur_off += write_len as u64;
             written += write_len;
@@ -272,7 +320,7 @@ impl BlockDev {
                     min(max_chunk, aligned_bytes - done)
                 };
                 let src_slice = &src[written + done..written + done + chunk];
-                block_on(async { Self::pnp_write_from(volume, cur_off, src_slice).await })?;
+                block_on(self.pnp_write_from(cur_off, src_slice))?;
 
                 cur_off += chunk as u64;
                 done += chunk;
@@ -283,16 +331,17 @@ impl BlockDev {
 
         // Trailing partial sector (read-modify-write).
         if remaining != 0 {
-            let scratch = &mut self.scratch[..bps];
-            block_on(async { Self::pnp_read_into(volume, cur_off, scratch).await })?;
+            let scratch = &mut scratch_buf[..bps];
+            block_on(self.pnp_read_into(cur_off, scratch))?;
             scratch[..remaining].copy_from_slice(&src[written..written + remaining]);
-            block_on(async { Self::pnp_write_from(volume, cur_off, scratch).await })?;
+            block_on(self.pnp_write_from(cur_off, scratch))?;
 
             cur_off += remaining as u64;
             written += remaining;
         }
 
         self.pos = cur_off;
+        self.scratch = scratch_buf;
         Ok(written)
     }
 }
