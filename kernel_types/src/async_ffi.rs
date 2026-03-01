@@ -738,12 +738,28 @@ pub struct BorrowingFfiFuture<'a, T> {
     pub abi_version: u32,
     pub data: *mut (),
     pub poll_fn: unsafe extern "win64" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
+    pub drop_fn: Option<unsafe extern "win64" fn(*mut ())>,
     _pd: PhantomData<&'a mut ()>,
 }
 
 impl<'a, T> BorrowingFfiFuture<'a, T> {
     pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
         unsafe { (self.poll_fn)(self.data, waker) }
+    }
+
+    /// Wrap an owned `FfiFuture` while tying it to a borrow lifetime.
+    /// This preserves the original drop function so resources are freed
+    /// when the borrowing future is dropped or completes.
+    pub fn from_owned_ffi<'b>(mut fut: FfiFuture<T>) -> BorrowingFfiFuture<'b, T> {
+        let out = BorrowingFfiFuture {
+            abi_version: fut.abi_version,
+            data: fut.data,
+            poll_fn: fut.poll_fn,
+            drop_fn: Some(fut.drop_fn),
+            _pd: PhantomData,
+        };
+        fut.data = ptr::null_mut();
+        out
     }
 }
 
@@ -776,6 +792,7 @@ where
         abi_version: ABI_VERSION,
         data: p as *mut (),
         poll_fn: borrowing_future_poll::<F>,
+        drop_fn: None,
         _pd: PhantomData,
     }
 }
@@ -807,7 +824,29 @@ impl<'a, T> Future for BorrowingFfiFuture<'a, T> {
         let this = unsafe { self.get_unchecked_mut() };
         let ffi_waker = cx.waker().clone().into_ffi();
         let p = unsafe { (this.poll_fn)(this.data, &ffi_waker as *const FfiWaker) };
-        unsafe { p.into_poll() }
+        match unsafe { p.into_poll() } {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(v) => {
+                if let Some(df) = this.drop_fn {
+                    if !this.data.is_null() {
+                        unsafe { df(this.data) };
+                        this.data = ptr::null_mut();
+                    }
+                }
+                Poll::Ready(v)
+            }
+        }
+    }
+}
+
+impl<'a, T> Drop for BorrowingFfiFuture<'a, T> {
+    fn drop(&mut self) {
+        if let Some(df) = self.drop_fn {
+            if !self.data.is_null() {
+                unsafe { df(self.data) };
+                self.data = ptr::null_mut();
+            }
+        }
     }
 }
 

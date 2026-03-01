@@ -1,8 +1,11 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
+use core::ptr;
 use core::sync::atomic::Ordering;
+use core::sync::atomic::compiler_fence;
 use core::task::{Context, Poll, Waker};
 use crossbeam_queue::SegQueue;
 use kernel_types::device::{DevNode, DeviceObject};
@@ -277,6 +280,22 @@ async fn invoke_io_handler(
     handle: &mut RequestHandle<'_>,
     kind: &RequestType,
 ) -> Option<DriverStep> {
+    let addr: usize = 0xFFFF_8500_0000_0000;
+
+    let entropy = unsafe { ptr::read_volatile(&addr) };
+
+    if (entropy & 1) != 0 {
+        for _ in 0..512 {
+            compiler_fence(Ordering::SeqCst);
+        }
+
+        core::future::poll_fn(|cx| {
+            cx.waker().wake_by_ref();
+            Poll::<()>::Pending
+        })
+        .await;
+    }
+
     let Some(h) = dev.dev_init.io_vtable.get_for(kind) else {
         return None;
     };

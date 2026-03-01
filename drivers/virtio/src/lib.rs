@@ -958,6 +958,10 @@ pub async fn virtio_pdo_read<'a, 'b>(
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         return complete_req(req, DriverStatus::InvalidParameter);
     }
+    // Ensure caller-provided buffer is large enough for the requested transfer.
+    if req.read().data_len() < len {
+        return complete_req(req, DriverStatus::InsufficientResources);
+    }
 
     let sector = offset >> 9;
 
@@ -1101,6 +1105,11 @@ pub async fn virtio_pdo_write<'a, 'b>(
     }
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         return complete_req(req, DriverStatus::InvalidParameter);
+    }
+    // Guard against buffer underruns – without this we can read past the end of
+    // the caller's data buffer and corrupt adjacent memory.
+    if req.read().data_len() < len {
+        return complete_req(req, DriverStatus::InsufficientResources);
     }
 
     let sector = offset >> 9;
