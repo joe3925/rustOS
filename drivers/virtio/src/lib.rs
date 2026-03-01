@@ -62,19 +62,13 @@ const SPIN_WAIT_SLICE_NS: u64 = 50;
 
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
 
+// legacy helpers
+#[inline(always)]
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
-    {
-        let mut w = req.write();
-        w.status = status;
-    }
     DriverStep::complete(status)
 }
-
+#[inline(always)]
 fn continue_req(req: &mut RequestHandle) -> DriverStep {
-    {
-        let mut w = req.write();
-        w.status = DriverStatus::ContinueStep;
-    }
     DriverStep::Continue
 }
 
@@ -453,7 +447,6 @@ async fn virtio_pnp_start<'a, 'b>(
         } else {
             (None, None, None)
         };
-
         let vq = virtqueue_iter
             .next()
             .expect("virtio-blk: virtqueue missing during init");

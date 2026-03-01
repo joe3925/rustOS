@@ -507,13 +507,15 @@ impl BlkIoArena {
                         // Allocate data buffer on demand
                         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
                         let data_pages = ((data_len as u64) + 4095) & !4095;
-                        let data_va =
-                            match allocate_auto_kernel_range_mapped(data_pages.max(4096), flags) {
-                                Ok(va) => va,
-                                Err(_) => {
-                                    // Failed to allocate data buffer, return slot to pool
-                                    bitmap.fetch_or(mask, Ordering::Release);
-                                    return None;
+                        let data_va = match allocate_auto_kernel_range_mapped_contiguous(
+                            data_pages.max(4096),
+                            flags,
+                        ) {
+                            Ok(va) => va,
+                            Err(_) => {
+                                // Failed to allocate data buffer, return slot to pool
+                                bitmap.fetch_or(mask, Ordering::Release);
+                                return None;
                             }
                         };
                         let data_phys = match virt_to_phys(data_va) {
@@ -528,15 +530,15 @@ impl BlkIoArena {
 
                         // Allocate indirect table sized for the data length
                         let table_len = calculate_indirect_table_size(data_len);
-                        let indirect_va = match allocate_auto_kernel_range_mapped(table_len, flags)
-                        {
-                            Ok(va) => va,
-                            Err(_) => {
-                                unsafe { unmap_range(data_va, data_pages.max(4096)) };
-                                bitmap.fetch_or(mask, Ordering::Release);
-                                return None;
-                            }
-                        };
+                        let indirect_va =
+                            match allocate_auto_kernel_range_mapped_contiguous(table_len, flags) {
+                                Ok(va) => va,
+                                Err(_) => {
+                                    unsafe { unmap_range(data_va, data_pages.max(4096)) };
+                                    bitmap.fetch_or(mask, Ordering::Release);
+                                    return None;
+                                }
+                            };
                         let indirect_phys = match virt_to_phys(indirect_va) {
                             Some(p) => p,
                             None => {
@@ -591,7 +593,7 @@ impl BlkIoArena {
         // If this fails, we can still proceed with a direct descriptor chain.
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
         let table_len = calculate_indirect_table_size(data_len);
-        if let Ok(va) = allocate_auto_kernel_range_mapped(table_len, flags) {
+        if let Ok(va) = allocate_auto_kernel_range_mapped_contiguous(table_len, flags) {
             if let Some(pa) = virt_to_phys(va) {
                 req.indirect_table_va = Some(va);
                 req.indirect_table_phys = Some(pa);
@@ -1323,14 +1325,17 @@ impl BlkIoRequest {
     pub(crate) fn new_internal(data_len: u32) -> Option<Self> {
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
 
-        let header_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+        // Use contiguous mappings so we never advertise a non-contiguous buffer
+        // as a single descriptor to the device (avoids DMA scribbling).
+        let header_va = allocate_auto_kernel_range_mapped_contiguous(4096, flags).ok()?;
         let header_phys = virt_to_phys(header_va)?;
 
         let data_pages = ((data_len as u64) + 4095) & !4095;
-        let data_va = allocate_auto_kernel_range_mapped(data_pages.max(4096), flags).ok()?;
+        let data_va =
+            allocate_auto_kernel_range_mapped_contiguous(data_pages.max(4096), flags).ok()?;
         let data_phys = virt_to_phys(data_va)?;
 
-        let status_va = allocate_auto_kernel_range_mapped(4096, flags).ok()?;
+        let status_va = allocate_auto_kernel_range_mapped_contiguous(4096, flags).ok()?;
         let status_phys = virt_to_phys(status_va)?;
         unsafe { core::ptr::write_volatile(status_va.as_u64() as *mut u8, 0xFF) }; // sentinel
 
