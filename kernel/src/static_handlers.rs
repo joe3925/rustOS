@@ -74,7 +74,7 @@ pub extern "win64" fn create_kernel_task(
     ctx: usize,
     name: String,
 ) -> u64 {
-    let task = Task::new_kernel_mode(entry, ctx, StackSize::Medium, name, 0);
+    let task = Task::new_kernel_mode(entry, ctx, StackSize::Huge2M, name, 0);
     SCHEDULER.add_task(task)
 }
 
@@ -154,7 +154,10 @@ pub extern "win64" fn kernel_apic_cpu_ids() -> Vec<u8> {
 pub extern "win64" fn print(str: &str) {
     CONSOLE.lock().print(str.as_bytes());
 }
-
+#[unsafe(no_mangle)]
+pub fn routing_print_impl(s: &str) {
+    CONSOLE.lock().print(s.as_bytes());
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn wait_duration(time: Duration) {
     interrupt_index::wait_duration(time);

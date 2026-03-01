@@ -6,6 +6,7 @@ use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
+use futures::stream::StreamExt;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
 use kernel_api::request::{RequestType, TraversalPolicy};
@@ -464,7 +465,6 @@ where
             w.completion_routine = None;
             w.completion_context = 0;
             w.waker = None;
-            w.data.set_len(BLOCK_SIZE);
             let dst = w.data_slice_mut();
             let data = page.data.read().await;
             dst.copy_from_slice(&data.bytes[..]);
@@ -525,7 +525,6 @@ where
             req_w.completion_routine = None;
             req_w.completion_context = 0;
             req_w.waker = None;
-            req_w.data.set_len(BLOCK_SIZE);
 
             let dst = req_w.data_slice_mut();
             let data = page.data.read().await;
@@ -577,46 +576,16 @@ where
 
         joins.clear();
 
-        let n = pages.len();
-        let chunk = (n + width - 1) / width;
-
-        let pages_ptr_usize = pages.as_ptr() as usize;
-        let pages_len = n;
-
-        for w in 0..width {
-            let start = w * chunk;
-            let end = core::cmp::min(start + chunk, n);
-            if start >= end {
-                break;
-            }
-
-            let backend = Arc::clone(&backend);
-            let stats = Arc::clone(&stats);
-            let request_pool = Arc::clone(&request_pool);
-
-            let j = spawn(async move {
-                let pages_ptr = pages_ptr_usize as *const (u64, Arc<Page<BLOCK_SIZE>>);
-                let pages_slice: &[(u64, Arc<Page<BLOCK_SIZE>>)] =
-                    unsafe { core::slice::from_raw_parts(pages_ptr, pages_len) };
-
-                for i in start..end {
-                    let (lba, page) = pages_slice[i].clone();
-                    let _ = Self::flush_page_task(
-                        Arc::clone(&backend),
-                        Arc::clone(&stats),
-                        Arc::clone(&request_pool),
-                        lba,
-                        page,
-                    )
-                    .await;
+        futures::stream::iter(pages.iter().cloned())
+            .for_each_concurrent(width, |(lba, page)| {
+                let backend = Arc::clone(&backend);
+                let stats = Arc::clone(&stats);
+                let request_pool = Arc::clone(&request_pool);
+                async move {
+                    let _ = Self::flush_page_task(backend, stats, request_pool, lba, page).await;
                 }
-            });
-            joins.push(j);
-        }
-
-        for j in joins.drain(..) {
-            j.await;
-        }
+            })
+            .await;
 
         Ok(())
     }

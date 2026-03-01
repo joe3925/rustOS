@@ -103,7 +103,6 @@ impl VolumeCacheBackend for CacheBackend {
                 w.completion_routine = None;
                 w.completion_context = 0;
                 w.waker = None;
-                w.data.set_len(len);
             }
 
             let status = pnp_send_request(self.target.clone(), req).await;
@@ -145,7 +144,6 @@ impl VolumeCacheBackend for CacheBackend {
                 w.completion_routine = None;
                 w.completion_context = 0;
                 w.waker = None;
-                w.data.set_len(block_len);
                 let dst = w.data_slice_mut();
                 dst[..block_len].copy_from_slice(&data[..block_len]);
             }
@@ -188,7 +186,6 @@ impl VolumeCacheBackend for CacheBackend {
                 w.completion_routine = None;
                 w.completion_context = 0;
                 w.waker = None;
-                w.data.set_len(0);
             }
 
             let status = pnp_send_request(self.target.clone(), req).await;

@@ -56,21 +56,6 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
     dev.try_devext().expect("Failed to get fat32 dev ext")
 }
 
-fn from_boxed_bytes<T>(bytes: Box<[u8]>) -> Result<T, DriverStatus> {
-    if bytes.len() != size_of::<T>() {
-        return Err(DriverStatus::InvalidParameter);
-    }
-    let ptr = bytes.as_ptr();
-    if !(ptr as usize).is_multiple_of(align_of::<T>()) {
-        drop(bytes);
-        return Err(DriverStatus::InvalidParameter);
-    }
-    // SAFETY: same rationale as take_req.
-    let val = unsafe { (ptr as *const T).read() };
-    drop(bytes);
-    Ok(val)
-}
-
 #[request_handler]
 pub async fn fs_root_ioctl<'a, 'b>(
     _dev: &Arc<DeviceObject>,
@@ -109,12 +94,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
             if st == DriverStatus::Success
                 && let Some(pnp) = query.write().pnp.as_mut()
             {
-                let mut pi_opt = pnp.data_out.try_take::<PartitionInfo>();
-                if pi_opt.is_none() {
-                    let raw = pnp.data_out.take_bytes();
-                    pi_opt = from_boxed_bytes::<PartitionInfo>(raw).ok();
-                }
-
+                let pi_opt = pnp.data_out.try_take::<PartitionInfo>();
                 if let Some(pi) = pi_opt {
                     sector_size = Some(if pi.disk.logical_block_size != 0 {
                         pi.disk.logical_block_size as u16

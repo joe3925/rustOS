@@ -62,7 +62,14 @@ impl DriverRuntime {
         self.state.store(s as u8, Ordering::Release);
     }
     pub fn get_state(&self) -> DriverState {
-        unsafe { core::mem::transmute(self.state.load(Ordering::Acquire) as u32) }
+        match self.state.load(Ordering::Acquire) {
+            0 => DriverState::Loaded,
+            1 => DriverState::Continue,
+            2 => DriverState::Started,
+            3 => DriverState::Stopped,
+            4 => DriverState::Failed,
+            _ => DriverState::Failed,
+        }
     }
 }
 #[repr(C)]

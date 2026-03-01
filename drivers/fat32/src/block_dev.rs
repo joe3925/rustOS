@@ -114,7 +114,6 @@ impl BlockDev {
             RequestHandle::Owned(r) => {
                 debug_assert!(len <= MAX_CHUNK_BYTES);
                 r.kind = RequestType::Read { offset, len };
-                r.data.set_len(len);
                 r.completed = false;
                 r.status = DriverStatus::ContinueStep;
                 r.traversal_policy = TraversalPolicy::ForwardLower;
@@ -144,7 +143,6 @@ impl BlockDev {
                     len,
                     flush_write_through,
                 };
-                r.data.set_len(len);
                 r.data.as_mut_slice()[..len].copy_from_slice(src);
                 r.completed = false;
                 r.status = DriverStatus::ContinueStep;

@@ -32,8 +32,6 @@ enum StorageMode {
     HeapTyped = 1,
     /// Data is heap-allocated as raw bytes (from Box<[u8]>, reconstruct on drop)
     HeapBytes = 2,
-    /// Data is borrowed from an external buffer (raw pointer, no deallocation)
-    BorrowedBytes = 3,
 }
 
 /// Aligned inline buffer for small data
@@ -178,27 +176,7 @@ impl RequestData {
             }
         }
     }
-
-    /// Borrow a typed value without taking ownership.
-    ///
-    /// # Safety
-    /// The caller must guarantee that `ptr` points to a valid instance of `T` that
-    /// remains alive and correctly aligned for the full lifetime of this
-    /// `RequestData` and any `RequestHandle` that contains it.
-    pub unsafe fn from_borrowed_t<T: Send + 'static>(ptr: &'static mut T) -> Self {
-        Self {
-            inline: InlineBuffer::new(),
-            heap_ptr: (ptr as *mut T) as *mut u8,
-            // Stored for metadata only; we never deallocate borrowed data.
-            heap_layout: Layout::new::<T>(),
-            tag: Some(type_tag::<T>()),
-            dropper: noop_dropper,
-            size: size_of::<T>(),
-            mode: StorageMode::BorrowedBytes,
-        }
-    }
-
-    pub fn from_t<T: 'static>(value: T) -> Self {
+    pub fn from_t<T: 'static + Send + Sync>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
 
@@ -256,17 +234,12 @@ impl RequestData {
     }
 
     #[inline]
-    pub fn set_len(&mut self, new_size: usize) {
-        self.size = new_size;
-    }
-
-    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self.mode {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts(self.inline.as_ptr(), self.size)
             },
-            StorageMode::HeapTyped | StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
+            StorageMode::HeapTyped | StorageMode::HeapBytes => {
                 if self.heap_ptr.is_null() {
                     &[]
                 } else {
@@ -282,7 +255,7 @@ impl RequestData {
             StorageMode::Inline => unsafe {
                 core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size)
             },
-            StorageMode::HeapTyped | StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
+            StorageMode::HeapTyped | StorageMode::HeapBytes => {
                 if self.heap_ptr.is_null() {
                     &mut []
                 } else {
@@ -304,7 +277,7 @@ impl RequestData {
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
             StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes | StorageMode::BorrowedBytes => return None,
+            StorageMode::HeapBytes => return None,
         };
 
         if ptr.is_null() {
@@ -322,7 +295,7 @@ impl RequestData {
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
             StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes | StorageMode::BorrowedBytes => return None,
+            StorageMode::HeapBytes => return None,
         };
 
         if ptr.is_null() {
@@ -360,7 +333,7 @@ impl RequestData {
 
                 value
             }
-            StorageMode::HeapBytes | StorageMode::BorrowedBytes => {
+            StorageMode::HeapBytes => {
                 // Cannot take typed value from raw bytes
                 return None;
             }
@@ -374,115 +347,6 @@ impl RequestData {
         self.dropper = noop_dropper;
 
         Some(value)
-    }
-
-    /// Create request data for filesystem writes without copying the payload buffer.
-    ///
-    /// This mirrors `from_t` but accepts `FsWriteParams<'a>` which contains a borrowed slice.
-    /// The caller must ensure the referenced buffer lives at least as long as the request.
-    pub fn from_fs_write_params<'a>(value: crate::fs::FsWriteParams<'a>) -> Self {
-        let size = size_of::<crate::fs::FsWriteParams<'a>>();
-        let align = align_of::<crate::fs::FsWriteParams<'a>>();
-
-        fn typed_dropper(ptr: *mut u8) {
-            unsafe {
-                core::ptr::drop_in_place(ptr as *mut crate::fs::FsWriteParams<'static>);
-            }
-        }
-
-        if size <= INLINE_THRESHOLD && align <= INLINE_ALIGN {
-            // INLINE PATH: Copy value into inline buffer
-            let mut result = Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: null_mut(),
-                heap_layout: Layout::new::<()>(),
-                tag: Some(type_tag::<crate::fs::FsWriteParams<'a>>()),
-                dropper: typed_dropper,
-                size,
-                mode: StorageMode::Inline,
-            };
-
-            unsafe {
-                let dst = result.inline.as_mut_ptr() as *mut crate::fs::FsWriteParams<'a>;
-                core::ptr::write(dst, value);
-            }
-
-            result
-        } else {
-            // HEAP PATH: Allocate with correct Layout
-            let layout = Layout::new::<crate::fs::FsWriteParams<'a>>();
-            let ptr = unsafe { alloc::alloc::alloc(layout) };
-
-            if ptr.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
-
-            unsafe {
-                core::ptr::write(ptr as *mut crate::fs::FsWriteParams<'a>, value);
-            }
-
-            Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: ptr,
-                heap_layout: layout,
-                tag: Some(type_tag::<crate::fs::FsWriteParams<'a>>()),
-                dropper: typed_dropper,
-                size,
-                mode: StorageMode::HeapTyped,
-            }
-        }
-    }
-
-    /// Create request data for filesystem appends without copying the payload buffer.
-    /// Same rules as `from_fs_write_params` regarding the lifetime of the slice.
-    pub fn from_fs_append_params<'a>(value: crate::fs::FsAppendParams<'a>) -> Self {
-        let size = size_of::<crate::fs::FsAppendParams<'a>>();
-        let align = align_of::<crate::fs::FsAppendParams<'a>>();
-
-        fn typed_dropper(ptr: *mut u8) {
-            unsafe {
-                core::ptr::drop_in_place(ptr as *mut crate::fs::FsAppendParams<'static>);
-            }
-        }
-
-        if size <= INLINE_THRESHOLD && align <= INLINE_ALIGN {
-            let mut result = Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: null_mut(),
-                heap_layout: Layout::new::<()>(),
-                tag: Some(type_tag::<crate::fs::FsAppendParams<'a>>()),
-                dropper: typed_dropper,
-                size,
-                mode: StorageMode::Inline,
-            };
-
-            unsafe {
-                let dst = result.inline.as_mut_ptr() as *mut crate::fs::FsAppendParams<'a>;
-                core::ptr::write(dst, value);
-            }
-
-            result
-        } else {
-            let layout = Layout::new::<crate::fs::FsAppendParams<'a>>();
-            let ptr = unsafe { alloc::alloc::alloc(layout) };
-            if ptr.is_null() {
-                alloc::alloc::handle_alloc_error(layout);
-            }
-
-            unsafe {
-                core::ptr::write(ptr as *mut crate::fs::FsAppendParams<'a>, value);
-            }
-
-            Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: ptr,
-                heap_layout: layout,
-                tag: Some(type_tag::<crate::fs::FsAppendParams<'a>>()),
-                dropper: typed_dropper,
-                size,
-                mode: StorageMode::HeapTyped,
-            }
-        }
     }
 
     pub fn take_bytes(&mut self) -> Box<[u8]> {
@@ -537,19 +401,6 @@ impl RequestData {
                     }
                 }
             }
-            StorageMode::BorrowedBytes => {
-                // Must copy — we don't own the memory
-                if self.heap_ptr.is_null() || self.size == 0 {
-                    Box::new([])
-                } else {
-                    let mut vec = Vec::with_capacity(self.size);
-                    unsafe {
-                        core::ptr::copy_nonoverlapping(self.heap_ptr, vec.as_mut_ptr(), self.size);
-                        vec.set_len(self.size);
-                    }
-                    vec.into_boxed_slice()
-                }
-            }
         };
 
         // Reset to empty state
@@ -593,9 +444,6 @@ impl Drop for RequestData {
                         // Box drops here, deallocating with correct layout
                     }
                 }
-            }
-            StorageMode::BorrowedBytes => {
-                // Borrowed — caller owns the memory, nothing to free.
             }
         }
     }
@@ -666,23 +514,6 @@ pub struct Request {
 }
 
 impl Request {
-    /// Ensure all payloads are owned (no borrowed pointers). Copies borrowed buffers.
-    pub fn safe(&mut self) {
-        fn ensure_owned(data: &mut RequestData) {
-            if matches!(data.mode, StorageMode::BorrowedBytes) {
-                // take_bytes() will copy for borrowed storage, yielding owned Box<[u8]>.
-                let owned = data.take_bytes();
-                *data = RequestData::from_boxed_bytes(owned);
-            }
-        }
-
-        ensure_owned(&mut self.data);
-
-        if let Some(pnp) = self.pnp.as_mut() {
-            ensure_owned(&mut pnp.data_out);
-        }
-    }
-
     /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
     pub(crate) fn new(kind: RequestType, data: RequestData) -> Self {
         if matches!(kind, RequestType::Pnp) {
@@ -722,13 +553,13 @@ impl Request {
 
     /// Create a request with typed payload.
     #[inline]
-    pub(crate) fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+    pub(crate) fn new_t<T: 'static + Send + Sync>(kind: RequestType, data: T) -> Self {
         Self::new(kind, RequestData::from_t(data))
     }
 
     /// Create a PnP request with typed payload.
     #[inline]
-    pub(crate) fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+    pub(crate) fn new_pnp_t<T: 'static + Send + Sync>(pnp: PnpRequest, data: T) -> Self {
         Self::new_pnp(pnp, RequestData::from_t(data))
     }
 
@@ -756,7 +587,7 @@ impl Request {
     }
 
     #[inline]
-    pub fn set_data_t<T: 'static>(&mut self, data: T) {
+    pub fn set_data_t<T: 'static + Send + Sync>(&mut self, data: T) {
         self.data = RequestData::from_t(data);
     }
 
@@ -852,12 +683,16 @@ impl Request {
     }
     #[inline]
     fn complete_for_drop(&mut self) {
-        let (_status, waker) = {
+        let (should_drop_chain_ctx, _status, waker) = {
             if self.completed {
                 return;
             }
 
+            let mut drop_chain = false;
+
             if let Some(fp) = self.completion_routine.take() {
+                drop_chain =
+                    fp as usize == chained_completion as usize && self.completion_context != 0;
                 let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
                 let context = self.completion_context;
                 self.status = f(&mut *self, context);
@@ -868,8 +703,21 @@ impl Request {
             }
 
             self.completed = true;
-            (self.status, self.waker.take())
+            (
+                drop_chain.then_some(self.completion_context),
+                self.status,
+                self.waker.take(),
+            )
         };
+
+        if let Some(ctx) = should_drop_chain_ctx {
+            unsafe {
+                drop(alloc::sync::Arc::from_raw(
+                    ctx as *const alloc::vec::Vec<CompletionEntry>,
+                ));
+            }
+            self.completion_context = 0;
+        }
 
         if let Some(w) = waker {
             w.wake();
@@ -881,12 +729,7 @@ impl Drop for Request {
         self.complete_for_drop();
     }
 }
-#[repr(C)]
-struct CompletionNode {
-    func: CompletionRoutine,
-    ctx: usize,
-    next: Option<*mut CompletionNode>,
-}
+type CompletionEntry = (CompletionRoutine, usize);
 
 fn store_prev_and_new(
     prev: CompletionRoutine,
@@ -894,29 +737,27 @@ fn store_prev_and_new(
     next: CompletionRoutine,
     next_ctx: usize,
 ) -> usize {
-    let head = Box::new(CompletionNode {
-        func: next,
-        ctx: next_ctx,
-        next: Some(Box::into_raw(Box::new(CompletionNode {
-            func: prev,
-            ctx: prev_ctx,
-            next: None,
-        }))),
-    });
-    Box::into_raw(head) as usize
+    let mut entries: alloc::vec::Vec<CompletionEntry> = alloc::vec::Vec::with_capacity(2);
+    entries.push((next, next_ctx)); // newest first
+    entries.push((prev, prev_ctx));
+    let arc: alloc::sync::Arc<alloc::vec::Vec<CompletionEntry>> = alloc::sync::Arc::new(entries);
+    alloc::sync::Arc::into_raw(arc) as usize
 }
 
 extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverStatus {
-    let head = unsafe { Box::from_raw(ctx as *mut CompletionNode) };
+    if ctx == 0 {
+        return DriverStatus::Success;
+    }
+
+    // Temporarily borrow the chain without consuming the original Arc so
+    // repeated invocations stay safe.
+    let arc = unsafe { alloc::sync::Arc::from_raw(ctx as *const alloc::vec::Vec<CompletionEntry>) };
+    let keep_alive = arc.clone();
+    let _ = alloc::sync::Arc::into_raw(arc);
 
     let mut status = DriverStatus::Success;
-
-    let mut node_opt: Option<Box<CompletionNode>> = Some(head);
-    while let Some(mut node) = node_opt {
-        let st = (node.func)(req, node.ctx);
-        status = st;
-        let next_raw = node.next.take();
-        node_opt = next_raw.map(|p| unsafe { Box::from_raw(p) });
+    for (func, c) in keep_alive.iter() {
+        status = func(req, *c);
     }
 
     status
@@ -1053,13 +894,13 @@ impl<'a> RequestHandle<'a> {
 
     /// Create a request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_t<T: 'static>(kind: RequestType, data: T) -> Self {
+    pub fn new_t<T: 'static + Send + Sync>(kind: RequestType, data: T) -> Self {
         RequestHandle::Owned(Request::new_t(kind, data))
     }
 
     /// Create a PnP request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp_t<T: 'static>(pnp: PnpRequest, data: T) -> Self {
+    pub fn new_pnp_t<T: 'static + Send + Sync>(pnp: PnpRequest, data: T) -> Self {
         RequestHandle::Owned(Request::new_pnp_t(pnp, data))
     }
 
@@ -1120,13 +961,11 @@ impl<'a> RequestHandle<'a> {
     pub fn promote(&mut self) {
         match self {
             RequestHandle::Stack(req_ref) => {
-                req_ref.safe(); // The request may now live longer then the caller expects, so ensure all payloads are owned and safe to move to heap.
                 let request = core::mem::replace(*req_ref, Request::empty());
                 *self = RequestHandle::Shared(SharedRequest::new(request));
             }
             RequestHandle::Owned(req_ref) => {
                 // Take ownership of the request and wrap in SharedRequest
-                req_ref.safe();
                 let old = core::mem::replace(self, RequestHandle::Owned(Request::empty()));
                 if let RequestHandle::Owned(request) = old {
                     *self = RequestHandle::Shared(SharedRequest::new(request));

@@ -123,6 +123,7 @@ pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
 pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
 
 /// Configuration for a benchmark window.
+#[repr(C)]
 #[derive(Clone, Debug)]
 pub struct BenchWindowConfig {
     pub name: &'static str,

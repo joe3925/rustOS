@@ -151,17 +151,18 @@ impl Vfs {
         Some(tgt)
     }
 
-    async fn call_fs_with_data<TResult>(
+    async fn call_fs<TParam, TResult>(
         &self,
         volume_symlink: &str,
         target: Option<IoTarget>,
         op: FsOp,
-        data: RequestData,
+        param: TParam,
     ) -> Result<TResult, DriverStatus>
     where
+        TParam: 'static + Send + Sync,
         TResult: 'static,
     {
-        let mut handle = RequestHandle::new(RequestType::Fs(op), data);
+        let mut handle = RequestHandle::new(RequestType::Fs(op), RequestData::from_t(param));
         handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = if let Some(tgt) = target {
@@ -176,27 +177,12 @@ impl Vfs {
             return Err(status);
         }
 
-        // Get the result from the handle (which may still be Stack or promoted to Shared)
-        let ret = handle
-            .write()
-            .take_data::<TResult>()
-            .ok_or(DriverStatus::InvalidParameter);
-        ret
-    }
-
-    async fn call_fs<TParam, TResult>(
-        &self,
-        volume_symlink: &str,
-        target: Option<IoTarget>,
-        op: FsOp,
-        param: TParam,
-    ) -> Result<TResult, DriverStatus>
-    where
-        TParam: 'static,
-        TResult: 'static,
-    {
-        self.call_fs_with_data(volume_symlink, target, op, RequestData::from_t(param))
-            .await
+        // Pull the FS driver's response out of the request handle before dropping it.
+        let data = {
+            let mut guard = handle.write();
+            guard.take_data::<TResult>()
+        };
+        data.ok_or(DriverStatus::InvalidParameter)
     }
 
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
@@ -516,7 +502,7 @@ impl Vfs {
         }
     }
 
-    pub async fn write<'a>(&self, mut p: FsWriteParams<'a>) -> (FsWriteResult, DriverStatus) {
+    pub async fn write(&self, mut p: FsWriteParams) -> (FsWriteResult, DriverStatus) {
         let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
@@ -545,12 +531,7 @@ impl Vfs {
         };
 
         match self
-            .call_fs_with_data::<FsWriteResult>(
-                symlink,
-                target,
-                FsOp::Write,
-                RequestData::from_fs_write_params(p),
-            )
+            .call_fs::<FsWriteParams, FsWriteResult>(symlink, target, FsOp::Write, p)
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -808,7 +789,7 @@ impl Vfs {
             ),
         }
     }
-    pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
+    pub async fn append(&self, mut p: FsAppendParams) -> (FsAppendResult, DriverStatus) {
         let (target, inner_id, symlink_ptr) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
@@ -838,12 +819,7 @@ impl Vfs {
         };
 
         match self
-            .call_fs_with_data::<FsAppendResult>(
-                symlink,
-                target,
-                FsOp::Append,
-                RequestData::from_fs_append_params(p),
-            )
+            .call_fs::<FsAppendParams, FsAppendResult>(symlink, target, FsOp::Append, p)
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -961,7 +937,7 @@ impl FileProvider for Vfs {
             fs_file_id: file_id,
             offset,
             write_through,
-            data,
+            data: data.to_vec(),
         })
         .into_ffi()
     }
@@ -1056,7 +1032,7 @@ impl FileProvider for Vfs {
 
         this.append(FsAppendParams {
             fs_file_id: file_id,
-            data,
+            data: data.to_vec(),
             write_through,
         })
         .into_ffi()

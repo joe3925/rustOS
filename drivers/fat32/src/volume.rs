@@ -300,11 +300,10 @@ fn handle_fs_request(
                 }
 
                 FsOp::Write => {
-                    let params: FsWriteParams<'_> =
-                        match take_typed_params::<FsWriteParams<'_>>(req) {
-                            Ok(p) => p,
-                            Err(st) => return st,
-                        };
+                    let params: FsWriteParams = match take_typed_params::<FsWriteParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
+                    };
 
                     let write_res: Result<usize, FileStatus> = {
                         let tbl = vdx.table.read();
@@ -538,11 +537,10 @@ fn handle_fs_request(
                 }
 
                 FsOp::Append => {
-                    let params: FsAppendParams<'_> =
-                        match take_typed_params::<FsAppendParams<'_>>(req) {
-                            Ok(p) => p,
-                            Err(st) => return st,
-                        };
+                    let params: FsAppendParams = match take_typed_params::<FsAppendParams>(req) {
+                        Ok(p) => p,
+                        Err(st) => return st,
+                    };
 
                     let result: Result<(usize, u64), FileStatus> = {
                         let tbl = vdx.table.read();
@@ -677,13 +675,16 @@ pub async fn fs_op_dispatch<'a, 'b>(
     let vdx = ext_mut::<VolCtrlDevExt>(&dev);
     let fs_arc = vdx.fs.clone();
     let volume_target = vdx.volume_target.clone();
-    let mut fs_guard = fs_arc.lock();
+    let status = {
+        let mut fs_guard = fs_arc.lock();
 
-    let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
-        handle_seek_request(&dev, req, &mut fs_guard)
-    } else {
-        // Todo: change this to spawn blocking when I fix request promotion
-        handle_fs_request(&dev, req, &mut fs_guard)
+        let status = if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+            handle_seek_request(&dev, req, &mut fs_guard)
+        } else {
+            // Todo: change this to spawn blocking when I fix request promotion
+            handle_fs_request(&dev, req, &mut fs_guard)
+        };
+        status
     };
 
     if vdx.should_flush.swap(false, Ordering::AcqRel) {

@@ -169,12 +169,12 @@ pub struct FsReadResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FsWriteParams<'a> {
+#[derive(Debug, Clone)]
+pub struct FsWriteParams {
     pub fs_file_id: u64,
     pub offset: u64,
     pub write_through: bool,
-    pub data: &'a [u8],
+    pub data: alloc::vec::Vec<u8>,
 }
 
 #[repr(C)]
@@ -288,10 +288,10 @@ pub struct FsSetLenResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FsAppendParams<'a> {
+#[derive(Debug, Clone)]
+pub struct FsAppendParams {
     pub fs_file_id: u64,
-    pub data: &'a [u8],
+    pub data: alloc::vec::Vec<u8>,
     pub write_through: bool,
 }
 
