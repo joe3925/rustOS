@@ -514,8 +514,8 @@ impl BlkIoArena {
                                     // Failed to allocate data buffer, return slot to pool
                                     bitmap.fetch_or(mask, Ordering::Release);
                                     return None;
-                                }
-                            };
+                            }
+                        };
                         let data_phys = match virt_to_phys(data_va) {
                             Some(p) => p,
                             None => {

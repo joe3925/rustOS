@@ -280,21 +280,21 @@ async fn invoke_io_handler(
     handle: &mut RequestHandle<'_>,
     kind: &RequestType,
 ) -> Option<DriverStep> {
-    let addr: usize = 0xFFFF_8500_0000_0000;
+    // let addr: usize = 0xFFFF_8500_0000_0000;
 
-    let entropy = unsafe { ptr::read_volatile(&addr) };
+    // let entropy = unsafe { ptr::read_volatile(&addr) };
 
-    if (entropy & 1) != 0 {
-        for _ in 0..512 {
-            compiler_fence(Ordering::SeqCst);
-        }
+    // if (entropy & 1) != 0 {
+    //     for _ in 0..512 {
+    //         compiler_fence(Ordering::SeqCst);
+    //     }
 
-        core::future::poll_fn(|cx| {
-            cx.waker().wake_by_ref();
-            Poll::<()>::Pending
-        })
-        .await;
-    }
+    //     core::future::poll_fn(|cx| {
+    //         cx.waker().wake_by_ref();
+    //         Poll::<()>::Pending
+    //     })
+    //     .await;
+    // }
 
     let Some(h) = dev.dev_init.io_vtable.get_for(kind) else {
         return None;

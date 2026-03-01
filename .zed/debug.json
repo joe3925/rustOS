@@ -39,7 +39,7 @@
       "target modules load --file \"mountmgr.dll\" .text 0xffff900016e76000",
 
       "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/fat32.dll\"",
-      "target modules load --file \"fat32.dll\" .text 0xffff9000170ae000",
+      "target modules load --file \"fat32.dll\" .text 0xffff9000170b2000",
     ],
     "sourceLanguages": ["rust"],
   },

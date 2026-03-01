@@ -2,8 +2,6 @@ use alloc::sync::Arc;
 use kernel_api::util::random_number;
 use schnellru::{LruMap, Unlimited};
 
-use crate::request_pool::RequestPool;
-
 pub use crate::cache_core::VolumeCache;
 pub use crate::cache_traits::{
     CacheConfig, CacheError, CacheStats, VolumeCacheBackend, VolumeCacheOps,
@@ -145,11 +143,7 @@ impl<B, const BLOCK_SIZE: usize> DefaultVolumeCache<B, BLOCK_SIZE>
 where
     B: VolumeCacheBackend,
 {
-    pub fn new_default(
-        backend: Arc<B>,
-        cfg: CacheConfig,
-        request_pool: Arc<RequestPool<BLOCK_SIZE>>,
-    ) -> Result<Self, CacheError<B::Error>> {
-        Self::new_with_index(backend, cfg, request_pool, DefaultIndexFactory)
+    pub fn new_default(backend: Arc<B>, cfg: CacheConfig) -> Result<Self, CacheError<B::Error>> {
+        Self::new_with_index(backend, cfg, DefaultIndexFactory)
     }
 }
