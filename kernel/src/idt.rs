@@ -8,11 +8,11 @@ use kernel_types::irq::{
     DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult,
 };
 use spin::Once;
-use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
 use crate::drivers;
-use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
+use crate::drivers::interrupt_index::{APIC, current_cpu_id, get_current_logical_id, send_eoi};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
@@ -881,11 +881,7 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 fn vector_to_gsi(vector: u8) -> Option<u8> {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
     let gsi = vector.wrapping_sub(base);
-    if gsi < 64 {
-        Some(gsi)
-    } else {
-        None
-    }
+    if gsi < 64 { Some(gsi) } else { None }
 }
 
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
