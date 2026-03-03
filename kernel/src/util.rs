@@ -47,7 +47,6 @@ use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::VirtAddr;
-pub static AP_STARTUP_CODE: &[u8] = include_bytes!("../../target/ap_startup.bin");
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);

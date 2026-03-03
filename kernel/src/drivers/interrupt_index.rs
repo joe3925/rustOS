@@ -13,7 +13,7 @@ use crate::memory::paging::virt_tracker::unmap_range;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::structs::per_cpu_vec::PerCpuVec;
 use crate::syscalls::syscall::syscall_init;
-use crate::util::{APIC_START_PERIOD, AP_STARTUP_CODE, CORE_LOCK, CPU_ID, INIT_LOCK};
+use crate::util::{APIC_START_PERIOD, CORE_LOCK, CPU_ID, INIT_LOCK};
 use crate::KERNEL_INITIALIZED;
 use acpi::platform::interrupt::Apic;
 use alloc::alloc::Global;
@@ -64,7 +64,20 @@ const START_STACK_OFF: usize = 0x1E;
 const START_ADDR_OFF: usize = 0x26;
 const LONGMODE_GDTR_LIMIT_OFF: usize = 0x2E;
 const LONGMODE_GDTR_BASE_OFF: usize = 0x30;
+core::arch::global_asm!(include_str!("../ap_startup.s"));
 
+extern "C" {
+    static trampoline: u8;
+    static trampoline_end: u8;
+}
+
+pub fn trampoline_blob() -> &'static [u8] {
+    let start = core::ptr::addr_of!(trampoline) as *const u8;
+    let end = core::ptr::addr_of!(trampoline_end) as *const u8;
+
+    let len = unsafe { end.offset_from(start) as usize };
+    unsafe { core::slice::from_raw_parts(start, len) }
+}
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct PassedInfo {
@@ -554,17 +567,37 @@ impl ApicImpl {
     }
 
     pub fn start_aps(&self) {
-        unsafe {
-            identity_map_page(
-                PhysAddr::new(0x6000),
-                0x3000,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
-            )
-            .expect("map low RAM")
-        };
+        let plat = ACPI_TABLES.get_plat_info().expect("bad interrupt model");
+        let proc = plat.processor_info.expect("bad interrupt model");
+        let apics = proc.application_processors;
+
+        let ap_count = apics.len();
+        set_num_cores(ap_count + 1);
+
+        if ap_count == 0 {
+            return;
+        }
+
+        let code = trampoline_blob();
+        assert!(code.len() <= TRAMPOLINE_STEP as usize);
 
         const GDT_PHYS: u64 = 0x6000;
         static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00AF_9200_0000_FFFF];
+
+        let map_start = GDT_PHYS;
+        let map_end = TRAMPOLINE_BASE + (ap_count as u64) * TRAMPOLINE_STEP;
+        let mut map_len = (map_end - map_start) as usize;
+        map_len = (map_len + 0x0FFF) & !0x0FFF;
+
+        unsafe {
+            identity_map_page(
+                PhysAddr::new(map_start),
+                map_len as usize,
+                PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+            )
+            .expect("map low RAM");
+        }
+
         unsafe {
             ptr::copy_nonoverlapping(
                 GDT.as_ptr() as *const u8,
@@ -572,30 +605,23 @@ impl ApicImpl {
                 mem::size_of_val(&GDT),
             );
         }
+
         let gdtr = DescriptorTablePointer {
             base: VirtAddr::new(GDT_PHYS),
             limit: (mem::size_of::<[u64; 3]>() - 1) as u16,
         };
         let longmode_gdt = sgdt();
 
-        let apics = ACPI_TABLES
-            .get_plat_info()
-            .expect("bad interrupt model")
-            .processor_info
-            .expect("bad interrupt model")
-            .application_processors;
-        set_num_cores(apics.iter().count() + 1);
         for (idx, apic) in apics.iter().enumerate() {
-            let tramp_phys = PhysAddr::new(TRAMPOLINE_BASE);
+            let tramp_u64 = TRAMPOLINE_BASE + (idx as u64) * TRAMPOLINE_STEP;
+            let tramp_phys = PhysAddr::new(tramp_u64);
+
             unsafe {
-                ptr::copy_nonoverlapping(
-                    AP_STARTUP_CODE.as_ptr(),
-                    tramp_phys.as_u64() as *mut u8,
-                    AP_STARTUP_CODE.len(),
-                );
+                ptr::copy_nonoverlapping(code.as_ptr(), tramp_u64 as *mut u8, code.len());
             }
+
             unsafe {
-                let info = tramp_phys.as_u64() as *mut u8;
+                let info = tramp_u64 as *mut u8;
 
                 let (frame, _flags): (PhysFrame, u16) = Cr3::read_raw();
                 ptr::write_unaligned(
@@ -606,7 +632,8 @@ impl ApicImpl {
                 ptr::write_unaligned(info.add(GDTR_LIMIT_OFF) as *mut u16, gdtr.limit);
                 ptr::write_unaligned(info.add(GDTR_BASE_OFF) as *mut u64, gdtr.base.as_u64());
 
-                ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, 0x7000u32);
+                let temp_sp = (tramp_u64 + TRAMPOLINE_STEP - 0x10) as u32;
+                ptr::write_unaligned(info.add(TEMP_STACK_OFF) as *mut u32, temp_sp);
 
                 let stack_top = allocate_kernel_stack(StackSize::Medium)
                     .expect("AP stack")
@@ -617,6 +644,7 @@ impl ApicImpl {
                     info.add(START_ADDR_OFF) as *mut u64,
                     ap_startup as *const () as u64,
                 );
+
                 ptr::write_unaligned(
                     info.add(LONGMODE_GDTR_LIMIT_OFF) as *mut u16,
                     longmode_gdt.limit,
@@ -643,11 +671,25 @@ impl ApicImpl {
                     },
                 );
                 wait_duration(Duration::from_millis(10));
+
+                self.lapic.send_ipi(
+                    dst,
+                    IpiKind::Startup {
+                        vector_phys_addr: tramp_phys,
+                    },
+                );
+                wait_duration(Duration::from_millis(10));
             }
         }
-        //TODO: properly wait for all cpus to finish
-        wait_duration(Duration::from_millis(100));
-        unmap_range(VirtAddr::new(0x6000), 0x3000);
+
+        for _ in 0..200 {
+            if CORE_LOCK.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            wait_duration(Duration::from_millis(1));
+        }
+
+        unmap_range(VirtAddr::new(map_start), map_len as u64);
     }
 }
 

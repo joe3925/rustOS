@@ -15,22 +15,8 @@ fn main() {
         .parent()
         .unwrap();
     let root_dir = target_dir.parent().unwrap().parent().unwrap();
-    let kernel_source = root_dir.join("kernel").join("src");
     let image_path = target_dir.join("boot.img");
     let efi_path = target_dir.join("kernel.efi");
-
-    let asm_src = kernel_source.join("ap_startup.asm");
-    let asm_bin = target_dir.parent().unwrap().join("ap_startup.bin");
-
-    let status = Command::new("nasm")
-        .args(["-f", "bin", "-o"])
-        .arg(&asm_bin)
-        .arg(&asm_src)
-        .status()
-        .expect("Failed to run nasm");
-    assert!(status.success(), "nasm failed");
-
-    println!("cargo:rerun-if-changed=src/ap_startup.asm");
 
     let config = BootConfig::default();
     let mut uefi_boot = UefiBoot::new(&kernel_path);

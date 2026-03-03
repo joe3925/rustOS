@@ -1,28 +1,24 @@
-use std::{env, error::Error, fs, path::PathBuf, process::Command};
+use std::env;
+use std::error::Error;
+use std::fs;
+use std::path::PathBuf;
 
-fn run(cmd: &mut Command) {
-    let status = cmd.status().expect("failed to spawn command");
-    assert!(status.success(), "command failed: {cmd:?}");
-}
+use implib::{Flavor, ImportLibrary, MachineType};
 
 fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(), Box<dyn Error>> {
-    let contents = fs::read_to_string(exports_path)
-        .map_err(|e| format!("Failed to read {}: {}", exports_path.display(), e))?;
-
-    let _export_block = contents
-        .lines()
-        .find(|line| line.trim_start().starts_with("export!"))
-        .ok_or("export! macro not found")?;
+    let contents = fs::read_to_string(exports_path)?;
 
     let start = contents
         .find('{')
         .ok_or("Missing opening `{` in export! macro")?;
     let end = contents
-        .find('}')
+        .rfind('}')
         .ok_or("Missing closing `}` in export! macro")?;
     let export_body = &contents[start + 1..end];
 
-    let mut lines = vec!["LIBRARY KRNL".to_string(), "EXPORTS".to_string()];
+    let mut lines = Vec::new();
+    lines.push("LIBRARY KRNL".to_string());
+    lines.push("EXPORTS".to_string());
 
     for line in export_body.lines() {
         let trimmed = line.trim().trim_end_matches(',');
@@ -31,42 +27,63 @@ fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(
         }
     }
 
-    fs::write(def_out_path, lines.join("\n"))
-        .map_err(|e| format!("Failed to write {}: {}", def_out_path.display(), e))?;
-
+    fs::write(def_out_path, lines.join("\n"))?;
     Ok(())
 }
 
+fn machine_from_target(target: &str) -> MachineType {
+    if target.contains("aarch64") {
+        MachineType::ARM64
+    } else if target.contains("arm") {
+        MachineType::ARMNT
+    } else if target.contains("i686") || (target.contains("x86") && !target.contains("x86_64")) {
+        MachineType::I386
+    } else {
+        MachineType::AMD64
+    }
+}
+
+fn flavor_from_target(target: &str) -> Flavor {
+    if target.contains("gnu") {
+        Flavor::Gnu
+    } else {
+        Flavor::Msvc
+    }
+}
+
 fn main() {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let target_dir = out_dir
-        .ancestors()
-        .nth(5)
-        .expect("unexpected OUT_DIR layout")
-        .to_path_buf();
+    let target = env::var("TARGET").unwrap();
 
-    let asm_src = PathBuf::from("src/ap_startup.asm");
-    let bin_out = target_dir.join("ap_startup.bin");
+    let exports_path = manifest_dir.join("src").join("exports.rs");
+    println!("cargo:rerun-if-changed={}", exports_path.display());
 
-    run(Command::new("nasm")
-        .args(["-f", "bin"])
-        .arg(&asm_src)
-        .args(["-o"])
-        .arg(&bin_out));
-    println!("cargo:rerun-if-changed={}", asm_src.display());
-    println!("cargo:rustc-env=AP_STARTUP_BIN={}", bin_out.display());
+    let def_path = out_dir.join("KRNL.def");
+    generate_def_file(&exports_path, &def_path).expect("Failed to generate .def file");
 
-    let def_path = out_dir.join("KRNL.DEF");
-    generate_def_file(&PathBuf::from("src/exports.rs"), &def_path)
-        .expect("Failed to generate .DEF file");
-    println!("cargo:rerun-if-changed=src/exports.rs");
+    let def_text = fs::read_to_string(&def_path).expect("Failed to read generated .def");
 
-    let lib_out = target_dir.join("KRNL.lib");
-    run(Command::new("lib").args([
-        &format!("/DEF:{}", def_path.display()),
-        "/MACHINE:X64",
-        &format!("/OUT:{}", lib_out.display()),
-    ]));
-    println!("cargo:rustc-env=KRNL_LIB={}", lib_out.display());
-    println!("cargo:rustc-link-search=native={}", target_dir.display());
+    let machine = machine_from_target(&target);
+    let flavor = flavor_from_target(&target);
+
+    let lib_out = out_dir.join("KRNL.lib");
+    let lib = ImportLibrary::new(&def_text, machine, flavor).expect("implib failed");
+    let mut f = fs::File::create(&lib_out).expect("Failed to create KRNL.lib");
+    lib.write_to(&mut f).expect("Failed to write KRNL.lib");
+
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            out_dir
+                .ancestors()
+                .nth(4) // .../target/<profile>/build/<pkg>/out -> target is 4 up
+                .expect("unexpected OUT_DIR layout")
+                .to_path_buf()
+        });
+
+    let shared_lib = target_dir.join("KRNL.lib");
+    fs::copy(&lib_out, &shared_lib).expect("Failed to copy KRNL.lib to target/");
+
+    println!("cargo:rerun-if-changed=build.rs");
 }

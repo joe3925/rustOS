@@ -349,17 +349,16 @@ impl Program {
     }
 
     pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Option<VirtAddr> {
+        let want = strip_dll_ext(dll_name);
         let modules = self.modules.read();
 
         for module in modules.iter() {
-            if module.read().title.eq_ignore_ascii_case(dll_name) {
-                if let Some(symbol) = module
-                    .read()
-                    .symbols
-                    .iter()
-                    .find(|(name, _)| name == symbol_name)
-                {
-                    return Some(module.read().image_base + symbol.1 as u64);
+            let m = module.read();
+            let have = strip_dll_ext(&m.title);
+
+            if have.eq_ignore_ascii_case(want) {
+                if let Some((_, rva)) = m.symbols.iter().find(|(name, _)| name == symbol_name) {
+                    return Some(m.image_base + *rva as u64);
                 }
             }
         }
@@ -368,10 +367,12 @@ impl Program {
     }
 
     pub fn has_module(&self, name_lc: &str) -> bool {
+        let want = strip_dll_ext(name_lc);
+
         self.modules
             .read()
             .iter()
-            .any(|m| m.read().title.eq_ignore_ascii_case(name_lc))
+            .any(|m| strip_dll_ext(&m.read().title).eq_ignore_ascii_case(want))
     }
 
     pub fn resolve_handle(&self, handle: UserHandle) -> Option<ObjectRef> {
@@ -541,7 +542,20 @@ impl ProgramManager {
         self.programs.read().values().cloned().collect()
     }
 }
+fn basename(s: &str) -> &str {
+    s.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(s)
+}
 
+fn strip_dll_ext(s: &str) -> &str {
+    let s = basename(s);
+    if s.len() >= 4 {
+        let (head, tail) = s.split_at(s.len() - 4);
+        if tail.eq_ignore_ascii_case(".dll") {
+            return head;
+        }
+    }
+    s
+}
 lazy_static! {
     pub static ref PROGRAM_MANAGER: ProgramManager = ProgramManager::new();
 }

@@ -5,3 +5,4 @@ target-dir = "target"
 [unstable]
 build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
 build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true

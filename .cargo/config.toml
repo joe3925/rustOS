@@ -1,5 +1,6 @@
 [unstable]
 bindeps = true
+
 [target.x86_64-unknown-none]
 rustflags = ["-C", "code-model=large"]
 [profile.dev.package.kernel]
