@@ -8,11 +8,11 @@ use kernel_types::irq::{
     DropHook, IrqHandleOpaque, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult,
 };
 use spin::Once;
-use x86_64::VirtAddr;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use x86_64::VirtAddr;
 
 use crate::drivers;
-use crate::drivers::interrupt_index::{APIC, current_cpu_id, get_current_logical_id, send_eoi};
+use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
@@ -373,40 +373,38 @@ impl core::future::Future for IrqWaitFuture {
     ) -> core::task::Poll<Self::Output> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
 
+        let handle = this.handle.as_inner();
+        let mut state = handle.state.lock();
+
         if let Some(result) = this.waiter.result.take() {
             return core::task::Poll::Ready(result);
         }
 
-        {
-            let handle = this.handle.as_inner();
-            let mut state = handle.state.lock();
+        if handle.is_closed() {
+            return core::task::Poll::Ready(IrqWaitResult::closed());
+        }
 
-            if handle.is_closed() {
-                return core::task::Poll::Ready(IrqWaitResult::closed());
-            }
+        let node_ptr: *mut WaiterNode = &mut this.waiter;
 
-            let node_ptr: *mut WaiterNode = &mut this.waiter;
+        if state.pending_signals > 0 {
+            state.pending_signals -= 1;
+            let meta = state.last_meta;
+            return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, 1));
+        }
 
-            if state.pending_signals > 0 {
-                state.pending_signals -= 1;
-                let meta = state.last_meta;
-                return core::task::Poll::Ready(IrqWaitResult::ok_n(meta, 1));
-            }
+        if !this.waiter.enqueued {
+            this.waiter.enqueued = true;
+            this.waiter.next = ptr::null_mut();
+            state.waiters.push_back(node_ptr);
+        }
 
-            if !this.waiter.enqueued {
-                this.waiter.enqueued = true;
-                this.waiter.next = ptr::null_mut();
-                state.waiters.push_back(node_ptr);
-            }
-
-            let cw = cx.waker();
-            let need_update = match this.waiter.waker.as_ref() {
-                Some(w) => !w.will_wake(cw),
-                None => true,
-            };
-            if need_update {
-                this.waiter.waker = Some(cw.clone());
-            }
+        let cw = cx.waker();
+        let need_update = match this.waiter.waker.as_ref() {
+            Some(w) => !w.will_wake(cw),
+            None => true,
+        };
+        if need_update {
+            this.waiter.waker = Some(cw.clone());
         }
 
         core::task::Poll::Pending
@@ -415,11 +413,16 @@ impl core::future::Future for IrqWaitFuture {
 
 impl Drop for IrqWaitFuture {
     fn drop(&mut self) {
-        if self.waiter.enqueued {
-            let ptr: *mut WaiterNode = &mut self.waiter;
-            self.handle.as_inner().cancel_waiter(ptr);
-            self.waiter.enqueued = false;
-        }
+        let ptr: *mut WaiterNode = &mut self.waiter;
+        let handle = self.handle.as_inner();
+        let mut state = handle.state.lock();
+
+        // Attempt removal even if we think we're not enqueued; this keeps flags consistent.
+        let _ = state.waiters.remove(ptr);
+        self.waiter.enqueued = false;
+        self.waiter.next = ptr::null_mut();
+        self.waiter.waker = None;
+        self.waiter.result = None;
     }
 }
 
@@ -881,7 +884,11 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
 fn vector_to_gsi(vector: u8) -> Option<u8> {
     let base = drivers::interrupt_index::InterruptIndex::Timer.as_u8();
     let gsi = vector.wrapping_sub(base);
-    if gsi < 64 { Some(gsi) } else { None }
+    if gsi < 64 {
+        Some(gsi)
+    } else {
+        None
+    }
 }
 
 pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {

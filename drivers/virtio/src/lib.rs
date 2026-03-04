@@ -25,7 +25,7 @@ use kernel_api::irq::{
     IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
     irq_wait_ok,
 };
-use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_api::kernel_types::async_types::AsyncRwLock;
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -412,7 +412,7 @@ async fn virtio_pnp_start<'a, 'b>(
                         let _ = irq_free_vector(vec);
                     }
                     qs.queue
-                        .try_lock()
+                        .try_write()
                         .expect("queue not locked during cleanup")
                         .destroy();
                 }
@@ -460,7 +460,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         queue_states.push(QueueState {
-            queue: AsyncMutex::new(vq),
+            queue: AsyncRwLock::new(vq),
             arena,
             max_request_bytes,
             max_data_segments: max_data_segments as u16,
@@ -477,7 +477,7 @@ async fn virtio_pnp_start<'a, 'b>(
         unsafe {
             pci::common_write_u16(caps.common_cfg, pci::COMMON_QUEUE_SELECT, idx as u16);
         }
-        let vq = qs.queue.try_lock().expect("queue not locked during init");
+        let vq = qs.queue.try_write().expect("queue not locked during init");
         vq.enable(caps.common_cfg);
     }
 
@@ -498,7 +498,7 @@ async fn virtio_pnp_start<'a, 'b>(
                 let _ = irq_free_vector(vec);
             }
             qs.queue
-                .try_lock()
+                .try_write()
                 .expect("queue not locked during cleanup")
                 .destroy();
         }
@@ -521,24 +521,26 @@ async fn virtio_pnp_start<'a, 'b>(
 
     let irq_ready = dev_ext::InitGate::new();
 
-    dx.inner.call_once(|| DevExtInner {
-        common_cfg: caps.common_cfg,
-        notify_base: caps.notify_base,
-        notify_off_multiplier: caps.notify_off_multiplier,
-        isr_cfg: caps.isr_cfg,
-        device_cfg: caps.device_cfg,
-        queues: queue_states,
-        queue_count: final_queue_count,
-        queue_strategy: QueueSelectionStrategy::RoundRobin,
-        rr_counter: AtomicUsize::new(0),
-        capacity: init_result.capacity,
-        mapped_bars: Mutex::new(bar_list),
-        msix_pba,
-        irq_ready,
-        indirect_desc_enabled: init_result.indirect_desc_supported,
+    dx.inner.call_once(|| {
+        Arc::new(DevExtInner {
+            common_cfg: caps.common_cfg,
+            notify_base: caps.notify_base,
+            notify_off_multiplier: caps.notify_off_multiplier,
+            isr_cfg: caps.isr_cfg,
+            device_cfg: caps.device_cfg,
+            queues: queue_states,
+            queue_count: final_queue_count,
+            queue_strategy: QueueSelectionStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            capacity: init_result.capacity,
+            mapped_bars: Mutex::new(bar_list),
+            msix_pba,
+            irq_ready,
+            indirect_desc_enabled: init_result.indirect_desc_supported,
+        })
     });
 
-    if let Some(inner) = dx.inner.get() {
+    if let Some(inner) = dx.inner.get().cloned() {
         for qs in inner.queues.iter() {
             if let Some(h) = unsafe { &*qs.irq_handle.get() } {
                 h.set_user_ctx(&qs.waiting_tasks as *const AtomicU32 as usize);
@@ -556,7 +558,7 @@ async fn virtio_pnp_remove<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
-        if let Some(inner) = dx.inner.get() {
+        if let Some(inner) = dx.inner.get().cloned() {
             blk::reset_device(inner.common_cfg);
 
             for qs in inner.queues.iter() {
@@ -571,7 +573,7 @@ async fn virtio_pnp_remove<'a, 'b>(
                 {
                     let vq = qs
                         .queue
-                        .try_lock()
+                        .try_write()
                         .expect("queue not locked during cleanup");
                     vq.destroy();
                 }
@@ -907,7 +909,7 @@ pub async fn virtio_pdo_query_resources<'a, 'b>(
 
 fn get_parent_inner(
     pdo: &Arc<DeviceObject>,
-) -> Result<(Arc<DeviceObject>, &'static DevExtInner), DriverStatus> {
+) -> Result<(Arc<DeviceObject>, Arc<DevExtInner>), DriverStatus> {
     let cdx = pdo
         .try_devext::<ChildExt>()
         .map_err(|_| DriverStatus::NoSuchDevice)?;
@@ -918,8 +920,7 @@ fn get_parent_inner(
     let dx = parent
         .try_devext::<DevExt>()
         .map_err(|_| DriverStatus::NoSuchDevice)?;
-    let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?;
-    let inner: &'static DevExtInner = unsafe { &*(inner as *const DevExtInner) };
+    let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?.clone();
     Ok((parent, inner))
 }
 
@@ -997,7 +998,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
             };
 
             let (head, queue_full_after_submit) = {
-                let mut vq = qs.queue.lock().await;
+                let mut vq = qs.queue.write().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
@@ -1152,7 +1153,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
             }
 
             let (head, queue_full_after_submit) = {
-                let mut vq = qs.queue.lock().await;
+                let mut vq = qs.queue.write().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
@@ -1245,7 +1246,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                 Err(s) => return complete_req(req, s),
             };
 
-            match bench_sweep(inner, true).await {
+            match bench_sweep(&inner, true).await {
                 Ok(r) => {
                     {
                         req.write().data = RequestData::from_t(r);
@@ -1262,7 +1263,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                 Err(s) => return complete_req(req, s),
             };
 
-            match bench_sweep(inner, false).await {
+            match bench_sweep(&inner, false).await {
                 Ok(r) => {
                     {
                         req.write().data = RequestData::from_t(r);
@@ -1286,10 +1287,10 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                     .copied()
                     .unwrap_or_default()
             };
-            let params_used = sanitize_bench_params(inner, params_in);
+            let params_used = sanitize_bench_params(&inner, params_in);
 
             let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
-                match bench_sweep_params(inner, &params_used, true).await {
+                match bench_sweep_params(&inner, &params_used, true).await {
                     Ok(r) => r,
                     Err(e) => return complete_req(req, e),
                 }
@@ -1298,7 +1299,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             };
 
             let poll = if (params_used.flags & BENCH_FLAG_POLL) != 0 {
-                match bench_sweep_params(inner, &params_used, false).await {
+                match bench_sweep_params(&inner, &params_used, false).await {
                     Ok(r) => r,
                     Err(e) => return complete_req(req, e),
                 }
@@ -1307,7 +1308,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             };
 
             let qs0 = inner.get_queue(0);
-            let qsz = unsafe { (&*qs0.queue.as_ptr()).size };
+            let qsz = qs0.vq_ref().size;
 
             let msix_enabled = inner.queues.iter().any(|q| q.msix_vector.is_some());
 

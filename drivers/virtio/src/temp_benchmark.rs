@@ -53,7 +53,7 @@ fn bench_descs_per_request(use_indirect: bool, request_size: u32) -> usize {
 fn bench_max_inflight_queue0(inner: &DevExtInner, request_size: u32, use_indirect: bool) -> usize {
     let q0 = inner.get_queue(0);
     let dpr = bench_descs_per_request(use_indirect, request_size);
-    (q0.queue.try_lock().expect("queue not locked").size as usize / dpr).max(1)
+    (q0.vq_ref().size as usize / dpr).max(1)
 }
 
 async fn bench_reads_direct(
@@ -102,7 +102,7 @@ async fn bench_reads_direct(
             };
 
             let head = {
-                let mut vq = bench_queue.queue.lock().await;
+                let mut vq = bench_queue.queue.write().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => h,
@@ -125,7 +125,7 @@ async fn bench_reads_direct(
         }
 
         {
-            let vq = bench_queue.queue.lock().await;
+            let vq = bench_queue.queue.read().await;
             vq.notify(inner.notify_base, inner.notify_off_multiplier);
         }
 

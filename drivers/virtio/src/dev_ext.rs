@@ -1,14 +1,15 @@
-use alloc::sync::Weak;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::hint::spin_loop;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::async_types::AsyncMutex;
+use kernel_api::kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::util::get_current_lapic_id;
 use kernel_api::x86_64::VirtAddr;
@@ -31,8 +32,8 @@ pub enum QueueSelectionStrategy {
 /// Per-queue state: queue, arena, and IRQ handle.
 pub struct QueueState {
     /// The virtqueue for this request queue.
-    /// Uses AsyncMutex for better async contention handling on the submission path.
-    pub queue: AsyncMutex<Virtqueue>,
+    /// Uses AsyncRwLock so readers of atomic-only paths don't alias with writers.
+    pub queue: AsyncRwLock<Virtqueue>,
     /// Pre-allocated arena for this queue's BlkIoRequest slots.
     pub arena: BlkIoArena,
     /// Maximum safe data payload per request on this queue (512-byte aligned).
@@ -58,56 +59,63 @@ unsafe impl Send for QueueState {}
 unsafe impl Sync for QueueState {}
 
 impl QueueState {
-    /// Get a reference to the Virtqueue for atomic-only operations (lock-free).
-    /// SAFETY: Caller must only call methods that use atomics and don't mutate
-    /// the free list (free_head, num_free).
     #[inline]
-    pub fn vq_ref(&self) -> &Virtqueue {
-        // SAFETY: We're only accessing atomic fields through immutable references.
-        // The AsyncMutex ensures exclusive access for mutable operations (push_chain, free_chain).
-        unsafe { &*self.queue.as_ptr() }
+    fn vq_read(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
+        // Spin until we can take a read guard; short critical sections keep this brief.
+        loop {
+            if let Some(g) = self.queue.try_read() {
+                return g;
+            }
+            spin_loop();
+        }
     }
 
     /// Get the current drain epoch (lock-free).
     #[inline]
     pub fn drain_epoch(&self) -> u64 {
-        self.vq_ref().drain_epoch()
+        self.vq_read().drain_epoch()
     }
 
     /// Check if head is completed and take the completion (lock-free).
     #[inline]
     pub fn take_completion(&self, head: u16) -> Option<u32> {
-        self.vq_ref().take_completion(head)
+        self.vq_read().take_completion(head)
     }
 
     /// Try to acquire the single-drainer gate (lock-free).
     #[inline]
     pub fn try_acquire_drainer(&self) -> bool {
-        self.vq_ref().try_acquire_drainer()
+        self.vq_read().try_acquire_drainer()
     }
 
     /// Release the single-drainer gate (lock-free).
     #[inline]
     pub fn release_drainer(&self) {
-        self.vq_ref().release_drainer()
+        self.vq_read().release_drainer()
     }
 
     /// Enqueue a descriptor chain head for deferred freeing (lock-free).
     #[inline]
     pub fn defer_free_chain(&self, head: u16) {
-        self.vq_ref().defer_free_chain(head)
+        self.vq_read().defer_free_chain(head)
     }
 
     /// Drain used ring to completions using CAS (lock-free).
     #[inline]
     pub fn drain_used_to_completions_lockfree(&self) -> usize {
-        self.vq_ref().drain_used_to_completions_lockfree()
+        self.vq_read().drain_used_to_completions_lockfree()
     }
 
     /// Check if there are any pending completions in the used ring (lock-free).
     #[inline]
     pub fn has_pending_used(&self) -> bool {
-        self.vq_ref().has_pending_used()
+        self.vq_read().has_pending_used()
+    }
+
+    /// Obtain a read guard for direct virtqueue access when needed.
+    #[inline]
+    pub fn vq_ref(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
+        self.vq_read()
     }
 }
 
@@ -116,7 +124,7 @@ impl QueueState {
 #[repr(C)]
 pub struct DevExt {
     /// Populated during StartDevice after mapping BARs and parsing caps.
-    pub inner: Once<DevExtInner>,
+    pub inner: Once<Arc<DevExtInner>>,
     /// Whether we have already enumerated children.
     pub enumerated: AtomicBool,
 }
