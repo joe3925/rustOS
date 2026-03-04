@@ -20,7 +20,7 @@ use alloc::alloc::Global;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use core::{mem, ptr};
 use pic8259::ChainedPics;
@@ -39,6 +39,8 @@ pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
 pub static USE_APIC: AtomicBool = AtomicBool::new(false);
+/// Counts APs that have made it into Rust code (past the SIPI trampoline).
+static AP_BOOTED: AtomicUsize = AtomicUsize::new(0);
 
 pub static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 pub static LAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
@@ -578,6 +580,9 @@ impl ApicImpl {
             return;
         }
 
+        // Reset boot tracker in case this is invoked again.
+        AP_BOOTED.store(0, Ordering::SeqCst);
+
         let code = trampoline_blob();
         assert!(code.len() <= TRAMPOLINE_STEP as usize);
 
@@ -585,7 +590,8 @@ impl ApicImpl {
         static GDT: [u64; 3] = [0, 0x00AF_9A00_0000_FFFF, 0x00AF_9200_0000_FFFF];
 
         let map_start = GDT_PHYS;
-        let map_end = TRAMPOLINE_BASE + (ap_count as u64) * TRAMPOLINE_STEP;
+        // Single trampoline at 0x8000 reused per AP.
+        let map_end = TRAMPOLINE_BASE + TRAMPOLINE_STEP;
         let mut map_len = (map_end - map_start) as usize;
         map_len = (map_len + 0x0FFF) & !0x0FFF;
 
@@ -612,13 +618,14 @@ impl ApicImpl {
         };
         let longmode_gdt = sgdt();
 
-        for (idx, apic) in apics.iter().enumerate() {
-            let tramp_u64 = TRAMPOLINE_BASE + (idx as u64) * TRAMPOLINE_STEP;
-            let tramp_phys = PhysAddr::new(tramp_u64);
+        // Install trampoline code once at the fixed address.
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), TRAMPOLINE_BASE as *mut u8, code.len());
+        }
 
-            unsafe {
-                ptr::copy_nonoverlapping(code.as_ptr(), tramp_u64 as *mut u8, code.len());
-            }
+        for apic in apics.iter() {
+            let tramp_u64 = TRAMPOLINE_BASE;
+            let tramp_phys = PhysAddr::new(tramp_u64);
 
             unsafe {
                 let info = tramp_u64 as *mut u8;
@@ -664,6 +671,7 @@ impl ApicImpl {
                 self.lapic.send_ipi(dst, IpiKind::InitDeassert);
                 wait_duration(Duration::from_millis(10));
 
+                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
                 self.lapic.send_ipi(
                     dst,
                     IpiKind::Startup {
@@ -679,6 +687,14 @@ impl ApicImpl {
                     },
                 );
                 wait_duration(Duration::from_millis(10));
+
+                // Wait until the AP has executed ap_startup (past the trampoline) before reusing it.
+                for _ in 0..500 {
+                    if AP_BOOTED.load(Ordering::SeqCst) >= expected {
+                        break;
+                    }
+                    wait_duration(Duration::from_millis(1));
+                }
             }
         }
 
@@ -706,6 +722,8 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
 
 extern "C" fn ap_startup() -> ! {
     cpu::enable_sse();
+    // Signal that this AP is past the trampoline and safe to reuse it.
+    AP_BOOTED.fetch_add(1, Ordering::SeqCst);
     {
         CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();

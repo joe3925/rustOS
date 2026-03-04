@@ -184,10 +184,10 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
                 async move {
                     let _bench_span = {
                         let __obj: u64 = #obj_expr;
-                        ::kernel_api::benchmark::span(
-                            stringify!(#fn_ident),
-                            ::kernel_api::benchmark::object_id(__obj),
-                        )
+                        // ::kernel_api::benchmark::span(
+                        //     stringify!(#fn_ident),
+                        //     ::kernel_api::benchmark::object_id(__obj),
+                        // )
                     };
 
                     #(#original_stmts)*

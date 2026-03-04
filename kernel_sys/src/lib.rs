@@ -205,10 +205,6 @@ unsafe extern "win64" {
     pub fn bench_kernel_span_begin(tag: BenchTag, object_id: BenchObjectId) -> BenchSpanGuard;
     pub fn bench_kernel_span_end(span_id: BenchSpanId, tag: BenchTag, object_id: BenchObjectId);
 
-    // Idle tracking (for benchmark)
-    pub fn idle_tracking_start();
-    pub fn idle_tracking_stop() -> f64;
-
     // Async Runtime (global)
     pub fn kernel_spawn_ffi(fut: FfiFuture<()>);
     pub fn kernel_spawn_joinable_ffi(fut: FfiFuture<()>) -> FfiFuture<()>;

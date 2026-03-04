@@ -9,7 +9,7 @@ use core::marker::PhantomData;
 use core::mem;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::ptr;
+use core::ptr::{self, null_mut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -376,7 +376,7 @@ impl FfiWaker {
 #[repr(C)]
 pub struct FfiFuture<T> {
     pub abi_version: u32,
-    pub data: *mut (),
+    pub data: Option<*mut ()>,
     pub poll_fn: unsafe extern "win64" fn(*mut (), *const FfiWaker) -> FfiPoll<T>,
     pub drop_fn: unsafe extern "win64" fn(*mut ()),
 }
@@ -385,19 +385,22 @@ unsafe impl<T: Send> Send for FfiFuture<T> {}
 
 impl<T> FfiFuture<T> {
     pub fn is_null(&self) -> bool {
-        self.data.is_null()
+        self.data.is_none()
     }
 
     pub unsafe fn poll(&mut self, waker: *const FfiWaker) -> FfiPoll<T> {
-        unsafe { (self.poll_fn)(self.data, waker) }
+        if let Some(ptr) = self.data {
+            unsafe { (self.poll_fn)(ptr, waker) }
+        } else {
+            FfiPoll::pending()
+        }
     }
 }
 
 impl<T> Drop for FfiFuture<T> {
     fn drop(&mut self) {
-        if !self.data.is_null() {
-            unsafe { (self.drop_fn)(self.data) }
-            self.data = ptr::null_mut();
+        if let Some(ptr) = self.data.take() {
+            unsafe { (self.drop_fn)(ptr) }
         }
     }
 }
@@ -461,7 +464,7 @@ where
 
     FfiFuture {
         abi_version: ABI_VERSION,
-        data: data_ptr as *mut (),
+        data: Some(data_ptr as *mut ()),
         poll_fn: future_box_poll::<F>,
         drop_fn: future_box_drop::<F>,
     }
@@ -751,14 +754,14 @@ impl<'a, T> BorrowingFfiFuture<'a, T> {
     /// This preserves the original drop function so resources are freed
     /// when the borrowing future is dropped or completes.
     pub fn from_owned_ffi<'b>(mut fut: FfiFuture<T>) -> BorrowingFfiFuture<'b, T> {
+        let data_ptr = fut.data.take().unwrap_or(ptr::null_mut());
         let out = BorrowingFfiFuture {
             abi_version: fut.abi_version,
-            data: fut.data,
+            data: data_ptr,
             poll_fn: fut.poll_fn,
             drop_fn: Some(fut.drop_fn),
             _pd: PhantomData,
         };
-        fut.data = ptr::null_mut();
         out
     }
 }
@@ -855,17 +858,17 @@ impl<T> Future for FfiFuture<T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
         let this = unsafe { self.get_unchecked_mut() };
-        if this.data.is_null() {
+        let Some(ptr) = this.data else {
             return Poll::Pending;
-        }
+        };
 
         let ffi_waker = cx.waker().clone().into_ffi();
-        let p = unsafe { (this.poll_fn)(this.data, &ffi_waker as *const FfiWaker) };
+        let p = unsafe { (this.poll_fn)(ptr, &ffi_waker as *const FfiWaker) };
         match unsafe { p.into_poll() } {
             Poll::Pending => Poll::Pending,
             Poll::Ready(v) => {
-                unsafe { (this.drop_fn)(this.data) };
-                this.data = ptr::null_mut();
+                unsafe { (this.drop_fn)(ptr) };
+                this.data = None;
                 Poll::Ready(v)
             }
         }

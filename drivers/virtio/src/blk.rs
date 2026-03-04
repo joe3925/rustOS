@@ -615,20 +615,27 @@ impl BlkIoArena {
 
         let slot = self.get_preallocated_slot(idx);
 
-        // Verify generation matches (prevents ABA issues)
-        let current_state = slot.state.load(Ordering::Acquire);
-        if unpack_generation(current_state) != generation {
-            return; // Slot was already recycled (shouldn't happen)
+        // Verify generation AND ownership, transitioning to FREE atomically
+        let expected = pack_slot_state(generation, SLOT_IN_USE);
+        if slot
+            .state
+            .compare_exchange(
+                expected,
+                pack_slot_state(generation, SLOT_FREE),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
         }
 
         // Reset status sentinel for next use
         unsafe {
             core::ptr::write_volatile(slot.status_va.as_u64() as *mut u8, 0xFF);
         }
-
-        // Mark slot as free (keep generation for ABA detection)
-        slot.state
-            .store(pack_slot_state(generation, SLOT_FREE), Ordering::Release);
+        // Ensure buffer writes are visible before advertising the slot as free
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
         // Return to free pool by setting bit in the correct bitmap word
         let word_idx = idx / 64;

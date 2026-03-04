@@ -1,8 +1,7 @@
 use alloc::{boxed::Box, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous,
-    unmap_range, virt_to_phys,
+    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, unmap_range, virt_to_phys,
 };
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -11,6 +10,8 @@ use crate::pci;
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 pub const VRING_DESC_F_INDIRECT: u16 = 4;
+
+const DEFERRED_FREE_EMPTY: u16 = 0xFFFF;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -71,7 +72,7 @@ pub struct Virtqueue {
     drain_epoch: AtomicU64,
 
     /// Lock-free stack of descriptor chain heads pending free.
-    /// 0xFFFF = empty sentinel.
+    /// DEFERRED_FREE_EMPTY = empty sentinel.
     deferred_free_head: AtomicU16,
 
     /// Per-descriptor "next" pointers for the deferred free stack.
@@ -130,7 +131,7 @@ impl Virtqueue {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        let deferred_free_next = core::iter::repeat_with(|| AtomicU16::new(0xFFFF))
+        let deferred_free_next = core::iter::repeat_with(|| AtomicU16::new(DEFERRED_FREE_EMPTY))
             .take(size as usize)
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -164,7 +165,7 @@ impl Virtqueue {
             completions,
             draining: AtomicBool::new(false),
             drain_epoch: AtomicU64::new(0),
-            deferred_free_head: AtomicU16::new(0xFFFF),
+            deferred_free_head: AtomicU16::new(DEFERRED_FREE_EMPTY),
             deferred_free_next,
         })
     }
@@ -330,7 +331,8 @@ impl Virtqueue {
         let elem_offset = 4 + (last % self.size) as usize * 8;
         let elem_ptr = (self.used_va.as_u64() + elem_offset as u64) as *const VirtqUsedElem;
         let elem = unsafe { core::ptr::read_volatile(elem_ptr) };
-        self.last_used_idx.store(last.wrapping_add(1), Ordering::Release);
+        self.last_used_idx
+            .store(last.wrapping_add(1), Ordering::Release);
 
         Some((elem.id as u16, elem.len))
     }
@@ -341,10 +343,15 @@ impl Virtqueue {
         let mut count = 0;
         while let Some((head, len)) = self.pop_used() {
             // Store len+1 so 0 means "not completed"
-            self.completions[head as usize].store(len.wrapping_add(1), Ordering::Release);
-            count += 1;
+            if self.completions[head as usize]
+                .compare_exchange(0, len.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                count += 1;
+            }
         }
         if count > 0 {
+            core::sync::atomic::fence(Ordering::Release);
             // Increment epoch to signal waiters that new completions are available
             self.drain_epoch.fetch_add(1, Ordering::Release);
         }
@@ -390,10 +397,17 @@ impl Virtqueue {
 
                     // Store completion (len + 1, where 0 means "not completed")
                     let head = elem.id as u16;
-                    self.completions[head as usize]
-                        .store(elem.len.wrapping_add(1), Ordering::Release);
-
-                    count += 1;
+                    if self.completions[head as usize]
+                        .compare_exchange(
+                            0,
+                            elem.len.wrapping_add(1),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        count += 1;
+                    }
                     // Continue to try draining more entries
                 }
                 Err(_) => {
@@ -404,6 +418,8 @@ impl Virtqueue {
         }
 
         if count > 0 {
+            // Ensure completion stores are visible before signaling waiters
+            core::sync::atomic::fence(Ordering::Release);
             self.drain_epoch.fetch_add(1, Ordering::Release);
         }
 
@@ -447,6 +463,9 @@ impl Virtqueue {
         if val == 0 {
             None
         } else {
+            // Ensure device writes associated with the completion are globally visible
+            // before the descriptor chain can be reused.
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
             Some(val - 1) // Recover original len
         }
     }
@@ -501,18 +520,34 @@ impl Virtqueue {
         loop {
             let old_head = self.deferred_free_head.load(Ordering::Acquire);
 
-            // Set our next pointer to the old head
-            self.deferred_free_next[head as usize].store(old_head, Ordering::Release);
-
-            // CAS to become the new head
-            match self.deferred_free_head.compare_exchange_weak(
+            // Only link the descriptor if it is not already on the list.
+            match self.deferred_free_next[head as usize].compare_exchange(
+                DEFERRED_FREE_EMPTY,
                 old_head,
-                head,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
+                Ordering::Release,
+                Ordering::Acquire,
             ) {
-                Ok(_) => break,
-                Err(_) => continue,
+                Ok(_) => {
+                    // CAS to become the new head
+                    match self.deferred_free_head.compare_exchange_weak(
+                        old_head,
+                        head,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            // Roll back the link before retrying to avoid corrupting an in-flight list.
+                            self.deferred_free_next[head as usize]
+                                .store(DEFERRED_FREE_EMPTY, Ordering::Release);
+                            continue;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Already enqueued or being drained; avoid corrupting the list.
+                    return;
+                }
             }
         }
     }
@@ -522,16 +557,20 @@ impl Virtqueue {
     /// Returns number of descriptor chains freed.
     pub fn drain_deferred_frees(&mut self) -> usize {
         // Atomically take the entire list (single swap)
-        let mut head = self.deferred_free_head.swap(0xFFFF, Ordering::AcqRel);
+        let mut head = self
+            .deferred_free_head
+            .swap(DEFERRED_FREE_EMPTY, Ordering::AcqRel);
 
-        if head == 0xFFFF {
+        if head == DEFERRED_FREE_EMPTY {
             return 0; // Empty
         }
 
         let mut count = 0;
 
-        while head != 0xFFFF {
-            let next = self.deferred_free_next[head as usize].load(Ordering::Acquire);
+        while head != DEFERRED_FREE_EMPTY {
+            // Take and clear the next pointer to allow safe reuse on re-enqueue.
+            let next =
+                self.deferred_free_next[head as usize].swap(DEFERRED_FREE_EMPTY, Ordering::AcqRel);
 
             // Actually free this descriptor chain
             self.free_chain(head);

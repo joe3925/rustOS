@@ -13,7 +13,6 @@ use kernel_types::status::PageMapError;
 use spin::RwLock;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
-
 pub type TaskEntry = extern "win64" fn(usize);
 
 const PAGE_SIZE: u64 = 4096;

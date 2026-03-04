@@ -21,6 +21,9 @@ use x86_64::{
     structures::paging::FrameAllocator,
 };
 
+// NOTE: When changing the allocator, floating point can not be used unless the fpu guard in interrupts is changed to manually dropped instead of relying on the drop impl.
+// Rust will order the drop of the guard how ever it feels like this can mean the guard is dropped then some allocation is dropped, the free uses floating point, and floating point is corrupted.
+
 // #[global_allocator]
 // pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
 #[global_allocator]

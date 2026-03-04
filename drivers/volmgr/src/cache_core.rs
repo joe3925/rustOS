@@ -534,6 +534,7 @@ where
             }
         }
     }
+
     /// Joins is a vector with len equal to the desired parallelism, used to track in-flight flush tasks.
     async fn flush_pages_parallel(
         backend: Arc<B>,
@@ -567,6 +568,7 @@ where
 
         Ok(())
     }
+
     async fn flush_shard_streaming(
         &self,
         shard_idx: usize,

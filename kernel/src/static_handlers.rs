@@ -5,6 +5,7 @@ use core::{
     time::Duration,
 };
 use kernel_types::object_manager::OmError;
+use x86_64::instructions::interrupts;
 
 use acpi::AcpiTables;
 use alloc::{
@@ -545,7 +546,9 @@ pub unsafe extern "win64" fn submit_blocking_internal(
 
 #[no_mangle]
 pub unsafe extern "win64" fn task_yield() {
-    unsafe { asm!("int 0x80") };
+    interrupts::without_interrupts(|| {
+        unsafe { asm!("int 0x80") };
+    });
 }
 
 pub unsafe extern "win64" fn switch_to_vfs_async() -> FfiFuture<Result<(), RegError>> {
@@ -721,16 +724,6 @@ pub extern "win64" fn bench_kernel_span_end(
     object_id: BenchObjectId,
 ) {
     bench_log_span_end(span_id.0, tag, object_id.0);
-}
-
-#[no_mangle]
-pub extern "win64" fn idle_tracking_start() {
-    crate::drivers::timer_driver::idle_tracking_start();
-}
-
-#[no_mangle]
-pub extern "win64" fn idle_tracking_stop() -> f64 {
-    crate::drivers::timer_driver::idle_tracking_stop()
 }
 
 #[no_mangle]

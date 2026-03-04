@@ -11,12 +11,12 @@ use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
-use crate::drivers;
 use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, send_eoi, APIC};
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
 use crate::gdt::{DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, TIMER_IST_INDEX, YIELD_IST_INDEX};
-use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry};
+use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry, KernelFpuGuard, SCHEDULER};
+use crate::{drivers, println};
 
 struct WaiterNode {
     next: *mut WaiterNode,
@@ -980,7 +980,10 @@ pub const SCHED_IPI_VECTOR: u8 = 0xF2;
 macro_rules! gen_irq_stub {
     ($name:ident, $vec:expr) => {
         extern "x86-interrupt" fn $name(mut frame: InterruptStackFrame) {
-            irq_dispatch($vec, &mut frame);
+            let _fpu_guard = KernelFpuGuard::new();
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                irq_dispatch($vec, &mut frame);
+            });
         }
     };
 }

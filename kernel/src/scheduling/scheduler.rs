@@ -2,9 +2,7 @@ use crate::cpu;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
-use crate::drivers::timer_driver::{
-    IDLE_SCHED_IN_CYCLES, IDLE_TIME_CYCLES, IDLE_TRACKING_ENABLED, TIMER,
-};
+use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
@@ -98,6 +96,56 @@ impl TaskTable {
         unsafe {
             Arc::increment_strong_count(p);
             Some(Arc::from_raw(p))
+        }
+    }
+}
+
+/// Saves the current task's FPU/SIMD state for the duration of a kernel handler.
+/// Restores it only if we return to the same task (i.e., no context switch happened).
+pub struct KernelFpuGuard {
+    saved_task: Option<TaskHandle>,
+}
+
+impl KernelFpuGuard {
+    #[inline(always)]
+    pub fn new() -> Self {
+        let cpu_id = current_cpu_id();
+        let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
+            // Avoid blocking inside interrupts; skip if the lock is contended.
+            let locked = {
+                if let Some(mut guard) = task.inner.try_write() {
+                    guard.save_fpu_state();
+                    true
+                } else {
+                    false
+                }
+            };
+            if locked {
+                Some(task)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        Self { saved_task }
+    }
+}
+
+impl Drop for KernelFpuGuard {
+    fn drop(&mut self) {
+        let Some(task) = self.saved_task.take() else {
+            return;
+        };
+
+        let cpu_id = current_cpu_id();
+        if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
+            if Arc::ptr_eq(&task, &current) {
+                if let Some(mut guard) = current.inner.try_write() {
+                    guard.restore_fpu_state();
+                }
+            }
         }
     }
 }
@@ -364,7 +412,6 @@ impl Scheduler {
                     } else {
                         self.find_least_loaded_cpu(n, 0)
                     };
-
                     task.set_target_cpu(best_cpu);
 
                     without_interrupts(|| {
@@ -565,18 +612,6 @@ impl Scheduler {
         if let Some(prev) = previous {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
 
-            // Account idle time when leaving idle task
-            if prev_is_idle && IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-                let idle_start = IDLE_SCHED_IN_CYCLES
-                    .get_by_id(cpu_id)
-                    .swap(0, Ordering::Relaxed);
-                if idle_start > 0 && now_cycles > idle_start {
-                    IDLE_TIME_CYCLES
-                        .get_by_id(cpu_id)
-                        .fetch_add(now_cycles - idle_start, Ordering::Relaxed);
-                }
-            }
-
             let mut lock_failed = false;
             if let Some(mut guard) = prev.inner.try_write() {
                 guard.save_fpu_state();
@@ -676,13 +711,6 @@ impl Scheduler {
             let mut guard = core.idle_task.inner.write();
             guard.restore_fpu_state();
             guard.mark_scheduled_in(cpu_id, now_cycles);
-        }
-
-        // Record idle start time if tracking is enabled
-        if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            IDLE_SCHED_IN_CYCLES
-                .get_by_id(cpu_id)
-                .store(now_cycles, Ordering::Relaxed);
         }
 
         sched_state.current = Some(core.idle_task.clone());
@@ -818,18 +846,6 @@ impl Scheduler {
             guard.save_fpu_state();
         }
 
-        // Account idle time when IPI wakes idle core
-        if IDLE_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            let idle_start = IDLE_SCHED_IN_CYCLES
-                .get_by_id(cpu_id)
-                .swap(0, Ordering::Relaxed);
-            if idle_start > 0 && now_cycles > idle_start {
-                IDLE_TIME_CYCLES
-                    .get_by_id(cpu_id)
-                    .fetch_add(now_cycles - idle_start, Ordering::Relaxed);
-            }
-        }
-
         let mut ipi_cand: Option<TaskHandle> = None;
         loop {
             let Some(cand) = core.ipi_queue.pop() else {
@@ -889,6 +905,7 @@ pub extern "C" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_ipi(state, cpu_id);
 }
@@ -898,6 +915,7 @@ pub extern "C" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_timer_tick(state, cpu_id);
 }

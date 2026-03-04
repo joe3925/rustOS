@@ -11,12 +11,10 @@ use crate::memory::{
 use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
-use crate::static_handlers::{idle_tracking_stop, pnp_get_device_target, wait_duration};
+use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
 use crate::{cpu, println, vec};
-
-use crate::drivers::timer_driver::idle_tracking_start;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -2069,7 +2067,7 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 400 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 40 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,

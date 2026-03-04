@@ -3,6 +3,7 @@ use crate::drivers::interrupt_index::get_current_logical_id;
 use crate::executable::program::{Message, UserHandle};
 use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
+use crate::scheduling::scheduler::KernelFpuGuard;
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
 use kernel_types::fs::OpenFlags;
@@ -161,6 +162,7 @@ const SYSCALL_TABLE: &[Handler] = &[
 
 #[no_mangle]
 pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
+    let _fpu_guard = KernelFpuGuard::new();
     let num = frame.rax as usize;
     // stack args start immediately after the pushed register block
     let rest_ptr = unsafe { (frame as *const SyscallFrame).add(1) } as *const u64;
