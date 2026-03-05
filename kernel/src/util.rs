@@ -53,7 +53,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 50_000;
+pub const APIC_START_PERIOD: u64 = 10_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -64,7 +64,7 @@ lazy_static! {
         name: "global",
         folder: "C:\\system\\logs",
         log_samples: true,
-        log_spans: false,
+        log_spans: true,
         log_mem_on_persist: false,
         end_on_drop: false,
         timeout_ms: None,
