@@ -46,6 +46,7 @@ use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
+use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
 
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -88,6 +89,7 @@ pub unsafe fn init() {
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
+        x86_64::instructions::interrupts::enable();
         syscall_init();
 
         // TSC calibration
@@ -233,6 +235,20 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
 #[allow(unconditional_recursion)]
 pub extern "C" fn trigger_stack_overflow() {
     trigger_stack_overflow();
+}
+
+#[no_mangle]
+#[inline(never)]
+pub extern "win64" fn trigger_triple_fault() -> ! {
+    // Replace the active IDT with an empty one so the next fault has nowhere to go.
+    static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
+
+    x86_64::instructions::interrupts::disable();
+    unsafe {
+        EMPTY_IDT.load();
+        // UD2 raises an invalid opcode fault; with no IDT entries this escalates to a triple fault.
+        asm!("ud2", options(noreturn));
+    }
 }
 
 pub fn trigger_breakpoint() {

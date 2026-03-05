@@ -1284,5 +1284,4 @@ fn init_idt() -> InterruptDescriptorTable {
 
 pub fn load_idt() {
     IDT.call_once(init_idt).load();
-    x86_64::instructions::interrupts::enable();
 }

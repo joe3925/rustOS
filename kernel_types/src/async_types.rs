@@ -41,6 +41,7 @@ fn wake_all(list: &mut Vec<Waker>) {
         w.wake();
     }
 }
+#[repr(C)]
 
 pub struct AsyncMutex<T> {
     locked: AtomicBool,
@@ -50,11 +51,13 @@ pub struct AsyncMutex<T> {
 
 unsafe impl<T: Send> Sync for AsyncMutex<T> {}
 unsafe impl<T: Send> Send for AsyncMutex<T> {}
+#[repr(C)]
 
 pub struct AsyncMutexGuard<'a, T> {
     m: &'a AsyncMutex<T>,
     _pd: PhantomData<&'a mut T>,
 }
+#[repr(C)]
 
 pub struct AsyncMutexLockFuture<'a, T> {
     m: &'a AsyncMutex<T>,
@@ -162,6 +165,7 @@ impl<'a, T> Future for AsyncMutexLockFuture<'a, T> {
         Poll::Pending
     }
 }
+#[repr(C)]
 
 pub struct AsyncMutexOwnedGuard<T> {
     m: Arc<AsyncMutex<T>>,
@@ -188,6 +192,7 @@ impl<T> Drop for AsyncMutexOwnedGuard<T> {
 
 unsafe impl<T: Send> Send for AsyncMutexOwnedGuard<T> {}
 unsafe impl<T: Send> Sync for AsyncMutexOwnedGuard<T> {}
+#[repr(C)]
 
 pub struct AsyncRwLock<T> {
     state: AtomicIsize, // -1 = writer, 0 = free, >0 = readers
@@ -198,21 +203,24 @@ pub struct AsyncRwLock<T> {
 
 unsafe impl<T: Send + Sync> Sync for AsyncRwLock<T> {}
 unsafe impl<T: Send> Send for AsyncRwLock<T> {}
+#[repr(C)]
 
 pub struct AsyncRwLockReadGuard<'a, T> {
     l: &'a AsyncRwLock<T>,
     _pd: PhantomData<&'a T>,
 }
+#[repr(C)]
 
 pub struct AsyncRwLockWriteGuard<'a, T> {
     l: &'a AsyncRwLock<T>,
     _pd: PhantomData<&'a mut T>,
 }
+#[repr(C)]
 
 pub struct AsyncRwLockReadFuture<'a, T> {
     l: &'a AsyncRwLock<T>,
 }
-
+#[repr(C)]
 pub struct AsyncRwLockWriteFuture<'a, T> {
     l: &'a AsyncRwLock<T>,
 }
@@ -361,6 +369,9 @@ impl<'a, T> Future for AsyncRwLockReadFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(g) = self.l.try_read() {
+            // Clean up any stale waker we might have enqueued on a previous poll.
+            let mut rw = self.l.r_waiters.lock();
+            remove_waker(&mut rw, cx.waker());
             return Poll::Ready(g);
         }
 
@@ -384,6 +395,9 @@ impl<'a, T> Future for AsyncRwLockWriteFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(g) = self.l.try_write() {
+            // Clean up any stale waker we might have enqueued on a previous poll.
+            let mut ww = self.l.w_waiters.lock();
+            remove_waker(&mut ww, cx.waker());
             return Poll::Ready(g);
         }
 
@@ -401,10 +415,12 @@ impl<'a, T> Future for AsyncRwLockWriteFuture<'a, T> {
         Poll::Pending
     }
 }
+#[repr(C)]
 
 pub struct AsyncRwLockOwnedReadGuard<T> {
     l: Arc<AsyncRwLock<T>>,
 }
+#[repr(C)]
 
 pub struct AsyncRwLockOwnedWriteGuard<T> {
     l: Arc<AsyncRwLock<T>>,

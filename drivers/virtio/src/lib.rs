@@ -25,7 +25,7 @@ use kernel_api::irq::{
     IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
     irq_wait_ok,
 };
-use kernel_api::kernel_types::async_types::AsyncRwLock;
+use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -57,7 +57,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const INVALID_HEAD: u16 = 0xFFFF;
-const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 0;
+const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 600;
 const SPIN_WAIT_SLICE_NS: u64 = 50;
 
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
@@ -537,6 +537,7 @@ async fn virtio_pnp_start<'a, 'b>(
             msix_pba,
             irq_ready,
             indirect_desc_enabled: init_result.indirect_desc_supported,
+            queue_lock: AsyncMutex::new(()),
         })
     });
 
@@ -695,10 +696,12 @@ impl<'a> SubmitTasksGuard<'a> {
     }
 
     /// Decrement the counter and notify if we're the last submitter or we must force a kick.
+    /// The caller is expected to hold any necessary queue lock and pass a direct reference
+    /// to the virtqueue to avoid re-acquiring locks while writers are queued (which can deadlock).
     #[inline]
     fn finish_and_maybe_notify(
         &mut self,
-        qs: &QueueState,
+        vq: &Virtqueue,
         notify_base: VirtAddr,
         notify_off_multiplier: u32,
         force_notify: bool,
@@ -708,7 +711,7 @@ impl<'a> SubmitTasksGuard<'a> {
         }
         let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
         if force_notify || prev == 1 {
-            qs.vq_ref().notify(notify_base, notify_off_multiplier);
+            vq.notify(notify_base, notify_off_multiplier);
         }
         self.active = false;
     }
@@ -750,18 +753,18 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
     let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
 
     loop {
-        let epoch_before = qs.drain_epoch();
+        let epoch_before = qs.drain_epoch_async().await;
 
-        if let Some(len) = qs.take_completion(head) {
-            qs.defer_free_chain(head);
+        if let Some(len) = qs.take_completion_async(head).await {
+            qs.defer_free_chain_async(head).await;
             return Ok(len);
         }
 
-        let we_are_drainer = qs.try_acquire_drainer();
+        let we_are_drainer = qs.try_acquire_drainer_async().await;
         let mut made_progress = false;
 
         if we_are_drainer {
-            let drained = qs.drain_used_to_completions_lockfree();
+            let drained = qs.drain_used_to_completions_lockfree_async().await;
             if drained > 0 {
                 made_progress = true;
 
@@ -774,16 +777,16 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
                 }
             }
 
-            if let Some(len) = qs.take_completion(head) {
-                qs.release_drainer();
-                qs.defer_free_chain(head);
+            if let Some(len) = qs.take_completion_async(head).await {
+                qs.release_drainer_async().await;
+                qs.defer_free_chain_async(head).await;
                 return Ok(len);
             }
 
-            qs.release_drainer();
+            qs.release_drainer_async().await;
         } else {
-            if let Some(len) = qs.take_completion(head) {
-                qs.defer_free_chain(head);
+            if let Some(len) = qs.take_completion_async(head).await {
+                qs.defer_free_chain_async(head).await;
                 return Ok(len);
             }
         }
@@ -792,7 +795,7 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             continue;
         }
 
-        let epoch_after = qs.drain_epoch();
+        let epoch_after = qs.drain_epoch_async().await;
         if epoch_after != epoch_before {
             continue;
         }
@@ -802,8 +805,8 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             let mut remaining_ns = spin_ns;
 
             while remaining_ns > 0 {
-                if let Some(len) = qs.take_completion(head) {
-                    qs.defer_free_chain(head);
+                if let Some(len) = qs.take_completion_async(head).await {
+                    qs.defer_free_chain_async(head).await;
                     return Ok(len);
                 }
 
@@ -934,7 +937,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
-
+    inner.queue_lock.lock().await;
     let (offset, len) = match {
         let r = req.read();
         match r.kind {
@@ -997,18 +1000,25 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let (head, queue_full_after_submit) = {
+            let head = {
                 let mut vq = qs.queue.write().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
                         let queue_full = vq.num_free == 0;
-                        (Some(h), queue_full)
+                        let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
+                        submit_guard.finish_and_maybe_notify(
+                            &vq,
+                            inner.notify_base,
+                            inner.notify_off_multiplier,
+                            queue_full,
+                        );
+                        Some(h)
                     }
                     None => {
                         // Queue is full (or no descriptors). Kick immediately so completions free space.
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        (None, false)
+                        None
                     }
                 }
             };
@@ -1017,14 +1027,6 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 Some(h) => h,
                 None => continue,
             };
-
-            let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
-            submit_guard.finish_and_maybe_notify(
-                qs,
-                inner.notify_base,
-                inner.notify_off_multiplier,
-                queue_full_after_submit,
-            );
 
             let _ = match wait_for_completion(qs, head).await {
                 Ok(l) => l,
@@ -1082,6 +1084,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
+    inner.queue_lock.lock().await;
 
     let (offset, len) = match {
         let r = req.read();
@@ -1152,18 +1155,25 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
-            let (head, queue_full_after_submit) = {
+            let head = {
                 let mut vq = qs.queue.write().await;
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
                         let queue_full = vq.num_free == 0;
-                        (Some(h), queue_full)
+                        let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
+                        submit_guard.finish_and_maybe_notify(
+                            &vq,
+                            inner.notify_base,
+                            inner.notify_off_multiplier,
+                            queue_full,
+                        );
+                        Some(h)
                     }
                     None => {
                         // Virtqueue out of descriptors: kick immediately so completions can free space.
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        (None, false)
+                        None
                     }
                 }
             };
@@ -1172,14 +1182,6 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 Some(h) => h,
                 None => continue,
             };
-
-            let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
-            submit_guard.finish_and_maybe_notify(
-                qs,
-                inner.notify_base,
-                inner.notify_off_multiplier,
-                queue_full_after_submit,
-            );
 
             let _ = match wait_for_completion(qs, head).await {
                 Ok(l) => l,

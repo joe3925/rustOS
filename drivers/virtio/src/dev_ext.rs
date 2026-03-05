@@ -9,7 +9,7 @@ use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard};
+use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock, AsyncRwLockReadGuard};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::util::get_current_lapic_id;
 use kernel_api::x86_64::VirtAddr;
@@ -17,6 +17,8 @@ use spin::{Mutex, Once};
 
 use crate::blk::BlkIoArena;
 use crate::virtqueue::Virtqueue;
+
+const VQ_READ_SPIN_LIMIT: usize = 32;
 
 /// Strategy for selecting which queue to use for I/O requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,7 +61,7 @@ unsafe impl Send for QueueState {}
 unsafe impl Sync for QueueState {}
 
 impl QueueState {
-    #[inline]
+    #[inline(never)]
     fn vq_read(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
         // Spin until we can take a read guard; short critical sections keep this brief.
         loop {
@@ -70,40 +72,47 @@ impl QueueState {
         }
     }
 
-    /// Get the current drain epoch (lock-free).
     #[inline]
-    pub fn drain_epoch(&self) -> u64 {
-        self.vq_read().drain_epoch()
+    pub async fn vq_read_async(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
+        for _ in 0..VQ_READ_SPIN_LIMIT {
+            if let Some(g) = self.queue.try_read() {
+                return g;
+            }
+            spin_loop();
+        }
+        self.queue.read().await
     }
 
-    /// Check if head is completed and take the completion (lock-free).
     #[inline]
-    pub fn take_completion(&self, head: u16) -> Option<u32> {
-        self.vq_read().take_completion(head)
+    pub async fn drain_epoch_async(&self) -> u64 {
+        self.vq_read_async().await.drain_epoch()
     }
 
-    /// Try to acquire the single-drainer gate (lock-free).
     #[inline]
-    pub fn try_acquire_drainer(&self) -> bool {
-        self.vq_read().try_acquire_drainer()
+    pub async fn take_completion_async(&self, head: u16) -> Option<u32> {
+        self.vq_read_async().await.take_completion(head)
     }
 
-    /// Release the single-drainer gate (lock-free).
     #[inline]
-    pub fn release_drainer(&self) {
-        self.vq_read().release_drainer()
+    pub async fn try_acquire_drainer_async(&self) -> bool {
+        self.vq_read_async().await.try_acquire_drainer()
     }
 
-    /// Enqueue a descriptor chain head for deferred freeing (lock-free).
     #[inline]
-    pub fn defer_free_chain(&self, head: u16) {
-        self.vq_read().defer_free_chain(head)
+    pub async fn release_drainer_async(&self) {
+        self.vq_read_async().await.release_drainer()
     }
 
-    /// Drain used ring to completions using CAS (lock-free).
     #[inline]
-    pub fn drain_used_to_completions_lockfree(&self) -> usize {
-        self.vq_read().drain_used_to_completions_lockfree()
+    pub async fn defer_free_chain_async(&self, head: u16) {
+        self.vq_read_async().await.defer_free_chain(head)
+    }
+
+    #[inline]
+    pub async fn drain_used_to_completions_lockfree_async(&self) -> usize {
+        self.vq_read_async()
+            .await
+            .drain_used_to_completions_lockfree()
     }
 
     /// Check if there are any pending completions in the used ring (lock-free).
@@ -112,7 +121,10 @@ impl QueueState {
         self.vq_read().has_pending_used()
     }
 
-    /// Obtain a read guard for direct virtqueue access when needed.
+    #[inline]
+    pub async fn vq_ref_async(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
+        self.vq_read_async().await
+    }
     #[inline]
     pub fn vq_ref(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
         self.vq_read()
@@ -151,6 +163,9 @@ pub struct DevExtInner {
     pub irq_ready: InitGate,
     /// Whether indirect descriptors are enabled for this device.
     pub indirect_desc_enabled: bool,
+
+    // TODO: there is a memory corruption issue somewhere in this driver that forces us to serialize all queue accesses with a big lock.
+    pub queue_lock: AsyncMutex<()>,
 }
 
 impl DevExtInner {
