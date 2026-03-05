@@ -25,7 +25,6 @@ use kernel_api::irq::{
     IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
     irq_wait_ok,
 };
-use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -41,7 +40,7 @@ use kernel_api::status::DriverStatus;
 use kernel_api::util::{panic_common, wait_duration};
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
-use spin::Mutex;
+use spin::{Mutex, RwLock};
 use temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
     bench_sweep, bench_sweep_params, sanitize_bench_params,
@@ -460,7 +459,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
         queue_states.push(QueueState {
-            queue: AsyncRwLock::new(vq),
+            queue: RwLock::new(vq),
             arena,
             max_request_bytes,
             max_data_segments: max_data_segments as u16,
@@ -537,7 +536,7 @@ async fn virtio_pnp_start<'a, 'b>(
             msix_pba,
             irq_ready,
             indirect_desc_enabled: init_result.indirect_desc_supported,
-            queue_lock: AsyncMutex::new(()),
+            queue_lock: Mutex::new(()),
         })
     });
 
@@ -753,18 +752,18 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
     let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
 
     loop {
-        let epoch_before = qs.drain_epoch_async().await;
+        let epoch_before = qs.drain_epoch();
 
-        if let Some(len) = qs.take_completion_async(head).await {
-            qs.defer_free_chain_async(head).await;
+        if let Some(len) = qs.take_completion(head) {
+            qs.defer_free_chain(head);
             return Ok(len);
         }
 
-        let we_are_drainer = qs.try_acquire_drainer_async().await;
+        let we_are_drainer = qs.try_acquire_drainer();
         let mut made_progress = false;
 
         if we_are_drainer {
-            let drained = qs.drain_used_to_completions_lockfree_async().await;
+            let drained = qs.drain_used_to_completions_lockfree();
             if drained > 0 {
                 made_progress = true;
 
@@ -777,16 +776,16 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
                 }
             }
 
-            if let Some(len) = qs.take_completion_async(head).await {
-                qs.release_drainer_async().await;
-                qs.defer_free_chain_async(head).await;
+            if let Some(len) = qs.take_completion(head) {
+                qs.release_drainer();
+                qs.defer_free_chain(head);
                 return Ok(len);
             }
 
-            qs.release_drainer_async().await;
+            qs.release_drainer();
         } else {
-            if let Some(len) = qs.take_completion_async(head).await {
-                qs.defer_free_chain_async(head).await;
+            if let Some(len) = qs.take_completion(head) {
+                qs.defer_free_chain(head);
                 return Ok(len);
             }
         }
@@ -795,7 +794,7 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             continue;
         }
 
-        let epoch_after = qs.drain_epoch_async().await;
+        let epoch_after = qs.drain_epoch();
         if epoch_after != epoch_before {
             continue;
         }
@@ -805,8 +804,8 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
             let mut remaining_ns = spin_ns;
 
             while remaining_ns > 0 {
-                if let Some(len) = qs.take_completion_async(head).await {
-                    qs.defer_free_chain_async(head).await;
+                if let Some(len) = qs.take_completion(head) {
+                    qs.defer_free_chain(head);
                     return Ok(len);
                 }
 
@@ -937,7 +936,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
-    inner.queue_lock.lock().await;
+    let _ = inner.queue_lock.lock();
     let (offset, len) = match {
         let r = req.read();
         match r.kind {
@@ -1001,7 +1000,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
             };
 
             let head = {
-                let mut vq = qs.queue.write().await;
+                let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
@@ -1084,7 +1083,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
-    inner.queue_lock.lock().await;
+    let _ = inner.queue_lock.lock();
 
     let (offset, len) = match {
         let r = req.read();
@@ -1156,7 +1155,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
             }
 
             let head = {
-                let mut vq = qs.queue.write().await;
+                let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {

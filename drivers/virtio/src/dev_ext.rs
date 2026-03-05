@@ -9,11 +9,10 @@ use core::task::{Context, Poll, Waker};
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
-use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock, AsyncRwLockReadGuard};
 use kernel_api::kernel_types::io::DiskInfo;
 use kernel_api::util::get_current_lapic_id;
 use kernel_api::x86_64::VirtAddr;
-use spin::{Mutex, Once};
+use spin::{Mutex, Once, RwLock, RwLockReadGuard};
 
 use crate::blk::BlkIoArena;
 use crate::virtqueue::Virtqueue;
@@ -34,8 +33,8 @@ pub enum QueueSelectionStrategy {
 /// Per-queue state: queue, arena, and IRQ handle.
 pub struct QueueState {
     /// The virtqueue for this request queue.
-    /// Uses AsyncRwLock so readers of atomic-only paths don't alias with writers.
-    pub queue: AsyncRwLock<Virtqueue>,
+    /// Uses RwLock so readers of atomic-only paths don't alias with writers.
+    pub queue: RwLock<Virtqueue>,
     /// Pre-allocated arena for this queue's BlkIoRequest slots.
     pub arena: BlkIoArena,
     /// Maximum safe data payload per request on this queue (512-byte aligned).
@@ -62,72 +61,55 @@ unsafe impl Sync for QueueState {}
 
 impl QueueState {
     #[inline(never)]
-    fn vq_read(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
-        // Spin until we can take a read guard; short critical sections keep this brief.
-        loop {
-            if let Some(g) = self.queue.try_read() {
-                return g;
-            }
-            spin_loop();
-        }
-    }
-
-    #[inline]
-    pub async fn vq_read_async(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
+    fn vq_read_spin(&self) -> RwLockReadGuard<'_, Virtqueue> {
         for _ in 0..VQ_READ_SPIN_LIMIT {
             if let Some(g) = self.queue.try_read() {
                 return g;
             }
             spin_loop();
         }
-        self.queue.read().await
+        self.queue.read()
     }
 
     #[inline]
-    pub async fn drain_epoch_async(&self) -> u64 {
-        self.vq_read_async().await.drain_epoch()
+    pub fn drain_epoch(&self) -> u64 {
+        self.vq_read_spin().drain_epoch()
     }
 
     #[inline]
-    pub async fn take_completion_async(&self, head: u16) -> Option<u32> {
-        self.vq_read_async().await.take_completion(head)
+    pub fn take_completion(&self, head: u16) -> Option<u32> {
+        self.vq_read_spin().take_completion(head)
     }
 
     #[inline]
-    pub async fn try_acquire_drainer_async(&self) -> bool {
-        self.vq_read_async().await.try_acquire_drainer()
+    pub fn try_acquire_drainer(&self) -> bool {
+        self.vq_read_spin().try_acquire_drainer()
     }
 
     #[inline]
-    pub async fn release_drainer_async(&self) {
-        self.vq_read_async().await.release_drainer()
+    pub fn release_drainer(&self) {
+        self.vq_read_spin().release_drainer()
     }
 
     #[inline]
-    pub async fn defer_free_chain_async(&self, head: u16) {
-        self.vq_read_async().await.defer_free_chain(head)
+    pub fn defer_free_chain(&self, head: u16) {
+        self.vq_read_spin().defer_free_chain(head)
     }
 
     #[inline]
-    pub async fn drain_used_to_completions_lockfree_async(&self) -> usize {
-        self.vq_read_async()
-            .await
-            .drain_used_to_completions_lockfree()
+    pub fn drain_used_to_completions_lockfree(&self) -> usize {
+        self.vq_read_spin().drain_used_to_completions_lockfree()
     }
 
     /// Check if there are any pending completions in the used ring (lock-free).
     #[inline]
     pub fn has_pending_used(&self) -> bool {
-        self.vq_read().has_pending_used()
+        self.vq_read_spin().has_pending_used()
     }
 
     #[inline]
-    pub async fn vq_ref_async(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
-        self.vq_read_async().await
-    }
-    #[inline]
-    pub fn vq_ref(&self) -> AsyncRwLockReadGuard<'_, Virtqueue> {
-        self.vq_read()
+    pub fn vq_ref(&self) -> RwLockReadGuard<'_, Virtqueue> {
+        self.vq_read_spin()
     }
 }
 
@@ -165,7 +147,7 @@ pub struct DevExtInner {
     pub indirect_desc_enabled: bool,
 
     // TODO: there is a memory corruption issue somewhere in this driver that forces us to serialize all queue accesses with a big lock.
-    pub queue_lock: AsyncMutex<()>,
+    pub queue_lock: Mutex<()>,
 }
 
 impl DevExtInner {

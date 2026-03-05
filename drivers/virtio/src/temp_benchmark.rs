@@ -102,7 +102,7 @@ async fn bench_reads_direct(
             };
 
             let head = {
-                let mut vq = bench_queue.queue.write().await;
+                let mut vq = bench_queue.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => h,
@@ -125,7 +125,7 @@ async fn bench_reads_direct(
         }
 
         {
-            let vq = bench_queue.queue.read().await;
+            let vq = bench_queue.queue.read();
             vq.notify(inner.notify_base, inner.notify_off_multiplier);
         }
 
@@ -158,12 +158,12 @@ async fn bench_reads_direct(
             }
 
             // Drain and reap whatever completed
-            bench_queue.drain_used_to_completions_lockfree_async().await;
+            bench_queue.drain_used_to_completions_lockfree();
 
             for slot in slots.iter_mut().take(batch_submitted) {
                 let Some(s) = slot.take() else { continue };
 
-                let len_opt = bench_queue.take_completion_async(s.head).await;
+                let len_opt = bench_queue.take_completion(s.head);
                 if len_opt.is_none() {
                     *slot = Some(s);
                     continue;
@@ -172,11 +172,11 @@ async fn bench_reads_direct(
                 let end_tsc = rdtsc();
 
                 if s.io_req.status() != VIRTIO_BLK_S_OK {
-                    bench_queue.defer_free_chain_async(s.head).await;
+                    bench_queue.defer_free_chain(s.head);
                     return Err(DriverStatus::DeviceError);
                 }
 
-                bench_queue.defer_free_chain_async(s.head).await;
+                bench_queue.defer_free_chain(s.head);
                 lat_samples.push(end_tsc.saturating_sub(s.start_tsc));
 
                 batch_completed += 1;
