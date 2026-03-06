@@ -1,25 +1,25 @@
+use crate::runtime::task::TaskPoll;
 use alloc::boxed::Box;
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::future::Future;
+use core::marker::PhantomData;
+use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
-
 use spin::Mutex;
 
-pub use super::block_on::block_on;
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
 use crate::global_async::GlobalAsyncExecutor;
 use crate::platform::{platform, Job};
 
-use core::marker::PhantomData;
-use core::mem::{align_of, size_of};
-
 use super::slab::{get_task_slab, INLINE_FUTURE_ALIGN, JOINABLE_STORAGE_SIZE};
-use super::task::{FutureTask, JoinableTask, TaskPoll};
+use super::task::{FutureTask, JoinableTask};
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
@@ -44,6 +44,66 @@ pub extern "win64" fn try_steal_blocking_one() -> bool {
     platform().try_steal_blocking_one()
 }
 
+struct BlockOnWakeState {
+    ready: AtomicBool,
+}
+
+unsafe fn block_on_waker_clone(ptr: *const ()) -> RawWaker {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
+    let cloned = Arc::clone(&arc);
+    RawWaker::new(Arc::into_raw(cloned) as *const (), &BLOCK_ON_WAKER_VTABLE)
+}
+
+unsafe fn block_on_waker_wake(ptr: *const ()) {
+    let arc = unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) };
+    arc.ready.store(true, Ordering::Release);
+}
+
+unsafe fn block_on_waker_wake_by_ref(ptr: *const ()) {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
+    arc.ready.store(true, Ordering::Release);
+}
+
+unsafe fn block_on_waker_drop(ptr: *const ()) {
+    drop(unsafe { Arc::from_raw(ptr as *const BlockOnWakeState) });
+}
+
+static BLOCK_ON_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    block_on_waker_clone,
+    block_on_waker_wake,
+    block_on_waker_wake_by_ref,
+    block_on_waker_drop,
+);
+
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    let state = Arc::new(BlockOnWakeState {
+        ready: AtomicBool::new(false),
+    });
+
+    let raw = RawWaker::new(
+        Arc::into_raw(state.clone()) as *const (),
+        &BLOCK_ON_WAKER_VTABLE,
+    );
+    let waker = unsafe { Waker::from_raw(raw) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = future;
+
+    loop {
+        let poll = unsafe { Pin::new_unchecked(&mut future) }.poll(&mut cx);
+        match poll {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {}
+        }
+
+        if !state.ready.swap(false, Ordering::AcqRel) && !try_steal_blocking_one() {
+            yield_now();
+        }
+    }
+}
+
 /// Spawns a future, preferring slab allocation before falling back to Arc.
 /// Returns a JoinHandle that can be awaited to get the result.
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
@@ -53,7 +113,6 @@ where
 {
     let slab = get_task_slab();
 
-    // Check if both future and result fit in slab storage
     let future_fits =
         size_of::<F>() <= JOINABLE_STORAGE_SIZE && align_of::<F>() <= INLINE_FUTURE_ALIGN;
     let result_fits =
@@ -74,7 +133,6 @@ where
         }
     }
 
-    // Fallback to Arc-based allocation
     slab.record_joinable_fallback();
     let task = Arc::new(JoinableTask::new(future));
     task.enqueue();
@@ -93,7 +151,6 @@ enum JoinHandleInner<T: Send + 'static> {
         shard_idx: u8,
         local_idx: u16,
         generation: u32,
-        /// Set to true after we've taken the result and decremented our ref
         consumed: bool,
         _marker: PhantomData<T>,
     },
@@ -103,8 +160,6 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
-        // Safety: JoinHandle doesn't contain any self-referential data,
-        // so it's safe to get mutable access through Pin
         let this = unsafe { self.get_unchecked_mut() };
 
         match &mut this.inner {
@@ -113,7 +168,6 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
                     Poll::Ready(result)
                 } else {
                     task.update_waker(cx.waker());
-                    // Check again in case result arrived between take_result and set_waker
                     if let Some(result) = task.take_result() {
                         Poll::Ready(result)
                     } else {
@@ -150,7 +204,6 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
                     Poll::Ready(result)
                 } else {
                     slot.update_join_waker(cx.waker());
-                    // Double-check after setting waker
                     if slot.is_completed() {
                         let result = unsafe { slot.take_result::<T>() };
                         slab.decrement_joinable_ref(
@@ -180,7 +233,6 @@ impl<T: Send + 'static> Drop for JoinHandle<T> {
         } = &self.inner
         {
             if !*consumed {
-                // Release the JoinHandle's ref if we haven't already
                 get_task_slab().decrement_joinable_ref(
                     *shard_idx as usize,
                     *local_idx as usize,
@@ -188,7 +240,6 @@ impl<T: Send + 'static> Drop for JoinHandle<T> {
                 );
             }
         }
-        // Arc variant drops automatically
     }
 }
 
@@ -199,11 +250,9 @@ where
 {
     let slab = get_task_slab();
 
-    // Try slab allocation first
     if let Some(slot_handle) = slab.allocate() {
         slot_handle.init_and_enqueue(future);
     } else {
-        // Fallback to Arc-based allocation
         slab.record_fallback();
         let task = Arc::new(FutureTask::new(future));
         task.enqueue();
@@ -226,7 +275,7 @@ struct IndexedWakerData {
 }
 
 unsafe fn indexed_waker_clone(ptr: *const ()) -> RawWaker {
-    let data = &*(ptr as *const IndexedWakerData);
+    let data = unsafe { &*(ptr as *const IndexedWakerData) };
     let cloned = Box::new(IndexedWakerData {
         shared: data.shared.clone(),
         index: data.index,
@@ -235,7 +284,7 @@ unsafe fn indexed_waker_clone(ptr: *const ()) -> RawWaker {
 }
 
 unsafe fn indexed_waker_wake(ptr: *const ()) {
-    let data = Box::from_raw(ptr as *mut IndexedWakerData);
+    let data = unsafe { Box::from_raw(ptr as *mut IndexedWakerData) };
     data.shared.ready_queue.push(data.index);
     let guard = data.shared.parent.lock();
     if let Some(w) = guard.as_ref() {
@@ -245,7 +294,7 @@ unsafe fn indexed_waker_wake(ptr: *const ()) {
 }
 
 unsafe fn indexed_waker_wake_by_ref(ptr: *const ()) {
-    let data = &*(ptr as *const IndexedWakerData);
+    let data = unsafe { &*(ptr as *const IndexedWakerData) };
     data.shared.ready_queue.push(data.index);
     let guard = data.shared.parent.lock();
     if let Some(w) = guard.as_ref() {
@@ -255,7 +304,7 @@ unsafe fn indexed_waker_wake_by_ref(ptr: *const ()) {
 }
 
 unsafe fn indexed_waker_drop(ptr: *const ()) {
-    drop(Box::from_raw(ptr as *mut IndexedWakerData));
+    drop(unsafe { Box::from_raw(ptr as *mut IndexedWakerData) });
 }
 
 static INDEXED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -294,7 +343,6 @@ impl JoinAllShared {
     }
 }
 
-/// Joins multiple futures, storing them inline and using indexed wakers to avoid O(n^2) rescans.
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
     remaining: usize,
@@ -334,7 +382,6 @@ impl<F: Future> Future for JoinAll<F> {
         this.shared.update_parent(cx.waker());
 
         if this.first_poll {
-            // First poll: must poll every child once to register their wakers.
             this.first_poll = false;
             for (i, slot) in this.slots.iter_mut().enumerate() {
                 if let FutureSlot::Running(fut) = slot {
@@ -348,7 +395,6 @@ impl<F: Future> Future for JoinAll<F> {
                 }
             }
         } else {
-            // Subsequent polls: only re-poll children that were woken.
             while let Some(idx) = this.shared.ready_queue.pop() {
                 if idx >= this.slots.len() {
                     continue;
