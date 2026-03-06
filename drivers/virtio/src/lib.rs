@@ -56,7 +56,7 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const INVALID_HEAD: u16 = 0xFFFF;
-const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 600;
+const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 0;
 const SPIN_WAIT_SLICE_NS: u64 = 50;
 
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
@@ -536,7 +536,6 @@ async fn virtio_pnp_start<'a, 'b>(
             msix_pba,
             irq_ready,
             indirect_desc_enabled: init_result.indirect_desc_supported,
-            queue_lock: Mutex::new(()),
         })
     });
 
@@ -936,7 +935,6 @@ pub async fn virtio_pdo_read<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
-    let _ = inner.queue_lock.lock();
     let (offset, len) = match {
         let r = req.read();
         match r.kind {
@@ -1083,7 +1081,6 @@ pub async fn virtio_pdo_write<'a, 'b>(
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
-    let _ = inner.queue_lock.lock();
 
     let (offset, len) = match {
         let r = req.read();

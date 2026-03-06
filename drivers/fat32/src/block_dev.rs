@@ -224,6 +224,20 @@ impl BlockDev {
             let scratch = &mut scratch_buf[..bps];
 
             block_on(self.pnp_read_into(lba_base, scratch))?;
+
+            if unsafe {
+                let src = scratch.as_ptr().add(in_sector);
+                let dst = dst.as_ptr();
+
+                src.is_null()
+                    || dst.is_null()
+                    || (src as usize) % core::mem::align_of::<u8>() != 0
+                    || (dst as usize) % core::mem::align_of::<u8>() != 0
+                    || (src < dst.add(take) && src.add(take) > dst)
+            } {
+                panic!("Unexpected overlap between scratch buffer and destination buffer");
+            }
+
             dst[..take].copy_from_slice(&scratch[in_sector..in_sector + take]);
 
             cur_off += take as u64;
@@ -258,6 +272,18 @@ impl BlockDev {
         if remaining != 0 {
             let scratch = &mut scratch_buf[..bps];
             block_on(self.pnp_read_into(cur_off, scratch))?;
+            if unsafe {
+                let src = scratch.as_ptr().add(in_sector);
+                let dst_ptr = dst.as_ptr();
+
+                src.is_null()
+                    || dst_ptr.is_null()
+                    || (src as usize) % core::mem::align_of::<u8>() != 0
+                    || (dst_ptr as usize) % core::mem::align_of::<u8>() != 0
+                    || (src < dst_ptr.add(dst.len()) && src.add(remaining) > dst_ptr)
+            } {
+                panic!("Unexpected overlap between scratch buffer and destination buffer");
+            }
             dst[written..written + remaining].copy_from_slice(&scratch[..remaining]);
 
             cur_off += remaining as u64;

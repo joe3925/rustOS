@@ -145,9 +145,6 @@ pub struct DevExtInner {
     pub irq_ready: InitGate,
     /// Whether indirect descriptors are enabled for this device.
     pub indirect_desc_enabled: bool,
-
-    // TODO: there is a memory corruption issue somewhere in this driver that forces us to serialize all queue accesses with a big lock.
-    pub queue_lock: Mutex<()>,
 }
 
 impl DevExtInner {

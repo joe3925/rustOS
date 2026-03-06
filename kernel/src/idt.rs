@@ -386,6 +386,15 @@ impl core::future::Future for IrqWaitFuture {
 
         let node_ptr: *mut WaiterNode = &mut this.waiter;
 
+        let cw = cx.waker();
+        let need_update = match this.waiter.waker.as_ref() {
+            Some(w) => !w.will_wake(cw),
+            None => true,
+        };
+        if need_update {
+            this.waiter.waker = Some(cw.clone());
+        }
+
         if state.pending_signals > 0 {
             state.pending_signals -= 1;
             let meta = state.last_meta;
@@ -396,15 +405,6 @@ impl core::future::Future for IrqWaitFuture {
             this.waiter.enqueued = true;
             this.waiter.next = ptr::null_mut();
             state.waiters.push_back(node_ptr);
-        }
-
-        let cw = cx.waker();
-        let need_update = match this.waiter.waker.as_ref() {
-            Some(w) => !w.will_wake(cw),
-            None => true,
-        };
-        if need_update {
-            this.waiter.waker = Some(cw.clone());
         }
 
         core::task::Poll::Pending
