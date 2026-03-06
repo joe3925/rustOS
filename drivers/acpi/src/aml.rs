@@ -43,6 +43,21 @@ pub struct McfgSeg {
     pub eb: u8,
 }
 
+/// Volatile read/write helper that tolerates unaligned MMIO addresses.
+#[repr(C, packed)]
+struct VolatileUnaligned<T>(T);
+
+#[inline]
+unsafe fn read_volatile_unaligned<T: Copy>(ptr: *const u8) -> T {
+    // Cast through an align(1) wrapper so the volatile access is well-defined.
+    read_volatile(ptr as *const VolatileUnaligned<T>).0
+}
+
+#[inline]
+unsafe fn write_volatile_unaligned<T: Copy>(ptr: *mut u8, val: T) {
+    write_volatile(ptr as *mut VolatileUnaligned<T>, VolatileUnaligned(val));
+}
+
 #[inline]
 fn round_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
@@ -69,8 +84,8 @@ unsafe fn unmap_phys_window(va: VirtAddr, size: usize) {
 #[inline]
 unsafe fn mmio_read<T: Copy>(paddr: usize) -> T {
     let (va, off, size) = unsafe { map_phys_window(paddr, core::mem::size_of::<T>()) };
-    let ptr = (va.as_u64() as usize + off) as *const T;
-    let v = unsafe { read_volatile(ptr) };
+    let ptr = (va.as_u64() as usize + off) as *const u8;
+    let v = unsafe { read_volatile_unaligned::<T>(ptr) };
     unsafe { unmap_phys_window(va, size) };
     v
 }
@@ -78,8 +93,8 @@ unsafe fn mmio_read<T: Copy>(paddr: usize) -> T {
 #[inline]
 unsafe fn mmio_write<T: Copy>(paddr: usize, val: T) {
     let (va, off, size) = unsafe { map_phys_window(paddr, core::mem::size_of::<T>()) };
-    let ptr = (va.as_u64() as usize + off) as *mut T;
-    unsafe { write_volatile(ptr, val) };
+    let ptr = (va.as_u64() as usize + off) as *mut u8;
+    unsafe { write_volatile_unaligned::<T>(ptr, val) };
     unsafe { unmap_phys_window(va, size) };
 }
 

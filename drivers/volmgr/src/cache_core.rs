@@ -356,13 +356,16 @@ where
         &self,
         lba: u64,
     ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        let mut buf: PageBuf<BLOCK_SIZE> = PageBuf::zeroed();
+        self.backend
+            .read_block(lba, &mut buf.bytes[..])
+            .await
+            .map_err(CacheError::Backend)?;
+
         let page = Arc::new(Page::new_zeroed());
         {
             let mut data = page.data.write().await;
-            self.backend
-                .read_block(lba, &mut data.bytes[..])
-                .await
-                .map_err(CacheError::Backend)?;
+            data.bytes.copy_from_slice(&buf.bytes[..]);
         }
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
         Ok(page)
@@ -575,40 +578,49 @@ where
         block_range: Option<&Range<u64>>,
         parallelism: usize,
     ) -> Result<(), CacheError<B::Error>> {
-        let mut scratch = self.flush_scratch.lock().await;
-        scratch.reset();
-        scratch.ensure_join_capacity(parallelism);
+        let (batch, mut joins) = {
+            let mut scratch = self.flush_scratch.lock().await;
+            scratch.reset();
+            scratch.ensure_join_capacity(parallelism);
 
-        {
-            let shard = self.shards[shard_idx].lock().await;
-            let needed = shard.index.len();
-            let current = scratch.batch.capacity();
-            if current < needed {
-                scratch.batch.reserve(needed - current);
+            {
+                let shard = self.shards[shard_idx].lock().await;
+                let needed = shard.index.len();
+                let current = scratch.batch.capacity();
+                if current < needed {
+                    scratch.batch.reserve(needed - current);
+                }
+
+                shard.index.for_each_chunk(0, usize::MAX, |k, v| {
+                    if block_range.map_or(true, |r| k >= r.start && k < r.end) {
+                        scratch.batch.push((k, Arc::clone(v)));
+                    }
+                });
             }
 
-            shard.index.for_each_chunk(0, usize::MAX, |k, v| {
-                if block_range.map_or(true, |r| k >= r.start && k < r.end) {
-                    scratch.batch.push((k, Arc::clone(v)));
-                }
-            });
-        }
+            if scratch.batch.is_empty() {
+                return Ok(());
+            }
 
-        if scratch.batch.is_empty() {
-            return Ok(());
-        }
+            let batch = core::mem::take(&mut scratch.batch);
+            let joins = core::mem::take(&mut scratch.joins);
+            (batch, joins)
+        };
 
-        let mut joins = core::mem::take(&mut scratch.joins);
         Self::flush_pages_parallel(
             Arc::clone(&self.backend),
             Arc::clone(&self.stats),
-            &scratch.batch,
+            &batch,
             &mut joins,
         )
         .await?;
-        scratch.joins = joins;
 
-        scratch.reset();
+        {
+            let mut scratch = self.flush_scratch.lock().await;
+            scratch.batch = batch;
+            scratch.joins = joins;
+            scratch.reset();
+        }
 
         Ok(())
     }

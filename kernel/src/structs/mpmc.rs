@@ -159,6 +159,11 @@ impl<T> Receiver<T> {
                 return Err(RecvError);
             }
 
+            // Sender may have already dequeued us; if so, avoid parking and retry.
+            if !self.inner.receivers_waiting.is_current_enqueued() {
+                continue;
+            }
+
             SCHEDULER.park_current(BlockReason::ChannelRecv);
             self.inner.receivers_waiting.clear_current_if_queued();
         }

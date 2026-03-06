@@ -3,6 +3,20 @@ use kernel_api::memory::map_mmio_region;
 use kernel_api::pnp::ResourceKind;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
+/// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
+#[repr(C, packed)]
+struct VolatileUnaligned<T>(T);
+
+#[inline]
+unsafe fn read_volatile_unaligned<T: Copy>(ptr: *const u8) -> T {
+    core::ptr::read_volatile(ptr as *const VolatileUnaligned<T>).0
+}
+
+#[inline]
+unsafe fn write_volatile_unaligned<T: Copy>(ptr: *mut u8, val: T) {
+    core::ptr::write_volatile(ptr as *mut VolatileUnaligned<T>, VolatileUnaligned(val));
+}
+
 /// Parsed virtio PCI capability pointers (virtual addresses into mapped BARs).
 pub struct VirtioPciCaps {
     pub common_cfg: VirtAddr,
@@ -98,10 +112,12 @@ pub fn find_legacy_irq_line(resources: &[PciResource]) -> Option<u8> {
 pub fn map_memory_bars(resources: &[PciResource]) -> Vec<(u32, VirtAddr, u64)> {
     let mut mapped = Vec::new();
     for r in resources {
-        if r.kind == ResourceKind::Memory as u32 && r.length > 0
-            && let Ok(va) = map_mmio_region(PhysAddr::new(r.start), r.length) {
-                mapped.push((r.index, va, r.length));
-            }
+        if r.kind == ResourceKind::Memory as u32
+            && r.length > 0
+            && let Ok(va) = map_mmio_region(PhysAddr::new(r.start), r.length)
+        {
+            mapped.push((r.index, va, r.length));
+        }
     }
     mapped
 }
@@ -162,8 +178,8 @@ pub fn parse_virtio_caps(
             // This is a virtio capability
             let cfg_type = unsafe { core::ptr::read_volatile(base.add(ptr + 3)) };
             let bar = unsafe { core::ptr::read_volatile(base.add(ptr + 4)) };
-            let offset = unsafe { core::ptr::read_volatile(base.add(ptr + 8) as *const u32) };
-            let _length = unsafe { core::ptr::read_volatile(base.add(ptr + 12) as *const u32) };
+            let offset = unsafe { read_volatile_unaligned::<u32>(base.add(ptr + 8)) };
+            let _length = unsafe { read_volatile_unaligned::<u32>(base.add(ptr + 12)) };
 
             // Find the mapped BAR
             if let Some((_idx, bar_va, _sz)) =
@@ -176,7 +192,7 @@ pub fn parse_virtio_caps(
                         notify_base = Some(region_va);
                         // The notify_off_multiplier is at cap offset 16 (after the standard cap fields)
                         notify_off_multiplier =
-                            unsafe { core::ptr::read_volatile(base.add(ptr + 16) as *const u32) };
+                            unsafe { read_volatile_unaligned::<u32>(base.add(ptr + 16)) };
                     }
                     3 => isr_cfg = Some(region_va),
                     4 => device_cfg = Some(region_va),
@@ -207,27 +223,27 @@ pub unsafe fn common_write_u8(common: VirtAddr, offset: usize, val: u8) {
 }
 
 pub unsafe fn common_read_u16(common: VirtAddr, offset: usize) -> u16 {
-    unsafe { core::ptr::read_volatile((common.as_u64() as *const u8).add(offset) as *const u16) }
+    unsafe { read_volatile_unaligned::<u16>((common.as_u64() as *const u8).add(offset)) }
 }
 
 pub unsafe fn common_write_u16(common: VirtAddr, offset: usize, val: u16) {
-    unsafe { core::ptr::write_volatile((common.as_u64() as *mut u8).add(offset) as *mut u16, val) }
+    unsafe { write_volatile_unaligned::<u16>((common.as_u64() as *mut u8).add(offset), val) }
 }
 
 pub unsafe fn common_read_u32(common: VirtAddr, offset: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((common.as_u64() as *const u8).add(offset) as *const u32) }
+    unsafe { read_volatile_unaligned::<u32>((common.as_u64() as *const u8).add(offset)) }
 }
 
 pub unsafe fn common_write_u32(common: VirtAddr, offset: usize, val: u32) {
-    unsafe { core::ptr::write_volatile((common.as_u64() as *mut u8).add(offset) as *mut u32, val) }
+    unsafe { write_volatile_unaligned::<u32>((common.as_u64() as *mut u8).add(offset), val) }
 }
 
 pub unsafe fn common_read_u64(common: VirtAddr, offset: usize) -> u64 {
-    unsafe { core::ptr::read_volatile((common.as_u64() as *const u8).add(offset) as *const u64) }
+    unsafe { read_volatile_unaligned::<u64>((common.as_u64() as *const u8).add(offset)) }
 }
 
 pub unsafe fn common_write_u64(common: VirtAddr, offset: usize, val: u64) {
-    unsafe { core::ptr::write_volatile((common.as_u64() as *mut u8).add(offset) as *mut u64, val) }
+    unsafe { write_volatile_unaligned::<u64>((common.as_u64() as *mut u8).add(offset), val) }
 }
 
 // Named offsets

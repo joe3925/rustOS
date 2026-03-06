@@ -11,6 +11,7 @@ mod temp_benchmark;
 mod virtqueue;
 
 use alloc::{sync::Arc, vec, vec::Vec};
+use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::panic::PanicInfo;
@@ -169,7 +170,6 @@ async fn setup_msix_via_pci(
         Err(status)
     }
 }
-
 #[request_handler]
 async fn virtio_pnp_start<'a, 'b>(
     dev: &Arc<DeviceObject>,

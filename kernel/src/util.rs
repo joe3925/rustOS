@@ -240,13 +240,11 @@ pub extern "C" fn trigger_stack_overflow() {
 #[no_mangle]
 #[inline(never)]
 pub extern "win64" fn trigger_triple_fault() -> ! {
-    // Replace the active IDT with an empty one so the next fault has nowhere to go.
     static EMPTY_IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 
     x86_64::instructions::interrupts::disable();
     unsafe {
         EMPTY_IDT.load();
-        // UD2 raises an invalid opcode fault; with no IDT entries this escalates to a triple fault.
         asm!("ud2", options(noreturn));
     }
 }

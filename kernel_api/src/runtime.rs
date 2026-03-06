@@ -127,12 +127,20 @@ impl<R> Future for BlockingJoin<R> {
     type Output = R;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        // TODO: consider removing this fast path. low prio change; needs to be benchmarked to see if it actually improves perf.
         if self.state.ready.load(Ordering::Acquire) {
             if let Some(v) = self.state.result.lock().take() {
                 return Poll::Ready(v);
             }
         }
+
         *self.state.waker.lock() = Some(cx.waker().clone());
+
+        if self.state.ready.load(Ordering::Acquire) {
+            if let Some(v) = self.state.result.lock().take() {
+                return Poll::Ready(v);
+            }
+        }
         Poll::Pending
     }
 }

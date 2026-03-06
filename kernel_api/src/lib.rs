@@ -56,11 +56,13 @@ pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _:
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn fma(_x: f64, _y: f64, z: f64) -> f64 {
+    panic!("Floating point was used");
     z
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fmaf(_x: f32, _y: f32, z: f32) -> f32 {
+    panic!("Floating point was used");
     z
 }
 #[unsafe(naked)]

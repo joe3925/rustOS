@@ -9,6 +9,7 @@ mod dev_ext;
 mod msix;
 
 use alloc::{sync::Arc, vec::Vec};
+use core::arch::asm;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
@@ -280,7 +281,6 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
             devices
         }));
     }
-
     for join in joins {
         for p in join.await {
             make_pdo_for_function(&devnode, &p);
@@ -290,7 +290,6 @@ pub async fn enumerate_bus(device: &Arc<DeviceObject>) -> DriverStatus {
     for m in unmaps {
         let _ = unmap_mmio_region(m.base, m.size);
     }
-
     DriverStatus::Success
 }
 

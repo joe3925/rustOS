@@ -411,6 +411,12 @@ impl BlkIoArena {
 
     /// Try to allocate from the preallocated slot pool using lock-free CAS.
     fn try_allocate_preallocated(&self, data_len: u32) -> Option<BlkIoRequestHandle<'_>> {
+        if data_len > PREALLOCATED_DATA_SIZE as u32 {
+            return None;
+        }
+
+        debug_assert!(data_len <= PREALLOCATED_DATA_SIZE as u32);
+
         let hint = self.preallocated_hint.load(Ordering::Relaxed);
         let start_word = (hint / 64).min(ARENA_BITMAP_WORDS.saturating_sub(1));
 

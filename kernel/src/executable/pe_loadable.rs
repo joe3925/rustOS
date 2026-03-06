@@ -1,5 +1,5 @@
 use core::mem::transmute;
-use core::ptr::copy_nonoverlapping;
+use core::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 
 use crate::file_system::file::File;
 use crate::memory::paging::tables::new_user_mode_page_table;
@@ -407,8 +407,9 @@ impl PELoader {
                 BaseRelocType::Dir64 => {
                     let target = self.current_base.as_u64() + entry.virtual_address as u64;
                     unsafe {
-                        let p = target as *mut u64;
-                        p.write(p.read().wrapping_add(delta));
+                        let p = target as *mut u8;
+                        let current = read_unaligned(p as *const u64);
+                        write_unaligned(p as *mut u64, current.wrapping_add(delta));
                     }
                 }
                 _ => return Err(LoadError::UnsupportedRelocationFormat),

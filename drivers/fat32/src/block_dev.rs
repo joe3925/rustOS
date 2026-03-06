@@ -15,7 +15,10 @@ use kernel_api::{
 
 use crate::volume::VolCtrlDevExt;
 
+// Upper bound for per-request I/O. Virtio preallocated DMA buffers are 64KiB,
+// so we clamp streaming reads/writes to this size to avoid overruns in lower drivers.
 const MAX_CHUNK_BYTES: usize = 256 * 1024;
+const DEVICE_MAX_IO_BYTES: usize = 64 * 1024;
 
 pub struct BlockDev {
     volume: IoTarget,
@@ -252,12 +255,12 @@ impl BlockDev {
             while done < aligned_bytes {
                 // Cap each IO to MAX_CHUNK_BYTES while staying sector aligned.
                 let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
-                let chunk = if max_chunk == 0 {
-                    // Fallback for unusually large sector sizes.
-                    min(bps, aligned_bytes - done)
-                } else {
-                    min(max_chunk, aligned_bytes - done)
-                };
+                let device_cap = DEVICE_MAX_IO_BYTES - (DEVICE_MAX_IO_BYTES % bps);
+
+                let chunk_cap = if max_chunk == 0 { bps } else { max_chunk };
+                let device_cap = if device_cap == 0 { bps } else { device_cap };
+
+                let chunk = min(aligned_bytes - done, min(chunk_cap, device_cap));
                 let dst_slice = &mut dst[written + done..written + done + chunk];
                 block_on(self.pnp_read_into(cur_off, dst_slice))?;
 
@@ -272,19 +275,30 @@ impl BlockDev {
         if remaining != 0 {
             let scratch = &mut scratch_buf[..bps];
             block_on(self.pnp_read_into(cur_off, scratch))?;
+
+            // Recompute the in-sector offset for the *current* position.
+            // The earlier `in_sector` may be non-zero when the read starts mid‑sector;
+            // reusing it here would produce out-of-bounds pointer arithmetic once
+            // we've advanced to a new sector.
+            let tail_in_sector = self.in_sector_off(cur_off);
+
+            // Only the slice we will actually copy (tail_in_sector..tail_in_sector+remaining)
+            // should be considered in the overlap check.
             if unsafe {
-                let src = scratch.as_ptr().add(in_sector);
-                let dst_ptr = dst.as_ptr();
+                let src = scratch.as_ptr().add(tail_in_sector);
+                let dst_ptr = dst.as_ptr().add(written);
 
                 src.is_null()
                     || dst_ptr.is_null()
                     || (src as usize) % core::mem::align_of::<u8>() != 0
                     || (dst_ptr as usize) % core::mem::align_of::<u8>() != 0
-                    || (src < dst_ptr.add(dst.len()) && src.add(remaining) > dst_ptr)
+                    || (src < dst_ptr.add(remaining) && src.add(remaining) > dst_ptr)
             } {
                 panic!("Unexpected overlap between scratch buffer and destination buffer");
             }
-            dst[written..written + remaining].copy_from_slice(&scratch[..remaining]);
+
+            dst[written..written + remaining]
+                .copy_from_slice(&scratch[tail_in_sector..tail_in_sector + remaining]);
 
             cur_off += remaining as u64;
             written += remaining;
@@ -338,11 +352,12 @@ impl BlockDev {
             let mut done = 0;
             while done < aligned_bytes {
                 let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
-                let chunk = if max_chunk == 0 {
-                    min(bps, aligned_bytes - done)
-                } else {
-                    min(max_chunk, aligned_bytes - done)
-                };
+                let device_cap = DEVICE_MAX_IO_BYTES - (DEVICE_MAX_IO_BYTES % bps);
+
+                let chunk_cap = if max_chunk == 0 { bps } else { max_chunk };
+                let device_cap = if device_cap == 0 { bps } else { device_cap };
+
+                let chunk = min(aligned_bytes - done, min(chunk_cap, device_cap));
                 let src_slice = &src[written + done..written + done + chunk];
                 block_on(self.pnp_write_from(cur_off, src_slice))?;
 
