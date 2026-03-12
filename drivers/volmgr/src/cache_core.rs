@@ -13,11 +13,11 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use futures::stream::StreamExt;
 use kernel_api::async_ffi::FfiFuture;
-use kernel_api::kernel_types::async_types::{AsyncMutex, AsyncRwLock};
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
+use spin::{Mutex, RwLock};
 struct StatsInner {
     read_hits: AtomicU64,
     read_misses: AtomicU64,
@@ -88,7 +88,7 @@ impl<const BLOCK_SIZE: usize> PageBuf<BLOCK_SIZE> {
 }
 
 struct Page<const BLOCK_SIZE: usize> {
-    data: AsyncRwLock<PageBuf<BLOCK_SIZE>>,
+    data: RwLock<PageBuf<BLOCK_SIZE>>,
     dirty: AtomicBool,
     writeback: AtomicBool,
     generation: AtomicU64,
@@ -99,7 +99,7 @@ struct Page<const BLOCK_SIZE: usize> {
 impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
     fn new_zeroed() -> Self {
         Self {
-            data: AsyncRwLock::new(PageBuf::zeroed()),
+            data: RwLock::new(PageBuf::zeroed()),
             dirty: AtomicBool::new(false),
             writeback: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -194,7 +194,7 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
 pub(crate) struct FlushJobHandle<E> {
     id: u64,
     future: Shared<FfiFuture<()>>,
-    result: Arc<AsyncMutex<Option<Result<(), CacheError<E>>>>>,
+    result: Arc<Mutex<Option<Result<(), CacheError<E>>>>>,
 }
 
 // pooled page vectors removed; streaming batching used instead.
@@ -205,13 +205,13 @@ where
     F: CacheIndexFactory<Arc<Page<BLOCK_SIZE>>>,
 {
     backend: Arc<B>,
-    shards: Vec<AsyncMutex<Shard<F::Index>>>,
+    shards: Vec<Mutex<Shard<F::Index>>>,
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     closed: AtomicBool,
-    flush_job: AsyncMutex<Option<Arc<FlushJobHandle<B::Error>>>>,
+    flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
     flush_job_id: AtomicU64,
-    flush_scratch: AsyncMutex<FlushScratch<BLOCK_SIZE>>,
+    flush_scratch: Mutex<FlushScratch<BLOCK_SIZE>>,
     _index_factory: PhantomData<F>,
 }
 
@@ -253,7 +253,7 @@ where
         let mut i = 0usize;
         while i < shard_count {
             let index = factory.build(per_shard);
-            shards.push(AsyncMutex::new(Shard::new(index, per_shard)));
+            shards.push(Mutex::new(Shard::new(index, per_shard)));
             i += 1;
         }
 
@@ -263,9 +263,9 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             closed: AtomicBool::new(false),
-            flush_job: AsyncMutex::new(None),
+            flush_job: Mutex::new(None),
             flush_job_id: AtomicU64::new(0),
-            flush_scratch: AsyncMutex::new(FlushScratch::new(cfg.flush_parallelism)),
+            flush_scratch: Mutex::new(FlushScratch::new(cfg.flush_parallelism)),
             _index_factory: PhantomData,
         })
     }
@@ -305,7 +305,7 @@ where
 
     async fn try_get_page(&self, lba: u64) -> Option<Arc<Page<BLOCK_SIZE>>> {
         let idx = self.shard_index(lba);
-        let mut shard = self.shards[idx].lock().await;
+        let mut shard = self.shards[idx].lock();
         shard.index.get(&lba).map(|page| Arc::clone(&*page))
     }
 
@@ -334,7 +334,7 @@ where
         page: Arc<Page<BLOCK_SIZE>>,
     ) -> Arc<Page<BLOCK_SIZE>> {
         let idx = self.shard_index(lba);
-        let mut shard = self.shards[idx].lock().await;
+        let mut shard = self.shards[idx].lock();
 
         if let Some(existing) = shard.index.get(&lba) {
             return Arc::clone(&*existing);
@@ -364,7 +364,7 @@ where
 
         let page = Arc::new(Page::new_zeroed());
         {
-            let mut data = page.data.write().await;
+            let mut data = page.data.write();
             data.bytes.copy_from_slice(&buf.bytes[..]);
         }
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
@@ -374,7 +374,7 @@ where
     async fn new_page_from_full_block_write(&self, src: &[u8]) -> Arc<Page<BLOCK_SIZE>> {
         let page = Arc::new(Page::new_zeroed());
         {
-            let mut data = page.data.write().await;
+            let mut data = page.data.write();
             data.bytes[..].copy_from_slice(src);
         }
         page.mark_dirty();
@@ -455,7 +455,7 @@ where
         {
             let mut w = req.write();
             let dst = w.data_slice_mut();
-            let data = page.data.read().await;
+            let data = page.data.read();
             dst.copy_from_slice(&data.bytes[..]);
         }
 
@@ -510,7 +510,7 @@ where
         {
             let mut req_w = req.write();
             let dst = req_w.data_slice_mut();
-            let data = page.data.read().await;
+            let data = page.data.read();
             dst.copy_from_slice(&data.bytes[..]);
         }
 
@@ -579,12 +579,12 @@ where
         parallelism: usize,
     ) -> Result<(), CacheError<B::Error>> {
         let (batch, mut joins) = {
-            let mut scratch = self.flush_scratch.lock().await;
+            let mut scratch = self.flush_scratch.lock();
             scratch.reset();
             scratch.ensure_join_capacity(parallelism);
 
             {
-                let shard = self.shards[shard_idx].lock().await;
+                let shard = self.shards[shard_idx].lock();
                 let needed = shard.index.len();
                 let current = scratch.batch.capacity();
                 if current < needed {
@@ -616,7 +616,7 @@ where
         .await?;
 
         {
-            let mut scratch = self.flush_scratch.lock().await;
+            let mut scratch = self.flush_scratch.lock();
             scratch.batch = batch;
             scratch.joins = joins;
             scratch.reset();
@@ -640,7 +640,7 @@ where
     async fn has_dirty_pages(&self) -> bool {
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
-            let shard = self.shards[shard_idx].lock().await;
+            let shard = self.shards[shard_idx].lock();
             let mut found = false;
             shard.index.for_each(|_, page| {
                 if !found && page.dirty.load(Ordering::Acquire) {
@@ -666,14 +666,14 @@ where
     }
 
     async fn finish_flush_job(&self, id: u64) {
-        let mut job = self.flush_job.lock().await;
+        let mut job = self.flush_job.lock();
         if job.as_ref().map(|h| h.id == id).unwrap_or(false) {
             job.take();
         }
     }
 
     pub(crate) async fn ensure_flush_job(self: &Arc<Self>) -> Arc<FlushJobHandle<B::Error>> {
-        let mut job_guard = self.flush_job.lock().await;
+        let mut job_guard = self.flush_job.lock();
         if let Some(handle) = job_guard.as_ref() {
             return Arc::clone(handle);
         }
@@ -683,14 +683,16 @@ where
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1);
 
-        let result_slot = Arc::new(AsyncMutex::new(None));
+        let result_slot = Arc::new(Mutex::new(None));
         let result_slot_clone = Arc::clone(&result_slot);
         let cache = Arc::clone(self);
 
         let job_future = spawn(async move {
             let outcome = cache.flush_until_clean().await;
-            let mut slot = result_slot_clone.lock().await;
-            *slot = Some(outcome);
+            {
+                let mut slot = result_slot_clone.lock();
+                *slot = Some(outcome);
+            }
             cache.finish_flush_job(id).await;
         })
         .shared();
@@ -711,13 +713,7 @@ where
     {
         let handle = self.ensure_flush_job().await;
         handle.future.clone().await;
-        handle
-            .result
-            .lock()
-            .await
-            .as_ref()
-            .cloned()
-            .unwrap_or(Ok(()))
+        handle.result.lock().as_ref().cloned().unwrap_or(Ok(()))
     }
 
     async fn flush_internal_range(
@@ -763,7 +759,7 @@ where
         let mut i = 0usize;
 
         while i < self.shards.len() {
-            let mut shard = self.shards[i].lock().await;
+            let mut shard = self.shards[i].lock();
             let mut keys = Vec::new();
 
             shard.index.for_each(|k, _| {
@@ -857,7 +853,7 @@ where
             let _use_guard = PageUseGuard::new(&page);
 
             {
-                let data = page.data.read().await;
+                let data = page.data.read();
                 out[dst_pos..dst_pos + take]
                     .copy_from_slice(&data.bytes[block_off..block_off + take]);
             }
@@ -895,7 +891,7 @@ where
                     let _use_guard = PageUseGuard::new(&page);
 
                     {
-                        let mut page_data = page.data.write().await;
+                        let mut page_data = page.data.write();
                         page_data.bytes[block_off..block_off + take]
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
@@ -904,7 +900,7 @@ where
                 }
                 WriteAcquire::Direct(page) => {
                     {
-                        let mut page_data = page.data.write().await;
+                        let mut page_data = page.data.write();
                         page_data.bytes[block_off..block_off + take]
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
@@ -947,7 +943,7 @@ where
         let mut i = 0usize;
 
         while i < self.shards.len() {
-            let mut shard = self.shards[i].lock().await;
+            let mut shard = self.shards[i].lock();
             let mut keys = Vec::new();
 
             shard.index.for_each(|k, v| {
@@ -998,7 +994,7 @@ where
         let mut i = 0usize;
 
         while i < self.shards.len() {
-            let shard = self.shards[i].lock().await;
+            let shard = self.shards[i].lock();
             total += shard.index.len();
             i += 1;
         }
