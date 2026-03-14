@@ -437,7 +437,7 @@ pub async fn vol_pdo_read<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     buf_len: usize,
 ) -> DriverStep {
-    let dx = ext::<VolPdoExt>(&dev);
+    let dx = ext::<VolPdoExt>(dev);
 
     let cache = match dx.cache.get() {
         Some(c) => c,
@@ -468,19 +468,28 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
+    let req_data_len = {
+        let r = req.read();
+        r.data_len()
+    };
+
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req.read().data_len());
+    len = core::cmp::min(len, req_data_len);
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let mut guard = req.write();
-    let buf = &mut guard.data_slice_mut()[..len];
-    match cache.read_at(offset, buf).await {
-        Ok(()) => DriverStep::complete(DriverStatus::Success),
+    let mut temp = alloc::vec![0u8; len];
+
+    match cache.read_at(offset, temp.as_mut_slice()).await {
+        Ok(()) => {
+            let mut w = req.write();
+            w.data_slice_mut()[..len].copy_from_slice(temp.as_slice());
+            DriverStep::complete(DriverStatus::Success)
+        }
         Err(CacheError::Backend(s)) => DriverStep::complete(s),
         Err(_) => DriverStep::complete(DriverStatus::Unsuccessful),
     }

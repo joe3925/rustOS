@@ -1,4 +1,5 @@
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::arch::asm;
 
 use alloc::sync::Arc;
@@ -269,17 +270,20 @@ impl IrqHandleInner {
             return;
         }
 
-        // Drain waiters and wake them closed.
-        loop {
-            let waiter_opt = {
-                let mut st = self.state.lock();
-                st.pending_signals = 0;
-                st.pop_waiter()
-            };
+        let waiters = {
+            let mut st = self.state.lock();
+            st.pending_signals = 0;
 
-            let Some(waiter) = waiter_opt else { break };
+            let mut drained = Vec::with_capacity(st.waiters.len());
+            while let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                drained.push(waiter);
+            }
+            drained
+        };
+
+        for waiter in waiters {
             waiter.store_result(IrqWaitResult::closed());
-            waiter.clear();
             waiter.wake();
         }
     }
@@ -288,21 +292,23 @@ impl IrqHandleInner {
         if self.is_closed() {
             return;
         }
+
         let waiter_opt = {
             let mut st = self.state.lock();
             st.last_meta = meta;
-            st.pop_waiter().map(|w| {
-                w.enqueued.store(false, Ordering::Release);
-                w
-            })
+
+            if let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                Some(waiter)
+            } else {
+                st.pending_signals = st.pending_signals.saturating_add(1);
+                None
+            }
         };
 
         if let Some(waiter) = waiter_opt {
             waiter.store_result(IrqWaitResult::ok_n(meta, 1));
             waiter.wake();
-        } else {
-            let mut st = self.state.lock();
-            st.pending_signals = st.pending_signals.saturating_add(1);
         }
     }
 
@@ -314,18 +320,19 @@ impl IrqHandleInner {
         let waiter_opt = {
             let mut st = self.state.lock();
             st.last_meta = meta;
-            st.pop_waiter().map(|w| {
-                w.enqueued.store(false, Ordering::Release);
-                w
-            })
+
+            if let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                Some(waiter)
+            } else {
+                st.pending_signals = 1;
+                None
+            }
         };
 
         if let Some(waiter) = waiter_opt {
             waiter.store_result(IrqWaitResult::ok_n(meta, 1));
             waiter.wake();
-        } else {
-            let mut st = self.state.lock();
-            st.pending_signals = 1;
         }
     }
 
@@ -334,32 +341,30 @@ impl IrqHandleInner {
             return 0;
         }
 
-        let mut woken = 0;
-        // Wake up to n waiters.
-        for _ in 0..n {
-            let waiter_opt = {
-                let mut st = self.state.lock();
-                st.last_meta = meta;
-                st.pop_waiter().map(|w| {
-                    w.enqueued.store(false, Ordering::Release);
-                    w
-                })
-            };
-
-            match waiter_opt {
-                Some(waiter) => {
-                    waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-                    waiter.wake();
-                    woken += 1;
-                }
-                None => break,
-            }
-        }
-
-        if woken < n {
+        let waiters = {
             let mut st = self.state.lock();
-            st.pending_signals = st.pending_signals.saturating_add(n - woken);
+            st.last_meta = meta;
+
+            let mut drained = Vec::with_capacity(n.min(st.waiters.len()));
+            for _ in 0..n {
+                let Some(waiter) = st.pop_waiter() else { break };
+                waiter.enqueued.store(false, Ordering::Release);
+                drained.push(waiter);
+            }
+
+            if drained.len() < n {
+                st.pending_signals = st.pending_signals.saturating_add(n - drained.len());
+            }
+
+            drained
+        };
+
+        let woken = waiters.len();
+        for waiter in waiters.iter() {
+            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
+            waiter.wake();
         }
+
         woken
     }
 

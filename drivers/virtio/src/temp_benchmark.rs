@@ -1,11 +1,11 @@
 use alloc::vec::Vec;
 use core::hint::spin_loop;
-
 use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::irq::{IrqHandleExt, irq_wait_ok};
 use kernel_api::kernel_types::irq::IrqMeta;
+use kernel_api::println;
 use kernel_api::status::DriverStatus;
 
 use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
@@ -250,6 +250,7 @@ pub async fn bench_sweep_params(
     let mut result = BenchSweepResult::default();
     let current_sector: u64 = params.start_sector;
     for level in levels {
+        println!("Starting level: {}", level);
         if (result.used as usize) >= result.levels.len() {
             break;
         }
