@@ -309,7 +309,7 @@ pub fn apic_program_period_ms(ms: u64) {
     apic_program_period_ns(ns);
 }
 
-/// Return the list of known APIC logical IDs (BSP first).
+/// Return the list of known APIC logical IDs.
 pub fn apic_logical_ids() -> Vec<u8> {
     let mut ids = Vec::new();
     ids.push(get_current_logical_id());

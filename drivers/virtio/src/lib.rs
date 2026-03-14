@@ -297,7 +297,7 @@ async fn virtio_pnp_start<'a, 'b>(
                 }
             };
 
-            let target_cpu = (queue_idx % cpu_count) as u8;
+            let target_cpu = cpu_ids[queue_idx % cpu_count];
             let table_index = queue_idx as u16;
 
             match setup_msix_via_pci(&dev, vector, target_cpu, table_index).await {
