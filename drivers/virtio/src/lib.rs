@@ -17,17 +17,16 @@ use core::hint::spin_loop;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
-
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
-    IrqHandle, irq_alloc_vector, irq_free_vector, irq_register_isr, irq_register_isr_gsi,
-    irq_wait_ok,
+    IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
+    irq_register_isr_gsi, irq_wait_ok,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
-use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
+use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{unmap_mmio_region, unmap_range};
@@ -108,21 +107,18 @@ pub extern "win64" fn virtio_device_add(
 extern "win64" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: *mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandlePtr,
+    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    handle: IrqHandle,
     ctx: usize,
 ) -> bool {
     let isr_va = ctx as *const u8;
     let isr_status = unsafe { core::ptr::read_volatile(isr_va) };
 
     if isr_status & 1 != 0 {
-        if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-            h.signal_one(IrqMeta {
-                tag: 0,
-                data: [0; 3],
-            });
-            core::mem::forget(h);
-        }
+        handle.signal_one(IrqMeta {
+            tag: 0,
+            data: [0; 3],
+        });
         true
     } else {
         false
@@ -132,17 +128,14 @@ extern "win64" fn virtio_isr(
 extern "win64" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: *mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandlePtr,
+    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    handle: IrqHandle,
     _ctx: usize,
 ) -> bool {
-    if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-        h.signal_one(IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        });
-        core::mem::forget(h);
-    }
+    handle.signal_one(IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    });
     true
 }
 
@@ -770,7 +763,7 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
                     let waiters = qs.waiting_tasks.load(Ordering::Acquire);
                     let to_wake = waiters.saturating_sub(1);
                     if to_wake > 0 {
-                        irq_handle.signal_n(meta, to_wake);
+                        IrqHandleExt::signal_n(irq_handle, meta, to_wake);
                     }
                 }
             }

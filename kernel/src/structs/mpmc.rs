@@ -163,7 +163,6 @@ impl<T> Receiver<T> {
             if !self.inner.receivers_waiting.is_current_enqueued() {
                 continue;
             }
-
             SCHEDULER.park_current(BlockReason::ChannelRecv);
             self.inner.receivers_waiting.clear_current_if_queued();
         }

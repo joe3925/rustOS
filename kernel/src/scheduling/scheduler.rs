@@ -491,6 +491,9 @@ impl Scheduler {
     }
 
     pub fn park_current(&self, reason: BlockReason) {
+        if !x86_64::instructions::interrupts::are_enabled() {
+            panic!("Attempt to park with interrupts disabled, this will always cause a deadlock");
+        }
         let cpu_id = current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;

@@ -19,9 +19,11 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
-use kernel_api::irq::{IrqHandle, irq_register_isr, irq_register_isr_gsi, irq_wait_ok};
+use kernel_api::irq::{
+    IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
+};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
-use kernel_api::kernel_types::irq::{IrqHandlePtr, IrqMeta};
+use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{
@@ -81,8 +83,8 @@ fn continue_req(req: &mut RequestHandle) -> DriverStep {
 extern "win64" fn ide_isr(
     _vector: u8,
     _cpu: u32,
-    _frame: *mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandlePtr,
+    _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
+    handle: IrqHandle,
     ctx: usize,
 ) -> bool {
     // Read the status register to acknowledge/clear the IDE interrupt.
@@ -90,13 +92,10 @@ extern "win64" fn ide_isr(
     let mut status_port: Port<u8> = Port::new(io_base + 7);
     let _status = unsafe { status_port.read() };
 
-    if let Some(h) = unsafe { IrqHandle::from_raw(handle) } {
-        h.signal_one(IrqMeta {
-            tag: 0,
-            data: [0; 3],
-        });
-        core::mem::forget(h);
-    }
+    handle.signal_one(IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    });
     true
 }
 

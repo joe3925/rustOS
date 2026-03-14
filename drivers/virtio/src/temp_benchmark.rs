@@ -4,14 +4,13 @@ use core::hint::spin_loop;
 use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
-use kernel_api::irq::irq_wait_ok;
+use kernel_api::irq::{IrqHandleExt, irq_wait_ok};
 use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::status::DriverStatus;
 
 use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::dev_ext::DevExtInner;
 use crate::{WaitTasksGuard, rdtsc};
-
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 

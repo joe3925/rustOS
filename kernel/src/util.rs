@@ -54,7 +54,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 10_000;
+pub const APIC_START_PERIOD: u64 = 250_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -98,12 +98,15 @@ pub unsafe fn init() {
         let tsc_end = cpu::get_cycles();
         calibrate_tsc(tsc_start, tsc_end, 50);
         TOTAL_TIME.call_once(Stopwatch::start);
-
+        let apic_time = Stopwatch::start();
         match ApicImpl::init_apic_full() {
             Ok(_) => {
-                println!("APIC transition successful!");
                 x86_64::instructions::interrupts::disable();
                 APIC.lock().as_ref().unwrap().start_aps();
+                println!(
+                    "APIC init and AP start successful in {} s!",
+                    apic_time.elapsed_sec()
+                );
             }
             Err(err) => {
                 println!("APIC transition failed {}!", err.to_str());

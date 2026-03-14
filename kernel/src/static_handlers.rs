@@ -22,7 +22,7 @@ use kernel_types::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::{OpenFlags, Path},
     io::IoTarget,
-    irq::{IrqHandlePtr, IrqIsrFn, IrqMeta},
+    irq::{IrqHandle, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::RequestHandle,
     status::{Data, DriverStatus, FileStatus, PageMapError, RegError},
@@ -110,30 +110,30 @@ pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
     };
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+pub extern "win64" fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     irq_register(vector, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr {
+pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     irq_register_gsi(gsi, isr, ctx)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta) {
+pub extern "win64" fn kernel_irq_signal(handle: &IrqHandle, meta: IrqMeta) {
     irq_signal(handle, meta)
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_ensure_signal(handle: IrqHandlePtr, meta: IrqMeta) {
+pub extern "win64" fn kernel_irq_ensure_signal(handle: &IrqHandle, meta: IrqMeta) {
     irq_signal_exactly(handle, meta);
 }
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32) {
+pub extern "win64" fn kernel_irq_signal_n(handle: &IrqHandle, meta: IrqMeta, n: u32) {
     irq_signal_n(handle, meta, n)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal_all(handle: IrqHandlePtr, meta: IrqMeta) {
+pub extern "win64" fn kernel_irq_signal_all(handle: &IrqHandle, meta: IrqMeta) {
     irq_signal_all(handle, meta)
 }
 

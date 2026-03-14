@@ -14,7 +14,7 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
-use kernel_types::irq::{DropHook, IrqHandlePtr, IrqIsrFn, IrqMeta, IrqWaitResult};
+use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
@@ -52,24 +52,24 @@ unsafe extern "win64" {
     pub unsafe fn wake_task(id: u64);
 
     // IRQ
-    pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
-    pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandlePtr;
-    pub fn kernel_irq_signal(handle: IrqHandlePtr, meta: IrqMeta);
-    pub fn kernel_irq_signal_n(handle: IrqHandlePtr, meta: IrqMeta, n: u32);
-    pub fn kernel_irq_signal_all(handle: IrqHandlePtr, meta: IrqMeta);
-    pub fn kernel_irq_ensure_signal(handle: IrqHandlePtr, meta: IrqMeta);
-    pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandlePtr;
+    pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
+    pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
+    pub fn kernel_irq_signal(handle: &IrqHandle, meta: IrqMeta);
+    pub fn kernel_irq_signal_n(handle: &IrqHandle, meta: IrqMeta, n: u32);
+    pub fn kernel_irq_signal_all(handle: &IrqHandle, meta: IrqMeta);
+    pub fn kernel_irq_ensure_signal(handle: &IrqHandle, meta: IrqMeta);
+    pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandle;
 
-    pub fn irq_handle_clone(h: IrqHandlePtr) -> IrqHandlePtr;
-    pub fn irq_handle_drop(h: IrqHandlePtr);
+    pub fn irq_handle_clone(h: &IrqHandle) -> IrqHandle;
+    pub fn irq_handle_drop(h: IrqHandle);
 
-    pub fn irq_handle_unregister(h: IrqHandlePtr);
-    pub fn irq_handle_is_closed(h: IrqHandlePtr) -> bool;
+    pub fn irq_handle_unregister(h: &IrqHandle);
+    pub fn irq_handle_is_closed(h: &IrqHandle) -> bool;
 
-    pub fn irq_handle_set_user_ctx(h: IrqHandlePtr, v: usize);
-    pub fn irq_handle_get_user_ctx(h: IrqHandlePtr) -> usize;
+    pub fn irq_handle_set_user_ctx(h: &IrqHandle, v: usize);
+    pub fn irq_handle_get_user_ctx(h: &IrqHandle) -> usize;
 
-    pub fn irq_handle_wait_ffi(h: IrqHandlePtr, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
+    pub fn irq_handle_wait_ffi(h: &IrqHandle, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
 

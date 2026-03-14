@@ -445,6 +445,7 @@ dependencies = [
  "crossbeam-queue",
  "kernel_types",
  "spin 0.10.0",
+ "x86_64 0.15.2",
 ]
 
 [[package]]

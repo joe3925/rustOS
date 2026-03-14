@@ -1,5 +1,8 @@
+use core::hint::black_box;
+
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::{stack::KERNEL_STACK_MAX_BYTES, tables::kernel_cr3};
+use crate::println;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::static_handlers::get_current_cpu_id;
 use crate::util::PANIC_ACTIVE;
@@ -7,7 +10,6 @@ use alloc::fmt;
 use x86_64::registers::control::{Cr2, Cr3};
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 use x86_64::structures::paging::PageTableFlags;
-
 pub(crate) extern "x86-interrupt" fn divide_by_zero_fault(stack_frame: InterruptStackFrame) {
     panic!("EXCEPTION: DIVIDE BY ZERO\n{:#?}", stack_frame);
 }
@@ -23,7 +25,8 @@ pub(crate) extern "x86-interrupt" fn non_maskable_interrupt(stack_frame: Interru
 }
 
 pub(crate) extern "x86-interrupt" fn breakpoint_exception(stack_frame: InterruptStackFrame) {
-    panic!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+    println!("EXCEPTION: BREAKPOINT\n");
+    black_box(0);
 }
 
 pub(crate) extern "x86-interrupt" fn overflow_exception(stack_frame: InterruptStackFrame) {
