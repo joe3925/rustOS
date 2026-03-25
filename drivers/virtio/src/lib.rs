@@ -747,6 +747,23 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
         let epoch_before = qs.drain_epoch();
 
         if let Some(len) = qs.take_completion(head) {
+            // Drain the used ring before returning so that completions
+            // arriving from the ISR that woke us are not stranded.  Without
+            // this, another task's completion can sit in the used ring with
+            // no one left to drain or signal it.
+            if qs.try_acquire_drainer() {
+                let drained = qs.drain_used_to_completions_lockfree();
+                if drained > 0 {
+                    if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
+                        let waiters = qs.waiting_tasks.load(Ordering::Acquire);
+                        let to_wake = waiters.saturating_sub(1);
+                        if to_wake > 0 {
+                            IrqHandleExt::signal_n(irq_handle, meta, to_wake);
+                        }
+                    }
+                }
+                qs.release_drainer();
+            }
             qs.defer_free_chain(head);
             return Ok(len);
         }

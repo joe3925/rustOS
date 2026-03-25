@@ -397,10 +397,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     spawn_blocking(|| {
         wait_duration(Duration::from_millis(50));
         spawn_detached(async move {
-            // bench_c_drive_io_async().await;
+            bench_c_drive_io_async().await;
             // bench_async_vs_sync_call_latency_async().await;
-            run_virtio_bench_matrix_print().await;
-            // trigger_triple_fault();
+            // run_virtio_bench_matrix_print().await;
+            trigger_triple_fault();
         });
     });
     Ok(())
