@@ -842,7 +842,9 @@ async fn wait_for_completion(
         if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
             let wait_result = irq_handle.wait(meta).await;
 
-            if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
+            if wait_result.code == 4
+            /* IRQ_RESCUE_WAKEUP */
+            {
                 let isr_now = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
                 let isr_diff = isr_now.wrapping_sub(isr_start);
 
@@ -852,11 +854,13 @@ async fn wait_for_completion(
                 );
 
                 if isr_diff == 0 {
-                    println!("virtio-blk debug: -> NO INTERRUPTS RECEIVED. (Race condition 1)");
+                    panic!("virtio-blk debug: -> NO INTERRUPTS RECEIVED. (Race condition 1)");
                 } else if spurious_wake_count > 0 {
-                    println!("virtio-blk debug: -> WOKE UP PREVIOUSLY BUT FOUND NO COMPLETION. (Race condition 2)");
+                    panic!(
+                        "virtio-blk debug: -> WOKE UP PREVIOUSLY BUT FOUND NO COMPLETION. (Race condition 2)"
+                    );
                 } else {
-                    println!("virtio-blk debug: -> ISR FIRED BUT WAIT HUNG. (Race condition 3)");
+                    panic!("virtio-blk debug: -> ISR FIRED BUT WAIT HUNG. (Race condition 3)");
                 }
             } else if !irq_wait_ok(wait_result) {
                 return Err(DriverStatus::DeviceError);
@@ -1100,8 +1104,12 @@ pub async fn virtio_pdo_read<'a, 'b>(
         for qs in inner.queues.iter() {
             if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                 let wait_result = irq_handle.wait(meta).await;
-                if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
-                    println!("virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in read.");
+                if wait_result.code == 4
+                /* IRQ_RESCUE_WAKEUP */
+                {
+                    println!(
+                        "virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in read."
+                    );
                 } else if !irq_wait_ok(wait_result) {
                     return complete_req(req, DriverStatus::DeviceError);
                 }
@@ -1250,8 +1258,12 @@ pub async fn virtio_pdo_write<'a, 'b>(
         for qs in inner.queues.iter() {
             if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                 let wait_result = irq_handle.wait(meta).await;
-                if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
-                    println!("virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in write.");
+                if wait_result.code == 4
+                /* IRQ_RESCUE_WAKEUP */
+                {
+                    println!(
+                        "virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in write."
+                    );
                 } else if !irq_wait_ok(wait_result) {
                     return complete_req(req, DriverStatus::DeviceError);
                 }

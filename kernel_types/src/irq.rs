@@ -453,7 +453,7 @@ impl Future for IrqWaitFuture {
         if let Some(r) = this.waiter.take_result() {
             return Poll::Ready(r);
         }
-        if self.test_wakeup.load(Ordering::Relaxed) > 5000 {
+        if self.test_wakeup.load(Ordering::Relaxed) > 500_000 {
             return Poll::Ready(IrqWaitResult::rescue());
         }
         if this.handle.is_closed() {
