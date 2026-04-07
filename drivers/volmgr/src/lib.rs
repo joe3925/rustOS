@@ -11,6 +11,7 @@ use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::async_ffi::FutureExt;
+use kernel_api::println;
 
 use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
@@ -421,7 +422,8 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 
         if vol_len != 0 {
             let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
-            let cfg = CacheConfig::new(1024 * 1024 * 20 / BLOCK_SIZE);
+            // TODO: set this based on system memory and maybe volume size
+            let cfg = CacheConfig::new(1024 * 1024 * 50 / BLOCK_SIZE);
             if let Ok(cache) = VolCache::new(backend, cfg) {
                 pdx.cache.call_once(|| Arc::new(cache));
             }

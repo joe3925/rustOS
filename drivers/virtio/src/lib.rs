@@ -800,7 +800,6 @@ async fn wait_for_completion(
             if let Some(len) = qs.take_completion(head) {
                 qs.release_drainer();
                 qs.defer_free_chain(head);
-                record_completion(spurious_wake_count);
                 return Ok(len);
             }
 
@@ -808,7 +807,6 @@ async fn wait_for_completion(
         } else {
             if let Some(len) = qs.take_completion(head) {
                 qs.defer_free_chain(head);
-                record_completion(spurious_wake_count);
                 return Ok(len);
             }
         }
@@ -829,7 +827,6 @@ async fn wait_for_completion(
             while remaining_ns > 0 {
                 if let Some(len) = qs.take_completion(head) {
                     qs.defer_free_chain(head);
-                    record_completion(spurious_wake_count);
                     return Ok(len);
                 }
 
