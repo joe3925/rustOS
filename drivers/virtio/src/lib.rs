@@ -800,6 +800,7 @@ async fn wait_for_completion(
             if let Some(len) = qs.take_completion(head) {
                 qs.release_drainer();
                 qs.defer_free_chain(head);
+                record_completion(spurious_wake_count);
                 return Ok(len);
             }
 
@@ -807,6 +808,7 @@ async fn wait_for_completion(
         } else {
             if let Some(len) = qs.take_completion(head) {
                 qs.defer_free_chain(head);
+                record_completion(spurious_wake_count);
                 return Ok(len);
             }
         }
@@ -827,6 +829,7 @@ async fn wait_for_completion(
             while remaining_ns > 0 {
                 if let Some(len) = qs.take_completion(head) {
                     qs.defer_free_chain(head);
+                    record_completion(spurious_wake_count);
                     return Ok(len);
                 }
 
@@ -865,6 +868,20 @@ async fn wait_for_completion(
             } else if !irq_wait_ok(wait_result) {
                 return Err(DriverStatus::DeviceError);
             } else {
+                // Re-signal to break the pending_signals theft race: if this
+                // task woke up via a pending_signal that was intended for
+                // another task (whose waiter was not yet enqueued when
+                // signal_one fired), that other task's waiter will now receive
+                // a signal either directly (if already enqueued) or via the
+                // pending_signals counter (if it polls next).
+                // Guard on waiting_tasks > 1 to avoid feeding our own next
+                // poll in the single-task case, which would spin infinitely.
+                if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
+                    let waiters = qs.waiting_tasks.load(Ordering::Acquire);
+                    if waiters > 1 {
+                        IrqHandleExt::signal_one(irq_handle, wait_result.meta);
+                    }
+                }
                 spurious_wake_count += 1;
             }
         } else {
