@@ -4,11 +4,14 @@ use kernel_sys::{
     kernel_irq_free_vector, kernel_irq_register, kernel_irq_register_gsi, kernel_irq_signal,
     kernel_irq_signal_all, kernel_irq_signal_n,
 };
+use kernel_types::irq::IRQ_RESCUE_WAKEUP;
 pub use kernel_types::irq::{
     IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult, IRQ_WAIT_CLOSED, IRQ_WAIT_NULL, IRQ_WAIT_OK,
 };
 
 use kernel_types::async_ffi::FfiFuture;
+
+use crate::println;
 
 pub trait IrqHandleExt {
     fn unregister(&self);
@@ -96,6 +99,10 @@ pub fn apic_cpu_ids() -> alloc::vec::Vec<u8> {
 }
 
 pub fn irq_wait_ok(r: IrqWaitResult) -> bool {
+    if r.code == IRQ_RESCUE_WAKEUP {
+        println!("saved by rescue wakeup");
+        return true;
+    }
     r.code == IRQ_WAIT_OK
 }
 

@@ -75,6 +75,7 @@ pub const IRQ_WAIT_OK: u32 = 0;
 pub const IRQ_WAIT_CLOSED: u32 = 1;
 pub const IRQ_WAIT_NULL: u32 = 2;
 pub const IRQ_WAIT_TIMEOUT: u32 = 3;
+pub const IRQ_RESCUE_WAKEUP: u32 = 4;
 
 /// Result of waiting on an IRQ
 #[repr(C)]
@@ -129,6 +130,13 @@ impl IrqWaitResult {
     pub const fn timeout() -> Self {
         Self {
             code: IRQ_WAIT_TIMEOUT,
+            count: 0,
+            meta: IrqMeta::new(),
+        }
+    }
+    pub const fn rescue() -> Self {
+        Self {
+            code: IRQ_RESCUE_WAKEUP,
             count: 0,
             meta: IrqMeta::new(),
         }
@@ -302,6 +310,7 @@ impl IrqHandleInner {
                 Some(waiter)
             } else {
                 st.pending_signals = st.pending_signals.saturating_add(1);
+
                 None
             }
         };
@@ -390,6 +399,9 @@ impl IrqHandleInner {
             woken += 1;
         }
 
+        if woken == 0 {
+            self.signal_one(meta);
+        }
         woken
     }
 
@@ -412,6 +424,7 @@ impl IrqHandleInner {
         IrqWaitFuture {
             handle: Arc::clone(self),
             waiter: Waiter::new(),
+            test_wakeup: AtomicUsize::new(0),
         }
     }
 }
@@ -426,6 +439,8 @@ impl Drop for IrqHandleInner {
 
 pub struct IrqWaitFuture {
     handle: IrqHandle,
+    //TODO: Remove this
+    test_wakeup: AtomicUsize,
     waiter: Arc<Waiter>,
 }
 
@@ -438,7 +453,9 @@ impl Future for IrqWaitFuture {
         if let Some(r) = this.waiter.take_result() {
             return Poll::Ready(r);
         }
-
+        if self.test_wakeup.load(Ordering::Relaxed) > 5000 {
+            return Poll::Ready(IrqWaitResult::rescue());
+        }
         if this.handle.is_closed() {
             return Poll::Ready(IrqWaitResult::closed());
         }
@@ -458,7 +475,7 @@ impl Future for IrqWaitFuture {
                 st.push_waiter(this.waiter.clone());
             }
         }
-
+        self.test_wakeup.fetch_add(1, Ordering::Relaxed);
         Poll::Pending
     }
 }

@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use kernel_routing::println;
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{DropHook, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqWaitResult};
 use spin::{Once, RwLock};

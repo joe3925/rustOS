@@ -37,7 +37,7 @@ use kernel_api::pnp::{
 };
 use kernel_api::request::{RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
-use kernel_api::util::{panic_common, wait_duration};
+use kernel_api::util::{get_current_cpu_id, panic_common, wait_duration};
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
@@ -60,6 +60,7 @@ const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 0;
 const SPIN_WAIT_SLICE_NS: u64 = 50;
 
 static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
+static DEBUG_ISR_FIRED: AtomicU64 = AtomicU64::new(0);
 
 // legacy helpers
 #[inline(always)]
@@ -111,6 +112,7 @@ extern "win64" fn virtio_isr(
     handle: IrqHandle,
     ctx: usize,
 ) -> bool {
+    DEBUG_ISR_FIRED.fetch_add(1, Ordering::Relaxed);
     let isr_va = ctx as *const u8;
     let isr_status = unsafe { core::ptr::read_volatile(isr_va) };
 
@@ -132,6 +134,7 @@ extern "win64" fn virtio_msix_isr(
     handle: IrqHandle,
     _ctx: usize,
 ) -> bool {
+    DEBUG_ISR_FIRED.fetch_add(1, Ordering::Relaxed);
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],
@@ -735,7 +738,11 @@ fn spin_for_ns(ns: u64) {
     wait_duration(Duration::from_nanos(ns));
 }
 
-async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverStatus> {
+async fn wait_for_completion(
+    qs: &QueueState,
+    head: u16,
+    inner: &Arc<DevExtInner>,
+) -> Result<u32, DriverStatus> {
     let meta = IrqMeta {
         tag: 0,
         data: [0; 3],
@@ -743,7 +750,12 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
 
     let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
 
+    let isr_start = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
+    let mut spurious_wake_count = 0;
+    let mut loop_iterations = 0;
+
     loop {
+        loop_iterations += 1;
         let epoch_before = qs.drain_epoch();
 
         if let Some(len) = qs.take_completion(head) {
@@ -823,11 +835,33 @@ async fn wait_for_completion(qs: &QueueState, head: u16) -> Result<u32, DriverSt
                 remaining_ns -= slice;
             }
         }
-
+        if let Some(len) = qs.take_completion(head) {
+            qs.defer_free_chain(head);
+            return Ok(len);
+        }
         if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
             let wait_result = irq_handle.wait(meta).await;
-            if !irq_wait_ok(wait_result) {
+
+            if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
+                let isr_now = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
+                let isr_diff = isr_now.wrapping_sub(isr_start);
+
+                println!(
+                    "virtio-blk debug: RESCUE WAKEUP for head {}. ISRs fired since wait start: {}. Spurious wakes: {}. Loops: {}.",
+                    head, isr_diff, spurious_wake_count, loop_iterations
+                );
+
+                if isr_diff == 0 {
+                    println!("virtio-blk debug: -> NO INTERRUPTS RECEIVED. (Race condition 1)");
+                } else if spurious_wake_count > 0 {
+                    println!("virtio-blk debug: -> WOKE UP PREVIOUSLY BUT FOUND NO COMPLETION. (Race condition 2)");
+                } else {
+                    println!("virtio-blk debug: -> ISR FIRED BUT WAIT HUNG. (Race condition 3)");
+                }
+            } else if !irq_wait_ok(wait_result) {
                 return Err(DriverStatus::DeviceError);
+            } else {
+                spurious_wake_count += 1;
             }
         } else {
             spin_loop();
@@ -1035,7 +1069,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head).await {
+            let _ = match wait_for_completion(qs, head, &inner).await {
                 Ok(l) => l,
                 Err(e) => return complete_req(req, e),
             };
@@ -1066,7 +1100,9 @@ pub async fn virtio_pdo_read<'a, 'b>(
         for qs in inner.queues.iter() {
             if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                 let wait_result = irq_handle.wait(meta).await;
-                if !irq_wait_ok(wait_result) {
+                if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
+                    println!("virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in read.");
+                } else if !irq_wait_ok(wait_result) {
                     return complete_req(req, DriverStatus::DeviceError);
                 }
                 waited = true;
@@ -1189,7 +1225,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head).await {
+            let _ = match wait_for_completion(qs, head, &inner).await {
                 Ok(l) => l,
                 Err(e) => return complete_req(req, e),
             };
@@ -1214,7 +1250,9 @@ pub async fn virtio_pdo_write<'a, 'b>(
         for qs in inner.queues.iter() {
             if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
                 let wait_result = irq_handle.wait(meta).await;
-                if !irq_wait_ok(wait_result) {
+                if wait_result.code == 4 /* IRQ_RESCUE_WAKEUP */ {
+                    println!("virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in write.");
+                } else if !irq_wait_ok(wait_result) {
                     return complete_req(req, DriverStatus::DeviceError);
                 }
                 waited = true;
