@@ -33,6 +33,7 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
                 offset: 0,
                 len: BLOCK_SIZE,
                 flush_write_through: false,
+                owner: 0,
             },
             RequestData::from_boxed_bytes(data),
         )

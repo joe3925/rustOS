@@ -118,7 +118,7 @@ impl IoType {
             RequestType::Write { .. } => Some(1),
             RequestType::DeviceControl(_) => Some(2),
             RequestType::Fs(_) => Some(3),
-            RequestType::Flush { .. } | RequestType::FlushDirty { .. } => Some(4),
+            RequestType::Flush { .. } | RequestType::FlushDirty { .. } | RequestType::FlushOwner { .. } => Some(4),
             _ => None,
         }
     }

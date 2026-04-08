@@ -2,7 +2,7 @@ use alloc::{vec, vec::Vec};
 use core::{cmp::min, mem};
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
@@ -32,6 +32,8 @@ pub struct BlockDev {
     write_req: RequestHandle<'static>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
+    /// Current file owner tag — set before FS writes, read by prep_write_req.
+    pub(crate) current_owner: Arc<AtomicU64>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -57,6 +59,7 @@ impl BlockDev {
         sector_size: u16,
         total_sectors: u64,
         should_flush: Arc<AtomicBool>,
+        current_owner: Arc<AtomicU64>,
     ) -> Self {
         let scratch = vec![0u8; sector_size as usize];
         // Allocate max-sized data buffers once; reuse without shrinking.
@@ -73,6 +76,7 @@ impl BlockDev {
                     offset: 0,
                     len: 0,
                     flush_write_through: false,
+                    owner: 0,
                 },
                 data,
             );
@@ -88,6 +92,7 @@ impl BlockDev {
             read_req,
             write_req,
             should_flush,
+            current_owner,
         }
     }
 
@@ -145,6 +150,7 @@ impl BlockDev {
                     offset,
                     len,
                     flush_write_through,
+                    owner: self.current_owner.load(Ordering::Acquire),
                 };
                 r.data.as_mut_slice()[..len].copy_from_slice(src);
                 r.completed = false;
@@ -401,6 +407,11 @@ impl Write for BlockDev {
     }
 }
 pub fn flush(vdx: &VolCtrlDevExt) {
+    vdx.should_flush.store(true, Ordering::SeqCst);
+}
+
+pub fn flush_owner(vdx: &VolCtrlDevExt, owner: u64) {
+    vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 

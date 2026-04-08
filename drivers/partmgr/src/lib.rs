@@ -180,6 +180,7 @@ pub async fn partition_pdo_write<'a, 'b>(
                 offset,
                 len,
                 flush_write_through,
+                owner,
             } => {
                 if buf_len != len {
                     Err(DriverStatus::InvalidParameter)
@@ -192,14 +193,14 @@ pub async fn partition_pdo_write<'a, 'b>(
                     {
                         Err(DriverStatus::InvalidParameter)
                     } else {
-                        Ok((offset, flush_write_through))
+                        Ok((offset, flush_write_through, owner))
                     }
                 }
             }
             _ => Err(DriverStatus::InvalidParameter),
         }
     };
-    let (off, flush_write_through) = match off_res {
+    let (off, flush_write_through, owner) = match off_res {
         Ok(v) => v,
         Err(st) => return DriverStep::complete(st),
     };
@@ -212,6 +213,7 @@ pub async fn partition_pdo_write<'a, 'b>(
         offset: phys_off,
         len: buf_len,
         flush_write_through,
+        owner,
     };
 
     let status = send_req_parent(dx.parent.get().unwrap(), request).await;

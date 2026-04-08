@@ -52,10 +52,12 @@ export! {
     kernel_irq_register,
     kernel_irq_register_gsi,
     kernel_irq_signal,
+    kernel_irq_ensure_signal,
     kernel_irq_signal_n,
     kernel_irq_signal_all,
     kernel_irq_alloc_vector,
     kernel_irq_free_vector,
+
     irq_handle_create,
     irq_handle_clone,
     irq_handle_drop,

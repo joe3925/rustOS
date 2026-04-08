@@ -94,6 +94,8 @@ struct Page<const BLOCK_SIZE: usize> {
     generation: AtomicU64,
     wb_generation: AtomicU64,
     active_ops: AtomicUsize,
+    /// File-level owner tag. 0 = unowned (included in all targeted flushes).
+    owner: AtomicU64,
 }
 
 impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
@@ -105,10 +107,17 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
             active_ops: AtomicUsize::new(0),
+            owner: AtomicU64::new(0),
         }
     }
 
     fn mark_dirty(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.dirty.store(true, Ordering::Release);
+    }
+
+    fn mark_dirty_with_owner(&self, owner: u64) {
+        self.owner.store(owner, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.dirty.store(true, Ordering::Release);
     }
@@ -162,6 +171,30 @@ impl<I> Shard<I> {
 enum WriteAcquire<const BLOCK_SIZE: usize> {
     Cached(Arc<Page<BLOCK_SIZE>>),
     Direct(Arc<Page<BLOCK_SIZE>>),
+}
+
+/// Filter predicate for flush operations.
+enum FlushFilter<'a> {
+    /// Flush all dirty pages.
+    All,
+    /// Flush dirty pages within a block range.
+    BlockRange(&'a Range<u64>),
+    /// Flush dirty pages belonging to the given owner (and unowned pages where owner == 0).
+    Owner(u64),
+}
+
+impl FlushFilter<'_> {
+    #[inline]
+    fn matches<const BLOCK_SIZE: usize>(&self, lba: u64, page: &Page<BLOCK_SIZE>) -> bool {
+        match self {
+            FlushFilter::All => true,
+            FlushFilter::BlockRange(r) => lba >= r.start && lba < r.end,
+            FlushFilter::Owner(owner) => {
+                let page_owner = page.owner.load(Ordering::Acquire);
+                page_owner == *owner || page_owner == 0
+            }
+        }
+    }
 }
 
 struct FlushScratch<const BLOCK_SIZE: usize> {
@@ -447,6 +480,7 @@ where
                 offset: lba * BLOCK_SIZE as u64,
                 len: BLOCK_SIZE,
                 flush_write_through: false,
+                owner: 0,
             },
             RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
         );
@@ -502,6 +536,7 @@ where
                 offset: lba * BLOCK_SIZE as u64,
                 len: BLOCK_SIZE,
                 flush_write_through: false,
+                owner: 0,
             },
             RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
         );
@@ -575,7 +610,7 @@ where
     async fn flush_shard_streaming(
         &self,
         shard_idx: usize,
-        block_range: Option<&Range<u64>>,
+        filter: &FlushFilter<'_>,
         parallelism: usize,
     ) -> Result<(), CacheError<B::Error>> {
         let (batch, mut joins) = {
@@ -592,7 +627,7 @@ where
                 }
 
                 shard.index.for_each_chunk(0, usize::MAX, |k, v| {
-                    if block_range.map_or(true, |r| k >= r.start && k < r.end) {
+                    if filter.matches(k, v) {
                         scratch.batch.push((k, Arc::clone(v)));
                     }
                 });
@@ -630,7 +665,7 @@ where
     ) -> Result<(), CacheError<B::Error>> {
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
-            self.flush_shard_streaming(shard_idx, None, parallelism)
+            self.flush_shard_streaming(shard_idx, &FlushFilter::All, parallelism)
                 .await?;
             shard_idx += 1;
         }
@@ -716,14 +751,14 @@ where
         handle.result.lock().as_ref().cloned().unwrap_or(Ok(()))
     }
 
-    async fn flush_internal_range(
+    async fn flush_internal_filtered(
         &self,
-        block_range: Range<u64>,
+        filter: &FlushFilter<'_>,
     ) -> Result<(), CacheError<B::Error>> {
         self.check_open()?;
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
-            self.flush_shard_streaming(shard_idx, Some(&block_range), self.cfg.flush_parallelism)
+            self.flush_shard_streaming(shard_idx, filter, self.cfg.flush_parallelism)
                 .await?;
             shard_idx += 1;
         }
@@ -734,19 +769,24 @@ where
             .map_err(CacheError::Backend)
     }
 
-    async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
-        self.check_open()?;
-        let mut shard_idx = 0usize;
-        while shard_idx < self.shards.len() {
-            self.flush_shard_streaming(shard_idx, None, self.cfg.flush_parallelism)
-                .await?;
-            shard_idx += 1;
-        }
-
-        self.backend
-            .flush_device()
+    async fn flush_internal_range(
+        &self,
+        block_range: Range<u64>,
+    ) -> Result<(), CacheError<B::Error>> {
+        self.flush_internal_filtered(&FlushFilter::BlockRange(&block_range))
             .await
-            .map_err(CacheError::Backend)
+    }
+
+    async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
+        self.flush_internal_filtered(&FlushFilter::All).await
+    }
+
+    async fn flush_internal_owner(
+        &self,
+        owner: u64,
+    ) -> Result<(), CacheError<B::Error>> {
+        self.flush_internal_filtered(&FlushFilter::Owner(owner))
+            .await
     }
 
     async fn invalidate_blocks_after_flush(
@@ -822,6 +862,72 @@ where
             }
         });
     }
+
+    /// Shared write implementation that optionally tags pages with an owner.
+    async fn write_at_inner(
+        &self,
+        offset: u64,
+        data: &[u8],
+        owner: u64,
+    ) -> Result<(), CacheError<B::Error>> {
+        self.check_open()?;
+        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, data.len())?;
+
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let mut src_pos = 0usize;
+        let mut cur_off = offset;
+        let bs_u64 = VolumeCache::<B, BLOCK_SIZE, F>::block_size_u64();
+
+        while src_pos < data.len() {
+            let lba = cur_off / bs_u64;
+            let block_off = (cur_off % bs_u64) as usize;
+            let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
+
+            let acquired = self
+                .get_or_create_write_page(lba, block_off, take, &data[src_pos..src_pos + take])
+                .await?;
+
+            match acquired {
+                WriteAcquire::Cached(page) => {
+                    let _use_guard = PageUseGuard::new(&page);
+
+                    {
+                        let mut page_data = page.data.write();
+                        page_data.bytes[block_off..block_off + take]
+                            .copy_from_slice(&data[src_pos..src_pos + take]);
+                    }
+
+                    if owner != 0 {
+                        page.mark_dirty_with_owner(owner);
+                    } else {
+                        page.mark_dirty();
+                    }
+                }
+                WriteAcquire::Direct(page) => {
+                    {
+                        let mut page_data = page.data.write();
+                        page_data.bytes[block_off..block_off + take]
+                            .copy_from_slice(&data[src_pos..src_pos + take]);
+                    }
+
+                    if owner != 0 {
+                        page.mark_dirty_with_owner(owner);
+                    } else {
+                        page.mark_dirty();
+                    }
+                    self.direct_write_page(lba, &page).await?;
+                }
+            }
+
+            src_pos += take;
+            cur_off += take as u64;
+        }
+
+        Ok(())
+    }
 }
 
 impl<B, const BLOCK_SIZE: usize, F> VolumeCacheOps for Arc<VolumeCache<B, BLOCK_SIZE, F>>
@@ -866,64 +972,29 @@ where
     }
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        self.check_open()?;
-        let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, data.len())?;
+        self.write_at_inner(offset, data, 0).await
+    }
 
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        let mut src_pos = 0usize;
-        let mut cur_off = offset;
-        let bs_u64 = VolumeCache::<B, BLOCK_SIZE, F>::block_size_u64();
-
-        while src_pos < data.len() {
-            let lba = cur_off / bs_u64;
-            let block_off = (cur_off % bs_u64) as usize;
-            let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
-
-            let acquired = self
-                .get_or_create_write_page(lba, block_off, take, &data[src_pos..src_pos + take])
-                .await?;
-
-            match acquired {
-                WriteAcquire::Cached(page) => {
-                    let _use_guard = PageUseGuard::new(&page);
-
-                    {
-                        let mut page_data = page.data.write();
-                        page_data.bytes[block_off..block_off + take]
-                            .copy_from_slice(&data[src_pos..src_pos + take]);
-                    }
-
-                    page.mark_dirty();
-                }
-                WriteAcquire::Direct(page) => {
-                    {
-                        let mut page_data = page.data.write();
-                        page_data.bytes[block_off..block_off + take]
-                            .copy_from_slice(&data[src_pos..src_pos + take]);
-                    }
-
-                    page.mark_dirty();
-                    self.direct_write_page(lba, &page).await?;
-                }
-            }
-
-            src_pos += take;
-            cur_off += take as u64;
-        }
-
-        Ok(())
+    async fn write_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error> {
+        self.write_at_inner(offset, data, owner).await
     }
 
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        self.write_at(offset, data).await?;
+        self.write_at_inner(offset, data, 0).await?;
         self.flush_range(offset, data.len()).await
+    }
+
+    async fn write_through_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error> {
+        self.write_at_inner(offset, data, owner).await?;
+        self.flush_internal_owner(owner).await
     }
 
     async fn flush(&self) -> Result<(), Self::Error> {
         self.flush_internal_all().await
+    }
+
+    async fn flush_owner(&self, owner: u64) -> Result<(), Self::Error> {
+        self.flush_internal_owner(owner).await
     }
 
     async fn flush_range(&self, offset: u64, len: usize) -> Result<(), Self::Error> {

@@ -123,9 +123,11 @@ pub async fn fs_root_ioctl<'a, 'b>(
             let target_clone = id.volume_fdo.clone();
             let should_flush = Arc::new(AtomicBool::new(false));
             let should_flush_blk = should_flush.clone();
+            let current_owner = Arc::new(AtomicU64::new(0));
+            let current_owner_blk = current_owner.clone();
             let result = spawn_blocking(move || {
                 fatfs::FileSystem::new(
-                    BlockDev::new(target_clone, sector_size, total_sectors, should_flush_blk),
+                    BlockDev::new(target_clone, sector_size, total_sectors, should_flush_blk, current_owner_blk),
                     options,
                 )
             })
@@ -141,6 +143,8 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         table: RwLock::new(BTreeMap::new()),
                         volume_target: id.volume_fdo.clone(),
                         should_flush,
+                        pending_flush_owner: Arc::new(AtomicU64::new(0)),
+                        current_owner,
                     };
 
                     let mut init = DeviceInit::new(io_vtable, None);

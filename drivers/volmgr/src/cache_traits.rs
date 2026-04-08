@@ -95,9 +95,12 @@ pub trait VolumeCacheOps {
 
     async fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), Self::Error>;
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
+    async fn write_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error>;
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
+    async fn write_through_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error>;
 
     async fn flush(&self) -> Result<(), Self::Error>;
+    async fn flush_owner(&self, owner: u64) -> Result<(), Self::Error>;
     async fn flush_range(&self, offset: u64, len: usize) -> Result<(), Self::Error>;
 
     async fn invalidate_range(&self, offset: u64, len: usize) -> Result<usize, Self::Error>;

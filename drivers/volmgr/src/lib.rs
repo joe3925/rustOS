@@ -117,6 +117,7 @@ impl VolumeCacheBackend for CacheBackend {
                     offset,
                     len: block_len,
                     flush_write_through: false,
+                    owner: 0,
                 },
                 RequestData::from_boxed_bytes(vec![0u8; block_len].into_boxed_slice()),
             );
@@ -150,6 +151,7 @@ impl VolumeCacheBackend for CacheBackend {
                     offset,
                     len,
                     flush_write_through,
+                    owner,
                 } = w.kind
                 {
                     let lba = offset / BLOCK_SIZE as u64;
@@ -163,6 +165,7 @@ impl VolumeCacheBackend for CacheBackend {
                             offset,
                             len: clamped,
                             flush_write_through,
+                            owner,
                         };
                     }
                 }
@@ -515,12 +518,13 @@ pub async fn vol_pdo_write<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let (offset, len_req, flush_write_through) = match req.read().kind {
+    let (offset, len_req, flush_write_through, owner) = match req.read().kind {
         RequestType::Write {
             offset,
             len,
             flush_write_through,
-        } => (offset, len, flush_write_through),
+            owner,
+        } => (offset, len, flush_write_through, owner),
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
@@ -546,10 +550,11 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let data = req.read().data_slice()[..len].to_vec();
 
-    let result = if flush_write_through {
-        cache.write_through_at(offset, &data).await
-    } else {
-        cache.write_at(offset, &data).await
+    let result = match (flush_write_through, owner) {
+        (true, o) if o != 0 => cache.write_through_at_owned(offset, &data, o).await,
+        (true, _) => cache.write_through_at(offset, &data).await,
+        (false, o) if o != 0 => cache.write_at_owned(offset, &data, o).await,
+        (false, _) => cache.write_at(offset, &data).await,
     };
 
     match result {
@@ -571,12 +576,24 @@ pub async fn vol_pdo_flush<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let should_block = match req.read().kind {
+    let (should_block, flush_owner) = match req.read().kind {
         RequestType::Flush { should_block } | RequestType::FlushDirty { should_block } => {
-            should_block
+            (should_block, None)
+        }
+        RequestType::FlushOwner { owner, should_block } => {
+            (should_block, Some(owner))
         }
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
+
+    // Owner-targeted flush: flush only pages belonging to this file.
+    if let Some(owner) = flush_owner {
+        match cache.flush_owner(owner).await {
+            Ok(()) => return DriverStep::complete(DriverStatus::Success),
+            Err(CacheError::Backend(s)) => return DriverStep::complete(s),
+            Err(_) => return DriverStep::complete(DriverStatus::Unsuccessful),
+        }
+    }
 
     if should_block {
         match cache.wait_for_flush_job().await {

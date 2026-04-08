@@ -472,6 +472,8 @@ pub enum RequestType {
         offset: u64,
         len: usize,
         flush_write_through: bool,
+        /// File-level owner tag. 0 = unowned (included in all targeted flushes).
+        owner: u64,
     },
     Flush {
         /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
@@ -481,6 +483,11 @@ pub enum RequestType {
     FlushDirty {
         /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
         /// This flag can have unforeseen consequences if set to true, if something is activley writing data it is likely you won't return until they stop.
+        should_block: bool,
+    },
+    /// Flush only dirty cache pages belonging to the given owner (and unowned pages).
+    FlushOwner {
+        owner: u64,
         should_block: bool,
     },
     DeviceControl(u32),

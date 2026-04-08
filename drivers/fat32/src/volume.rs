@@ -1,4 +1,4 @@
-use crate::block_dev::flush;
+use crate::block_dev::flush_owner;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -49,6 +49,10 @@ pub struct VolCtrlDevExt {
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
     pub should_flush: Arc<AtomicBool>,
+    /// Owner tag of the file that requested the pending flush (0 = flush all dirty).
+    pub pending_flush_owner: Arc<AtomicU64>,
+    /// Current file owner tag — shared with BlockDev, set before FS writes.
+    pub current_owner: Arc<AtomicU64>,
 }
 
 pub struct FileCtx {
@@ -290,6 +294,7 @@ fn execute_fs_work(
         }
 
         FsWork::Write(params) => {
+            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
             let write_res: Result<usize, FileStatus> = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -304,7 +309,7 @@ fn execute_fs_work(
                                 match file.write_all(&params.data) {
                                     Ok(()) => {
                                         if params.write_through {
-                                            flush(&vdx);
+                                            flush_owner(&vdx, params.fs_file_id);
                                             Ok(n)
                                         } else {
                                             Ok(n)
@@ -318,6 +323,7 @@ fn execute_fs_work(
                     },
                 }
             };
+            vdx.current_owner.store(0, Ordering::Release);
 
             if let Ok(written) = write_res {
                 let mut tbl = vdx.table.write();
@@ -378,6 +384,7 @@ fn execute_fs_work(
         }
 
         FsWork::Flush(params) => {
+            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -389,7 +396,8 @@ fn execute_fs_work(
                     },
                 }
             };
-            flush(&vdx);
+            vdx.current_owner.store(0, Ordering::Release);
+            flush_owner(&vdx, params.fs_file_id);
             let res = FsFlushResult { error: err };
             (DriverStatus::Success, Some(FsReply::Flush(res)))
         }
@@ -473,10 +481,7 @@ fn execute_fs_work(
                     Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
                         Ok(mut file) => match file.seek(SeekFrom::Start(params.new_size)) {
                             Ok(_) => match file.truncate() {
-                                Ok(()) => {
-                                    flush(&vdx);
-                                    None
-                                }
+                                Ok(()) => None,
                                 Err(e) => Some(map_fatfs_err(&e)),
                             },
                             Err(e) => Some(map_fatfs_err(&e)),
@@ -501,6 +506,7 @@ fn execute_fs_work(
         }
 
         FsWork::Append(params) => {
+            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
             let result: Result<(usize, u64), FileStatus> = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -515,7 +521,7 @@ fn execute_fs_work(
                                     match file.write_all(&params.data) {
                                         Ok(()) => {
                                             if params.write_through {
-                                                flush(&vdx);
+                                                flush_owner(&vdx, params.fs_file_id);
                                                 Ok((n, start_off + n as u64))
                                             } else {
                                                 Ok((n, start_off + n as u64))
@@ -531,6 +537,7 @@ fn execute_fs_work(
                     },
                 }
             };
+            vdx.current_owner.store(0, Ordering::Release);
 
             if let Ok((_, new_size)) = result {
                 let mut tbl = vdx.table.write();
@@ -557,6 +564,7 @@ fn execute_fs_work(
         }
 
         FsWork::ZeroRange(params) => {
+            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -579,7 +587,7 @@ fn execute_fs_work(
                                             let zeros = vec![0u8; zero_len as usize];
                                             match file.write_all(&zeros) {
                                                 Ok(()) => {
-                                                    flush(&vdx);
+                                                    flush_owner(&vdx, params.fs_file_id);
                                                     None
                                                 }
                                                 Err(e) => Some(map_fatfs_err(&e)),
@@ -594,6 +602,7 @@ fn execute_fs_work(
                     },
                 }
             };
+            vdx.current_owner.store(0, Ordering::Release);
 
             let res = FsZeroRangeResult { error: err };
             (DriverStatus::Success, Some(FsReply::ZeroRange(res)))
@@ -669,17 +678,30 @@ async fn send_flush_dirty(volume_target: &IoTarget) -> DriverStatus {
     pnp_send_request(volume_target.clone(), &mut flush_req).await
 }
 
+async fn send_flush_owner(volume_target: &IoTarget, owner: u64) -> DriverStatus {
+    let mut flush_req = RequestHandle::new(
+        RequestType::FlushOwner {
+            owner,
+            should_block: false,
+        },
+        RequestData::empty(),
+    );
+    flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    pnp_send_request(volume_target.clone(), &mut flush_req).await
+}
+
 #[request_handler]
 pub async fn fs_op_dispatch<'a, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let (fs_arc, volume_target, flush_flag) = {
+    let (fs_arc, volume_target, flush_flag, pending_flush_owner) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         (
             vdx.fs.clone(),
             vdx.volume_target.clone(),
             vdx.should_flush.clone(),
+            vdx.pending_flush_owner.clone(),
         )
     };
 
@@ -705,7 +727,12 @@ pub async fn fs_op_dispatch<'a, 'b>(
     apply_fs_reply(req, reply);
 
     if flush_flag.swap(false, Ordering::AcqRel) {
-        let _ = send_flush_dirty(&volume_target).await;
+        let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
+        if owner != 0 {
+            let _ = send_flush_owner(&volume_target, owner).await;
+        } else {
+            let _ = send_flush_dirty(&volume_target).await;
+        }
     }
 
     req.write().status = status;

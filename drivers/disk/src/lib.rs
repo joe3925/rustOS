@@ -135,6 +135,7 @@ pub async fn disk_write<'a, 'b>(
             offset,
             len,
             flush_write_through: _,
+            owner: _,
         } => (offset, len),
         _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
     };

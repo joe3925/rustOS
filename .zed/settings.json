@@ -1,7 +1,14 @@
 {
   "lsp": {
     "rust-analyzer": {
+      "binary": {
+        // TODO: remove this when ever RA fixes the E0308 regression
+        "path": "C:\\Users\\Boden\\Downloads\\rust-analyzer.exe",
+      },
       "initialization_options": {
+        "diagnostics": {
+          "disabled": ["mismatched-types"],
+        },
         "procMacro": {
           "enable": true,
         },
