@@ -580,13 +580,13 @@ pub async fn vol_pdo_flush<'a, 'b>(
         RequestType::Flush { should_block } | RequestType::FlushDirty { should_block } => {
             (should_block, None)
         }
-        RequestType::FlushOwner { owner, should_block } => {
-            (should_block, Some(owner))
-        }
+        RequestType::FlushOwner {
+            owner,
+            should_block,
+        } => (should_block, Some(owner)),
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
-    // Owner-targeted flush: flush only pages belonging to this file.
     if let Some(owner) = flush_owner {
         match cache.flush_owner(owner).await {
             Ok(()) => return DriverStep::complete(DriverStatus::Success),

@@ -573,7 +573,7 @@ where
         }
     }
 
-    /// Joins is a vector with len equal to the desired parallelism, used to track in-flight flush tasks.
+    /// Joins is a vector used to track in-flight flush task handles.
     async fn flush_pages_parallel(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
@@ -584,29 +584,27 @@ where
             return Ok(());
         }
 
-        let mut width = joins.capacity();
-        if width == 0 {
-            width = 1;
-        }
-        if width > pages.len() {
-            width = pages.len();
-        }
-
         joins.clear();
 
-        futures::stream::iter(pages.iter().cloned())
-            .for_each_concurrent(width, |(lba, page)| {
-                let backend = Arc::clone(&backend);
-                let stats = Arc::clone(&stats);
-                async move {
-                    let _ = Self::flush_page_task(backend, stats, lba, page).await;
-                }
-            })
-            .await;
+        for (lba, page) in pages {
+            let backend = Arc::clone(&backend);
+            let stats = Arc::clone(&stats);
+            let page = Arc::clone(page);
+            let lba = *lba;
+
+            let handle = spawn(async move {
+                let _ = Self::flush_page_task(backend, stats, lba, page).await;
+            });
+
+            joins.push(handle);
+        }
+
+        for handle in joins.drain(..) {
+            handle.await;
+        }
 
         Ok(())
     }
-
     async fn flush_shard_streaming(
         &self,
         shard_idx: usize,
@@ -781,10 +779,7 @@ where
         self.flush_internal_filtered(&FlushFilter::All).await
     }
 
-    async fn flush_internal_owner(
-        &self,
-        owner: u64,
-    ) -> Result<(), CacheError<B::Error>> {
+    async fn flush_internal_owner(&self, owner: u64) -> Result<(), CacheError<B::Error>> {
         self.flush_internal_filtered(&FlushFilter::Owner(owner))
             .await
     }
@@ -975,7 +970,12 @@ where
         self.write_at_inner(offset, data, 0).await
     }
 
-    async fn write_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error> {
+    async fn write_at_owned(
+        &self,
+        offset: u64,
+        data: &[u8],
+        owner: u64,
+    ) -> Result<(), Self::Error> {
         self.write_at_inner(offset, data, owner).await
     }
 
@@ -984,7 +984,12 @@ where
         self.flush_range(offset, data.len()).await
     }
 
-    async fn write_through_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error> {
+    async fn write_through_at_owned(
+        &self,
+        offset: u64,
+        data: &[u8],
+        owner: u64,
+    ) -> Result<(), Self::Error> {
         self.write_at_inner(offset, data, owner).await?;
         self.flush_internal_owner(owner).await
     }

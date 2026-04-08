@@ -16,7 +16,6 @@ pub struct DeviceIds {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverStep {
     Continue,
-    Pending,
     Complete { status: DriverStatus },
 }
 

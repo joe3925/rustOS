@@ -3,7 +3,6 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
-use core::ptr;
 use core::sync::atomic::Ordering;
 use core::sync::atomic::compiler_fence;
 use core::task::{Context, Poll, Waker};
@@ -12,7 +11,7 @@ use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
 use kernel_types::request::{
-    Request, RequestCompletionHandle, RequestHandle, RequestType, TraversalPolicy,
+    Request, RequestHandle, RequestType, TraversalPolicy,
 };
 use kernel_types::status::DriverStatus;
 
@@ -76,7 +75,6 @@ pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> D
         let mut guard = handle.write();
         guard.status = DriverStatus::ContinueStep;
         guard.completed = false;
-        guard.waker = None;
     }
 
     let (kind, policy) = {
@@ -88,14 +86,6 @@ pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> D
     let result = call_device_handler(dev, handle, kind, policy).await;
 
     match result {
-        DriverStep::Pending => {
-            // Handler returned Pending with promoted handle
-            let shared = match &handle {
-                RequestHandle::Shared(s) => s.clone(),
-                _ => panic!("Pending returned without promoted handle"),
-            };
-            RequestCompletionHandle::new(shared).await
-        }
         DriverStep::Complete { status } => status,
         DriverStep::Continue => handle.read().status,
     }
@@ -161,35 +151,27 @@ pub async fn send_request_to_stack_top(
     }
 }
 
-/// Complete a request. Does NOT promote - returns handle with same lifetime.
+/// Complete a request.
 pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
-    let (status, waker) = {
-        let mut guard = handle.write();
+    let mut guard = handle.write();
 
-        if guard.completed {
-            return guard.status;
-        }
-
-        if let Some(fp) = guard.completion_routine.take() {
-            let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
-            let context = guard.completion_context;
-            guard.status = f(&mut guard, context);
-        }
-
-        if guard.status == DriverStatus::ContinueStep {
-            guard.status = DriverStatus::Success;
-        }
-        guard.completion_context = 0;
-        guard.completion_routine = None;
-        guard.completed = true;
-        (guard.status, guard.waker.take())
-    };
-
-    if let Some(w) = waker {
-        w.wake();
+    if guard.completed {
+        return guard.status;
     }
 
-    status
+    if let Some(fp) = guard.completion_routine.take() {
+        let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
+        let context = guard.completion_context;
+        guard.status = f(&mut guard, context);
+    }
+
+    if guard.status == DriverStatus::ContinueStep {
+        guard.status = DriverStatus::Success;
+    }
+    guard.completion_context = 0;
+    guard.completion_routine = None;
+    guard.completed = true;
+    guard.status
 }
 
 async fn call_device_handler(
@@ -210,9 +192,6 @@ async fn call_device_handler(
                 pnp_minor_dispatch(&dev, h).await
             };
             match step {
-                DriverStep::Pending => {
-                    // PnP handlers should never return pending
-                }
                 DriverStep::Complete { status } => {
                     handle.write().status = status;
                     return DriverStep::complete(complete_request(handle));
@@ -237,10 +216,6 @@ async fn call_device_handler(
             }
         }
         match invoke_io_handler(&dev, handle, &kind).await {
-            Some(DriverStep::Pending) => {
-                handle.write().status = DriverStatus::PendingStep;
-                return DriverStep::Pending;
-            }
             Some(DriverStep::Complete { status }) => {
                 handle.write().status = status;
                 return DriverStep::complete(complete_request(handle));
@@ -339,8 +314,6 @@ async fn pnp_minor_dispatch(
             step = DriverStep::Complete {
                 status: minor.default_status_for_unhandled(),
             };
-        } else if matches!(step, DriverStep::Pending) {
-            panic!("PNP request handlers can not return pending")
         }
         return step;
     }

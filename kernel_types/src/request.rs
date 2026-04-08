@@ -4,17 +4,12 @@ use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
     alloc::Layout,
     mem::{MaybeUninit, align_of, size_of},
-    ops::{Deref, DerefMut},
-    pin::Pin,
     ptr::null_mut,
-    task::{Context, Poll, Waker},
 };
-use spin::RwLock;
 
 /// Maximum size for inline storage (bytes)
 const INLINE_THRESHOLD: usize = 64;
@@ -517,7 +512,6 @@ pub struct Request {
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
 
-    pub waker: Option<Waker>,
 }
 
 impl Request {
@@ -536,8 +530,6 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
-
-            waker: None,
         }
     }
 
@@ -553,8 +545,6 @@ impl Request {
             pnp: Some(pnp_request),
             completion_routine: None,
             completion_context: 0,
-
-            waker: None,
         }
     }
 
@@ -645,7 +635,7 @@ impl Request {
             None => alloc::string::String::from("None"),
         };
         alloc::format!(
-            "Request {{ kind: {:?}, data: {}, completed: {}, status: {:?}, traversal_policy: {:?}, pnp: {}, completion_routine: {:?}, completion_context: {:#x}, waker: {} }}",
+            "Request {{ kind: {:?}, data: {}, completed: {}, status: {:?}, traversal_policy: {:?}, pnp: {}, completion_routine: {:?}, completion_context: {:#x} }}",
             self.kind,
             self.data.print_meta(),
             self.completed,
@@ -654,7 +644,6 @@ impl Request {
             pnp_str,
             self.completion_routine.map(|_| "Some(fn)"),
             self.completion_context,
-            if self.waker.is_some() { "Some" } else { "None" }
         )
     }
 
@@ -669,8 +658,6 @@ impl Request {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
-
-            waker: None,
         }
     }
 
@@ -690,7 +677,7 @@ impl Request {
     }
     #[inline]
     fn complete_for_drop(&mut self) {
-        let (should_drop_chain_ctx, _status, waker) = {
+        let should_drop_chain_ctx = {
             if self.completed {
                 return;
             }
@@ -710,11 +697,7 @@ impl Request {
             }
 
             self.completed = true;
-            (
-                drop_chain.then_some(self.completion_context),
-                self.status,
-                self.waker.take(),
-            )
+            drop_chain.then_some(self.completion_context)
         };
 
         if let Some(ctx) = should_drop_chain_ctx {
@@ -724,10 +707,6 @@ impl Request {
                 ));
             }
             self.completion_context = 0;
-        }
-
-        if let Some(w) = waker {
-            w.wake();
         }
     }
 }
@@ -769,64 +748,11 @@ extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverSta
 
     status
 }
-#[repr(C)]
-pub struct RequestCompletion {
-    pub req: Arc<RwLock<Request>>,
-}
-
-impl Future for RequestCompletion {
-    type Output = DriverStatus;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = self.req.write();
-
-        if guard.completed {
-            return Poll::Ready(guard.status);
-        }
-
-        guard.waker = Some(cx.waker().clone());
-        Poll::Pending
-    }
-}
-
 // ============================================================================
-// RequestHandle - Stack or Shared ownership abstraction
+// RequestHandle - Stack or Owned abstraction
 // ============================================================================
 
-/// Wrapper for shared request ownership. Guarantees 'static lifetime.
-#[repr(transparent)]
-#[derive(Debug)]
-pub struct SharedRequest(pub Arc<RwLock<Request>>);
-
-impl SharedRequest {
-    #[inline]
-    pub fn new(req: Request) -> Self {
-        Self(Arc::new(RwLock::new(req)))
-    }
-
-    #[inline]
-    pub fn arc(&self) -> &Arc<RwLock<Request>> {
-        &self.0
-    }
-
-    #[inline]
-    pub fn read(&self) -> spin::RwLockReadGuard<'_, Request> {
-        self.0.read()
-    }
-
-    #[inline]
-    pub fn write(&self) -> spin::RwLockWriteGuard<'_, Request> {
-        self.0.write()
-    }
-}
-
-impl Clone for SharedRequest {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-/// Handle to a request - stack-allocated, owned, or heap-allocated (shared).
+/// Handle to a request - stack-borrowed or owned.
 #[repr(C)]
 #[derive(Debug)]
 pub enum RequestHandle<'a> {
@@ -834,56 +760,6 @@ pub enum RequestHandle<'a> {
     Stack(&'a mut Request),
     /// Owned request - the RequestHandle owns the Request directly.
     Owned(Request),
-    /// Shared ownership - already heap-allocated.
-    Shared(SharedRequest),
-}
-
-/// Read guard for RequestHandle - either a direct reference or an RwLock guard.
-#[repr(C)]
-pub enum HandleReadGuard<'a> {
-    Stack(&'a Request),
-    Shared(spin::RwLockReadGuard<'a, Request>),
-}
-
-impl<'a> Deref for HandleReadGuard<'a> {
-    type Target = Request;
-
-    #[inline]
-    fn deref(&self) -> &Request {
-        match self {
-            HandleReadGuard::Stack(r) => r,
-            HandleReadGuard::Shared(g) => g,
-        }
-    }
-}
-
-/// Write guard for RequestHandle - either a direct reference or an RwLock guard.
-#[repr(C)]
-pub enum HandleWriteGuard<'a> {
-    Stack(&'a mut Request),
-    Shared(spin::RwLockWriteGuard<'a, Request>),
-}
-
-impl<'a> Deref for HandleWriteGuard<'a> {
-    type Target = Request;
-
-    #[inline]
-    fn deref(&self) -> &Request {
-        match self {
-            HandleWriteGuard::Stack(r) => r,
-            HandleWriteGuard::Shared(g) => g,
-        }
-    }
-}
-
-impl<'a> DerefMut for HandleWriteGuard<'a> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Request {
-        match self {
-            HandleWriteGuard::Stack(r) => r,
-            HandleWriteGuard::Shared(g) => &mut *g,
-        }
-    }
 }
 
 impl<'a> RequestHandle<'a> {
@@ -922,6 +798,7 @@ impl<'a> RequestHandle<'a> {
     pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
         RequestHandle::Owned(Request::new_pnp_bytes(pnp, data))
     }
+
     #[inline]
     pub fn is_stack(&self) -> bool {
         matches!(self, Self::Stack(_))
@@ -933,135 +810,46 @@ impl<'a> RequestHandle<'a> {
     }
 
     #[inline]
-    pub fn is_shared(&self) -> bool {
-        matches!(self, Self::Shared(_))
-    }
-    #[inline]
     pub fn status(&self) -> DriverStatus {
         self.read().status
     }
 
-    /// Acquire read access. Returns a guard that derefs to &Request.
+    /// Acquire read access.
     #[inline]
-    pub fn read(&self) -> HandleReadGuard<'_> {
+    pub fn read(&self) -> &Request {
         match self {
-            RequestHandle::Stack(r) => HandleReadGuard::Stack(r),
-            RequestHandle::Owned(r) => HandleReadGuard::Stack(r),
-            RequestHandle::Shared(s) => HandleReadGuard::Shared(s.read()),
+            RequestHandle::Stack(r) => r,
+            RequestHandle::Owned(r) => r,
         }
     }
 
-    /// Acquire write access. Returns a guard that derefs to &mut Request.
+    /// Acquire write access.
     #[inline]
-    pub fn write(&mut self) -> HandleWriteGuard<'_> {
+    pub fn write(&mut self) -> &mut Request {
         match self {
-            RequestHandle::Stack(r) => HandleWriteGuard::Stack(r),
-            RequestHandle::Owned(r) => HandleWriteGuard::Stack(r),
-            RequestHandle::Shared(s) => HandleWriteGuard::Shared(s.write()),
-        }
-    }
-    // TODO: this currently does not work as intended the request on the request handle on the stack should not point to nothing
-    /// Promote stack/owned request to shared (heap) ownership.
-    /// Stack: copies content into a new SharedRequest, leaves empty sentinel in original.
-    /// Owned: moves the owned request into a new SharedRequest.
-    /// Shared: no-op, already on heap.
-    pub fn promote(&mut self) {
-        match self {
-            RequestHandle::Stack(req_ref) => {
-                let request = core::mem::replace(*req_ref, Request::empty());
-                *self = RequestHandle::Shared(SharedRequest::new(request));
-            }
-            RequestHandle::Owned(req_ref) => {
-                // Take ownership of the request and wrap in SharedRequest
-                let old = core::mem::replace(self, RequestHandle::Owned(Request::empty()));
-                if let RequestHandle::Owned(request) = old {
-                    *self = RequestHandle::Shared(SharedRequest::new(request));
-                }
-            }
-            RequestHandle::Shared(_) => {}
-        }
-    }
-
-    /// Convert to SharedRequest. Promotes if needed.
-    #[inline]
-    pub fn into_shared(mut self) -> SharedRequest {
-        self.promote();
-        match self {
-            RequestHandle::Shared(s) => s,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Get SharedRequest if already shared.
-    #[inline]
-    pub fn as_shared(&self) -> Option<&SharedRequest> {
-        match self {
-            RequestHandle::Shared(s) => Some(s),
-            _ => None,
+            RequestHandle::Stack(r) => r,
+            RequestHandle::Owned(r) => r,
         }
     }
 
     #[inline]
     pub fn set_traversal_policy(&mut self, policy: TraversalPolicy) {
-        match self {
-            RequestHandle::Stack(r) => {
-                r.traversal_policy = policy;
-            }
-            RequestHandle::Shared(s) => {
-                s.write().traversal_policy = policy;
-            }
-            RequestHandle::Owned(request) => {
-                request.traversal_policy = policy;
-            }
-        }
+        self.write().traversal_policy = policy;
     }
 }
 
-impl RequestHandle<'static> {
-    #[inline]
-    pub fn pending(self) -> RequestHandleResult<'static> {
-        RequestHandleResult {
-            step: DriverStep::Pending,
-            handle: self,
-        }
-    }
-}
 impl<'a> RequestHandleResult<'a> {
     pub fn status(&self) -> DriverStatus {
         match self.step {
             DriverStep::Complete { status } => status,
             DriverStep::Continue => todo!(),
-            DriverStep::Pending => DriverStatus::PendingStep,
         }
     }
 }
+
 /// Handler return type. Carries step + handle back to dispatcher.
 #[repr(C)]
 pub struct RequestHandleResult<'a> {
     pub step: DriverStep,
     pub handle: RequestHandle<'a>,
-}
-
-/// Future for awaiting completion of a shared request.
-#[repr(C)]
-pub struct RequestCompletionHandle(SharedRequest);
-
-impl RequestCompletionHandle {
-    pub fn new(shared: SharedRequest) -> Self {
-        Self(shared)
-    }
-}
-
-impl Future for RequestCompletionHandle {
-    type Output = DriverStatus;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut guard = self.0.write();
-        if guard.completed {
-            Poll::Ready(guard.status)
-        } else {
-            guard.waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
-    }
 }

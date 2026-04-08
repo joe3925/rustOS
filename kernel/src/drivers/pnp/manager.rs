@@ -607,7 +607,6 @@ impl PnpManager {
         let step = cb(drv, &mut dev_init);
 
         match step {
-            DriverStep::Pending => return None,
             DriverStep::Complete { status } if status != DriverStatus::Success => return None,
             DriverStep::Complete { .. } | DriverStep::Continue => {}
         }
@@ -818,11 +817,8 @@ impl PnpManager {
                     .write()
                     .add_completion(Self::process_enumerated_children, ctx);
 
-                // Use SharedRequest because this is spawned detached
-                let shared = bus_enum_request.into_shared();
-
                 spawn_detached(async move {
-                    let mut handle = RequestHandle::Shared(shared);
+                    let mut handle = bus_enum_request;
                     let _ = &PNP_MANAGER.send_request(top_device, &mut handle).await;
                 });
             }

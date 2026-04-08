@@ -128,7 +128,6 @@ impl BlockDev {
                 r.pnp = None;
                 r.completion_routine = None;
                 r.completion_context = 0;
-                r.waker = None;
             }
             _ => unreachable!(),
         }
@@ -159,7 +158,6 @@ impl BlockDev {
                 r.pnp = None;
                 r.completion_routine = None;
                 r.completion_context = 0;
-                r.waker = None;
             }
             _ => unreachable!(),
         }
