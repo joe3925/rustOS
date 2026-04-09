@@ -482,13 +482,13 @@ where
                 flush_write_through: false,
                 owner: 0,
             },
-            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
+            RequestData::from_t::<Vec<u8>>(vec![0u8; BLOCK_SIZE]),
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         {
             let mut w = req.write();
-            let dst = w.data_slice_mut();
+            let dst = w.view_data_mut::<Vec<u8>>().expect("write req missing Vec<u8>");
             let data = page.data.read();
             dst.copy_from_slice(&data.bytes[..]);
         }
@@ -538,13 +538,13 @@ where
                 flush_write_through: false,
                 owner: 0,
             },
-            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
+            RequestData::from_t::<Vec<u8>>(vec![0u8; BLOCK_SIZE]),
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         {
             let mut req_w = req.write();
-            let dst = req_w.data_slice_mut();
+            let dst = req_w.view_data_mut::<Vec<u8>>().expect("write req missing Vec<u8>");
             let data = page.data.read();
             dst.copy_from_slice(&data.bytes[..]);
         }

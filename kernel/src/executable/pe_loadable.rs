@@ -17,7 +17,7 @@ use goblin::Object;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::Module;
-use kernel_types::status::PageMapError;
+use kernel_types::status::{LoadError, PageMapError};
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
@@ -137,25 +137,16 @@ impl PELoader {
             program.tracker.alloc(preferred_base, image_size).is_err() || self.needs_relocation();
 
         if need_reloc {
-            let new_base = self.calculate_relocation_base(&program.tracker)?;
+            program.tracker.dealloc(preferred_base, image_size);
+            let new_base = self.allocate_relocation_base(&program.tracker)?;
             self.current_base = new_base;
-
-            program
-                .virtual_map_alloc(new_base, image_size as usize)
-                .map_err(|_| LoadError::NoMemory)?;
+            unsafe { program.virtual_map(new_base, image_size as usize) }?;
 
             self.load_sections()?;
             self.relocate()?;
         } else {
             unsafe {
-                program
-                    .virtual_map(VirtAddr::new(preferred_base), image_size as usize)
-                    .map_err(|e| match e {
-                        PageMapError::Page4KiB(MapToError::PageAlreadyMapped(_)) => {
-                            LoadError::UnsupportedImageBase
-                        }
-                        _ => LoadError::NoMemory,
-                    })?;
+                program.virtual_map(VirtAddr::new(preferred_base), image_size as usize)?;
             }
             self.current_base = VirtAddr::new(preferred_base);
             self.load_sections()?;
@@ -243,7 +234,7 @@ impl PELoader {
         }
         let range_tracker = Arc::new(RangeTracker::new(0x1000u64, 0x00007FFFFFFFFFFFu64));
         self.current_base = if (self.needs_relocation()) {
-            self.calculate_relocation_base(&range_tracker)?
+            self.allocate_relocation_base(&range_tracker)?
         } else {
             VirtAddr::new(opt_hdr.windows_fields.image_base)
         };
@@ -275,10 +266,12 @@ impl PELoader {
         );
 
         // Allocates the image + a guard page + the stack + the heap
-        match program.virtual_map_alloc(
-            program.image_base,
-            (image_size + 0x1000 + stack_size + heap_size) as usize,
-        ) {
+        match unsafe {
+            program.virtual_map(
+                program.image_base,
+                (image_size + 0x1000 + stack_size + heap_size) as usize,
+            )
+        } {
             Err(PageMapError::Page4KiB(MapToError::FrameAllocationFailed)) => {
                 return Err(LoadError::NoMemory)
             }
@@ -417,7 +410,7 @@ impl PELoader {
         }
         Ok(())
     }
-    pub fn calculate_relocation_base(
+    pub fn allocate_relocation_base(
         &mut self,
         range_tracker: &RangeTracker,
     ) -> Result<VirtAddr, LoadError> {
@@ -426,15 +419,14 @@ impl PELoader {
             .header
             .optional_header
             .ok_or(LoadError::MissingSections)?;
-        let alloc_size = if (self.pe.is_lib) {
+        let alloc_size = if self.pe.is_lib {
             self.calculate_allocation_size()?
         } else {
-            opt_hdr.windows_fields.image_base as usize
+            opt_hdr.windows_fields.size_of_image as usize
         };
         let new_base = range_tracker
             .alloc_auto(alloc_size as u64)
             .ok_or(LoadError::NoMemory)?;
-        range_tracker.dealloc(new_base.as_u64(), alloc_size as u64);
         Ok(new_base)
     }
     fn collect_exports(&self) -> Vec<(String, usize)> {
@@ -502,25 +494,6 @@ pub fn parse_base_relocations(reloc_data: &[u8]) -> impl Iterator<Item = Relocat
         }))
     })
     .flatten()
-}
-
-#[derive(Debug)]
-pub enum LoadError {
-    IsNotExecutable,
-    Not64Bit,
-    NoEntryPoint,
-    InvalidSubsystem,
-    InvalidDllCharacteristics,
-    UnsupportedRelocationFormat,
-    MissingSections,
-    UnsupportedImageBase,
-    NotImplemented,
-    NoMemory,
-    BadPID,
-    NotDLL,
-    NoFile,
-    NoMainThread,
-    NoSuchSymbol,
 }
 
 #[repr(u16)]

@@ -4,11 +4,15 @@
 #![feature(const_trait_impl)]
 extern crate alloc;
 
+use crate::vec::Vec;
 use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
+#[cfg(not(test))]
+use core::panic::PanicInfo;
 use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
+use kernel_api::kernel_routing::println;
 use kernel_api::kernel_types::io::{
     DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo,
 };
@@ -23,9 +27,6 @@ use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
-
-#[cfg(not(test))]
-use core::panic::PanicInfo;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 #[cfg(not(test))]
@@ -253,12 +254,16 @@ async fn read_from_lower_async(
 ) -> Result<Box<[u8]>, DriverStatus> {
     let mut child_req = RequestHandle::new(
         RequestType::Read { offset, len },
-        RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
+        RequestData::from_t::<Vec<u8>>(vec![0u8; len]),
     );
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
     if status == DriverStatus::Success {
-        Ok(child_req.write().take_data_bytes())
+        Ok(child_req
+            .write()
+            .take_data::<Vec<u8>>()
+            .map(|v| v.into_boxed_slice())
+            .unwrap_or_default())
     } else {
         Err(status)
     }

@@ -188,7 +188,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     spawn_detached(async move {
         let mut binding = RequestHandle::new(
             RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-            RequestData::from_boxed_bytes(ctrl_link.clone().into_bytes().into_boxed_slice()),
+            RequestData::from_t::<Vec<u8>>(ctrl_link.clone().into_bytes()),
         );
         binding.set_traversal_policy(TraversalPolicy::ForwardLower);
 

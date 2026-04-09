@@ -33,7 +33,7 @@ use crate::{
     util::boot_info,
 };
 
-use super::pe_loadable::LoadError;
+use kernel_types::status::LoadError;
 
 type ObjectRef = Arc<Object>;
 pub type ProgramHandle = Arc<RwLock<Program>>;
@@ -163,6 +163,7 @@ pub struct Program {
     pub extra_queues: Mutex<BTreeMap<u64, QueueHandle>>,
 
     pub routing_rules: Mutex<RuleList>,
+    pub page_table_lock: Mutex<()>,
 }
 impl Program {
     pub fn new(
@@ -188,32 +189,35 @@ impl Program {
             default_queue: Arc::new(RwLock::new(MessageQueue {
                 queue: VecDeque::new(),
             })),
+            page_table_lock: Mutex::new(()),
             extra_queues: Mutex::new(BTreeMap::new()),
             routing_rules: Mutex::new(Vec::new()),
         }
     }
 
     pub fn virtual_map_alloc(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
+        let _guard = self.page_table_lock.lock();
+
         let start = virt_addr;
         let end = virt_addr + size as u64;
-
         self.tracker
             .alloc(start.as_u64(), size as u64)
             .map_err(|_| PageMapError::NoMemory())?;
 
         let old_cr3 = Cr3::read();
-        unsafe { Cr3::write(self.cr3, old_cr3.1) };
+
+        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+            Cr3::write(self.cr3, old_cr3.1);
+        });
 
         let res = (|| {
             let boot_info = boot_info();
-            let phys_mem_offset = VirtAddr::new(
-                boot_info
-                    .physical_memory_offset
-                    .into_option()
-                    .expect("phys mem off missing"),
-            );
+            let phys_mem_offset =
+                VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+
             let mut mapper = init_mapper(phys_mem_offset);
             let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
             let flags = PageTableFlags::PRESENT
                 | PageTableFlags::WRITABLE
                 | PageTableFlags::USER_ACCESSIBLE;
@@ -226,14 +230,15 @@ impl Program {
                     &mut frame_alloc,
                     flags,
                 )
-            }?;
-            Ok(())
+            }
         })();
 
-        unsafe { Cr3::write(old_cr3.0, old_cr3.1) };
+        unsafe {
+            Cr3::write(old_cr3.0, old_cr3.1);
+        }
+
         res
     }
-
     pub unsafe fn virtual_map(&self, virt_addr: VirtAddr, size: usize) -> Result<(), PageMapError> {
         let start = virt_addr;
         let end = virt_addr + size as u64;
@@ -268,7 +273,45 @@ impl Program {
         Cr3::write(old_cr3.0, old_cr3.1);
         result
     }
+    pub fn virtual_map_auto_alloc(&self, size: usize) -> Result<VirtAddr, PageMapError> {
+        let _guard = self.page_table_lock.lock();
+        let start = self
+            .tracker
+            .alloc_auto(size as u64)
+            .ok_or(PageMapError::NoMemory())?;
+        let end = start + size as u64;
 
+        let old_cr3 = Cr3::read();
+
+        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+            Cr3::write(self.cr3, old_cr3.1);
+        });
+
+        let boot_info = boot_info();
+        let phys_mem_offset =
+            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+
+        let mut mapper = init_mapper(phys_mem_offset);
+        let mut frame_alloc = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+        let flags =
+            PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+        unsafe {
+            map_range_with_huge_pages(
+                &mut mapper,
+                start,
+                end.as_u64() - start.as_u64(),
+                &mut frame_alloc,
+                flags,
+            )?;
+        }
+        unsafe {
+            Cr3::write(old_cr3.0, old_cr3.1);
+        }
+
+        Ok(start)
+    }
     pub async fn load_module(&mut self, root_path: Path) -> Result<ModuleHandle, LoadError> {
         let mut queue = Vec::new();
         queue.push(root_path);

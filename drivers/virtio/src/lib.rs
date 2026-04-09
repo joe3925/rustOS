@@ -156,7 +156,7 @@ async fn setup_msix_via_pci(
 
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_PCI_SETUP_MSIX),
-        RequestData::from_boxed_bytes(buf.into_boxed_slice()),
+        RequestData::from_t::<Vec<u8>>(buf),
     );
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
 
@@ -189,7 +189,10 @@ async fn virtio_pnp_start<'a, 'b>(
 
     let resources = {
         let r = query_req.read();
-        let blob = r.pnp.as_ref().map(|p| p.data_out.as_slice()).unwrap_or(&[]);
+        let blob = r.pnp.as_ref()
+            .and_then(|p| p.data_out.view::<Vec<u8>>())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         pci::parse_resources(blob)
     };
     let msix_cap = pci::find_msix_capability(&resources);
@@ -1015,7 +1018,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
     // Ensure caller-provided buffer is large enough for the requested transfer.
-    if req.read().data_len() < len {
+    if req.read().view_data::<Vec<u8>>().map_or(true, |d| d.len() < len) {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
 
@@ -1098,7 +1101,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
             {
                 let mut w = req.write();
-                let dst = &mut w.data_slice_mut()[buf_offset..buf_offset + chunk_len as usize];
+                let dst = &mut w.view_data_mut::<Vec<u8>>().expect("read req missing Vec<u8> buffer")[buf_offset..buf_offset + chunk_len as usize];
                 dst.copy_from_slice(io_req.data_slice());
             }
 
@@ -1169,7 +1172,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
     }
     // Guard against buffer underruns – without this we can read past the end of
     // the caller's data buffer and corrupt adjacent memory.
-    if req.read().data_len() < len {
+    if req.read().view_data::<Vec<u8>>().map_or(true, |d| d.len() < len) {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
 
@@ -1215,7 +1218,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
             {
                 let r = req.read();
-                let src = &r.data_slice()[buf_offset..buf_offset + chunk_len as usize];
+                let src = &r.view_data::<Vec<u8>>().expect("write req missing Vec<u8> buffer")[buf_offset..buf_offset + chunk_len as usize];
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 

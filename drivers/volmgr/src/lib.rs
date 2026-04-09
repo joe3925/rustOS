@@ -86,7 +86,7 @@ impl VolumeCacheBackend for CacheBackend {
 
             let mut req = RequestHandle::new(
                 RequestType::Read { offset, len },
-                RequestData::from_boxed_bytes(vec![0u8; len].into_boxed_slice()),
+                RequestData::from_t::<Vec<u8>>(vec![0u8; len]),
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -96,7 +96,7 @@ impl VolumeCacheBackend for CacheBackend {
             }
 
             let guard = req.read();
-            let data = guard.data_slice();
+            let data = guard.view_data::<Vec<u8>>().expect("read response missing Vec<u8>");
             out[..len].copy_from_slice(&data[..len]);
 
             if len < out.len() {
@@ -119,13 +119,13 @@ impl VolumeCacheBackend for CacheBackend {
                     flush_write_through: false,
                     owner: 0,
                 },
-                RequestData::from_boxed_bytes(vec![0u8; block_len].into_boxed_slice()),
+                RequestData::from_t::<Vec<u8>>(vec![0u8; block_len]),
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             {
                 let mut w = req.write();
-                let dst = w.data_slice_mut();
+                let dst = w.view_data_mut::<Vec<u8>>().expect("write req missing Vec<u8>");
                 dst[..block_len].copy_from_slice(&data[..block_len]);
             }
 
@@ -473,10 +473,7 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let req_data_len = {
-        let r = req.read();
-        r.data_len()
-    };
+    let req_data_len = req.read().view_data::<Vec<u8>>().map(|d| d.len()).unwrap_or(0);
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
@@ -492,7 +489,7 @@ pub async fn vol_pdo_read<'a, 'b>(
     match cache.read_at(offset, temp.as_mut_slice()).await {
         Ok(()) => {
             let mut w = req.write();
-            w.data_slice_mut()[..len].copy_from_slice(temp.as_slice());
+            w.view_data_mut::<Vec<u8>>().expect("read response missing Vec<u8>")[..len].copy_from_slice(temp.as_slice());
             DriverStep::complete(DriverStatus::Success)
         }
         Err(CacheError::Backend(s)) => DriverStep::complete(s),
@@ -541,14 +538,14 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req.read().data_len());
+    len = core::cmp::min(len, req.read().view_data::<Vec<u8>>().map(|d| d.len()).unwrap_or(0));
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let data = req.read().data_slice()[..len].to_vec();
+    let data = req.read().view_data::<Vec<u8>>().expect("write req missing Vec<u8>")[..len].to_vec();
 
     let result = match (flush_write_through, owner) {
         (true, o) if o != 0 => cache.write_through_at_owned(offset, &data, o).await,

@@ -70,12 +70,64 @@ impl FromResidual<DriverStatus> for DriverStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u32)]
+#[derive(Debug)]
+#[repr(C)]
+pub enum LoadError {
+    IsNotExecutable,
+    Not64Bit,
+    NoEntryPoint,
+    InvalidSubsystem,
+    InvalidDllCharacteristics,
+    UnsupportedRelocationFormat,
+    MissingSections,
+    UnsupportedImageBase,
+    NotImplemented,
+    NoMemory,
+    BadPID,
+    NotDLL,
+    NoFile,
+    NoMainThread,
+    NoSuchSymbol,
+    PageError(PageMapError),
+}
+
+impl From<PageMapError> for LoadError {
+    fn from(err: PageMapError) -> Self {
+        LoadError::PageError(err)
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
 pub enum DriverError {
-    LoadError,
-    BindError,
-    StartError,
+    File(FileStatus),
+    InvalidUtf8,
+    TomlParse,
+    DriverAlreadyInstalled,
+    NoParent,
+    Registry(RegError),
+    LoadErr(LoadError),
+}
+
+impl From<FileStatus> for DriverError {
+    fn from(e: FileStatus) -> Self {
+        if e == FileStatus::FileAlreadyExist {
+            return DriverError::DriverAlreadyInstalled;
+        }
+        DriverError::File(e)
+    }
+}
+
+impl From<RegError> for DriverError {
+    fn from(e: RegError) -> Self {
+        DriverError::Registry(e)
+    }
+}
+
+impl From<LoadError> for DriverError {
+    fn from(e: LoadError) -> Self {
+        DriverError::LoadErr(e)
+    }
 }
 
 #[derive(Debug)]

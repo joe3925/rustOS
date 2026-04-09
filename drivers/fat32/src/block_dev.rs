@@ -64,13 +64,13 @@ impl BlockDev {
         let scratch = vec![0u8; sector_size as usize];
         // Allocate max-sized data buffers once; reuse without shrinking.
         let read_req = {
-            let data = RequestData::from_boxed_bytes(vec![0u8; MAX_CHUNK_BYTES].into_boxed_slice());
+            let data = RequestData::from_t::<Vec<u8>>(vec![0u8; MAX_CHUNK_BYTES]);
             let mut req = RequestHandle::new(RequestType::Read { offset: 0, len: 0 }, data);
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             req
         };
         let write_req = {
-            let data = RequestData::from_boxed_bytes(vec![0u8; MAX_CHUNK_BYTES].into_boxed_slice());
+            let data = RequestData::from_t::<Vec<u8>>(vec![0u8; MAX_CHUNK_BYTES]);
             let mut req = RequestHandle::new(
                 RequestType::Write {
                     offset: 0,
@@ -151,7 +151,10 @@ impl BlockDev {
                     flush_write_through,
                     owner: self.current_owner.load(Ordering::Acquire),
                 };
-                r.data.as_mut_slice()[..len].copy_from_slice(src);
+                r.data
+                    .view_mut::<Vec<u8>>()
+                    .expect("read req missing Vec<u8>")[..len]
+                    .copy_from_slice(src);
                 r.completed = false;
                 r.status = DriverStatus::ContinueStep;
                 r.traversal_policy = TraversalPolicy::ForwardLower;
@@ -173,7 +176,9 @@ impl BlockDev {
             let st = pnp_send_request(volume, req).await;
             if st == DriverStatus::Success {
                 let w = req.write();
-                dst.copy_from_slice(&w.data.as_slice()[..len]);
+                dst.copy_from_slice(
+                    &w.data.view::<Vec<u8>>().expect("write req missing Vec<u8>")[..len],
+                );
             }
             st
         };
@@ -181,7 +186,7 @@ impl BlockDev {
         if status == DriverStatus::Success {
             Ok(())
         } else {
-            println!("Error: {:#?}", status);
+            println!("Read Error: {:#?}", status);
             Err(status)
         }
     }
@@ -197,7 +202,7 @@ impl BlockDev {
         if status == DriverStatus::Success {
             Ok(())
         } else {
-            println!("Error: {:#?}", status);
+            println!("Write Error: {:#?}", status);
             Err(status)
         }
     }

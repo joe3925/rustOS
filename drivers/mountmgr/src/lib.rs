@@ -4,14 +4,15 @@
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
 extern crate alloc;
-
+use alloc::vec;
+use alloc::vec::Vec;
 use alloc::{
     boxed::Box,
     collections::BTreeMap,
     string::{String, ToString},
     sync::Arc,
-    vec::Vec,
 };
+use core::ptr::addr_of;
 use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -171,7 +172,9 @@ pub async fn volclass_ioctl<'a, 'b>(
         }
         IOCTL_MOUNTMGR_QUERY => {
             let mut w = req.write();
-            w.set_data_bytes(build_status_blob(&dev));
+            w.set_data(RequestData::from_t::<Vec<u8>>(
+                build_status_blob(&dev).into_vec(),
+            ));
             drop(w);
             DriverStep::complete(DriverStatus::Success)
         }
@@ -186,7 +189,7 @@ pub async fn volclass_ioctl<'a, 'b>(
         }
         IOCTL_MOUNTMGR_LIST_FS => {
             let mut w = req.write();
-            w.set_data_bytes(list_fs_blob());
+            w.set_data(RequestData::from_t::<Vec<u8>>(list_fs_blob().into_vec()));
             drop(w);
             DriverStep::complete(DriverStatus::Success)
         }
@@ -451,7 +454,6 @@ async fn try_bind_filesystems_for_parent_fdo(
         if let Ok((dn, _top)) = created {
             let primary_link = public_link.to_string();
             let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
-
             let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
             let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
             let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), stable_link.clone());
@@ -490,9 +492,13 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
 }
 
 fn string_from_req(req: &Request) -> Option<String> {
-    core::str::from_utf8(req.data_slice())
-        .ok()
-        .map(|s| s.trim_matches(core::char::from_u32(0).unwrap()).to_string())
+    core::str::from_utf8(
+        req.view_data::<Vec<u8>>()
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]),
+    )
+    .ok()
+    .map(|s| s.trim_matches(core::char::from_u32(0).unwrap()).to_string())
 }
 
 fn list_fs_blob() -> Box<[u8]> {

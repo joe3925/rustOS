@@ -3,10 +3,9 @@ use crate::fs::FsOp;
 use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::{
     alloc::Layout,
+    marker::PhantomData,
     mem::{MaybeUninit, align_of, size_of},
     ptr::null_mut,
 };
@@ -25,8 +24,9 @@ enum StorageMode {
     Inline = 0,
     /// Data is heap-allocated as typed data (raw ptr + Layout for deallocation)
     HeapTyped = 1,
-    /// Data is heap-allocated as raw bytes (from Box<[u8]>, reconstruct on drop)
-    HeapBytes = 2,
+    /// Non-owning borrow of driver-owned data. `heap_ptr` is a raw *mut T cast to *mut u8.
+    /// Must NOT be dropped or deallocated — the driver retains ownership via BorrowedHandle.
+    Borrowed = 3,
 }
 
 /// Aligned inline buffer for small data
@@ -63,9 +63,6 @@ impl core::fmt::Debug for InlineBuffer {
 /// Dropper function signature - only does drop_in_place, never deallocates
 type DropperFn = fn(*mut u8);
 
-// TODO: Consider adding a safe zero-copy borrowed mode using raw pointer + PhantomData
-// lifetime tracking to avoid memory copies on I/O operations. Current approach removes
-// borrowed mode entirely and copies data, which is safe but has overhead.
 
 #[repr(C)]
 pub struct RequestData {
@@ -95,11 +92,9 @@ impl core::fmt::Debug for RequestData {
     }
 }
 
-// SAFETY: RequestData owns its heap allocation exclusively. The raw pointer is only
-// used internally and never escapes. The data pointed to is either:
-// - HeapTyped: allocated via alloc::alloc, exclusively owned
-// - HeapBytes: from Box::into_raw, exclusively owned
-// Both cases ensure exclusive ownership, making Send/Sync safe.
+// SAFETY: RequestData owns its heap allocation exclusively (HeapTyped) or holds a non-owning
+// pointer to driver-owned data (Borrowed). For Borrowed, the driver enforces T: Send + Sync
+// via BorrowedHandle's type bounds, making cross-thread access safe.
 unsafe impl Send for RequestData {}
 unsafe impl Sync for RequestData {}
 // TODO: better hashing is probably possible to reduce the case where 2 types have the same name.
@@ -135,42 +130,20 @@ impl RequestData {
         }
     }
 
-    pub fn from_boxed_bytes(bytes: Box<[u8]>) -> Self {
-        let size = bytes.len();
-
-        if size <= INLINE_THRESHOLD {
-            // Copy to inline buffer
-            let mut result = Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: null_mut(),
-                heap_layout: Layout::new::<()>(),
-                tag: None,
-                dropper: noop_dropper,
-                size,
-                mode: StorageMode::Inline,
-            };
-
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), result.inline.as_mut_ptr(), size);
-            }
-            // Original box is dropped here
-
-            result
-        } else {
-            // Keep as heap allocation - store raw pointer from Box
-            let ptr = Box::into_raw(bytes) as *mut u8;
-
-            Self {
-                inline: InlineBuffer::new(),
-                heap_ptr: ptr,
-                heap_layout: Layout::new::<()>(), // Not used for HeapBytes
-                tag: None,
-                dropper: noop_dropper,
-                size,
-                mode: StorageMode::HeapBytes,
-            }
+    /// Install a non-owning borrow of driver-owned data. Only called by `BorrowedHandle::new`.
+    /// The driver retains ownership; this RequestData must not drop or deallocate the pointer.
+    fn from_borrowed_raw(ptr: *mut u8, tag: u64, size: usize) -> Self {
+        Self {
+            inline: InlineBuffer::new(),
+            heap_ptr: ptr,
+            heap_layout: Layout::new::<()>(),
+            tag: Some(tag),
+            dropper: noop_dropper,
+            size,
+            mode: StorageMode::Borrowed,
         }
     }
+
     pub fn from_t<T: 'static + Send + Sync>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
@@ -228,38 +201,6 @@ impl RequestData {
         self.size
     }
 
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        match self.mode {
-            StorageMode::Inline => unsafe {
-                core::slice::from_raw_parts(self.inline.as_ptr(), self.size)
-            },
-            StorageMode::HeapTyped | StorageMode::HeapBytes => {
-                if self.heap_ptr.is_null() {
-                    &[]
-                } else {
-                    unsafe { core::slice::from_raw_parts(self.heap_ptr, self.size) }
-                }
-            }
-        }
-    }
-
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        match self.mode {
-            StorageMode::Inline => unsafe {
-                core::slice::from_raw_parts_mut(self.inline.as_mut_ptr(), self.size)
-            },
-            StorageMode::HeapTyped | StorageMode::HeapBytes => {
-                if self.heap_ptr.is_null() {
-                    &mut []
-                } else {
-                    unsafe { core::slice::from_raw_parts_mut(self.heap_ptr, self.size) }
-                }
-            }
-        }
-    }
-
     fn matches<T>(&self) -> bool {
         self.tag == Some(type_tag::<T>()) && self.size == size_of::<T>()
     }
@@ -271,8 +212,7 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
-            StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes => return None,
+            StorageMode::HeapTyped | StorageMode::Borrowed => self.heap_ptr as *const u8,
         };
 
         if ptr.is_null() {
@@ -289,8 +229,7 @@ impl RequestData {
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::HeapTyped => self.heap_ptr,
-            StorageMode::HeapBytes => return None,
+            StorageMode::HeapTyped | StorageMode::Borrowed => self.heap_ptr,
         };
 
         if ptr.is_null() {
@@ -328,8 +267,8 @@ impl RequestData {
 
                 value
             }
-            StorageMode::HeapBytes => {
-                // Cannot take typed value from raw bytes
+            StorageMode::Borrowed => {
+                // Cannot move out of a borrow — driver retains ownership
                 return None;
             }
         };
@@ -344,69 +283,6 @@ impl RequestData {
         Some(value)
     }
 
-    pub fn take_bytes(&mut self) -> Box<[u8]> {
-        let result = match self.mode {
-            StorageMode::Inline => {
-                // Must allocate a new box and copy inline data into it
-                let mut vec = Vec::with_capacity(self.size);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        self.inline.as_ptr(),
-                        vec.as_mut_ptr(),
-                        self.size,
-                    );
-                    vec.set_len(self.size);
-                }
-
-                // Run dropper for typed inline data
-                if self.tag.is_some() {
-                    (self.dropper)(self.inline.as_mut_ptr());
-                }
-
-                vec.into_boxed_slice()
-            }
-            StorageMode::HeapTyped => {
-                // Allocate new Box<[u8]>, copy data, deallocate original
-                if self.heap_ptr.is_null() {
-                    return Box::new([]);
-                }
-
-                let mut vec = Vec::with_capacity(self.size);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(self.heap_ptr, vec.as_mut_ptr(), self.size);
-                    vec.set_len(self.size);
-
-                    // Run typed dropper
-                    (self.dropper)(self.heap_ptr);
-
-                    // Deallocate with original layout
-                    alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
-                }
-
-                vec.into_boxed_slice()
-            }
-            StorageMode::HeapBytes => {
-                // Reconstruct the Box<[u8]> directly
-                if self.heap_ptr.is_null() {
-                    Box::new([])
-                } else {
-                    unsafe {
-                        let slice = core::slice::from_raw_parts_mut(self.heap_ptr, self.size);
-                        Box::from_raw(slice)
-                    }
-                }
-            }
-        };
-
-        // Reset to empty state
-        self.heap_ptr = null_mut();
-        self.tag = None;
-        self.size = 0;
-        self.mode = StorageMode::Inline;
-        self.dropper = noop_dropper;
-
-        result
-    }
 }
 
 impl Drop for RequestData {
@@ -430,15 +306,8 @@ impl Drop for RequestData {
                     }
                 }
             }
-            StorageMode::HeapBytes => {
-                if !self.heap_ptr.is_null() {
-                    // Reconstruct and drop the Box<[u8]>
-                    unsafe {
-                        let slice = core::slice::from_raw_parts_mut(self.heap_ptr, self.size);
-                        let _ = Box::from_raw(slice);
-                        // Box drops here, deallocating with correct layout
-                    }
-                }
+            StorageMode::Borrowed => {
+                // Not owned — driver retains ownership via BorrowedHandle. Do nothing.
             }
         }
     }
@@ -560,18 +429,6 @@ impl Request {
         Self::new_pnp(pnp, RequestData::from_t(data))
     }
 
-    /// Create a request from boxed bytes.
-    #[inline]
-    pub(crate) fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
-        Self::new(kind, RequestData::from_boxed_bytes(data))
-    }
-
-    /// Create a PnP request from boxed bytes.
-    #[inline]
-    pub(crate) fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
-        Self::new_pnp(pnp, RequestData::from_boxed_bytes(data))
-    }
-
     #[inline]
     pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
         self.traversal_policy = policy;
@@ -589,26 +446,6 @@ impl Request {
     }
 
     #[inline]
-    pub fn set_data_bytes(&mut self, data: Box<[u8]>) {
-        self.data = RequestData::from_boxed_bytes(data);
-    }
-
-    #[inline]
-    pub fn data_len(&self) -> usize {
-        self.data.len()
-    }
-
-    #[inline]
-    pub fn data_slice(&self) -> &[u8] {
-        self.data.as_slice()
-    }
-
-    #[inline]
-    pub fn data_slice_mut(&mut self) -> &mut [u8] {
-        self.data.as_mut_slice()
-    }
-
-    #[inline]
     pub fn view_data<T>(&self) -> Option<&T> {
         self.data.view::<T>()
     }
@@ -621,11 +458,6 @@ impl Request {
     #[inline]
     pub fn take_data<T>(&mut self) -> Option<T> {
         self.data.try_take::<T>()
-    }
-
-    #[inline]
-    pub fn take_data_bytes(&mut self) -> Box<[u8]> {
-        self.data.take_bytes()
     }
 
     /// Print all fields except the actual data payloads
@@ -787,18 +619,6 @@ impl<'a> RequestHandle<'a> {
         RequestHandle::Owned(Request::new_pnp_t(pnp, data))
     }
 
-    /// Create a request from boxed bytes owned by the RequestHandle.
-    #[inline]
-    pub fn new_bytes(kind: RequestType, data: Box<[u8]>) -> Self {
-        RequestHandle::Owned(Request::new_bytes(kind, data))
-    }
-
-    /// Create a PnP request from boxed bytes owned by the RequestHandle.
-    #[inline]
-    pub fn new_pnp_bytes(pnp: PnpRequest, data: Box<[u8]>) -> Self {
-        RequestHandle::Owned(Request::new_pnp_bytes(pnp, data))
-    }
-
     #[inline]
     pub fn is_stack(&self) -> bool {
         matches!(self, Self::Stack(_))
@@ -836,6 +656,15 @@ impl<'a> RequestHandle<'a> {
     pub fn set_traversal_policy(&mut self, policy: TraversalPolicy) {
         self.write().traversal_policy = policy;
     }
+
+    /// Returns a raw pointer to the inner Request. Only for use by BorrowedHandle within
+    /// this module — not accessible outside request.rs.
+    pub(super) fn write_raw(&mut self) -> *mut Request {
+        match self {
+            RequestHandle::Stack(r) => *r as *mut Request,
+            RequestHandle::Owned(r) => r as *mut Request,
+        }
+    }
 }
 
 impl<'a> RequestHandleResult<'a> {
@@ -852,4 +681,66 @@ impl<'a> RequestHandleResult<'a> {
 pub struct RequestHandleResult<'a> {
     pub step: DriverStep,
     pub handle: RequestHandle<'a>,
+}
+
+// ============================================================================
+// BorrowedHandle — zero-copy driver-owned data borrow for forwarded requests
+// ============================================================================
+
+/// Installs a lifetime-bounded borrow of driver-owned data into a request for the duration
+/// of a forwarded call. The borrow checker enforces:
+///
+/// - `data` is exclusively borrowed while `BorrowedHandle` is alive (via `PhantomData<&'data mut T>`)
+/// - `handle` is exclusively borrowed while `BorrowedHandle` is alive (via `&'req mut RequestHandle`)
+/// - `'data: 'req` — data outlives the request's use of it (implicit from struct field types)
+///
+/// On drop, clears the request's data field back to `RequestData::empty()` only if the lower
+/// driver has not replaced it with a response. This prevents silently clobbering response data.
+///
+/// # Known limitation
+/// Like all RAII guards in Rust, `mem::forget(borrow)` prevents Drop from running, leaving the
+/// request with a dangling pointer. This is an accepted trade-off (same as `MutexGuard`).
+/// `'data` — lifetime of the driver-owned data being lent
+/// `'req`  — lifetime of our exclusive borrow of the RequestHandle
+/// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
+pub struct BorrowedHandle<'data, 'req, 'h, T: 'static + Send + Sync> {
+    handle: &'req mut RequestHandle<'h>,
+    _data: PhantomData<&'data mut T>,
+}
+
+impl<'data, 'req, 'h, T: 'static + Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
+    /// Installs a borrow of `data` into `handle`'s request data slot.
+    ///
+    /// While the returned `BorrowedHandle` is alive:
+    /// - `data` is exclusively borrowed and cannot be accessed directly
+    /// - `handle` is exclusively borrowed and cannot be used directly
+    /// - The raw pointer to `data` is accessible to lower drivers via `view_data::<T>()`
+    pub fn new(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
+        // SAFETY:
+        // - ptr is valid for 'data (derived from &'data mut T).
+        // - 'data: 'req is enforced by the struct's field types — the compiler requires it.
+        // - The &'data mut T exclusive borrow prevents any access to *data while Self is alive.
+        // - Drop clears the pointer before 'data ends because 'data must outlive Self.
+        let ptr = data as *mut T as *mut u8;
+        unsafe { &mut *handle.write_raw() }.data =
+            RequestData::from_borrowed_raw(ptr, type_tag::<T>(), size_of::<T>());
+        Self { handle, _data: PhantomData }
+    }
+
+    /// Returns the inner handle for passing to lower drivers.
+    pub fn handle(&mut self) -> &mut RequestHandle<'h> {
+        self.handle
+    }
+}
+
+impl<'data, 'req, 'h, T: 'static + Send + Sync> Drop for BorrowedHandle<'data, 'req, 'h, T> {
+    fn drop(&mut self) {
+        // SAFETY: handle is still valid — 'req is live while Self exists.
+        let req = unsafe { &mut *self.handle.write_raw() };
+        // Only clear if still in Borrowed mode. If the lower driver set a response,
+        // leave it intact so the upper driver can read it after the await.
+        if req.data.mode == StorageMode::Borrowed {
+            req.data = RequestData::empty();
+        }
+    }
 }
