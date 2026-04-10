@@ -1,13 +1,12 @@
 use alloc::sync::Arc;
-use alloc::vec;
 use crossbeam_queue::ArrayQueue;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::status::DriverStatus;
 
-/// Lock-free pool of reusable RequestHandle instances backed by a SegQueue.
-/// Requests are created once (with BLOCK_SIZE backing storage) and recycled,
-/// keeping steady-state I/O paths allocation-free.
+/// Lock-free pool of reusable RequestHandle instances backed by an ArrayQueue.
+/// Requests are created once (with empty data — callers install data via
+/// BorrowedHandle) and recycled, keeping steady-state I/O paths allocation-free.
 pub struct RequestPool<const BLOCK_SIZE: usize> {
     queue: ArrayQueue<RequestHandle<'static>>,
 }
@@ -27,7 +26,6 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
     }
 
     fn make_request() -> RequestHandle<'static> {
-        let data = vec![0u8; BLOCK_SIZE].into_boxed_slice();
         RequestHandle::new(
             RequestType::Write {
                 offset: 0,
@@ -35,7 +33,7 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
                 flush_write_through: false,
                 owner: 0,
             },
-            RequestData::from_t::<Vec<u8>>(data.into_vec()),
+            RequestData::empty(),
         )
     }
 

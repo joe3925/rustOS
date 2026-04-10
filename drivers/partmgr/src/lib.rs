@@ -23,7 +23,7 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
     pnp_send_request_to_stack_top,
 };
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use spin::Once;
@@ -252,18 +252,21 @@ async fn read_from_lower_async(
     offset: u64,
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
+    let mut data = vec![0u8; len];
     let mut child_req = RequestHandle::new(
         RequestType::Read { offset, len },
-        RequestData::from_t::<Vec<u8>>(vec![0u8; len]),
+        RequestData::empty(),
     );
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
+
+    let status = {
+        let mut buf = BufSlice::new(&mut data);
+        let mut borrow = BorrowedHandle::<BufSlice>::new(&mut child_req, &mut buf);
+        pnp_forward_request_to_next_lower(dev.clone(), borrow.handle()).await
+    };
+
     if status == DriverStatus::Success {
-        Ok(child_req
-            .write()
-            .take_data::<Vec<u8>>()
-            .map(|v| v.into_boxed_slice())
-            .unwrap_or_default())
+        Ok(data.into_boxed_slice())
     } else {
         Err(status)
     }

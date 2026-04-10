@@ -34,7 +34,7 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -86,18 +86,19 @@ impl VolumeCacheBackend for CacheBackend {
 
             let mut req = RequestHandle::new(
                 RequestType::Read { offset, len },
-                RequestData::from_t::<Vec<u8>>(vec![0u8; len]),
+                RequestData::empty(),
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
+            let mut buf = BufSlice::new(&mut out[..len]);
+            let status = {
+                let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+                pnp_send_request(self.target.clone(), borrow.handle()).await
+            };
+
             if status != DriverStatus::Success {
                 return Err(status);
             }
-
-            let guard = req.read();
-            let data = guard.view_data::<Vec<u8>>().expect("read response missing Vec<u8>");
-            out[..len].copy_from_slice(&data[..len]);
 
             if len < out.len() {
                 out[len..].fill(0);
@@ -119,17 +120,17 @@ impl VolumeCacheBackend for CacheBackend {
                     flush_write_through: false,
                     owner: 0,
                 },
-                RequestData::from_t::<Vec<u8>>(vec![0u8; block_len]),
+                RequestData::empty(),
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            {
-                let mut w = req.write();
-                let dst = w.view_data_mut::<Vec<u8>>().expect("write req missing Vec<u8>");
-                dst[..block_len].copy_from_slice(&data[..block_len]);
-            }
+            // SAFETY: lower drivers only read from write-request buffers.
+            let mut buf = unsafe { BufSlice::from_const(&data[..block_len]) };
+            let status = {
+                let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+                pnp_send_request(self.target.clone(), borrow.handle()).await
+            };
 
-            let status = pnp_send_request(self.target.clone(), &mut req).await;
             if status != DriverStatus::Success {
                 return Err(status);
             }
@@ -473,7 +474,7 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let req_data_len = req.read().view_data::<Vec<u8>>().map(|d| d.len()).unwrap_or(0);
+    let req_data_len = req.read().view_data::<BufSlice>().map(|b| b.len()).unwrap_or(0);
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
@@ -484,14 +485,17 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let mut temp = alloc::vec![0u8; len];
+    // SAFETY: BufSlice pointer is valid for the duration of the request (BorrowedHandle
+    // lifetime enforced by the caller). We write directly into the caller's buffer.
+    let dst = unsafe {
+        req.write()
+            .view_data_mut::<BufSlice>()
+            .expect("read response missing BufSlice")
+            .as_mut_slice()
+    };
 
-    match cache.read_at(offset, temp.as_mut_slice()).await {
-        Ok(()) => {
-            let mut w = req.write();
-            w.view_data_mut::<Vec<u8>>().expect("read response missing Vec<u8>")[..len].copy_from_slice(temp.as_slice());
-            DriverStep::complete(DriverStatus::Success)
-        }
+    match cache.read_at(offset, &mut dst[..len]).await {
+        Ok(()) => DriverStep::complete(DriverStatus::Success),
         Err(CacheError::Backend(s)) => DriverStep::complete(s),
         Err(_) => DriverStep::complete(DriverStatus::Unsuccessful),
     }
@@ -538,20 +542,26 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req.read().view_data::<Vec<u8>>().map(|d| d.len()).unwrap_or(0));
+    len = core::cmp::min(len, req.read().view_data::<BufSlice>().map(|b| b.len()).unwrap_or(0));
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    let data = req.read().view_data::<Vec<u8>>().expect("write req missing Vec<u8>")[..len].to_vec();
+    // SAFETY: BufSlice pointer is valid for the duration of the request.
+    let data = unsafe {
+        req.read()
+            .view_data::<BufSlice>()
+            .expect("write req missing BufSlice")
+            .as_slice()
+    };
 
     let result = match (flush_write_through, owner) {
-        (true, o) if o != 0 => cache.write_through_at_owned(offset, &data, o).await,
-        (true, _) => cache.write_through_at(offset, &data).await,
-        (false, o) if o != 0 => cache.write_at_owned(offset, &data, o).await,
-        (false, _) => cache.write_at(offset, &data).await,
+        (true, o) if o != 0 => cache.write_through_at_owned(offset, &data[..len], o).await,
+        (true, _) => cache.write_through_at(offset, &data[..len]).await,
+        (false, o) if o != 0 => cache.write_at_owned(offset, &data[..len], o).await,
+        (false, _) => cache.write_at(offset, &data[..len]).await,
     };
 
     match result {

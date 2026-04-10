@@ -31,7 +31,7 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{RequestHandle, RequestType};
+use kernel_api::request::{BufSlice, RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
@@ -365,7 +365,7 @@ pub async fn ide_pdo_read<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    let has_buffer = req.read().view_data::<Vec<u8>>().map_or(false, |d| d.len() >= len);
+    let has_buffer = req.read().view_data::<BufSlice>().map_or(false, |b| b.len() >= len);
     if !has_buffer {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
@@ -375,7 +375,13 @@ pub async fn ide_pdo_read<'a, 'b>(
 
     let mut ctrl = dx.controller.lock().await;
     let mut w = req.write();
-    let buf = &mut w.view_data_mut::<Vec<u8>>().expect("write req missing Vec<u8>")[..len];
+    // SAFETY: BufSlice pointer is valid for the duration of the request.
+    let buf = unsafe {
+        &mut w
+            .view_data_mut::<BufSlice>()
+            .expect("read req missing BufSlice")
+            .as_mut_slice()[..len]
+    };
 
     let ok = ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
     drop(ctrl);
@@ -440,7 +446,7 @@ pub async fn ide_pdo_write<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    let has_buffer = req.read().view_data::<Vec<u8>>().map_or(false, |d| d.len() >= len);
+    let has_buffer = req.read().view_data::<BufSlice>().map_or(false, |b| b.len() >= len);
     if !has_buffer {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
@@ -450,7 +456,12 @@ pub async fn ide_pdo_write<'a, 'b>(
 
     let mut ctrl = dx.controller.lock().await;
     let r = req.read();
-    let buf = &r.view_data::<Vec<u8>>().expect("read req missing Vec<u8>")[..len];
+    // SAFETY: BufSlice pointer is valid for the duration of the request.
+    let buf = unsafe {
+        &r.view_data::<BufSlice>()
+            .expect("write req missing BufSlice")
+            .as_slice()[..len]
+    };
 
     let ok = ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
     drop(ctrl);

@@ -1,23 +1,21 @@
 use alloc::{vec, vec::Vec};
-use core::{cmp::min, mem};
+use core::cmp::min;
 
 use alloc::sync::Arc;
+use core::mem;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
     println,
-    request::{RequestHandle, RequestType, TraversalPolicy},
+    request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
 
 use crate::volume::VolCtrlDevExt;
 
-// Upper bound for per-request I/O. Virtio preallocated DMA buffers are 64KiB,
-// so we clamp streaming reads/writes to this size to avoid overruns in lower drivers.
-const MAX_CHUNK_BYTES: usize = 256 * 1024;
 const DEVICE_MAX_IO_BYTES: usize = 64 * 1024;
 
 pub struct BlockDev {
@@ -25,11 +23,10 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
-    /// Scratch buffer used for partial-sector R/W to avoid per-call allocations.
+    /// Scratch buffer used only for partial-sector R/W (the single allocation).
     scratch: Vec<u8>,
-    /// Preallocated owned requests with fixed backing storage.
-    read_req: RequestHandle<'static>,
-    write_req: RequestHandle<'static>,
+    /// Reusable request — data slot is overwritten each call via BorrowedHandle.
+    req: RequestHandle<'static>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
     /// Current file owner tag — set before FS writes, read by prep_write_req.
@@ -62,35 +59,17 @@ impl BlockDev {
         current_owner: Arc<AtomicU64>,
     ) -> Self {
         let scratch = vec![0u8; sector_size as usize];
-        // Allocate max-sized data buffers once; reuse without shrinking.
-        let read_req = {
-            let data = RequestData::from_t::<Vec<u8>>(vec![0u8; MAX_CHUNK_BYTES]);
-            let mut req = RequestHandle::new(RequestType::Read { offset: 0, len: 0 }, data);
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            req
-        };
-        let write_req = {
-            let data = RequestData::from_t::<Vec<u8>>(vec![0u8; MAX_CHUNK_BYTES]);
-            let mut req = RequestHandle::new(
-                RequestType::Write {
-                    offset: 0,
-                    len: 0,
-                    flush_write_through: false,
-                    owner: 0,
-                },
-                data,
-            );
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            req
-        };
+        let req = RequestHandle::new(
+            RequestType::Read { offset: 0, len: 0 },
+            RequestData::empty(),
+        );
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
             scratch,
-            read_req,
-            write_req,
+            req,
             should_flush,
             current_owner,
         }
@@ -107,20 +86,15 @@ impl BlockDev {
     }
 
     #[inline]
-    fn lba_of(&self, byte_off: u64) -> u64 {
-        byte_off / self.sector_size as u64
-    }
-
-    #[inline]
     fn in_sector_off(&self, byte_off: u64) -> usize {
         (byte_off % self.sector_size as u64) as usize
     }
 
+    /// Reset the request header for a read, leaving data empty.
     #[inline]
-    fn prep_read_req(&mut self, offset: u64, len: usize) -> &mut RequestHandle<'static> {
-        match &mut self.read_req {
+    fn prep_req_read(&mut self, offset: u64, len: usize) {
+        match &mut self.req {
             RequestHandle::Owned(r) => {
-                debug_assert!(len <= MAX_CHUNK_BYTES);
                 r.kind = RequestType::Read { offset, len };
                 r.completed = false;
                 r.status = DriverStatus::ContinueStep;
@@ -131,30 +105,19 @@ impl BlockDev {
             }
             _ => unreachable!(),
         }
-        &mut self.read_req
     }
 
+    /// Reset the request header for a write, leaving data empty.
     #[inline]
-    fn prep_write_req(
-        &mut self,
-        offset: u64,
-        src: &[u8],
-        flush_write_through: bool,
-    ) -> &mut RequestHandle<'static> {
-        match &mut self.write_req {
+    fn prep_req_write(&mut self, offset: u64, len: usize, flush_write_through: bool) {
+        match &mut self.req {
             RequestHandle::Owned(r) => {
-                let len = src.len();
-                debug_assert!(len <= MAX_CHUNK_BYTES);
                 r.kind = RequestType::Write {
                     offset,
                     len,
                     flush_write_through,
                     owner: self.current_owner.load(Ordering::Acquire),
                 };
-                r.data
-                    .view_mut::<Vec<u8>>()
-                    .expect("read req missing Vec<u8>")[..len]
-                    .copy_from_slice(src);
                 r.completed = false;
                 r.status = DriverStatus::ContinueStep;
                 r.traversal_policy = TraversalPolicy::ForwardLower;
@@ -164,23 +127,18 @@ impl BlockDev {
             }
             _ => unreachable!(),
         }
-        &mut self.write_req
     }
 
-    /// Prepare and dispatch a read using the owned read request.
-    async fn pnp_read_into(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), DriverStatus> {
+    /// Send a read, borrowing `dst` directly so the lower driver writes into it.
+    async fn send_read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), DriverStatus> {
         let len = dst.len();
         let volume = self.volume.clone();
+        self.prep_req_read(offset, len);
+
+        let mut buf = BufSlice::new(dst);
         let status = {
-            let req = self.prep_read_req(offset, len);
-            let st = pnp_send_request(volume, req).await;
-            if st == DriverStatus::Success {
-                let w = req.write();
-                dst.copy_from_slice(
-                    &w.data.view::<Vec<u8>>().expect("write req missing Vec<u8>")[..len],
-                );
-            }
-            st
+            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut self.req, &mut buf);
+            pnp_send_request(volume, borrow.handle()).await
         };
 
         if status == DriverStatus::Success {
@@ -191,12 +149,38 @@ impl BlockDev {
         }
     }
 
-    /// Prepare and dispatch a write using the owned write request.
-    async fn pnp_write_from(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
+    /// Send a write, borrowing `src` directly — zero copy for aligned data.
+    async fn send_write(&mut self, offset: u64, src: &mut [u8]) -> Result<(), DriverStatus> {
+        let len = src.len();
         let volume = self.volume.clone();
+        self.prep_req_write(offset, len, false);
+
+        let mut buf = BufSlice::new(src);
         let status = {
-            let req = self.prep_write_req(offset, src, false);
-            pnp_send_request(volume, req).await
+            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut self.req, &mut buf);
+            pnp_send_request(volume, borrow.handle()).await
+        };
+
+        if status == DriverStatus::Success {
+            Ok(())
+        } else {
+            println!("Write Error: {:#?}", status);
+            Err(status)
+        }
+    }
+
+    /// Send a write from an immutable source. Uses `BufSlice::from_const`;
+    /// lower stack must not mutate write buffers.
+    async fn send_write_immut(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
+        let len = src.len();
+        let volume = self.volume.clone();
+        self.prep_req_write(offset, len, false);
+
+        // SAFETY: lower drivers only read from write-request buffers.
+        let mut buf = unsafe { BufSlice::from_const(src) };
+        let status = {
+            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut self.req, &mut buf);
+            pnp_send_request(volume, borrow.handle()).await
         };
 
         if status == DriverStatus::Success {
@@ -218,60 +202,38 @@ impl BlockDev {
             return Ok(0);
         }
 
-        // Clamp reads that would pass the end of the device.
         remaining = min(remaining, (cap_bytes - self.pos) as usize);
         let mut written = 0usize;
         let mut cur_off = self.pos;
         let bps = self.bps();
-        let mut scratch_buf = mem::take(&mut self.scratch);
-        if scratch_buf.len() < bps {
-            scratch_buf.resize(bps, 0);
-        }
 
-        // Handle leading partial sector, if any.
+        // Leading partial sector — uses scratch buffer.
         let in_sector = self.in_sector_off(cur_off);
         if in_sector != 0 {
             let lba_base = cur_off - in_sector as u64;
             let take = min(bps - in_sector, remaining);
-            let scratch = &mut scratch_buf[..bps];
 
-            block_on(self.pnp_read_into(lba_base, scratch))?;
-
-            if unsafe {
-                let src = scratch.as_ptr().add(in_sector);
-                let dst = dst.as_ptr();
-
-                src.is_null()
-                    || dst.is_null()
-                    || (src as usize) % core::mem::align_of::<u8>() != 0
-                    || (dst as usize) % core::mem::align_of::<u8>() != 0
-                    || (src < dst.add(take) && src.add(take) > dst)
-            } {
-                panic!("Unexpected overlap between scratch buffer and destination buffer");
-            }
-
+            // Take scratch out of self so we can pass &mut self to send_read.
+            let mut scratch = mem::take(&mut self.scratch);
+            block_on(self.send_read(lba_base, &mut scratch[..bps]))?;
             dst[..take].copy_from_slice(&scratch[in_sector..in_sector + take]);
+            self.scratch = scratch;
 
             cur_off += take as u64;
             written += take;
             remaining -= take;
         }
 
-        // Whole aligned sectors can stream directly into destination in chunks.
+        // Whole aligned sectors stream directly into destination — zero copy.
         let aligned_bytes = remaining - (remaining % bps);
         if aligned_bytes != 0 {
             let mut done = 0;
             while done < aligned_bytes {
-                // Cap each IO to MAX_CHUNK_BYTES while staying sector aligned.
-                let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
                 let device_cap = DEVICE_MAX_IO_BYTES - (DEVICE_MAX_IO_BYTES % bps);
-
-                let chunk_cap = if max_chunk == 0 { bps } else { max_chunk };
-                let device_cap = if device_cap == 0 { bps } else { device_cap };
-
-                let chunk = min(aligned_bytes - done, min(chunk_cap, device_cap));
+                let chunk_cap = if device_cap == 0 { bps } else { device_cap };
+                let chunk = min(aligned_bytes - done, chunk_cap);
                 let dst_slice = &mut dst[written + done..written + done + chunk];
-                block_on(self.pnp_read_into(cur_off, dst_slice))?;
+                block_on(self.send_read(cur_off, dst_slice))?;
 
                 cur_off += chunk as u64;
                 done += chunk;
@@ -280,41 +242,20 @@ impl BlockDev {
             remaining -= aligned_bytes;
         }
 
-        // Trailing partial sector.
+        // Trailing partial sector — uses scratch buffer.
         if remaining != 0 {
-            let scratch = &mut scratch_buf[..bps];
-            block_on(self.pnp_read_into(cur_off, scratch))?;
-
-            // Recompute the in-sector offset for the *current* position.
-            // The earlier `in_sector` may be non-zero when the read starts mid‑sector;
-            // reusing it here would produce out-of-bounds pointer arithmetic once
-            // we've advanced to a new sector.
+            let mut scratch = mem::take(&mut self.scratch);
+            block_on(self.send_read(cur_off, &mut scratch[..bps]))?;
             let tail_in_sector = self.in_sector_off(cur_off);
-
-            // Only the slice we will actually copy (tail_in_sector..tail_in_sector+remaining)
-            // should be considered in the overlap check.
-            if unsafe {
-                let src = scratch.as_ptr().add(tail_in_sector);
-                let dst_ptr = dst.as_ptr().add(written);
-
-                src.is_null()
-                    || dst_ptr.is_null()
-                    || (src as usize) % core::mem::align_of::<u8>() != 0
-                    || (dst_ptr as usize) % core::mem::align_of::<u8>() != 0
-                    || (src < dst_ptr.add(remaining) && src.add(remaining) > dst_ptr)
-            } {
-                panic!("Unexpected overlap between scratch buffer and destination buffer");
-            }
-
             dst[written..written + remaining]
                 .copy_from_slice(&scratch[tail_in_sector..tail_in_sector + remaining]);
+            self.scratch = scratch;
 
             cur_off += remaining as u64;
             written += remaining;
         }
 
         self.pos = cur_off;
-        self.scratch = scratch_buf;
         Ok(written)
     }
 
@@ -329,46 +270,38 @@ impl BlockDev {
             return Ok(0);
         }
 
-        // Clamp writes beyond end of device.
         remaining = min(remaining, (cap_bytes - self.pos) as usize);
         let mut written = 0usize;
         let mut cur_off = self.pos;
         let bps = self.bps();
-        let mut scratch_buf = mem::take(&mut self.scratch);
-        if scratch_buf.len() < bps {
-            scratch_buf.resize(bps, 0);
-        }
 
-        // Leading partial sector (read-modify-write).
+        // Leading partial sector (read-modify-write via scratch).
         let in_sector = self.in_sector_off(cur_off);
         if in_sector != 0 {
             let lba_base = cur_off - in_sector as u64;
             let write_len = min(bps - in_sector, remaining);
-            let scratch = &mut scratch_buf[..bps];
 
-            block_on(self.pnp_read_into(lba_base, scratch))?;
+            let mut scratch = mem::take(&mut self.scratch);
+            block_on(self.send_read(lba_base, &mut scratch[..bps]))?;
             scratch[in_sector..in_sector + write_len].copy_from_slice(&src[..write_len]);
-            block_on(self.pnp_write_from(lba_base, scratch))?;
+            block_on(self.send_write(lba_base, &mut scratch[..bps]))?;
+            self.scratch = scratch;
 
             cur_off += write_len as u64;
             written += write_len;
             remaining -= write_len;
         }
 
-        // Aligned middle portion.
+        // Aligned middle — borrow src directly, zero copy.
         let aligned_bytes = remaining - (remaining % bps);
         if aligned_bytes != 0 {
             let mut done = 0;
             while done < aligned_bytes {
-                let max_chunk = MAX_CHUNK_BYTES - (MAX_CHUNK_BYTES % bps);
                 let device_cap = DEVICE_MAX_IO_BYTES - (DEVICE_MAX_IO_BYTES % bps);
-
-                let chunk_cap = if max_chunk == 0 { bps } else { max_chunk };
-                let device_cap = if device_cap == 0 { bps } else { device_cap };
-
-                let chunk = min(aligned_bytes - done, min(chunk_cap, device_cap));
+                let chunk_cap = if device_cap == 0 { bps } else { device_cap };
+                let chunk = min(aligned_bytes - done, chunk_cap);
                 let src_slice = &src[written + done..written + done + chunk];
-                block_on(self.pnp_write_from(cur_off, src_slice))?;
+                block_on(self.send_write_immut(cur_off, src_slice))?;
 
                 cur_off += chunk as u64;
                 done += chunk;
@@ -377,19 +310,19 @@ impl BlockDev {
             remaining -= aligned_bytes;
         }
 
-        // Trailing partial sector (read-modify-write).
+        // Trailing partial sector (read-modify-write via scratch).
         if remaining != 0 {
-            let scratch = &mut scratch_buf[..bps];
-            block_on(self.pnp_read_into(cur_off, scratch))?;
+            let mut scratch = mem::take(&mut self.scratch);
+            block_on(self.send_read(cur_off, &mut scratch[..bps]))?;
             scratch[..remaining].copy_from_slice(&src[written..written + remaining]);
-            block_on(self.pnp_write_from(cur_off, scratch))?;
+            block_on(self.send_write(cur_off, &mut scratch[..bps]))?;
+            self.scratch = scratch;
 
             cur_off += remaining as u64;
             written += remaining;
         }
 
         self.pos = cur_off;
-        self.scratch = scratch_buf;
         Ok(written)
     }
 }

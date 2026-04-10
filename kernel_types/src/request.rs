@@ -820,3 +820,74 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req,
         }
     }
 }
+
+/// Thin wrapper around a raw `*mut u8` + length so a borrowed byte slice can be
+/// stored in [`RequestData`] without carrying lifetime parameters.
+///
+/// Lower drivers resolve this with `view::<BufSlice>()` / `view_mut::<BufSlice>()`
+/// and then call `.as_slice()` / `.as_mut_slice()` to access the underlying bytes.
+///
+/// # Safety
+/// The caller must guarantee the pointer remains valid for the duration of the
+/// request (enforced externally by [`BorrowedHandle`] lifetimes).
+pub struct BufSlice {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: BufSlice is only constructed from references whose lifetimes are
+// enforced by BorrowedHandle. The pointer is valid and exclusive for the
+// duration of the borrow.
+unsafe impl Send for BufSlice {}
+unsafe impl Sync for BufSlice {}
+
+impl BufSlice {
+    /// Wrap a mutable byte slice into a `BufSlice`.
+    #[inline]
+    pub fn new(slice: &mut [u8]) -> Self {
+        Self {
+            ptr: slice.as_mut_ptr(),
+            len: slice.len(),
+        }
+    }
+
+    /// Wrap an immutable byte slice into a `BufSlice` for read-only forwarding
+    /// (e.g. write requests where the lower stack only reads the buffer).
+    ///
+    /// # Safety
+    /// The caller must guarantee that no code path will call `as_mut_slice()`
+    /// on the resulting `BufSlice`. The pointer is stored as `*mut` internally
+    /// but must only be accessed via `as_slice()`.
+    #[inline]
+    pub unsafe fn from_const(slice: &[u8]) -> Self {
+        Self {
+            ptr: slice.as_ptr() as *mut u8,
+            len: slice.len(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// View the buffer as an immutable byte slice.
+    ///
+    /// # Safety
+    /// Caller must ensure the pointer is still valid (guaranteed when accessed
+    /// through a live `BorrowedHandle`).
+    #[inline]
+    pub unsafe fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    /// View the buffer as a mutable byte slice.
+    ///
+    /// # Safety
+    /// Caller must ensure the pointer is still valid and no other references
+    /// exist (guaranteed when accessed through a live `BorrowedHandle`).
+    #[inline]
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}

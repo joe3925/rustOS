@@ -637,7 +637,10 @@ fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> Dri
     };
     let res = match result {
         Ok(pos) => FsSeekResult { pos, error: None },
-        Err(e) => FsSeekResult { pos: 0, error: Some(e) },
+        Err(e) => FsSeekResult {
+            pos: 0,
+            error: Some(e),
+        },
     };
     req.write().set_data_t(res);
     DriverStatus::Success
@@ -654,11 +657,7 @@ async fn send_flush_dirty(volume_target: IoTarget) -> DriverStatus {
     pnp_send_request(volume_target, &mut flush_req).await
 }
 
-async fn send_flush_owner(
-    volume_target: IoTarget,
-    owner: u64,
-    should_block: bool,
-) -> DriverStatus {
+async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
     let mut flush_req = RequestHandle::new(
         RequestType::FlushOwner {
             owner,

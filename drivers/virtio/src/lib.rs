@@ -35,7 +35,7 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{RequestHandle, RequestType};
+use kernel_api::request::{BufSlice, RequestHandle, RequestType};
 use kernel_api::status::DriverStatus;
 use kernel_api::util::{get_current_cpu_id, panic_common, wait_duration};
 use kernel_api::x86_64::VirtAddr;
@@ -1022,8 +1022,8 @@ pub async fn virtio_pdo_read<'a, 'b>(
     // Ensure caller-provided buffer is large enough for the requested transfer.
     if req
         .read()
-        .view_data::<Vec<u8>>()
-        .map_or(true, |d| d.len() < len)
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < len)
     {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
@@ -1107,10 +1107,13 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
             {
                 let mut w = req.write();
-                let dst = &mut w
-                    .view_data_mut::<Vec<u8>>()
-                    .expect("read req missing Vec<u8> buffer")
-                    [buf_offset..buf_offset + chunk_len as usize];
+                // SAFETY: BufSlice pointer is valid for the duration of the request.
+                let dst = unsafe {
+                    &mut w
+                        .view_data_mut::<BufSlice>()
+                        .expect("read req missing BufSlice buffer")
+                        .as_mut_slice()[buf_offset..buf_offset + chunk_len as usize]
+                };
                 dst.copy_from_slice(io_req.data_slice());
             }
 
@@ -1183,8 +1186,8 @@ pub async fn virtio_pdo_write<'a, 'b>(
     // the caller's data buffer and corrupt adjacent memory.
     if req
         .read()
-        .view_data::<Vec<u8>>()
-        .map_or(true, |d| d.len() < len)
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < len)
     {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
@@ -1231,10 +1234,12 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
             {
                 let r = req.read();
-                let src = &r
-                    .view_data::<Vec<u8>>()
-                    .expect("write req missing Vec<u8> buffer")
-                    [buf_offset..buf_offset + chunk_len as usize];
+                // SAFETY: BufSlice pointer is valid for the duration of the request.
+                let src = unsafe {
+                    &r.view_data::<BufSlice>()
+                        .expect("write req missing BufSlice buffer")
+                        .as_slice()[buf_offset..buf_offset + chunk_len as usize]
+                };
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
