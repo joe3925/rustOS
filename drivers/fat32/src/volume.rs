@@ -1,4 +1,4 @@
-use crate::block_dev::flush_owner;
+use crate::block_dev::{flush_owner, flush_owner_blocking};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -51,6 +51,8 @@ pub struct VolCtrlDevExt {
     pub should_flush: Arc<AtomicBool>,
     /// Owner tag of the file that requested the pending flush (0 = flush all dirty).
     pub pending_flush_owner: Arc<AtomicU64>,
+    /// Whether the pending flush must block until the cache confirms writeback.
+    pub pending_flush_block: Arc<AtomicBool>,
     /// Current file owner tag — shared with BlockDev, set before FS writes.
     pub current_owner: Arc<AtomicU64>,
 }
@@ -309,7 +311,7 @@ fn execute_fs_work(
                                 match file.write_all(&params.data) {
                                     Ok(()) => {
                                         if params.write_through {
-                                            flush_owner(&vdx, params.fs_file_id);
+                                            flush_owner_blocking(&vdx, params.fs_file_id);
                                             Ok(n)
                                         } else {
                                             Ok(n)
@@ -397,7 +399,7 @@ fn execute_fs_work(
                 }
             };
             vdx.current_owner.store(0, Ordering::Release);
-            flush_owner(&vdx, params.fs_file_id);
+            flush_owner_blocking(&vdx, params.fs_file_id);
             let res = FsFlushResult { error: err };
             (DriverStatus::Success, Some(FsReply::Flush(res)))
         }
@@ -521,7 +523,7 @@ fn execute_fs_work(
                                     match file.write_all(&params.data) {
                                         Ok(()) => {
                                             if params.write_through {
-                                                flush_owner(&vdx, params.fs_file_id);
+                                                flush_owner_blocking(&vdx, params.fs_file_id);
                                                 Ok((n, start_off + n as u64))
                                             } else {
                                                 Ok((n, start_off + n as u64))
@@ -678,11 +680,11 @@ async fn send_flush_dirty(volume_target: &IoTarget) -> DriverStatus {
     pnp_send_request(volume_target.clone(), &mut flush_req).await
 }
 
-async fn send_flush_owner(volume_target: &IoTarget, owner: u64) -> DriverStatus {
+async fn send_flush_owner(volume_target: &IoTarget, owner: u64, should_block: bool) -> DriverStatus {
     let mut flush_req = RequestHandle::new(
         RequestType::FlushOwner {
             owner,
-            should_block: false,
+            should_block,
         },
         RequestData::empty(),
     );
@@ -695,13 +697,14 @@ pub async fn fs_op_dispatch<'a, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a>,
 ) -> DriverStep {
-    let (fs_arc, volume_target, flush_flag, pending_flush_owner) = {
+    let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         (
             vdx.fs.clone(),
             vdx.volume_target.clone(),
             vdx.should_flush.clone(),
             vdx.pending_flush_owner.clone(),
+            vdx.pending_flush_block.clone(),
         )
     };
 
@@ -728,8 +731,9 @@ pub async fn fs_op_dispatch<'a, 'b>(
 
     if flush_flag.swap(false, Ordering::AcqRel) {
         let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
+        let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
         if owner != 0 {
-            let _ = send_flush_owner(&volume_target, owner).await;
+            let _ = send_flush_owner(&volume_target, owner, should_block).await;
         } else {
             let _ = send_flush_dirty(&volume_target).await;
         }

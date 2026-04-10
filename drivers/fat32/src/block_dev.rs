@@ -410,11 +410,22 @@ impl Write for BlockDev {
     }
 }
 pub fn flush(vdx: &VolCtrlDevExt) {
+    vdx.pending_flush_block.store(false, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 
+/// Kick a non-blocking cache flush for `owner`. The flush completes asynchronously.
 pub fn flush_owner(vdx: &VolCtrlDevExt, owner: u64) {
     vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
+    vdx.pending_flush_block.store(false, Ordering::SeqCst);
+    vdx.should_flush.store(true, Ordering::SeqCst);
+}
+
+/// Kick a blocking cache flush for `owner`. The caller will wait until the cache
+/// confirms the data has been written (used for write-through writes and explicit flushes).
+pub fn flush_owner_blocking(vdx: &VolCtrlDevExt, owner: u64) {
+    vdx.pending_flush_owner.store(owner, Ordering::SeqCst);
+    vdx.pending_flush_block.store(true, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
 

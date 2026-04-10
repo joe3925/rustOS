@@ -144,6 +144,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                         volume_target: id.volume_fdo.clone(),
                         should_flush,
                         pending_flush_owner: Arc::new(AtomicU64::new(0)),
+                        pending_flush_block: Arc::new(AtomicBool::new(false)),
                         current_owner,
                     };
 

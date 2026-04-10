@@ -100,36 +100,41 @@ pub(crate) extern "x86-interrupt" fn page_fault(
 
     if !is_protection {
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            let mut t = task.inner.write();
-            if !t.is_user_mode && !is_user && t.guard_page != 0 {
-                let max_depth = t.stack_start.saturating_sub(KERNEL_STACK_MAX_BYTES);
-                let gp = t.guard_page;
+            // No lock taken here — stack metadata lives in lock-free atomics on
+            // TaskRef so the page-fault handler never contends with a guard held
+            // by the interrupted code.
+            if task.is_kernel_mode.load(core::sync::atomic::Ordering::Relaxed) && !is_user {
+                let gp = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+                if gp != 0 {
+                    let stack_start = task.stack_start.load(core::sync::atomic::Ordering::Relaxed);
+                    let max_depth = stack_start.saturating_sub(KERNEL_STACK_MAX_BYTES);
 
-                // Allow growth for faults anywhere within the 2MiB reserved window below stack_start.
-                if fault >= max_depth && fault < t.stack_start {
-                    let flags = PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::NO_EXECUTE;
-                    while fault < t.guard_page + PAGE_SIZE {
-                        match t.grow_stack(flags) {
-                            Ok(true) => {}
-                            _ => break,
+                    // Allow growth for faults anywhere within the 2MiB reserved window below stack_start.
+                    if fault >= max_depth && fault < stack_start {
+                        let flags = PageTableFlags::PRESENT
+                            | PageTableFlags::WRITABLE
+                            | PageTableFlags::NO_EXECUTE;
+                        while fault < task.guard_page.load(core::sync::atomic::Ordering::Acquire) + PAGE_SIZE {
+                            match task.grow_stack(flags) {
+                                Ok(true) => {}
+                                _ => break,
+                            }
+                        }
+                        if fault >= task.guard_page.load(core::sync::atomic::Ordering::Acquire) + PAGE_SIZE {
+                            return;
                         }
                     }
-                    if fault >= t.guard_page + PAGE_SIZE {
-                        return;
-                    }
-                }
 
-                if fault >= gp - StackSize::Huge2M.as_bytes() {
-                    unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
-                    panic!(
-                        "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
-                        error_code,
-                        fault,
-                        gp,
-                        stack_frame
-                    );
+                    if fault >= gp - StackSize::Huge2M.as_bytes() {
+                        unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
+                        panic!(
+                            "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
+                            error_code,
+                            fault,
+                            gp,
+                            stack_frame
+                        );
+                    }
                 }
             }
         }

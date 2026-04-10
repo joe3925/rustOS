@@ -585,10 +585,15 @@ pub async fn vol_pdo_flush<'a, 'b>(
     };
 
     if let Some(owner) = flush_owner {
-        match cache.flush_owner(owner).await {
-            Ok(()) => return DriverStep::complete(DriverStatus::Success),
-            Err(CacheError::Backend(s)) => return DriverStep::complete(s),
-            Err(_) => return DriverStep::complete(DriverStatus::Unsuccessful),
+        if should_block {
+            match cache.flush_owner(owner).await {
+                Ok(()) => return DriverStep::complete(DriverStatus::Success),
+                Err(CacheError::Backend(s)) => return DriverStep::complete(s),
+                Err(_) => return DriverStep::complete(DriverStatus::Unsuccessful),
+            }
+        } else {
+            cache.flush_async().await;
+            return DriverStep::complete(DriverStatus::Success);
         }
     }
 
