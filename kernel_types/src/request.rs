@@ -3,6 +3,8 @@ use crate::fs::FsOp;
 use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
+use alloc::string::String;
+use core::num::NonZeroU64;
 use core::{
     alloc::Layout,
     marker::PhantomData,
@@ -63,7 +65,6 @@ impl core::fmt::Debug for InlineBuffer {
 /// Dropper function signature - only does drop_in_place, never deallocates
 type DropperFn = fn(*mut u8);
 
-
 #[repr(C)]
 pub struct RequestData {
     /// Inline buffer for small data (always present, may be unused)
@@ -91,19 +92,88 @@ impl core::fmt::Debug for RequestData {
             .finish_non_exhaustive()
     }
 }
+const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> usize {
+    let mut i = 0;
+    let mut o = 0;
+    let mut depth: usize = 0;
 
+    // Skip leading '&'
+    if i < input.len() && input[i] == b'&' {
+        i += 1;
+    }
+
+    while i < input.len() {
+        let b = input[i];
+        if b == b'<' {
+            depth += 1;
+            out[o] = b;
+            o += 1;
+            i += 1;
+        } else if b == b'>' {
+            if depth > 0 {
+                depth -= 1;
+            }
+            out[o] = b;
+            o += 1;
+            i += 1;
+        } else if b == b'\'' {
+            if depth > 0 {
+                while o > 0 && out[o - 1] == b' ' {
+                    o -= 1;
+                }
+                if o > 0 && out[o - 1] == b',' {
+                    o -= 1;
+                }
+                i += 1;
+                while i < input.len() && input[i] != b',' && input[i] != b'>' {
+                    i += 1;
+                }
+                if i < input.len() && input[i] == b',' {
+                    i += 1;
+                    while i < input.len() && input[i] == b' ' {
+                        i += 1;
+                    }
+                }
+            } else {
+                i += 1;
+                while i < input.len() && input[i] != b' ' && input[i] != b',' && input[i] != b'>' {
+                    i += 1;
+                }
+                if i < input.len() && input[i] == b' ' {
+                    i += 1;
+                }
+            }
+        } else {
+            out[o] = b;
+            o += 1;
+            i += 1;
+        }
+    }
+    o
+}
+pub fn type_name_stripped<T>() -> String {
+    let mut buf = [0u8; 512];
+    let len = strip_lifetimes_and_borrows(core::any::type_name::<T>().as_bytes(), &mut buf);
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
 // SAFETY: RequestData owns its heap allocation exclusively (HeapTyped) or holds a non-owning
 // pointer to driver-owned data (Borrowed). For Borrowed, the driver enforces T: Send + Sync
 // via BorrowedHandle's type bounds, making cross-thread access safe.
 unsafe impl Send for RequestData {}
 unsafe impl Sync for RequestData {}
-// TODO: better hashing is probably possible to reduce the case where 2 types have the same name.
+/// Compute a type tag for `T`, stripping lifetime parameters from generic argument lists
+/// so that e.g. `FsAppendParams<'_>` and `FsAppendParams<'data>` produce the same hash,
+/// while non-lifetime generics (e.g. `Vec<u8>` vs `Vec<u16>`) remain distinct.
 #[inline]
 pub const fn type_tag<T>() -> u64 {
-    const fn fnv1a(bytes: &[u8]) -> u64 {
+    /// Copy `input` into `out`, removing lifetime tokens (`'ident`) that appear inside
+    /// angle-bracket generic argument lists, along with their adjacent `, ` separators.
+    /// Returns the number of bytes written.
+
+    const fn fnv1a(bytes: &[u8], len: usize) -> u64 {
         let mut hash: u64 = 0x817776954A86F58E;
         let mut i = 0;
-        while i < bytes.len() {
+        while i < len {
             hash ^= bytes[i] as u64;
             hash = hash.wrapping_mul(0x100000001b3);
             i += 1;
@@ -111,7 +181,9 @@ pub const fn type_tag<T>() -> u64 {
         hash
     }
 
-    fnv1a(core::any::type_name::<T>().as_bytes())
+    let mut buf = [0u8; 512];
+    let len = strip_lifetimes_and_borrows(core::any::type_name::<T>().as_bytes(), &mut buf);
+    fnv1a(&buf, len)
 }
 
 /// No-op dropper for raw bytes or empty data
@@ -204,7 +276,9 @@ impl RequestData {
     fn matches<T>(&self) -> bool {
         self.tag == Some(type_tag::<T>()) && self.size == size_of::<T>()
     }
-
+    pub fn get_type_tag(&self) -> Option<u64> {
+        self.tag
+    }
     pub fn view<T>(&self) -> Option<&T> {
         if !self.matches::<T>() {
             return None;
@@ -282,7 +356,6 @@ impl RequestData {
 
         Some(value)
     }
-
 }
 
 impl Drop for RequestData {
@@ -380,7 +453,6 @@ pub struct Request {
     pub pnp: Option<PnpRequest>,
     pub completion_routine: Option<CompletionRoutine>,
     pub completion_context: usize,
-
 }
 
 impl Request {
@@ -682,7 +754,6 @@ pub struct RequestHandleResult<'a> {
     pub step: DriverStep,
     pub handle: RequestHandle<'a>,
 }
-
 // ============================================================================
 // BorrowedHandle — zero-copy driver-owned data borrow for forwarded requests
 // ============================================================================
@@ -692,23 +763,25 @@ pub struct RequestHandleResult<'a> {
 ///
 /// - `data` is exclusively borrowed while `BorrowedHandle` is alive (via `PhantomData<&'data mut T>`)
 /// - `handle` is exclusively borrowed while `BorrowedHandle` is alive (via `&'req mut RequestHandle`)
-/// - `'data: 'req` — data outlives the request's use of it (implicit from struct field types)
+/// - `'data: 'req` — data outlives the request's use of it (explicitly bounded on the struct)
 ///
 /// On drop, clears the request's data field back to `RequestData::empty()` only if the lower
 /// driver has not replaced it with a response. This prevents silently clobbering response data.
 ///
 /// # Known limitation
 /// Like all RAII guards in Rust, `mem::forget(borrow)` prevents Drop from running, leaving the
-/// request with a dangling pointer. This is an accepted trade-off (same as `MutexGuard`).
+/// request with a dangling pointer. This is an accepted trade-off structurally, but in a kernel
+/// environment, leaking this type will lead to a use-after-free and bug check.
+///
 /// `'data` — lifetime of the driver-owned data being lent
 /// `'req`  — lifetime of our exclusive borrow of the RequestHandle
 /// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
-pub struct BorrowedHandle<'data, 'req, 'h, T: 'static + Send + Sync> {
+pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: Send + Sync> {
     handle: &'req mut RequestHandle<'h>,
     _data: PhantomData<&'data mut T>,
 }
 
-impl<'data, 'req, 'h, T: 'static + Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
     /// Installs a borrow of `data` into `handle`'s request data slot.
     ///
     /// While the returned `BorrowedHandle` is alive:
@@ -718,13 +791,16 @@ impl<'data, 'req, 'h, T: 'static + Send + Sync> BorrowedHandle<'data, 'req, 'h, 
     pub fn new(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
         // SAFETY:
         // - ptr is valid for 'data (derived from &'data mut T).
-        // - 'data: 'req is enforced by the struct's field types — the compiler requires it.
+        // - 'data: 'req is explicitly enforced by the struct's generic bounds.
         // - The &'data mut T exclusive borrow prevents any access to *data while Self is alive.
         // - Drop clears the pointer before 'data ends because 'data must outlive Self.
         let ptr = data as *mut T as *mut u8;
         unsafe { &mut *handle.write_raw() }.data =
             RequestData::from_borrowed_raw(ptr, type_tag::<T>(), size_of::<T>());
-        Self { handle, _data: PhantomData }
+        Self {
+            handle,
+            _data: PhantomData,
+        }
     }
 
     /// Returns the inner handle for passing to lower drivers.
@@ -733,7 +809,7 @@ impl<'data, 'req, 'h, T: 'static + Send + Sync> BorrowedHandle<'data, 'req, 'h, 
     }
 }
 
-impl<'data, 'req, 'h, T: 'static + Send + Sync> Drop for BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req, 'h, T> {
     fn drop(&mut self) {
         // SAFETY: handle is still valid — 'req is live while Self exists.
         let req = unsafe { &mut *self.handle.write_raw() };

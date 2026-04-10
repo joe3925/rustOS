@@ -289,14 +289,13 @@ pub struct FsSetLenResult {
 
 #[repr(C)]
 #[derive(Debug, Clone)]
-pub struct FsAppendParams {
+pub struct FsAppendParams<'a> {
     pub fs_file_id: u64,
-    pub data: alloc::vec::Vec<u8>,
+    pub data: &'a [u8],
     pub write_through: bool,
 }
-
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FsAppendResult {
     pub written: usize,
     pub new_size: u64,

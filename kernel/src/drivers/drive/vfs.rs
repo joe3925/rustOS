@@ -5,7 +5,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
-use kernel_types::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::request::{
+    type_name_stripped, BorrowedHandle, RequestHandle, RequestType, TraversalPolicy,
+};
 use kernel_types::status::{DriverStatus, FileStatus};
 
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -184,7 +186,46 @@ impl Vfs {
         };
         data.ok_or(DriverStatus::InvalidParameter)
     }
+    async fn call_fs_test<TParam, TResult>(
+        &self,
+        volume_symlink: &str,
+        target: Option<IoTarget>,
+        op: FsOp,
+        mut param: TParam,
+    ) -> Result<TResult, DriverStatus>
+    where
+        TParam: Send + Sync,
+        TResult: 'static + Copy,
+    {
+        let mut request_handle = RequestHandle::new(RequestType::Fs(op), RequestData::empty());
+        request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
+        let mut borrow_handle = BorrowedHandle::new(&mut request_handle, &mut param);
 
+        let status = if let Some(tgt) = target {
+            PNP_MANAGER.send_request(tgt, borrow_handle.handle()).await
+        } else {
+            PNP_MANAGER
+                .send_request_via_symlink(volume_symlink.to_string(), borrow_handle.handle())
+                .await
+        };
+
+        if status != DriverStatus::Success {
+            println!("Send request failed with status: {}", status);
+            return Err(status);
+        }
+
+        let data = {
+            let mut guard = borrow_handle.handle().write();
+            guard.view_data::<TResult>().copied()
+        };
+
+        if let Some(inner) = data {
+            Ok(inner)
+        } else {
+            // The driver reported success but did not provide the expected payload type.
+            Err(DriverStatus::DeviceError)
+        }
+    }
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(p.path) {
             Ok(v) => v,
@@ -789,14 +830,14 @@ impl Vfs {
             ),
         }
     }
-    pub async fn append(&self, mut p: FsAppendParams) -> (FsAppendResult, DriverStatus) {
-        let (target, inner_id, symlink_ptr) = {
+    pub async fn append<'a>(&self, mut p: FsAppendParams<'a>) -> (FsAppendResult, DriverStatus) {
+        let (target, inner_id, symlink) = {
             let binding = self.handles.read().await;
             if let Some(h) = binding.get(&p.fs_file_id) {
                 (
                     h.target.clone(),
                     h.inner_id,
-                    h.volume_symlink.as_str() as *const str,
+                    h.volume_symlink.clone(), // Safe owned extraction
                 )
             } else {
                 return (
@@ -808,18 +849,22 @@ impl Vfs {
                     DriverStatus::Success,
                 );
             }
-        };
+        }; // Lock drops safely here
 
+        // Translate the virtual handle ID to the lower driver's actual file ID
         p.fs_file_id = inner_id;
 
-        let symlink: &str = if target.is_some() {
-            ""
-        } else {
-            unsafe { &*symlink_ptr }
-        };
+        let symlink_ref: &str = if target.is_some() { "" } else { &symlink };
 
+        // Pass an immutable reference (&p) to call_fs_test.
+        // The generalized BorrowedHandle trait will forward this safely as a Read-Only borrow.
         match self
-            .call_fs::<FsAppendParams, FsAppendResult>(symlink, target, FsOp::Append, p)
+            .call_fs_test::<&FsAppendParams<'a>, FsAppendResult>(
+                symlink_ref,
+                target,
+                FsOp::Append,
+                &mut p,
+            )
             .await
         {
             Ok(r) => (r, DriverStatus::Success),
@@ -1030,9 +1075,10 @@ impl FileProvider for Vfs {
     ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
         let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
 
+        // Pass the slice directly instead of allocating a Vec.
         this.append(FsAppendParams {
             fs_file_id: file_id,
-            data: data.to_vec(),
+            data,
             write_through,
         })
         .into_ffi()

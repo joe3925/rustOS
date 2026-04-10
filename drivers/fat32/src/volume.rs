@@ -1,4 +1,3 @@
-use crate::block_dev::{flush_owner, flush_owner_blocking};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -10,6 +9,8 @@ use fatfs::{
     NullTimeProvider, Read, Seek, SeekFrom, Write,
 };
 use kernel_api::kernel_types::fs::Path;
+use kernel_api::println;
+use kernel_api::request::type_name_stripped;
 use kernel_api::runtime::spawn_blocking;
 use spin::{Mutex, RwLock};
 
@@ -31,7 +32,7 @@ use kernel_api::{
     request_handler,
 };
 
-use crate::block_dev::BlockDev;
+use crate::block_dev::{BlockDev, flush_owner, flush_owner_blocking};
 use crate::control::ext_mut;
 
 type FatDev = BlockDev;
@@ -64,7 +65,21 @@ pub struct FileCtx {
     size: u64,
 }
 
-enum FsWork {
+/// Static handoff structure to pass borrowed buffer data across the thread boundary
+pub struct FsAppendWork {
+    pub fs_file_id: u64,
+    pub data_ptr: *const u8,
+    pub data_len: usize,
+    pub write_through: bool,
+}
+
+// SAFETY: The pointer is guaranteed to remain valid for the duration of the
+// execute_fs_work thread because the parent async function strictly .awaits
+// the completion of the thread before the RequestHandle (and buffer) is dropped.
+unsafe impl Send for FsAppendWork {}
+unsafe impl Sync for FsAppendWork {}
+
+pub enum FsWork {
     Open(FsOpenParams),
     Close(FsCloseParams),
     Read(FsReadParams),
@@ -76,7 +91,10 @@ enum FsWork {
     ReadDir(FsListDirParams),
     GetInfo(FsGetInfoParams),
     SetLen(FsSetLenParams),
-    Append(FsAppendParams),
+
+    // Replaced the lifetime-bound struct with our static handoff struct
+    Append(FsAppendWork),
+
     ZeroRange(FsZeroRangeParams),
     SetInfo,
     Delete,
@@ -99,7 +117,7 @@ enum FsReply {
 }
 
 fn take_typed_params<T>(req: &mut RequestHandle<'_>) -> Result<T, DriverStatus> {
-    let mut r = req.write();
+    let r = req.write();
     r.take_data::<T>().ok_or(DriverStatus::InvalidParameter)
 }
 
@@ -160,7 +178,22 @@ fn parse_fs_work(req: &mut RequestHandle<'_>) -> Result<FsWork, DriverStatus> {
             FsOp::ReadDir => Ok(FsWork::ReadDir(take_typed_params::<FsListDirParams>(req)?)),
             FsOp::GetInfo => Ok(FsWork::GetInfo(take_typed_params::<FsGetInfoParams>(req)?)),
             FsOp::SetLen => Ok(FsWork::SetLen(take_typed_params::<FsSetLenParams>(req)?)),
-            FsOp::Append => Ok(FsWork::Append(take_typed_params::<FsAppendParams>(req)?)),
+
+            FsOp::Append => {
+                let guard = req.read();
+                let params_ref = guard
+                    .view_data::<&FsAppendParams<'_>>()
+                    .ok_or(DriverStatus::InvalidParameter)?;
+
+                // Erase the lifetime into raw pointers for the thread handoff
+                Ok(FsWork::Append(FsAppendWork {
+                    fs_file_id: params_ref.fs_file_id,
+                    data_ptr: params_ref.data.as_ptr(),
+                    data_len: params_ref.data.len(),
+                    write_through: params_ref.write_through,
+                }))
+            }
+
             FsOp::ZeroRange => Ok(FsWork::ZeroRange(take_typed_params::<FsZeroRangeParams>(
                 req,
             )?)),
@@ -296,7 +329,8 @@ fn execute_fs_work(
         }
 
         FsWork::Write(params) => {
-            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
+            vdx.current_owner
+                .store(params.fs_file_id, Ordering::Release);
             let write_res: Result<usize, FileStatus> = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -386,7 +420,8 @@ fn execute_fs_work(
         }
 
         FsWork::Flush(params) => {
-            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
+            vdx.current_owner
+                .store(params.fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -507,11 +542,15 @@ fn execute_fs_work(
             (DriverStatus::Success, Some(FsReply::SetLen(res)))
         }
 
-        FsWork::Append(params) => {
-            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
+        FsWork::Append(work) => {
+            vdx.current_owner.store(work.fs_file_id, Ordering::Release);
+
+            // Reconstruct the zero-copy slice safely inside the spawned thread
+            let data_slice = unsafe { core::slice::from_raw_parts(work.data_ptr, work.data_len) };
+
             let result: Result<(usize, u64), FileStatus> = {
                 let tbl = vdx.table.read();
-                match tbl.get(&params.fs_file_id) {
+                match tbl.get(&work.fs_file_id) {
                     None => Err(FileStatus::PathNotFound),
                     Some(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
                     Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
@@ -519,15 +558,13 @@ fn execute_fs_work(
                             let start_off = ctx.size;
                             match file.seek(SeekFrom::Start(start_off)) {
                                 Ok(_) => {
-                                    let n = params.data.len();
-                                    match file.write_all(&params.data) {
+                                    let n = data_slice.len();
+                                    match file.write_all(data_slice) {
                                         Ok(()) => {
-                                            if params.write_through {
-                                                flush_owner_blocking(&vdx, params.fs_file_id);
-                                                Ok((n, start_off + n as u64))
-                                            } else {
-                                                Ok((n, start_off + n as u64))
+                                            if work.write_through {
+                                                flush_owner_blocking(&vdx, work.fs_file_id);
                                             }
+                                            Ok((n, start_off + n as u64))
                                         }
                                         Err(e) => Err(map_fatfs_err(&e)),
                                     }
@@ -543,7 +580,7 @@ fn execute_fs_work(
 
             if let Ok((_, new_size)) = result {
                 let mut tbl = vdx.table.write();
-                if let Some(ctx) = tbl.get_mut(&params.fs_file_id) {
+                if let Some(ctx) = tbl.get_mut(&work.fs_file_id) {
                     ctx.pos = new_size;
                     ctx.size = new_size;
                 }
@@ -566,7 +603,8 @@ fn execute_fs_work(
         }
 
         FsWork::ZeroRange(params) => {
-            vdx.current_owner.store(params.fs_file_id, Ordering::Release);
+            vdx.current_owner
+                .store(params.fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&params.fs_file_id) {
@@ -616,7 +654,7 @@ fn execute_fs_work(
 
 fn apply_fs_reply(req: &mut RequestHandle<'_>, reply: Option<FsReply>) {
     if let Some(rep) = reply {
-        let mut w = req.write();
+        let w = req.write();
         match rep {
             FsReply::Open(v) => w.set_data_t(v),
             FsReply::Close(v) => w.set_data_t(v),
@@ -680,7 +718,11 @@ async fn send_flush_dirty(volume_target: &IoTarget) -> DriverStatus {
     pnp_send_request(volume_target.clone(), &mut flush_req).await
 }
 
-async fn send_flush_owner(volume_target: &IoTarget, owner: u64, should_block: bool) -> DriverStatus {
+async fn send_flush_owner(
+    volume_target: &IoTarget,
+    owner: u64,
+    should_block: bool,
+) -> DriverStatus {
     let mut flush_req = RequestHandle::new(
         RequestType::FlushOwner {
             owner,
@@ -693,10 +735,7 @@ async fn send_flush_owner(volume_target: &IoTarget, owner: u64, should_block: bo
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch<'a, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
-) -> DriverStep {
+pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStep {
     let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         (
@@ -708,6 +747,7 @@ pub async fn fs_op_dispatch<'a, 'b>(
         )
     };
 
+    // The mutable borrow of `req` completely finishes when this block ends
     let work = match parse_fs_work(req) {
         Ok(w) => w,
         Err(status) => {
@@ -724,6 +764,8 @@ pub async fn fs_op_dispatch<'a, 'b>(
     }
 
     let dev_cloned = dev.clone();
+
+    // work is now completely 'static, so spawn_blocking compiles cleanly
     let join = spawn_blocking(move || execute_fs_work(&dev_cloned, &fs_arc, work));
     let (status, reply) = join.await;
 
