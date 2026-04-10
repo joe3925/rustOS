@@ -152,7 +152,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                     init.set_dev_ext_from(ext);
 
                     let vol_name = alloc::format!("\\Device\\fat32.vol.{:p}", &id.volume_fdo);
-                    let vol_ctrl = pnp_create_control_device_with_init(vol_name.clone(), init);
+                    let vol_ctrl = pnp_create_control_device_with_init(vol_name, init);
 
                     id.mount_device = Some(vol_ctrl);
                     id.can_mount = true;
@@ -184,12 +184,12 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
     let ctrl_name = "\\Device\\fat32.fs".to_string();
-    let _ctrl = pnp_create_control_device_and_link(ctrl_name.clone(), init, ctrl_link.clone());
+    let _ctrl = pnp_create_control_device_and_link(ctrl_name, init, ctrl_link.clone());
 
     spawn_detached(async move {
         let mut binding = RequestHandle::new(
             RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-            RequestData::from_t::<Vec<u8>>(ctrl_link.clone().into_bytes()),
+            RequestData::from_t::<Vec<u8>>(ctrl_link.into_bytes()),
         );
         binding.set_traversal_policy(TraversalPolicy::ForwardLower);
 

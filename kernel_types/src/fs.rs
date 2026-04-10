@@ -154,27 +154,31 @@ pub struct FsCloseResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FsReadParams {
+#[derive(Debug)]
+pub struct FsReadParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
-    pub len: usize,
+    pub buf: &'a mut [u8],
 }
 
+// Safety: exclusive access is guaranteed by the &'a mut borrow while the BorrowedHandle
+// is alive; the driver only writes into buf during the awaited call, never concurrently.
+unsafe impl<'a> Sync for FsReadParams<'a> {}
+
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FsReadResult {
-    pub data: Vec<u8>,
+    pub bytes_read: usize,
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct FsWriteParams {
+#[derive(Debug)]
+pub struct FsWriteParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
     pub write_through: bool,
-    pub data: alloc::vec::Vec<u8>,
+    pub data: &'a [u8],
 }
 
 #[repr(C)]

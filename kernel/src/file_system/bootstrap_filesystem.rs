@@ -465,30 +465,34 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn read_at_sync(&self, file_id: u64, offset: u64, len: u32) -> (FsReadResult, DriverStatus) {
+    fn read_at_sync(&self, file_id: u64, offset: u64, buf: &mut [u8]) -> (FsReadResult, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
                 return (
                     FsReadResult {
-                        data: Vec::new(),
+                        bytes_read: 0,
                         error: Some(FileStatus::PathNotFound),
                     },
                     DriverStatus::Success,
                 )
             }
         };
-        match self.read_slice(&path, offset, len) {
-            Ok(v) => (
-                FsReadResult {
-                    data: v,
-                    error: None,
-                },
-                DriverStatus::Success,
-            ),
+        match self.read_slice(&path, offset, buf.len() as u32) {
+            Ok(v) => {
+                let n = v.len().min(buf.len());
+                buf[..n].copy_from_slice(&v[..n]);
+                (
+                    FsReadResult {
+                        bytes_read: n,
+                        error: None,
+                    },
+                    DriverStatus::Success,
+                )
+            }
             Err(e) => (
                 FsReadResult {
-                    data: Vec::new(),
+                    bytes_read: 0,
                     error: Some(e),
                 },
                 DriverStatus::Success,
@@ -1031,9 +1035,9 @@ impl<'a> FileProvider for BootstrapProvider<'a> {
         &self,
         file_id: u64,
         offset: u64,
-        len: u32,
+        buf: &mut [u8],
     ) -> FfiFuture<(FsReadResult, DriverStatus)> {
-        let res = self.read_at_sync(file_id, offset, len);
+        let res = self.read_at_sync(file_id, offset, buf);
         async move { res }.into_ffi()
     }
 

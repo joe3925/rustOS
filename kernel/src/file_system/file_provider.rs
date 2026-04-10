@@ -31,7 +31,7 @@ pub trait FileProvider: Send + Sync {
         &self,
         file_id: u64,
         offset: u64,
-        len: u32,
+        buf: &mut [u8],
     ) -> FfiFuture<(FsReadResult, DriverStatus)>;
 
     fn write_at(

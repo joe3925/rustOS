@@ -92,7 +92,7 @@ impl core::fmt::Debug for RequestData {
             .finish_non_exhaustive()
     }
 }
-const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> usize {
+pub const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> usize {
     let mut i = 0;
     let mut o = 0;
     let mut depth: usize = 0;
