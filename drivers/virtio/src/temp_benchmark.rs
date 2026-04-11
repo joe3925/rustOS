@@ -1,16 +1,12 @@
+use crate::dev_ext::DevExtInner;
+use crate::rdtsc;
 use alloc::vec::Vec;
 use core::hint::spin_loop;
 use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
-use kernel_api::irq::{IrqHandleExt, irq_wait_ok};
-use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::println;
 use kernel_api::status::DriverStatus;
-
-use crate::blk::{PREALLOCATED_DATA_SIZE, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
-use crate::dev_ext::DevExtInner;
-use crate::{WaitTasksGuard, rdtsc};
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 
@@ -55,168 +51,17 @@ fn bench_max_inflight_queue0(inner: &DevExtInner, request_size: u32, use_indirec
     (q0.vq_ref().size as usize / dpr).max(1)
 }
 
+// TODO: rewrite bench_reads_direct to go through the drain-task-based IO path.
 async fn bench_reads_direct(
-    inner: &DevExtInner,
-    start_sector: u64,
+    _inner: &DevExtInner,
+    _start_sector: u64,
     inflight: usize,
-    bench_cfg: &BenchConfig,
-    use_interrupts: bool,
+    _bench_cfg: &BenchConfig,
+    _use_interrupts: bool,
 ) -> Result<BenchLevelResult, DriverStatus> {
     let mut result = BenchLevelResult::default();
     result.inflight = inflight as u32;
-    struct BenchInflight<'a> {
-        start_tsc: u64,
-        head: u16,
-        io_req: crate::blk::BlkIoRequestHandle<'a>,
-    }
-
-    let mut slots: Vec<Option<BenchInflight<'_>>> = Vec::with_capacity(inflight);
-    slots.resize_with(inflight, || None);
-
-    let bench_queue = inner.get_queue(0);
-    let total_requests = bench_cfg.requests_per_run;
-    let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
-    let mut current_sector = start_sector;
-    let mut completed = 0u32;
-    let mut irq_wait_wall_cycles = 0u64;
-    let run_start_tsc = rdtsc();
-
-    let meta = IrqMeta {
-        tag: 0,
-        data: [0; 3],
-    };
-
-    while completed < total_requests {
-        let batch_size = (total_requests - completed).min(inflight as u32) as usize;
-        let mut batch_submitted = 0usize;
-
-        for slot in slots.iter_mut().take(batch_size) {
-            let io_req = match bench_queue.arena.new_request(
-                VIRTIO_BLK_T_IN,
-                current_sector,
-                bench_cfg.request_size,
-            ) {
-                Some(r) => r,
-                None => break,
-            };
-
-            let head = {
-                let mut vq = bench_queue.queue.write();
-                let use_indirect = inner.indirect_desc_enabled;
-                match io_req.submit(&mut vq, false, use_indirect) {
-                    Some(h) => h,
-                    None => break,
-                }
-            };
-
-            let start_tsc = rdtsc();
-            *slot = Some(BenchInflight {
-                start_tsc,
-                head,
-                io_req,
-            });
-            current_sector = current_sector.saturating_add((bench_cfg.request_size as u64) >> 9);
-            batch_submitted += 1;
-        }
-
-        if batch_submitted == 0 {
-            break;
-        }
-
-        {
-            let vq = bench_queue.queue.read();
-            vq.notify(inner.notify_base, inner.notify_off_multiplier);
-        }
-
-        // === Phase 3: Wait for ALL submitted requests to complete ===
-        let mut batch_completed = 0usize;
-        while batch_completed < batch_submitted {
-            // Wait for the device to signal completions
-            if use_interrupts {
-                if let Some(irq_handle) = unsafe { &*bench_queue.irq_handle.get() } {
-                    let _guard = WaitTasksGuard::new(&bench_queue.waiting_tasks);
-
-                    let t0 = rdtsc();
-                    let wait_result = irq_handle.wait(meta).await;
-                    let t1 = rdtsc();
-
-                    irq_wait_wall_cycles =
-                        irq_wait_wall_cycles.saturating_add(t1.saturating_sub(t0));
-
-                    if !irq_wait_ok(wait_result) {
-                        return Err(DriverStatus::DeviceError);
-                    }
-                } else {
-                    spin_loop();
-                }
-            } else {
-                // Polling mode: spin until something appears in the used ring
-                while !bench_queue.has_pending_used() {
-                    spin_loop();
-                }
-            }
-
-            // Drain and reap whatever completed
-            bench_queue.drain_used_to_completions_lockfree();
-
-            for slot in slots.iter_mut().take(batch_submitted) {
-                let Some(s) = slot.take() else { continue };
-
-                let len_opt = bench_queue.take_completion(s.head);
-                if len_opt.is_none() {
-                    *slot = Some(s);
-                    continue;
-                }
-
-                let end_tsc = rdtsc();
-
-                if s.io_req.status() != VIRTIO_BLK_S_OK {
-                    bench_queue.defer_free_chain(s.head);
-                    return Err(DriverStatus::DeviceError);
-                }
-
-                bench_queue.defer_free_chain(s.head);
-                lat_samples.push(end_tsc.saturating_sub(s.start_tsc));
-
-                batch_completed += 1;
-                completed += 1;
-            }
-        }
-    }
-
-    let run_end_tsc = rdtsc();
-
-    result.request_count = lat_samples.len() as u32;
-    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
-    result.total_cycles = result.total_time_cycles;
-
-    if result.total_time_cycles != 0 {
-        let pct = (irq_wait_wall_cycles as f64) * 100.0 / (result.total_time_cycles as f64);
-        result.idle_pct = pct.clamp(0.0, 100.0);
-    } else {
-        result.idle_pct = 0.0;
-    }
-
-    if !lat_samples.is_empty() {
-        let sum_lat: u64 = lat_samples.iter().copied().sum();
-        lat_samples.sort_unstable();
-
-        result.max_cycles = *lat_samples.last().unwrap_or(&0);
-        result.min_cycles = *lat_samples.first().unwrap_or(&0);
-        result.avg_cycles = sum_lat / lat_samples.len() as u64;
-
-        let p50i = percentile_index_permille(lat_samples.len(), 500);
-        let p99i = percentile_index_permille(lat_samples.len(), 990);
-        let p999i = percentile_index_permille(lat_samples.len(), 999);
-
-        result.p50_cycles = lat_samples[p50i];
-        result.p99_cycles = lat_samples[p99i];
-        result.p999_cycles = lat_samples[p999i];
-    } else {
-        result.min_cycles = 0;
-    }
-
-    Ok(result)
+    Err(DriverStatus::NotImplemented)
 }
 
 pub async fn bench_sweep_params(
