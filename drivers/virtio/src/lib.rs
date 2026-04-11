@@ -747,6 +747,7 @@ async fn wait_for_completion(
     qs: &QueueState,
     head: u16,
     inner: &Arc<DevExtInner>,
+    isr_start: u64,
 ) -> Result<u32, DriverStatus> {
     let meta = IrqMeta {
         tag: 0,
@@ -754,8 +755,6 @@ async fn wait_for_completion(
     };
 
     let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
-
-    let isr_start = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
     let mut spurious_wake_count = 0;
     let mut loop_iterations = 0;
 
@@ -1068,12 +1067,13 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let head = {
+            let (head, isr_start) = {
                 let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
                         let queue_full = vq.num_free == 0;
+                        let isr_start = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
                         let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
                         submit_guard.finish_and_maybe_notify(
                             &vq,
@@ -1081,12 +1081,12 @@ pub async fn virtio_pdo_read<'a, 'b>(
                             inner.notify_off_multiplier,
                             queue_full,
                         );
-                        Some(h)
+                        (Some(h), isr_start)
                     }
                     None => {
                         // Queue is full (or no descriptors). Kick immediately so completions free space.
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        None
+                        (None, 0)
                     }
                 }
             };
@@ -1096,7 +1096,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head, &inner).await {
+            let _ = match wait_for_completion(qs, head, &inner, isr_start).await {
                 Ok(l) => l,
                 Err(e) => return complete_req(req, e),
             };
@@ -1243,12 +1243,13 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
-            let head = {
+            let (head, isr_start) = {
                 let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
                         let queue_full = vq.num_free == 0;
+                        let isr_start = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
                         let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
                         submit_guard.finish_and_maybe_notify(
                             &vq,
@@ -1256,12 +1257,12 @@ pub async fn virtio_pdo_write<'a, 'b>(
                             inner.notify_off_multiplier,
                             queue_full,
                         );
-                        Some(h)
+                        (Some(h), isr_start)
                     }
                     None => {
                         // Virtqueue out of descriptors: kick immediately so completions can free space.
                         vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        None
+                        (None, 0)
                     }
                 }
             };
@@ -1271,7 +1272,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head, &inner).await {
+            let _ = match wait_for_completion(qs, head, &inner, isr_start).await {
                 Ok(l) => l,
                 Err(e) => return complete_req(req, e),
             };
