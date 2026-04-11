@@ -104,7 +104,7 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
             .read()
             .pnp
             .as_ref()
-            .map(|p| p.data_out.as_slice().to_vec())
+            .and_then(|p| p.data_out.view::<Vec<u8>>()).cloned()
             .unwrap_or_default();
         let segs = parse_ecam_segments_from_blob(&blob);
 
@@ -388,7 +388,7 @@ pub async fn pci_pdo_query_resources<'a, 'b>(
         match r.pnp.as_mut() {
             Some(pnp) => {
                 pnp.data_out =
-                    RequestData::from_boxed_bytes(build_resources_blob(&ext).into_boxed_slice());
+                    RequestData::from_t::<Vec<u8>>(build_resources_blob(&ext));
                 DriverStatus::Success
             }
             None => DriverStatus::InvalidParameter,

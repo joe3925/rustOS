@@ -3,8 +3,8 @@
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
 extern crate alloc;
-
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::{
     mem::size_of,
     panic::PanicInfo,
@@ -22,7 +22,7 @@ use kernel_api::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
-    request::{RequestHandle, RequestType, TraversalPolicy},
+    request::{BufSlice, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
     status::DriverStatus,
 };
@@ -110,7 +110,11 @@ pub async fn disk_read<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if req.read().data_len() < total {
+    if req
+        .read()
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < total)
+    {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
@@ -156,7 +160,11 @@ pub async fn disk_write<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if req.read().data_len() < total {
+    if req
+        .read()
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < total)
+    {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
@@ -277,7 +285,11 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
                 let Some(pnp) = req.pnp.as_ref() else {
                     return None;
                 };
-                let blob = pnp.data_out.as_slice();
+                let blob = pnp
+                    .data_out
+                    .view::<Vec<u8>>()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
                 if blob.len() < size_of::<DiskInfo>() {
                     return None;
                 }

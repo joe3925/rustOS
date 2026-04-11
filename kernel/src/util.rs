@@ -177,7 +177,7 @@ pub extern "win64" fn trigger_guard_page_overflow() -> ! {
     let task = SCHEDULER
         .get_current_task(current_cpu_id())
         .expect("no current task");
-    let guard = task.inner.read().guard_page;
+    let guard = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
     let target = (guard + 0x800) & !0xFu64;
     unsafe {
         asm!(

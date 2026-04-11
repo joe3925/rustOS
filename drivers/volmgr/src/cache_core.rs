@@ -14,7 +14,7 @@ use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use futures::stream::StreamExt;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 use spin::{Mutex, RwLock};
@@ -482,21 +482,20 @@ where
                 flush_write_through: false,
                 owner: 0,
             },
-            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
+            RequestData::empty(),
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         {
-            let mut w = req.write();
-            let dst = w.data_slice_mut();
             let data = page.data.read();
-            dst.copy_from_slice(&data.bytes[..]);
+            // SAFETY: lower drivers only read from write-request buffers.
+            let mut buf = unsafe { BufSlice::from_const(&data.bytes[..]) };
+            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+            self.backend
+                .write_request(borrow.handle())
+                .await
+                .map_err(CacheError::Backend)?;
         }
-
-        self.backend
-            .write_request(&mut req)
-            .await
-            .map_err(CacheError::Backend)?;
 
         self.stats.backend_writes.fetch_add(1, Ordering::Relaxed);
         self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
@@ -538,21 +537,20 @@ where
                 flush_write_through: false,
                 owner: 0,
             },
-            RequestData::from_boxed_bytes(vec![0u8; BLOCK_SIZE].into_boxed_slice()),
+            RequestData::empty(),
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        {
-            let mut req_w = req.write();
-            let dst = req_w.data_slice_mut();
+        let write_res = {
             let data = page.data.read();
-            dst.copy_from_slice(&data.bytes[..]);
-        }
-
-        let write_res = backend
-            .write_request(&mut req)
-            .await
-            .map_err(CacheError::Backend);
+            // SAFETY: lower drivers only read from write-request buffers.
+            let mut buf = unsafe { BufSlice::from_const(&data.bytes[..]) };
+            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+            backend
+                .write_request(borrow.handle())
+                .await
+                .map_err(CacheError::Backend)
+        };
 
         match write_res {
             Ok(()) => {

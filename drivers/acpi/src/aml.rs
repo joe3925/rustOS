@@ -978,7 +978,7 @@ pub async fn acpi_pdo_query_resources<'a, 'b>(
     {
         let mut w = req.write();
         if let Some(p) = w.pnp.as_mut() {
-            p.data_out = RequestData::from_boxed_bytes(blob.into_boxed_slice());
+            p.data_out = RequestData::from_t::<Vec<u8>>(blob);
         }
         w.status = DriverStatus::Success;
     }

@@ -1,9 +1,16 @@
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::future::Future;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::task::{Context, Poll};
 use kernel_routing::println;
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
-use kernel_types::irq::{DropHook, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqWaitResult};
-use spin::{Once, RwLock};
+use kernel_types::irq::{
+    DropHook, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult, WaitState,
+    Waiter,
+};
+use spin::{Mutex, Once, RwLock};
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::drivers;
@@ -15,7 +22,7 @@ use crate::drivers::interrupt_index::{current_cpu_id, get_current_logical_id, se
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn irq_handle_create(drop_hook: DropHook) -> IrqHandle {
-    IrqHandleInner::new(drop_hook)
+    create_irq_handle(drop_hook)
 }
 
 #[unsafe(no_mangle)]
@@ -72,8 +79,244 @@ pub extern "win64" fn irq_handle_wait_ffi(
     h: &IrqHandle,
     _meta: IrqMeta,
 ) -> FfiFuture<IrqWaitResult> {
-    let handle = h.clone();
-    async move { handle.wait_future().await }.into_ffi()
+    let fut = irq_wait_future(h);
+    async move { fut.await }.into_ffi()
+}
+
+// =============================================================================
+// IRQ HANDLE IMPLEMENTATION
+// =============================================================================
+
+pub(crate) trait IrqHandleOps {
+    fn is_closed(&self) -> bool;
+    fn close(&self);
+    fn signal_one(&self, meta: IrqMeta);
+    fn ensure_signal_exactly_one(&self, meta: IrqMeta);
+    fn signal_n(&self, meta: IrqMeta, n: usize) -> usize;
+    fn signal_all(&self, meta: IrqMeta) -> usize;
+    fn cancel_waiter(&self, waiter: &Arc<Waiter>);
+    fn set_user_ctx(&self, v: usize);
+    fn user_ctx(&self) -> usize;
+}
+
+impl IrqHandleOps for IrqHandleInner {
+    #[inline]
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let waiters = {
+            let mut st = self.state.lock();
+            st.pending_signals = 0;
+
+            let mut drained = Vec::with_capacity(st.waiters.len());
+            while let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                drained.push(waiter);
+            }
+            drained
+        };
+
+        for waiter in waiters {
+            waiter.store_result(IrqWaitResult::closed());
+            waiter.wake();
+        }
+    }
+
+    fn signal_one(&self, meta: IrqMeta) {
+        if self.is_closed() {
+            return;
+        }
+
+        let waiter_opt = {
+            let mut st = self.state.lock();
+            st.last_meta = meta;
+
+            if let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                Some(waiter)
+            } else {
+                st.pending_signals = st.pending_signals.saturating_add(1);
+                None
+            }
+        };
+
+        if let Some(waiter) = waiter_opt {
+            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
+            waiter.wake();
+        }
+    }
+
+    fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
+        if self.is_closed() {
+            return;
+        }
+
+        let waiter_opt = {
+            let mut st = self.state.lock();
+            st.last_meta = meta;
+
+            if let Some(waiter) = st.pop_waiter() {
+                waiter.enqueued.store(false, Ordering::Release);
+                Some(waiter)
+            } else {
+                st.pending_signals = 1;
+                None
+            }
+        };
+
+        if let Some(waiter) = waiter_opt {
+            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
+            waiter.wake();
+        }
+    }
+
+    fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
+        if n == 0 || self.is_closed() {
+            return 0;
+        }
+
+        let waiters = {
+            let mut st = self.state.lock();
+            st.last_meta = meta;
+
+            let mut drained = Vec::with_capacity(n.min(st.waiters.len()));
+            for _ in 0..n {
+                let Some(waiter) = st.pop_waiter() else { break };
+                waiter.enqueued.store(false, Ordering::Release);
+                drained.push(waiter);
+            }
+
+            if drained.len() < n {
+                st.pending_signals = st.pending_signals.saturating_add(n - drained.len());
+            }
+
+            drained
+        };
+
+        let woken = waiters.len();
+        for waiter in waiters.iter() {
+            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
+            waiter.wake();
+        }
+
+        woken
+    }
+
+    fn signal_all(&self, meta: IrqMeta) -> usize {
+        if self.is_closed() {
+            return 0;
+        }
+
+        let mut woken = 0;
+        loop {
+            let waiter_opt = {
+                let mut st = self.state.lock();
+                st.last_meta = meta;
+                st.pop_waiter().map(|w| {
+                    w.enqueued.store(false, Ordering::Release);
+                    w
+                })
+            };
+
+            let Some(waiter) = waiter_opt else { break };
+            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
+            waiter.wake();
+            woken += 1;
+        }
+
+        if woken == 0 {
+            self.signal_one(meta);
+        }
+        woken
+    }
+
+    fn cancel_waiter(&self, waiter: &Arc<Waiter>) {
+        let mut st = self.state.lock();
+        if st.remove_waiter(waiter) {
+            waiter.enqueued.store(false, Ordering::Release);
+        }
+    }
+
+    fn set_user_ctx(&self, v: usize) {
+        self.user_ctx.store(v, Ordering::Release);
+    }
+
+    fn user_ctx(&self) -> usize {
+        self.user_ctx.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) fn create_irq_handle(drop_hook: DropHook) -> IrqHandle {
+    Arc::new(IrqHandleInner {
+        drop_hook: Mutex::new(Some(drop_hook)),
+        closed: AtomicBool::new(false),
+        user_ctx: AtomicUsize::new(0),
+        state: IrqSafeMutex::new(WaitState::new()),
+    })
+}
+
+pub(crate) fn irq_wait_future(handle: &IrqHandle) -> IrqWaitFuture {
+    IrqWaitFuture {
+        handle: Arc::clone(handle),
+        waiter: Waiter::new(),
+        test_wakeup: AtomicUsize::new(0),
+    }
+}
+
+pub struct IrqWaitFuture {
+    handle: IrqHandle,
+    //TODO: Remove this
+    test_wakeup: AtomicUsize,
+    waiter: Arc<Waiter>,
+}
+
+impl Future for IrqWaitFuture {
+    type Output = IrqWaitResult;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_ref().get_ref();
+
+        if let Some(r) = this.waiter.take_result() {
+            return Poll::Ready(r);
+        }
+        if self.test_wakeup.load(Ordering::Relaxed) > 500_000_000 {
+            return Poll::Ready(IrqWaitResult::rescue());
+        }
+        if this.handle.is_closed() {
+            return Poll::Ready(IrqWaitResult::closed());
+        }
+
+        {
+            let mut st = this.handle.state.lock();
+
+            this.waiter.set_waker(cx.waker());
+
+            if st.pending_signals > 0 {
+                st.pending_signals -= 1;
+                let meta = st.last_meta;
+                return Poll::Ready(IrqWaitResult::ok_n(meta, 1));
+            }
+
+            if !this.waiter.enqueued.swap(true, Ordering::AcqRel) {
+                st.push_waiter(this.waiter.clone());
+            }
+        }
+        self.test_wakeup.fetch_add(1, Ordering::Relaxed);
+        Poll::Pending
+    }
+}
+
+impl Drop for IrqWaitFuture {
+    fn drop(&mut self) {
+        self.handle.cancel_waiter(&self.waiter);
+        self.waiter.clear();
+    }
 }
 
 // =============================================================================
@@ -329,7 +572,7 @@ fn null_handle() -> IrqHandle {
     static NULL_HANDLE: Once<IrqHandle> = Once::new();
     NULL_HANDLE
         .call_once(|| {
-            let h = IrqHandleInner::new(DropHook::new(dummy_drop, 0));
+            let h = create_irq_handle(DropHook::new(dummy_drop, 0));
             h.close();
             h
         })
@@ -356,7 +599,7 @@ pub fn irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     let id = irq_manager().alloc_id();
     let hook = DropHook::new(irq_unregister_thunk, id);
 
-    let handle = IrqHandleInner::new(hook);
+    let handle = create_irq_handle(hook);
 
     let first_for_vector = {
         let regs = irq_manager().vectors[vector as usize].regs.read();
@@ -403,7 +646,7 @@ pub fn irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle {
     let id = irq_manager().alloc_id();
     let hook = DropHook::new(irq_unregister_thunk, id);
 
-    let handle = IrqHandleInner::new(hook);
+    let handle = create_irq_handle(hook);
 
     let first_for_vector = {
         let regs = irq_manager().vectors[vector as usize].regs.read();

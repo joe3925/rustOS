@@ -58,6 +58,17 @@ pub struct TaskRef {
 
     /// Fast path for kernel mode check
     pub is_kernel_mode: AtomicBool,
+
+    /// Top of the allocated stack region (write-once, read lock-free)
+    pub stack_start: AtomicU64,
+
+    /// Current guard page address; advanced downward on each stack growth.
+    /// Written only by the page-fault handler while the task is running on
+    /// this CPU — no lock needed.
+    pub guard_page: AtomicU64,
+
+    /// Total reserved stack bytes (write-once, read lock-free)
+    pub stack_size: AtomicU64,
 }
 
 /// Handle type used throughout the scheduler
@@ -146,6 +157,38 @@ impl TaskRef {
     pub fn set_task_id(&self, id: u64) {
         self.id.store(id, Ordering::Relaxed);
     }
+
+    /// Attempt to grow the kernel stack by one page.
+    ///
+    /// Called from the page-fault handler without holding `inner` — safe
+    /// because a task can only fault on the CPU it is currently running on,
+    /// so there is no concurrent writer for `guard_page`.
+    pub fn grow_stack(&self, flags: PageTableFlags) -> Result<bool, PageMapError> {
+        if !self.is_kernel_mode.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        let gp = self.guard_page.load(Ordering::Acquire);
+        if gp == 0 {
+            return Ok(false);
+        }
+        let next_guard = match gp.checked_sub(PAGE_SIZE) {
+            Some(v) => v,
+            None => return Ok(false),
+        };
+        unsafe { map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags) }?;
+        self.guard_page.store(next_guard, Ordering::Release);
+        Ok(true)
+    }
+
+    /// Unmap the kernel stack backing this task.
+    pub fn destroy(&self) {
+        if !self.is_kernel_mode.load(Ordering::Relaxed) {
+            return;
+        }
+        let start = self.stack_start.load(Ordering::Relaxed);
+        let size = self.stack_size.load(Ordering::Relaxed);
+        unmap_range(VirtAddr::new(start), size);
+    }
 }
 
 /// Inner task data - accessed through RwLock
@@ -154,12 +197,9 @@ pub struct Task {
     pub name: String,
     pub context: State,
     pub fpu_state: FpuState,
-    pub stack_start: u64,
-    pub guard_page: u64,
     pub is_user_mode: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u64>,
-    pub stack_size: u64,
 
     // Accounting (can be accessed via inner lock or made atomic if needed)
     sched_in_cycles: AtomicU64,
@@ -205,12 +245,9 @@ impl Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
-            stack_start: stack_top,
-            guard_page,
             is_user_mode: true,
             parent_pid,
             executer_id: None,
-            stack_size,
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
             total_run_cycles: AtomicU64::new(0),
@@ -227,6 +264,9 @@ impl Task {
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(false),
+            stack_start: AtomicU64::new(stack_top),
+            guard_page: AtomicU64::new(guard_page),
+            stack_size: AtomicU64::new(stack_size),
         })
     }
 
@@ -265,12 +305,9 @@ impl Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
-            stack_start: stack_top_u64,
-            guard_page,
             is_user_mode: false,
             parent_pid,
             executer_id: None,
-            stack_size: stack_size.as_bytes(),
             sched_in_cycles: AtomicU64::new(0),
             last_quantum_cycles: AtomicU64::new(0),
             total_run_cycles: AtomicU64::new(0),
@@ -287,6 +324,9 @@ impl Task {
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(true),
+            stack_start: AtomicU64::new(stack_top_u64),
+            guard_page: AtomicU64::new(guard_page),
+            stack_size: AtomicU64::new(stack_size.as_bytes()),
         })
     }
 
@@ -294,30 +334,7 @@ impl Task {
         self.context = unsafe { *context };
     }
 
-    pub fn destroy(&mut self) {
-        if self.is_user_mode {
-            return;
-        }
-        unmap_range(VirtAddr::new(self.stack_start), self.stack_size);
-    }
-
-    pub fn grow_stack(&mut self, flags: PageTableFlags) -> Result<bool, PageMapError> {
-        if self.is_user_mode || self.guard_page == 0 {
-            return Ok(false);
-        }
-
-        let base = self.guard_page;
-        let next_guard = match base.checked_sub(PAGE_SIZE) {
-            Some(v) => v,
-            None => return Ok(false),
-        };
-
-        unsafe { map_kernel_range(VirtAddr::new(base), PAGE_SIZE, flags) }?;
-        self.guard_page = next_guard;
-        Ok(true)
-    }
-
-    #[inline(always)]
+#[inline(always)]
     pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
         self.last_cpu.store(cpu_id, Ordering::Relaxed);
         self.sched_in_cycles.store(now_cycles, Ordering::Relaxed);

@@ -101,10 +101,14 @@ impl IoType {
         handle: &mut RequestHandle<'_>,
     ) -> DriverStep {
         match *self {
-            IoType::Read(h) | IoType::Write(h) => {
-                let len = handle.read().data.len();
-                h(dev, handle, len).await
-            }
+            IoType::Read(h) | IoType::Write(h) => match handle.read().kind {
+                RequestType::Read { len, .. } | RequestType::Write { len, .. } => {
+                    h(dev, handle, len).await
+                }
+                _ => {
+                    panic!("IoType doesn't match RequestType, this indicates UB")
+                }
+            },
             IoType::DeviceControl(h) => h(dev, handle).await,
             IoType::Fs(h) => h(dev, handle).await,
             IoType::Flush(h) => h(dev, handle).await,
@@ -118,7 +122,9 @@ impl IoType {
             RequestType::Write { .. } => Some(1),
             RequestType::DeviceControl(_) => Some(2),
             RequestType::Fs(_) => Some(3),
-            RequestType::Flush { .. } | RequestType::FlushDirty { .. } | RequestType::FlushOwner { .. } => Some(4),
+            RequestType::Flush { .. }
+            | RequestType::FlushDirty { .. }
+            | RequestType::FlushOwner { .. } => Some(4),
             _ => None,
         }
     }

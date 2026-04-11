@@ -1,10 +1,11 @@
 use super::driver_index::{self as idx, HwIndex};
-use crate::drivers::driver_install::DriverError;
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::object_manager::{ObjRef, Object, ObjectPayload, OBJECT_MANAGER};
+use core::ptr::addr_of;
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::object_manager::OmError;
+use kernel_types::status::DriverError;
 
 use crate::println;
 use crate::registry::reg::{get_key, get_value, list_keys};
@@ -1319,6 +1320,7 @@ impl PnpManager {
         self.send_request(top.clone(), &mut start_request).await;
 
         dn.set_state(DevNodeState::Started);
+
         Ok((dn, top))
     }
 

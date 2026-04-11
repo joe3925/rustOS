@@ -42,10 +42,26 @@ impl BootInfoFrameAllocator {
     pub fn init_start(_memory_regions: &'static [MemoryRegion]) {
         let mut bm = MEMORY_BITMAP.lock();
 
+        // Mark everything as allocated, then carve out usable regions.
+        // This means allocate_contiguous_frames_aligned can scan the bitmap
+        // directly without consulting boot_info at every call.
         for w in bm.iter_mut() {
-            *w = 0;
+            *w = u64::MAX;
         }
 
+        for region in boot_info()
+            .memory_regions
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+        {
+            let start_frame = (region.start >> 12) as usize;
+            let end_frame = (region.end >> 12) as usize;
+            if end_frame > start_frame {
+                clear_range(bm.as_mut_slice(), start_frame, end_frame - start_frame);
+            }
+        }
+
+        // Re-mark low frames as allocated (may overlap with usable regions).
         if LOW_FRAMES != 0 {
             set_range(bm.as_mut_slice(), 0, LOW_FRAMES);
         }
@@ -61,6 +77,11 @@ impl BootInfoFrameAllocator {
 
     /// Allocate `num_frames` physically contiguous 4KiB frames, aligned to
     /// `align_frames` frame boundary (e.g. 512 for 2MiB, 1 for no extra alignment).
+    ///
+    /// Scans the bitmap directly — non-usable regions are pre-marked during
+    /// init.  The outer loop skips fully-allocated words in O(1) per word (same
+    /// trick as `allocate_frame`) before doing the run check, so traversing
+    /// allocated regions costs O(words) not O(frames).
     pub fn allocate_contiguous_frames_aligned(
         num_frames: usize,
         align_frames: usize,
@@ -70,41 +91,53 @@ impl BootInfoFrameAllocator {
         }
         debug_assert!(align_frames.is_power_of_two());
 
-        let mut bm = MEMORY_BITMAP.lock();
-        let total_frames = bm.len() * 64;
-        if num_frames > total_frames {
-            return None;
+        // Single-frame path: delegate to the word-hint-optimised allocate_frame.
+        if num_frames == 1 && align_frames == 1 {
+            let mut alloc = BootInfoFrameAllocator {};
+            return FrameAllocator::<Size4KiB>::allocate_frame(&mut alloc)
+                .map(|f| f.start_address());
         }
 
-        let boot = boot_info();
+        let mut bm = MEMORY_BITMAP.lock();
+        let total_frames = bm.len() * 64;
+        let words = bm.len();
+        let align_mask = align_frames - 1;
 
-        for region in boot
-            .memory_regions
-            .iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
-        {
-            let region_start = usize::max((region.start >> 12) as usize, LOW_FRAMES);
-            let end_frame = (region.end >> 12) as usize;
+        // Start from the word that contains LOW_FRAMES.
+        let mut word_idx = LOW_FRAMES / 64;
 
-            if region_start >= end_frame {
-                continue;
+        loop {
+            // Skip fully-allocated words — ~64x faster through dense allocated runs.
+            while word_idx < words && bm[word_idx] == u64::MAX {
+                word_idx += 1;
+            }
+            if word_idx >= words {
+                break;
             }
 
-            // Round up to alignment boundary
-            let mut start_frame = (region_start + align_frames - 1) & !(align_frames - 1);
+            // First free bit in this word, aligned up to the required boundary.
+            let free_bit = (!bm[word_idx]).trailing_zeros() as usize;
+            let free_frame = word_idx * 64 + free_bit;
+            let candidate = (free_frame + align_mask) & !align_mask;
 
-            while start_frame + num_frames <= end_frame {
-                if range_is_free(&*bm, start_frame, num_frames) {
-                    set_range(bm.as_mut_slice(), start_frame, num_frames);
+            let end = match candidate.checked_add(num_frames) {
+                Some(e) if e <= total_frames => e,
+                _ => break,
+            };
+
+            match first_set_bit_in_range(&*bm, candidate, end) {
+                None => {
+                    // Entire run is free — mark and return.
+                    set_range(bm.as_mut_slice(), candidate, num_frames);
                     USED_MEMORY.fetch_add(num_frames * 0x1000, Ordering::SeqCst);
-                    NEXT_WORD_4K.store(start_frame / 64, Ordering::Relaxed);
-
-                    let phys = (start_frame as u64) << 12;
-                    return Some(PhysAddr::new(phys));
+                    NEXT_WORD_4K.store(candidate / 64, Ordering::Relaxed);
+                    return Some(PhysAddr::new((candidate as u64) << 12));
                 }
-
-                // Skip to next aligned position
-                start_frame += align_frames;
+                Some(blocking) => {
+                    // Jump to next aligned position; the outer MAX-word skip
+                    // handles any fully-allocated words between here and there.
+                    word_idx = ((blocking + align_frames) & !align_mask) / 64;
+                }
             }
         }
 
@@ -386,6 +419,56 @@ fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
     }
 
     bitmap[last_word] &= !(!0u64 >> (63 - (end_incl & 63)));
+}
+
+/// Return the index of the first set bit in `[start, end)`, or `None` if all clear.
+fn first_set_bit_in_range(bitmap: &[u64], start: usize, end: usize) -> Option<usize> {
+    if start >= end {
+        return None;
+    }
+    let total_bits = bitmap.len() * 64;
+    let end = end.min(total_bits);
+    if start >= end {
+        return None;
+    }
+
+    let first_word = start / 64;
+    let last_word = (end - 1) / 64;
+    let start_bit = start & 63;
+
+    if first_word == last_word {
+        let last_bit = (end - 1) & 63;
+        let mask = (!0u64 << start_bit) & (!0u64 >> (63 - last_bit));
+        let word = bitmap[first_word] & mask;
+        return if word != 0 {
+            Some(first_word * 64 + word.trailing_zeros() as usize)
+        } else {
+            None
+        };
+    }
+
+    // First word (partial high bits)
+    let word = bitmap[first_word] & (!0u64 << start_bit);
+    if word != 0 {
+        return Some(first_word * 64 + word.trailing_zeros() as usize);
+    }
+
+    // Middle words (full)
+    for w in (first_word + 1)..last_word {
+        let word = bitmap[w];
+        if word != 0 {
+            return Some(w * 64 + word.trailing_zeros() as usize);
+        }
+    }
+
+    // Last word (partial low bits)
+    let last_bit = (end - 1) & 63;
+    let word = bitmap[last_word] & (!0u64 >> (63 - last_bit));
+    if word != 0 {
+        Some(last_word * 64 + word.trailing_zeros() as usize)
+    } else {
+        None
+    }
 }
 
 fn range_is_free(bitmap: &[u64], start: usize, len: usize) -> bool {

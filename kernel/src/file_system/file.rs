@@ -183,31 +183,36 @@ impl File {
             return Err(e);
         }
         let size = gi.size as usize;
+        let mut buf = alloc::vec![0u8; size];
         let (rr, st2) = file_provider::provider()
-            .read_at(self.fs_file_id, 0, size as u32)
+            .read_at(self.fs_file_id, 0, &mut buf)
             .await;
         if st2 != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match rr.error {
-            None => Ok(rr.data),
+            None => {
+                buf.truncate(rr.bytes_read);
+                Ok(buf)
+            }
             Some(e) => Err(e),
         }
     }
 
     pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FileStatus> {
-        if len > u32::MAX as usize {
-            return Err(FileStatus::UnknownFail);
-        }
+        let mut buf = alloc::vec![0u8; len];
         let (res, st) = file_provider::provider()
-            .read_at(self.fs_file_id, offset, len as u32)
+            .read_at(self.fs_file_id, offset, &mut buf)
             .await;
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match res.error {
-            None => Ok(res.data),
+            None => {
+                buf.truncate(res.bytes_read);
+                Ok(buf)
+            }
             Some(e) => Err(e),
         }
     }

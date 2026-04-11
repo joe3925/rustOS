@@ -25,7 +25,7 @@ use kernel_types::{
     irq::{IrqHandle, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::RequestHandle,
-    status::{Data, DriverStatus, FileStatus, PageMapError, RegError},
+    status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
 use spin::{Mutex, Once};
@@ -37,7 +37,6 @@ use crate::{
     },
     console::CONSOLE,
     drivers::{
-        driver_install::DriverError,
         interrupt_index::{self, current_cpu_id, get_current_logical_id},
         pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
         ACPI::{ACPIImpl, ACPI_TABLES},

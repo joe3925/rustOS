@@ -1,9 +1,8 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::executable::pe_loadable::LoadError;
 use alloc::{string::String, vec::Vec};
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::pnp::BootType;
-use kernel_types::status::{Data, FileStatus, RegError};
+use kernel_types::status::{Data, DriverError, FileStatus, LoadError, RegError};
 use toml::de::{DeInteger, DeTable};
 use toml::Spanned;
 
@@ -73,35 +72,6 @@ pub struct DriverToml {
     pub reg_writes: Vec<RegWrite>,
 }
 
-#[derive(Debug)]
-pub enum DriverError {
-    File(FileStatus),
-    InvalidUtf8,
-    TomlParse,
-    DriverAlreadyInstalled,
-    NoParent,
-    Registry(RegError),
-    LoadErr(LoadError),
-}
-impl From<FileStatus> for DriverError {
-    fn from(e: FileStatus) -> Self {
-        if e == FileStatus::FileAlreadyExist {
-            return DriverError::DriverAlreadyInstalled;
-        }
-        DriverError::File(e)
-    }
-}
-
-impl From<RegError> for DriverError {
-    fn from(e: RegError) -> Self {
-        DriverError::Registry(e)
-    }
-}
-impl From<LoadError> for DriverError {
-    fn from(e: LoadError) -> Self {
-        DriverError::LoadErr(e)
-    }
-}
 #[inline(always)]
 fn inner<T>(s: &Spanned<T>) -> &T {
     s.get_ref()

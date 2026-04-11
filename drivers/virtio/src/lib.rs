@@ -13,20 +13,19 @@ mod virtqueue;
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::hint::spin_loop;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use core::time::Duration;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use futures_channel::oneshot;
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
     IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
-    irq_register_isr_gsi, irq_wait_ok,
+    irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
-use kernel_api::kernel_types::irq::IrqMeta;
+use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{unmap_mmio_region, unmap_range};
@@ -35,9 +34,10 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{RequestHandle, RequestType};
+use kernel_api::request::{BufSlice, RequestHandle, RequestType};
+use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
-use kernel_api::util::{get_current_cpu_id, panic_common, wait_duration};
+use kernel_api::util::panic_common;
 use kernel_api::x86_64::VirtAddr;
 use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
@@ -55,12 +55,6 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
-const INVALID_HEAD: u16 = 0xFFFF;
-const DEFAULT_SPIN_BEFORE_WAIT_NS: u64 = 0;
-const SPIN_WAIT_SLICE_NS: u64 = 50;
-
-static SPIN_BEFORE_WAIT_NS: AtomicU64 = AtomicU64::new(DEFAULT_SPIN_BEFORE_WAIT_NS);
-static DEBUG_ISR_FIRED: AtomicU64 = AtomicU64::new(0);
 
 // legacy helpers
 #[inline(always)]
@@ -112,7 +106,6 @@ extern "win64" fn virtio_isr(
     handle: IrqHandle,
     ctx: usize,
 ) -> bool {
-    DEBUG_ISR_FIRED.fetch_add(1, Ordering::Relaxed);
     let isr_va = ctx as *const u8;
     let isr_status = unsafe { core::ptr::read_volatile(isr_va) };
 
@@ -134,7 +127,6 @@ extern "win64" fn virtio_msix_isr(
     handle: IrqHandle,
     _ctx: usize,
 ) -> bool {
-    DEBUG_ISR_FIRED.fetch_add(1, Ordering::Relaxed);
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],
@@ -156,7 +148,7 @@ async fn setup_msix_via_pci(
 
     let mut req = RequestHandle::new(
         RequestType::DeviceControl(IOCTL_PCI_SETUP_MSIX),
-        RequestData::from_boxed_bytes(buf.into_boxed_slice()),
+        RequestData::from_t::<Vec<u8>>(buf),
     );
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut req).await;
 
@@ -189,7 +181,12 @@ async fn virtio_pnp_start<'a, 'b>(
 
     let resources = {
         let r = query_req.read();
-        let blob = r.pnp.as_ref().map(|p| p.data_out.as_slice()).unwrap_or(&[]);
+        let blob = r
+            .pnp
+            .as_ref()
+            .and_then(|p| p.data_out.view::<Vec<u8>>())
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         pci::parse_resources(blob)
     };
     let msix_cap = pci::find_msix_capability(&resources);
@@ -454,6 +451,11 @@ async fn virtio_pnp_start<'a, 'b>(
 
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
+        let completion_slots = (0..vq_capacity)
+            .map(|_| spin::Mutex::new(None))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
             arena,
@@ -462,9 +464,9 @@ async fn virtio_pnp_start<'a, 'b>(
             irq_handle: UnsafeCell::new(irq_handle),
             msix_vector,
             msix_table_index,
-            waiting_tasks: AtomicU32::new(0),
             submitting_tasks: AtomicU32::new(0),
             use_indirect: init_result.indirect_desc_supported,
+            completion_slots,
         });
     }
 
@@ -514,8 +516,6 @@ async fn virtio_pnp_start<'a, 'b>(
     let dx = dev.try_devext::<DevExt>().expect("virtio: DevExt missing");
     let bar_list: Vec<(u32, VirtAddr, u64)> = mapped_bars.iter().copied().collect();
 
-    let irq_ready = dev_ext::InitGate::new();
-
     dx.inner.call_once(|| {
         Arc::new(DevExtInner {
             common_cfg: caps.common_cfg,
@@ -530,18 +530,23 @@ async fn virtio_pnp_start<'a, 'b>(
             capacity: init_result.capacity,
             mapped_bars: Mutex::new(bar_list),
             msix_pba,
-            irq_ready,
             indirect_desc_enabled: init_result.indirect_desc_supported,
         })
     });
 
+    // Spawn one drain task per queue. Each task owns a clone of its IrqHandle;
+    // when pnp_remove unregisters the handle the wait returns IRQ_WAIT_CLOSED
+    // and the task exits cleanly.
     if let Some(inner) = dx.inner.get().cloned() {
-        for qs in inner.queues.iter() {
-            if let Some(h) = unsafe { &*qs.irq_handle.get() } {
-                h.set_user_ctx(&qs.waiting_tasks as *const AtomicU32 as usize);
+        for queue_idx in 0..inner.queue_count {
+            let irq = unsafe { (*inner.queues[queue_idx].irq_handle.get()).clone() };
+            if let Some(handle) = irq {
+                let inner_clone = inner.clone();
+                spawn_detached(async move {
+                    queue_drain_loop(inner_clone, queue_idx, handle).await;
+                });
             }
         }
-        inner.irq_ready.set_ready();
     }
 
     complete_req(req, DriverStatus::Success)
@@ -557,6 +562,8 @@ async fn virtio_pnp_remove<'a, 'b>(
             blk::reset_device(inner.common_cfg);
 
             for qs in inner.queues.iter() {
+                // Unregistering closes the handle, causing the drain task's
+                // irq_handle.wait() to return IRQ_WAIT_CLOSED so it exits.
                 if let Some(h) = unsafe { &*qs.irq_handle.get() } {
                     h.unregister();
                 }
@@ -565,12 +572,14 @@ async fn virtio_pnp_remove<'a, 'b>(
                     let _ = irq_free_vector(vec);
                 }
 
-                {
-                    let vq = qs
-                        .queue
-                        .try_write()
-                        .expect("queue not locked during cleanup");
-                    vq.destroy();
+                // Acquire write lock to wait for any in-progress drain to finish
+                // before unmapping the queue's DMA memory.
+                qs.queue.write().destroy();
+
+                // Drop all pending completion senders so that in-flight submitters
+                // blocked on rx.await get Err(Canceled) instead of hanging forever.
+                for slot in qs.completion_slots.iter() {
+                    slot.lock().take();
                 }
 
                 if let Some(va) = qs.arena.indirect_pages_va {
@@ -658,231 +667,72 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     );
 }
 
-pub(crate) struct WaitTasksGuard<'a> {
-    counter: &'a AtomicU32,
-}
-impl<'a> WaitTasksGuard<'a> {
-    #[inline]
-    fn new(counter: &'a AtomicU32) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self { counter }
-    }
-}
-impl<'a> Drop for WaitTasksGuard<'a> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// Tracks concurrent submitters on a queue so only the last one kicks.
+/// Notify happens automatically in Drop — no manual finish call required.
 pub(crate) struct SubmitTasksGuard<'a> {
     counter: &'a AtomicU32,
-    active: bool,
+    vq: &'a Virtqueue,
+    notify_base: VirtAddr,
+    notify_off_multiplier: u32,
+    force_notify: bool,
 }
 impl<'a> SubmitTasksGuard<'a> {
     #[inline]
-    fn new(counter: &'a AtomicU32) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self {
-            counter,
-            active: true,
-        }
-    }
-
-    /// Decrement the counter and notify if we're the last submitter or we must force a kick.
-    /// The caller is expected to hold any necessary queue lock and pass a direct reference
-    /// to the virtqueue to avoid re-acquiring locks while writers are queued (which can deadlock).
-    #[inline]
-    fn finish_and_maybe_notify(
-        &mut self,
-        vq: &Virtqueue,
+    fn new(
+        counter: &'a AtomicU32,
+        vq: &'a Virtqueue,
         notify_base: VirtAddr,
         notify_off_multiplier: u32,
         force_notify: bool,
-    ) {
-        if !self.active {
-            return;
+    ) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            counter,
+            vq,
+            notify_base,
+            notify_off_multiplier,
+            force_notify,
         }
-        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
-        if force_notify || prev == 1 {
-            vq.notify(notify_base, notify_off_multiplier);
-        }
-        self.active = false;
     }
 }
 impl<'a> Drop for SubmitTasksGuard<'a> {
     fn drop(&mut self) {
-        if self.active {
-            self.counter.fetch_sub(1, Ordering::AcqRel);
+        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        if self.force_notify || prev == 1 {
+            self.vq.notify(self.notify_base, self.notify_off_multiplier);
         }
     }
 }
 
-/// Update the spin duration (in nanoseconds) performed before waiting on an interrupt.
-/// Setting this to 0 disables pre-wait spinning.
-pub fn set_wait_spin_ns(ns: u64) {
-    SPIN_BEFORE_WAIT_NS.store(ns, Ordering::Relaxed);
-}
-
-#[inline]
-fn current_spin_ns() -> u64 {
-    SPIN_BEFORE_WAIT_NS.load(Ordering::Relaxed)
-}
-
-#[inline]
-fn spin_for_ns(ns: u64) {
-    if ns == 0 {
-        return;
-    }
-
-    wait_duration(Duration::from_nanos(ns));
-}
-
-async fn wait_for_completion(
-    qs: &QueueState,
-    head: u16,
-    inner: &Arc<DevExtInner>,
-) -> Result<u32, DriverStatus> {
+/// Drain loop run as one background task per queue.
+/// Waits for an IRQ, drains the entire used ring under the write lock,
+/// frees descriptor chains, and delivers completion results via the per-head
+/// oneshot slots. Exits when the IRQ handle is closed (device removal).
+async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle: IrqHandle) {
     let meta = IrqMeta {
         tag: 0,
         data: [0; 3],
     };
-
-    let _guard = WaitTasksGuard::new(&qs.waiting_tasks);
-
-    let isr_start = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
-    let mut spurious_wake_count = 0;
-    let mut loop_iterations = 0;
+    let qs = &inner.queues[queue_idx];
 
     loop {
-        loop_iterations += 1;
-        let epoch_before = qs.drain_epoch();
+        let result = irq_handle.wait(meta).await;
 
-        if let Some(len) = qs.take_completion(head) {
-            // Drain the used ring before returning so that completions
-            // arriving from the ISR that woke us are not stranded.  Without
-            // this, another task's completion can sit in the used ring with
-            // no one left to drain or signal it.
-            if qs.try_acquire_drainer() {
-                let drained = qs.drain_used_to_completions_lockfree();
-                if drained > 0 {
-                    if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                        let waiters = qs.waiting_tasks.load(Ordering::Acquire);
-                        let to_wake = waiters.saturating_sub(1);
-                        if to_wake > 0 {
-                            IrqHandleExt::signal_n(irq_handle, meta, to_wake);
-                        }
-                    }
-                }
-                qs.release_drainer();
-            }
-            qs.defer_free_chain(head);
-            return Ok(len);
+        if irq_wait_closed(result) {
+            break;
+        }
+        if result.code == IRQ_RESCUE_WAKEUP {
+            panic!("WHYYYYYYY");
         }
 
-        let we_are_drainer = qs.try_acquire_drainer();
-        let mut made_progress = false;
-
-        if we_are_drainer {
-            let drained = qs.drain_used_to_completions_lockfree();
-            if drained > 0 {
-                made_progress = true;
-
-                if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                    let waiters = qs.waiting_tasks.load(Ordering::Acquire);
-                    let to_wake = waiters.saturating_sub(1);
-                    if to_wake > 0 {
-                        IrqHandleExt::signal_n(irq_handle, meta, to_wake);
-                    }
-                }
-            }
-
-            if let Some(len) = qs.take_completion(head) {
-                qs.release_drainer();
-                qs.defer_free_chain(head);
-                return Ok(len);
-            }
-
-            qs.release_drainer();
-        } else {
-            if let Some(len) = qs.take_completion(head) {
-                qs.defer_free_chain(head);
-                return Ok(len);
-            }
-        }
-
-        if made_progress {
-            continue;
-        }
-
-        let epoch_after = qs.drain_epoch();
-        if epoch_after != epoch_before {
-            continue;
-        }
-
-        let spin_ns = current_spin_ns();
-        if spin_ns > 0 {
-            let mut remaining_ns = spin_ns;
-
-            while remaining_ns > 0 {
-                if let Some(len) = qs.take_completion(head) {
-                    qs.defer_free_chain(head);
-                    return Ok(len);
-                }
-
-                let slice = remaining_ns.min(SPIN_WAIT_SLICE_NS);
-                spin_for_ns(slice);
-                remaining_ns -= slice;
-            }
-        }
-        if let Some(len) = qs.take_completion(head) {
-            qs.defer_free_chain(head);
-            return Ok(len);
-        }
-        if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-            let wait_result = irq_handle.wait(meta).await;
-
-            if wait_result.code == 4
-            /* IRQ_RESCUE_WAKEUP */
-            {
-                let isr_now = DEBUG_ISR_FIRED.load(Ordering::Relaxed);
-                let isr_diff = isr_now.wrapping_sub(isr_start);
-
-                println!(
-                    "virtio-blk debug: RESCUE WAKEUP for head {}. ISRs fired since wait start: {}. Spurious wakes: {}. Loops: {}.",
-                    head, isr_diff, spurious_wake_count, loop_iterations
-                );
-
-                if isr_diff == 0 {
-                    panic!("virtio-blk debug: -> NO INTERRUPTS RECEIVED. (Race condition 1)");
-                } else if spurious_wake_count > 0 {
-                    panic!(
-                        "virtio-blk debug: -> WOKE UP PREVIOUSLY BUT FOUND NO COMPLETION. (Race condition 2)"
-                    );
-                } else {
-                    panic!("virtio-blk debug: -> ISR FIRED BUT WAIT HUNG. (Race condition 3)");
-                }
-            } else if !irq_wait_ok(wait_result) {
-                return Err(DriverStatus::DeviceError);
+        let mut vq = qs.queue.write();
+        while let Some((head, len)) = vq.pop_used() {
+            vq.free_chain(head);
+            if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
+                let _ = tx.send(len);
             } else {
-                // Re-signal to break the pending_signals theft race: if this
-                // task woke up via a pending_signal that was intended for
-                // another task (whose waiter was not yet enqueued when
-                // signal_one fired), that other task's waiter will now receive
-                // a signal either directly (if already enqueued) or via the
-                // pending_signals counter (if it polls next).
-                // Guard on waiting_tasks > 1 to avoid feeding our own next
-                // poll in the single-task case, which would spin infinitely.
-                if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                    let waiters = qs.waiting_tasks.load(Ordering::Acquire);
-                    if waiters > 1 {
-                        IrqHandleExt::signal_one(irq_handle, wait_result.meta);
-                    }
-                }
-                spurious_wake_count += 1;
+                panic!("oops");
             }
-        } else {
-            spin_loop();
         }
     }
 }
@@ -1015,7 +865,11 @@ pub async fn virtio_pdo_read<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
     // Ensure caller-provided buffer is large enough for the requested transfer.
-    if req.read().data_len() < len {
+    if req
+        .read()
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < len)
+    {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
 
@@ -1033,13 +887,6 @@ pub async fn virtio_pdo_read<'a, 'b>(
     let mut remaining = len as u64;
     let mut buf_offset = 0usize;
     let mut next_sector = sector;
-
-    inner.irq_ready.wait().await;
-
-    let meta = IrqMeta {
-        tag: 0,
-        data: [0; 3],
-    };
 
     while remaining > 0 {
         let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
@@ -1059,14 +906,17 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 None => continue,
             };
 
-            let head = {
+            let (tx, rx) = oneshot::channel::<u32>();
+
+            let head_opt = {
                 let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, false, use_indirect) {
                     Some(h) => {
+                        *qs.completion_slots[h as usize].lock() = Some(tx);
                         let queue_full = vq.num_free == 0;
-                        let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
-                        submit_guard.finish_and_maybe_notify(
+                        let _submit_guard = SubmitTasksGuard::new(
+                            &qs.submitting_tasks,
                             &vq,
                             inner.notify_base,
                             inner.notify_off_multiplier,
@@ -1082,14 +932,14 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 }
             };
 
-            let head = match head {
+            let head = match head_opt {
                 Some(h) => h,
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head, &inner).await {
+            let _ = match rx.await {
                 Ok(l) => l,
-                Err(e) => return complete_req(req, e),
+                Err(_) => return complete_req(req, DriverStatus::DeviceError),
             };
 
             if io_req.status() != VIRTIO_BLK_S_OK {
@@ -1098,7 +948,13 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
             {
                 let mut w = req.write();
-                let dst = &mut w.data_slice_mut()[buf_offset..buf_offset + chunk_len as usize];
+                // SAFETY: BufSlice pointer is valid for the duration of the request.
+                let dst = unsafe {
+                    &mut w
+                        .view_data_mut::<BufSlice>()
+                        .expect("read req missing BufSlice buffer")
+                        .as_mut_slice()[buf_offset..buf_offset + chunk_len as usize]
+                };
                 dst.copy_from_slice(io_req.data_slice());
             }
 
@@ -1110,29 +966,19 @@ pub async fn virtio_pdo_read<'a, 'b>(
             break;
         }
 
-        if submitted {
-            continue;
-        }
-
-        let mut waited = false;
-        for qs in inner.queues.iter() {
-            if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                let wait_result = irq_handle.wait(meta).await;
-                if wait_result.code == 4
-                /* IRQ_RESCUE_WAKEUP */
-                {
-                    println!(
-                        "virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in read."
-                    );
-                } else if !irq_wait_ok(wait_result) {
-                    return complete_req(req, DriverStatus::DeviceError);
+        if !submitted {
+            // All queues were full. Yield to let the drain task free descriptors.
+            let mut done = false;
+            core::future::poll_fn(move |cx| {
+                if done {
+                    core::task::Poll::Ready(())
+                } else {
+                    done = true;
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
                 }
-                waited = true;
-                break;
-            }
-        }
-        if !waited {
-            spin_loop();
+            })
+            .await;
         }
     }
 
@@ -1169,7 +1015,11 @@ pub async fn virtio_pdo_write<'a, 'b>(
     }
     // Guard against buffer underruns – without this we can read past the end of
     // the caller's data buffer and corrupt adjacent memory.
-    if req.read().data_len() < len {
+    if req
+        .read()
+        .view_data::<BufSlice>()
+        .map_or(true, |b| b.len() < len)
+    {
         return complete_req(req, DriverStatus::InsufficientResources);
     }
 
@@ -1187,13 +1037,6 @@ pub async fn virtio_pdo_write<'a, 'b>(
     let mut remaining = len as u64;
     let mut buf_offset = 0usize;
     let mut next_sector = sector;
-
-    inner.irq_ready.wait().await;
-
-    let meta = IrqMeta {
-        tag: 0,
-        data: [0; 3],
-    };
 
     while remaining > 0 {
         let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
@@ -1215,18 +1058,26 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
             {
                 let r = req.read();
-                let src = &r.data_slice()[buf_offset..buf_offset + chunk_len as usize];
+                // SAFETY: BufSlice pointer is valid for the duration of the request.
+                let src = unsafe {
+                    &r.view_data::<BufSlice>()
+                        .expect("write req missing BufSlice buffer")
+                        .as_slice()[buf_offset..buf_offset + chunk_len as usize]
+                };
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
-            let head = {
+            let (tx, rx) = oneshot::channel::<u32>();
+
+            let head_opt = {
                 let mut vq = qs.queue.write();
                 let use_indirect = inner.indirect_desc_enabled;
                 match io_req.submit(&mut vq, true, use_indirect) {
                     Some(h) => {
+                        *qs.completion_slots[h as usize].lock() = Some(tx);
                         let queue_full = vq.num_free == 0;
-                        let mut submit_guard = SubmitTasksGuard::new(&qs.submitting_tasks);
-                        submit_guard.finish_and_maybe_notify(
+                        let _submit_guard = SubmitTasksGuard::new(
+                            &qs.submitting_tasks,
                             &vq,
                             inner.notify_base,
                             inner.notify_off_multiplier,
@@ -1242,14 +1093,14 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 }
             };
 
-            let head = match head {
+            let _head = match head_opt {
                 Some(h) => h,
                 None => continue,
             };
 
-            let _ = match wait_for_completion(qs, head, &inner).await {
+            let _ = match rx.await {
                 Ok(l) => l,
-                Err(e) => return complete_req(req, e),
+                Err(_) => return complete_req(req, DriverStatus::DeviceError),
             };
 
             if io_req.status() != VIRTIO_BLK_S_OK {
@@ -1264,29 +1115,19 @@ pub async fn virtio_pdo_write<'a, 'b>(
             break;
         }
 
-        if submitted {
-            continue;
-        }
-
-        let mut waited = false;
-        for qs in inner.queues.iter() {
-            if let Some(irq_handle) = unsafe { &*qs.irq_handle.get() } {
-                let wait_result = irq_handle.wait(meta).await;
-                if wait_result.code == 4
-                /* IRQ_RESCUE_WAKEUP */
-                {
-                    println!(
-                        "virtio-blk debug: Fallback IO wait loop rescue wakeup triggered in write."
-                    );
-                } else if !irq_wait_ok(wait_result) {
-                    return complete_req(req, DriverStatus::DeviceError);
+        if !submitted {
+            // All queues were full. Yield to let the drain task free descriptors.
+            let mut done = false;
+            core::future::poll_fn(move |cx| {
+                if done {
+                    core::task::Poll::Ready(())
+                } else {
+                    done = true;
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
                 }
-                waited = true;
-                break;
-            }
-        }
-        if !waited {
-            spin_loop();
+            })
+            .await;
         }
     }
 

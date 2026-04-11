@@ -77,7 +77,7 @@ fn main() {
         .unwrap_or_else(|| {
             out_dir
                 .ancestors()
-                .nth(4) // .../target/<profile>/build/<pkg>/out -> target is 4 up
+                .nth(5) // .../target/<profile>/build/<pkg>/out -> target is 4 up
                 .expect("unexpected OUT_DIR layout")
                 .to_path_buf()
         });

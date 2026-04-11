@@ -1,5 +1,5 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU16, Ordering};
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, unmap_range, virt_to_phys,
 };
@@ -10,8 +10,6 @@ use crate::pci;
 pub const VRING_DESC_F_NEXT: u16 = 1;
 pub const VRING_DESC_F_WRITE: u16 = 2;
 pub const VRING_DESC_F_INDIRECT: u16 = 4;
-
-const DEFERRED_FREE_EMPTY: u16 = 0xFFFF;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -27,12 +25,6 @@ pub struct VirtqDesc {
 pub struct VirtqUsedElem {
     pub id: u32,
     pub len: u32,
-}
-
-#[derive(Clone, Copy)]
-pub struct DescState {
-    /// true if this descriptor slot is free
-    pub free: bool,
 }
 
 pub struct Virtqueue {
@@ -55,29 +47,9 @@ pub struct Virtqueue {
     pub free_head: u16,
     pub num_free: u16,
 
-    /// Last used ring index we've processed (atomic for lock-free draining).
+    /// Last used ring index we've processed.
+    /// Only accessed by the drain task under the queue write lock.
     last_used_idx: AtomicU16,
-
-    /// Completion status array indexed by descriptor head.
-    /// - 0: not completed
-    /// - non-zero: completed, value is (len + 1) to distinguish from "not completed"
-    completions: Box<[AtomicU32]>,
-
-    /// Single-drainer gate: true if a drain operation is in progress.
-    /// Only one task should drain at a time to prevent thundering herd.
-    draining: AtomicBool,
-
-    /// Epoch counter incremented each time drain_used_to_completions() drains entries.
-    /// Waiters can use this to detect when new completions have been processed.
-    drain_epoch: AtomicU64,
-
-    /// Lock-free stack of descriptor chain heads pending free.
-    /// DEFERRED_FREE_EMPTY = empty sentinel.
-    deferred_free_head: AtomicU16,
-
-    /// Per-descriptor "next" pointers for the deferred free stack.
-    /// Only written by wait_for_completion (producers), read by submitter (consumer).
-    deferred_free_next: Box<[AtomicU16]>,
 }
 
 fn align_up(v: u64, align: u64) -> u64 {
@@ -94,7 +66,6 @@ impl Virtqueue {
         if max_size == 0 {
             return None;
         }
-        // Use the full queue size advertised by the device.
         let size = max_size;
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
@@ -126,17 +97,6 @@ impl Virtqueue {
             }
         }
 
-        let completions = core::iter::repeat_with(|| AtomicU32::new(0))
-            .take(size as usize)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let deferred_free_next = core::iter::repeat_with(|| AtomicU16::new(DEFERRED_FREE_EMPTY))
-            .take(size as usize)
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        // Cache the per-queue notify offset while this queue is selected.
         let queue_notify_off =
             unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_NOTIFY_OFF) };
 
@@ -162,18 +122,12 @@ impl Virtqueue {
             free_head: 0,
             num_free: size,
             last_used_idx: AtomicU16::new(0),
-            completions,
-            draining: AtomicBool::new(false),
-            drain_epoch: AtomicU64::new(0),
-            deferred_free_head: AtomicU16::new(DEFERRED_FREE_EMPTY),
-            deferred_free_next,
         })
     }
 
     /// Enable the queue after all configuration (including MSI-X vector) is set.
     pub fn enable(&self, common_cfg: VirtAddr) {
         unsafe {
-            // Re-select the queue before enabling to ensure the register window is pointed at us.
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, self.idx);
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
         }
@@ -207,14 +161,8 @@ impl Virtqueue {
     }
 
     /// Push a chain of buffers into the virtqueue.
-    /// `bufs` is a slice of (physical_addr, length, flags) where flags uses VRING_DESC_F_WRITE
-    /// for device-writable buffers.
-    ///
     /// Returns the head descriptor index of the chain.
     pub fn push_chain(&mut self, bufs: &[(PhysAddr, u32, u16)]) -> Option<u16> {
-        // Drain any deferred frees first (we hold the lock)
-        self.drain_deferred_frees();
-
         if bufs.is_empty() || bufs.len() as u16 > self.num_free {
             return None;
         }
@@ -247,7 +195,6 @@ impl Virtqueue {
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
         unsafe {
             core::ptr::write_volatile(ring_entry, head);
-            // Memory barrier before updating idx
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::write_volatile(avail_base.add(1), avail_idx.wrapping_add(1));
         }
@@ -256,13 +203,8 @@ impl Virtqueue {
     }
 
     /// Push a single indirect descriptor table into the virtqueue.
-    /// `table_phys` is the physical address of the indirect descriptor table.
-    /// `table_len` is the total size in bytes of the indirect table.
     /// Returns the head descriptor index.
     pub fn push_indirect(&mut self, table_phys: PhysAddr, table_len: u32) -> Option<u16> {
-        // Drain any deferred frees first (we hold the lock)
-        self.drain_deferred_frees();
-
         if self.num_free == 0 {
             return None;
         }
@@ -273,7 +215,7 @@ impl Virtqueue {
             (*desc).addr = table_phys.as_u64();
             (*desc).len = table_len;
             (*desc).flags = VRING_DESC_F_INDIRECT;
-            (*desc).next = 0; // next is not used for indirect descriptors
+            (*desc).next = 0;
         }
 
         let avail_base = self.avail_va.as_u64() as *mut u16;
@@ -281,7 +223,6 @@ impl Virtqueue {
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
         unsafe {
             core::ptr::write_volatile(ring_entry, head);
-            // Memory barrier before updating idx
             core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             core::ptr::write_volatile(avail_base.add(1), avail_idx.wrapping_add(1));
         }
@@ -293,30 +234,12 @@ impl Virtqueue {
     pub fn notify(&self, notify_base: VirtAddr, notify_off_multiplier: u32) {
         let offset = self.queue_notify_off as u64 * notify_off_multiplier as u64;
         let addr = (notify_base.as_u64() + offset) as *mut u16;
-        // Ensure avail ring updates are visible before the MMIO notify.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         unsafe { core::ptr::write_volatile(addr, self.idx) };
     }
 
-    /// Check if the queue needs a notification after adding descriptors.
-    /// Returns true if the queue was empty before the current batch of submissions.
-    /// This allows batching multiple submissions with a single notify.
-    pub fn needs_notify(&self, avail_idx_before_batch: u16) -> bool {
-        // Notify if the queue transitioned from empty to non-empty.
-        // The queue was "empty" if avail_idx == last_used_idx before we started submitting.
-        avail_idx_before_batch == self.last_used_idx.load(Ordering::Acquire)
-    }
-
-    /// Get the current available ring index. Use this before a batch of submissions
-    /// to determine if a notify is needed afterward.
-    pub fn avail_idx(&self) -> u16 {
-        let avail_base = self.avail_va.as_u64() as *const u16;
-        unsafe { core::ptr::read_volatile(avail_base.add(1)) }
-    }
-
-    /// Pop completed entries from the used ring (requires mutable access).
-    /// Returns a list of (descriptor_head_index, bytes_written).
-    /// Note: For lock-free draining, use drain_used_to_completions_lockfree() instead.
+    /// Pop one completed entry from the used ring.
+    /// Called exclusively by the drain task under the queue write lock.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         let used_base = self.used_va.as_u64() as *const u16;
         let used_idx = unsafe { core::ptr::read_volatile(used_base.add(1)) };
@@ -337,156 +260,6 @@ impl Virtqueue {
         Some((elem.id as u16, elem.len))
     }
 
-    /// Drain all pending used ring entries into the completions array.
-    /// Returns the number of entries drained.
-    pub fn drain_used_to_completions(&mut self) -> usize {
-        let mut count = 0;
-        while let Some((head, len)) = self.pop_used() {
-            // Store len+1 so 0 means "not completed"
-            if self.completions[head as usize]
-                .compare_exchange(0, len.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                count += 1;
-            }
-        }
-        if count > 0 {
-            core::sync::atomic::fence(Ordering::Release);
-            // Increment epoch to signal waiters that new completions are available
-            self.drain_epoch.fetch_add(1, Ordering::Release);
-        }
-        count
-    }
-
-    /// Drain used ring to completions using CAS (fully lock-free).
-    /// Multiple callers can race; each entry is claimed by exactly one caller via CAS.
-    /// Returns the number of entries successfully drained by this call.
-    pub fn drain_used_to_completions_lockfree(&self) -> usize {
-        let mut count = 0;
-
-        loop {
-            // Read device's used_idx (volatile read from used ring)
-            let used_base = self.used_va.as_u64() as *const u16;
-            let device_used_idx = unsafe { core::ptr::read_volatile(used_base.add(1)) };
-
-            // Load our current last_used_idx atomically
-            let our_last = self.last_used_idx.load(Ordering::Acquire);
-
-            // If equal, nothing to drain
-            if our_last == device_used_idx {
-                break;
-            }
-
-            // Try to claim ONE entry by CAS'ing last_used_idx forward
-            let next_idx = our_last.wrapping_add(1);
-            match self.last_used_idx.compare_exchange_weak(
-                our_last,
-                next_idx,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // We successfully claimed the entry at position our_last
-                    // Memory barrier to ensure used ring entry is read after claiming
-                    core::sync::atomic::fence(Ordering::Acquire);
-
-                    let elem_offset = 4 + (our_last % self.size) as usize * 8;
-                    let elem_ptr =
-                        (self.used_va.as_u64() + elem_offset as u64) as *const VirtqUsedElem;
-                    let elem = unsafe { core::ptr::read_volatile(elem_ptr) };
-
-                    // Store completion (len + 1, where 0 means "not completed")
-                    let head = elem.id as u16;
-                    if self.completions[head as usize]
-                        .compare_exchange(
-                            0,
-                            elem.len.wrapping_add(1),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        count += 1;
-                    }
-                    // Continue to try draining more entries
-                }
-                Err(_) => {
-                    // Another thread claimed this entry, retry from the top
-                    continue;
-                }
-            }
-        }
-
-        if count > 0 {
-            // Ensure completion stores are visible before signaling waiters
-            core::sync::atomic::fence(Ordering::Release);
-            self.drain_epoch.fetch_add(1, Ordering::Release);
-        }
-
-        count
-    }
-
-    /// Try to acquire the single-drainer gate.
-    /// Returns true if this caller is now the drainer, false if another drainer is active.
-    /// Use `release_drainer()` when done draining.
-    #[inline]
-    pub fn try_acquire_drainer(&self) -> bool {
-        self.draining
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    /// Release the single-drainer gate after draining is complete.
-    #[inline]
-    pub fn release_drainer(&self) {
-        self.draining.store(false, Ordering::Release);
-    }
-
-    /// Check if a drain operation is currently in progress.
-    #[inline]
-    pub fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::Acquire)
-    }
-
-    /// Get the current drain epoch. Waiters can compare this value before and after
-    /// sleeping to detect if new completions have been processed.
-    #[inline]
-    pub fn drain_epoch(&self) -> u64 {
-        self.drain_epoch.load(Ordering::Acquire)
-    }
-
-    /// Check if head is completed and take the completion (atomic swap to 0).
-    /// Returns Some(len) if completed, None if not.
-    /// This is lock-free and can be called without holding the virtqueue mutex.
-    pub fn take_completion(&self, head: u16) -> Option<u32> {
-        let val = self.completions[head as usize].swap(0, Ordering::AcqRel);
-        if val == 0 {
-            None
-        } else {
-            // Ensure device writes associated with the completion are globally visible
-            // before the descriptor chain can be reused.
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-            Some(val - 1) // Recover original len
-        }
-    }
-
-    /// Check if head is completed without taking the completion.
-    /// This is lock-free and useful for polling without consuming the completion.
-    #[inline]
-    pub fn peek_completion(&self, head: u16) -> bool {
-        self.completions[head as usize].load(Ordering::Acquire) != 0
-    }
-
-    /// Check if there are any pending completions in the used ring.
-    /// This is useful for deciding whether to drain before waiting.
-    /// Lock-free: only reads atomics and volatile memory.
-    #[inline]
-    pub fn has_pending_used(&self) -> bool {
-        let used_base = self.used_va.as_u64() as *const u16;
-        let used_idx = unsafe { core::ptr::read_volatile(used_base.add(1)) };
-        self.last_used_idx.load(Ordering::Acquire) != used_idx
-    }
-
     /// Free a descriptor chain starting from `head`.
     pub fn free_chain(&mut self, head: u16) {
         let mut idx = head;
@@ -495,9 +268,7 @@ impl Virtqueue {
             let flags = unsafe { (*desc).flags };
             let next = unsafe { (*desc).next };
 
-            // For an indirect descriptor, we only free the single head descriptor.
-            // The descriptors within the indirect table are not part of this virtqueue's
-            // free list and are managed separately by the request arena.
+            // For an indirect descriptor, only free the single head descriptor.
             if (flags & VRING_DESC_F_INDIRECT) != 0 {
                 self.free_desc(idx);
                 return;
@@ -513,74 +284,9 @@ impl Virtqueue {
         }
     }
 
-    /// Enqueue a descriptor chain head for deferred freeing (lock-free push).
-    /// Called from wait_for_completion without holding any locks.
-    /// The submitter will drain these under its existing lock via drain_deferred_frees().
-    pub fn defer_free_chain(&self, head: u16) {
-        loop {
-            let old_head = self.deferred_free_head.load(Ordering::Acquire);
-
-            // Only link the descriptor if it is not already on the list.
-            match self.deferred_free_next[head as usize].compare_exchange(
-                DEFERRED_FREE_EMPTY,
-                old_head,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    // CAS to become the new head
-                    match self.deferred_free_head.compare_exchange_weak(
-                        old_head,
-                        head,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break,
-                        Err(_) => {
-                            // Roll back the link before retrying to avoid corrupting an in-flight list.
-                            self.deferred_free_next[head as usize]
-                                .store(DEFERRED_FREE_EMPTY, Ordering::Release);
-                            continue;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Already enqueued or being drained; avoid corrupting the list.
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Drain all deferred free entries and free them.
-    /// Called from push_chain UNDER the queue lock.
-    /// Returns number of descriptor chains freed.
-    pub fn drain_deferred_frees(&mut self) -> usize {
-        // Atomically take the entire list (single swap)
-        let mut head = self
-            .deferred_free_head
-            .swap(DEFERRED_FREE_EMPTY, Ordering::AcqRel);
-
-        if head == DEFERRED_FREE_EMPTY {
-            return 0; // Empty
-        }
-
-        let mut count = 0;
-
-        while head != DEFERRED_FREE_EMPTY {
-            // Take and clear the next pointer to allow safe reuse on re-enqueue.
-            let next =
-                self.deferred_free_next[head as usize].swap(DEFERRED_FREE_EMPTY, Ordering::AcqRel);
-
-            // Actually free this descriptor chain
-            self.free_chain(head);
-            count += 1;
-
-            head = next;
-        }
-
-        count
-    }
+    // TODO: defer_free_chain (lock-free deferred free stack) is preserved here
+    // for a future multi-queue scenario where non-drain tasks need to return
+    // descriptor chains without holding the write lock.
 
     /// Deallocate all DMA memory for this virtqueue.
     pub fn destroy(&self) {
