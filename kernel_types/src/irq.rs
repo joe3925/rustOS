@@ -1,15 +1,9 @@
 use alloc::collections::VecDeque;
-use alloc::vec::Vec;
-use core::arch::asm;
-
 use alloc::sync::Arc;
-use core::future::Future;
-use core::hint::black_box;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
-use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use core::task::{Context, Poll, Waker};
+use core::task::Waker;
 
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use x86_64::instructions::interrupts;
@@ -173,14 +167,14 @@ impl Default for IrqWaitResult {
 // IRQ HANDLE (safe, Arc-based)
 // =============================================================================
 #[repr(C)]
-struct Waiter {
-    waker: IrqSafeMutex<Option<Waker>>,
-    result: IrqSafeMutex<Option<IrqWaitResult>>,
-    enqueued: AtomicBool,
+pub struct Waiter {
+    pub waker: IrqSafeMutex<Option<Waker>>,
+    pub result: IrqSafeMutex<Option<IrqWaitResult>>,
+    pub enqueued: AtomicBool,
 }
 
 impl Waiter {
-    fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
             waker: IrqSafeMutex::new(None),
             result: IrqSafeMutex::new(None),
@@ -188,7 +182,7 @@ impl Waiter {
         })
     }
 
-    fn set_waker(&self, w: &Waker) {
+    pub fn set_waker(&self, w: &Waker) {
         let mut g = self.waker.lock();
         let update = match g.as_ref() {
             Some(existing) => !existing.will_wake(w),
@@ -199,35 +193,35 @@ impl Waiter {
         }
     }
 
-    fn take_result(&self) -> Option<IrqWaitResult> {
+    pub fn take_result(&self) -> Option<IrqWaitResult> {
         self.result.lock().take()
     }
 
-    fn store_result(&self, r: IrqWaitResult) {
+    pub fn store_result(&self, r: IrqWaitResult) {
         *self.result.lock() = Some(r);
     }
 
-    fn wake(&self) {
+    pub fn wake(&self) {
         if let Some(w) = self.waker.lock().take() {
             w.wake();
         }
     }
 
-    fn clear(&self) {
+    pub fn clear(&self) {
         self.enqueued.store(false, Ordering::Release);
         *self.waker.lock() = None;
         *self.result.lock() = None;
     }
 }
 
-struct WaitState {
-    waiters: VecDeque<Arc<Waiter>>,
-    pending_signals: usize,
-    last_meta: IrqMeta,
+pub struct WaitState {
+    pub waiters: VecDeque<Arc<Waiter>>,
+    pub pending_signals: usize,
+    pub last_meta: IrqMeta,
 }
 
 impl WaitState {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             waiters: VecDeque::new(),
             pending_signals: 0,
@@ -235,15 +229,15 @@ impl WaitState {
         }
     }
 
-    fn pop_waiter(&mut self) -> Option<Arc<Waiter>> {
+    pub fn pop_waiter(&mut self) -> Option<Arc<Waiter>> {
         self.waiters.pop_front()
     }
 
-    fn push_waiter(&mut self, w: Arc<Waiter>) {
+    pub fn push_waiter(&mut self, w: Arc<Waiter>) {
         self.waiters.push_back(w);
     }
 
-    fn remove_waiter(&mut self, target: &Arc<Waiter>) -> bool {
+    pub fn remove_waiter(&mut self, target: &Arc<Waiter>) -> bool {
         let before = self.waiters.len();
         self.waiters.retain(|w| !Arc::ptr_eq(w, target));
         before != self.waiters.len()
@@ -252,181 +246,10 @@ impl WaitState {
 
 #[repr(C)]
 pub struct IrqHandleInner {
-    drop_hook: Mutex<Option<DropHook>>,
-    closed: AtomicBool,
-    user_ctx: AtomicUsize,
-    state: IrqSafeMutex<WaitState>,
-}
-
-impl IrqHandleInner {
-    pub fn new(drop_hook: DropHook) -> IrqHandle {
-        Arc::new(Self {
-            drop_hook: Mutex::new(Some(drop_hook)),
-            closed: AtomicBool::new(false),
-            user_ctx: AtomicUsize::new(0),
-            state: IrqSafeMutex::new(WaitState::new()),
-        })
-    }
-
-    #[inline]
-    pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-
-    pub fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-
-        let waiters = {
-            let mut st = self.state.lock();
-            st.pending_signals = 0;
-
-            let mut drained = Vec::with_capacity(st.waiters.len());
-            while let Some(waiter) = st.pop_waiter() {
-                waiter.enqueued.store(false, Ordering::Release);
-                drained.push(waiter);
-            }
-            drained
-        };
-
-        for waiter in waiters {
-            waiter.store_result(IrqWaitResult::closed());
-            waiter.wake();
-        }
-    }
-
-    pub fn signal_one(&self, meta: IrqMeta) {
-        if self.is_closed() {
-            return;
-        }
-
-        let waiter_opt = {
-            let mut st = self.state.lock();
-            st.last_meta = meta;
-
-            if let Some(waiter) = st.pop_waiter() {
-                waiter.enqueued.store(false, Ordering::Release);
-                Some(waiter)
-            } else {
-                st.pending_signals = st.pending_signals.saturating_add(1);
-
-                None
-            }
-        };
-
-        if let Some(waiter) = waiter_opt {
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake();
-        }
-    }
-
-    pub fn ensure_signal_exactly_one(&self, meta: IrqMeta) {
-        if self.is_closed() {
-            return;
-        }
-
-        let waiter_opt = {
-            let mut st = self.state.lock();
-            st.last_meta = meta;
-
-            if let Some(waiter) = st.pop_waiter() {
-                waiter.enqueued.store(false, Ordering::Release);
-                Some(waiter)
-            } else {
-                st.pending_signals = 1;
-                None
-            }
-        };
-
-        if let Some(waiter) = waiter_opt {
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake();
-        }
-    }
-
-    pub fn signal_n(&self, meta: IrqMeta, n: usize) -> usize {
-        if n == 0 || self.is_closed() {
-            return 0;
-        }
-
-        let waiters = {
-            let mut st = self.state.lock();
-            st.last_meta = meta;
-
-            let mut drained = Vec::with_capacity(n.min(st.waiters.len()));
-            for _ in 0..n {
-                let Some(waiter) = st.pop_waiter() else { break };
-                waiter.enqueued.store(false, Ordering::Release);
-                drained.push(waiter);
-            }
-
-            if drained.len() < n {
-                st.pending_signals = st.pending_signals.saturating_add(n - drained.len());
-            }
-
-            drained
-        };
-
-        let woken = waiters.len();
-        for waiter in waiters.iter() {
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake();
-        }
-
-        woken
-    }
-
-    pub fn signal_all(&self, meta: IrqMeta) -> usize {
-        if self.is_closed() {
-            return 0;
-        }
-
-        let mut woken = 0;
-        loop {
-            let waiter_opt = {
-                let mut st = self.state.lock();
-                st.last_meta = meta;
-                st.pop_waiter().map(|w| {
-                    w.enqueued.store(false, Ordering::Release);
-                    w
-                })
-            };
-
-            let Some(waiter) = waiter_opt else { break };
-            waiter.store_result(IrqWaitResult::ok_n(meta, 1));
-            waiter.wake();
-            woken += 1;
-        }
-
-        if woken == 0 {
-            self.signal_one(meta);
-        }
-        woken
-    }
-
-    pub fn cancel_waiter(&self, waiter: &Arc<Waiter>) {
-        let mut st = self.state.lock();
-        if st.remove_waiter(waiter) {
-            waiter.enqueued.store(false, Ordering::Release);
-        }
-    }
-
-    pub fn set_user_ctx(&self, v: usize) {
-        self.user_ctx.store(v, Ordering::Release);
-    }
-
-    pub fn user_ctx(&self) -> usize {
-        self.user_ctx.load(Ordering::Acquire)
-    }
-
-    pub fn wait_future(self: &Arc<Self>) -> IrqWaitFuture {
-        IrqWaitFuture {
-            handle: Arc::clone(self),
-            waiter: Waiter::new(),
-            test_wakeup: AtomicUsize::new(0),
-        }
-    }
+    pub drop_hook: Mutex<Option<DropHook>>,
+    pub closed: AtomicBool,
+    pub user_ctx: AtomicUsize,
+    pub state: IrqSafeMutex<WaitState>,
 }
 
 impl Drop for IrqHandleInner {
@@ -434,56 +257,6 @@ impl Drop for IrqHandleInner {
         if let Some(h) = self.drop_hook.lock().take() {
             h.invoke();
         }
-    }
-}
-
-pub struct IrqWaitFuture {
-    handle: IrqHandle,
-    //TODO: Remove this
-    test_wakeup: AtomicUsize,
-    waiter: Arc<Waiter>,
-}
-
-impl Future for IrqWaitFuture {
-    type Output = IrqWaitResult;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.as_ref().get_ref();
-
-        if let Some(r) = this.waiter.take_result() {
-            return Poll::Ready(r);
-        }
-        if self.test_wakeup.load(Ordering::Relaxed) > 500_000_000 {
-            return Poll::Ready(IrqWaitResult::rescue());
-        }
-        if this.handle.is_closed() {
-            return Poll::Ready(IrqWaitResult::closed());
-        }
-
-        {
-            let mut st = this.handle.state.lock();
-
-            this.waiter.set_waker(cx.waker());
-
-            if st.pending_signals > 0 {
-                st.pending_signals -= 1;
-                let meta = st.last_meta;
-                return Poll::Ready(IrqWaitResult::ok_n(meta, 1));
-            }
-
-            if !this.waiter.enqueued.swap(true, Ordering::AcqRel) {
-                st.push_waiter(this.waiter.clone());
-            }
-        }
-        self.test_wakeup.fetch_add(1, Ordering::Relaxed);
-        Poll::Pending
-    }
-}
-
-impl Drop for IrqWaitFuture {
-    fn drop(&mut self) {
-        self.handle.cancel_waiter(&self.waiter);
-        self.waiter.clear();
     }
 }
 

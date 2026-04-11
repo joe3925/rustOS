@@ -54,7 +54,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             }
         }
         if !ready.swap(false, Ordering::AcqRel) {
-            let _ = unsafe { sys_try_steal_blocking_one() };
+            //let _ = unsafe { sys_try_steal_blocking_one() };
         }
     }
 }

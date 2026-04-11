@@ -349,7 +349,16 @@ impl Scheduler {
 
     fn core_effective_load(&self, i: usize) -> Option<usize> {
         let core = self.core(i)?;
-        Some(core.load.load(Ordering::Acquire))
+        let queue_load = core.load.load(Ordering::Acquire);
+
+        let current = core.current_ptr.load(Ordering::Acquire);
+        let is_idle = core::ptr::eq(current, Arc::as_ptr(&core.idle_task) as *mut _);
+
+        if is_idle {
+            Some(queue_load)
+        } else {
+            Some(queue_load + 1)
+        }
     }
 
     #[inline(always)]

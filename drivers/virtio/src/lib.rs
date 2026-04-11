@@ -25,7 +25,7 @@ use kernel_api::irq::{
     irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
-use kernel_api::kernel_types::irq::IrqMeta;
+use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::{unmap_mmio_region, unmap_range};
@@ -686,7 +686,13 @@ impl<'a> SubmitTasksGuard<'a> {
         force_notify: bool,
     ) -> Self {
         counter.fetch_add(1, Ordering::AcqRel);
-        Self { counter, vq, notify_base, notify_off_multiplier, force_notify }
+        Self {
+            counter,
+            vq,
+            notify_base,
+            notify_off_multiplier,
+            force_notify,
+        }
     }
 }
 impl<'a> Drop for SubmitTasksGuard<'a> {
@@ -703,13 +709,20 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
 /// frees descriptor chains, and delivers completion results via the per-head
 /// oneshot slots. Exits when the IRQ handle is closed (device removal).
 async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle: IrqHandle) {
-    let meta = IrqMeta { tag: 0, data: [0; 3] };
+    let meta = IrqMeta {
+        tag: 0,
+        data: [0; 3],
+    };
     let qs = &inner.queues[queue_idx];
 
     loop {
         let result = irq_handle.wait(meta).await;
+
         if irq_wait_closed(result) {
             break;
+        }
+        if result.code == IRQ_RESCUE_WAKEUP {
+            panic!("WHYYYYYYY");
         }
 
         let mut vq = qs.queue.write();
@@ -717,6 +730,8 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
             vq.free_chain(head);
             if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
                 let _ = tx.send(len);
+            } else {
+                panic!("oops");
             }
         }
     }

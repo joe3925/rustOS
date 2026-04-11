@@ -100,10 +100,11 @@ pub(crate) extern "x86-interrupt" fn page_fault(
 
     if !is_protection {
         if let Some(task) = SCHEDULER.get_current_task(get_current_cpu_id()) {
-            // No lock taken here — stack metadata lives in lock-free atomics on
-            // TaskRef so the page-fault handler never contends with a guard held
-            // by the interrupted code.
-            if task.is_kernel_mode.load(core::sync::atomic::Ordering::Relaxed) && !is_user {
+            if task
+                .is_kernel_mode
+                .load(core::sync::atomic::Ordering::Relaxed)
+                && !is_user
+            {
                 let gp = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
                 if gp != 0 {
                     let stack_start = task.stack_start.load(core::sync::atomic::Ordering::Relaxed);
@@ -114,18 +115,26 @@ pub(crate) extern "x86-interrupt" fn page_fault(
                         let flags = PageTableFlags::PRESENT
                             | PageTableFlags::WRITABLE
                             | PageTableFlags::NO_EXECUTE;
-                        while fault < task.guard_page.load(core::sync::atomic::Ordering::Acquire) + PAGE_SIZE {
+                        while fault
+                            < task.guard_page.load(core::sync::atomic::Ordering::Acquire)
+                                + PAGE_SIZE
+                        {
                             match task.grow_stack(flags) {
                                 Ok(true) => {}
                                 _ => break,
                             }
                         }
-                        if fault >= task.guard_page.load(core::sync::atomic::Ordering::Acquire) + PAGE_SIZE {
+                        if fault
+                            >= task.guard_page.load(core::sync::atomic::Ordering::Acquire)
+                                + PAGE_SIZE
+                        {
                             return;
                         }
                     }
 
-                    if fault >= gp - StackSize::Huge2M.as_bytes() {
+                    let reserved_start = gp - StackSize::Huge2M.as_bytes();
+
+                    if fault >= reserved_start && fault < gp {
                         unsafe { Cr3::write(kernel_cr3(), Cr3::read().1) };
                         panic!(
                             "KERNEL STACK OVERFLOW\nerror_code={:?}\ncr2={:#x}\n(task guard={:#x})\n{:#?}",
