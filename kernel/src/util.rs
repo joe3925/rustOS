@@ -25,7 +25,7 @@ use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
@@ -222,6 +222,18 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
     if is_owner {
         println!("\n=== KERNEL PANIC [{}] ===", mod_name);
         println!("\n{}", info);
+
+        let dump = dump_scheduler();
+        println!("\n--- Running tasks at panic ---");
+        for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+            if let Some(task) = slot {
+                let name = unsafe { task_name_panic(task) };
+                println!("  CPU {}: \"{}\" (id={})", cpu_id, name, task.id.load(Ordering::Relaxed));
+            } else {
+                println!("  CPU {}: <idle>", cpu_id);
+            }
+        }
+
         unsafe {
             if let Some(a) = APIC.lock().as_ref() {
                 a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)

@@ -1024,3 +1024,145 @@ pub fn kernel_task_end() -> ! {
         yield_now();
     }
 }
+
+// ── Panic dump ────────────────────────────────────────────────────────────────
+
+const MAX_DUMP_CPUS: usize = 16;
+const MAX_DUMP_QUEUE: usize = 128;
+
+pub struct QueueSnapshot {
+    /// Number of task handles stored in `tasks` (≤ MAX_DUMP_QUEUE).
+    pub captured: usize,
+    /// Queue length before we started draining; may exceed `captured`.
+    pub total_before_drain: usize,
+    pub tasks: [Option<TaskHandle>; MAX_DUMP_QUEUE],
+}
+
+impl QueueSnapshot {
+    const fn empty() -> Self {
+        Self {
+            captured: 0,
+            total_before_drain: 0,
+            tasks: [const { None }; MAX_DUMP_QUEUE],
+        }
+    }
+}
+
+pub struct SchedulerDump {
+    pub num_cores: usize,
+    pub next_task_id: u64,
+    pub last_balance_tick: usize,
+    /// Currently running task on each CPU, indexed by logical cpu_id.
+    /// `None` if the CPU is not initialized or is running its idle task.
+    pub current_tasks: [Option<TaskHandle>; MAX_DUMP_CPUS],
+    pub run_queues: [QueueSnapshot; MAX_DUMP_CPUS],
+    pub ipi_queues: [QueueSnapshot; MAX_DUMP_CPUS],
+    pub core_loads: [usize; MAX_DUMP_CPUS],
+    pub lapic_ids: [u8; MAX_DUMP_CPUS],
+}
+
+/// Capture a snapshot of the scheduler for panic diagnostics.
+///
+/// # Safety contract (caller's responsibility)
+/// - No other code will access the scheduler after this call.
+/// - Interrupts must be disabled before calling (panic_common already does this).
+///
+/// Does not allocate heap memory. Does not acquire any locks.
+pub fn dump_scheduler() -> SchedulerDump {
+    let mut dump = SchedulerDump {
+        num_cores: SCHEDULER.num_cores.load(Ordering::Acquire),
+        next_task_id: SCHEDULER.next_task_id.load(Ordering::Acquire),
+        last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
+        current_tasks: [const { None }; MAX_DUMP_CPUS],
+        run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+        ipi_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+        core_loads: [0usize; MAX_DUMP_CPUS],
+        lapic_ids: [0u8; MAX_DUMP_CPUS],
+    };
+
+    // SAFETY: We bypass the RwLock on `cores` because:
+    //   1. Interrupts are disabled — no timer tick, no IPI.
+    //   2. The caller guarantees nothing else will touch the scheduler.
+    //   3. `cores` is only mutated at startup; it is effectively immutable here.
+    let cores: &Vec<Arc<CoreScheduler>> = unsafe { bypass_spin_rwlock(&SCHEDULER.cores) };
+
+    for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
+        dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
+        dump.run_queues[i] = drain_array_queue(&core.run_queue);
+        dump.ipi_queues[i] = drain_array_queue(&core.ipi_queue);
+        dump.core_loads[i] = core.load.load(Ordering::Acquire);
+        dump.lapic_ids[i] = core.lapic_id;
+    }
+
+    dump
+}
+
+/// Bypass a `spin::RwLock<T>` without acquiring it.
+///
+/// `spin::RwLock<T>` is `{ lock: AtomicUsize, data: UnsafeCell<T> }`.
+/// `UnsafeCell<T>` is `repr(transparent)`, so the data lies immediately after
+/// the `AtomicUsize` field (with natural alignment padding for `T`).
+///
+/// # Safety
+/// Caller must ensure no concurrent writes to the lock's data.
+unsafe fn bypass_spin_rwlock<T>(lock: &spin::RwLock<T>) -> &T {
+    let base = (lock as *const spin::RwLock<T>).cast::<u8>();
+    let offset = core::mem::size_of::<core::sync::atomic::AtomicUsize>();
+    let raw = base.add(offset).cast::<T>();
+    // Align up to T's required alignment.
+    let align = core::mem::align_of::<T>();
+    let aligned = ((raw as usize) + align - 1) & !(align - 1);
+    &*(aligned as *const T)
+}
+
+/// Clone the `Arc<TaskRef>` stored as a raw pointer in `current_ptr`.
+///
+/// The pointer was stored via `Arc::as_ptr()` / raw pointer bookkeeping inside
+/// the scheduler — we reconstruct a temporary `Arc` to clone it, then
+/// `mem::forget` the temporary so we do not decrement the original refcount.
+fn clone_arc_from_current_ptr(ptr: &AtomicPtr<TaskRef>) -> Option<TaskHandle> {
+    let raw = ptr.load(Ordering::Acquire);
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: The pointer was obtained from an Arc<TaskRef> that is still live
+    // (the task is currently running). We forget the reconstructed Arc
+    // immediately after cloning so the refcount is not decremented.
+    unsafe {
+        let arc = Arc::from_raw(raw);
+        let cloned = Arc::clone(&arc);
+        core::mem::forget(arc);
+        Some(cloned)
+    }
+}
+
+/// Read a task's name without acquiring its inner `RwLock`.
+///
+/// Returns an empty string if the pointer is null. Safe to call in panic context.
+///
+/// # Safety
+/// Caller must ensure no concurrent mutation of `task.inner` (panic context only).
+pub unsafe fn task_name_panic(task: &TaskRef) -> &str {
+    let inner = bypass_spin_rwlock(&task.inner);
+    inner.name.as_str()
+}
+
+/// Drain up to `MAX_DUMP_QUEUE` tasks from a lock-free `ArrayQueue`.
+fn drain_array_queue(queue: &ArrayQueue<TaskHandle>) -> QueueSnapshot {
+    let total_before_drain = queue.len();
+    let mut snap = QueueSnapshot {
+        captured: 0,
+        total_before_drain,
+        tasks: [const { None }; MAX_DUMP_QUEUE],
+    };
+    while snap.captured < MAX_DUMP_QUEUE {
+        match queue.pop() {
+            Some(task) => {
+                snap.tasks[snap.captured] = Some(task);
+                snap.captured += 1;
+            }
+            None => break,
+        }
+    }
+    snap
+}
