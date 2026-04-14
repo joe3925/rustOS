@@ -17,6 +17,7 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 pub const TIMER_IST_INDEX: u16 = 1;
 pub const PAGE_FAULT_IST_INDEX: u16 = 2;
 pub const YIELD_IST_INDEX: u16 = 3;
+pub const SCHED_IPI_IST_INDEX: u16 = 4;
 lazy_static! {
     pub static ref PER_CPU_GDT: Mutex<(GDTTracker)> = Mutex::new(GDTTracker::new());
 }
@@ -69,10 +70,13 @@ impl GDTTracker {
 
         let yield_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack ");
+        let sched_ipi_stack =
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc sched ipi stack ");
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack;
         tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack;
         tss_static.interrupt_stack_table[YIELD_IST_INDEX as usize] = yield_stack;
+        tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack;
         tss_static.privilege_stack_table[0] = privilege_stack;
 
         let tss_size = core::mem::size_of::<TaskStateSegment>();

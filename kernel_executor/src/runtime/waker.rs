@@ -9,13 +9,13 @@ use crate::platform::JobFn;
 
 use super::slab::{
     decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,
-    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, joinable_slab_poll_trampoline,
-    slab_poll_trampoline,
+    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, is_joinable_slab_ptr,
+    is_slab_ptr, joinable_slab_poll_trampoline, slab_poll_trampoline,
 };
 use super::task::TaskPoll;
 
-// Bit 0 is reserved for slab pointers. Use bit 1 to tag Arc-based executor wakers.
-const TASK_WAKER_TAG: usize = 0b10;
+// Bit 0 and 1 are reserved for slab pointers. Use bit 2 to tag Arc-based executor wakers.
+const TASK_WAKER_TAG: usize = 0b100;
 const TASK_WAKER_MASK: usize = !TASK_WAKER_TAG;
 
 #[inline]
@@ -79,11 +79,11 @@ unsafe fn drop_waker<T: TaskPoll + 'static>(ptr: *const ()) {
     drop(Arc::from_raw(untag_ptr::<T>(ptr)));
 }
 
-unsafe fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
+unsafe extern "win64" fn clone_ctx<T: TaskPoll + 'static>(ptr: *const ()) {
     Arc::increment_strong_count(untag_ptr::<T>(ptr));
 }
 
-unsafe fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
+unsafe extern "win64" fn drop_ctx<T: TaskPoll + 'static>(ctx: usize) {
     drop(Arc::from_raw(untag_ptr::<T>(ctx as *const ())));
 }
 
@@ -93,7 +93,7 @@ extern "win64" fn wake_waker_trampoline(ctx: usize) {
     w.wake_by_ref();
 }
 
-unsafe fn drop_waker_ctx(ctx: usize) {
+unsafe extern "win64" fn drop_waker_ctx(ctx: usize) {
     drop(Box::from_raw(ctx as *mut Waker));
 }
 
@@ -124,15 +124,15 @@ extern "win64" fn poll_trampoline_inline<T: TaskPoll + 'static>(ctx: usize) {
 pub struct TaskWakerVtable {
     pub raw: RawWakerVTable,
     pub inline_poll: JobFn,
-    pub clone_ctx: unsafe fn(*const ()),
-    pub drop_ctx: unsafe fn(usize),
+    pub clone_ctx: unsafe extern "win64" fn(*const ()),
+    pub drop_ctx: unsafe extern "win64" fn(usize),
 }
 
 #[derive(Clone, Copy)]
 pub struct Continuation {
     pub tramp: JobFn,
     pub ctx: usize,
-    pub drop_fn: unsafe fn(usize),
+    pub drop_fn: unsafe extern "win64" fn(usize),
 }
 
 pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
@@ -146,7 +146,7 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     let drop_guard = unsafe { Waker::from_raw(raw) };
 
     // Slab-based waker (detached)
-    if ptr::eq(vtable_ptr, &SLAB_WAKER_VTABLE) {
+    if is_slab_ptr(data) {
         // Keep slot alive while the continuation is stored
         if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(data) {
             get_task_slab().increment_ref(shard_idx, local_idx, generation);
@@ -163,7 +163,7 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     }
 
     // Joinable slab-based waker
-    if ptr::eq(vtable_ptr, &JOINABLE_SLAB_WAKER_VTABLE) {
+    if is_joinable_slab_ptr(data) {
         if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(data) {
             get_task_slab().increment_joinable_ref(shard_idx, local_idx, generation);
             drop(drop_guard);
@@ -271,7 +271,7 @@ extern "win64" fn slab_inline_poll(ctx: usize) {
     }
 }
 
-unsafe fn drop_slab_ctx(ctx: usize) {
+unsafe extern "win64" fn drop_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(ctx) {
         get_task_slab().decrement_ref(shard_idx, local_idx, generation);
     }
@@ -349,7 +349,7 @@ extern "win64" fn joinable_slab_inline_poll(ctx: usize) {
     }
 }
 
-unsafe fn drop_joinable_slab_ctx(ctx: usize) {
+unsafe extern "win64" fn drop_joinable_slab_ctx(ctx: usize) {
     if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) {
         get_task_slab().decrement_joinable_ref(shard_idx, local_idx, generation);
     }
