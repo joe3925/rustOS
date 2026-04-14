@@ -338,7 +338,7 @@ impl<T> From<Poll<T>> for FfiPoll<T> {
 
 #[repr(C)]
 pub struct FfiWakerVTable {
-    pub clone: unsafe extern "win64" fn(*const ()) -> FfiWaker,
+    pub clone: unsafe extern "win64" fn(*const ()) -> *const FfiWaker,
     pub wake: unsafe extern "win64" fn(*const ()),
     pub wake_by_ref: unsafe extern "win64" fn(*const ()),
     pub drop: unsafe extern "win64" fn(*const ()),
@@ -352,7 +352,12 @@ pub struct FfiWaker {
 
 impl Clone for FfiWaker {
     fn clone(&self) -> Self {
-        unsafe { (self.vtable.clone)(self.data) }
+        unsafe {
+            let ptr = (self.vtable.clone)(self.data);
+            let waker = core::ptr::read(ptr);
+            drop(Box::from_raw(ptr as *mut FfiWaker));
+            waker
+        }
     }
 }
 
@@ -580,14 +585,15 @@ fn ffi_waker_from_waker(w: Waker) -> FfiWaker {
     }
 }
 
-unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> FfiWaker {
+unsafe extern "win64" fn rust_waker_box_clone(data: *const ()) -> *const FfiWaker {
     unsafe {
         let b = data as *const RustWakerBox;
         (*b).refs.fetch_add(1, Ordering::Relaxed);
-        FfiWaker {
+        let waker = FfiWaker {
             data,
             vtable: &RUST_WAKER_BOX_VTABLE,
-        }
+        };
+        Box::into_raw(Box::new(waker))
     }
 }
 
