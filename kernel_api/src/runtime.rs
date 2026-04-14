@@ -69,12 +69,11 @@ static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
     drop: block_on_waker_drop,
 };
 
-unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> *const FfiWaker {
-    let waker = FfiWaker {
+unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
+    FfiWaker {
         data,
         vtable: &BLOCK_ON_WAKER_VTABLE,
-    };
-    Box::into_raw(Box::new(waker))
+    }
 }
 
 unsafe extern "win64" fn block_on_waker_wake(data: *const ()) {
