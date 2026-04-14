@@ -727,6 +727,12 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
 
         let mut vq = qs.queue.write();
         while let Some((head, len)) = vq.pop_used() {
+            if head as usize >= qs.completion_slots.len() {
+                panic!(
+                    "virtio: device returned out-of-bounds descriptor index {}",
+                    head
+                );
+            }
             vq.free_chain(head);
             if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
                 let _ = tx.send(len);

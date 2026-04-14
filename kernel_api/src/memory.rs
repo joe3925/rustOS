@@ -58,25 +58,24 @@ pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { kernel_sys::deallocate_kernel_range(addr, size) }
 }
 #[inline(always)]
-fn get_level4_page_table(mem_offset: VirtAddr) -> &'static mut PageTable {
+fn get_level4_page_table(mem_offset: VirtAddr) -> *mut PageTable {
     let (table_frame, _) = Cr3::read();
     let virt_addr = mem_offset + table_frame.start_address().as_u64();
-    let page_table_ptr: *mut PageTable = virt_addr.as_mut_ptr();
-    unsafe { &mut *page_table_ptr }
+    virt_addr.as_mut_ptr()
 }
 #[inline(always)]
 pub fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
     let mem_offset = PHYSICAL_MEMORY_OFFSET;
     let l4 = get_level4_page_table(mem_offset);
-    let l4e = &l4[to_phys.p4_index()];
+    let l4e = unsafe { &(&*l4)[to_phys.p4_index()] };
     if !l4e.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
 
     // Level 3
     let l3_virt = mem_offset + l4e.addr().as_u64();
-    let l3_table: &PageTable = unsafe { &*(l3_virt.as_ptr()) };
-    let l3e = &l3_table[to_phys.p3_index()];
+    let l3_table: *const PageTable = l3_virt.as_ptr();
+    let l3e = unsafe { &(&*l3_table)[to_phys.p3_index()] };
     if !l3e.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
@@ -89,8 +88,8 @@ pub fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
 
     // Level 2
     let l2_virt = mem_offset + l3e.addr().as_u64();
-    let l2_table: &PageTable = unsafe { &*(l2_virt.as_ptr()) };
-    let l2e = &l2_table[to_phys.p2_index()];
+    let l2_table: *const PageTable = l2_virt.as_ptr();
+    let l2e = unsafe { &(&*l2_table)[to_phys.p2_index()] };
     if !l2e.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }
@@ -103,8 +102,8 @@ pub fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
 
     // Level 1
     let l1_virt = mem_offset + l2e.addr().as_u64();
-    let l1_table: &PageTable = unsafe { &*(l1_virt.as_ptr()) };
-    let l1e = &l1_table[to_phys.p1_index()];
+    let l1_table: *const PageTable = l1_virt.as_ptr();
+    let l1e = unsafe { &(&*l1_table)[to_phys.p1_index()] };
     if !l1e.flags().contains(PageTableFlags::PRESENT) {
         return None;
     }

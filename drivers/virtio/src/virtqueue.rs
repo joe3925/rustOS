@@ -191,12 +191,16 @@ impl Virtqueue {
         }
 
         let avail_base = self.avail_va.as_u64() as *mut u16;
-        let avail_idx = unsafe { core::ptr::read_volatile(avail_base.add(1)) };
+        let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
+        let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
         unsafe {
             core::ptr::write_volatile(ring_entry, head);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::write_volatile(avail_base.add(1), avail_idx.wrapping_add(1));
+            let avail_idx_ptr_mut = avail_base.add(1) as *mut core::sync::atomic::AtomicU16;
+            (*avail_idx_ptr_mut).store(
+                avail_idx.wrapping_add(1),
+                core::sync::atomic::Ordering::Release,
+            );
         }
 
         Some(head)
@@ -219,12 +223,16 @@ impl Virtqueue {
         }
 
         let avail_base = self.avail_va.as_u64() as *mut u16;
-        let avail_idx = unsafe { core::ptr::read_volatile(avail_base.add(1)) };
+        let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
+        let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
         unsafe {
             core::ptr::write_volatile(ring_entry, head);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
-            core::ptr::write_volatile(avail_base.add(1), avail_idx.wrapping_add(1));
+            let avail_idx_ptr_mut = avail_base.add(1) as *mut core::sync::atomic::AtomicU16;
+            (*avail_idx_ptr_mut).store(
+                avail_idx.wrapping_add(1),
+                core::sync::atomic::Ordering::Release,
+            );
         }
 
         Some(head)
@@ -242,14 +250,13 @@ impl Virtqueue {
     /// Called exclusively by the drain task under the queue write lock.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
         let used_base = self.used_va.as_u64() as *const u16;
-        let used_idx = unsafe { core::ptr::read_volatile(used_base.add(1)) };
+        let used_idx_ptr = unsafe { used_base.add(1) } as *const core::sync::atomic::AtomicU16;
+        let used_idx = unsafe { (*used_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
 
         let last = self.last_used_idx.load(Ordering::Acquire);
         if last == used_idx {
             return None;
         }
-
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
         let elem_offset = 4 + (last % self.size) as usize * 8;
         let elem_ptr = (self.used_va.as_u64() + elem_offset as u64) as *const VirtqUsedElem;
@@ -264,6 +271,12 @@ impl Virtqueue {
     pub fn free_chain(&mut self, head: u16) {
         let mut idx = head;
         loop {
+            if idx >= self.size {
+                panic!(
+                    "virtio: descriptor index {} out of bounds (size {})",
+                    idx, self.size
+                );
+            }
             let desc = self.desc_ptr(idx);
             let flags = unsafe { (*desc).flags };
             let next = unsafe { (*desc).next };
