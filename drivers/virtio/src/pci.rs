@@ -1,20 +1,28 @@
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 use kernel_api::memory::map_mmio_region;
 use kernel_api::pnp::ResourceKind;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 /// Volatile reads/writes that remain defined on unaligned PCI/virtio registers.
-#[repr(C, packed)]
-struct VolatileUnaligned<T>(T);
-
 #[inline]
 unsafe fn read_volatile_unaligned<T: Copy>(ptr: *const u8) -> T {
-    core::ptr::read_volatile(ptr as *const VolatileUnaligned<T>).0
+    let mut val: MaybeUninit<T> = MaybeUninit::uninit();
+    let dst = val.as_mut_ptr() as *mut u8;
+    for i in 0..core::mem::size_of::<T>() {
+        let byte = core::ptr::read_volatile(ptr.add(i));
+        core::ptr::write(dst.add(i), byte);
+    }
+    val.assume_init()
 }
 
 #[inline]
 unsafe fn write_volatile_unaligned<T: Copy>(ptr: *mut u8, val: T) {
-    core::ptr::write_volatile(ptr as *mut VolatileUnaligned<T>, VolatileUnaligned(val));
+    let src = &val as *const T as *const u8;
+    for i in 0..core::mem::size_of::<T>() {
+        let byte = core::ptr::read(src.add(i));
+        core::ptr::write_volatile(ptr.add(i), byte);
+    }
 }
 
 /// Parsed virtio PCI capability pointers (virtual addresses into mapped BARs).

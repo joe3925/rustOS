@@ -200,9 +200,10 @@ impl BlkIoArena {
         let dynamic_count = dynamic_count.min(ARENA_DYNAMIC_SLOTS);
 
         let preallocated_slots: [UnsafeCell<MaybeUninit<PreallocatedSlot>>;
-            ARENA_PREALLOCATED_SLOTS] = unsafe { MaybeUninit::uninit().assume_init() };
+            ARENA_PREALLOCATED_SLOTS] =
+            core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
         let dynamic_slots: [UnsafeCell<MaybeUninit<DynamicSlot>>; ARENA_DYNAMIC_SLOTS] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+            core::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
 
         let data_stride: usize = (PREALLOCATED_DATA_SIZE + (page - 1)) & !(page - 1);
 

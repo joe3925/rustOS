@@ -102,7 +102,7 @@ pub const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> u
         i += 1;
     }
 
-    while i < input.len() {
+    while i < input.len() && o < 512 {
         let b = input[i];
         if b == b'<' {
             depth += 1;
