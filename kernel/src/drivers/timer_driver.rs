@@ -68,13 +68,13 @@ pub extern "win64" fn timer_interrupt_entry() {
 
         "mov  rdi, rsp",
         "cld",
-        "sub  rsp, 8",
+        "sub  rsp, 32",
         "call {handler}",
-        "add  rsp, 8",
+        "add  rsp, 32",
 
-        "sub  rsp, 8",
+        "sub  rsp, 32",
         "call {eoi}",
-        "add  rsp, 8",
+        "add  rsp, 32",
 
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",

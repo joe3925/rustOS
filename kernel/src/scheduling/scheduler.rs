@@ -113,12 +113,11 @@ impl KernelFpuGuard {
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
             // Avoid blocking inside interrupts; skip if the lock is contended.
             let locked = {
-                if let Some(mut guard) = task.inner.try_write() {
-                    guard.save_fpu_state();
-                    true
-                } else {
-                    false
-                }
+                let mut guard = task.inner.try_write().expect(
+                    "Failed to acquire task lock for saving FPU state in interrupt handler",
+                );
+                guard.save_fpu_state();
+                true
             };
             if locked {
                 Some(task)
@@ -142,9 +141,10 @@ impl Drop for KernelFpuGuard {
         let cpu_id = current_cpu_id();
         if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
             if Arc::ptr_eq(&task, &current) {
-                if let Some(mut guard) = current.inner.try_write() {
-                    guard.restore_fpu_state();
-                }
+                let mut guard = current.inner.try_write().expect(
+                    "Failed to acquire task lock for restoring FPU state in interrupt handler",
+                );
+                guard.restore_fpu_state();
             }
         }
     }
@@ -959,9 +959,9 @@ pub extern "win64" fn ipi_entry() {
 
         "mov  rdi, rsp",
         "cld",
-        "sub  rsp, 8",
+        "sub  rsp, 32",
         "call {handler}",
-        "add  rsp, 8",
+        "add  rsp, 32",
 
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",
@@ -975,9 +975,9 @@ pub extern "win64" fn ipi_entry() {
         "push r11","push r10","push r9","push r8",
         "push rdi","push rsi","push rbp","push rbx",
         "push rdx","push rcx","push rax",
-        "sub  rsp, 8",
+        "sub  rsp, 32",
         "call {eoi_only}",
-        "add  rsp, 8",
+        "add  rsp, 32",
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",
         "pop  r9","pop  r10","pop  r11","pop  r12",
@@ -1002,9 +1002,9 @@ pub extern "win64" fn yield_interrupt_entry() {
 
         "mov  rdi, rsp",
         "cld",
-        "sub  rsp, 8",
+        "sub  rsp, 32",
         "call {handler}",
-        "add  rsp, 8",
+        "add  rsp, 32",
 
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",
