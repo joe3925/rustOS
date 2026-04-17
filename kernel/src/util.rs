@@ -220,11 +220,11 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
     };
 
     if is_owner {
-        println!("\n=== KERNEL PANIC [{}] ===", mod_name);
-        println!("\n{}", info);
+        println!("=== KERNEL PANIC [{}] ===", mod_name);
+        println!("{}", info);
 
         let dump = dump_scheduler();
-        println!("\n--- Running tasks at panic ---");
+        println!("--- Running tasks at panic ---");
         for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
             if let Some(task) = slot {
                 let name = unsafe { task_name_panic(task) };
@@ -233,7 +233,38 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
                 println!("  CPU {}: <idle>", cpu_id);
             }
         }
+        println!("--- Tasks in run queue and ipi queue ---");
+        for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
+            let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+            println!(
+                "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
+                cpu_id, some_count, queue.captured, queue.total_before_drain
+            );
+        }
 
+        for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
+            let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
+            println!(
+                "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
+                cpu_id, some_count, queue.captured, queue.total_before_drain
+            );
+        }
+        for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
+            match task {
+                Some(task) => {
+                    let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
+                    let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
+
+                    println!(
+                        "  CPU {}: current_task stack_size={} guard_page={:#x}",
+                        cpu_id, stack_size, guard_page
+                    );
+                }
+                None => {
+                    println!("  CPU {}: current_task=None", cpu_id);
+                }
+            }
+        }
         unsafe {
             if let Some(a) = APIC.lock().as_ref() {
                 a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
