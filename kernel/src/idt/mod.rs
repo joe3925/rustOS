@@ -2,6 +2,7 @@ use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
+use crate::drivers;
 use crate::drivers::interrupt_index::InterruptIndex;
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
@@ -9,7 +10,6 @@ use crate::gdt::{
     DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, SCHED_IPI_IST_INDEX, TIMER_IST_INDEX,
     YIELD_IST_INDEX,
 };
-use crate::memory::paging::paging::{tlb_shootdown_interrupt, TLB_SHOOTDOWN_VECTOR};
 use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry, KernelFpuGuard};
 
 mod interrupt_impl;
@@ -312,10 +312,6 @@ fn init_idt() -> InterruptDescriptorTable {
     }
 
     unsafe {
-        idt[TLB_SHOOTDOWN_VECTOR]
-            .set_handler_fn(tlb_shootdown_interrupt)
-            .set_stack_index(SCHED_IPI_IST_INDEX);
-
         idt[SCHED_IPI_VECTOR]
             .set_handler_addr(VirtAddr::new(ipi_entry as *const () as u64))
             .set_stack_index(SCHED_IPI_IST_INDEX);

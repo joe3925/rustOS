@@ -574,6 +574,7 @@ impl ApicImpl {
         let apics = proc.application_processors;
 
         let ap_count = apics.len();
+        set_num_cores(ap_count + 1);
 
         if ap_count == 0 {
             return;
@@ -703,8 +704,8 @@ impl ApicImpl {
             }
             wait_duration(Duration::from_millis(1));
         }
+
         unmap_range(VirtAddr::new(map_start), map_len as u64);
-        set_num_cores(ap_count + 1);
     }
 }
 
@@ -747,11 +748,11 @@ extern "C" fn ap_startup() -> ! {
         SCHEDULER.init_core(current_cpu_id());
         CORE_LOCK.fetch_sub(1, Ordering::SeqCst);
     }
-    x86_64::instructions::interrupts::enable();
 
     while !KERNEL_INITIALIZED.load(Ordering::SeqCst) {
         core::hint::spin_loop()
     }
+    x86_64::instructions::interrupts::enable();
     loop {
         x86_64::instructions::hlt();
     }

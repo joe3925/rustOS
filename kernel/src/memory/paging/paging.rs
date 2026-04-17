@@ -1,91 +1,23 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use kernel_types::status::PageMapError;
-use spin::Mutex;
 use x86_64::{
-    instructions::interrupts,
-    registers::control::Cr3,
-    structures::idt::InterruptStackFrame,
     structures::paging::{
-        mapper::{MapToError, MapperFlush},
-        FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB, Size2MiB, Size4KiB,
+        mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB,
+        Size2MiB, Size4KiB,
     },
     PhysAddr, VirtAddr,
 };
 
 use crate::{
     cpu::get_cpu_info,
-    drivers::{
-        interrupt_index::{send_eoi, IpiDest, IpiKind, LocalApic, APIC},
-        timer_driver::NUM_CORES,
-    },
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
-    util::{boot_info, CORE_LOCK},
+    util::boot_info,
 };
 
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
 }
 
-pub const TLB_SHOOTDOWN_VECTOR: u8 = 0xF1;
-
-static TLB_SHOOTDOWN_LOCK: Mutex<()> = Mutex::new(());
-
 // TODO: it is possible to remove all this unsafe, not urgent.
-
-#[inline(always)]
-fn reload_current_cr3() {
-    let (cr3, flags) = Cr3::read();
-    unsafe { Cr3::write(cr3, flags) };
-}
-
-pub extern "x86-interrupt" fn tlb_shootdown_interrupt(_frame: InterruptStackFrame) {
-    reload_current_cr3();
-    send_eoi(TLB_SHOOTDOWN_VECTOR);
-}
-
-pub fn flush_tlb_global() {
-    if NUM_CORES.load(Ordering::Acquire) <= 1 || CORE_LOCK.load(Ordering::Relaxed) != 0 {
-        reload_current_cr3();
-        return;
-    }
-
-    if let Some(_shootdown_guard) = TLB_SHOOTDOWN_LOCK.try_lock() {
-        let interrupts_were_enabled = interrupts::are_enabled();
-        if interrupts_were_enabled {
-            interrupts::disable();
-        }
-
-        reload_current_cr3();
-
-        let remote_targets = NUM_CORES.load(Ordering::Acquire).saturating_sub(1);
-        if remote_targets != 0 {
-            let apic_guard = APIC.lock();
-            if let Some(apic) = apic_guard.as_ref() {
-                unsafe {
-                    apic.lapic.send_ipi(
-                        IpiDest::AllExcludingSelf,
-                        IpiKind::Fixed {
-                            vector: TLB_SHOOTDOWN_VECTOR,
-                        },
-                    );
-                }
-                drop(apic_guard);
-            }
-        }
-
-        if interrupts_were_enabled {
-            interrupts::enable();
-        }
-    } else {
-        return;
-    }
-}
-
-pub fn flush_tlb_shootdown<S: x86_64::structures::paging::page::PageSize>(flush: MapperFlush<S>) {
-    flush.ignore();
-    flush_tlb_global();
-}
 
 /// SAFETY: Does not check the kernel range allocator before mapping the requested range.
 /// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
@@ -213,7 +145,7 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
     let page = Page::<S>::containing_address(addr);
     match mapper.unmap(page) {
         Ok((frame, flush)) => {
-            flush_tlb_shootdown(flush);
+            flush.flush();
             // SAFETY: the frame is no longer mapped
             frame_allocator.deallocate_frame(frame);
             true
@@ -256,13 +188,14 @@ pub unsafe extern "win64" fn identity_map_page(
         let frame = PhysFrame::containing_address(addr);
 
         unsafe {
-            let flush = mapper.map_to(
-                page,
-                frame,
-                flags | PageTableFlags::PRESENT,
-                &mut frame_allocator,
-            )?;
-            flush_tlb_shootdown(flush);
+            mapper
+                .map_to(
+                    page,
+                    frame,
+                    flags | PageTableFlags::PRESENT,
+                    &mut frame_allocator,
+                )?
+                .flush();
         }
     }
 
@@ -281,8 +214,7 @@ pub unsafe fn map_page(
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
     unsafe {
-        let flush = mapper.map_to(page, frame, flags, frame_allocator)?;
-        flush_tlb_shootdown(flush);
+        mapper.map_to(page, frame, flags, frame_allocator)?.flush();
     }
     Ok(())
 }
@@ -312,8 +244,7 @@ where
     };
 
     unsafe {
-        let flush = mapper.map_to(page, frame, effective_flags, fa)?;
-        flush_tlb_shootdown(flush);
+        mapper.map_to(page, frame, effective_flags, fa)?.flush();
     }
     Ok(())
 }
@@ -344,8 +275,7 @@ where
     };
 
     unsafe {
-        let flush = mapper.map_to(page, frame, effective_flags, fa)?;
-        flush_tlb_shootdown(flush);
+        mapper.map_to(page, frame, effective_flags, fa)?.flush();
     }
     Ok(())
 }

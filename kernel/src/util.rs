@@ -18,8 +18,7 @@ use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
-use crate::memory::heap::HEAP_SIZE;
-use crate::memory::allocator::ALLOCATOR;
+use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -80,9 +79,9 @@ pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
-    ALLOCATOR.init();
     {
         let _init_lock = INIT_LOCK.lock();
+        init_heap();
         Screen::clear_framebuffer();
         load_idt();
 
@@ -229,12 +228,7 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
             if let Some(task) = slot {
                 let name = unsafe { task_name_panic(task) };
-                println!(
-                    "  CPU {}: \"{}\" (id={})",
-                    cpu_id,
-                    name,
-                    task.id.load(Ordering::Relaxed)
-                );
+                println!("  CPU {}: \"{}\" (id={})", cpu_id, name, task.id.load(Ordering::Relaxed));
             } else {
                 println!("  CPU {}: <idle>", cpu_id);
             }
