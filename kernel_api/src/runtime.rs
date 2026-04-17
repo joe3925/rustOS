@@ -32,36 +32,35 @@ where
 {
     unsafe { kernel_spawn_detached_ffi(future.into_ffi()) };
 }
+#[repr(C)]
+struct BlockOnState {
+    ready: AtomicBool,
+}
 
-/// Block the current thread until the future completes
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut ffi_fut = future.into_ffi();
-    let ready = AtomicBool::new(false);
-
-    let vtable: &'static FfiWakerVTable = &BLOCK_ON_WAKER_VTABLE;
-    let ffi_waker = FfiWaker {
-        data: &ready as *const AtomicBool as *const (),
-        vtable,
-    };
-
+    let state = Arc::new(BlockOnState {
+        ready: AtomicBool::new(false),
+    });
     loop {
+        let ffi_waker = FfiWaker {
+            data: Arc::into_raw(state.clone()) as *const (),
+            vtable: &BLOCK_ON_WAKER_VTABLE,
+        };
+
         let poll = unsafe { ffi_fut.poll(&ffi_waker as *const FfiWaker) };
+
         if poll.is_ready() {
-            // SAFETY: we just checked is_ready
             match unsafe { poll.into_poll() } {
                 Poll::Ready(v) => return v,
                 Poll::Pending => unreachable!(),
             }
         }
-        if !ready.swap(false, Ordering::AcqRel) {
-            //let _ = unsafe { sys_try_steal_blocking_one() };
-        }
+
+        if !state.ready.swap(false, Ordering::AcqRel) {}
     }
 }
 
-/// Static vtable for the block_on FfiWaker. The data pointer is a raw pointer
-/// to a stack-local AtomicBool, so clone just copies the pointer (no refcount needed
-/// since the bool outlives all waker copies within block_on).
 static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
     clone: block_on_waker_clone,
     wake: block_on_waker_wake,
@@ -70,6 +69,7 @@ static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
 };
 
 unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
+    Arc::increment_strong_count(data as *const BlockOnState);
     FfiWaker {
         data,
         vtable: &BLOCK_ON_WAKER_VTABLE,
@@ -77,23 +77,18 @@ unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
 }
 
 unsafe extern "win64" fn block_on_waker_wake(data: *const ()) {
-    unsafe {
-        let ready = &*(data as *const AtomicBool);
-        ready.store(true, Ordering::Release);
-    }
+    let state = Arc::from_raw(data as *const BlockOnState);
+    state.ready.store(true, Ordering::Release);
 }
 
 unsafe extern "win64" fn block_on_waker_wake_by_ref(data: *const ()) {
-    unsafe {
-        let ready = &*(data as *const AtomicBool);
-        ready.store(true, Ordering::Release);
-    }
+    let state = &*(data as *const BlockOnState);
+    state.ready.store(true, Ordering::Release);
 }
 
-unsafe extern "win64" fn block_on_waker_drop(_data: *const ()) {
-    // No-op: the AtomicBool lives on the block_on stack frame.
+unsafe extern "win64" fn block_on_waker_drop(data: *const ()) {
+    drop(Arc::from_raw(data as *const BlockOnState));
 }
-
 /// Minimal blocking join handle executed on the kernel blocking pool.
 pub struct BlockingJoin<R> {
     state: Arc<BlockingState<R>>,
