@@ -2,7 +2,7 @@ use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use crate::{
     memory::{
-        heap::{HEAP_SIZE, HEAP_START},
+        heap::{init_heap, HEAP_SIZE, HEAP_START},
         paging::{
             frame_alloc::BootInfoFrameAllocator, paging::unmap_range_impl, tables::init_mapper,
         },
@@ -13,7 +13,6 @@ use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::paging::{mapper::MapToError, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
 use x86_64::{
@@ -26,10 +25,10 @@ use x86_64::{
 
 // #[global_allocator]
 // pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
-#[global_allocator]
-pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
 // #[global_allocator]
-// pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
+// pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
+#[global_allocator]
+pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
 
 /// Global allocator wrapper that yields if another CPU is holding the lock
 /// instead of spinning with interrupts off.
@@ -45,6 +44,9 @@ impl YieldingMimalloc {
     }
 
     #[inline(always)]
+    pub unsafe fn init(&self) {}
+
+    #[inline(always)]
     fn lock(&self) -> spin::MutexGuard<'_, Mimalloc<KernelSegAlloc>> {
         loop {
             if let Some(g) = self.inner.try_lock() {
@@ -52,7 +54,7 @@ impl YieldingMimalloc {
             }
 
             if interrupts::are_enabled() {
-                yield_now();
+                //yield_now();
             } else {
                 core::hint::spin_loop();
             }
@@ -577,28 +579,22 @@ unsafe fn vm_free(ptr: *mut u8, size: usize) {
 // }
 pub struct BuddyLocked {
     inner: LockedHeap<32>,
-    init: AtomicBool,
 }
 
 impl BuddyLocked {
     pub const fn new() -> Self {
         Self {
             inner: LockedHeap::<32>::empty(),
-            init: AtomicBool::new(false),
         }
     }
     #[inline(always)]
-    unsafe fn ensure_init(&self) {
-        if !self.init.load(Ordering::Acquire) {
-            without_interrupts(|| {
-                if !self.init.load(Ordering::Acquire) {
-                    let heap_start = HEAP_START;
-                    let heap_size = HEAP_SIZE as usize;
-                    self.inner.lock().init(heap_start, heap_size);
-                    self.init.store(true, Ordering::Release);
-                }
-            });
-        }
+    pub unsafe fn init(&self) {
+        init_heap();
+        without_interrupts(|| {
+            let heap_start = HEAP_START;
+            let heap_size = HEAP_SIZE as usize;
+            self.inner.lock().init(heap_start, heap_size);
+        });
     }
     pub fn free_memory(&self) -> usize {
         without_interrupts(|| {
@@ -610,14 +606,12 @@ impl BuddyLocked {
 
 unsafe impl GlobalAlloc for BuddyLocked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.ensure_init();
         without_interrupts(|| self.inner.lock().alloc(layout))
             .expect("kernel heap overflow")
             .as_ptr()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.ensure_init();
         without_interrupts(|| {
             self.inner.lock().dealloc(
                 NonNull::new(ptr).expect("Null ptr passed to kernel heap dealloc"),
