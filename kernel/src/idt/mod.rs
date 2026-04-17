@@ -1,8 +1,9 @@
+use core::arch::naked_asm;
+
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 use x86_64::VirtAddr;
 
-use crate::drivers;
 use crate::drivers::interrupt_index::InterruptIndex;
 use crate::drivers::timer_driver::timer_interrupt_entry;
 use crate::exception_handlers::exception_handlers;
@@ -19,13 +20,40 @@ pub use interrupt_impl::*;
 // IRQ VECTOR STUBS
 // =============================================================================
 
+const IRQ_SAVED_GPR_BYTES: usize = 15 * 8;
+
+extern "win64" fn irq_interrupt_handler_c(vector: u8, frame: *mut InterruptStackFrame) {
+    let _fpu_guard = KernelFpuGuard::new();
+    let frame = unsafe { &mut *frame };
+    irq_dispatch(vector, frame);
+}
+
 macro_rules! gen_irq_stub {
     ($name:ident, $vec:expr) => {
-        extern "x86-interrupt" fn $name(mut frame: InterruptStackFrame) {
-            let _fpu_guard = KernelFpuGuard::new();
-            x86_64::instructions::interrupts::without_interrupts(|| {
-                irq_dispatch($vec, &mut frame);
-            });
+        #[unsafe(naked)]
+        extern "win64" fn $name() {
+            naked_asm!(
+                "cli",
+                "push r15","push r14","push r13","push r12",
+                "push r11","push r10","push r9","push r8",
+                "push rdi","push rsi","push rbp","push rbx",
+                "push rdx","push rcx","push rax",
+                "mov  ecx, {vector}",
+                "lea  rdx, [rsp + {saved_gpr_bytes}]",
+                "cld",
+                "sub  rsp, 32",
+                "call {handler}",
+                "add  rsp, 32",
+                "pop  rax","pop  rcx","pop  rdx","pop  rbx",
+                "pop  rbp","pop  rsi","pop  rdi","pop  r8",
+                "pop  r9","pop  r10","pop  r11","pop  r12",
+                "pop  r13","pop  r14","pop  r15",
+                "sti",
+                "iretq",
+                vector = const $vec,
+                saved_gpr_bytes = const IRQ_SAVED_GPR_BYTES,
+                handler = sym irq_interrupt_handler_c,
+            );
         }
     };
 }
@@ -33,7 +61,7 @@ macro_rules! gen_irq_stub {
 macro_rules! gen_irq_stubs {
     ($(($name:ident, $vec:expr)),+ $(,)?) => {
         $(gen_irq_stub!($name, $vec);)+
-        type IrqStub = extern "x86-interrupt" fn(InterruptStackFrame);
+        type IrqStub = extern "win64" fn();
         const IRQ_VECTOR_STUBS: &[(u8, IrqStub)] = &[ $(($vec, $name)),+ ];
     };
 }
@@ -308,7 +336,9 @@ fn init_idt() -> InterruptDescriptorTable {
             .set_stack_index(TIMER_IST_INDEX);
     }
     for (vec, stub) in IRQ_VECTOR_STUBS {
-        idt[*vec].set_handler_fn(*stub);
+        unsafe {
+            idt[*vec].set_handler_addr(VirtAddr::new(*stub as *const () as u64));
+        }
     }
 
     unsafe {

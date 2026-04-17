@@ -7,10 +7,10 @@ use core::task::{Context, Poll};
 use kernel_routing::println;
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::irq::{
-    DropHook, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqWaitResult, WaitState,
-    Waiter,
+    DropHook, IrqHandle, IrqHandleInner, IrqIsrFn, IrqMeta, IrqSafeMutex, IrqSafeRwLock,
+    IrqWaitResult, WaitState, Waiter,
 };
-use spin::{Mutex, Once, RwLock};
+use spin::{Mutex, Once};
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::drivers;
@@ -345,13 +345,13 @@ extern "win64" fn dummy_isr(
 }
 
 struct VectorSlot {
-    regs: RwLock<Vec<IrqReg>>,
+    regs: IrqSafeRwLock<Vec<IrqReg>>,
 }
 
 impl VectorSlot {
     fn new() -> Self {
         Self {
-            regs: RwLock::new(Vec::new()),
+            regs: IrqSafeRwLock::new(Vec::new()),
         }
     }
 

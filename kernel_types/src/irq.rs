@@ -202,7 +202,8 @@ impl Waiter {
     }
 
     pub fn wake(&self) {
-        if let Some(w) = self.waker.lock().take() {
+        let w = self.waker.lock().take();
+        if let Some(w) = w {
             w.wake();
         }
     }
