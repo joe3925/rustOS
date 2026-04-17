@@ -18,7 +18,8 @@ use crate::file_system::file_provider::{install_file_provider, ProviderKind};
 use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::heap::HEAP_SIZE;
+use crate::memory::allocator::ALLOCATOR;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -79,9 +80,9 @@ pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
+    ALLOCATOR.init();
     {
         let _init_lock = INIT_LOCK.lock();
-        init_heap();
         Screen::clear_framebuffer();
         load_idt();
 

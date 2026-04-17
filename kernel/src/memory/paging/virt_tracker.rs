@@ -2,7 +2,7 @@ use crate::{
     memory::paging::{
         constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
         frame_alloc::BootInfoFrameAllocator,
-        paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl},
+        paging::{align_up_4k, flush_tlb_shootdown, map_range_with_huge_pages, unmap_range_impl},
         tables::init_mapper,
     },
     structs::range_tracker::{RangeAllocationError, RangeTracker},
@@ -237,10 +237,10 @@ where
             let page = Page::<Size1GiB>::containing_address(VirtAddr::new(cur_virt));
             let frame = PhysFrame::<Size1GiB>::containing_address(PhysAddr::new(cur_phys));
             unsafe {
-                mapper
+                let flush = mapper
                     .map_to(page, frame, huge_flags, frame_allocator)
-                    .map_err(PageMapError::Page1GiB)?
-                    .flush();
+                    .map_err(PageMapError::Page1GiB)?;
+                flush_tlb_shootdown(flush);
             }
             cur_virt += gib;
             cur_phys += gib;
@@ -252,10 +252,10 @@ where
             let page = Page::<Size2MiB>::containing_address(VirtAddr::new(cur_virt));
             let frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(cur_phys));
             unsafe {
-                mapper
+                let flush = mapper
                     .map_to(page, frame, huge_flags, frame_allocator)
-                    .map_err(PageMapError::Page2MiB)?
-                    .flush();
+                    .map_err(PageMapError::Page2MiB)?;
+                flush_tlb_shootdown(flush);
             }
             cur_virt += mib2;
             cur_phys += mib2;
@@ -266,10 +266,10 @@ where
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(cur_virt));
         let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(cur_phys));
         unsafe {
-            mapper
+            let flush = mapper
                 .map_to(page, frame, flags, frame_allocator)
-                .map_err(PageMapError::Page4KiB)?
-                .flush();
+                .map_err(PageMapError::Page4KiB)?;
+            flush_tlb_shootdown(flush);
         }
         cur_virt += 0x1000;
         cur_phys += 0x1000;

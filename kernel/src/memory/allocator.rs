@@ -2,9 +2,11 @@ use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use crate::{
     memory::{
-        heap::{HEAP_SIZE, HEAP_START},
+        heap::{init_heap, HEAP_SIZE, HEAP_START},
         paging::{
-            frame_alloc::BootInfoFrameAllocator, paging::unmap_range_impl, tables::init_mapper,
+            frame_alloc::BootInfoFrameAllocator,
+            paging::{flush_tlb_shootdown, unmap_range_impl},
+            tables::init_mapper,
         },
     },
     scheduling::runtime::runtime::yield_now,
@@ -13,7 +15,6 @@ use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::structures::paging::{mapper::MapToError, Mapper, Page, PageTableFlags, Size4KiB};
 use x86_64::{align_up, VirtAddr};
 use x86_64::{
@@ -43,6 +44,9 @@ impl YieldingMimalloc {
             inner: spin::Mutex::new(Mimalloc::with_os_allocator(KernelSegAlloc)),
         }
     }
+
+    #[inline(always)]
+    pub unsafe fn init(&self) {}
 
     #[inline(always)]
     fn lock(&self) -> spin::MutexGuard<'_, Mimalloc<KernelSegAlloc>> {
@@ -281,7 +285,7 @@ unsafe fn ensure_header_mapped(addr: usize) -> bool {
 
     match mapper.map_to(page, new_frame, flags, &mut fa) {
         Ok(flush) => {
-            flush.flush();
+            flush_tlb_shootdown(flush);
             true
         }
         Err(MapToError::PageAlreadyMapped(_)) => {
@@ -324,7 +328,7 @@ unsafe fn map_range_4k_rollback(start: VirtAddr, size: usize) -> Result<(), ()> 
 
         match mapper.map_to(page, new_frame, flags, &mut fa) {
             Ok(flush) => {
-                flush.flush();
+                flush_tlb_shootdown(flush);
             }
             Err(MapToError::PageAlreadyMapped(_)) => {
                 fa.deallocate_frame(new_frame);
@@ -577,28 +581,22 @@ unsafe fn vm_free(ptr: *mut u8, size: usize) {
 // }
 pub struct BuddyLocked {
     inner: LockedHeap<32>,
-    init: AtomicBool,
 }
 
 impl BuddyLocked {
     pub const fn new() -> Self {
         Self {
             inner: LockedHeap::<32>::empty(),
-            init: AtomicBool::new(false),
         }
     }
     #[inline(always)]
-    unsafe fn ensure_init(&self) {
-        if !self.init.load(Ordering::Acquire) {
-            without_interrupts(|| {
-                if !self.init.load(Ordering::Acquire) {
-                    let heap_start = HEAP_START;
-                    let heap_size = HEAP_SIZE as usize;
-                    self.inner.lock().init(heap_start, heap_size);
-                    self.init.store(true, Ordering::Release);
-                }
-            });
-        }
+    pub unsafe fn init(&self) {
+        init_heap();
+        without_interrupts(|| {
+            let heap_start = HEAP_START;
+            let heap_size = HEAP_SIZE as usize;
+            self.inner.lock().init(heap_start, heap_size);
+        });
     }
     pub fn free_memory(&self) -> usize {
         without_interrupts(|| {
@@ -610,14 +608,12 @@ impl BuddyLocked {
 
 unsafe impl GlobalAlloc for BuddyLocked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.ensure_init();
         without_interrupts(|| self.inner.lock().alloc(layout))
             .expect("kernel heap overflow")
             .as_ptr()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.ensure_init();
         without_interrupts(|| {
             self.inner.lock().dealloc(
                 NonNull::new(ptr).expect("Null ptr passed to kernel heap dealloc"),
