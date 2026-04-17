@@ -4,7 +4,9 @@ use crate::{
     memory::{
         heap::{init_heap, HEAP_SIZE, HEAP_START},
         paging::{
-            frame_alloc::BootInfoFrameAllocator, paging::unmap_range_impl, tables::init_mapper,
+            frame_alloc::BootInfoFrameAllocator,
+            paging::{flush_tlb_shootdown, unmap_range_impl},
+            tables::init_mapper,
         },
     },
     scheduling::runtime::runtime::yield_now,
@@ -25,10 +27,10 @@ use x86_64::{
 
 // #[global_allocator]
 // pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
-// #[global_allocator]
-// pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
 #[global_allocator]
-pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
+pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
+// #[global_allocator]
+// pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
 
 /// Global allocator wrapper that yields if another CPU is holding the lock
 /// instead of spinning with interrupts off.
@@ -54,7 +56,7 @@ impl YieldingMimalloc {
             }
 
             if interrupts::are_enabled() {
-                //yield_now();
+                yield_now();
             } else {
                 core::hint::spin_loop();
             }
@@ -283,7 +285,7 @@ unsafe fn ensure_header_mapped(addr: usize) -> bool {
 
     match mapper.map_to(page, new_frame, flags, &mut fa) {
         Ok(flush) => {
-            flush.flush();
+            flush_tlb_shootdown(flush);
             true
         }
         Err(MapToError::PageAlreadyMapped(_)) => {
@@ -326,7 +328,7 @@ unsafe fn map_range_4k_rollback(start: VirtAddr, size: usize) -> Result<(), ()> 
 
         match mapper.map_to(page, new_frame, flags, &mut fa) {
             Ok(flush) => {
-                flush.flush();
+                flush_tlb_shootdown(flush);
             }
             Err(MapToError::PageAlreadyMapped(_)) => {
                 fa.deallocate_frame(new_frame);

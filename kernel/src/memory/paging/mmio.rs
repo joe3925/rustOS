@@ -13,8 +13,11 @@ use x86_64::{
 use crate::{
     cpu::get_cpu_info,
     memory::paging::{
-        constants::MMIO_BASE, frame_alloc::BootInfoFrameAllocator, paging::align_up_4k,
-        tables::init_mapper, virt_tracker::allocate_auto_kernel_range_aligned,
+        constants::MMIO_BASE,
+        frame_alloc::BootInfoFrameAllocator,
+        paging::{align_up_4k, flush_tlb_shootdown},
+        tables::init_mapper,
+        virt_tracker::allocate_auto_kernel_range_aligned,
     },
     util::boot_info,
 };
@@ -120,7 +123,7 @@ pub extern "win64" fn map_mmio_region_aligned(
                 )
             } {
                 Ok(flush) => {
-                    flush.flush();
+                    flush_tlb_shootdown(flush);
                     cur_v += GIB;
                     cur_p += GIB;
                     remaining -= GIB;
@@ -143,7 +146,7 @@ pub extern "win64" fn map_mmio_region_aligned(
                 )
             } {
                 Ok(flush) => {
-                    flush.flush();
+                    flush_tlb_shootdown(flush);
                     cur_v += MIB2;
                     cur_p += MIB2;
                     remaining -= MIB2;
@@ -157,9 +160,8 @@ pub extern "win64" fn map_mmio_region_aligned(
         let page: Page<Size4KiB> = Page::containing_address(cur_v);
         let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(cur_p));
         unsafe {
-            mapper
-                .map_to(page, frame, base_flags, &mut frame_allocator)?
-                .flush();
+            let flush = mapper.map_to(page, frame, base_flags, &mut frame_allocator)?;
+            flush_tlb_shootdown(flush);
         }
 
         cur_v += KIB4;
@@ -198,7 +200,7 @@ pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> 
         if remaining >= GIB && (cur.as_u64() & (GIB - 1)) == 0 {
             let page = Page::<Size1GiB>::containing_address(cur);
             if let Ok((_frame, flush)) = mapper.unmap(page) {
-                flush.flush();
+                flush_tlb_shootdown(flush);
                 cur += GIB;
                 remaining -= GIB;
                 continue;
@@ -208,7 +210,7 @@ pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> 
         if remaining >= MIB2 && (cur.as_u64() & (MIB2 - 1)) == 0 {
             let page = Page::<Size2MiB>::containing_address(cur);
             if let Ok((_frame, flush)) = mapper.unmap(page) {
-                flush.flush();
+                flush_tlb_shootdown(flush);
                 cur += MIB2;
                 remaining -= MIB2;
                 continue;
@@ -217,7 +219,7 @@ pub fn unmap_mmio_region(base: VirtAddr, size: u64) -> Result<(), PageMapError> 
 
         let page = Page::<Size4KiB>::containing_address(cur);
         if let Ok((_frame, flush)) = mapper.unmap(page) {
-            flush.flush();
+            flush_tlb_shootdown(flush);
         }
 
         cur += KIB4;
