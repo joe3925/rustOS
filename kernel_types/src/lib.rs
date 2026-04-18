@@ -19,6 +19,7 @@ pub mod memory;
 pub mod object_manager;
 pub mod pnp;
 pub mod request;
+pub mod runtime;
 pub mod status;
 use alloc::sync::Arc;
 use x86_64::VirtAddr;

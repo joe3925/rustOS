@@ -6,6 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
+use crate::scheduling::tls;
 use crate::structs::mpmc::{mpmc_channel, Receiver, Sender};
 
 pub type JobFn = extern "win64" fn(usize);
@@ -25,6 +26,7 @@ struct Shared {
     shutdown: AtomicBool,
     num_workers: AtomicUsize,
     total_workers: AtomicUsize,
+    block_on_enabled: bool,
 }
 
 struct WorkerCtx {
@@ -41,6 +43,14 @@ pub struct ThreadPool {
 
 impl ThreadPool {
     pub fn new(threads: usize) -> Self {
+        Self::new_with_block_on(threads, false)
+    }
+
+    pub fn new_blocking(threads: usize) -> Self {
+        Self::new_with_block_on(threads, true)
+    }
+
+    fn new_with_block_on(threads: usize, block_on_enabled: bool) -> Self {
         assert!(threads > 0);
 
         let (sender, receiver) = mpmc_channel::<Job>();
@@ -49,6 +59,7 @@ impl ThreadPool {
             total_workers: AtomicUsize::new(threads),
             shutdown: AtomicBool::new(false),
             num_workers: AtomicUsize::new(0),
+            block_on_enabled,
         });
 
         for i in 0..threads {
@@ -152,6 +163,10 @@ extern "win64" fn worker_entry(ctx: usize) {
     let shared = ctx.shared.clone();
     let receiver = ctx.receiver.clone();
     drop(ctx);
+
+    if shared.block_on_enabled {
+        tls::ensure_current_thread_runtime_initialized();
+    }
 
     loop {
         // Check shutdown before blocking

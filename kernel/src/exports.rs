@@ -107,6 +107,7 @@ export! {
     kernel_async_submit,
     kernel_spawn_detached_ffi,
     kernel_block_on_ffi,
+    kernel_block_on_thread_state,
     kernel_spawn_blocking_raw,
 
     bench_kernel_span_end,

@@ -2,7 +2,6 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use alloc::task::Wake;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -11,10 +10,12 @@ use core::task::{Context, Poll, Waker};
 use spin::Mutex;
 
 use kernel_sys::{
-    kernel_spawn_blocking_raw, kernel_spawn_detached_ffi, kernel_spawn_joinable_ffi,
+    kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_ffi,
+    kernel_spawn_joinable_ffi,
     try_steal_blocking_one as sys_try_steal_blocking_one,
 };
 use kernel_types::async_ffi::{FfiFuture, FfiWaker, FfiWakerVTable, FutureExt};
+use kernel_types::runtime::BlockOnThreadState;
 
 /// Spawn an async task on the kernel executor (shared singleton in the kernel) and
 /// return a join handle that can be awaited for completion.
@@ -32,22 +33,36 @@ where
 {
     unsafe { kernel_spawn_detached_ffi(future.into_ffi()) };
 }
-#[repr(C)]
-struct BlockOnState {
-    ready: AtomicBool,
+struct BlockOnActiveGuard<'a> {
+    state: &'a BlockOnThreadState,
+}
+
+impl<'a> BlockOnActiveGuard<'a> {
+    fn new(state: &'a BlockOnThreadState) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for BlockOnActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.state.exit();
+    }
 }
 
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let mut ffi_fut = future.into_ffi();
-    let state = Arc::new(BlockOnState {
-        ready: AtomicBool::new(false),
-    });
-    loop {
-        let ffi_waker = FfiWaker {
-            data: Arc::into_raw(state.clone()) as *const (),
-            vtable: &BLOCK_ON_WAKER_VTABLE,
-        };
+    let state = unsafe { kernel_block_on_thread_state() };
+    if !state.try_enter() {
+        panic!("reentrant kernel_api::runtime::block_on is not supported");
+    }
+    let _active = BlockOnActiveGuard::new(&state);
+    state.clear_ready();
+    let ffi_waker = FfiWaker {
+        data: Arc::into_raw(state.clone()) as *const (),
+        vtable: &BLOCK_ON_WAKER_VTABLE,
+    };
 
+    loop {
         let poll = unsafe { ffi_fut.poll(&ffi_waker as *const FfiWaker) };
 
         if poll.is_ready() {
@@ -57,7 +72,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
             }
         }
 
-        if !state.ready.swap(false, Ordering::AcqRel) {}
+        if !state.take_ready() {}
     }
 }
 
@@ -69,7 +84,7 @@ static BLOCK_ON_WAKER_VTABLE: FfiWakerVTable = FfiWakerVTable {
 };
 
 unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
-    Arc::increment_strong_count(data as *const BlockOnState);
+    Arc::increment_strong_count(data as *const BlockOnThreadState);
     FfiWaker {
         data,
         vtable: &BLOCK_ON_WAKER_VTABLE,
@@ -77,17 +92,17 @@ unsafe extern "win64" fn block_on_waker_clone(data: *const ()) -> FfiWaker {
 }
 
 unsafe extern "win64" fn block_on_waker_wake(data: *const ()) {
-    let state = Arc::from_raw(data as *const BlockOnState);
-    state.ready.store(true, Ordering::Release);
+    let state = Arc::from_raw(data as *const BlockOnThreadState);
+    state.mark_ready();
 }
 
 unsafe extern "win64" fn block_on_waker_wake_by_ref(data: *const ()) {
-    let state = &*(data as *const BlockOnState);
-    state.ready.store(true, Ordering::Release);
+    let state = &*(data as *const BlockOnThreadState);
+    state.mark_ready();
 }
 
 unsafe extern "win64" fn block_on_waker_drop(data: *const ()) {
-    drop(Arc::from_raw(data as *const BlockOnState));
+    drop(Arc::from_raw(data as *const BlockOnThreadState));
 }
 /// Minimal blocking join handle executed on the kernel blocking pool.
 pub struct BlockingJoin<R> {

@@ -25,6 +25,7 @@ use kernel_types::{
     irq::{IrqHandle, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::RequestHandle,
+    runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
 };
@@ -616,6 +617,11 @@ pub extern "win64" fn kernel_spawn_detached_ffi(fut: FfiFuture<()>) {
 #[no_mangle]
 pub extern "win64" fn kernel_block_on_ffi(fut: FfiFuture<()>) {
     kernel_block_on(fut);
+}
+
+#[no_mangle]
+pub extern "win64" fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState> {
+    scheduling::tls::current_block_on_thread_state()
 }
 
 #[no_mangle]

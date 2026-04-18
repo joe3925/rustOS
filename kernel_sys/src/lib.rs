@@ -16,6 +16,7 @@ use kernel_types::benchmark::{
 };
 use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
+use kernel_types::runtime::BlockOnThreadState;
 
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::PageTableFlags;
@@ -211,6 +212,7 @@ unsafe extern "win64" {
     pub fn kernel_async_submit(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn kernel_spawn_detached_ffi(fut: FfiFuture<()>);
     pub fn kernel_block_on_ffi(fut: FfiFuture<()>);
+    pub fn kernel_block_on_thread_state() -> Arc<BlockOnThreadState>;
     pub fn kernel_spawn_blocking_raw(trampoline: extern "win64" fn(usize), ctx: usize);
 
     // Routing FFI (sync - for kernel_routing crate)

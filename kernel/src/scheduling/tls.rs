@@ -1,9 +1,11 @@
 use crate::util::boot_info;
 use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use alloc::sync::Arc;
 use bootloader_api::info::TlsTemplate;
 use core::fmt;
 use core::ptr;
 use core::slice;
+use kernel_types::runtime::BlockOnThreadState;
 use spin::Once;
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
@@ -21,6 +23,9 @@ const TCB_SELF_POINTER_OFFSET: usize = 0;
 const TCB_RESERVED_OFFSET: usize = 8;
 
 static KERNEL_TLS_LAYOUT: Once<Option<KernelTlsLayout>> = Once::new();
+
+#[thread_local]
+static mut BLOCK_ON_THREAD_STATE: Option<Arc<BlockOnThreadState>> = None;
 
 #[derive(Clone, Copy, Debug)]
 struct KernelTlsLayout {
@@ -102,6 +107,30 @@ impl fmt::Debug for KernelTls {
 #[inline(always)]
 pub fn activate(thread_pointer: u64) {
     FsBase::write(VirtAddr::new(thread_pointer));
+}
+
+#[inline(always)]
+pub fn ensure_current_thread_runtime_initialized() {
+    if FsBase::read().as_u64() == 0 {
+        panic!("kernel TLS is not active for the current thread");
+    }
+    unsafe {
+        if BLOCK_ON_THREAD_STATE.is_none() {
+            BLOCK_ON_THREAD_STATE = Some(Arc::new(BlockOnThreadState::new()));
+        }
+    }
+}
+
+pub fn current_block_on_thread_state() -> Arc<BlockOnThreadState> {
+    if FsBase::read().as_u64() == 0 {
+        panic!("kernel TLS is not active for the current thread");
+    }
+    unsafe {
+        BLOCK_ON_THREAD_STATE
+            .as_ref()
+            .cloned()
+            .expect("kernel block_on TLS state is not initialized for the current thread")
+    }
 }
 
 fn kernel_tls_layout() -> Option<&'static KernelTlsLayout> {
