@@ -24,6 +24,7 @@ use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
+use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
 use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
@@ -37,6 +38,7 @@ use bootloader_api::BootInfo;
 use core::arch::asm;
 use core::mem::size_of;
 use core::panic::PanicInfo;
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
@@ -48,7 +50,6 @@ use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
-
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
@@ -75,6 +76,30 @@ lazy_static! {
         disable_per_core: true
     });
 }
+const TLS_SELF_TEST_PENDING: u8 = 0;
+const TLS_SELF_TEST_PASS: u8 = 1;
+const TLS_SELF_TEST_FAIL: u8 = 2;
+
+static TLS_SELF_TEST_BUSY: AtomicBool = AtomicBool::new(false);
+static TLS_SELF_TEST_RESULT: AtomicU8 = AtomicU8::new(TLS_SELF_TEST_PENDING);
+
+const TLS_TEMPLATE_U64: u64 = 0x1122_3344_5566_7788;
+const TLS_MAIN_U64: u64 = 0xA1A2_A3A4_A5A6_A7A8;
+const TLS_WORKER_U64: u64 = 0xB1B2_B3B4_B5B6_B7B8;
+const TLS_TEMPLATE_BYTES: [u8; 16] = *b"KERNEL_TLS_CHECK";
+const TLS_MAIN_BYTES: [u8; 16] = *b"KERNEL_TLS_MAIN!";
+const TLS_WORKER_BYTES: [u8; 16] = *b"KERNEL_TLS_WORK!";
+const TLS_MAIN_ZERO_BYTES: [u8; 16] = [0x4Du8; 16];
+const TLS_WORKER_ZERO_BYTES: [u8; 16] = [0x57u8; 16];
+
+#[thread_local]
+static mut TLS_TEST_INIT_U64: u64 = TLS_TEMPLATE_U64;
+#[thread_local]
+static mut TLS_TEST_INIT_BYTES: [u8; 16] = TLS_TEMPLATE_BYTES;
+#[thread_local]
+static mut TLS_TEST_ZERO_U64: u64 = 0;
+#[thread_local]
+static mut TLS_TEST_ZERO_BYTES: [u8; 16] = [0; 16];
 pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
@@ -140,7 +165,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
-
+    test_kernel_tls_runtime();
     let mut program = Program::new(
         "KRNL".to_string(),
         Path::from_string(""),
@@ -188,7 +213,7 @@ pub extern "win64" fn trigger_guard_page_overflow() -> ! {
         );
     }
 }
-#[inline(always)]
+#[inline(never)]
 fn halt_loop() -> ! {
     unsafe {
         loop {
@@ -218,7 +243,6 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         }
         None => false,
     };
-
     if is_owner {
         println!("=== KERNEL PANIC [{}] ===", mod_name);
         println!("{}", info);
@@ -228,7 +252,12 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
             if let Some(task) = slot {
                 let name = unsafe { task_name_panic(task) };
-                println!("  CPU {}: \"{}\" (id={})", cpu_id, name, task.id.load(Ordering::Relaxed));
+                println!(
+                    "  CPU {}: \"{}\" (id={})",
+                    cpu_id,
+                    name,
+                    task.id.load(Ordering::Relaxed)
+                );
             } else {
                 println!("  CPU {}: <idle>", cpu_id);
             }
@@ -416,4 +445,125 @@ macro_rules! boot_packages {
             )+
         ] as &[ $crate::util::BootPkg ]
     }};
+}
+unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
+    (
+        TLS_TEST_INIT_U64,
+        TLS_TEST_INIT_BYTES,
+        TLS_TEST_ZERO_U64,
+        TLS_TEST_ZERO_BYTES,
+    )
+}
+
+unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) {
+    TLS_TEST_INIT_U64 = init_u64;
+    TLS_TEST_INIT_BYTES = init_bytes;
+    TLS_TEST_ZERO_U64 = zero_u64;
+    TLS_TEST_ZERO_BYTES = zero_bytes;
+}
+
+extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
+    let expected = unsafe { tls_test_snapshot() };
+    if expected != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
+        TLS_SELF_TEST_RESULT.store(TLS_SELF_TEST_FAIL, Ordering::Release);
+        return;
+    }
+
+    unsafe {
+        tls_test_write(
+            TLS_WORKER_U64,
+            TLS_WORKER_BYTES,
+            TLS_WORKER_U64,
+            TLS_WORKER_ZERO_BYTES,
+        );
+    }
+
+    let worker_snapshot = unsafe { tls_test_snapshot() };
+    let ok = worker_snapshot
+        == (
+            TLS_WORKER_U64,
+            TLS_WORKER_BYTES,
+            TLS_WORKER_U64,
+            TLS_WORKER_ZERO_BYTES,
+        );
+
+    TLS_SELF_TEST_RESULT.store(
+        if ok {
+            TLS_SELF_TEST_PASS
+        } else {
+            TLS_SELF_TEST_FAIL
+        },
+        Ordering::Release,
+    );
+}
+
+pub fn test_kernel_tls_runtime() {
+    let current = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .expect("kernel TLS self-test requires a scheduled task");
+    assert!(
+        current.is_kernel_mode.load(Ordering::Acquire),
+        "kernel TLS self-test requires a scheduled kernel task"
+    );
+
+    let initial = unsafe { tls_test_snapshot() };
+    if initial != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
+        panic!(
+            "kernel TLS self-test saw wrong initial state: {:?}",
+            initial
+        );
+    }
+
+    unsafe {
+        tls_test_write(
+            TLS_MAIN_U64,
+            TLS_MAIN_BYTES,
+            TLS_MAIN_U64,
+            TLS_MAIN_ZERO_BYTES,
+        );
+    }
+
+    SCHEDULER.add_task(Task::new_kernel_mode(
+        kernel_tls_self_test_worker,
+        0,
+        StackSize::Tiny,
+        "kernel-tls-self-test".into(),
+        0,
+    ));
+
+    let mut completed = false;
+    for _ in 0..4096 {
+        if TLS_SELF_TEST_RESULT.load(Ordering::Acquire) != TLS_SELF_TEST_PENDING {
+            completed = true;
+            break;
+        }
+        yield_now();
+    }
+
+    let current_snapshot = unsafe { tls_test_snapshot() };
+    unsafe {
+        tls_test_write(TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]);
+    }
+    let worker_result = TLS_SELF_TEST_RESULT.load(Ordering::Acquire);
+    TLS_SELF_TEST_BUSY.store(false, Ordering::Release);
+
+    assert!(completed, "kernel TLS self-test worker did not complete");
+    assert!(
+        worker_result == TLS_SELF_TEST_PASS,
+        "kernel TLS self-test worker failed with state {}",
+        worker_result
+    );
+    assert!(
+        current_snapshot
+            == (
+                TLS_MAIN_U64,
+                TLS_MAIN_BYTES,
+                TLS_MAIN_U64,
+                TLS_MAIN_ZERO_BYTES,
+            ),
+        "kernel TLS self-test current thread state was clobbered: {:?}",
+        current_snapshot
+    );
+
+    println!("Kernel TLS self-test passed");
 }
