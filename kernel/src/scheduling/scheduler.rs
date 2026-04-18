@@ -9,6 +9,7 @@ use crate::memory::paging::stack::StackSize;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::state::{BlockReason, SchedState, State};
 use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
+use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 
 pub use crate::scheduling::task::TaskHandle;
@@ -606,6 +607,7 @@ impl Scheduler {
         };
 
         self.restore_page_table(&next);
+        self.restore_thread_local_storage(&next);
 
         let ctx_guard = next.inner.read();
         unsafe { ctx_guard.context.restore(state) };
@@ -746,6 +748,16 @@ impl Scheduler {
             let id = task_handle.task_id();
             let _ = self.delete_task(id);
         }
+    }
+
+    #[inline(always)]
+    pub fn restore_thread_local_storage(&self, task_handle: &TaskHandle) {
+        let thread_pointer = if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
+            task_handle.tls_thread_pointer.load(Ordering::Relaxed)
+        } else {
+            0
+        };
+        tls::activate(thread_pointer);
     }
 
     pub fn maybe_balance(&self) {
@@ -904,6 +916,7 @@ impl Scheduler {
         };
 
         self.restore_page_table(&next);
+        self.restore_thread_local_storage(&next);
 
         send_eoi(SCHED_IPI_VECTOR);
 

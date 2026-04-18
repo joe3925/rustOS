@@ -5,6 +5,7 @@ use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
 use crate::scheduling::scheduler::kernel_task_end;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
+use crate::scheduling::tls::KernelTls;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::naked_asm;
@@ -69,6 +70,9 @@ pub struct TaskRef {
 
     /// Total reserved stack bytes (write-once, read lock-free)
     pub stack_size: AtomicU64,
+
+    /// x86-64 ELF thread pointer for this task's kernel TLS block.
+    pub tls_thread_pointer: AtomicU64,
 }
 
 /// Handle type used throughout the scheduler
@@ -197,6 +201,7 @@ pub struct Task {
     pub name: String,
     pub context: State,
     pub fpu_state: FpuState,
+    pub kernel_tls: Option<KernelTls>,
     pub is_user_mode: bool,
     pub parent_pid: u64,
     pub executer_id: Option<u64>,
@@ -245,6 +250,7 @@ impl Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
+            kernel_tls: None,
             is_user_mode: true,
             parent_pid,
             executer_id: None,
@@ -267,6 +273,7 @@ impl Task {
             stack_start: AtomicU64::new(stack_top),
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size),
+            tls_thread_pointer: AtomicU64::new(0),
         })
     }
 
@@ -301,10 +308,14 @@ impl Task {
         state.cs = selectors.kernel_code_selector.0 as u64;
         state.ss = selectors.kernel_data_selector.0 as u64;
 
+        let kernel_tls = KernelTls::for_kernel_thread();
+        let tls_thread_pointer = kernel_tls.as_ref().map_or(0, KernelTls::thread_pointer);
+
         let inner_task = Task {
             name,
             context: state,
             fpu_state: FpuState::default(),
+            kernel_tls,
             is_user_mode: false,
             parent_pid,
             executer_id: None,
@@ -327,6 +338,7 @@ impl Task {
             stack_start: AtomicU64::new(stack_top_u64),
             guard_page: AtomicU64::new(guard_page),
             stack_size: AtomicU64::new(stack_size.as_bytes()),
+            tls_thread_pointer: AtomicU64::new(tls_thread_pointer),
         })
     }
 
