@@ -671,6 +671,13 @@ async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: boo
 
 #[request_handler]
 pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStep {
+    // Seek is fast-path: no FS lock needed, no thread spawn, no Arc clones.
+    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+        let status = handle_seek_fast(dev, req);
+        req.write().status = status;
+        return DriverStep::complete(status);
+    }
+
     let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
         (
@@ -681,13 +688,6 @@ pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>
             vdx.pending_flush_block.clone(),
         )
     };
-
-    // Seek is fast-path: no FS lock needed, no thread spawn.
-    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
-        let status = handle_seek_fast(dev, req);
-        req.write().status = status;
-        return DriverStep::complete(status);
-    }
 
     let dev_cloned = dev.clone();
     // SAFETY: req is valid for the entire duration of this async fn. spawn_blocking is
