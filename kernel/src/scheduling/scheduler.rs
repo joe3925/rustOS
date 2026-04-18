@@ -292,10 +292,23 @@ impl Scheduler {
         let Some(core) = self.core(cpu) else {
             panic!("enqueue_to_core_ipi: cpu {} not initialized", cpu);
         };
+        Self::reserve_queue_load_or_panic(cpu, &core.load, "ipi queue");
         if core.ipi_queue.push(task).err().is_some() {
+            core.load.fetch_sub(1, Ordering::Release);
             panic!("ipi queue overflow on cpu {cpu}");
         }
-        core.load.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline(always)]
+    fn reserve_queue_load_or_panic(cpu: usize, load: &AtomicUsize, queue_name: &str) {
+        // Reserve the shadow load slot before publishing to the queue so a
+        // concurrent pop cannot decrement a stale zero count and wrap it.
+        if load
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
+            .is_err()
+        {
+            panic!("{queue_name} load overflow on cpu {cpu}");
+        }
     }
 
     #[inline(always)]
@@ -305,10 +318,11 @@ impl Scheduler {
         load: &AtomicUsize,
         task: TaskHandle,
     ) {
+        Self::reserve_queue_load_or_panic(cpu, load, "run queue");
         if queue.push(task).err().is_some() {
+            load.fetch_sub(1, Ordering::Release);
             panic!("run queue overflow on cpu {cpu}");
         }
-        load.fetch_add(1, Ordering::Release);
     }
 
     fn choose_core_for_new_task(&self, n: usize) -> usize {
@@ -358,7 +372,7 @@ impl Scheduler {
         if is_idle {
             Some(queue_load)
         } else {
-            Some(queue_load + 1)
+            Some(queue_load.saturating_add(1))
         }
     }
 
