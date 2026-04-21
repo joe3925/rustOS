@@ -22,7 +22,7 @@ use kernel_api::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
-    request::{BufSlice, RequestHandle, RequestType, TraversalPolicy},
+    request::{BufSlice, RequestDataView, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
     status::DriverStatus,
 };
@@ -110,12 +110,14 @@ pub async fn disk_read<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if req
-        .read()
-        .view_data::<BufSlice>()
-        .map_or(true, |b| b.len() < total)
-    {
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+    match req.data() {
+        RequestDataView::FromDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::FromDevice(_) => {
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+        RequestDataView::ToDevice(_) => {
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     }
 
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
@@ -160,12 +162,14 @@ pub async fn disk_write<'a, 'b>(
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if req
-        .read()
-        .view_data::<BufSlice>()
-        .map_or(true, |b| b.len() < total)
-    {
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+    match req.data() {
+        RequestDataView::ToDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::ToDevice(_) => {
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+        RequestDataView::FromDevice(_) => {
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     }
 
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
@@ -217,7 +221,7 @@ pub async fn disk_ioctl<'a, 'b>(
                     .read()
                     .pnp
                     .as_ref()
-                    .and_then(|p| p.data_out.view::<DiskInfo>())
+                    .and_then(|p| p.data_out_ref().view::<DiskInfo>())
                     .copied();
             }
 
@@ -279,14 +283,14 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         di_opt = req
             .pnp
             .as_ref()
-            .and_then(|p| p.data_out.view::<DiskInfo>())
+            .and_then(|p| p.data_out_ref().view::<DiskInfo>())
             .copied()
             .or_else(|| {
                 let Some(pnp) = req.pnp.as_ref() else {
                     return None;
                 };
                 let blob = pnp
-                    .data_out
+                    .data_out_ref()
                     .view::<Vec<u8>>()
                     .map(|v| v.as_slice())
                     .unwrap_or(&[]);

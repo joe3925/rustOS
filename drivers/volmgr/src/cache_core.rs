@@ -488,9 +488,8 @@ where
 
         {
             let data = page.data.read();
-            // SAFETY: lower drivers only read from write-request buffers.
-            let mut buf = unsafe { BufSlice::from_const(&data.bytes[..]) };
-            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+            let buf = BufSlice::new_const(&data.bytes[..]);
+            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
             self.backend
                 .write_request(borrow.handle())
                 .await
@@ -543,9 +542,8 @@ where
 
         let write_res = {
             let data = page.data.read();
-            // SAFETY: lower drivers only read from write-request buffers.
-            let mut buf = unsafe { BufSlice::from_const(&data.bytes[..]) };
-            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+            let buf = BufSlice::new_const(&data.bytes[..]);
+            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
             backend
                 .write_request(borrow.handle())
                 .await

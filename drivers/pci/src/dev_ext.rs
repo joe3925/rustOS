@@ -571,7 +571,7 @@ extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(p) = req.pnp.as_ref() {
-        if let Some(v) = p.data_out.view::<Vec<u8>>() { out.extend_from_slice(v); }
+        if let Some(v) = p.data_out_ref().view::<Vec<u8>>() { out.extend_from_slice(v); }
     }
     unsafe {
         *w.status.get() = req.status;
@@ -669,7 +669,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         .read()
         .pnp
         .as_ref()
-        .and_then(|p| p.data_out.view::<Vec<u8>>()).cloned()
+        .and_then(|p| p.data_out_ref().view::<Vec<u8>>()).cloned()
         .unwrap_or_default();
 
     let segs: Vec<McfgSegment> = parse_ecam_segments_from_blob(&blob);

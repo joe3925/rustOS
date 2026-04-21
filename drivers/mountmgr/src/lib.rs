@@ -153,8 +153,8 @@ pub async fn volclass_ioctl<'a, 'b>(
     match code {
         IOCTL_MOUNTMGR_UNMOUNT => {
             let target = {
-                let r = req.read();
-                string_from_req(&r).unwrap_or_default()
+                let mut r = req.write();
+                string_from_req(&mut r).unwrap_or_default()
             };
 
             if !target.is_empty() {
@@ -206,15 +206,16 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
         RequestType::DeviceControl(c) => c,
         _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
-
+    println!("Ioctl");
     match code {
         IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
-                let r = req.read();
-                string_from_req(&r)
+                let mut r = req.write();
+                string_from_req(&mut r)
             };
             match tag {
                 Some(t) if !t.is_empty() => {
+                    println!("Registered for tag: {}", t);
                     let mut wr = FS_REGISTERED.write();
                     if !wr.iter().any(|s| s == &t) {
                         wr.push(t);
@@ -222,9 +223,13 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
                     drop(wr);
                     let _ = refresh_fs_registry_from_registry().await;
                     spawn_detached(rescan_all_volumes());
+
                     DriverStep::complete(DriverStatus::Success)
                 }
-                _ => DriverStep::complete(DriverStatus::InvalidParameter),
+                _ => {
+                    println!("tag was none");
+                    DriverStep::complete(DriverStatus::InvalidParameter)
+                }
             }
         }
         _ => DriverStep::complete(DriverStatus::NotImplemented),
@@ -271,7 +276,7 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
         dx.fs_attached.store(false, Ordering::Release);
         return;
     }
-
+    println!("trying bind");
     if try_bind_filesystems_for_parent_fdo(&dev, &public).await {
         let link = dx.fs_link.get().cloned().unwrap_or_else(|| public.clone());
         let inst = dx.inst_path.get().cloned().unwrap_or_default();
@@ -326,7 +331,7 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
         let req = request.read();
         let pnp = req.pnp.as_ref()?;
         if let Some(pi) = pnp
-            .data_out
+            .data_out_ref()
             .view::<kernel_api::kernel_types::io::PartitionInfo>()
         {
             pi.clone()
@@ -410,7 +415,7 @@ async fn try_bind_filesystems_for_parent_fdo(
             }),
         );
         identify_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
+        println!("Identify sent");
         let err = pnp_ioctl_via_symlink(
             tag.clone(),
             kernel_api::IOCTL_FS_IDENTIFY,
@@ -425,13 +430,13 @@ async fn try_bind_filesystems_for_parent_fdo(
             continue;
         }
 
-        let Some(id) = identify_req.write().take_data::<FsIdentify>() else {
+        let Some(id) = identify_req.write().data().to_device().view::<FsIdentify>() else {
             continue;
         };
         if !id.can_mount {
             continue;
         }
-        let Some(function_fdo) = id.mount_device else {
+        let Some(function_fdo) = id.mount_device.as_ref() else {
             continue;
         };
 
@@ -491,9 +496,11 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
     s.into_bytes().into_boxed_slice()
 }
 
-fn string_from_req(req: &Request) -> Option<String> {
+fn string_from_req(req: &mut Request) -> Option<String> {
     core::str::from_utf8(
-        req.view_data::<Vec<u8>>()
+        req.data()
+            .to_device()
+            .view::<Vec<u8>>()
             .map(|v| v.as_slice())
             .unwrap_or(&[]),
     )
@@ -588,7 +595,9 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
 
     if let Some(_) = req_inner
         .write()
-        .take_data::<FsOpenResult>()
+        .data()
+        .to_device()
+        .view::<FsOpenResult>()
         .map(|res| res.error.is_none())
     {
         return true;

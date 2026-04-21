@@ -34,7 +34,7 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{BufSlice, RequestHandle, RequestType};
+use kernel_api::request::{BufSlice, RequestDataView, RequestHandle, RequestType};
 use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
@@ -184,7 +184,7 @@ async fn virtio_pnp_start<'a, 'b>(
         let blob = r
             .pnp
             .as_ref()
-            .and_then(|p| p.data_out.view::<Vec<u8>>())
+            .and_then(|p| p.data_out_ref().view::<Vec<u8>>())
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         pci::parse_resources(blob)
@@ -871,12 +871,13 @@ pub async fn virtio_pdo_read<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
     // Ensure caller-provided buffer is large enough for the requested transfer.
-    if req
-        .read()
-        .view_data::<BufSlice>()
-        .map_or(true, |b| b.len() < len)
-    {
-        return complete_req(req, DriverStatus::InsufficientResources);
+    match req.data() {
+        RequestDataView::FromDevice(data)
+            if data.view::<BufSlice>().map_or(false, |b| b.len() >= len) => {}
+        RequestDataView::FromDevice(_) => {
+            return complete_req(req, DriverStatus::InsufficientResources);
+        }
+        RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
 
     let sector = offset >> 9;
@@ -953,11 +954,16 @@ pub async fn virtio_pdo_read<'a, 'b>(
             }
 
             {
-                let mut w = req.write();
+                let mut data = match req.data() {
+                    RequestDataView::FromDevice(data) => data,
+                    RequestDataView::ToDevice(_) => {
+                        return complete_req(req, DriverStatus::InvalidParameter);
+                    }
+                };
                 // SAFETY: BufSlice pointer is valid for the duration of the request.
                 let dst = unsafe {
-                    &mut w
-                        .view_data_mut::<BufSlice>()
+                    &mut data
+                        .view_mut::<BufSlice>()
                         .expect("read req missing BufSlice buffer")
                         .as_mut_slice()[buf_offset..buf_offset + chunk_len as usize]
                 };
@@ -1021,12 +1027,13 @@ pub async fn virtio_pdo_write<'a, 'b>(
     }
     // Guard against buffer underruns – without this we can read past the end of
     // the caller's data buffer and corrupt adjacent memory.
-    if req
-        .read()
-        .view_data::<BufSlice>()
-        .map_or(true, |b| b.len() < len)
-    {
-        return complete_req(req, DriverStatus::InsufficientResources);
+    match req.data() {
+        RequestDataView::ToDevice(data)
+            if data.view::<BufSlice>().map_or(false, |b| b.len() >= len) => {}
+        RequestDataView::ToDevice(_) => {
+            return complete_req(req, DriverStatus::InsufficientResources);
+        }
+        RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
 
     let sector = offset >> 9;
@@ -1063,10 +1070,16 @@ pub async fn virtio_pdo_write<'a, 'b>(
             };
 
             {
-                let r = req.read();
+                let data = match req.data() {
+                    RequestDataView::ToDevice(data) => data,
+                    RequestDataView::FromDevice(_) => {
+                        return complete_req(req, DriverStatus::InvalidParameter);
+                    }
+                };
                 // SAFETY: BufSlice pointer is valid for the duration of the request.
                 let src = unsafe {
-                    &r.view_data::<BufSlice>()
+                    &data
+                        .view::<BufSlice>()
                         .expect("write req missing BufSlice buffer")
                         .as_slice()[buf_offset..buf_offset + chunk_len as usize]
                 };
@@ -1168,7 +1181,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             match bench_sweep(&inner, true).await {
                 Ok(r) => {
                     {
-                        req.write().data = RequestData::from_t(r);
+                        req.write().set_data_t(r);
                     }
                     complete_req(req, DriverStatus::Success)
                 }
@@ -1185,7 +1198,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             match bench_sweep(&inner, false).await {
                 Ok(r) => {
                     {
-                        req.write().data = RequestData::from_t(r);
+                        req.write().set_data_t(r);
                     }
                     complete_req(req, DriverStatus::Success)
                 }
@@ -1200,8 +1213,9 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             };
 
             let params_in = {
-                let r = req.read();
-                r.data
+                let r = req.write();
+                r.data()
+                    .to_device()
                     .view::<BenchSweepParams>()
                     .copied()
                     .unwrap_or_default()
@@ -1243,7 +1257,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             };
 
             {
-                req.write().data = RequestData::from_t(out);
+                req.write().set_data_t(out);
             }
             complete_req(req, DriverStatus::Success)
         }

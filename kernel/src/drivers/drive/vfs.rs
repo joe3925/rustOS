@@ -8,7 +8,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
-use kernel_types::request::type_name_stripped;
 use kernel_types::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::{
@@ -156,15 +155,15 @@ impl Vfs {
         volume_symlink: &str,
         target: Option<IoTarget>,
         op: FsOp,
-        mut param: TParam,
+        param: TParam,
     ) -> Result<TResult, DriverStatus>
     where
         TParam: Send + Sync,
-        TResult: 'static,
+        TResult: 'static + Clone,
     {
         let mut request_handle = RequestHandle::new(RequestType::Fs(op), RequestData::empty());
         request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let mut borrow = BorrowedHandle::new(&mut request_handle, &mut param);
+        let mut borrow = BorrowedHandle::to_device(&mut request_handle, &param);
 
         let status = {
             if let Some(tgt) = target {
@@ -181,11 +180,11 @@ impl Vfs {
             return Err(status);
         }
 
-        borrow
-            .handle()
-            .write()
-            .take_data::<TResult>()
-            .ok_or(DriverStatus::InvalidParameter)
+        if let Some(res) = borrow.handle().write().data().to_device().view::<TResult>() {
+            return Ok(res.clone());
+        } else {
+            return Err(DriverStatus::InvalidParameter);
+        }
     }
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {
         let (symlink, fs_path) = match self.resolve_path(p.path) {

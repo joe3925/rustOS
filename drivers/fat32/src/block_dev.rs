@@ -119,7 +119,7 @@ impl BlockDev {
 
         let mut buf = BufSlice::new(dst);
         let status = {
-            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut self.req, &mut buf);
+            let mut borrow = BorrowedHandle::<BufSlice>::from_device(&mut self.req, &mut buf);
             pnp_send_request(volume, borrow.handle()).await
         };
 
@@ -131,17 +131,15 @@ impl BlockDev {
         }
     }
 
-    /// Send a write from an immutable source. Uses `BufSlice::from_const`;
-    /// lower stack must not mutate write buffers.
+    /// Send a write from an immutable source.
     async fn send_write_immut(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
         let len = src.len();
         let volume = self.volume.clone();
         self.prep_req_write(offset, len, false);
 
-        // SAFETY: lower drivers only read from write-request buffers.
-        let mut buf = unsafe { BufSlice::from_const(src) };
+        let buf = BufSlice::new_const(src);
         let status = {
-            let mut borrow = BorrowedHandle::<BufSlice>::new(&mut self.req, &mut buf);
+            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut self.req, &buf);
             pnp_send_request(volume, borrow.handle()).await
         };
 

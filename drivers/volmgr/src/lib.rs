@@ -34,7 +34,9 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{
+    BorrowedHandle, BufSlice, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
+};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 
@@ -90,7 +92,7 @@ impl VolumeCacheBackend for CacheBackend {
 
             let mut buf = BufSlice::new(&mut out[..len]);
             let status = {
-                let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+                let mut borrow = BorrowedHandle::<BufSlice>::from_device(&mut req, &mut buf);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -122,10 +124,9 @@ impl VolumeCacheBackend for CacheBackend {
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            // SAFETY: lower drivers only read from write-request buffers.
-            let mut buf = unsafe { BufSlice::from_const(&data[..block_len]) };
+            let buf = BufSlice::new_const(&data[..block_len]);
             let status = {
-                let mut borrow = BorrowedHandle::<BufSlice>::new(&mut req, &mut buf);
+                let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -472,11 +473,10 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let req_data_len = req
-        .read()
-        .view_data::<BufSlice>()
-        .map(|b| b.len())
-        .unwrap_or(0);
+    let req_data_len = match req.data() {
+        RequestDataView::FromDevice(data) => data.view::<BufSlice>().map(|b| b.len()).unwrap_or(0),
+        RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
@@ -489,9 +489,12 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     // SAFETY: BufSlice pointer is valid for the duration of the request (BorrowedHandle
     // lifetime enforced by the caller). We write directly into the caller's buffer.
+    let mut data = match req.data() {
+        RequestDataView::FromDevice(data) => data,
+        RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+    };
     let dst = unsafe {
-        req.write()
-            .view_data_mut::<BufSlice>()
+        data.view_mut::<BufSlice>()
             .expect("read response missing BufSlice")
             .as_mut_slice()
     };
@@ -544,13 +547,10 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(
-        len,
-        req.read()
-            .view_data::<BufSlice>()
-            .map(|b| b.len())
-            .unwrap_or(0),
-    );
+    len = core::cmp::min(len, match req.data() {
+        RequestDataView::ToDevice(data) => data.view::<BufSlice>().map(|b| b.len()).unwrap_or(0),
+        RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+    });
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
@@ -558,12 +558,11 @@ pub async fn vol_pdo_write<'a, 'b>(
     }
 
     // SAFETY: BufSlice pointer is valid for the duration of the request.
-    let data = unsafe {
-        req.read()
-            .view_data::<BufSlice>()
-            .expect("write req missing BufSlice")
-            .as_slice()
+    let data = match req.data() {
+        RequestDataView::ToDevice(data) => data,
+        RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
+    let data = unsafe { data.view::<BufSlice>().expect("write req missing BufSlice").as_slice() };
 
     let result = match (flush_write_through, owner) {
         (true, o) if o != 0 => cache.write_through_at_owned(offset, &data[..len], o).await,

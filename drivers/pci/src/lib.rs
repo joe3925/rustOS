@@ -108,7 +108,7 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
             .read()
             .pnp
             .as_ref()
-            .and_then(|p| p.data_out.view::<Vec<u8>>()).cloned()
+            .and_then(|p| p.data_out_ref().view::<Vec<u8>>()).cloned()
             .unwrap_or_default();
         let segs = parse_ecam_segments_from_blob(&blob);
 

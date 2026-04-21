@@ -4,7 +4,6 @@ use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
 use alloc::string::String;
-use core::num::NonZeroU64;
 use core::{
     alloc::Layout,
     marker::PhantomData,
@@ -26,11 +25,21 @@ enum StorageMode {
     Inline = 0,
     /// Data is heap-allocated as typed data (raw ptr + Layout for deallocation)
     HeapTyped = 1,
-    /// Non-owning borrow of driver-owned data. `heap_ptr` is a raw *mut T cast to *mut u8.
     /// Must NOT be dropped or deallocated — the driver retains ownership via BorrowedHandle.
-    Borrowed = 3,
+    /// Non-owning shared borrow of driver-owned data. `heap_ptr` is a raw *const T cast to
+    /// `*mut u8` for erased storage. Must NOT be dropped or deallocated.
+    BorrowedToDevice = 2,
+    /// Non-owning mutable borrow of driver-owned data. `heap_ptr` is a raw *mut T cast to
+    /// `*mut u8`. Must NOT be dropped or deallocated.
+    BorrowedFromDevice = 3,
 }
 
+impl StorageMode {
+    #[inline]
+    fn is_borrowed(self) -> bool {
+        matches!(self, Self::BorrowedToDevice | Self::BorrowedFromDevice)
+    }
+}
 /// Aligned inline buffer for small data
 #[repr(C, align(8))]
 struct InlineBuffer {
@@ -92,6 +101,87 @@ impl core::fmt::Debug for RequestData {
             .finish_non_exhaustive()
     }
 }
+
+/// Marker for request data flowing toward a lower device.
+#[derive(Debug, Clone, Copy)]
+pub struct ToDevice;
+
+/// Marker for request data flowing back from a lower device, or owned by the request and thus
+/// still mutable/replaceable.
+#[derive(Debug, Clone, Copy)]
+pub struct FromDevice;
+
+/// Shared directional request-data view.
+#[derive(Debug)]
+pub struct RequestDataRef<'a, Direction> {
+    data: &'a RequestData,
+    _direction: PhantomData<Direction>,
+}
+
+impl<'a, Direction> RequestDataRef<'a, Direction> {
+    #[inline]
+    pub fn view<T>(&self) -> Option<&'a T> {
+        self.data.view::<T>()
+    }
+}
+
+/// Mutable directional request-data view.
+#[derive(Debug)]
+pub struct RequestDataRefMut<'a, Direction> {
+    data: &'a mut RequestData,
+    _direction: PhantomData<Direction>,
+}
+
+impl<'a, Direction> RequestDataRefMut<'a, Direction> {
+    #[inline]
+    pub fn view<T>(&self) -> Option<&T> {
+        self.data.view::<T>()
+    }
+
+    #[inline]
+    pub fn to_device(self) -> RequestDataRef<'a, ToDevice> {
+        RequestDataRef {
+            data: &*self.data,
+            _direction: PhantomData,
+        }
+    }
+}
+
+impl<'a> RequestDataRefMut<'a, FromDevice> {
+    #[inline]
+    pub fn view_mut<T>(&mut self) -> Option<&mut T> {
+        unsafe { self.data.view_mut::<T>() }
+    }
+}
+
+/// Runtime view over the currently installed request payload.
+#[derive(Debug)]
+pub enum RequestDataView<'a> {
+    ToDevice(RequestDataRef<'a, ToDevice>),
+    FromDevice(RequestDataRefMut<'a, FromDevice>),
+}
+
+impl<'a> RequestDataView<'a> {
+    /// Obtain a shared `ToDevice` view regardless of the backing mode so callers that only need
+    /// read access do not need to match on direction first.
+    #[inline]
+    pub fn to_device(self) -> RequestDataRef<'a, ToDevice> {
+        match self {
+            Self::ToDevice(view) => view,
+            Self::FromDevice(view) => view.to_device(),
+        }
+    }
+}
+impl PnpRequest {
+    #[inline]
+    pub fn data_out_ref(&self) -> RequestDataRef<'_, ToDevice> {
+        RequestDataRef {
+            data: &self.data_out,
+            _direction: PhantomData,
+        }
+    }
+}
+
 pub const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> usize {
     let mut i = 0;
     let mut o = 0;
@@ -157,8 +247,8 @@ pub fn type_name_stripped<T>() -> String {
     String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 // SAFETY: RequestData owns its heap allocation exclusively (HeapTyped) or holds a non-owning
-// pointer to driver-owned data (Borrowed). For Borrowed, the driver enforces T: Send + Sync
-// via BorrowedHandle's type bounds, making cross-thread access safe.
+// pointer to driver-owned data in one of the borrowed modes. Borrowed payloads are installed
+// through BorrowedHandle, which enforces both the lifetime and T: Send + Sync bounds.
 unsafe impl Send for RequestData {}
 unsafe impl Sync for RequestData {}
 /// Compute a type tag for `T`, stripping lifetime parameters from generic argument lists
@@ -202,9 +292,9 @@ impl RequestData {
         }
     }
 
-    /// Install a non-owning borrow of driver-owned data. Only called by `BorrowedHandle::new`.
+    /// Install a non-owning borrow of driver-owned data. Only called by BorrowedHandle.
     /// The driver retains ownership; this RequestData must not drop or deallocate the pointer.
-    fn from_borrowed_raw(ptr: *mut u8, tag: u64, size: usize) -> Self {
+    fn from_borrowed_raw(ptr: *mut u8, tag: u64, size: usize, mode: StorageMode) -> Self {
         Self {
             inline: InlineBuffer::new(),
             heap_ptr: ptr,
@@ -212,7 +302,7 @@ impl RequestData {
             tag: Some(tag),
             dropper: noop_dropper,
             size,
-            mode: StorageMode::Borrowed,
+            mode,
         }
     }
 
@@ -279,14 +369,16 @@ impl RequestData {
     pub fn get_type_tag(&self) -> Option<u64> {
         self.tag
     }
-    pub fn view<T>(&self) -> Option<&T> {
+    pub(crate) fn view<T>(&self) -> Option<&T> {
         if !self.matches::<T>() {
             return None;
         }
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_ptr(),
-            StorageMode::HeapTyped | StorageMode::Borrowed => self.heap_ptr as *const u8,
+            StorageMode::HeapTyped
+            | StorageMode::BorrowedToDevice
+            | StorageMode::BorrowedFromDevice => self.heap_ptr as *const u8,
         };
 
         if ptr.is_null() {
@@ -296,14 +388,15 @@ impl RequestData {
         Some(unsafe { &*(ptr as *const T) })
     }
 
-    pub fn view_mut<T>(&mut self) -> Option<&mut T> {
+    pub(crate) unsafe fn view_mut<T>(&mut self) -> Option<&mut T> {
         if !self.matches::<T>() {
             return None;
         }
 
         let ptr = match self.mode {
             StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::HeapTyped | StorageMode::Borrowed => self.heap_ptr,
+            StorageMode::HeapTyped | StorageMode::BorrowedFromDevice => self.heap_ptr,
+            StorageMode::BorrowedToDevice => return None,
         };
 
         if ptr.is_null() {
@@ -341,7 +434,7 @@ impl RequestData {
 
                 value
             }
-            StorageMode::Borrowed => {
+            StorageMode::BorrowedToDevice | StorageMode::BorrowedFromDevice => {
                 // Cannot move out of a borrow — driver retains ownership
                 return None;
             }
@@ -379,7 +472,7 @@ impl Drop for RequestData {
                     }
                 }
             }
-            StorageMode::Borrowed => {
+            StorageMode::BorrowedToDevice | StorageMode::BorrowedFromDevice => {
                 // Not owned — driver retains ownership via BorrowedHandle. Do nothing.
             }
         }
@@ -446,7 +539,7 @@ pub enum TraversalPolicy {
 #[non_exhaustive]
 pub struct Request {
     pub kind: RequestType,
-    pub data: RequestData,
+    pub(crate) data: RequestData,
     pub completed: bool,
     pub status: DriverStatus,
     pub traversal_policy: TraversalPolicy,
@@ -518,18 +611,19 @@ impl Request {
     }
 
     #[inline]
-    pub fn view_data<T>(&self) -> Option<&T> {
-        self.data.view::<T>()
-    }
-
-    #[inline]
-    pub fn view_data_mut<T>(&mut self) -> Option<&mut T> {
-        self.data.view_mut::<T>()
-    }
-
-    #[inline]
-    pub fn take_data<T>(&mut self) -> Option<T> {
-        self.data.try_take::<T>()
+    pub fn data(&mut self) -> RequestDataView<'_> {
+        match self.data.mode {
+            StorageMode::BorrowedToDevice => RequestDataView::ToDevice(RequestDataRef {
+                data: &self.data,
+                _direction: PhantomData,
+            }),
+            StorageMode::BorrowedFromDevice | StorageMode::Inline | StorageMode::HeapTyped => {
+                RequestDataView::FromDevice(RequestDataRefMut {
+                    data: &mut self.data,
+                    _direction: PhantomData,
+                })
+            }
+        }
     }
 
     /// Print all fields except the actual data payloads
@@ -725,6 +819,11 @@ impl<'a> RequestHandle<'a> {
     }
 
     #[inline]
+    pub fn data(&mut self) -> RequestDataView<'_> {
+        self.write().data()
+    }
+
+    #[inline]
     pub fn set_traversal_policy(&mut self, policy: TraversalPolicy) {
         self.write().traversal_policy = policy;
     }
@@ -776,31 +875,44 @@ pub struct RequestHandleResult<'a> {
 /// `'data` — lifetime of the driver-owned data being lent
 /// `'req`  — lifetime of our exclusive borrow of the RequestHandle
 /// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
+enum BorrowedStorage<'data, T> {
+    ToDevice(&'data T),
+    FromDevice(&'data mut T),
+}
+
 pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: Send + Sync> {
     handle: &'req mut RequestHandle<'h>,
-    _data: PhantomData<&'data mut T>,
+    borrow: BorrowedStorage<'data, T>,
 }
 
 impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
-    /// Installs a borrow of `data` into `handle`'s request data slot.
-    ///
-    /// While the returned `BorrowedHandle` is alive:
-    /// - `data` is exclusively borrowed and cannot be accessed directly
-    /// - `handle` is exclusively borrowed and cannot be used directly
-    /// - The raw pointer to `data` is accessible to lower drivers via `view_data::<T>()`
-    pub fn new(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
-        // SAFETY:
-        // - ptr is valid for 'data (derived from &'data mut T).
-        // - 'data: 'req is explicitly enforced by the struct's generic bounds.
-        // - The &'data mut T exclusive borrow prevents any access to *data while Self is alive.
-        // - Drop clears the pointer before 'data ends because 'data must outlive Self.
-        let ptr = data as *mut T as *mut u8;
+    fn install(
+        handle: &'req mut RequestHandle<'h>,
+        ptr: *mut u8,
+        mode: StorageMode,
+        borrow: BorrowedStorage<'data, T>,
+    ) -> Self {
         unsafe { &mut *handle.write_raw() }.data =
-            RequestData::from_borrowed_raw(ptr, type_tag::<T>(), size_of::<T>());
-        Self {
+            RequestData::from_borrowed_raw(ptr, type_tag::<T>(), size_of::<T>(), mode);
+        Self { handle, borrow }
+    }
+
+    pub fn to_device(handle: &'req mut RequestHandle<'h>, data: &'data T) -> Self {
+        Self::install(
             handle,
-            _data: PhantomData,
-        }
+            data as *const T as *mut u8,
+            StorageMode::BorrowedToDevice,
+            BorrowedStorage::ToDevice(data),
+        )
+    }
+
+    pub fn from_device(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
+        Self::install(
+            handle,
+            data as *mut T as *mut u8,
+            StorageMode::BorrowedFromDevice,
+            BorrowedStorage::FromDevice(data),
+        )
     }
 
     /// Returns the inner handle for passing to lower drivers.
@@ -811,11 +923,20 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
 
 impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req, 'h, T> {
     fn drop(&mut self) {
+        match &mut self.borrow {
+            BorrowedStorage::ToDevice(data) => {
+                let _ = *data as *const T;
+            }
+            BorrowedStorage::FromDevice(data) => {
+                let _ = *data as *mut T;
+            }
+        }
         // SAFETY: handle is still valid — 'req is live while Self exists.
         let req = unsafe { &mut *self.handle.write_raw() };
-        // Only clear if still in Borrowed mode. If the lower driver set a response,
+        // Only clear if the request still holds one of the borrowed modes. If the lower driver set
+        // a response,
         // leave it intact so the upper driver can read it after the await.
-        if req.data.mode == StorageMode::Borrowed {
+        if req.data.mode.is_borrowed() {
             req.data = RequestData::empty();
         }
     }
@@ -831,7 +952,7 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req,
 /// The caller must guarantee the pointer remains valid for the duration of the
 /// request (enforced externally by [`BorrowedHandle`] lifetimes).
 pub struct BufSlice {
-    ptr: *mut u8,
+    ptr: *const u8,
     len: usize,
 }
 
@@ -846,22 +967,16 @@ impl BufSlice {
     #[inline]
     pub fn new(slice: &mut [u8]) -> Self {
         Self {
-            ptr: slice.as_mut_ptr(),
+            ptr: slice.as_ptr(),
             len: slice.len(),
         }
     }
 
-    /// Wrap an immutable byte slice into a `BufSlice` for read-only forwarding
-    /// (e.g. write requests where the lower stack only reads the buffer).
-    ///
-    /// # Safety
-    /// The caller must guarantee that no code path will call `as_mut_slice()`
-    /// on the resulting `BufSlice`. The pointer is stored as `*mut` internally
-    /// but must only be accessed via `as_slice()`.
+    /// Wrap an immutable byte slice into a `BufSlice`.
     #[inline]
-    pub unsafe fn from_const(slice: &[u8]) -> Self {
+    pub fn new_const(slice: &[u8]) -> Self {
         Self {
-            ptr: slice.as_ptr() as *mut u8,
+            ptr: slice.as_ptr(),
             len: slice.len(),
         }
     }
@@ -888,6 +1003,6 @@ impl BufSlice {
     /// exist (guaranteed when accessed through a live `BorrowedHandle`).
     #[inline]
     pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+        unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
     }
 }
