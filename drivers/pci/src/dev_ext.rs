@@ -94,6 +94,7 @@ pub struct PciPdoExt {
 
     pub vendor_id: u16,
     pub device_id: u16,
+    pub command: u16,
 
     pub class: u8,
     pub subclass: u8,
@@ -266,6 +267,7 @@ fn probe_function_mapped(
     let did_vid = unsafe { cfg_read32(func_base, 0x00) };
     let device_id = ((did_vid >> 16) & 0xFFFF) as u16;
     let vendor_id = (did_vid & 0xFFFF) as u16;
+    let command = (unsafe { cfg_read32(func_base, 0x04) } & 0xFFFF) as u16;
 
     let class_rev = unsafe { cfg_read32(func_base, 0x08) };
     let revision = (class_rev & 0xFF) as u8;
@@ -376,6 +378,7 @@ fn probe_function_mapped(
         func,
         vendor_id,
         device_id,
+        command,
         class,
         subclass,
         prog_if,
@@ -792,6 +795,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
 
     let device_id = ((did_vid >> 16) & 0xFFFF) as u16;
     let vendor_id = (did_vid & 0xFFFF) as u16;
+    let command = (unsafe { cfg1_read32_unlocked(bus, dev, func, 0x04) } & 0xFFFF) as u16;
 
     let class_rev = unsafe { cfg1_read32_unlocked(bus, dev, func, 0x08) };
     let revision = (class_rev & 0xFF) as u8;
@@ -898,6 +902,7 @@ pub fn probe_function_legacy(bus: u8, dev: u8, func: u8) -> Option<PciPdoExt> {
         func,
         vendor_id,
         device_id,
+        command,
         class,
         subclass,
         prog_if,

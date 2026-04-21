@@ -21,6 +21,10 @@ use dev_ext::{
 
 use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
+    dma::{
+        register_pci_pdo, DmaPciDeviceIdentity, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
+        DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED,
+    },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         io::{IoType, IoVtable},
@@ -318,7 +322,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
     let name = name_for(p);
     let instance_path = instance_path_for(p);
 
-    let (_child_dn, _child_pdo) = pnp_create_child_devnode_and_pdo_with_init(
+    let (_child_dn, child_pdo) = pnp_create_child_devnode_and_pdo_with_init(
         parent,
         name,
         instance_path,
@@ -326,6 +330,32 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
         Some(class_tag),
         child_init,
     );
+
+    let mut flags = DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
+    if (p.command & (1 << 2)) != 0 {
+        flags |= DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
+    }
+
+    let status = register_pci_pdo(
+        &child_pdo,
+        DmaPciDeviceIdentity {
+            segment: p.seg,
+            bus: p.bus,
+            device: p.dev,
+            function: p.func,
+            requester_id: ((p.bus as u16) << 8) | ((p.dev as u16) << 3) | p.func as u16,
+            flags,
+            command: p.command,
+            reserved: 0,
+            config_space_phys: p.cfg_phys,
+        },
+    );
+    if status != DriverStatus::Success {
+        panic!(
+            "[PCI] DMA manager registration failed for {}:{}:{}.{}: {:?}",
+            p.seg, p.bus, p.dev, p.func, status
+        );
+    }
 }
 
 #[request_handler]

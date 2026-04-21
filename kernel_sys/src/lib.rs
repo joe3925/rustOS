@@ -14,6 +14,7 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
+use kernel_types::dma::{DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity};
 use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
 use kernel_types::runtime::BlockOnThreadState;
@@ -73,6 +74,16 @@ unsafe extern "win64" {
     pub fn irq_handle_wait_ffi(h: &IrqHandle, meta: IrqMeta) -> FfiFuture<IrqWaitResult>;
     pub fn kernel_irq_alloc_vector() -> i32;
     pub fn kernel_irq_free_vector(vector: u8) -> bool;
+
+    // DMA / IOMMU
+    pub fn kernel_dma_register_pci_pdo(
+        pdo: &Arc<DeviceObject>,
+        identity: DmaPciDeviceIdentity,
+    ) -> DriverStatus;
+    pub fn kernel_dma_open_device_handle(
+        device: &Arc<DeviceObject>,
+    ) -> Result<DmaDeviceHandle, DriverStatus>;
+    pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
 
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(

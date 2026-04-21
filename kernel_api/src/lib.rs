@@ -13,6 +13,7 @@ pub use x86_64;
 pub use acpi;
 pub use kernel_macros::request_handler;
 pub mod benchmark;
+pub mod dma;
 pub mod fs;
 pub mod irq;
 pub mod memory;

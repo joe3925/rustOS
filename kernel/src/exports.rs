@@ -57,6 +57,9 @@ export! {
     kernel_irq_signal_all,
     kernel_irq_alloc_vector,
     kernel_irq_free_vector,
+    kernel_dma_register_pci_pdo,
+    kernel_dma_open_device_handle,
+    kernel_dma_query_device_state,
 
     irq_handle_create,
     irq_handle_clone,

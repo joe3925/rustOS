@@ -19,6 +19,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::dma::init_dma_manager;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -116,6 +117,7 @@ pub unsafe fn init() {
         PICS.lock().initialize();
         x86_64::instructions::interrupts::enable();
         syscall_init();
+        init_dma_manager();
 
         // TSC calibration
         let tsc_start = cpu::get_cycles();

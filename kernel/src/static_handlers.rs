@@ -19,6 +19,7 @@ use kernel_types::{
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
+    dma::{DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity},
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::{OpenFlags, Path},
     io::IoTarget,
@@ -52,6 +53,7 @@ use crate::{
     },
     memory::{
         allocator::ALLOCATOR,
+        dma,
         paging::{mmio, stack::StackSize},
     },
     registry::reg,
@@ -145,6 +147,28 @@ pub extern "win64" fn kernel_irq_alloc_vector() -> i32 {
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_free_vector(vector: u8) -> bool {
     irq_free_vector(vector)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_register_pci_pdo(
+    pdo: &Arc<DeviceObject>,
+    identity: DmaPciDeviceIdentity,
+) -> DriverStatus {
+    dma::register_pci_pdo(pdo, identity)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_open_device_handle(
+    device: &Arc<DeviceObject>,
+) -> Result<DmaDeviceHandle, DriverStatus> {
+    dma::open_device_handle(device)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_query_device_state(
+    device: &Arc<DeviceObject>,
+) -> Option<DmaDeviceState> {
+    dma::query_device_state(device)
 }
 
 #[no_mangle]
