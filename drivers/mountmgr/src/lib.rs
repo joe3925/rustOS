@@ -206,7 +206,6 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
         RequestType::DeviceControl(c) => c,
         _ => return DriverStep::complete(DriverStatus::NotImplemented),
     };
-    println!("Ioctl");
     match code {
         IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
@@ -215,7 +214,6 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
             };
             match tag {
                 Some(t) if !t.is_empty() => {
-                    println!("Registered for tag: {}", t);
                     let mut wr = FS_REGISTERED.write();
                     if !wr.iter().any(|s| s == &t) {
                         wr.push(t);
@@ -276,7 +274,6 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
         dx.fs_attached.store(false, Ordering::Release);
         return;
     }
-    println!("trying bind");
     if try_bind_filesystems_for_parent_fdo(&dev, &public).await {
         let link = dx.fs_link.get().cloned().unwrap_or_else(|| public.clone());
         let inst = dx.inst_path.get().cloned().unwrap_or_default();
@@ -415,7 +412,6 @@ async fn try_bind_filesystems_for_parent_fdo(
             }),
         );
         identify_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-        println!("Identify sent");
         let err = pnp_ioctl_via_symlink(
             tag.clone(),
             kernel_api::IOCTL_FS_IDENTIFY,

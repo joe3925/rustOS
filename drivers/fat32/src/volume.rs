@@ -18,7 +18,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{DriverStep, pnp_send_request};
-use kernel_api::request::{RequestDataRef, RequestDataView, RequestHandle, RequestType, ToDevice, TraversalPolicy};
+use kernel_api::request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
@@ -126,10 +126,8 @@ fn execute_fs_work(
 
         FsOp::Open => {
             let (path, flags, write_through) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsOpenParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -189,10 +187,8 @@ fn execute_fs_work(
 
         FsOp::Close => {
             let fs_file_id = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsCloseParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -210,10 +206,8 @@ fn execute_fs_work(
         FsOp::Read => {
             // Extract the buffer pointer from the borrowed params without moving them.
             let (fs_file_id, offset, buf_ptr, buf_len) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsReadParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -271,10 +265,8 @@ fn execute_fs_work(
 
         FsOp::Write => {
             let (fs_file_id, offset, write_through, data_ptr, data_len) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsWriteParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -346,10 +338,8 @@ fn execute_fs_work(
 
         FsOp::Flush => {
             let fs_file_id = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsFlushParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -375,10 +365,8 @@ fn execute_fs_work(
 
         FsOp::Create => {
             let err = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsCreateParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -394,10 +382,8 @@ fn execute_fs_work(
 
         FsOp::Rename => {
             let (src, dst) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsRenameParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -419,10 +405,8 @@ fn execute_fs_work(
 
         FsOp::ReadDir => {
             let res = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsListDirParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -440,10 +424,8 @@ fn execute_fs_work(
 
         FsOp::GetInfo => {
             let fs_file_id = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsGetInfoParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -477,10 +459,8 @@ fn execute_fs_work(
 
         FsOp::SetLen => {
             let (fs_file_id, new_size) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsSetLenParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -518,10 +498,8 @@ fn execute_fs_work(
 
         FsOp::Append => {
             let (fs_file_id, write_through, data_ptr, data_len) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsAppendParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -588,10 +566,8 @@ fn execute_fs_work(
 
         FsOp::ZeroRange => {
             let (fs_file_id, offset, len) = {
-                let data = match expect_to_device(req) {
-                    Ok(data) => data,
-                    Err(status) => return status,
-                };
+                let data = req.data().to_device();
+
                 let Some(p) = data.view::<FsZeroRangeParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
@@ -644,21 +620,10 @@ fn execute_fs_work(
     }
 }
 
-fn expect_to_device<'a>(
-    req: &'a mut RequestHandle<'_>,
-) -> Result<RequestDataRef<'a, ToDevice>, DriverStatus> {
-    match req.data() {
-        RequestDataView::ToDevice(data) => Ok(data),
-        RequestDataView::FromDevice(_) => Err(DriverStatus::InvalidParameter),
-    }
-}
-
 fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStatus {
     let (fs_file_id, origin, offset) = {
-        let data = match expect_to_device(req) {
-            Ok(data) => data,
-            Err(status) => return status,
-        };
+        let data = req.data().to_device();
+
         let Some(p) = data.view::<FsSeekParams>() else {
             return DriverStatus::InvalidParameter;
         };

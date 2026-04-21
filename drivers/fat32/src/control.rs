@@ -234,7 +234,6 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             RequestData::from_t::<Vec<u8>>(ctrl_link.into_bytes()),
         );
         binding.set_traversal_policy(TraversalPolicy::ForwardLower);
-        println!("register");
         pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
