@@ -84,10 +84,8 @@ impl VolumeCacheBackend for CacheBackend {
             let offset = lba * BLOCK_SIZE as u64;
             let len = block_len;
 
-            let mut req = RequestHandle::new(
-                RequestType::Read { offset, len },
-                RequestData::empty(),
-            );
+            let mut req =
+                RequestHandle::new(RequestType::Read { offset, len }, RequestData::empty());
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             let mut buf = BufSlice::new(&mut out[..len]);
@@ -474,7 +472,11 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    let req_data_len = req.read().view_data::<BufSlice>().map(|b| b.len()).unwrap_or(0);
+    let req_data_len = req
+        .read()
+        .view_data::<BufSlice>()
+        .map(|b| b.len())
+        .unwrap_or(0);
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
@@ -542,7 +544,13 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, req.read().view_data::<BufSlice>().map(|b| b.len()).unwrap_or(0));
+    len = core::cmp::min(
+        len,
+        req.read()
+            .view_data::<BufSlice>()
+            .map(|b| b.len())
+            .unwrap_or(0),
+    );
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {

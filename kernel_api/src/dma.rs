@@ -1,9 +1,11 @@
 use alloc::sync::Arc;
 
 pub use kernel_types::dma::{
-    DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity,
+    Bidirectional, Described, DmaDeviceHandle, DmaDeviceState, DmaMapped, DmaPciDeviceIdentity,
+    FromDevice, Mdl, MdlDmaSegment, MdlError, MdlPageFrame, Pinned, ToDevice,
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR, DMA_IOMMU_VENDOR_NONE,
     DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED,
+    MDL_INLINE_PAGE_CAPACITY, MDL_INLINE_SEGMENT_CAPACITY, MDL_PAGE_SIZE,
 };
 use kernel_types::device::DeviceObject;
 use kernel_types::status::DriverStatus;
