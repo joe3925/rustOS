@@ -12,6 +12,9 @@ use alloc::{sync::Arc, vec::Vec};
 use core::arch::asm;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
+use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE;
+use kernel_api::dma::dma::DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED;
+use kernel_api::dma::dma::DmaPciDeviceIdentity;
 
 use dev_ext::{
     DevExt, McfgSegment, PciPdoExt, PrtEntry, build_resources_blob, ecam_bus_base_from_segment,
@@ -21,11 +24,8 @@ use dev_ext::{
 
 use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
-    dma::{
-        register_pci_pdo, DmaPciDeviceIdentity, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
-        DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED,
-    },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
+    dma::register_pci_pdo,
     kernel_types::{
         io::{IoType, IoVtable},
         pnp::DeviceIds,
@@ -108,7 +108,8 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
             .read()
             .pnp
             .as_ref()
-            .and_then(|p| p.data_out_ref().view::<Vec<u8>>()).cloned()
+            .and_then(|p| p.data_out_ref().view::<Vec<u8>>())
+            .cloned()
             .unwrap_or_default();
         let segs = parse_ecam_segments_from_blob(&blob);
 
@@ -417,8 +418,7 @@ pub async fn pci_pdo_query_resources<'a, 'b>(
         let mut r = req.write();
         match r.pnp.as_mut() {
             Some(pnp) => {
-                pnp.data_out =
-                    RequestData::from_t::<Vec<u8>>(build_resources_blob(&ext));
+                pnp.data_out = RequestData::from_t::<Vec<u8>>(build_resources_blob(&ext));
                 DriverStatus::Success
             }
             None => DriverStatus::InvalidParameter,
