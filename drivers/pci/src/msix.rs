@@ -76,7 +76,7 @@ pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_>)
     };
 
     let entries = match {
-        let data = req.data().to_device();
+        let data = req.data().read_only();
         parse_msix_setup_request(data.view::<Vec<u8>>().map(|v| v.as_slice()).unwrap_or(&[]))
     } {
         Some(e) => e,

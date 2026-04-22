@@ -2916,7 +2916,7 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             }
 
                             let both = {
-                                let data = req.data().to_device();
+                                let data = req.data().read_only();
                                 match data.view::<BenchSweepBothResult>() {
                                     Some(r) => *r,
                                     None => {

@@ -960,9 +960,8 @@ pub async fn virtio_pdo_read<'a, 'b>(
                         return complete_req(req, DriverStatus::InvalidParameter);
                     }
                 };
-                let dst = &mut data
-                    .view_mut::<[u8]>()
-                    .expect("read req missing buffer")[buf_offset..buf_offset + chunk_len as usize];
+                let dst = &mut data.view_mut::<[u8]>().expect("read req missing buffer")
+                    [buf_offset..buf_offset + chunk_len as usize];
                 dst.copy_from_slice(io_req.data_slice());
             }
 
@@ -1072,9 +1071,8 @@ pub async fn virtio_pdo_write<'a, 'b>(
                         return complete_req(req, DriverStatus::InvalidParameter);
                     }
                 };
-                let src =
-                    &data.view::<[u8]>().expect("write req missing buffer")
-                        [buf_offset..buf_offset + chunk_len as usize];
+                let src = &data.view::<[u8]>().expect("write req missing buffer")
+                    [buf_offset..buf_offset + chunk_len as usize];
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 
@@ -1207,7 +1205,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             let params_in = {
                 let r = req.write();
                 r.data()
-                    .to_device()
+                    .read_only()
                     .view::<BenchSweepParams>()
                     .copied()
                     .unwrap_or_default()

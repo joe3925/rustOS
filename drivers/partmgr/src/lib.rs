@@ -238,7 +238,7 @@ pub async fn partmgr_start<'a, 'b>(
         return DriverStep::complete(status);
     }
 
-    if let Some(data) = parent_req.write().data().to_device().view::<DiskInfo>() {
+    if let Some(data) = parent_req.write().data().read_only().view::<DiskInfo>() {
         dx.disk_info.call_once(|| data.clone());
     } else {
         return DriverStep::complete(status);
@@ -257,7 +257,7 @@ async fn read_from_lower_async(
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let status = {
-        let mut borrow = BorrowedHandle::from_device(&mut child_req, &mut data[..]);
+        let mut borrow = BorrowedHandle::writable(&mut child_req, &mut data[..]);
         pnp_forward_request_to_next_lower(dev.clone(), borrow.handle()).await
     };
 

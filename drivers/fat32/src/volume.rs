@@ -126,7 +126,7 @@ fn execute_fs_work(
 
         FsOp::Open => {
             let (path, flags, write_through) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsOpenParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -187,7 +187,7 @@ fn execute_fs_work(
 
         FsOp::Close => {
             let fs_file_id = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsCloseParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -206,7 +206,7 @@ fn execute_fs_work(
         FsOp::Read => {
             // Extract the buffer pointer from the borrowed params without moving them.
             let (fs_file_id, offset, buf_ptr, buf_len) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsReadParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
@@ -265,7 +265,7 @@ fn execute_fs_work(
 
         FsOp::Write => {
             let (fs_file_id, offset, write_through, data_ptr, data_len) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsWriteParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
@@ -338,7 +338,7 @@ fn execute_fs_work(
 
         FsOp::Flush => {
             let fs_file_id = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsFlushParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -365,7 +365,7 @@ fn execute_fs_work(
 
         FsOp::Create => {
             let err = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsCreateParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -382,7 +382,7 @@ fn execute_fs_work(
 
         FsOp::Rename => {
             let (src, dst) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsRenameParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -405,7 +405,7 @@ fn execute_fs_work(
 
         FsOp::ReadDir => {
             let res = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsListDirParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -424,7 +424,7 @@ fn execute_fs_work(
 
         FsOp::GetInfo => {
             let fs_file_id = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsGetInfoParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -459,7 +459,7 @@ fn execute_fs_work(
 
         FsOp::SetLen => {
             let (fs_file_id, new_size) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsSetLenParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -498,7 +498,7 @@ fn execute_fs_work(
 
         FsOp::Append => {
             let (fs_file_id, write_through, data_ptr, data_len) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsAppendParams<'_>>() else {
                     return DriverStatus::InvalidParameter;
@@ -566,7 +566,7 @@ fn execute_fs_work(
 
         FsOp::ZeroRange => {
             let (fs_file_id, offset, len) = {
-                let data = req.data().to_device();
+                let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsZeroRangeParams>() else {
                     return DriverStatus::InvalidParameter;
@@ -622,7 +622,7 @@ fn execute_fs_work(
 
 fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStatus {
     let (fs_file_id, origin, offset) = {
-        let data = req.data().to_device();
+        let data = req.data().read_only();
 
         let Some(p) = data.view::<FsSeekParams>() else {
             return DriverStatus::InvalidParameter;

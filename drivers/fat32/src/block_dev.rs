@@ -118,7 +118,7 @@ impl BlockDev {
         self.prep_req_read(offset, len);
 
         let status = {
-            let mut borrow = BorrowedHandle::from_device(&mut self.req, dst);
+            let mut borrow = BorrowedHandle::writable(&mut self.req, dst);
             pnp_send_request(volume, borrow.handle()).await
         };
 
@@ -137,7 +137,7 @@ impl BlockDev {
         self.prep_req_write(offset, len, false);
 
         let status = {
-            let mut borrow = BorrowedHandle::to_device(&mut self.req, src);
+            let mut borrow = BorrowedHandle::read_only(&mut self.req, src);
             pnp_send_request(volume, borrow.handle()).await
         };
 

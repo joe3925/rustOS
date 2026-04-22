@@ -426,7 +426,7 @@ async fn try_bind_filesystems_for_parent_fdo(
             continue;
         }
 
-        let Some(id) = identify_req.write().data().to_device().view::<FsIdentify>() else {
+        let Some(id) = identify_req.write().data().read_only().view::<FsIdentify>() else {
             continue;
         };
         if !id.can_mount {
@@ -495,7 +495,7 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
 fn string_from_req(req: &mut Request) -> Option<String> {
     core::str::from_utf8(
         req.data()
-            .to_device()
+            .read_only()
             .view::<Vec<u8>>()
             .map(|v| v.as_slice())
             .unwrap_or(&[]),
@@ -592,7 +592,7 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
     if let Some(_) = req_inner
         .write()
         .data()
-        .to_device()
+        .read_only()
         .view::<FsOpenResult>()
         .map(|res| res.error.is_none())
     {

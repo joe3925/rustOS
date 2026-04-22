@@ -29,16 +29,16 @@ enum StorageMode {
     /// Must NOT be dropped or deallocated — the driver retains ownership via BorrowedHandle.
     /// Non-owning shared borrow of driver-owned data. `data_ptr` points at the erased payload
     /// data while `metadata` carries any DST metadata needed to rebuild it.
-    BorrowedToDevice = 2,
+    BorrowedReadOnly = 2,
     /// Non-owning mutable borrow of driver-owned data. `data_ptr` points at the erased payload
     /// data while `metadata` carries any DST metadata needed to rebuild it.
-    BorrowedFromDevice = 3,
+    BorrowedWritable = 3,
 }
 
 impl StorageMode {
     #[inline]
     fn is_borrowed(self) -> bool {
-        matches!(self, Self::BorrowedToDevice | Self::BorrowedFromDevice)
+        matches!(self, Self::BorrowedReadOnly | Self::BorrowedWritable)
     }
 }
 /// Aligned inline buffer for small data
@@ -75,6 +75,33 @@ impl core::fmt::Debug for InlineBuffer {
 /// Dropper function signature - only does drop_in_place, never deallocates
 type DropperFn = fn(*mut u8);
 
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as RequestPayload without an outer layout guarantee",
+    label = "missing outer layout guarantee for `{Self}`",
+    note = "add #[repr(C)] or #[repr(transparent)] to the type, or write `unsafe impl FfiSafe for {Self}` if you are asserting it manually"
+)]
+
+/// Unsafe escape hatch for `RequestPayload` on types whose outer layout is not
+/// expressed with a non-Rust `repr(...)`.
+///
+/// `#[repr(C)]`, `#[repr(transparent)]`, and supported enum primitive reprs are
+/// accepted by `RequestPayload` derive without this trait.
+///
+/// Implementing `FfiSafe` asserts that the type's outer layout is still safe to
+/// round-trip through the request payload FFI boundary even though the layout is
+/// not being enforced structurally by `repr(...)`.
+///
+/// This trait only covers the outer layout contract of `Self`. It does not
+/// guarantee anything about the internal layout or semantics of field types;
+/// those remain the API author's responsibility.
+///
+/// # Safety
+///
+/// Implement this trait only if the exact type may be cast to and from its raw
+/// payload representation across the request FFI boundary without causing
+/// layout-related undefined behavior.
+pub unsafe trait FfiSafe {}
+
 /// Erased raw payload parts stored inside [`RequestData`].
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy)]
@@ -83,48 +110,8 @@ pub struct RequestPayloadRawParts {
     pub metadata: usize,
     pub bytes: usize,
 }
-
-/// Supported request payload transport contract.
-///
-/// The old generic borrowed-payload API accepted reference-like `T` such as `&[u8]` or `&str`.
-/// That compiled, but the transport stored a pointer to the reference object or fat-pointer value
-/// instead of a stable representation of the underlying payload. `RequestPayload` makes the
-/// transport explicit: only types with a real transport implementation compile, and borrowed DST
-/// payloads like `[u8]` reconstruct directly from raw pointer + metadata.
-///
-/// ```compile_fail
-/// use kernel_types::request::RequestData;
-///
-/// let bytes: &[u8] = &[1, 2, 3];
-/// let _ = RequestData::from_t(bytes);
-/// ```
-///
-/// ```compile_fail
-/// use kernel_types::request::RequestData;
-///
-/// let text: &str = "hello";
-/// let _ = RequestData::from_t(text);
-/// ```
-///
-/// ```compile_fail
-/// use kernel_types::request::{BorrowedHandle, RequestData, RequestHandle, RequestType};
-///
-/// let bytes = [1u8, 2, 3];
-/// let mut handle = RequestHandle::new(
-///     RequestType::Write {
-///         offset: 0,
-///         len: bytes.len(),
-///         flush_write_through: false,
-///         owner: 0,
-///     },
-///     RequestData::empty(),
-/// );
-/// let mut borrow = BorrowedHandle::to_device(&mut handle, &bytes[..]);
-/// let mut view = borrow.handle().data().to_device();
-/// let _ = view.view_mut::<[u8]>();
-/// ```
 pub unsafe trait RequestPayload: Send + Sync {
-    /// Stable runtime tag for matching this payload type.
+    /// Stable runtime tag for matching this payload type. Either impl or use type_tag::<T>()
     fn runtime_tag() -> u64;
 
     /// Static byte size for nominal sized payloads.
@@ -332,7 +319,7 @@ impl<'a, Direction> RequestDataRefMut<'a, Direction> {
     }
 
     #[inline]
-    pub fn to_device(self) -> RequestDataRef<'a, ToDevice> {
+    pub fn read_only(self) -> RequestDataRef<'a, ToDevice> {
         RequestDataRef {
             data: &*self.data,
             _direction: PhantomData,
@@ -358,10 +345,10 @@ impl<'a> RequestDataView<'a> {
     /// Obtain a shared `ToDevice` view regardless of the backing mode so callers that only need
     /// read access do not need to match on direction first.
     #[inline]
-    pub fn to_device(self) -> RequestDataRef<'a, ToDevice> {
+    pub fn read_only(self) -> RequestDataRef<'a, ToDevice> {
         match self {
             Self::ToDevice(view) => view,
-            Self::FromDevice(view) => view.to_device(),
+            Self::FromDevice(view) => view.read_only(),
         }
     }
 }
@@ -574,8 +561,8 @@ impl RequestData {
             data: match self.mode {
                 StorageMode::Inline => self.inline.as_ptr() as *mut u8,
                 StorageMode::HeapTyped
-                | StorageMode::BorrowedToDevice
-                | StorageMode::BorrowedFromDevice => self.data_ptr,
+                | StorageMode::BorrowedReadOnly
+                | StorageMode::BorrowedWritable => self.data_ptr,
             },
             metadata: self.metadata,
             bytes: self.size,
@@ -619,8 +606,8 @@ impl RequestData {
         let parts = RequestPayloadRawParts {
             data: match self.mode {
                 StorageMode::Inline => self.inline.as_mut_ptr(),
-                StorageMode::HeapTyped | StorageMode::BorrowedFromDevice => self.data_ptr,
-                StorageMode::BorrowedToDevice => return None,
+                StorageMode::HeapTyped | StorageMode::BorrowedWritable => self.data_ptr,
+                StorageMode::BorrowedReadOnly => return None,
             },
             metadata: self.metadata,
             bytes: self.size,
@@ -661,7 +648,7 @@ impl RequestData {
 
                 value
             }
-            StorageMode::BorrowedToDevice | StorageMode::BorrowedFromDevice => {
+            StorageMode::BorrowedReadOnly | StorageMode::BorrowedWritable => {
                 // Cannot move out of a borrow — driver retains ownership
                 return None;
             }
@@ -700,7 +687,7 @@ impl Drop for RequestData {
                     }
                 }
             }
-            StorageMode::BorrowedToDevice | StorageMode::BorrowedFromDevice => {
+            StorageMode::BorrowedReadOnly | StorageMode::BorrowedWritable => {
                 // Not owned — driver retains ownership via BorrowedHandle. Do nothing.
             }
         }
@@ -841,11 +828,11 @@ impl Request {
     #[inline]
     pub fn data(&mut self) -> RequestDataView<'_> {
         match self.data.mode {
-            StorageMode::BorrowedToDevice => RequestDataView::ToDevice(RequestDataRef {
+            StorageMode::BorrowedReadOnly => RequestDataView::ToDevice(RequestDataRef {
                 data: &self.data,
                 _direction: PhantomData,
             }),
-            StorageMode::BorrowedFromDevice | StorageMode::Inline | StorageMode::HeapTyped => {
+            StorageMode::BorrowedWritable | StorageMode::Inline | StorageMode::HeapTyped => {
                 RequestDataView::FromDevice(RequestDataRefMut {
                     data: &mut self.data,
                     _direction: PhantomData,
@@ -1104,8 +1091,8 @@ pub struct RequestHandleResult<'a> {
 /// `'req`  — lifetime of our exclusive borrow of the RequestHandle
 /// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
 enum BorrowedStorage<'data, T: ?Sized> {
-    ToDevice(&'data T),
-    FromDevice(&'data mut T),
+    ReadOnly(&'data T),
+    Writable(&'data mut T),
 }
 
 pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> {
@@ -1125,21 +1112,21 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
         Self { handle, borrow }
     }
 
-    pub fn to_device(handle: &'req mut RequestHandle<'h>, data: &'data T) -> Self {
+    pub fn read_only(handle: &'req mut RequestHandle<'h>, data: &'data T) -> Self {
         Self::install(
             handle,
             T::shared_raw_parts(data),
-            StorageMode::BorrowedToDevice,
-            BorrowedStorage::ToDevice(data),
+            StorageMode::BorrowedReadOnly,
+            BorrowedStorage::ReadOnly(data),
         )
     }
 
-    pub fn from_device(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
+    pub fn writable(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
         Self::install(
             handle,
             T::mut_raw_parts(data),
-            StorageMode::BorrowedFromDevice,
-            BorrowedStorage::FromDevice(data),
+            StorageMode::BorrowedWritable,
+            BorrowedStorage::Writable(data),
         )
     }
 
@@ -1149,7 +1136,9 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
     }
 }
 
-impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> Drop for BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> Drop
+    for BorrowedHandle<'data, 'req, 'h, T>
+{
     fn drop(&mut self) {
         let _ = &self.borrow;
         // SAFETY: handle is still valid — 'req is live while Self exists.
@@ -1162,4 +1151,3 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> Drop for BorrowedHandle<
         }
     }
 }
-

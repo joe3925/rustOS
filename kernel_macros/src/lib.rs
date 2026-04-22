@@ -1,27 +1,97 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::format_ident;
 use quote::quote;
-use syn::{Data, DeriveInput, FnArg, ItemFn, Pat, ReturnType, Type, parse_macro_input};
+use syn::Data;
+use syn::DeriveInput;
+use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
+
+fn repr_kinds(attrs: &[syn::Attribute]) -> Vec<String> {
+    let mut out = Vec::new();
+
+    for attr in attrs {
+        if !attr.path().is_ident("repr") {
+            continue;
+        }
+
+        let _ = attr.parse_nested_meta(|meta| {
+            if let Some(ident) = meta.path.get_ident() {
+                out.push(ident.to_string());
+            }
+            Ok(())
+        });
+    }
+
+    out
+}
+
+fn has_struct_layout_repr(attrs: &[syn::Attribute]) -> bool {
+    let reprs = repr_kinds(attrs);
+
+    for repr in reprs {
+        if repr == "C" || repr == "transparent" {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_enum_layout_repr(attrs: &[syn::Attribute]) -> bool {
+    let reprs = repr_kinds(attrs);
+
+    for repr in reprs {
+        match repr.as_str() {
+            "C" | "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64"
+            | "isize" => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
 
 #[proc_macro_derive(RequestPayload)]
 pub fn derive_request_payload(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
 
-    if matches!(input.data, Data::Union(_)) {
-        return syn::Error::new_spanned(
-            input.ident,
-            "RequestPayload derive does not support unions",
-        )
-        .to_compile_error()
-        .into();
-    }
+    let needs_ffi_safe = match &input.data {
+        Data::Union(_) => {
+            return syn::Error::new_spanned(
+                &input.ident,
+                "RequestPayload derive does not support unions",
+            )
+            .to_compile_error()
+            .into();
+        }
+        Data::Struct(_) => !has_struct_layout_repr(&input.attrs),
+        Data::Enum(_) => !has_enum_layout_repr(&input.attrs),
+    };
 
     let ident = input.ident;
     let generics = input.generics;
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
+    let ffi_safe_check_item = if needs_ffi_safe {
+        let helper_ident = format_ident!("__request_payload_ffi_safe_check_for_{}", ident);
+
+        quote! {
+            #[allow(non_snake_case, dead_code)]
+            fn #helper_ident #impl_generics () #where_clause {
+                fn assert_impl<T: ::kernel_types::request::FfiSafe>() {}
+                assert_impl::<#ident #ty_generics>();
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     quote! {
-        unsafe impl #impl_generics ::kernel_types::request::RequestPayload for #ident #ty_generics #where_clause {
+        #ffi_safe_check_item
+
+        unsafe impl #impl_generics ::kernel_types::request::RequestPayload
+            for #ident #ty_generics #where_clause
+        {
             #[inline]
             fn runtime_tag() -> u64 {
                 ::kernel_types::request::type_tag::<Self>()
@@ -33,7 +103,9 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            fn shared_raw_parts(payload: &Self) -> ::kernel_types::request::RequestPayloadRawParts {
+            fn shared_raw_parts(
+                payload: &Self,
+            ) -> ::kernel_types::request::RequestPayloadRawParts {
                 ::kernel_types::request::RequestPayloadRawParts {
                     data: payload as *const Self as *mut u8,
                     metadata: 0,
@@ -42,7 +114,9 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            fn mut_raw_parts(payload: &mut Self) -> ::kernel_types::request::RequestPayloadRawParts {
+            fn mut_raw_parts(
+                payload: &mut Self,
+            ) -> ::kernel_types::request::RequestPayloadRawParts {
                 ::kernel_types::request::RequestPayloadRawParts {
                     data: payload as *mut Self as *mut u8,
                     metadata: 0,
@@ -67,7 +141,6 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
     }
     .into()
 }
-
 #[proc_macro_attribute]
 pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
@@ -229,7 +302,7 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let sig = &mut func.sig;
     let body = &func.block;
 
-    let _fn_ident = sig.ident.clone();
+    let fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
 
     // Remove async keyword

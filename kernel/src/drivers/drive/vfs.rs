@@ -164,7 +164,7 @@ impl Vfs {
     {
         let mut request_handle = RequestHandle::new(RequestType::Fs(op), RequestData::empty());
         request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let mut borrow = BorrowedHandle::to_device(&mut request_handle, &param);
+        let mut borrow = BorrowedHandle::read_only(&mut request_handle, &param);
 
         let status = {
             if let Some(tgt) = target {
@@ -181,7 +181,7 @@ impl Vfs {
             return Err(status);
         }
 
-        if let Some(res) = borrow.handle().write().data().to_device().view::<TResult>() {
+        if let Some(res) = borrow.handle().write().data().read_only().view::<TResult>() {
             return Ok(res.clone());
         } else {
             return Err(DriverStatus::InvalidParameter);

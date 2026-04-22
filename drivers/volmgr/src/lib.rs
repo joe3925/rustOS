@@ -91,7 +91,7 @@ impl VolumeCacheBackend for CacheBackend {
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             let status = {
-                let mut borrow = BorrowedHandle::from_device(&mut req, &mut out[..len]);
+                let mut borrow = BorrowedHandle::writable(&mut req, &mut out[..len]);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -124,7 +124,7 @@ impl VolumeCacheBackend for CacheBackend {
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             let status = {
-                let mut borrow = BorrowedHandle::to_device(&mut req, &data[..block_len]);
+                let mut borrow = BorrowedHandle::read_only(&mut req, &data[..block_len]);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -473,7 +473,9 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     let req_data_len = match req.data() {
         RequestDataView::FromDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
-        RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        RequestDataView::ToDevice(_) => {
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
     let mut len = len_req;
@@ -487,9 +489,13 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     let mut data = match req.data() {
         RequestDataView::FromDevice(data) => data,
-        RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        RequestDataView::ToDevice(_) => {
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
-    let dst = data.view_mut::<[u8]>().expect("read response missing buffer");
+    let dst = data
+        .view_mut::<[u8]>()
+        .expect("read response missing buffer");
 
     match cache.read_at(offset, &mut dst[..len]).await {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
@@ -539,10 +545,15 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
-    len = core::cmp::min(len, match req.data() {
-        RequestDataView::ToDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
-        RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
-    });
+    len = core::cmp::min(
+        len,
+        match req.data() {
+            RequestDataView::ToDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
+            RequestDataView::FromDevice(_) => {
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        },
+    );
     len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
@@ -551,7 +562,9 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let data = match req.data() {
         RequestDataView::ToDevice(data) => data,
-        RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        RequestDataView::FromDevice(_) => {
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
     let data = data.view::<[u8]>().expect("write req missing buffer");
 

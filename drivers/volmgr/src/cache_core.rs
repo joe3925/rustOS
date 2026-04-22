@@ -488,7 +488,7 @@ where
 
         {
             let data = page.data.read();
-            let mut borrow = BorrowedHandle::to_device(&mut req, &data.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &data.bytes[..]);
             self.backend
                 .write_request(borrow.handle())
                 .await
@@ -541,7 +541,7 @@ where
 
         let write_res = {
             let data = page.data.read();
-            let mut borrow = BorrowedHandle::to_device(&mut req, &data.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &data.bytes[..]);
             backend
                 .write_request(borrow.handle())
                 .await
