@@ -60,6 +60,8 @@ export! {
     kernel_dma_register_pci_pdo,
     kernel_dma_open_device_handle,
     kernel_dma_query_device_state,
+    kernel_dma_map_buffer,
+    kernel_dma_unmap_buffer,
 
     irq_handle_create,
     irq_handle_clone,

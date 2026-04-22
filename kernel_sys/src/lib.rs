@@ -14,7 +14,10 @@ use kernel_types::async_ffi::FfiFuture;
 use kernel_types::benchmark::{
     BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
 };
-use kernel_types::dma::{DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity};
+use kernel_types::dma::{
+    DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
+    IoBufferInner,
+};
 use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
 use kernel_types::runtime::BlockOnThreadState;
@@ -84,6 +87,12 @@ unsafe extern "win64" {
         device: &Arc<DeviceObject>,
     ) -> Result<DmaDeviceHandle, DriverStatus>;
     pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
+    pub fn kernel_dma_map_buffer<'a>(
+        device: &Arc<DeviceObject>,
+        buffer: IoBufferInner<'a>,
+        strategy: DmaMappingStrategy,
+    ) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)>;
+    pub fn kernel_dma_unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a>;
 
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(

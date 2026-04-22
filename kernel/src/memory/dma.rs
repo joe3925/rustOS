@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
-    DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity,
-    DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
+    IoBufferInner, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
     DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
 };
 use kernel_types::status::DriverStatus;
@@ -40,6 +40,35 @@ pub fn unregister_device(device: &Arc<DeviceObject>) -> DriverStatus {
 
 pub fn platform_iommu_info() -> &'static PlatformIommuInfo {
     manager().platform.as_ref()
+}
+
+// ---------------------------------------------------------------------------
+// IoBuffer mapping
+// ---------------------------------------------------------------------------
+
+pub fn map_buffer<'a>(
+    device: &Arc<DeviceObject>,
+    buffer: IoBufferInner<'a>,
+    strategy: DmaMappingStrategy,
+) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)> {
+    let _ = (device, buffer, strategy);
+
+    // TODO: validate the DMA registration for `device` and return the erased
+    // `IoBufferInner` with `DmaMapError::NoIommu` when the device cannot map.
+    // TODO: interpret `strategy`, pin pages when required, and populate DMA
+    // segments in the returned `IoBufferInner`.
+    // TODO: allocate and track IOVA / IOMMU state so `kernel_dma_unmap_buffer`
+    // can tear the mapping down later.
+    todo!("kernel DMA buffer mapping is not implemented yet")
+}
+
+pub fn unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
+    let _ = buffer;
+    // TODO: tear down the IOMMU / IOVA state referenced by the erased
+    // `IoBufferInner`.
+    // TODO: clear DMA segments and restore the post-unmap `IoBuffer` state in
+    // the returned erased buffer.
+    todo!("kernel DMA buffer unmapping is not implemented yet")
 }
 
 fn manager() -> &'static DmaManager {
@@ -143,7 +172,9 @@ struct DmaManagerState {
 
 impl DmaManagerState {
     fn new() -> Self {
-        Self { devices: BTreeMap::new() }
+        Self {
+            devices: BTreeMap::new(),
+        }
     }
 }
 

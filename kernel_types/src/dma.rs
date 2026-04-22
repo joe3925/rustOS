@@ -1,5 +1,4 @@
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -62,6 +61,7 @@ mod sealed {
     pub trait IoBufferState {}
     pub trait IoBufferDirection {}
     pub trait WritableDirection {}
+    pub trait MappableState {}
 }
 
 pub trait IoBufferState: sealed::IoBufferState {}
@@ -76,6 +76,61 @@ impl<T: IoBufferDirection + sealed::WritableDirection> WritableIoBufferDirection
 impl sealed::IoBufferState for Described {}
 impl sealed::IoBufferState for Pinned {}
 impl sealed::IoBufferState for DmaMapped {}
+
+pub trait MappableIoBufferState: IoBufferState + sealed::MappableState {}
+impl<T: IoBufferState + sealed::MappableState> MappableIoBufferState for T {}
+
+impl sealed::MappableState for Described {}
+impl sealed::MappableState for Pinned {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaMappingStrategy {
+    /// Entire buffer mapped as a single contiguous IOVA region -> 1 segment.
+    SingleContiguous,
+    /// Buffer divided into N equal chunks; each chunk is one contiguous IOVA
+    /// segment. Requires `buffer.len() % chunk_size == 0` and
+    /// `chunk_size % PAGE_SIZE == 0`.
+    ContiguousChunks { chunk_size: usize },
+    /// Every page's IOVA == its physical address. Adjacent physical pages are
+    /// merged into a single segment.
+    FullIdentity,
+    /// First `contiguous_byte_len` bytes -> one contiguous IOVA segment.
+    /// Remaining pages -> identity-mapped, merged where physically adjacent.
+    /// Requires `(page_offset + contiguous_byte_len) % PAGE_SIZE == 0` and
+    /// `0 < contiguous_byte_len < buffer.len()`.
+    PartialContiguousThenIdentity { contiguous_byte_len: usize },
+    /// One IOVA segment per page (scatter-gather, no merging).
+    ScatterGather,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DmaMapError {
+    /// IOMMU not available or device not registered.
+    NoIommu,
+    /// Mapping would require allocating synthetic IOVA space, which is not
+    /// implemented yet for this path.
+    RemappingUnavailable,
+    /// `chunk_size` does not evenly divide `buffer.len()`.
+    UnalignedChunkSize {
+        buffer_len: usize,
+        chunk_size: usize,
+    },
+    /// `chunk_size` is not a multiple of `IOBUFFER_PAGE_SIZE`.
+    ChunkSizeNotPageAligned { chunk_size: usize },
+    /// `contiguous_byte_len` is not on a page boundary within the buffer,
+    /// or is zero, or is >= buffer.len().
+    InvalidPartialBoundary {
+        contiguous_byte_len: usize,
+        buffer_len: usize,
+    },
+    /// Buffer spans more pages than inline page-frame storage can describe
+    /// (capacity = 32).
+    PageCapacityExceeded { required: usize },
+    /// Too many resulting segments to fit in inline storage (capacity = 32).
+    SegmentCapacityExceeded { required: usize },
+    /// `chunk_size` is zero or buffer is empty.
+    InvalidSize,
+}
 
 impl sealed::IoBufferDirection for ToDevice {}
 impl sealed::IoBufferDirection for FromDevice {}
@@ -112,14 +167,16 @@ const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     reserved: 0,
 };
 
-type DmaUnmapFn = fn(&Arc<DeviceObject>, usize);
+pub type DmaUnmapFn = fn(&Arc<DeviceObject>, usize);
 
+#[repr(C)]
 struct DmaDropContext {
     mapped_by: Arc<DeviceObject>,
     unmap: DmaUnmapFn,
     cookie: usize,
 }
 
+#[repr(C)]
 enum IoBufferBorrow<'a> {
     ReadOnly(&'a [u8]),
     Writable(&'a mut [u8]),
@@ -162,7 +219,9 @@ impl<'a> IoBufferBorrow<'a> {
     }
 }
 
-struct IoBufferInner<'a> {
+/// ABI-erased `IoBuffer` storage passed across the kernel DMA map/unmap calls.
+#[repr(C)]
+pub struct IoBufferInner<'a> {
     borrow: IoBufferBorrow<'a>,
     virt_addr: usize,
     page_base: usize,
@@ -293,7 +352,8 @@ pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
 }
 
 impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State, Direction> {
-    fn from_inner(inner: IoBufferInner<'a>) -> Self {
+    /// Rebuild an `IoBuffer` from its ABI-erased inner storage.
+    pub fn from_inner(inner: IoBufferInner<'a>) -> Self {
         Self {
             inner,
             _state: PhantomData,
@@ -301,8 +361,9 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
         }
     }
 
-    #[allow(dead_code)]
-    fn into_inner(self) -> IoBufferInner<'a> {
+    /// Erase the state and direction markers while preserving the underlying
+    /// buffer storage.
+    pub fn into_inner(self) -> IoBufferInner<'a> {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
     }
@@ -396,6 +457,43 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> Drop
         if let Some(drop_ctx) = self.inner.dma_drop.take() {
             (drop_ctx.unmap)(&drop_ctx.mapped_by, drop_ctx.cookie);
         }
+    }
+}
+
+impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, S, D> {
+    /// Consume this buffer, fill DMA segments, register the unmap callback,
+    /// and return an `IoBuffer<DmaMapped, D>`.
+    ///
+    /// On error the original buffer is returned so the caller can recover it.
+    pub fn apply_dma_mapping(
+        self,
+        segments: &[IoBufferDmaSegment],
+        mapped_by: Arc<DeviceObject>,
+        unmap: DmaUnmapFn,
+        cookie: usize,
+    ) -> Result<IoBuffer<'a, DmaMapped, D>, (Self, IoBufferError)> {
+        let mut inner = self.into_inner();
+        if let Err(e) = inner.replace_dma_segments(segments) {
+            return Err((IoBuffer::<'a, S, D>::from_inner(inner), e));
+        }
+        inner.set_dma_drop(mapped_by, unmap, cookie);
+        Ok(IoBuffer::<'a, DmaMapped, D>::from_inner(inner))
+    }
+}
+
+impl<'a, D: IoBufferDirection> IoBuffer<'a, DmaMapped, D> {
+    /// Consume this `DmaMapped` buffer, invoke the stored unmap callback,
+    /// clear all DMA segments, and return a `Described` buffer wrapping the
+    /// same underlying slice.
+    pub fn remove_dma_mapping(self) -> IoBuffer<'a, Described, D> {
+        let mut inner = self.into_inner();
+        if let Some(ctx) = inner.dma_drop.take() {
+            (ctx.unmap)(&ctx.mapped_by, ctx.cookie);
+        }
+        inner.mapped_by = None;
+        inner.dma_segments.fill(EMPTY_DMA_SEGMENT);
+        inner.dma_segments_len = 0;
+        IoBuffer::<'a, Described, D>::from_inner(inner)
     }
 }
 

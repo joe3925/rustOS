@@ -19,7 +19,7 @@ use kernel_types::{
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
-    dma::{DmaDeviceHandle, DmaDeviceState, DmaPciDeviceIdentity},
+    dma::{DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity, IoBufferInner},
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     fs::{OpenFlags, Path},
     io::IoTarget,
@@ -169,6 +169,23 @@ pub extern "win64" fn kernel_dma_query_device_state(
     device: &Arc<DeviceObject>,
 ) -> Option<DmaDeviceState> {
     dma::query_device_state(device)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_map_buffer<'a>(
+    device: &Arc<DeviceObject>,
+    buffer: IoBufferInner<'a>,
+    strategy: DmaMappingStrategy,
+) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)>
+{
+    dma::map_buffer(device, buffer, strategy)
+}
+
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_unmap_buffer<'a>(
+    buffer: IoBufferInner<'a>,
+) -> IoBufferInner<'a> {
+    dma::unmap_buffer(buffer)
 }
 
 #[no_mangle]
