@@ -34,6 +34,7 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{
     BorrowedHandle, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
 };
@@ -91,7 +92,8 @@ impl VolumeCacheBackend for CacheBackend {
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             let status = {
-                let mut borrow = BorrowedHandle::writable(&mut req, &mut out[..len]);
+                let mut io_buf = IoBuffer::<Described, FromDevice>::new(&mut out[..len]);
+                let mut borrow = BorrowedHandle::writable(&mut req, &mut io_buf);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -123,8 +125,9 @@ impl VolumeCacheBackend for CacheBackend {
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
+            let io_buf = IoBuffer::<Described, ToDevice>::new(&data[..block_len]);
             let status = {
-                let mut borrow = BorrowedHandle::read_only(&mut req, &data[..block_len]);
+                let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 

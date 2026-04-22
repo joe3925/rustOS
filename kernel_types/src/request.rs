@@ -110,7 +110,7 @@ pub struct RequestPayloadRawParts {
     pub metadata: usize,
     pub bytes: usize,
 }
-pub unsafe trait RequestPayload: Send + Sync {
+pub unsafe trait RequestPayload: Send {
     /// Stable runtime tag for matching this payload type. Either impl or use type_tag::<T>()
     fn runtime_tag() -> u64;
 
@@ -438,7 +438,7 @@ pub fn type_name_stripped<T>() -> String {
 // pointer to driver-owned data in one of the borrowed modes. Borrowed payloads are installed
 // through BorrowedHandle, which enforces both the lifetime and T: RequestPayload bounds.
 unsafe impl Send for RequestData {}
-unsafe impl Sync for RequestData {}
+
 /// Compute a type tag for `T`, stripping lifetime parameters from generic argument lists
 /// so that e.g. `FsAppendParams<'_>` and `FsAppendParams<'data>` produce the same hash,
 /// while non-lifetime generics (e.g. `Vec<u8>` vs `Vec<u16>`) remain distinct.

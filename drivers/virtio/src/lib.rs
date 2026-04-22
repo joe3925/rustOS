@@ -34,6 +34,7 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
 use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
@@ -873,7 +874,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
     // Ensure caller-provided buffer is large enough for the requested transfer.
     match req.data() {
         RequestDataView::FromDevice(data)
-            if data.view::<[u8]>().map_or(false, |b| b.len() >= len) => {}
+            if data.view::<IoBuffer<'_, Described, FromDevice>>().map_or(false, |b| b.len() >= len) => {}
         RequestDataView::FromDevice(_) => {
             return complete_req(req, DriverStatus::InsufficientResources);
         }
@@ -960,8 +961,9 @@ pub async fn virtio_pdo_read<'a, 'b>(
                         return complete_req(req, DriverStatus::InvalidParameter);
                     }
                 };
-                let dst = &mut data.view_mut::<[u8]>().expect("read req missing buffer")
-                    [buf_offset..buf_offset + chunk_len as usize];
+                let dst = &mut data.view_mut::<IoBuffer<'_, Described, FromDevice>>()
+                    .expect("read req missing buffer")
+                    .as_mut_slice()[buf_offset..buf_offset + chunk_len as usize];
                 dst.copy_from_slice(io_req.data_slice());
             }
 
@@ -1024,7 +1026,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
     // the caller's data buffer and corrupt adjacent memory.
     match req.data() {
         RequestDataView::ToDevice(data)
-            if data.view::<[u8]>().map_or(false, |b| b.len() >= len) => {}
+            if data.view::<IoBuffer<'_, Described, ToDevice>>().map_or(false, |b| b.len() >= len) => {}
         RequestDataView::ToDevice(_) => {
             return complete_req(req, DriverStatus::InsufficientResources);
         }
@@ -1071,8 +1073,9 @@ pub async fn virtio_pdo_write<'a, 'b>(
                         return complete_req(req, DriverStatus::InvalidParameter);
                     }
                 };
-                let src = &data.view::<[u8]>().expect("write req missing buffer")
-                    [buf_offset..buf_offset + chunk_len as usize];
+                let src = &data.view::<IoBuffer<'_, Described, ToDevice>>()
+                    .expect("write req missing buffer")
+                    .as_slice()[buf_offset..buf_offset + chunk_len as usize];
                 io_req.data_slice_mut().copy_from_slice(src);
             }
 

@@ -15,6 +15,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
+        dma::{Described, FromDevice, IoBuffer, ToDevice},
         io::{DiskInfo, IoType},
         request::RequestData,
     },
@@ -111,7 +112,7 @@ pub async fn disk_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::FromDevice(data) if data.view::<IoBuffer<'_, Described, FromDevice>>().map_or(false, |b| b.len() >= total) => {}
         RequestDataView::FromDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
         }
@@ -163,7 +164,7 @@ pub async fn disk_write<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::ToDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::ToDevice(data) if data.view::<IoBuffer<'_, Described, ToDevice>>().map_or(false, |b| b.len() >= total) => {}
         RequestDataView::ToDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
         }

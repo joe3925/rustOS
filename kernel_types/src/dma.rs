@@ -1,8 +1,10 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
-use core::ptr::{self, NonNull};
+use core::ptr;
+use kernel_macros::RequestPayload;
 
 use crate::device::DeviceObject;
 
@@ -118,9 +120,50 @@ struct DmaDropContext {
     cookie: usize,
 }
 
-struct IoBufferInner {
-    ptr: NonNull<u8>,
-    len: usize,
+enum IoBufferBorrow<'a> {
+    ReadOnly(&'a [u8]),
+    Writable(&'a mut [u8]),
+}
+
+impl<'a> IoBufferBorrow<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::ReadOnly(buf) => buf.len(),
+            Self::Writable(buf) => buf.len(),
+        }
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::ReadOnly(buf) => buf.as_ptr(),
+            Self::Writable(buf) => buf.as_ptr(),
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::ReadOnly(buf) => buf,
+            Self::Writable(buf) => buf,
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            Self::Writable(buf) => buf.as_mut_ptr(),
+            Self::ReadOnly(_) => unreachable!("mutable IoBuffer access on read-only borrow"),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Writable(buf) => buf,
+            Self::ReadOnly(_) => unreachable!("mutable IoBuffer access on read-only borrow"),
+        }
+    }
+}
+
+struct IoBufferInner<'a> {
+    borrow: IoBufferBorrow<'a>,
     virt_addr: usize,
     page_base: usize,
     page_offset: usize,
@@ -133,10 +176,18 @@ struct IoBufferInner {
     dma_drop: Option<DmaDropContext>,
 }
 
-impl IoBufferInner {
-    fn new(ptr: *mut u8, len: usize) -> Self {
-        let ptr = NonNull::new(ptr).unwrap_or_else(NonNull::dangling);
-        let virt_addr = ptr.as_ptr() as usize;
+impl<'a> IoBufferInner<'a> {
+    fn new_read_only(buf: &'a [u8]) -> Self {
+        Self::new(IoBufferBorrow::ReadOnly(buf))
+    }
+
+    fn new_writable(buf: &'a mut [u8]) -> Self {
+        Self::new(IoBufferBorrow::Writable(buf))
+    }
+
+    fn new(borrow: IoBufferBorrow<'a>) -> Self {
+        let virt_addr = borrow.as_ptr() as usize;
+        let len = borrow.len();
         let page_offset = virt_addr & (IOBUFFER_PAGE_SIZE - 1);
         let page_base = virt_addr - page_offset;
         let span = page_offset.saturating_add(len);
@@ -147,8 +198,7 @@ impl IoBufferInner {
         };
 
         Self {
-            ptr,
-            len,
+            borrow,
             virt_addr,
             page_base,
             page_offset,
@@ -160,6 +210,26 @@ impl IoBufferInner {
             mapped_by: None,
             dma_drop: None,
         }
+    }
+
+    fn len(&self) -> usize {
+        self.borrow.len()
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.borrow.as_ptr()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.borrow.as_slice()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.borrow.as_mut_ptr()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.borrow.as_mut_slice()
     }
 
     fn page_frames(&self) -> &[IoBufferPageFrame] {
@@ -215,25 +285,24 @@ impl IoBufferInner {
 }
 
 #[repr(C)]
+#[derive(RequestPayload)]
 pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
-    inner: IoBufferInner,
-    _borrow: PhantomData<&'a [u8]>,
-    _state: PhantomData<State>,
-    _direction: PhantomData<Direction>,
+    inner: IoBufferInner<'a>,
+    _state: PhantomData<fn() -> State>,
+    _direction: PhantomData<fn() -> Direction>,
 }
 
 impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State, Direction> {
-    fn from_inner(inner: IoBufferInner) -> Self {
+    fn from_inner(inner: IoBufferInner<'a>) -> Self {
         Self {
             inner,
-            _borrow: PhantomData,
             _state: PhantomData,
             _direction: PhantomData,
         }
     }
 
     #[allow(dead_code)]
-    fn into_inner(self) -> IoBufferInner {
+    fn into_inner(self) -> IoBufferInner<'a> {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
     }
@@ -244,11 +313,11 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
     }
 
     pub fn len(&self) -> usize {
-        self.inner.len
+        self.inner.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.inner.len() == 0
     }
 
     pub fn virtual_address(&self) -> usize {
@@ -276,11 +345,11 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
     }
 
     pub fn as_ptr(&self) -> *const u8 {
-        self.inner.ptr.as_ptr() as *const u8
+        self.inner.as_ptr()
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.len()) }
+        self.inner.as_slice()
     }
 }
 
@@ -294,29 +363,29 @@ impl<'a, State: IoBufferState, Direction: WritableIoBufferDirection>
     IoBuffer<'a, State, Direction>
 {
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.ptr.as_ptr()
+        self.inner.as_mut_ptr()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+        self.inner.as_mut_slice()
     }
 }
 
 impl<'a> IoBuffer<'a, Described, ToDevice> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self::from_inner(IoBufferInner::new(buf.as_ptr() as *mut u8, buf.len()))
+        Self::from_inner(IoBufferInner::new_read_only(buf))
     }
 }
 
 impl<'a> IoBuffer<'a, Described, FromDevice> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self::from_inner(IoBufferInner::new(buf.as_mut_ptr(), buf.len()))
+        Self::from_inner(IoBufferInner::new_writable(buf))
     }
 }
 
 impl<'a> IoBuffer<'a, Described, Bidirectional> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self::from_inner(IoBufferInner::new(buf.as_mut_ptr(), buf.len()))
+        Self::from_inner(IoBufferInner::new_writable(buf))
     }
 }
 
@@ -338,7 +407,7 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> fmt::Debug
             .field("state", &core::any::type_name::<State>())
             .field("direction", &core::any::type_name::<Direction>())
             .field("virt_addr", &self.inner.virt_addr)
-            .field("len", &self.inner.len)
+            .field("len", &self.inner.len())
             .field("page_base", &self.inner.page_base)
             .field("page_offset", &self.inner.page_offset)
             .field("page_count", &self.inner.page_count)
