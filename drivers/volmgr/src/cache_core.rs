@@ -14,7 +14,7 @@ use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use futures::stream::StreamExt;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::request::RequestData;
-use kernel_api::request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 use spin::{Mutex, RwLock};
@@ -488,8 +488,7 @@ where
 
         {
             let data = page.data.read();
-            let buf = BufSlice::new_const(&data.bytes[..]);
-            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
+            let mut borrow = BorrowedHandle::to_device(&mut req, &data.bytes[..]);
             self.backend
                 .write_request(borrow.handle())
                 .await
@@ -542,8 +541,7 @@ where
 
         let write_res = {
             let data = page.data.read();
-            let buf = BufSlice::new_const(&data.bytes[..]);
-            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
+            let mut borrow = BorrowedHandle::to_device(&mut req, &data.bytes[..]);
             backend
                 .write_request(borrow.handle())
                 .await

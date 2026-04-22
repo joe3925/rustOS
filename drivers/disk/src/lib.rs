@@ -22,7 +22,7 @@ use kernel_api::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
-    request::{BufSlice, RequestDataView, RequestHandle, RequestType, TraversalPolicy},
+    request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
     status::DriverStatus,
 };
@@ -111,7 +111,7 @@ pub async fn disk_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::FromDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= total) => {}
         RequestDataView::FromDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
         }
@@ -163,7 +163,7 @@ pub async fn disk_write<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::ToDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::ToDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= total) => {}
         RequestDataView::ToDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
         }

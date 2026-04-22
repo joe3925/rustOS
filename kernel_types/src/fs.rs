@@ -3,6 +3,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr;
+use kernel_macros;
 #[repr(C)]
 pub struct File {
     _private: [u8; 0],
@@ -125,7 +126,7 @@ pub enum FsOp {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsOpenParams {
     pub flags: OpenFlagsMask,
     pub write_through: bool,
@@ -133,7 +134,7 @@ pub struct FsOpenParams {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsOpenResult {
     pub fs_file_id: u64,
     pub is_dir: bool,
@@ -142,19 +143,19 @@ pub struct FsOpenResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCloseParams {
     pub fs_file_id: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCloseResult {
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, kernel_macros::RequestPayload)]
 pub struct FsReadParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
@@ -166,14 +167,14 @@ pub struct FsReadParams<'a> {
 unsafe impl<'a> Sync for FsReadParams<'a> {}
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, kernel_macros::RequestPayload)]
 pub struct FsReadResult {
     pub bytes_read: usize,
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, kernel_macros::RequestPayload)]
 pub struct FsWriteParams<'a> {
     pub fs_file_id: u64,
     pub offset: u64,
@@ -182,7 +183,7 @@ pub struct FsWriteParams<'a> {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsWriteResult {
     pub written: usize,
     pub error: Option<FileStatus>,
@@ -197,7 +198,7 @@ pub enum FsSeekWhence {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSeekParams {
     pub fs_file_id: u64,
     pub origin: FsSeekWhence,
@@ -205,26 +206,26 @@ pub struct FsSeekParams {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSeekResult {
     pub pos: u64,
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsFlushParams {
     pub fs_file_id: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsFlushResult {
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCreateParams {
     pub path: Path,
     pub dir: bool,
@@ -232,45 +233,45 @@ pub struct FsCreateParams {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsCreateResult {
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsRenameParams {
     pub src: Path,
     pub dst: Path,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsRenameResult {
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsListDirParams {
     pub path: Path,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsListDirResult {
     pub names: Vec<String>,
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsGetInfoParams {
     pub fs_file_id: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsGetInfoResult {
     pub size: u64,
     pub is_dir: bool,
@@ -279,27 +280,27 @@ pub struct FsGetInfoResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSetLenParams {
     pub fs_file_id: u64,
     pub new_size: u64,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsSetLenResult {
     pub error: Option<FileStatus>,
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsAppendParams<'a> {
     pub fs_file_id: u64,
     pub data: &'a [u8],
     pub write_through: bool,
 }
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, kernel_macros::RequestPayload)]
 pub struct FsAppendResult {
     pub written: usize,
     pub new_size: u64,
@@ -307,7 +308,7 @@ pub struct FsAppendResult {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsZeroRangeParams {
     pub fs_file_id: u64,
     pub offset: u64,
@@ -315,7 +316,7 @@ pub struct FsZeroRangeParams {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsZeroRangeResult {
     pub error: Option<FileStatus>,
 }

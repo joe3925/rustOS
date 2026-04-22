@@ -27,7 +27,7 @@ pub type BenchTag = &'static str;
 
 /// Result of a full benchmark sweep across multiple inflight levels.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
 pub struct BenchSweepResult {
     /// Number of levels actually tested
     pub used: u32,
@@ -42,7 +42,7 @@ pub const BENCH_MAX_LEVELS: usize = 11;
 
 /// Result for a single inflight level benchmark.
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, kernel_macros::RequestPayload)]
 pub struct BenchLevelResult {
     /// Inflight level tested
     pub inflight: u32,
@@ -78,7 +78,7 @@ impl Default for BenchSweepResult {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
 pub struct BenchSweepParams {
     pub version: u32,
     pub flags: u32,
@@ -106,7 +106,7 @@ impl Default for BenchSweepParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
 pub struct BenchSweepBothResult {
     pub params_used: BenchSweepParams,
     pub irq: BenchSweepResult,

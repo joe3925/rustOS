@@ -31,7 +31,7 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{BufSlice, RequestDataView, RequestHandle, RequestType};
+use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
@@ -366,7 +366,7 @@ pub async fn ide_pdo_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= len) => {}
+        RequestDataView::FromDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= len) => {}
         RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InsufficientResources),
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
@@ -379,13 +379,7 @@ pub async fn ide_pdo_read<'a, 'b>(
         RequestDataView::FromDevice(data) => data,
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     };
-    // SAFETY: BufSlice pointer is valid for the duration of the request.
-    let buf = unsafe {
-        &mut data
-            .view_mut::<BufSlice>()
-            .expect("read req missing BufSlice")
-            .as_mut_slice()[..len]
-    };
+    let buf = &mut data.view_mut::<[u8]>().expect("read req missing buffer")[..len];
 
     let ok = ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
     drop(ctrl);
@@ -451,7 +445,7 @@ pub async fn ide_pdo_write<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::ToDevice(data) if data.view::<BufSlice>().map_or(false, |b| b.len() >= len) => {}
+        RequestDataView::ToDevice(data) if data.view::<[u8]>().map_or(false, |b| b.len() >= len) => {}
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InsufficientResources),
         RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
@@ -464,13 +458,7 @@ pub async fn ide_pdo_write<'a, 'b>(
         RequestDataView::ToDevice(data) => data,
         RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     };
-    // SAFETY: BufSlice pointer is valid for the duration of the request.
-    let buf = unsafe {
-        &data
-            .view::<BufSlice>()
-            .expect("write req missing BufSlice")
-            .as_slice()[..len]
-    };
+    let buf = &data.view::<[u8]>().expect("write req missing buffer")[..len];
 
     let ok = ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
     drop(ctrl);

@@ -30,7 +30,7 @@ pub struct GptHeader {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, kernel_macros::RequestPayload)]
 pub struct DiskInfo {
     pub logical_block_size: u32,
     pub physical_block_size: u32,
@@ -40,7 +40,7 @@ pub struct DiskInfo {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct PartitionInfo {
     pub disk: DiskInfo,
     pub gpt_header: Option<GptHeader>,
@@ -48,6 +48,7 @@ pub struct PartitionInfo {
 }
 
 #[repr(C)]
+#[derive(kernel_macros::RequestPayload)]
 pub struct FsIdentify {
     pub volume_fdo: IoTarget,
     pub mount_device: Option<Arc<DeviceObject>>,
@@ -55,7 +56,7 @@ pub struct FsIdentify {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, kernel_macros::RequestPayload)]
 pub struct BlkRead {
     pub lba: u64,
     pub sectors: u32,

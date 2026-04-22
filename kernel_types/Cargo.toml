@@ -8,6 +8,7 @@ crate-type = ["rlib"]
 
 
 [dependencies]
+kernel_macros = { path = "../kernel_macros" }
 x86_64 = { version = "0.15.2", default-features = false, features = [
     "instructions",
 ] }
@@ -22,6 +23,7 @@ crossbeam-queue = { version = "0.3", default-features = false, features = [
     "alloc",
 ] }
 array-init = "2.0.0"
+
 [features]
 macros = []
 

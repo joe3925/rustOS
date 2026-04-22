@@ -7,7 +7,7 @@ use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
     println,
-    request::{BorrowedHandle, BufSlice, RequestHandle, RequestType, TraversalPolicy},
+    request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy},
     runtime::block_on,
     status::DriverStatus,
 };
@@ -117,9 +117,8 @@ impl BlockDev {
         let volume = self.volume.clone();
         self.prep_req_read(offset, len);
 
-        let mut buf = BufSlice::new(dst);
         let status = {
-            let mut borrow = BorrowedHandle::<BufSlice>::from_device(&mut self.req, &mut buf);
+            let mut borrow = BorrowedHandle::from_device(&mut self.req, dst);
             pnp_send_request(volume, borrow.handle()).await
         };
 
@@ -137,9 +136,8 @@ impl BlockDev {
         let volume = self.volume.clone();
         self.prep_req_write(offset, len, false);
 
-        let buf = BufSlice::new_const(src);
         let status = {
-            let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut self.req, &buf);
+            let mut borrow = BorrowedHandle::to_device(&mut self.req, src);
             pnp_send_request(volume, borrow.handle()).await
         };
 

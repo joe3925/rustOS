@@ -4,6 +4,7 @@ use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::{
     alloc::Layout,
     marker::PhantomData,
@@ -26,11 +27,11 @@ enum StorageMode {
     /// Data is heap-allocated as typed data (raw ptr + Layout for deallocation)
     HeapTyped = 1,
     /// Must NOT be dropped or deallocated — the driver retains ownership via BorrowedHandle.
-    /// Non-owning shared borrow of driver-owned data. `heap_ptr` is a raw *const T cast to
-    /// `*mut u8` for erased storage. Must NOT be dropped or deallocated.
+    /// Non-owning shared borrow of driver-owned data. `data_ptr` points at the erased payload
+    /// data while `metadata` carries any DST metadata needed to rebuild it.
     BorrowedToDevice = 2,
-    /// Non-owning mutable borrow of driver-owned data. `heap_ptr` is a raw *mut T cast to
-    /// `*mut u8`. Must NOT be dropped or deallocated.
+    /// Non-owning mutable borrow of driver-owned data. `data_ptr` points at the erased payload
+    /// data while `metadata` carries any DST metadata needed to rebuild it.
     BorrowedFromDevice = 3,
 }
 
@@ -74,12 +75,204 @@ impl core::fmt::Debug for InlineBuffer {
 /// Dropper function signature - only does drop_in_place, never deallocates
 type DropperFn = fn(*mut u8);
 
+/// Erased raw payload parts stored inside [`RequestData`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct RequestPayloadRawParts {
+    pub data: *mut u8,
+    pub metadata: usize,
+    pub bytes: usize,
+}
+
+/// Supported request payload transport contract.
+///
+/// The old generic borrowed-payload API accepted reference-like `T` such as `&[u8]` or `&str`.
+/// That compiled, but the transport stored a pointer to the reference object or fat-pointer value
+/// instead of a stable representation of the underlying payload. `RequestPayload` makes the
+/// transport explicit: only types with a real transport implementation compile, and borrowed DST
+/// payloads like `[u8]` reconstruct directly from raw pointer + metadata.
+///
+/// ```compile_fail
+/// use kernel_types::request::RequestData;
+///
+/// let bytes: &[u8] = &[1, 2, 3];
+/// let _ = RequestData::from_t(bytes);
+/// ```
+///
+/// ```compile_fail
+/// use kernel_types::request::RequestData;
+///
+/// let text: &str = "hello";
+/// let _ = RequestData::from_t(text);
+/// ```
+///
+/// ```compile_fail
+/// use kernel_types::request::{BorrowedHandle, RequestData, RequestHandle, RequestType};
+///
+/// let bytes = [1u8, 2, 3];
+/// let mut handle = RequestHandle::new(
+///     RequestType::Write {
+///         offset: 0,
+///         len: bytes.len(),
+///         flush_write_through: false,
+///         owner: 0,
+///     },
+///     RequestData::empty(),
+/// );
+/// let mut borrow = BorrowedHandle::to_device(&mut handle, &bytes[..]);
+/// let mut view = borrow.handle().data().to_device();
+/// let _ = view.view_mut::<[u8]>();
+/// ```
+pub unsafe trait RequestPayload: Send + Sync {
+    /// Stable runtime tag for matching this payload type.
+    fn runtime_tag() -> u64;
+
+    /// Static byte size for nominal sized payloads.
+    #[inline]
+    fn static_size() -> Option<usize> {
+        None
+    }
+
+    /// Erase a shared borrow into raw transport parts.
+    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts;
+
+    /// Erase a mutable borrow into raw transport parts.
+    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts;
+
+    /// Rebuild a shared view from erased raw transport parts.
+    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self;
+
+    /// Rebuild a mutable view from erased raw transport parts.
+    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self;
+}
+
+macro_rules! impl_nominal_request_payload {
+    ($ty:path) => {
+        unsafe impl RequestPayload for $ty {
+            #[inline]
+            fn runtime_tag() -> u64 {
+                type_tag::<Self>()
+            }
+
+            #[inline]
+            fn static_size() -> Option<usize> {
+                Some(size_of::<Self>())
+            }
+
+            #[inline]
+            fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+                RequestPayloadRawParts {
+                    data: payload as *const Self as *mut u8,
+                    metadata: 0,
+                    bytes: size_of::<Self>(),
+                }
+            }
+
+            #[inline]
+            fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+                RequestPayloadRawParts {
+                    data: payload as *mut Self as *mut u8,
+                    metadata: 0,
+                    bytes: size_of::<Self>(),
+                }
+            }
+
+            #[inline]
+            unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+                unsafe { &*(parts.data as *const Self) }
+            }
+
+            #[inline]
+            unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+                unsafe { &mut *(parts.data as *mut Self) }
+            }
+        }
+    };
+}
+
+unsafe impl RequestPayload for [u8] {
+    #[inline]
+    fn runtime_tag() -> u64 {
+        type_tag::<[u8]>()
+    }
+
+    #[inline]
+    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+        RequestPayloadRawParts {
+            data: payload.as_ptr() as *mut u8,
+            metadata: payload.len(),
+            bytes: payload.len(),
+        }
+    }
+
+    #[inline]
+    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+        RequestPayloadRawParts {
+            data: payload.as_mut_ptr(),
+            metadata: payload.len(),
+            bytes: payload.len(),
+        }
+    }
+
+    #[inline]
+    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+        unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) }
+    }
+
+    #[inline]
+    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+        unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) }
+    }
+}
+
+unsafe impl RequestPayload for str {
+    #[inline]
+    fn runtime_tag() -> u64 {
+        type_tag::<str>()
+    }
+
+    #[inline]
+    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+        let bytes = payload.as_bytes();
+        RequestPayloadRawParts {
+            data: bytes.as_ptr() as *mut u8,
+            metadata: bytes.len(),
+            bytes: bytes.len(),
+        }
+    }
+
+    #[inline]
+    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+        RequestPayloadRawParts {
+            data: payload.as_ptr() as *mut u8,
+            metadata: payload.len(),
+            bytes: payload.len(),
+        }
+    }
+
+    #[inline]
+    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+        let bytes = unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) };
+        unsafe { core::str::from_utf8_unchecked(bytes) }
+    }
+
+    #[inline]
+    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+        let bytes = unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) };
+        unsafe { core::str::from_utf8_unchecked_mut(bytes) }
+    }
+}
+
+impl_nominal_request_payload!(Vec<u8>);
+
 #[repr(C)]
 pub struct RequestData {
     /// Inline buffer for small data (always present, may be unused)
     inline: InlineBuffer,
-    /// Raw heap pointer (valid when mode is HeapTyped or HeapBytes)
-    heap_ptr: *mut u8,
+    /// Erased data pointer used for heap-backed or borrowed payloads
+    data_ptr: *mut u8,
+    /// Erased pointer metadata used for DST payloads such as `[u8]` and `str`
+    metadata: usize,
     /// Layout of the heap allocation (only used for HeapTyped mode)
     heap_layout: Layout,
     /// Type tag for runtime type checking
@@ -120,7 +313,7 @@ pub struct RequestDataRef<'a, Direction> {
 
 impl<'a, Direction> RequestDataRef<'a, Direction> {
     #[inline]
-    pub fn view<T>(&self) -> Option<&'a T> {
+    pub fn view<T: RequestPayload + ?Sized>(&self) -> Option<&'a T> {
         self.data.view::<T>()
     }
 }
@@ -134,7 +327,7 @@ pub struct RequestDataRefMut<'a, Direction> {
 
 impl<'a, Direction> RequestDataRefMut<'a, Direction> {
     #[inline]
-    pub fn view<T>(&self) -> Option<&T> {
+    pub fn view<T: RequestPayload + ?Sized>(&self) -> Option<&T> {
         self.data.view::<T>()
     }
 
@@ -149,7 +342,7 @@ impl<'a, Direction> RequestDataRefMut<'a, Direction> {
 
 impl<'a> RequestDataRefMut<'a, FromDevice> {
     #[inline]
-    pub fn view_mut<T>(&mut self) -> Option<&mut T> {
+    pub fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
         unsafe { self.data.view_mut::<T>() }
     }
 }
@@ -187,9 +380,17 @@ pub const fn strip_lifetimes_and_borrows(input: &[u8], out: &mut [u8; 512]) -> u
     let mut o = 0;
     let mut depth: usize = 0;
 
-    // Skip leading '&'
+    // Skip a leading borrow marker so nominal tags stay stable across `&T` / `&mut T`.
     if i < input.len() && input[i] == b'&' {
         i += 1;
+        if i + 3 < input.len()
+            && input[i] == b'm'
+            && input[i + 1] == b'u'
+            && input[i + 2] == b't'
+            && input[i + 3] == b' '
+        {
+            i += 4;
+        }
     }
 
     while i < input.len() && o < 512 {
@@ -248,14 +449,14 @@ pub fn type_name_stripped<T>() -> String {
 }
 // SAFETY: RequestData owns its heap allocation exclusively (HeapTyped) or holds a non-owning
 // pointer to driver-owned data in one of the borrowed modes. Borrowed payloads are installed
-// through BorrowedHandle, which enforces both the lifetime and T: Send + Sync bounds.
+// through BorrowedHandle, which enforces both the lifetime and T: RequestPayload bounds.
 unsafe impl Send for RequestData {}
 unsafe impl Sync for RequestData {}
 /// Compute a type tag for `T`, stripping lifetime parameters from generic argument lists
 /// so that e.g. `FsAppendParams<'_>` and `FsAppendParams<'data>` produce the same hash,
 /// while non-lifetime generics (e.g. `Vec<u8>` vs `Vec<u16>`) remain distinct.
 #[inline]
-pub const fn type_tag<T>() -> u64 {
+pub const fn type_tag<T: ?Sized>() -> u64 {
     /// Copy `input` into `out`, removing lifetime tokens (`'ident`) that appear inside
     /// angle-bracket generic argument lists, along with their adjacent `, ` separators.
     /// Returns the number of bytes written.
@@ -283,7 +484,8 @@ impl RequestData {
     pub fn empty() -> Self {
         Self {
             inline: InlineBuffer::new(),
-            heap_ptr: null_mut(),
+            data_ptr: null_mut(),
+            metadata: 0,
             heap_layout: Layout::new::<()>(),
             tag: None,
             dropper: noop_dropper,
@@ -294,19 +496,20 @@ impl RequestData {
 
     /// Install a non-owning borrow of driver-owned data. Only called by BorrowedHandle.
     /// The driver retains ownership; this RequestData must not drop or deallocate the pointer.
-    fn from_borrowed_raw(ptr: *mut u8, tag: u64, size: usize, mode: StorageMode) -> Self {
+    fn from_borrowed_raw(parts: RequestPayloadRawParts, tag: u64, mode: StorageMode) -> Self {
         Self {
             inline: InlineBuffer::new(),
-            heap_ptr: ptr,
+            data_ptr: parts.data,
+            metadata: parts.metadata,
             heap_layout: Layout::new::<()>(),
             tag: Some(tag),
             dropper: noop_dropper,
-            size,
+            size: parts.bytes,
             mode,
         }
     }
 
-    pub fn from_t<T: 'static + Send + Sync>(value: T) -> Self {
+    pub fn from_t<T: 'static + RequestPayload>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
 
@@ -319,9 +522,10 @@ impl RequestData {
             // INLINE PATH: Copy value into inline buffer
             let mut result = Self {
                 inline: InlineBuffer::new(),
-                heap_ptr: null_mut(),
+                data_ptr: null_mut(),
+                metadata: 0,
                 heap_layout: Layout::new::<()>(),
-                tag: Some(type_tag::<T>()),
+                tag: Some(T::runtime_tag()),
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::Inline,
@@ -348,9 +552,10 @@ impl RequestData {
 
             Self {
                 inline: InlineBuffer::new(),
-                heap_ptr: ptr,
+                data_ptr: ptr,
+                metadata: 0,
                 heap_layout: layout,
-                tag: Some(type_tag::<T>()),
+                tag: Some(T::runtime_tag()),
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::HeapTyped,
@@ -363,50 +568,72 @@ impl RequestData {
         self.size
     }
 
-    fn matches<T>(&self) -> bool {
-        self.tag == Some(type_tag::<T>()) && self.size == size_of::<T>()
+    #[inline]
+    fn raw_parts(&self) -> RequestPayloadRawParts {
+        RequestPayloadRawParts {
+            data: match self.mode {
+                StorageMode::Inline => self.inline.as_ptr() as *mut u8,
+                StorageMode::HeapTyped
+                | StorageMode::BorrowedToDevice
+                | StorageMode::BorrowedFromDevice => self.data_ptr,
+            },
+            metadata: self.metadata,
+            bytes: self.size,
+        }
     }
+
+    fn matches<T: RequestPayload + ?Sized>(&self) -> bool {
+        if self.tag != Some(T::runtime_tag()) {
+            return false;
+        }
+
+        match T::static_size() {
+            Some(expected) => self.size == expected,
+            None => true,
+        }
+    }
+
     pub fn get_type_tag(&self) -> Option<u64> {
         self.tag
     }
-    pub(crate) fn view<T>(&self) -> Option<&T> {
+
+    pub(crate) fn view<T: RequestPayload + ?Sized>(&self) -> Option<&T> {
         if !self.matches::<T>() {
             return None;
         }
 
-        let ptr = match self.mode {
-            StorageMode::Inline => self.inline.as_ptr(),
-            StorageMode::HeapTyped
-            | StorageMode::BorrowedToDevice
-            | StorageMode::BorrowedFromDevice => self.heap_ptr as *const u8,
-        };
+        let parts = self.raw_parts();
 
-        if ptr.is_null() {
+        if parts.data.is_null() {
             return None;
         }
 
-        Some(unsafe { &*(ptr as *const T) })
+        Some(unsafe { T::shared_from_raw_parts(parts) })
     }
 
-    pub(crate) unsafe fn view_mut<T>(&mut self) -> Option<&mut T> {
+    pub(crate) unsafe fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
         if !self.matches::<T>() {
             return None;
         }
 
-        let ptr = match self.mode {
-            StorageMode::Inline => self.inline.as_mut_ptr(),
-            StorageMode::HeapTyped | StorageMode::BorrowedFromDevice => self.heap_ptr,
-            StorageMode::BorrowedToDevice => return None,
+        let parts = RequestPayloadRawParts {
+            data: match self.mode {
+                StorageMode::Inline => self.inline.as_mut_ptr(),
+                StorageMode::HeapTyped | StorageMode::BorrowedFromDevice => self.data_ptr,
+                StorageMode::BorrowedToDevice => return None,
+            },
+            metadata: self.metadata,
+            bytes: self.size,
         };
 
-        if ptr.is_null() {
+        if parts.data.is_null() {
             return None;
         }
 
-        Some(unsafe { &mut *(ptr as *mut T) })
+        Some(unsafe { T::mut_from_raw_parts(parts) })
     }
 
-    pub fn try_take<T>(&mut self) -> Option<T> {
+    pub fn try_take<T: 'static + RequestPayload>(&mut self) -> Option<T> {
         if !self.matches::<T>() {
             return None;
         }
@@ -421,15 +648,15 @@ impl RequestData {
             }
             StorageMode::HeapTyped => {
                 // Read from heap, then deallocate the memory
-                if self.heap_ptr.is_null() {
+                if self.data_ptr.is_null() {
                     return None;
                 }
 
-                let value = unsafe { core::ptr::read(self.heap_ptr as *const T) };
+                let value = unsafe { core::ptr::read(self.data_ptr as *const T) };
 
                 // Deallocate the memory (we've taken ownership of the value)
                 unsafe {
-                    alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
+                    alloc::alloc::dealloc(self.data_ptr, self.heap_layout);
                 }
 
                 value
@@ -441,7 +668,8 @@ impl RequestData {
         };
 
         // Reset to empty state (don't run dropper - we took ownership)
-        self.heap_ptr = null_mut();
+        self.data_ptr = null_mut();
+        self.metadata = 0;
         self.tag = None;
         self.size = 0;
         self.mode = StorageMode::Inline;
@@ -462,13 +690,13 @@ impl Drop for RequestData {
                 // Inline buffer is part of struct, no deallocation needed
             }
             StorageMode::HeapTyped => {
-                if !self.heap_ptr.is_null() {
+                if !self.data_ptr.is_null() {
                     // Run typed dropper (drop_in_place)
-                    (self.dropper)(self.heap_ptr);
+                    (self.dropper)(self.data_ptr);
 
                     // Deallocate with stored Layout
                     unsafe {
-                        alloc::alloc::dealloc(self.heap_ptr, self.heap_layout);
+                        alloc::alloc::dealloc(self.data_ptr, self.heap_layout);
                     }
                 }
             }
@@ -584,13 +812,13 @@ impl Request {
 
     /// Create a request with typed payload.
     #[inline]
-    pub(crate) fn new_t<T: 'static + Send + Sync>(kind: RequestType, data: T) -> Self {
+    pub(crate) fn new_t<T: 'static + RequestPayload>(kind: RequestType, data: T) -> Self {
         Self::new(kind, RequestData::from_t(data))
     }
 
     /// Create a PnP request with typed payload.
     #[inline]
-    pub(crate) fn new_pnp_t<T: 'static + Send + Sync>(pnp: PnpRequest, data: T) -> Self {
+    pub(crate) fn new_pnp_t<T: 'static + RequestPayload>(pnp: PnpRequest, data: T) -> Self {
         Self::new_pnp(pnp, RequestData::from_t(data))
     }
 
@@ -606,7 +834,7 @@ impl Request {
     }
 
     #[inline]
-    pub fn set_data_t<T: 'static + Send + Sync>(&mut self, data: T) {
+    pub fn set_data_t<T: 'static + RequestPayload>(&mut self, data: T) {
         self.data = RequestData::from_t(data);
     }
 
@@ -775,13 +1003,13 @@ impl<'a> RequestHandle<'a> {
 
     /// Create a request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_t<T: 'static + Send + Sync>(kind: RequestType, data: T) -> Self {
+    pub fn new_t<T: 'static + RequestPayload>(kind: RequestType, data: T) -> Self {
         RequestHandle::Owned(Request::new_t(kind, data))
     }
 
     /// Create a PnP request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp_t<T: 'static + Send + Sync>(pnp: PnpRequest, data: T) -> Self {
+    pub fn new_pnp_t<T: 'static + RequestPayload>(pnp: PnpRequest, data: T) -> Self {
         RequestHandle::Owned(Request::new_pnp_t(pnp, data))
     }
 
@@ -875,32 +1103,32 @@ pub struct RequestHandleResult<'a> {
 /// `'data` — lifetime of the driver-owned data being lent
 /// `'req`  — lifetime of our exclusive borrow of the RequestHandle
 /// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
-enum BorrowedStorage<'data, T> {
+enum BorrowedStorage<'data, T: ?Sized> {
     ToDevice(&'data T),
     FromDevice(&'data mut T),
 }
 
-pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: Send + Sync> {
+pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> {
     handle: &'req mut RequestHandle<'h>,
     borrow: BorrowedStorage<'data, T>,
 }
 
-impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'req, 'h, T> {
     fn install(
         handle: &'req mut RequestHandle<'h>,
-        ptr: *mut u8,
+        parts: RequestPayloadRawParts,
         mode: StorageMode,
         borrow: BorrowedStorage<'data, T>,
     ) -> Self {
         unsafe { &mut *handle.write_raw() }.data =
-            RequestData::from_borrowed_raw(ptr, type_tag::<T>(), size_of::<T>(), mode);
+            RequestData::from_borrowed_raw(parts, T::runtime_tag(), mode);
         Self { handle, borrow }
     }
 
     pub fn to_device(handle: &'req mut RequestHandle<'h>, data: &'data T) -> Self {
         Self::install(
             handle,
-            data as *const T as *mut u8,
+            T::shared_raw_parts(data),
             StorageMode::BorrowedToDevice,
             BorrowedStorage::ToDevice(data),
         )
@@ -909,7 +1137,7 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
     pub fn from_device(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
         Self::install(
             handle,
-            data as *mut T as *mut u8,
+            T::mut_raw_parts(data),
             StorageMode::BorrowedFromDevice,
             BorrowedStorage::FromDevice(data),
         )
@@ -921,16 +1149,9 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> BorrowedHandle<'data, 'req, 'h, T> {
     }
 }
 
-impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> Drop for BorrowedHandle<'data, 'req, 'h, T> {
     fn drop(&mut self) {
-        match &mut self.borrow {
-            BorrowedStorage::ToDevice(data) => {
-                let _ = *data as *const T;
-            }
-            BorrowedStorage::FromDevice(data) => {
-                let _ = *data as *mut T;
-            }
-        }
+        let _ = &self.borrow;
         // SAFETY: handle is still valid — 'req is live while Self exists.
         let req = unsafe { &mut *self.handle.write_raw() };
         // Only clear if the request still holds one of the borrowed modes. If the lower driver set
@@ -942,67 +1163,3 @@ impl<'data: 'req, 'req, 'h, T: Send + Sync> Drop for BorrowedHandle<'data, 'req,
     }
 }
 
-/// Thin wrapper around a raw `*mut u8` + length so a borrowed byte slice can be
-/// stored in [`RequestData`] without carrying lifetime parameters.
-///
-/// Lower drivers resolve this with `view::<BufSlice>()` / `view_mut::<BufSlice>()`
-/// and then call `.as_slice()` / `.as_mut_slice()` to access the underlying bytes.
-///
-/// # Safety
-/// The caller must guarantee the pointer remains valid for the duration of the
-/// request (enforced externally by [`BorrowedHandle`] lifetimes).
-pub struct BufSlice {
-    ptr: *const u8,
-    len: usize,
-}
-
-// SAFETY: BufSlice is only constructed from references whose lifetimes are
-// enforced by BorrowedHandle. The pointer is valid and exclusive for the
-// duration of the borrow.
-unsafe impl Send for BufSlice {}
-unsafe impl Sync for BufSlice {}
-
-impl BufSlice {
-    /// Wrap a mutable byte slice into a `BufSlice`.
-    #[inline]
-    pub fn new(slice: &mut [u8]) -> Self {
-        Self {
-            ptr: slice.as_ptr(),
-            len: slice.len(),
-        }
-    }
-
-    /// Wrap an immutable byte slice into a `BufSlice`.
-    #[inline]
-    pub fn new_const(slice: &[u8]) -> Self {
-        Self {
-            ptr: slice.as_ptr(),
-            len: slice.len(),
-        }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// View the buffer as an immutable byte slice.
-    ///
-    /// # Safety
-    /// Caller must ensure the pointer is still valid (guaranteed when accessed
-    /// through a live `BorrowedHandle`).
-    #[inline]
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    /// View the buffer as a mutable byte slice.
-    ///
-    /// # Safety
-    /// Caller must ensure the pointer is still valid and no other references
-    /// exist (guaranteed when accessed through a live `BorrowedHandle`).
-    #[inline]
-    pub unsafe fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr as *mut u8, self.len) }
-    }
-}

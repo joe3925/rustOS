@@ -1,7 +1,72 @@
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::quote;
-use syn::{parse_macro_input, FnArg, ItemFn, Pat, ReturnType, Type};
+use syn::{Data, DeriveInput, FnArg, ItemFn, Pat, ReturnType, Type, parse_macro_input};
+
+#[proc_macro_derive(RequestPayload)]
+pub fn derive_request_payload(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+
+    if matches!(input.data, Data::Union(_)) {
+        return syn::Error::new_spanned(
+            input.ident,
+            "RequestPayload derive does not support unions",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let ident = input.ident;
+    let generics = input.generics;
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+
+    quote! {
+        unsafe impl #impl_generics ::kernel_types::request::RequestPayload for #ident #ty_generics #where_clause {
+            #[inline]
+            fn runtime_tag() -> u64 {
+                ::kernel_types::request::type_tag::<Self>()
+            }
+
+            #[inline]
+            fn static_size() -> ::core::option::Option<usize> {
+                ::core::option::Option::Some(::core::mem::size_of::<Self>())
+            }
+
+            #[inline]
+            fn shared_raw_parts(payload: &Self) -> ::kernel_types::request::RequestPayloadRawParts {
+                ::kernel_types::request::RequestPayloadRawParts {
+                    data: payload as *const Self as *mut u8,
+                    metadata: 0,
+                    bytes: ::core::mem::size_of::<Self>(),
+                }
+            }
+
+            #[inline]
+            fn mut_raw_parts(payload: &mut Self) -> ::kernel_types::request::RequestPayloadRawParts {
+                ::kernel_types::request::RequestPayloadRawParts {
+                    data: payload as *mut Self as *mut u8,
+                    metadata: 0,
+                    bytes: ::core::mem::size_of::<Self>(),
+                }
+            }
+
+            #[inline]
+            unsafe fn shared_from_raw_parts<'payload>(
+                parts: ::kernel_types::request::RequestPayloadRawParts,
+            ) -> &'payload Self {
+                unsafe { &*(parts.data as *const Self) }
+            }
+
+            #[inline]
+            unsafe fn mut_from_raw_parts<'payload>(
+                parts: ::kernel_types::request::RequestPayloadRawParts,
+            ) -> &'payload mut Self {
+                unsafe { &mut *(parts.data as *mut Self) }
+            }
+        }
+    }
+    .into()
+}
 
 #[proc_macro_attribute]
 pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -164,7 +229,7 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     let sig = &mut func.sig;
     let body = &func.block;
 
-    let fn_ident = sig.ident.clone();
+    let _fn_ident = sig.ident.clone();
     let obj_expr = choose_object_id_expr(sig);
 
     // Remove async keyword

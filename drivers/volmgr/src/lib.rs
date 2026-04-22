@@ -35,7 +35,7 @@ use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
 use kernel_api::request::{
-    BorrowedHandle, BufSlice, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
+    BorrowedHandle, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
 };
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
@@ -90,9 +90,8 @@ impl VolumeCacheBackend for CacheBackend {
                 RequestHandle::new(RequestType::Read { offset, len }, RequestData::empty());
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let mut buf = BufSlice::new(&mut out[..len]);
             let status = {
-                let mut borrow = BorrowedHandle::<BufSlice>::from_device(&mut req, &mut buf);
+                let mut borrow = BorrowedHandle::from_device(&mut req, &mut out[..len]);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -124,9 +123,8 @@ impl VolumeCacheBackend for CacheBackend {
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let buf = BufSlice::new_const(&data[..block_len]);
             let status = {
-                let mut borrow = BorrowedHandle::<BufSlice>::to_device(&mut req, &buf);
+                let mut borrow = BorrowedHandle::to_device(&mut req, &data[..block_len]);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
@@ -474,7 +472,7 @@ pub async fn vol_pdo_read<'a, 'b>(
     }
 
     let req_data_len = match req.data() {
-        RequestDataView::FromDevice(data) => data.view::<BufSlice>().map(|b| b.len()).unwrap_or(0),
+        RequestDataView::FromDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
         RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
@@ -487,17 +485,11 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    // SAFETY: BufSlice pointer is valid for the duration of the request (BorrowedHandle
-    // lifetime enforced by the caller). We write directly into the caller's buffer.
     let mut data = match req.data() {
         RequestDataView::FromDevice(data) => data,
         RequestDataView::ToDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
-    let dst = unsafe {
-        data.view_mut::<BufSlice>()
-            .expect("read response missing BufSlice")
-            .as_mut_slice()
-    };
+    let dst = data.view_mut::<[u8]>().expect("read response missing buffer");
 
     match cache.read_at(offset, &mut dst[..len]).await {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
@@ -548,7 +540,7 @@ pub async fn vol_pdo_write<'a, 'b>(
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
     len = core::cmp::min(len, match req.data() {
-        RequestDataView::ToDevice(data) => data.view::<BufSlice>().map(|b| b.len()).unwrap_or(0),
+        RequestDataView::ToDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
         RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
     });
     len = core::cmp::min(len, (vol_len - offset) as usize);
@@ -557,12 +549,11 @@ pub async fn vol_pdo_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    // SAFETY: BufSlice pointer is valid for the duration of the request.
     let data = match req.data() {
         RequestDataView::ToDevice(data) => data,
         RequestDataView::FromDevice(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
-    let data = unsafe { data.view::<BufSlice>().expect("write req missing BufSlice").as_slice() };
+    let data = data.view::<[u8]>().expect("write req missing buffer");
 
     let result = match (flush_write_through, owner) {
         (true, o) if o != 0 => cache.write_through_at_owned(offset, &data[..len], o).await,

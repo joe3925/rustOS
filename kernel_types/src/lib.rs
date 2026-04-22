@@ -6,6 +6,7 @@
 #![feature(const_type_name)]
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
+extern crate self as kernel_types;
 extern crate alloc;
 
 pub mod async_ffi;
@@ -22,6 +23,8 @@ pub mod pnp;
 pub mod request;
 pub mod runtime;
 pub mod status;
+pub use kernel_macros::RequestPayload;
+pub use request::RequestPayload;
 use alloc::sync::Arc;
 use x86_64::VirtAddr;
 

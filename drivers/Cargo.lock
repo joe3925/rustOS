@@ -344,6 +344,7 @@ dependencies = [
  "array-init",
  "bincode",
  "crossbeam-queue",
+ "kernel_macros",
  "spin",
  "strum",
  "x86_64",

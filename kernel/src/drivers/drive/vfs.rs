@@ -13,6 +13,7 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::{
     fs::{Path, *},
     request::RequestData,
+    RequestPayload,
 };
 
 #[derive(Clone, Debug)]
@@ -158,8 +159,8 @@ impl Vfs {
         param: TParam,
     ) -> Result<TResult, DriverStatus>
     where
-        TParam: Send + Sync,
-        TResult: 'static + Clone,
+        TParam: RequestPayload,
+        TResult: 'static + Clone + RequestPayload,
     {
         let mut request_handle = RequestHandle::new(RequestType::Fs(op), RequestData::empty());
         request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
