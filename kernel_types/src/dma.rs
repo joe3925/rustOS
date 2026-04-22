@@ -44,9 +44,9 @@ pub const DMA_IOMMU_VENDOR_AMD_IVRS: u8 = 2;
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE: u32 = 1 << 0;
 pub const DMA_PCI_IDENTITY_FLAG_BUS_MASTER_ENABLED: u32 = 1 << 1;
 
-pub const MDL_PAGE_SIZE: usize = 4096;
-pub const MDL_INLINE_PAGE_CAPACITY: usize = 32;
-pub const MDL_INLINE_SEGMENT_CAPACITY: usize = 32;
+pub const IOBUFFER_PAGE_SIZE: usize = 4096;
+pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 32;
+pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
 
 pub enum Described {}
 pub enum Pinned {}
@@ -57,40 +57,40 @@ pub enum FromDevice {}
 pub enum Bidirectional {}
 
 mod sealed {
-    pub trait MdlState {}
-    pub trait MdlDirection {}
+    pub trait IoBufferState {}
+    pub trait IoBufferDirection {}
     pub trait WritableDirection {}
 }
 
-pub trait MdlState: sealed::MdlState {}
-impl<T: sealed::MdlState> MdlState for T {}
+pub trait IoBufferState: sealed::IoBufferState {}
+impl<T: sealed::IoBufferState> IoBufferState for T {}
 
-pub trait MdlDirection: sealed::MdlDirection {}
-impl<T: sealed::MdlDirection> MdlDirection for T {}
+pub trait IoBufferDirection: sealed::IoBufferDirection {}
+impl<T: sealed::IoBufferDirection> IoBufferDirection for T {}
 
-pub trait WritableMdlDirection: MdlDirection + sealed::WritableDirection {}
-impl<T: MdlDirection + sealed::WritableDirection> WritableMdlDirection for T {}
+pub trait WritableIoBufferDirection: IoBufferDirection + sealed::WritableDirection {}
+impl<T: IoBufferDirection + sealed::WritableDirection> WritableIoBufferDirection for T {}
 
-impl sealed::MdlState for Described {}
-impl sealed::MdlState for Pinned {}
-impl sealed::MdlState for DmaMapped {}
+impl sealed::IoBufferState for Described {}
+impl sealed::IoBufferState for Pinned {}
+impl sealed::IoBufferState for DmaMapped {}
 
-impl sealed::MdlDirection for ToDevice {}
-impl sealed::MdlDirection for FromDevice {}
-impl sealed::MdlDirection for Bidirectional {}
+impl sealed::IoBufferDirection for ToDevice {}
+impl sealed::IoBufferDirection for FromDevice {}
+impl sealed::IoBufferDirection for Bidirectional {}
 
 impl sealed::WritableDirection for FromDevice {}
 impl sealed::WritableDirection for Bidirectional {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MdlPageFrame {
+pub struct IoBufferPageFrame {
     pub phys_addr: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MdlDmaSegment {
+pub struct IoBufferDmaSegment {
     pub dma_addr: u64,
     pub byte_len: u32,
     pub reserved: u32,
@@ -98,13 +98,13 @@ pub struct MdlDmaSegment {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MdlError {
+pub enum IoBufferError {
     PageCapacityExceeded { required: usize, capacity: usize },
     SegmentCapacityExceeded { required: usize, capacity: usize },
 }
 
-const EMPTY_PAGE_FRAME: MdlPageFrame = MdlPageFrame { phys_addr: 0 };
-const EMPTY_DMA_SEGMENT: MdlDmaSegment = MdlDmaSegment {
+const EMPTY_PAGE_FRAME: IoBufferPageFrame = IoBufferPageFrame { phys_addr: 0 };
+const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     dma_addr: 0,
     byte_len: 0,
     reserved: 0,
@@ -118,32 +118,32 @@ struct DmaDropContext {
     cookie: usize,
 }
 
-struct MdlInner {
+struct IoBufferInner {
     ptr: NonNull<u8>,
     len: usize,
     virt_addr: usize,
     page_base: usize,
     page_offset: usize,
     page_count: usize,
-    page_frames: [MdlPageFrame; MDL_INLINE_PAGE_CAPACITY],
+    page_frames: [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY],
     page_frames_len: usize,
-    dma_segments: [MdlDmaSegment; MDL_INLINE_SEGMENT_CAPACITY],
+    dma_segments: [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
     dma_segments_len: usize,
     mapped_by: Option<Arc<DeviceObject>>,
     dma_drop: Option<DmaDropContext>,
 }
 
-impl MdlInner {
+impl IoBufferInner {
     fn new(ptr: *mut u8, len: usize) -> Self {
         let ptr = NonNull::new(ptr).unwrap_or_else(NonNull::dangling);
         let virt_addr = ptr.as_ptr() as usize;
-        let page_offset = virt_addr & (MDL_PAGE_SIZE - 1);
+        let page_offset = virt_addr & (IOBUFFER_PAGE_SIZE - 1);
         let page_base = virt_addr - page_offset;
         let span = page_offset.saturating_add(len);
         let page_count = if span == 0 {
             0
         } else {
-            span.div_ceil(MDL_PAGE_SIZE)
+            span.div_ceil(IOBUFFER_PAGE_SIZE)
         };
 
         Self {
@@ -153,29 +153,29 @@ impl MdlInner {
             page_base,
             page_offset,
             page_count,
-            page_frames: [EMPTY_PAGE_FRAME; MDL_INLINE_PAGE_CAPACITY],
+            page_frames: [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY],
             page_frames_len: 0,
-            dma_segments: [EMPTY_DMA_SEGMENT; MDL_INLINE_SEGMENT_CAPACITY],
+            dma_segments: [EMPTY_DMA_SEGMENT; IOBUFFER_INLINE_SEGMENT_CAPACITY],
             dma_segments_len: 0,
             mapped_by: None,
             dma_drop: None,
         }
     }
 
-    fn page_frames(&self) -> &[MdlPageFrame] {
+    fn page_frames(&self) -> &[IoBufferPageFrame] {
         &self.page_frames[..self.page_frames_len]
     }
 
-    fn dma_segments(&self) -> &[MdlDmaSegment] {
+    fn dma_segments(&self) -> &[IoBufferDmaSegment] {
         &self.dma_segments[..self.dma_segments_len]
     }
 
     #[allow(dead_code)]
-    fn replace_page_frames(&mut self, frames: &[MdlPageFrame]) -> Result<(), MdlError> {
-        if frames.len() > MDL_INLINE_PAGE_CAPACITY {
-            return Err(MdlError::PageCapacityExceeded {
+    fn replace_page_frames(&mut self, frames: &[IoBufferPageFrame]) -> Result<(), IoBufferError> {
+        if frames.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
+            return Err(IoBufferError::PageCapacityExceeded {
                 required: frames.len(),
-                capacity: MDL_INLINE_PAGE_CAPACITY,
+                capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
             });
         }
 
@@ -186,11 +186,14 @@ impl MdlInner {
     }
 
     #[allow(dead_code)]
-    fn replace_dma_segments(&mut self, segments: &[MdlDmaSegment]) -> Result<(), MdlError> {
-        if segments.len() > MDL_INLINE_SEGMENT_CAPACITY {
-            return Err(MdlError::SegmentCapacityExceeded {
+    fn replace_dma_segments(
+        &mut self,
+        segments: &[IoBufferDmaSegment],
+    ) -> Result<(), IoBufferError> {
+        if segments.len() > IOBUFFER_INLINE_SEGMENT_CAPACITY {
+            return Err(IoBufferError::SegmentCapacityExceeded {
                 required: segments.len(),
-                capacity: MDL_INLINE_SEGMENT_CAPACITY,
+                capacity: IOBUFFER_INLINE_SEGMENT_CAPACITY,
             });
         }
 
@@ -212,15 +215,15 @@ impl MdlInner {
 }
 
 #[repr(C)]
-pub struct Mdl<'a, State: MdlState, Direction: MdlDirection> {
-    inner: MdlInner,
+pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
+    inner: IoBufferInner,
     _borrow: PhantomData<&'a [u8]>,
     _state: PhantomData<State>,
     _direction: PhantomData<Direction>,
 }
 
-impl<'a, State: MdlState, Direction: MdlDirection> Mdl<'a, State, Direction> {
-    fn from_inner(inner: MdlInner) -> Self {
+impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State, Direction> {
+    fn from_inner(inner: IoBufferInner) -> Self {
         Self {
             inner,
             _borrow: PhantomData,
@@ -230,14 +233,14 @@ impl<'a, State: MdlState, Direction: MdlDirection> Mdl<'a, State, Direction> {
     }
 
     #[allow(dead_code)]
-    fn into_inner(self) -> MdlInner {
+    fn into_inner(self) -> IoBufferInner {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
     }
 
     #[allow(dead_code)]
-    fn cast_state<NextState: MdlState>(self) -> Mdl<'a, NextState, Direction> {
-        Mdl::<'a, NextState, Direction>::from_inner(self.into_inner())
+    fn cast_state<NextState: IoBufferState>(self) -> IoBuffer<'a, NextState, Direction> {
+        IoBuffer::<'a, NextState, Direction>::from_inner(self.into_inner())
     }
 
     pub fn len(&self) -> usize {
@@ -264,11 +267,11 @@ impl<'a, State: MdlState, Direction: MdlDirection> Mdl<'a, State, Direction> {
         self.inner.page_count
     }
 
-    pub fn page_frames(&self) -> &[MdlPageFrame] {
+    pub fn page_frames(&self) -> &[IoBufferPageFrame] {
         self.inner.page_frames()
     }
 
-    pub fn dma_segments(&self) -> &[MdlDmaSegment] {
+    pub fn dma_segments(&self) -> &[IoBufferDmaSegment] {
         self.inner.dma_segments()
     }
 
@@ -281,13 +284,15 @@ impl<'a, State: MdlState, Direction: MdlDirection> Mdl<'a, State, Direction> {
     }
 }
 
-impl<'a, Direction: MdlDirection> Mdl<'a, DmaMapped, Direction> {
+impl<'a, Direction: IoBufferDirection> IoBuffer<'a, DmaMapped, Direction> {
     pub fn mapped_by(&self) -> Option<&Arc<DeviceObject>> {
         self.inner.mapped_by.as_ref()
     }
 }
 
-impl<'a, State: MdlState, Direction: WritableMdlDirection> Mdl<'a, State, Direction> {
+impl<'a, State: IoBufferState, Direction: WritableIoBufferDirection>
+    IoBuffer<'a, State, Direction>
+{
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.inner.ptr.as_ptr()
     }
@@ -297,25 +302,27 @@ impl<'a, State: MdlState, Direction: WritableMdlDirection> Mdl<'a, State, Direct
     }
 }
 
-impl<'a> Mdl<'a, Described, ToDevice> {
+impl<'a> IoBuffer<'a, Described, ToDevice> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self::from_inner(MdlInner::new(buf.as_ptr() as *mut u8, buf.len()))
+        Self::from_inner(IoBufferInner::new(buf.as_ptr() as *mut u8, buf.len()))
     }
 }
 
-impl<'a> Mdl<'a, Described, FromDevice> {
+impl<'a> IoBuffer<'a, Described, FromDevice> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self::from_inner(MdlInner::new(buf.as_mut_ptr(), buf.len()))
+        Self::from_inner(IoBufferInner::new(buf.as_mut_ptr(), buf.len()))
     }
 }
 
-impl<'a> Mdl<'a, Described, Bidirectional> {
+impl<'a> IoBuffer<'a, Described, Bidirectional> {
     pub fn new(buf: &'a mut [u8]) -> Self {
-        Self::from_inner(MdlInner::new(buf.as_mut_ptr(), buf.len()))
+        Self::from_inner(IoBufferInner::new(buf.as_mut_ptr(), buf.len()))
     }
 }
 
-impl<'a, State: MdlState, Direction: MdlDirection> Drop for Mdl<'a, State, Direction> {
+impl<'a, State: IoBufferState, Direction: IoBufferDirection> Drop
+    for IoBuffer<'a, State, Direction>
+{
     fn drop(&mut self) {
         if let Some(drop_ctx) = self.inner.dma_drop.take() {
             (drop_ctx.unmap)(&drop_ctx.mapped_by, drop_ctx.cookie);
@@ -323,9 +330,11 @@ impl<'a, State: MdlState, Direction: MdlDirection> Drop for Mdl<'a, State, Direc
     }
 }
 
-impl<'a, State: MdlState, Direction: MdlDirection> fmt::Debug for Mdl<'a, State, Direction> {
+impl<'a, State: IoBufferState, Direction: IoBufferDirection> fmt::Debug
+    for IoBuffer<'a, State, Direction>
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mdl")
+        f.debug_struct("IoBuffer")
             .field("state", &core::any::type_name::<State>())
             .field("direction", &core::any::type_name::<Direction>())
             .field("virt_addr", &self.inner.virt_addr)
