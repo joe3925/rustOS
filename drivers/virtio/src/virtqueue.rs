@@ -132,19 +132,47 @@ impl Virtqueue {
             pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_ENABLE, 1);
         }
     }
-
     /// Allocate a single descriptor from the free list. Returns descriptor index.
-    fn alloc_desc(&mut self) -> Option<u16> {
+    pub fn alloc_desc(&mut self) -> Option<u16> {
         if self.num_free == 0 {
             return None;
         }
         let idx = self.free_head;
         let desc = self.desc_ptr(idx);
-        self.free_head = unsafe { (*desc).next };
+        unsafe {
+            self.free_head = (*desc).next;
+        }
         self.num_free -= 1;
         Some(idx)
     }
 
+    pub fn push_allocated_indirect(
+        &mut self,
+        head: u16,
+        table_phys: kernel_api::x86_64::PhysAddr,
+        table_len: u32,
+    ) {
+        let desc = self.desc_ptr(head);
+        unsafe {
+            (*desc).addr = table_phys.as_u64();
+            (*desc).len = table_len;
+            (*desc).flags = VRING_DESC_F_INDIRECT;
+            (*desc).next = 0;
+        }
+
+        let avail_base = self.avail_va.as_u64() as *mut u16;
+        let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
+        let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
+        let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
+        unsafe {
+            core::ptr::write_volatile(ring_entry, head);
+            let avail_idx_ptr_mut = avail_base.add(1) as *mut core::sync::atomic::AtomicU16;
+            (*avail_idx_ptr_mut).store(
+                avail_idx.wrapping_add(1),
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+    }
     /// Free a descriptor back to the free list.
     fn free_desc(&mut self, idx: u16) {
         let desc = self.desc_ptr(idx);

@@ -15,7 +15,6 @@ use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use futures_channel::oneshot;
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
 };
@@ -24,6 +23,7 @@ use kernel_api::irq::{
     IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
     irq_register_isr_gsi, irq_wait_closed,
 };
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -34,7 +34,6 @@ use kernel_api::pnp::{
     driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
 use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
@@ -47,9 +46,7 @@ use temp_benchmark::{
     bench_sweep, bench_sweep_params, sanitize_bench_params,
 };
 
-use blk::{
-    BlkIoArena, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT, calculate_per_queue_arena_sizes,
-};
+use blk::{BlkIoSlots, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
 
@@ -382,19 +379,20 @@ async fn virtio_pnp_start<'a, 'b>(
         None
     };
 
-    let (prealloc_per_queue, dynamic_per_queue) =
-        calculate_per_queue_arena_sizes(final_queue_count);
-
     let mut queue_states: Vec<QueueState> = Vec::with_capacity(final_queue_count);
     let mut virtqueue_iter = virtqueues.into_iter();
 
     for i in 0..final_queue_count {
-        let arena = match BlkIoArena::init_with_capacity(prealloc_per_queue, dynamic_per_queue) {
+        let vq = virtqueue_iter
+            .next()
+            .expect("virtio-blk: virtqueue missing during init");
+
+        let arena = match BlkIoSlots::new(vq.size as usize) {
             Some(a) => a,
             None => {
                 println!(
-                    "virtio-blk: failed to create arena for queue {} with prealloc {} and dynamic {}",
-                    i, prealloc_per_queue, dynamic_per_queue
+                    "virtio-blk: failed to create slots for queue {} with size {}",
+                    i, vq.size
                 );
 
                 for qs in queue_states.iter() {
@@ -417,8 +415,9 @@ async fn virtio_pnp_start<'a, 'b>(
                     }
                 }
 
-                for vq in virtqueue_iter.by_ref() {
-                    vq.destroy();
+                vq.destroy();
+                for remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
                 }
 
                 blk::reset_device(caps.common_cfg);
@@ -440,13 +439,10 @@ async fn virtio_pnp_start<'a, 'b>(
         } else {
             (None, None, None)
         };
-        let vq = virtqueue_iter
-            .next()
-            .expect("virtio-blk: virtqueue missing during init");
 
         let vq_capacity = vq.size as usize;
         let max_data_segments = core::cmp::min(
-            blk::MAX_DESCRIPTORS_PER_REQUEST.saturating_sub(2),
+            blk::MAX_INDIRECT_DESCRIPTORS.saturating_sub(2),
             vq_capacity.saturating_sub(2),
         );
 
@@ -581,12 +577,6 @@ async fn virtio_pnp_remove<'a, 'b>(
                 // blocked on rx.await get Err(Canceled) instead of hanging forever.
                 for slot in qs.completion_slots.iter() {
                     slot.lock().take();
-                }
-
-                if let Some(va) = qs.arena.indirect_pages_va {
-                    unsafe {
-                        unmap_range(va, (qs.arena.indirect_pages_count * 4096) as u64);
-                    }
                 }
             }
 
@@ -850,7 +840,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
-    let (_parent, inner) = match get_parent_inner(pdo) {
+    let (parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
@@ -871,127 +861,90 @@ pub async fn virtio_pdo_read<'a, 'b>(
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         return complete_req(req, DriverStatus::InvalidParameter);
     }
-    // Ensure caller-provided buffer is large enough for the requested transfer.
-    match req.data() {
-        RequestDataView::FromDevice(data)
-            if data.view::<IoBuffer<'_, Described, FromDevice>>().map_or(false, |b| b.len() >= len) => {}
-        RequestDataView::FromDevice(_) => {
-            return complete_req(req, DriverStatus::InsufficientResources);
-        }
-        RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
-    }
 
     let sector = offset >> 9;
+    let queue_idx = inner.select_queue();
+    let qs = inner.get_queue(queue_idx);
 
-    let mut queue_idx = inner.select_queue();
-    let queue_count = inner.queue_count.max(1);
-    let max_chunk = inner
-        .queues
-        .iter()
-        .map(|q| q.max_request_bytes.max(512) as u64)
-        .min()
-        .unwrap_or(512);
+    let buffer = match req.data() {
+        RequestDataView::FromDevice(d) => {
+            let b = d.view::<IoBuffer<'_, Described, FromDevice>>();
+            match b {
+                Some(b) if b.len() >= len => unsafe { core::ptr::read(b as *const _) },
+                _ => return complete_req(req, DriverStatus::InsufficientResources),
+            }
+        }
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
+    };
+    let mapped_buffer = match kernel_api::dma::map_buffer(
+        &parent,
+        buffer,
+        kernel_api::kernel_types::dma::DmaMappingStrategy::SingleContiguous,
+    ) {
+        Ok(b) => b,
+        Err(_) => return complete_req(req, DriverStatus::InsufficientResources),
+    };
 
-    let mut remaining = len as u64;
-    let mut buf_offset = 0usize;
-    let mut next_sector = sector;
-
-    while remaining > 0 {
-        let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
-
-        let mut submitted = false;
-        let start_idx = queue_idx;
-
-        for attempt in 0..queue_count {
-            let qi = (start_idx + attempt) % queue_count;
-            let qs = inner.get_queue(qi);
-
-            let io_req = match qs
+    let mut submitted_head = None;
+    loop {
+        let (tx, rx) = futures_channel::oneshot::channel::<u32>();
+        let head_opt = {
+            let mut vq = qs.queue.write();
+            let segments = mapped_buffer.dma_segments();
+            match qs
                 .arena
-                .new_request(VIRTIO_BLK_T_IN, next_sector, chunk_len)
+                .submit_request(&mut vq, VIRTIO_BLK_T_IN, sector, segments, false)
             {
-                Some(r) => r,
-                None => continue,
-            };
-
-            let (tx, rx) = oneshot::channel::<u32>();
-
-            let head_opt = {
-                let mut vq = qs.queue.write();
-                let use_indirect = inner.indirect_desc_enabled;
-                match io_req.submit(&mut vq, false, use_indirect) {
-                    Some(h) => {
-                        *qs.completion_slots[h as usize].lock() = Some(tx);
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
-                        Some(h)
-                    }
-                    None => {
-                        // Queue is full (or no descriptors). Kick immediately so completions free space.
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        None
-                    }
+                Some(h) => {
+                    *qs.completion_slots[h as usize].lock() = Some(tx);
+                    let queue_full = vq.num_free == 0;
+                    let _submit_guard = SubmitTasksGuard::new(
+                        &qs.submitting_tasks,
+                        &vq,
+                        inner.notify_base,
+                        inner.notify_off_multiplier,
+                        queue_full,
+                    );
+                    Some(h)
                 }
-            };
-
-            let head = match head_opt {
-                Some(h) => h,
-                None => continue,
-            };
-
-            let _ = match rx.await {
-                Ok(l) => l,
-                Err(_) => return complete_req(req, DriverStatus::DeviceError),
-            };
-
-            if io_req.status() != VIRTIO_BLK_S_OK {
-                return complete_req(req, DriverStatus::DeviceError);
+                None => {
+                    vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                    None
+                }
             }
+        };
 
-            {
-                let mut data = match req.data() {
-                    RequestDataView::FromDevice(data) => data,
-                    RequestDataView::ToDevice(_) => {
-                        return complete_req(req, DriverStatus::InvalidParameter);
-                    }
-                };
-                let dst = &mut data.view_mut::<IoBuffer<'_, Described, FromDevice>>()
-                    .expect("read req missing buffer")
-                    .as_mut_slice()[buf_offset..buf_offset + chunk_len as usize];
-                dst.copy_from_slice(io_req.data_slice());
-            }
-
-            remaining = remaining.saturating_sub(chunk_len as u64);
-            buf_offset += chunk_len as usize;
-            next_sector = next_sector.saturating_add((chunk_len as u64) >> 9);
-            queue_idx = (qi + 1) % queue_count;
-            submitted = true;
+        if let Some(h) = head_opt {
+            submitted_head = Some((h, rx));
             break;
         }
 
-        if !submitted {
-            // All queues were full. Yield to let the drain task free descriptors.
-            let mut done = false;
-            core::future::poll_fn(move |cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        }
+        let mut done = false;
+        core::future::poll_fn(|cx| {
+            if done {
+                core::task::Poll::Ready(())
+            } else {
+                done = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await;
     }
 
-    complete_req(req, DriverStatus::Success)
+    let (head, rx) = submitted_head.unwrap();
+    let status = match rx.await {
+        Ok(_) => {
+            if qs.arena.get_status(head) == VIRTIO_BLK_S_OK {
+                DriverStatus::Success
+            } else {
+                DriverStatus::DeviceError
+            }
+        }
+        Err(_) => DriverStatus::DeviceError,
+    };
+
+    complete_req(req, status)
 }
 
 #[request_handler]
@@ -1000,7 +953,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
     req: &'b mut RequestHandle<'a>,
     _buf_len: usize,
 ) -> DriverStep {
-    let (_parent, inner) = match get_parent_inner(pdo) {
+    let (parent, inner) = match get_parent_inner(pdo) {
         Ok(v) => v,
         Err(s) => return complete_req(req, s),
     };
@@ -1022,128 +975,91 @@ pub async fn virtio_pdo_write<'a, 'b>(
     if (offset & 0x1FF) != 0 || (len & 0x1FF) != 0 {
         return complete_req(req, DriverStatus::InvalidParameter);
     }
-    // Guard against buffer underruns – without this we can read past the end of
-    // the caller's data buffer and corrupt adjacent memory.
-    match req.data() {
-        RequestDataView::ToDevice(data)
-            if data.view::<IoBuffer<'_, Described, ToDevice>>().map_or(false, |b| b.len() >= len) => {}
-        RequestDataView::ToDevice(_) => {
-            return complete_req(req, DriverStatus::InsufficientResources);
-        }
-        RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
-    }
 
     let sector = offset >> 9;
+    let queue_idx = inner.select_queue();
+    let qs = inner.get_queue(queue_idx);
 
-    let mut queue_idx = inner.select_queue();
-    let queue_count = inner.queue_count.max(1);
-    let max_chunk = inner
-        .queues
-        .iter()
-        .map(|q| q.max_request_bytes.max(512) as u64)
-        .min()
-        .unwrap_or(512);
+    let buffer = match req.data() {
+        RequestDataView::ToDevice(d) => {
+            let b = d.view::<IoBuffer<'_, Described, ToDevice>>();
+            match b {
+                Some(b) if b.len() >= len => unsafe { core::ptr::read(b as *const _) },
+                _ => return complete_req(req, DriverStatus::InsufficientResources),
+            }
+        }
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
+    };
 
-    let mut remaining = len as u64;
-    let mut buf_offset = 0usize;
-    let mut next_sector = sector;
+    let mapped_buffer = match kernel_api::dma::map_buffer(
+        &parent,
+        buffer,
+        kernel_api::kernel_types::dma::DmaMappingStrategy::SingleContiguous,
+    ) {
+        Ok(b) => b,
+        Err(_) => return complete_req(req, DriverStatus::InsufficientResources),
+    };
 
-    while remaining > 0 {
-        let chunk_len = core::cmp::min(max_chunk, remaining) as u32;
-
-        let mut submitted = false;
-        let start_idx = queue_idx;
-
-        for attempt in 0..queue_count {
-            let qi = (start_idx + attempt) % queue_count;
-            let qs = inner.get_queue(qi);
-
-            let mut io_req = match qs
+    let mut submitted_head = None;
+    loop {
+        let (tx, rx) = futures_channel::oneshot::channel::<u32>();
+        let head_opt = {
+            let mut vq = qs.queue.write();
+            let segments = mapped_buffer.dma_segments();
+            match qs
                 .arena
-                .new_request(VIRTIO_BLK_T_OUT, next_sector, chunk_len)
+                .submit_request(&mut vq, VIRTIO_BLK_T_OUT, sector, segments, true)
             {
-                Some(r) => r,
-                None => continue,
-            };
-
-            {
-                let data = match req.data() {
-                    RequestDataView::ToDevice(data) => data,
-                    RequestDataView::FromDevice(_) => {
-                        return complete_req(req, DriverStatus::InvalidParameter);
-                    }
-                };
-                let src = &data.view::<IoBuffer<'_, Described, ToDevice>>()
-                    .expect("write req missing buffer")
-                    .as_slice()[buf_offset..buf_offset + chunk_len as usize];
-                io_req.data_slice_mut().copy_from_slice(src);
-            }
-
-            let (tx, rx) = oneshot::channel::<u32>();
-
-            let head_opt = {
-                let mut vq = qs.queue.write();
-                let use_indirect = inner.indirect_desc_enabled;
-                match io_req.submit(&mut vq, true, use_indirect) {
-                    Some(h) => {
-                        *qs.completion_slots[h as usize].lock() = Some(tx);
-                        let queue_full = vq.num_free == 0;
-                        let _submit_guard = SubmitTasksGuard::new(
-                            &qs.submitting_tasks,
-                            &vq,
-                            inner.notify_base,
-                            inner.notify_off_multiplier,
-                            queue_full,
-                        );
-                        Some(h)
-                    }
-                    None => {
-                        // Virtqueue out of descriptors: kick immediately so completions can free space.
-                        vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                        None
-                    }
+                Some(h) => {
+                    *qs.completion_slots[h as usize].lock() = Some(tx);
+                    let queue_full = vq.num_free == 0;
+                    let _submit_guard = SubmitTasksGuard::new(
+                        &qs.submitting_tasks,
+                        &vq,
+                        inner.notify_base,
+                        inner.notify_off_multiplier,
+                        queue_full,
+                    );
+                    Some(h)
                 }
-            };
-
-            let _head = match head_opt {
-                Some(h) => h,
-                None => continue,
-            };
-
-            let _ = match rx.await {
-                Ok(l) => l,
-                Err(_) => return complete_req(req, DriverStatus::DeviceError),
-            };
-
-            if io_req.status() != VIRTIO_BLK_S_OK {
-                return complete_req(req, DriverStatus::DeviceError);
+                None => {
+                    vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                    None
+                }
             }
+        };
 
-            remaining = remaining.saturating_sub(chunk_len as u64);
-            buf_offset += chunk_len as usize;
-            next_sector = next_sector.saturating_add((chunk_len as u64) >> 9);
-            queue_idx = (qi + 1) % queue_count;
-            submitted = true;
+        if let Some(h) = head_opt {
+            submitted_head = Some((h, rx));
             break;
         }
 
-        if !submitted {
-            // All queues were full. Yield to let the drain task free descriptors.
-            let mut done = false;
-            core::future::poll_fn(move |cx| {
-                if done {
-                    core::task::Poll::Ready(())
-                } else {
-                    done = true;
-                    cx.waker().wake_by_ref();
-                    core::task::Poll::Pending
-                }
-            })
-            .await;
-        }
+        let mut done = false;
+        core::future::poll_fn(|cx| {
+            if done {
+                core::task::Poll::Ready(())
+            } else {
+                done = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await;
     }
 
-    complete_req(req, DriverStatus::Success)
+    let (head, rx) = submitted_head.unwrap();
+    let status = match rx.await {
+        Ok(_) => {
+            if qs.arena.get_status(head) == VIRTIO_BLK_S_OK {
+                DriverStatus::Success
+            } else {
+                DriverStatus::DeviceError
+            }
+        }
+        Err(_) => DriverStatus::DeviceError,
+    };
+
+    complete_req(req, status)
 }
 
 #[request_handler]

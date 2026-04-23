@@ -912,6 +912,7 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
         .expect("IVRS payload is truncated");
 
     let info = table.info;
+    let target_ivhd_type = select_amd_ivhd_type(payload);
     let mut remapper_units = Vec::new();
     let mut reserved_regions = Vec::new();
 
@@ -930,6 +931,11 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
         let block = &payload[offset..offset + length];
         match header.block_type {
             IVRS_TYPE_HARDWARE_10 | IVRS_TYPE_HARDWARE_11 | IVRS_TYPE_HARDWARE_40 => {
+                if header.block_type != target_ivhd_type {
+                    offset += length;
+                    continue;
+                }
+
                 if length < IVRS_HARDWARE_MIN_LENGTH {
                     panic!("IVRS hardware block is too short");
                 }
@@ -1025,6 +1031,44 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
         reserved_regions,
     }
 }
+
+// Linux selects one IVHD type for the whole IVRS walk so compatibility
+// blocks describing the same physical IOMMU do not get instantiated twice.
+fn select_amd_ivhd_type(payload: &[u8]) -> u8 {
+    let mut offset = 0usize;
+    let mut target_device_id = None;
+    let mut target_ivhd_type = None;
+
+    while offset < payload.len() {
+        if offset + size_of::<IvrsHeader>() > payload.len() {
+            panic!("IVRS block header is truncated");
+        }
+
+        let header = read_packed::<IvrsHeader>(payload, offset);
+        let length = header.length as usize;
+        if length < size_of::<IvrsHeader>() || offset + length > payload.len() {
+            panic!("IVRS block length is invalid");
+        }
+
+        match header.block_type {
+            IVRS_TYPE_HARDWARE_10 | IVRS_TYPE_HARDWARE_11 | IVRS_TYPE_HARDWARE_40 => {
+                let device_id = *target_device_id.get_or_insert(header.device_id);
+                if header.device_id == device_id {
+                    target_ivhd_type = Some(match target_ivhd_type {
+                        Some(existing) if existing > header.block_type => existing,
+                        _ => header.block_type,
+                    });
+                }
+            }
+            _ => {}
+        }
+
+        offset += length;
+    }
+
+    target_ivhd_type.unwrap_or(IVRS_TYPE_HARDWARE_10)
+}
+
 fn parse_intel_device_scopes(bytes: &[u8]) -> Vec<IntelDeviceScope> {
     let mut scopes = Vec::new();
     let mut offset = 0usize;

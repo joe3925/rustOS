@@ -3,8 +3,8 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-
 use futures_channel::oneshot;
+
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
 use kernel_api::kernel_types::io::DiskInfo;
@@ -12,7 +12,7 @@ use kernel_api::util::get_current_lapic_id;
 use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once, RwLock, RwLockReadGuard};
 
-use crate::blk::BlkIoArena;
+use crate::blk::BlkIoSlots;
 use crate::virtqueue::Virtqueue;
 
 /// Strategy for selecting which queue to use for I/O requests.
@@ -29,7 +29,7 @@ pub struct QueueState {
     /// The virtqueue for this request queue.
     pub queue: RwLock<Virtqueue>,
     /// Pre-allocated arena for this queue's BlkIoRequest slots.
-    pub arena: BlkIoArena,
+    pub arena: BlkIoSlots,
     /// Maximum safe data payload per request on this queue (512-byte aligned).
     pub max_request_bytes: u32,
     /// Maximum number of data descriptors we will use for a single request.
