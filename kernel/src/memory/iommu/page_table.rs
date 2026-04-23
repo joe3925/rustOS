@@ -23,6 +23,8 @@ use crate::util::boot_info;
 pub const PTE_P: u64 = 1 << 0;
 pub const PTE_RW: u64 = 1 << 1;
 pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+pub const AMD_IR: u64 = 1 << 61;
+pub const AMD_IW: u64 = 1 << 62;
 
 #[inline]
 fn phys_offset() -> u64 {
@@ -61,11 +63,13 @@ pub fn alloc_pt_frame_phys() -> Option<u64> {
 /// allocated on the way down are intentionally not reported — see the
 /// module docstring.
 #[inline]
-pub fn map_4k(
+pub fn map_4k<F: Fn(u32) -> u64>(
     root_phys: u64,
     iova: u64,
     phys: u64,
+    interior_flags: F,
     leaf_flags: u64,
+    present_mask: u64,
 ) -> Result<(), IommuError> {
     debug_assert_eq!(iova & 0xFFF, 0);
     debug_assert_eq!(phys & 0xFFF, 0);
@@ -76,32 +80,32 @@ pub fn map_4k(
         let idx = iova_index(iova, lvl);
         let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
         let entry = unsafe { entry_ptr.read_volatile() };
-        if entry & PTE_P != 0 {
+        if entry & present_mask != 0 {
             table_phys = entry & PTE_ADDR_MASK;
         } else {
             let np = alloc_pt_frame_phys().ok_or(IommuError::NoBackingFrame)?;
-            unsafe { entry_ptr.write_volatile(np | PTE_P | PTE_RW) };
+            unsafe { entry_ptr.write_volatile(np | interior_flags(lvl)) };
             table_phys = np;
         }
     }
 
     let idx = iova_index(iova, 1);
     let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
-    let leaf = (phys & PTE_ADDR_MASK) | PTE_P | PTE_RW | leaf_flags;
+    let leaf = (phys & PTE_ADDR_MASK) | leaf_flags;
     unsafe { entry_ptr.write_volatile(leaf) };
     Ok(())
 }
 
 /// Clear one 4 KiB leaf. Returns the physical address that was mapped, if any.
 #[inline]
-pub fn unmap_4k(root_phys: u64, iova: u64) -> Option<u64> {
+pub fn unmap_4k(root_phys: u64, iova: u64, present_mask: u64) -> Option<u64> {
     debug_assert_eq!(iova & 0xFFF, 0);
 
     let mut table_phys = root_phys;
     for lvl in (2..=4).rev() {
         let idx = iova_index(iova, lvl);
         let entry = unsafe { phys_table_ptr(table_phys).add(idx).read_volatile() };
-        if entry & PTE_P == 0 {
+        if entry & present_mask == 0 {
             return None;
         }
         table_phys = entry & PTE_ADDR_MASK;
@@ -110,7 +114,7 @@ pub fn unmap_4k(root_phys: u64, iova: u64) -> Option<u64> {
     let idx = iova_index(iova, 1);
     let entry_ptr = unsafe { phys_table_ptr(table_phys).add(idx) };
     let entry = unsafe { entry_ptr.read_volatile() };
-    if entry & PTE_P == 0 {
+    if entry & present_mask == 0 {
         return None;
     }
     unsafe { entry_ptr.write_volatile(0) };
@@ -123,13 +127,22 @@ pub fn identity_map_range(
     root_phys: u64,
     base: u64,
     limit: u64,
+    interior_flags: impl Fn(u32) -> u64 + Copy,
     leaf_flags: u64,
+    present_mask: u64,
 ) -> Result<(), IommuError> {
     let start = base & !0xFFFu64;
     let end = (limit + 0xFFF) & !0xFFFu64;
     let mut cur = start;
     while cur < end {
-        map_4k(root_phys, cur, cur, leaf_flags)?;
+        map_4k(
+            root_phys,
+            cur,
+            cur,
+            interior_flags,
+            leaf_flags,
+            present_mask,
+        )?;
         cur += 0x1000;
     }
     Ok(())

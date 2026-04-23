@@ -1,3 +1,40 @@
+// TODO(rustos-iommu-dma): Follow-up work remaining after initial bring-up.
+//
+// High-priority correctness:
+// - Remove the current two-record unmap limitation (`PendingUnmap { rec_a, rec_b }`).
+//   `FullIdentity` currently rejects fragmented layouts that would need more
+//   than two mapping records.
+// - Track and validate mapping ownership more strictly (cookie/device/domain consistency,
+//   stale-cookie behavior, and domain teardown ordering).
+// - Add explicit detach/cleanup behavior for device unregister and domain lifetime
+//   (including IOMMU-side detach where required by backend).
+//
+// IOMMU semantics / hardware completeness:
+// - Respect ACPI reserved regions (RMRR/IVMD) and enforce mapping restrictions.
+// - Add Intel/AMD fault/event reporting integration into kernel diagnostics.
+// - Evaluate per-range/page-selective invalidation instead of always domain-wide invalidation.
+//
+// DMA policy and feature completeness:
+// - Enforce per-device DMA constraints (DMA mask width, segment boundary constraints,
+//   max segment count/size policies).
+// - Implement bounce-buffer or remap fallback paths when direct mapping cannot satisfy
+//   device constraints.
+//
+// API / observability:
+// - Surface richer error distinctions (translation failure vs IOVA exhaustion vs HW fault).
+// - Add mapping/unmapping counters and per-device/domain telemetry for debugging.
+// - Decide whether to use `IommuDomain.mappings` for validation/accounting, or remove it
+//   if state is fully managed by `pending_unmaps`.
+//
+// Test coverage:
+// - Add unit/integration tests for all mapping strategies with:
+//   - aligned/unaligned buffers
+//   - multi-page and max-inline-page cases
+//   - fragmentation-heavy identity scenarios
+//   - map failure rollback correctness
+//   - unregister while mappings are live
+// - Add backend-specific tests for Intel VT-d and AMD-Vi invalidation behavior.
+//
 use crate::drivers::pnp::device::DevNodeExt;
 use crate::drivers::ACPI::{ACPIImpl, ACPI_TABLES};
 use acpi::sdt::{SdtHeader, Signature};
@@ -9,12 +46,17 @@ use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
-    IoBufferInner, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
-    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
+    IoBufferDmaSegment, IoBufferInner, IOBUFFER_INLINE_PAGE_CAPACITY,
+    IOBUFFER_INLINE_SEGMENT_CAPACITY, IOBUFFER_PAGE_SIZE, DMA_IOMMU_VENDOR_AMD_IVRS,
+    DMA_IOMMU_VENDOR_INTEL_DMAR, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
 };
 use kernel_types::status::DriverStatus;
 use raw_cpuid::CpuId;
 use spin::{Mutex, Once};
+use x86_64::VirtAddr;
+
+use crate::memory::iommu::{self, IommuDomain, MappingRecord};
+use crate::memory::paging::tables::virt_to_phys;
 
 static DMA_MANAGER: Once<DmaManager> = Once::new();
 
@@ -48,27 +90,412 @@ pub fn platform_iommu_info() -> &'static PlatformIommuInfo {
 
 pub fn map_buffer<'a>(
     device: &Arc<DeviceObject>,
-    buffer: IoBufferInner<'a>,
+    mut buffer: IoBufferInner<'a>,
     strategy: DmaMappingStrategy,
 ) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)> {
-    let _ = (device, buffer, strategy);
+    let m = manager();
+    let key = match resolve_hardware_pdo(device) {
+        Ok(pdo) => device_key(&pdo),
+        Err(_) => return Err((buffer, DmaMapError::NoIommu)),
+    };
 
-    // TODO: validate the DMA registration for `device` and return the erased
-    // `IoBufferInner` with `DmaMapError::NoIommu` when the device cannot map.
-    // TODO: interpret `strategy`, pin pages when required, and populate DMA
-    // segments in the returned `IoBufferInner`.
-    // TODO: allocate and track IOVA / IOMMU state so `kernel_dma_unmap_buffer`
-    // can tear the mapping down later.
-    todo!("kernel DMA buffer mapping is not implemented yet")
+    let mut state = m.state.lock();
+    let Some(entry) = state.devices.get_mut(&key) else {
+        return Err((buffer, DmaMapError::NoIommu));
+    };
+    let Some(pdo) = entry.pdo.upgrade() else {
+        return Err((buffer, DmaMapError::NoIommu));
+    };
+
+    let domain = if let Some(domain) = entry.domain.as_ref() {
+        domain.clone()
+    } else {
+        let identity = match entry.identity {
+            RegisteredDmaIdentity::Pci(id) => id,
+        };
+        let Some(domain) = iommu::get_or_create_domain(key, identity) else {
+            return Err((buffer, DmaMapError::NoIommu));
+        };
+        entry.domain = Some(domain.clone());
+        domain
+    };
+
+    let page_count = buffer.page_count();
+    let buffer_len = buffer.len();
+    let page_offset = buffer.page_offset();
+    if buffer_len == 0 || page_count == 0 {
+        return Err((buffer, DmaMapError::InvalidSize));
+    }
+    if page_count > IOBUFFER_INLINE_PAGE_CAPACITY {
+        return Err((buffer, DmaMapError::PageCapacityExceeded {
+            required: page_count,
+        }));
+    }
+
+    let page_base = buffer.page_base_address();
+    let mut phys_pages = [0u64; IOBUFFER_INLINE_PAGE_CAPACITY];
+    {
+        let page_frames = buffer.page_frames_storage_mut();
+        for i in 0..page_count {
+            let va = VirtAddr::new((page_base + i * IOBUFFER_PAGE_SIZE) as u64);
+            let Some(phys) = virt_to_phys(va) else {
+                return Err((buffer, DmaMapError::NoIommu));
+            };
+            let phys_addr = phys.as_u64();
+            phys_pages[i] = phys_addr;
+            page_frames[i].phys_addr = phys_addr;
+        }
+        for frame in &mut page_frames[page_count..] {
+            frame.phys_addr = 0;
+        }
+    }
+    if buffer.set_page_frames_len(page_count).is_err() {
+        return Err((buffer, DmaMapError::PageCapacityExceeded {
+            required: page_count,
+        }));
+    }
+
+    let mut rec_a: Option<MappingRecord> = None;
+    let mut rec_b: Option<MappingRecord> = None;
+    let mut segments = [IoBufferDmaSegment::default(); IOBUFFER_INLINE_SEGMENT_CAPACITY];
+    let mut page_iovas = [0u64; IOBUFFER_INLINE_PAGE_CAPACITY];
+    let segment_count = match strategy {
+        DmaMappingStrategy::SingleContiguous => {
+            let map_size = (page_count * IOBUFFER_PAGE_SIZE) as u64;
+            let Some(iova_base) = domain.alloc_iova(map_size) else {
+                return Err((buffer, DmaMapError::RemappingUnavailable));
+            };
+            if let Err(err) = map_phys_pages(&domain, iova_base, &phys_pages[..page_count]) {
+                domain.free_iova(iova_base, map_size);
+                return Err((buffer, err));
+            }
+
+            rec_a = Some(MappingRecord {
+                iova_base,
+                page_count: page_count as u32,
+                is_identity: false,
+            });
+
+            for (idx, slot) in page_iovas[..page_count].iter_mut().enumerate() {
+                *slot = iova_base + (idx * IOBUFFER_PAGE_SIZE) as u64;
+            }
+
+            match build_segments_from_page_iovas(
+                &page_iovas[..page_count],
+                page_offset,
+                buffer_len,
+                true,
+                &mut segments,
+            ) {
+                Ok(count) => count,
+                Err(err) => {
+                    rollback_mappings(&domain, rec_a, rec_b);
+                    return Err((buffer, err));
+                }
+            }
+        }
+        DmaMappingStrategy::ScatterGather => {
+            let map_size = (page_count * IOBUFFER_PAGE_SIZE) as u64;
+            let Some(iova_base) = domain.alloc_iova(map_size) else {
+                return Err((buffer, DmaMapError::RemappingUnavailable));
+            };
+            if let Err(err) = map_phys_pages(&domain, iova_base, &phys_pages[..page_count]) {
+                domain.free_iova(iova_base, map_size);
+                return Err((buffer, err));
+            }
+
+            rec_a = Some(MappingRecord {
+                iova_base,
+                page_count: page_count as u32,
+                is_identity: false,
+            });
+
+            for (idx, slot) in page_iovas[..page_count].iter_mut().enumerate() {
+                *slot = iova_base + (idx * IOBUFFER_PAGE_SIZE) as u64;
+            }
+
+            match build_segments_from_page_iovas(
+                &page_iovas[..page_count],
+                page_offset,
+                buffer_len,
+                false,
+                &mut segments,
+            ) {
+                Ok(count) => count,
+                Err(err) => {
+                    rollback_mappings(&domain, rec_a, rec_b);
+                    return Err((buffer, err));
+                }
+            }
+        }
+        DmaMappingStrategy::ContiguousChunks { chunk_size } => {
+            if chunk_size == 0 {
+                return Err((buffer, DmaMapError::InvalidSize));
+            }
+            if (chunk_size % IOBUFFER_PAGE_SIZE) != 0 {
+                return Err((buffer, DmaMapError::ChunkSizeNotPageAligned {
+                    chunk_size,
+                }));
+            }
+            if (buffer_len % chunk_size) != 0 {
+                return Err((
+                    buffer,
+                    DmaMapError::UnalignedChunkSize {
+                        buffer_len,
+                        chunk_size,
+                    },
+                ));
+            }
+
+            let map_size = (page_count * IOBUFFER_PAGE_SIZE) as u64;
+            let Some(iova_base) = domain.alloc_iova(map_size) else {
+                return Err((buffer, DmaMapError::RemappingUnavailable));
+            };
+            if let Err(err) = map_phys_pages(&domain, iova_base, &phys_pages[..page_count]) {
+                domain.free_iova(iova_base, map_size);
+                return Err((buffer, err));
+            }
+            rec_a = Some(MappingRecord {
+                iova_base,
+                page_count: page_count as u32,
+                is_identity: false,
+            });
+
+            let chunk_count = buffer_len / chunk_size;
+            if chunk_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
+                rollback_mappings(&domain, rec_a, rec_b);
+                return Err((
+                    buffer,
+                    DmaMapError::SegmentCapacityExceeded {
+                        required: chunk_count,
+                    },
+                ));
+            }
+
+            for (idx, seg) in segments[..chunk_count].iter_mut().enumerate() {
+                *seg = IoBufferDmaSegment {
+                    dma_addr: iova_base + page_offset as u64 + (idx * chunk_size) as u64,
+                    byte_len: chunk_size as u32,
+                    reserved: 0,
+                };
+            }
+            chunk_count
+        }
+        DmaMappingStrategy::FullIdentity => {
+            let mut runs = [(0usize, 0usize); 2];
+            let run_count = match collect_phys_runs(&phys_pages[..page_count], &mut runs) {
+                Ok(count) => count,
+                Err(err) => return Err((buffer, err)),
+            };
+
+            for idx in 0..run_count {
+                let (run_start, run_len) = runs[idx];
+                let run_pages = &phys_pages[run_start..run_start + run_len];
+                let run_iova = run_pages[0];
+                if let Err(err) = map_phys_pages(&domain, run_iova, run_pages) {
+                    rollback_mappings(&domain, rec_a, rec_b);
+                    return Err((buffer, err));
+                }
+                let rec = MappingRecord {
+                    iova_base: run_iova,
+                    page_count: run_len as u32,
+                    is_identity: true,
+                };
+                if rec_a.is_none() {
+                    rec_a = Some(rec);
+                } else {
+                    rec_b = Some(rec);
+                }
+            }
+
+            page_iovas[..page_count].copy_from_slice(&phys_pages[..page_count]);
+            match build_segments_from_page_iovas(
+                &page_iovas[..page_count],
+                page_offset,
+                buffer_len,
+                true,
+                &mut segments,
+            ) {
+                Ok(count) => count,
+                Err(err) => {
+                    rollback_mappings(&domain, rec_a, rec_b);
+                    return Err((buffer, err));
+                }
+            }
+        }
+    };
+
+    if let Err(err) = buffer.replace_dma_segments(&segments[..segment_count]) {
+        rollback_mappings(&domain, rec_a, rec_b);
+        return Err((
+            buffer,
+            match err {
+                kernel_types::dma::IoBufferError::SegmentCapacityExceeded { required, .. } => {
+                    DmaMapError::SegmentCapacityExceeded { required }
+                }
+                kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. } => {
+                    DmaMapError::PageCapacityExceeded { required }
+                }
+            },
+        ));
+    }
+
+    let Some(rec_a) = rec_a else {
+        return Err((buffer, DmaMapError::RemappingUnavailable));
+    };
+    let cookie = state.next_cookie;
+    state.next_cookie = state.next_cookie.wrapping_add(1);
+    state.pending_unmaps.insert(
+        cookie,
+        PendingUnmap {
+            device_key: key,
+            domain: domain.clone(),
+            rec_a,
+            rec_b,
+        },
+    );
+
+    buffer.set_dma_drop(pdo, unmap_trampoline, cookie as usize);
+    iommu::invalidate(&domain);
+    Ok(buffer)
 }
 
-pub fn unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
-    let _ = buffer;
-    // TODO: tear down the IOMMU / IOVA state referenced by the erased
-    // `IoBufferInner`.
-    // TODO: clear DMA segments and restore the post-unmap `IoBuffer` state in
-    // the returned erased buffer.
-    todo!("kernel DMA buffer unmapping is not implemented yet")
+pub fn unmap_buffer<'a>(mut buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
+    buffer.remove_dma_mapping_in_place();
+    buffer
+}
+
+fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
+    let m = manager();
+    let mut state = m.state.lock();
+    let Some(pending) = state.pending_unmaps.remove(&(cookie as u64)) else {
+        return;
+    };
+    unmap_record(&pending.domain, pending.rec_a);
+    if let Some(rec_b) = pending.rec_b {
+        unmap_record(&pending.domain, rec_b);
+    }
+    iommu::invalidate(&pending.domain);
+}
+
+fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
+    match err {
+        iommu::IommuError::NoBackingFrame | iommu::IommuError::IovaSpaceExhausted => {
+            DmaMapError::RemappingUnavailable
+        }
+        iommu::IommuError::NotMapped
+        | iommu::IommuError::HardwareError
+        | iommu::IommuError::Unsupported => DmaMapError::NoIommu,
+    }
+}
+
+fn map_phys_pages(domain: &IommuDomain, iova_base: u64, phys_pages: &[u64]) -> Result<(), DmaMapError> {
+    if phys_pages.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
+        return Err(DmaMapError::PageCapacityExceeded {
+            required: phys_pages.len(),
+        });
+    }
+    let mut pfns = [0u64; IOBUFFER_INLINE_PAGE_CAPACITY];
+    for (idx, &phys) in phys_pages.iter().enumerate() {
+        pfns[idx] = phys >> 12;
+    }
+    iommu::map_pages(domain, iova_base, &pfns[..phys_pages.len()]).map_err(map_iommu_error)
+}
+
+fn unmap_record(domain: &IommuDomain, rec: MappingRecord) {
+    iommu::unmap_pages(domain, rec.iova_base, rec.page_count);
+    if !rec.is_identity {
+        domain.free_iova(rec.iova_base, rec.page_count as u64 * IOBUFFER_PAGE_SIZE as u64);
+    }
+}
+
+fn rollback_mappings(domain: &IommuDomain, rec_a: Option<MappingRecord>, rec_b: Option<MappingRecord>) {
+    if let Some(rec_a) = rec_a {
+        unmap_record(domain, rec_a);
+    }
+    if let Some(rec_b) = rec_b {
+        unmap_record(domain, rec_b);
+    }
+    iommu::invalidate(domain);
+}
+
+fn collect_phys_runs(
+    phys_pages: &[u64],
+    runs: &mut [(usize, usize); 2],
+) -> Result<usize, DmaMapError> {
+    if phys_pages.is_empty() {
+        return Ok(0);
+    }
+
+    let mut run_start = 0usize;
+    let mut run_count = 0usize;
+    for idx in 1..=phys_pages.len() {
+        let is_end = idx == phys_pages.len()
+            || phys_pages[idx] != phys_pages[idx - 1] + IOBUFFER_PAGE_SIZE as u64;
+        if !is_end {
+            continue;
+        }
+
+        if run_count >= runs.len() {
+            return Err(DmaMapError::RemappingUnavailable);
+        }
+        runs[run_count] = (run_start, idx - run_start);
+        run_count += 1;
+        run_start = idx;
+    }
+
+    Ok(run_count)
+}
+
+fn build_segments_from_page_iovas(
+    page_iovas: &[u64],
+    page_offset: usize,
+    buffer_len: usize,
+    merge_adjacent: bool,
+    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
+) -> Result<usize, DmaMapError> {
+    let mut remaining = buffer_len;
+    let mut count = 0usize;
+
+    for (idx, &page_iova) in page_iovas.iter().enumerate() {
+        if remaining == 0 {
+            break;
+        }
+
+        let start_in_page = if idx == 0 { page_offset } else { 0 };
+        let bytes = remaining.min(IOBUFFER_PAGE_SIZE - start_in_page);
+        let dma_addr = page_iova + start_in_page as u64;
+
+        if merge_adjacent && count > 0 {
+            let prev = &mut segments[count - 1];
+            let prev_end = prev.dma_addr + prev.byte_len as u64;
+            if prev_end == dma_addr {
+                prev.byte_len += bytes as u32;
+                remaining -= bytes;
+                continue;
+            }
+        }
+
+        if count >= IOBUFFER_INLINE_SEGMENT_CAPACITY {
+            return Err(DmaMapError::SegmentCapacityExceeded {
+                required: count + 1,
+            });
+        }
+
+        segments[count] = IoBufferDmaSegment {
+            dma_addr,
+            byte_len: bytes as u32,
+            reserved: 0,
+        };
+        count += 1;
+        remaining -= bytes;
+    }
+
+    if remaining != 0 {
+        return Err(DmaMapError::NoIommu);
+    }
+
+    Ok(count)
 }
 
 fn manager() -> &'static DmaManager {
@@ -114,6 +541,7 @@ impl DmaManager {
             RegisteredDmaDevice {
                 pdo: Arc::downgrade(pdo),
                 identity: RegisteredDmaIdentity::Pci(identity),
+                domain: None,
             },
         );
         DriverStatus::Success
@@ -145,13 +573,25 @@ impl DmaManager {
         }
         Some(DmaDeviceState {
             registered: 1,
-            activated: 0,
+            activated: if entry.domain.is_some() { 1 } else { 0 },
             iommu_vendor: self.platform.vendor_code(),
             reserved0: 0,
-            remapper_index: u32::MAX,
-            active_mappings: 0,
+            remapper_index: entry
+                .domain
+                .as_ref()
+                .map(|domain| domain.remapper_index)
+                .unwrap_or(u32::MAX),
+            active_mappings: state
+                .pending_unmaps
+                .values()
+                .filter(|pending| pending.device_key == key)
+                .count() as u32,
             reserved1: 0,
-            domain_id: 0,
+            domain_id: entry
+                .domain
+                .as_ref()
+                .map(|domain| domain.domain_id as u64)
+                .unwrap_or(0),
         })
     }
 
@@ -168,12 +608,16 @@ impl DmaManager {
 
 struct DmaManagerState {
     devices: BTreeMap<usize, RegisteredDmaDevice>,
+    pending_unmaps: BTreeMap<u64, PendingUnmap>,
+    next_cookie: u64,
 }
 
 impl DmaManagerState {
     fn new() -> Self {
         Self {
             devices: BTreeMap::new(),
+            pending_unmaps: BTreeMap::new(),
+            next_cookie: 1,
         }
     }
 }
@@ -181,6 +625,14 @@ impl DmaManagerState {
 struct RegisteredDmaDevice {
     pdo: Weak<DeviceObject>,
     identity: RegisteredDmaIdentity,
+    domain: Option<Arc<IommuDomain>>,
+}
+
+struct PendingUnmap {
+    device_key: usize,
+    domain: Arc<IommuDomain>,
+    rec_a: MappingRecord,
+    rec_b: Option<MappingRecord>,
 }
 
 #[derive(Clone, Copy)]

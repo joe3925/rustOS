@@ -94,11 +94,6 @@ pub enum DmaMappingStrategy {
     /// Every page's IOVA == its physical address. Adjacent physical pages are
     /// merged into a single segment.
     FullIdentity,
-    /// First `contiguous_byte_len` bytes -> one contiguous IOVA segment.
-    /// Remaining pages -> identity-mapped, merged where physically adjacent.
-    /// Requires `(page_offset + contiguous_byte_len) % PAGE_SIZE == 0` and
-    /// `0 < contiguous_byte_len < buffer.len()`.
-    PartialContiguousThenIdentity { contiguous_byte_len: usize },
     /// One IOVA segment per page (scatter-gather, no merging).
     ScatterGather,
 }
@@ -117,12 +112,6 @@ pub enum DmaMapError {
     },
     /// `chunk_size` is not a multiple of `IOBUFFER_PAGE_SIZE`.
     ChunkSizeNotPageAligned { chunk_size: usize },
-    /// `contiguous_byte_len` is not on a page boundary within the buffer,
-    /// or is zero, or is >= buffer.len().
-    InvalidPartialBoundary {
-        contiguous_byte_len: usize,
-        buffer_len: usize,
-    },
     /// Buffer spans more pages than inline page-frame storage can describe
     /// (capacity = 32).
     PageCapacityExceeded { required: usize },
@@ -271,36 +260,35 @@ impl<'a> IoBufferInner<'a> {
         }
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.borrow.len()
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    pub fn as_ptr(&self) -> *const u8 {
         self.borrow.as_ptr()
     }
 
-    fn as_slice(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         self.borrow.as_slice()
     }
 
-    fn as_mut_ptr(&mut self) -> *mut u8 {
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.borrow.as_mut_ptr()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.borrow.as_mut_slice()
     }
 
-    fn page_frames(&self) -> &[IoBufferPageFrame] {
+    pub fn page_frames(&self) -> &[IoBufferPageFrame] {
         &self.page_frames[..self.page_frames_len]
     }
 
-    fn dma_segments(&self) -> &[IoBufferDmaSegment] {
+    pub fn dma_segments(&self) -> &[IoBufferDmaSegment] {
         &self.dma_segments[..self.dma_segments_len]
     }
 
-    #[allow(dead_code)]
-    fn replace_page_frames(&mut self, frames: &[IoBufferPageFrame]) -> Result<(), IoBufferError> {
+    pub fn replace_page_frames(&mut self, frames: &[IoBufferPageFrame]) -> Result<(), IoBufferError> {
         if frames.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
                 required: frames.len(),
@@ -314,8 +302,7 @@ impl<'a> IoBufferInner<'a> {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn replace_dma_segments(
+    pub fn replace_dma_segments(
         &mut self,
         segments: &[IoBufferDmaSegment],
     ) -> Result<(), IoBufferError> {
@@ -332,14 +319,68 @@ impl<'a> IoBufferInner<'a> {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn set_dma_drop(&mut self, mapped_by: Arc<DeviceObject>, unmap: DmaUnmapFn, cookie: usize) {
+    pub fn set_dma_drop(&mut self, mapped_by: Arc<DeviceObject>, unmap: DmaUnmapFn, cookie: usize) {
         self.mapped_by = Some(mapped_by.clone());
         self.dma_drop = Some(DmaDropContext {
             mapped_by,
             unmap,
             cookie,
         });
+    }
+
+    pub fn page_base_address(&self) -> usize {
+        self.page_base
+    }
+
+    pub fn page_offset(&self) -> usize {
+        self.page_offset
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
+
+    pub fn page_frames_storage_mut(
+        &mut self,
+    ) -> &mut [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY] {
+        &mut self.page_frames
+    }
+
+    pub fn set_page_frames_len(&mut self, len: usize) -> Result<(), IoBufferError> {
+        if len > IOBUFFER_INLINE_PAGE_CAPACITY {
+            return Err(IoBufferError::PageCapacityExceeded {
+                required: len,
+                capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
+            });
+        }
+        self.page_frames_len = len;
+        Ok(())
+    }
+
+    pub fn dma_segments_storage_mut(
+        &mut self,
+    ) -> &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY] {
+        &mut self.dma_segments
+    }
+
+    pub fn set_dma_segments_len(&mut self, len: usize) -> Result<(), IoBufferError> {
+        if len > IOBUFFER_INLINE_SEGMENT_CAPACITY {
+            return Err(IoBufferError::SegmentCapacityExceeded {
+                required: len,
+                capacity: IOBUFFER_INLINE_SEGMENT_CAPACITY,
+            });
+        }
+        self.dma_segments_len = len;
+        Ok(())
+    }
+
+    pub fn remove_dma_mapping_in_place(&mut self) {
+        if let Some(ctx) = self.dma_drop.take() {
+            (ctx.unmap)(&ctx.mapped_by, ctx.cookie);
+        }
+        self.mapped_by = None;
+        self.dma_segments.fill(EMPTY_DMA_SEGMENT);
+        self.dma_segments_len = 0;
     }
 }
 

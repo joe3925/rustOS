@@ -26,7 +26,9 @@ pub struct MappingRecord {
 pub struct IommuDomain {
     pub root_phys: u64,
     pub domain_id: u16,
+    pub segment: u16,
     pub requester_id: u16,
+    pub remapper_index: u32,
     pub iova_tracker: RangeTracker,
     /// Mapping records keyed by IOVA base. Populated by `map_buffer`
     /// strategy paths and drained by `unmap_buffer`.
@@ -34,13 +36,22 @@ pub struct IommuDomain {
 }
 
 impl IommuDomain {
-    pub fn new(root_phys: u64, domain_id: u16, requester_id: u16, iova_end: u64) -> Self {
+    pub fn new(
+        root_phys: u64,
+        domain_id: u16,
+        segment: u16,
+        requester_id: u16,
+        remapper_index: u32,
+        iova_end: u64,
+    ) -> Self {
         // IOVA allocations start above 4 GiB to sidestep legacy ISA DMA and
         // leave the low window for firmware-reserved / identity regions.
         Self {
             root_phys,
             domain_id,
+            segment,
             requester_id,
+            remapper_index,
             iova_tracker: RangeTracker::new(0x1_0000_0000, iova_end),
             mappings: Mutex::new(BTreeMap::new()),
         }

@@ -82,62 +82,63 @@ impl BootInfoFrameAllocator {
     /// init.  The outer loop skips fully-allocated words in O(1) per word (same
     /// trick as `allocate_frame`) before doing the run check, so traversing
     /// allocated regions costs O(words) not O(frames).
+
     pub fn allocate_contiguous_frames_aligned(
         num_frames: usize,
         align_frames: usize,
     ) -> Option<PhysAddr> {
-        if num_frames == 0 || align_frames == 0 {
-            return None;
-        }
-        debug_assert!(align_frames.is_power_of_two());
-
-        // Single-frame path: delegate to the word-hint-optimised allocate_frame.
-        if num_frames == 1 && align_frames == 1 {
-            let mut alloc = BootInfoFrameAllocator {};
-            return FrameAllocator::<Size4KiB>::allocate_frame(&mut alloc)
-                .map(|f| f.start_address());
-        }
-
         let mut bm = MEMORY_BITMAP.lock();
-        let total_frames = bm.len() * 64;
-        let words = bm.len();
-        let align_mask = align_frames - 1;
+        let total_words = bm.len();
 
-        // Start from the word that contains LOW_FRAMES.
-        let mut word_idx = LOW_FRAMES / 64;
+        let mut word_idx = 0;
+        let mut bit_idx = 0;
 
-        loop {
-            // Skip fully-allocated words — ~64x faster through dense allocated runs.
-            while word_idx < words && bm[word_idx] == u64::MAX {
+        while word_idx < total_words {
+            let word = bm[word_idx];
+
+            if word == u64::MAX {
                 word_idx += 1;
+                bit_idx = 0;
+                continue;
             }
-            if word_idx >= words {
-                break;
+
+            while bit_idx < 64 {
+                if (word & (1 << bit_idx)) == 0 {
+                    let mut start_idx = word_idx * 64 + bit_idx;
+
+                    let remainder = start_idx % align_frames;
+                    if remainder != 0 {
+                        start_idx += align_frames - remainder;
+                    }
+
+                    let end_idx = start_idx + num_frames;
+
+                    if end_idx > total_words * 64 {
+                        return None;
+                    }
+
+                    match first_set_bit_in_range(&*bm, start_idx, end_idx) {
+                        None => {
+                            set_range(&mut *bm, start_idx, num_frames);
+
+                            return Some(PhysAddr::new((start_idx * 4096) as u64));
+                        }
+                        Some(conflict_idx) => {
+                            // Conflict found: jump past the allocated bit to save cycles
+                            // and avoid an infinite loop.
+                            let next_scan_idx = conflict_idx + 1;
+                            word_idx = next_scan_idx / 64;
+                            bit_idx = next_scan_idx % 64;
+
+                            break;
+                        }
+                    }
+                }
+                bit_idx += 1;
             }
-
-            // First free bit in this word, aligned up to the required boundary.
-            let free_bit = (!bm[word_idx]).trailing_zeros() as usize;
-            let free_frame = word_idx * 64 + free_bit;
-            let candidate = (free_frame + align_mask) & !align_mask;
-
-            let end = match candidate.checked_add(num_frames) {
-                Some(e) if e <= total_frames => e,
-                _ => break,
-            };
-
-            match first_set_bit_in_range(&*bm, candidate, end) {
-                None => {
-                    // Entire run is free — mark and return.
-                    set_range(bm.as_mut_slice(), candidate, num_frames);
-                    USED_MEMORY.fetch_add(num_frames * 0x1000, Ordering::SeqCst);
-                    NEXT_WORD_4K.store(candidate / 64, Ordering::Relaxed);
-                    return Some(PhysAddr::new((candidate as u64) << 12));
-                }
-                Some(blocking) => {
-                    // Jump to next aligned position; the outer MAX-word skip
-                    // handles any fully-allocated words between here and there.
-                    word_idx = ((blocking + align_frames) & !align_mask) / 64;
-                }
+            if bit_idx == 64 {
+                word_idx += 1;
+                bit_idx = 0;
             }
         }
 
