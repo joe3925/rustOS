@@ -8,6 +8,8 @@ pub struct CacheConfig {
     pub flush_parallelism: usize,
     pub write_allocate: bool,
     pub read_allocate: bool,
+    pub lazy_page_allocation: bool,
+    pub lazy_index_allocation: bool,
 }
 
 impl CacheConfig {
@@ -18,7 +20,18 @@ impl CacheConfig {
             flush_parallelism: 4,
             write_allocate: true,
             read_allocate: true,
+            lazy_page_allocation: false,
+            lazy_index_allocation: false,
         }
+    }
+
+    pub const fn with_lazy_page_allocation(mut self, enabled: bool) -> Self {
+        self.lazy_page_allocation = enabled;
+        self
+    }
+    pub const fn with_lazy_index_allocation(mut self, enabled: bool) -> Self {
+        self.lazy_index_allocation = enabled;
+        self
     }
 }
 
@@ -46,6 +59,7 @@ pub enum CacheError<E> {
     InvalidConfig,
     OffsetOverflow,
     Closed,
+    NoFreePages,
 }
 
 impl<E: Clone> Clone for CacheError<E> {
@@ -55,6 +69,7 @@ impl<E: Clone> Clone for CacheError<E> {
             CacheError::InvalidConfig => CacheError::InvalidConfig,
             CacheError::OffsetOverflow => CacheError::OffsetOverflow,
             CacheError::Closed => CacheError::Closed,
+            CacheError::NoFreePages => CacheError::NoFreePages,
         }
     }
 }
@@ -95,9 +110,15 @@ pub trait VolumeCacheOps {
 
     async fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), Self::Error>;
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
-    async fn write_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error>;
+    async fn write_at_owned(&self, offset: u64, data: &[u8], owner: u64)
+    -> Result<(), Self::Error>;
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error>;
-    async fn write_through_at_owned(&self, offset: u64, data: &[u8], owner: u64) -> Result<(), Self::Error>;
+    async fn write_through_at_owned(
+        &self,
+        offset: u64,
+        data: &[u8],
+        owner: u64,
+    ) -> Result<(), Self::Error>;
 
     async fn flush(&self) -> Result<(), Self::Error>;
     async fn flush_owner(&self, owner: u64) -> Result<(), Self::Error>;

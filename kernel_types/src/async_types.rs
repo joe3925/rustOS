@@ -2,10 +2,12 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
+use core::hint::spin_loop;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 use spin::Mutex as SpinMutex;
 
@@ -463,3 +465,375 @@ unsafe impl<T: Sync> Sync for AsyncRwLockOwnedReadGuard<T> {}
 
 unsafe impl<T: Send> Send for AsyncRwLockOwnedWriteGuard<T> {}
 unsafe impl<T: Send> Sync for AsyncRwLockOwnedWriteGuard<T> {}
+
+const EMPTY: u8 = 0;
+const WRITING: u8 = 1;
+const READY: u8 = 2;
+const CLOSED: u8 = 3;
+const TAKEN: u8 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Canceled;
+
+pub struct Oneshot<T> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+    waker: WakerSlot,
+}
+
+pub struct Sender<'a, T> {
+    chan: &'a Oneshot<T>,
+    finished: bool,
+}
+
+pub struct Receiver<'a, T> {
+    chan: &'a Oneshot<T>,
+    finished: bool,
+}
+
+struct WakerSlot {
+    locked: AtomicBool,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+struct WakerGuard<'a> {
+    slot: &'a WakerSlot,
+}
+
+unsafe impl<T: Send> Send for Oneshot<T> {}
+unsafe impl<T: Send> Sync for Oneshot<T> {}
+
+unsafe impl Send for WakerSlot {}
+unsafe impl Sync for WakerSlot {}
+
+impl<T> Oneshot<T> {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(EMPTY),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            waker: WakerSlot::new(),
+        }
+    }
+
+    pub fn split(&mut self) -> (Sender<'_, T>, Receiver<'_, T>) {
+        self.reset();
+
+        let chan = &*self;
+
+        (
+            Sender {
+                chan,
+                finished: false,
+            },
+            Receiver {
+                chan,
+                finished: false,
+            },
+        )
+    }
+
+    fn reset(&mut self) {
+        let state = self.state.load(Ordering::Acquire);
+
+        if state == READY {
+            unsafe {
+                self.value.get_mut().assume_init_drop();
+            }
+        }
+
+        self.waker.clear_mut();
+        self.state.store(EMPTY, Ordering::Release);
+    }
+
+    fn send(&self, value: T) -> Result<(), T> {
+        let result =
+            self.state
+                .compare_exchange(EMPTY, WRITING, Ordering::AcqRel, Ordering::Acquire);
+
+        if result.is_err() {
+            return Err(value);
+        }
+
+        unsafe {
+            (*self.value.get()).write(value);
+        }
+
+        self.state.store(READY, Ordering::Release);
+        self.waker.wake();
+
+        Ok(())
+    }
+
+    fn recv(&self, cx: &mut Context<'_>) -> Poll<Result<T, Canceled>> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+
+            match state {
+                READY => {
+                    let result = self.state.compare_exchange(
+                        READY,
+                        TAKEN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+
+                    if result.is_ok() {
+                        self.waker.clear();
+
+                        let value = unsafe { (*self.value.get()).assume_init_read() };
+
+                        return Poll::Ready(Ok(value));
+                    }
+                }
+                EMPTY => {
+                    self.waker.register(cx.waker());
+
+                    if self.state.load(Ordering::Acquire) == EMPTY {
+                        return Poll::Pending;
+                    }
+                }
+                WRITING => {
+                    spin_loop();
+                }
+                CLOSED | TAKEN => {
+                    self.waker.clear();
+                    return Poll::Ready(Err(Canceled));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn try_recv(&self) -> Result<Option<T>, Canceled> {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+
+            match state {
+                READY => {
+                    let result = self.state.compare_exchange(
+                        READY,
+                        TAKEN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+
+                    if result.is_ok() {
+                        self.waker.clear();
+
+                        let value = unsafe { (*self.value.get()).assume_init_read() };
+
+                        return Ok(Some(value));
+                    }
+                }
+                EMPTY | WRITING => return Ok(None),
+                CLOSED | TAKEN => return Err(Canceled),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn close_sender(&self) {
+        let result =
+            self.state
+                .compare_exchange(EMPTY, CLOSED, Ordering::AcqRel, Ordering::Acquire);
+
+        if result.is_ok() {
+            self.waker.wake();
+        }
+    }
+
+    fn close_receiver(&self) {
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+
+            match state {
+                EMPTY => {
+                    let result = self.state.compare_exchange(
+                        EMPTY,
+                        CLOSED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+
+                    if result.is_ok() {
+                        self.waker.clear();
+                        return;
+                    }
+                }
+                WRITING => {
+                    spin_loop();
+                }
+                READY => {
+                    let result = self.state.compare_exchange(
+                        READY,
+                        TAKEN,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+
+                    if result.is_ok() {
+                        unsafe {
+                            (*self.value.get()).assume_init_drop();
+                        }
+
+                        self.waker.clear();
+                        return;
+                    }
+                }
+                CLOSED | TAKEN => {
+                    self.waker.clear();
+                    return;
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+impl<T> Drop for Oneshot<T> {
+    fn drop(&mut self) {
+        if self.state.load(Ordering::Acquire) == READY {
+            unsafe {
+                self.value.get_mut().assume_init_drop();
+            }
+        }
+
+        self.waker.clear_mut();
+    }
+}
+
+impl<'a, T> Sender<'a, T> {
+    pub fn send(mut self, value: T) -> Result<(), T> {
+        let result = self.chan.send(value);
+        self.finished = true;
+        result
+    }
+
+    pub fn is_canceled(&self) -> bool {
+        self.chan.state.load(Ordering::Acquire) == CLOSED
+    }
+}
+
+impl<T> Drop for Sender<'_, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.chan.close_sender();
+            self.finished = true;
+        }
+    }
+}
+
+impl<'a, T> Receiver<'a, T> {
+    pub fn try_recv(&mut self) -> Result<Option<T>, Canceled> {
+        let result = self.chan.try_recv();
+
+        if !matches!(result, Ok(None)) {
+            self.finished = true;
+        }
+
+        result
+    }
+
+    pub fn close(&mut self) {
+        if !self.finished {
+            self.chan.close_receiver();
+            self.finished = true;
+        }
+    }
+}
+
+impl<T> Future for Receiver<'_, T> {
+    type Output = Result<T, Canceled>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if this.finished {
+            return Poll::Ready(Err(Canceled));
+        }
+
+        let result = this.chan.recv(cx);
+
+        if result.is_ready() {
+            this.finished = true;
+        }
+
+        result
+    }
+}
+
+impl<T> Drop for Receiver<'_, T> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.chan.close_receiver();
+            self.finished = true;
+        }
+    }
+}
+
+impl<T> Unpin for Sender<'_, T> {}
+impl<T> Unpin for Receiver<'_, T> {}
+
+impl WakerSlot {
+    const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            waker: UnsafeCell::new(None),
+        }
+    }
+
+    fn register(&self, waker: &Waker) {
+        let mut guard = self.lock();
+        let slot = guard.get_mut();
+
+        match slot {
+            Some(old) if old.will_wake(waker) => {}
+            _ => *slot = Some(waker.clone()),
+        }
+    }
+
+    fn wake(&self) {
+        let waker = {
+            let mut guard = self.lock();
+            guard.get_mut().take()
+        };
+
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn clear(&self) {
+        let mut guard = self.lock();
+        guard.get_mut().take();
+    }
+
+    fn clear_mut(&mut self) {
+        *self.waker.get_mut() = None;
+        self.locked.store(false, Ordering::Relaxed);
+    }
+
+    fn lock(&self) -> WakerGuard<'_> {
+        while self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spin_loop();
+        }
+
+        WakerGuard { slot: self }
+    }
+}
+
+impl<'a> WakerGuard<'a> {
+    fn get_mut(&mut self) -> &mut Option<Waker> {
+        unsafe { &mut *self.slot.waker.get() }
+    }
+}
+
+impl Drop for WakerGuard<'_> {
+    fn drop(&mut self) {
+        self.slot.locked.store(false, Ordering::Release);
+    }
+}

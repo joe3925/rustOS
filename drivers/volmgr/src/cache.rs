@@ -8,6 +8,7 @@ pub use crate::cache_traits::{
 };
 
 pub trait CacheIndex<V>: Send {
+    fn reserve_or_panic(&mut self, size: usize);
     fn len(&self) -> usize;
     fn get(&mut self, key: &u64) -> Option<&mut V>;
     fn peek(&self, key: &u64) -> Option<&V>;
@@ -64,6 +65,10 @@ impl<V> CacheIndex<V> for DefaultIndex<V>
 where
     V: Send,
 {
+    #[inline]
+    fn reserve_or_panic(&mut self, size: usize) {
+        self.inner.reserve_or_panic(size);
+    }
     #[inline]
     fn len(&self) -> usize {
         self.inner.len()

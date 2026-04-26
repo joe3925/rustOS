@@ -17,6 +17,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -34,7 +35,6 @@ use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
 use kernel_api::pnp::pnp_forward_request_to_next_lower;
 use kernel_api::pnp::pnp_get_device_target;
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::request::{
     BorrowedHandle, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
 };
@@ -51,7 +51,9 @@ mod cache_traits;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const BLOCK_SIZE: usize = 1024 * 16;
-
+const CACHE_CAPACITY_BYTES: usize = 1024 * 1024 * 50;
+const LAZY_CACHE_PAGE_ALLOCATION: bool = false;
+const LAZY_INDEX_ALLOCATION: bool = false;
 struct CacheBackend {
     target: IoTarget,
     /// Total addressable bytes for the volume (computed from partition info).
@@ -427,7 +429,9 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         if vol_len != 0 {
             let backend = Arc::new(CacheBackend::new(tgt_clone, vol_len));
             // TODO: set this based on system memory and maybe volume size
-            let cfg = CacheConfig::new(1024 * 1024 * 50 / BLOCK_SIZE);
+            let cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE)
+                .with_lazy_page_allocation(LAZY_CACHE_PAGE_ALLOCATION)
+                .with_lazy_index_allocation(LAZY_INDEX_ALLOCATION);
             if let Ok(cache) = VolCache::new(backend, cfg) {
                 pdx.cache.call_once(|| Arc::new(cache));
             }

@@ -3,7 +3,6 @@ use super::cache::{
     VolumeCacheBackend, VolumeCacheOps,
 };
 use crate::alloc::vec::Vec;
-use crate::vec;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cmp::min;
@@ -11,7 +10,6 @@ use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
-use futures::stream::StreamExt;
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
@@ -130,6 +128,15 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
         self.active_ops.fetch_sub(1, Ordering::AcqRel);
     }
 
+    fn reset_for_reuse(&self) {
+        self.dirty.store(false, Ordering::Release);
+        self.writeback.store(false, Ordering::Release);
+        self.generation.store(0, Ordering::Release);
+        self.wb_generation.store(0, Ordering::Release);
+        self.active_ops.store(0, Ordering::Release);
+        self.owner.store(0, Ordering::Release);
+    }
+
     fn is_evictable(&self) -> bool {
         !self.dirty.load(Ordering::Acquire)
             && !self.writeback.load(Ordering::Acquire)
@@ -164,6 +171,36 @@ impl<I> Shard<I> {
         Self {
             index,
             target_capacity,
+        }
+    }
+}
+
+struct PagePool<const BLOCK_SIZE: usize> {
+    free: Mutex<Vec<Arc<Page<BLOCK_SIZE>>>>,
+}
+
+impl<const BLOCK_SIZE: usize> PagePool<BLOCK_SIZE> {
+    fn new(capacity: usize) -> Self {
+        let mut free = Vec::with_capacity(capacity);
+        let mut i = 0usize;
+        while i < capacity {
+            free.push(Arc::new(Page::new_zeroed()));
+            i += 1;
+        }
+
+        Self {
+            free: Mutex::new(free),
+        }
+    }
+
+    fn pop(&self) -> Option<Arc<Page<BLOCK_SIZE>>> {
+        self.free.lock().pop()
+    }
+
+    fn push(&self, mut page: Arc<Page<BLOCK_SIZE>>) {
+        if let Some(inner) = Arc::get_mut(&mut page) {
+            inner.reset_for_reuse();
+            self.free.lock().push(page);
         }
     }
 }
@@ -239,6 +276,7 @@ where
 {
     backend: Arc<B>,
     shards: Vec<Mutex<Shard<F::Index>>>,
+    page_pool: Option<PagePool<BLOCK_SIZE>>,
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     closed: AtomicBool,
@@ -285,14 +323,24 @@ where
 
         let mut i = 0usize;
         while i < shard_count {
-            let index = factory.build(per_shard);
+            let mut index = factory.build(per_shard);
+            if !cfg.lazy_index_allocation {
+                index.reserve_or_panic(per_shard);
+            }
             shards.push(Mutex::new(Shard::new(index, per_shard)));
             i += 1;
         }
 
+        let page_pool = if cfg.lazy_page_allocation {
+            None
+        } else {
+            Some(PagePool::new(cfg.capacity_blocks))
+        };
+
         Ok(Self {
             backend,
             shards,
+            page_pool,
             cfg,
             stats: Arc::new(StatsInner::new()),
             closed: AtomicBool::new(false),
@@ -342,23 +390,125 @@ where
         shard.index.get(&lba).map(|page| Arc::clone(&*page))
     }
 
-    fn trim_shard_locked(&self, shard: &mut Shard<F::Index>) {
-        while shard.index.len() > shard.target_capacity {
-            let popped = shard.index.pop_oldest();
-            let Some((lba, page)) = popped else {
-                break;
-            };
+    fn page_can_be_reclaimed(page: &Arc<Page<BLOCK_SIZE>>) -> bool {
+        page.is_evictable() && Arc::strong_count(page) == 1
+    }
 
-            if page.is_evictable() {
-                let _ = lba;
+    fn recycle_or_drop_page(&self, page: Arc<Page<BLOCK_SIZE>>) {
+        if let Some(pool) = &self.page_pool {
+            pool.push(page);
+        }
+    }
+
+    fn reclaim_page_from_shard_locked(
+        &self,
+        shard: &mut Shard<F::Index>,
+    ) -> Option<Arc<Page<BLOCK_SIZE>>> {
+        let mut skipped = Vec::new();
+        let mut scanned = 0usize;
+        let mut reclaimed = None;
+
+        while let Some((lba, page)) = shard.index.pop_oldest() {
+            scanned += 1;
+
+            if Self::page_can_be_reclaimed(&page) {
                 self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                continue;
+                reclaimed = Some(page);
+                break;
             }
 
-            let _ = shard.index.insert(lba, page);
-            self.stats.failed_evictions.fetch_add(1, Ordering::Relaxed);
-            break;
+            skipped.push((lba, page));
         }
+
+        for (lba, page) in skipped {
+            let _ = shard.index.insert(lba, page);
+        }
+
+        if reclaimed.is_none() && scanned != 0 {
+            self.stats.failed_evictions.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Some(mut page) = reclaimed {
+            if let Some(inner) = Arc::get_mut(&mut page) {
+                inner.reset_for_reuse();
+                return Some(page);
+            }
+        }
+
+        None
+    }
+
+    fn try_reclaim_cache_page(&self, preferred_idx: usize) -> Option<Arc<Page<BLOCK_SIZE>>> {
+        {
+            let mut shard = self.shards[preferred_idx].lock();
+            if let Some(page) = self.reclaim_page_from_shard_locked(&mut shard) {
+                return Some(page);
+            }
+        }
+
+        let mut idx = 0usize;
+        while idx < self.shards.len() {
+            if idx != preferred_idx {
+                let mut shard = self.shards[idx].lock();
+                if let Some(page) = self.reclaim_page_from_shard_locked(&mut shard) {
+                    return Some(page);
+                }
+            }
+
+            idx += 1;
+        }
+
+        None
+    }
+
+    fn trim_shard_locked(&self, shard: &mut Shard<F::Index>) {
+        while shard.index.len() > shard.target_capacity {
+            if let Some(page) = self.reclaim_page_from_shard_locked(shard) {
+                self.recycle_or_drop_page(page);
+            } else {
+                break;
+            }
+        }
+    }
+
+    async fn acquire_cache_page(
+        &self,
+        lba: u64,
+    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        if self.cfg.lazy_page_allocation {
+            return Ok(Arc::new(Page::new_zeroed()));
+        }
+
+        if let Some(pool) = &self.page_pool {
+            if let Some(mut page) = pool.pop() {
+                if let Some(inner) = Arc::get_mut(&mut page) {
+                    inner.reset_for_reuse();
+                    return Ok(page);
+                }
+            }
+        }
+
+        let preferred_idx = self.shard_index(lba);
+        if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
+            return Ok(page);
+        }
+
+        self.flush_internal_all().await?;
+
+        if let Some(pool) = &self.page_pool {
+            if let Some(mut page) = pool.pop() {
+                if let Some(inner) = Arc::get_mut(&mut page) {
+                    inner.reset_for_reuse();
+                    return Ok(page);
+                }
+            }
+        }
+
+        if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
+            return Ok(page);
+        }
+
+        Err(CacheError::NoFreePages)
     }
 
     async fn insert_page_or_get_existing(
@@ -370,7 +520,10 @@ where
         let mut shard = self.shards[idx].lock();
 
         if let Some(existing) = shard.index.get(&lba) {
-            return Arc::clone(&*existing);
+            let existing = Arc::clone(&*existing);
+            drop(shard);
+            self.recycle_or_drop_page(page);
+            return existing;
         }
 
         self.trim_shard_locked(&mut shard);
@@ -385,33 +538,76 @@ where
         page
     }
 
-    async fn load_page_from_backend(
+    async fn read_block_into_unique_page(
         &self,
         lba: u64,
-    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut buf: PageBuf<BLOCK_SIZE> = PageBuf::zeroed();
+        page: &mut Arc<Page<BLOCK_SIZE>>,
+    ) -> Result<(), CacheError<B::Error>> {
+        let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
+        let data = page.data.get_mut();
         self.backend
-            .read_block(lba, &mut buf.bytes[..])
+            .read_block(lba, &mut data.bytes[..])
             .await
             .map_err(CacheError::Backend)?;
 
-        let page = Arc::new(Page::new_zeroed());
-        {
-            let mut data = page.data.write();
-            data.bytes.copy_from_slice(&buf.bytes[..]);
-        }
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn load_detached_page_from_backend(
+        &self,
+        lba: u64,
+    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        let mut page = Arc::new(Page::new_zeroed());
+        self.read_block_into_unique_page(lba, &mut page).await?;
         Ok(page)
     }
 
-    async fn new_page_from_full_block_write(&self, src: &[u8]) -> Arc<Page<BLOCK_SIZE>> {
-        let page = Arc::new(Page::new_zeroed());
-        {
-            let mut data = page.data.write();
-            data.bytes[..].copy_from_slice(src);
+    async fn load_cache_page_from_backend(
+        &self,
+        lba: u64,
+    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        let mut page = self.acquire_cache_page(lba).await?;
+        match self.read_block_into_unique_page(lba, &mut page).await {
+            Ok(()) => Ok(page),
+            Err(e) => {
+                self.recycle_or_drop_page(page);
+                Err(e)
+            }
         }
+    }
+
+    fn fill_unique_page_from_full_block_write(
+        page: &mut Arc<Page<BLOCK_SIZE>>,
+        src: &[u8],
+    ) -> Result<(), CacheError<B::Error>> {
+        let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
+        let data = page.data.get_mut();
+        data.bytes[..].copy_from_slice(src);
         page.mark_dirty();
-        page
+        Ok(())
+    }
+
+    async fn new_cache_page_from_full_block_write(
+        &self,
+        lba: u64,
+        src: &[u8],
+    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        let mut page = self.acquire_cache_page(lba).await?;
+        if let Err(e) = Self::fill_unique_page_from_full_block_write(&mut page, src) {
+            self.recycle_or_drop_page(page);
+            return Err(e);
+        }
+        Ok(page)
+    }
+
+    fn new_detached_page_from_full_block_write(
+        &self,
+        src: &[u8],
+    ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
+        let mut page = Arc::new(Page::new_zeroed());
+        Self::fill_unique_page_from_full_block_write(&mut page, src)?;
+        Ok(page)
     }
 
     async fn get_or_create_read_page(
@@ -426,10 +622,10 @@ where
         self.stats.read_misses.fetch_add(1, Ordering::Relaxed);
 
         if !self.cfg.read_allocate {
-            return self.load_page_from_backend(lba).await;
+            return self.load_detached_page_from_backend(lba).await;
         }
 
-        let loaded = self.load_page_from_backend(lba).await?;
+        let loaded = self.load_cache_page_from_backend(lba).await?;
         Ok(self.insert_page_or_get_existing(lba, loaded).await)
     }
 
@@ -451,22 +647,24 @@ where
 
         if self.cfg.write_allocate {
             if is_full_block {
-                let page = self.new_page_from_full_block_write(src_for_full).await;
+                let page = self
+                    .new_cache_page_from_full_block_write(lba, src_for_full)
+                    .await?;
                 let page = self.insert_page_or_get_existing(lba, page).await;
                 return Ok(WriteAcquire::Cached(page));
             }
 
-            let page = self.load_page_from_backend(lba).await?;
+            let page = self.load_cache_page_from_backend(lba).await?;
             let page = self.insert_page_or_get_existing(lba, page).await;
             return Ok(WriteAcquire::Cached(page));
         }
 
         if is_full_block {
-            let page = self.new_page_from_full_block_write(src_for_full).await;
+            let page = self.new_detached_page_from_full_block_write(src_for_full)?;
             return Ok(WriteAcquire::Direct(page));
         }
 
-        let page = self.load_page_from_backend(lba).await?;
+        let page = self.load_detached_page_from_backend(lba).await?;
         Ok(WriteAcquire::Direct(page))
     }
 
@@ -800,11 +998,10 @@ where
             let mut j = 0usize;
             while j < keys.len() {
                 if let Some(page) = shard.index.peek(&keys[j]) {
-                    if page.active_ops.load(Ordering::Acquire) == 0
-                        && !page.writeback.load(Ordering::Acquire)
-                        && !page.dirty.load(Ordering::Acquire)
-                    {
-                        let _ = shard.index.remove(&keys[j]);
+                    if Self::page_can_be_reclaimed(page) {
+                        if let Some(page) = shard.index.remove(&keys[j]) {
+                            self.recycle_or_drop_page(page);
+                        }
                         removed += 1;
                     }
                 }
@@ -843,7 +1040,7 @@ where
             let mut lba = range.start;
             while lba < range.end {
                 if cache.try_get_page(lba).await.is_none() {
-                    if let Ok(page) = cache.load_page_from_backend(lba).await {
+                    if let Ok(page) = cache.load_cache_page_from_backend(lba).await {
                         let _ = cache.insert_page_or_get_existing(lba, page).await;
                     }
                 }
@@ -1017,14 +1214,15 @@ where
             let mut keys = Vec::new();
 
             shard.index.for_each(|k, v| {
-                if v.is_evictable() {
+                if VolumeCache::<B, BLOCK_SIZE, F>::page_can_be_reclaimed(v) {
                     keys.push(k);
                 }
             });
 
             let mut j = 0usize;
             while j < keys.len() {
-                if shard.index.remove(&keys[j]).is_some() {
+                if let Some(page) = shard.index.remove(&keys[j]) {
+                    self.recycle_or_drop_page(page);
                     removed += 1;
                     self.stats.evictions.fetch_add(1, Ordering::Relaxed);
                 }
