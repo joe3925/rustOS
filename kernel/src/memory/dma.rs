@@ -945,6 +945,12 @@ fn parse_amd_ivrs(tables: &AcpiTables<ACPIImpl>) -> AmdPlatformIommuInfo {
                 let segment = read_u16(block, 16);
                 let unit_info = read_u16(block, 18);
                 let feature_reporting = if length >= 24 { read_u32(block, 20) } else { 0 };
+                if (feature_reporting & IVHD_ATTR_HATDIS) != 0 {
+                    panic!(
+                        "iommu: AMD IVRS reports host DMA translation disabled for remapper at {:#x}; if using QEMU, pass -device amd-iommu,dma-translation=on,dma-remap=on",
+                        register_base
+                    );
+                }
                 let (efr_image, device_entries_offset) =
                     if header.block_type == IVRS_TYPE_HARDWARE_10 {
                         (None, 24usize)
@@ -1408,6 +1414,8 @@ const IVRS_TYPE_HARDWARE_40: u8 = 0x40;
 const IVRS_TYPE_MEMORY_ALL: u8 = 0x20;
 const IVRS_TYPE_MEMORY_SPECIFIED: u8 = 0x21;
 const IVRS_TYPE_MEMORY_RANGE: u8 = 0x22;
+
+const IVHD_ATTR_HATDIS: u32 = 1 << 0;
 
 const IVRS_DEVICE_PAD4: u8 = 0x00;
 const IVRS_DEVICE_ALL: u8 = 0x01;

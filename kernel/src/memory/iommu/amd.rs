@@ -25,6 +25,7 @@ const CMD_TAIL: usize = 0x2008;
 const EVT_HEAD: usize = 0x2010;
 const EVT_TAIL: usize = 0x2018;
 const STATUS_REG: usize = 0x2020;
+const EXT_FEATURE_REG: usize = 0x0030;
 
 const CTRL_IOMMU_EN: u64 = 1 << 0;
 const CTRL_EVT_LOG_EN: u64 = 1 << 2;
@@ -38,6 +39,10 @@ const STATUS_COM_WAIT_INT: u64 = 1 << 2;
 const STATUS_EVENT_LOG_RUN: u64 = 1 << 3;
 const STATUS_CMD_BUF_RUN: u64 = 1 << 4;
 const STATUS_RW1C_MASK: u64 = STATUS_EVENT_OVERFLOW | STATUS_EVENT_LOG_INT | STATUS_COM_WAIT_INT;
+
+const EXT_FEATURE_HATS_SHIFT: u64 = 10;
+const EXT_FEATURE_HATS_MASK: u64 = 0b11 << EXT_FEATURE_HATS_SHIFT;
+const EXT_FEATURE_HATS_RESERVED: u64 = 0b11;
 
 const DEV_TABLE_PAGES: usize = 512;
 const CMD_ENTRY_COUNT: u32 = 256;
@@ -80,6 +85,8 @@ impl AmdViBackend {
             let reg_va = map_mmio_region(PhysAddr::new(unit.register_base), 0x3000)
                 .map_err(|_| IommuError::HardwareError)?
                 .as_mut_ptr::<u8>();
+            let ext_features = unsafe { read_reg64(reg_va, EXT_FEATURE_REG) };
+            require_host_dma_translation(unit.register_base, ext_features);
 
             let (dev_table_phys, dev_table_va) = alloc_zeroed_pages_contiguous(DEV_TABLE_PAGES)?;
             let (cmd_buf_phys, cmd_buf_va) = alloc_zeroed_pages_contiguous(1)?;
@@ -108,8 +115,8 @@ impl AmdViBackend {
             }
 
             println!(
-                "iommu: AMD-Vi up at {:#x}, segment={}, status={:#x}, va_bits={}",
-                unit.register_base, unit.segment, status, info.virtual_address_size
+                "iommu: AMD-Vi up at {:#x}, segment={}, status={:#x}, ext_features={:#x}, va_bits={}",
+                unit.register_base, unit.segment, status, ext_features, info.virtual_address_size
             );
 
             units.push(AmdUnit {
@@ -280,6 +287,16 @@ fn calc_iova_end(va_bits: u8) -> u64 {
         _ => 48,
     };
     1u64 << width
+}
+
+fn require_host_dma_translation(register_base: u64, ext_features: u64) {
+    let hats = (ext_features & EXT_FEATURE_HATS_MASK) >> EXT_FEATURE_HATS_SHIFT;
+    if hats == EXT_FEATURE_HATS_RESERVED {
+        panic!(
+            "iommu: AMD-Vi host DMA translation is disabled at {:#x}; if using QEMU, pass -device amd-iommu,dma-translation=on,dma-remap=on",
+            register_base
+        );
+    }
 }
 
 fn write_dte(dev_table_va: *mut u64, requester_id: u16, domain: &IommuDomain) {

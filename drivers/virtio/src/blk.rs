@@ -1,9 +1,8 @@
-use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
-    unmap_range, virt_to_phys,
-};
-use kernel_api::x86_64::{PhysAddr, VirtAddr};
+use alloc::sync::Arc;
+use kernel_api::device::DeviceObject;
+use kernel_api::x86_64::VirtAddr;
 
+use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
 use crate::virtqueue::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE, VirtqDesc, Virtqueue};
 
@@ -32,6 +31,9 @@ pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
 /// Mandatory for modern virtio-pci devices.
 pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
+
+/// Device can operate with platform-mediated DMA addresses (for example IOVA).
+pub const VIRTIO_F_ACCESS_PLATFORM: u64 = 1u64 << 33;
 
 /// Multiqueue feature bit - device supports multiple request queues.
 pub const VIRTIO_BLK_F_MQ: u64 = 1 << 12;
@@ -93,9 +95,17 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
     // Check for feature support
     let mq_supported = (dev_features & VIRTIO_BLK_F_MQ) != 0;
     let indirect_supported = (dev_features & VIRTIO_F_INDIRECT_DESC) != 0;
+    let access_platform_supported = (dev_features & VIRTIO_F_ACCESS_PLATFORM) != 0;
+
+    if !access_platform_supported {
+        unsafe {
+            pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
+        };
+        return None;
+    }
 
     // Negotiate VERSION_1 and other supported features
-    let mut supported_features = VIRTIO_F_VERSION_1;
+    let mut supported_features = VIRTIO_F_VERSION_1 | VIRTIO_F_ACCESS_PLATFORM;
     if mq_supported {
         supported_features |= VIRTIO_BLK_F_MQ;
     }
@@ -199,9 +209,7 @@ pub struct BlkSlot {
 }
 
 pub struct BlkIoSlots {
-    pub pool_va: VirtAddr,
-    pub pool_phys: PhysAddr,
-    pub pool_pages: usize,
+    pub pool: ContiguousDmaRegion,
     pub slot_count: usize,
 }
 
@@ -209,35 +217,28 @@ unsafe impl Send for BlkIoSlots {}
 unsafe impl Sync for BlkIoSlots {}
 
 impl BlkIoSlots {
-    pub fn new(slot_count: usize) -> Option<Self> {
-        let bytes = slot_count * core::mem::size_of::<BlkSlot>();
-        let pool_pages = (bytes + 4095) / 4096;
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        let pool_va =
-            allocate_auto_kernel_range_mapped_contiguous((pool_pages * 4096) as u64, flags).ok()?;
-        let pool_phys = virt_to_phys(pool_va)?;
+    pub fn new(slot_count: usize, device: &Arc<DeviceObject>) -> Option<Self> {
+        let slot_bytes = core::mem::size_of::<BlkSlot>();
+        let mapped_bytes = slot_count * slot_bytes;
+        let alloc_bytes = mapped_bytes.div_ceil(4096) * 4096;
+        let pool =
+            ContiguousDmaRegion::new_with_alloc(device, mapped_bytes, alloc_bytes, slot_bytes)?;
 
         // initialize statuses to 0xFF (sentinel)
         unsafe {
-            core::ptr::write_bytes(pool_va.as_u64() as *mut u8, 0, pool_pages * 4096);
             for i in 0..slot_count {
-                let slot = (pool_va.as_u64() as *mut BlkSlot).add(i);
+                let slot = pool.as_ptr::<BlkSlot>().add(i);
                 (*slot).status = 0xFF;
             }
         }
 
-        Some(Self {
-            pool_va,
-            pool_phys,
-            pool_pages,
-            slot_count,
-        })
+        Some(Self { pool, slot_count })
     }
 
     #[inline]
     pub fn get_slot_ptr(&self, idx: u16) -> *mut BlkSlot {
         debug_assert!((idx as usize) < self.slot_count);
-        (self.pool_va.as_u64() as *mut BlkSlot).wrapping_add(idx as usize)
+        self.pool.as_ptr::<BlkSlot>().wrapping_add(idx as usize)
     }
 
     pub fn submit_request(
@@ -251,13 +252,14 @@ impl BlkIoSlots {
         let head = vq.alloc_desc()?;
         let slot_ptr = self.get_slot_ptr(head);
 
-        let pool_phys_base = self.pool_phys.as_u64();
-        let slot_phys_base =
-            pool_phys_base + (head as u64) * (core::mem::size_of::<BlkSlot>() as u64);
+        let slot_dma_base = self
+            .pool
+            .dma_addr_at(head as usize * core::mem::size_of::<BlkSlot>())
+            .expect("virtio-blk: slot offset fell outside mapped DMA pool");
 
-        let header_phys = slot_phys_base + core::mem::offset_of!(BlkSlot, header) as u64;
-        let status_phys = slot_phys_base + core::mem::offset_of!(BlkSlot, status) as u64;
-        let indirect_phys = slot_phys_base + core::mem::offset_of!(BlkSlot, indirect_table) as u64;
+        let header_phys = slot_dma_base + core::mem::offset_of!(BlkSlot, header) as u64;
+        let status_phys = slot_dma_base + core::mem::offset_of!(BlkSlot, status) as u64;
+        let indirect_phys = slot_dma_base + core::mem::offset_of!(BlkSlot, indirect_table) as u64;
 
         unsafe {
             (*slot_ptr).header.req_type = req_type;
@@ -293,10 +295,14 @@ impl BlkIoSlots {
             desc_count += 1;
 
             let total_table_len = (desc_count * 16) as u32;
-            vq.push_allocated_indirect(head, PhysAddr::new(indirect_phys), total_table_len);
+            vq.push_allocated_indirect(head, indirect_phys, total_table_len);
         }
 
         Some(head)
+    }
+
+    pub fn destroy(&mut self) {
+        self.pool.destroy();
     }
 
     pub fn get_status(&self, head: u16) -> u8 {
@@ -307,8 +313,6 @@ impl BlkIoSlots {
 
 impl Drop for BlkIoSlots {
     fn drop(&mut self) {
-        let bytes = (self.pool_pages * 4096) as u64;
-        unsafe { unmap_range(self.pool_va, bytes) };
-        deallocate_kernel_range(self.pool_va, bytes);
+        self.destroy();
     }
 }

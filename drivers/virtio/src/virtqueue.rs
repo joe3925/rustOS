@@ -1,10 +1,9 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU16, Ordering};
-use kernel_api::memory::{
-    PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, unmap_range, virt_to_phys,
-};
+use kernel_api::device::DeviceObject;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
+use crate::dma_region::ContiguousDmaRegion;
 use crate::pci;
 
 pub const VRING_DESC_F_NEXT: u16 = 1;
@@ -32,17 +31,9 @@ pub struct Virtqueue {
     pub size: u16,
     pub queue_notify_off: u16,
 
-    pub desc_va: VirtAddr,
-    pub avail_va: VirtAddr,
-    pub used_va: VirtAddr,
-
-    pub desc_phys: PhysAddr,
-    pub avail_phys: PhysAddr,
-    pub used_phys: PhysAddr,
-
-    desc_size: u64,
-    avail_size: u64,
-    used_size: u64,
+    desc: ContiguousDmaRegion,
+    avail: ContiguousDmaRegion,
+    used: ContiguousDmaRegion,
 
     pub free_head: u16,
     pub num_free: u16,
@@ -59,7 +50,11 @@ fn align_up(v: u64, align: u64) -> u64 {
 impl Virtqueue {
     /// Allocate and initialise a split virtqueue.
     /// Writes the physical addresses into the device via common_cfg.
-    pub fn new(queue_idx: u16, common_cfg: VirtAddr) -> Option<Self> {
+    pub fn new(
+        queue_idx: u16,
+        common_cfg: VirtAddr,
+        device: &Arc<DeviceObject>,
+    ) -> Option<Self> {
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
         let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
@@ -69,60 +64,62 @@ impl Virtqueue {
         let size = max_size;
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
         let desc_bytes = align_up(size as u64 * 16, 4096);
-        let desc_va = allocate_auto_kernel_range_mapped_contiguous(desc_bytes, flags).ok()?;
-        let desc_phys = virt_to_phys(desc_va)?;
+        let desc = ContiguousDmaRegion::new(device, desc_bytes as usize, 1)?;
 
         let avail_bytes = align_up(6 + size as u64 * 2, 4096);
-        let avail_va = allocate_auto_kernel_range_mapped_contiguous(avail_bytes, flags).ok()?;
-        let avail_phys = virt_to_phys(avail_va)?;
+        let avail = ContiguousDmaRegion::new(device, avail_bytes as usize, 1)?;
 
         let used_bytes = align_up(6 + size as u64 * 8, 4096);
-        let used_va = allocate_auto_kernel_range_mapped_contiguous(used_bytes, flags).ok()?;
-        let used_phys = virt_to_phys(used_va)?;
+        let used = ContiguousDmaRegion::new(device, used_bytes as usize, 1)?;
 
         unsafe {
-            core::ptr::write_bytes(desc_va.as_u64() as *mut u8, 0, desc_bytes as usize);
-            core::ptr::write_bytes(avail_va.as_u64() as *mut u8, 0, avail_bytes as usize);
-            core::ptr::write_bytes(used_va.as_u64() as *mut u8, 0, used_bytes as usize);
-        }
-
-        for i in 0..size {
-            let desc_ptr = (desc_va.as_u64() + i as u64 * 16) as *mut VirtqDesc;
-            unsafe {
+            for i in 0..size {
+                let desc_ptr = (desc.as_ptr::<u8>() as u64 + i as u64 * 16) as *mut VirtqDesc;
                 (*desc_ptr).next = if i + 1 < size { i + 1 } else { 0 };
                 (*desc_ptr).flags = 0;
             }
         }
 
+        let desc_dma = desc.dma_addr_at(0)?;
+        let avail_dma = avail.dma_addr_at(0)?;
+        let used_dma = used.dma_addr_at(0)?;
+
         let queue_notify_off =
             unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_NOTIFY_OFF) };
 
         unsafe {
-            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DESC, desc_phys.as_u64());
-            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DRIVER, avail_phys.as_u64());
-            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DEVICE, used_phys.as_u64());
+            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DESC, desc_dma);
+            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DRIVER, avail_dma);
+            pci::common_write_u64(common_cfg, pci::COMMON_QUEUE_DEVICE, used_dma);
         }
 
         Some(Self {
             idx: queue_idx,
             size,
-            desc_va,
-            avail_va,
-            used_va,
-            desc_phys,
-            avail_phys,
-            used_phys,
-            desc_size: desc_bytes,
-            avail_size: avail_bytes,
-            used_size: used_bytes,
-            queue_notify_off,
+            desc,
+            avail,
+            used,
             free_head: 0,
             num_free: size,
             last_used_idx: AtomicU16::new(0),
+            queue_notify_off,
         })
+    }
+
+    #[inline]
+    fn desc_va(&self) -> VirtAddr {
+        self.desc.base_va()
+    }
+
+    #[inline]
+    fn avail_va(&self) -> VirtAddr {
+        self.avail.base_va()
+    }
+
+    #[inline]
+    fn used_va(&self) -> VirtAddr {
+        self.used.base_va()
     }
 
     /// Enable the queue after all configuration (including MSI-X vector) is set.
@@ -146,21 +143,16 @@ impl Virtqueue {
         Some(idx)
     }
 
-    pub fn push_allocated_indirect(
-        &mut self,
-        head: u16,
-        table_phys: kernel_api::x86_64::PhysAddr,
-        table_len: u32,
-    ) {
+    pub fn push_allocated_indirect(&mut self, head: u16, table_addr: u64, table_len: u32) {
         let desc = self.desc_ptr(head);
         unsafe {
-            (*desc).addr = table_phys.as_u64();
+            (*desc).addr = table_addr;
             (*desc).len = table_len;
             (*desc).flags = VRING_DESC_F_INDIRECT;
             (*desc).next = 0;
         }
 
-        let avail_base = self.avail_va.as_u64() as *mut u16;
+        let avail_base = self.avail_va().as_u64() as *mut u16;
         let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
         let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
@@ -185,7 +177,7 @@ impl Virtqueue {
     }
 
     fn desc_ptr(&self, idx: u16) -> *mut VirtqDesc {
-        (self.desc_va.as_u64() + idx as u64 * 16) as *mut VirtqDesc
+        (self.desc_va().as_u64() + idx as u64 * 16) as *mut VirtqDesc
     }
 
     /// Push a chain of buffers into the virtqueue.
@@ -218,7 +210,7 @@ impl Virtqueue {
             prev = idx;
         }
 
-        let avail_base = self.avail_va.as_u64() as *mut u16;
+        let avail_base = self.avail_va().as_u64() as *mut u16;
         let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
         let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
@@ -250,7 +242,7 @@ impl Virtqueue {
             (*desc).next = 0;
         }
 
-        let avail_base = self.avail_va.as_u64() as *mut u16;
+        let avail_base = self.avail_va().as_u64() as *mut u16;
         let avail_idx_ptr = unsafe { avail_base.add(1) } as *const core::sync::atomic::AtomicU16;
         let avail_idx = unsafe { (*avail_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
         let ring_entry = avail_base.wrapping_add(2 + (avail_idx % self.size) as usize);
@@ -277,7 +269,7 @@ impl Virtqueue {
     /// Pop one completed entry from the used ring.
     /// Called exclusively by the drain task under the queue write lock.
     pub fn pop_used(&mut self) -> Option<(u16, u32)> {
-        let used_base = self.used_va.as_u64() as *const u16;
+        let used_base = self.used_va().as_u64() as *const u16;
         let used_idx_ptr = unsafe { used_base.add(1) } as *const core::sync::atomic::AtomicU16;
         let used_idx = unsafe { (*used_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
 
@@ -287,7 +279,7 @@ impl Virtqueue {
         }
 
         let elem_offset = 4 + (last % self.size) as usize * 8;
-        let elem_ptr = (self.used_va.as_u64() + elem_offset as u64) as *const VirtqUsedElem;
+        let elem_ptr = (self.used_va().as_u64() + elem_offset as u64) as *const VirtqUsedElem;
         let elem = unsafe { core::ptr::read_volatile(elem_ptr) };
         self.last_used_idx
             .store(last.wrapping_add(1), Ordering::Release);
@@ -330,9 +322,9 @@ impl Virtqueue {
     // descriptor chains without holding the write lock.
 
     /// Deallocate all DMA memory for this virtqueue.
-    pub fn destroy(&self) {
-        unsafe { unmap_range(self.desc_va, self.desc_size) };
-        unsafe { unmap_range(self.avail_va, self.avail_size) };
-        unsafe { unmap_range(self.used_va, self.used_size) };
+    pub fn destroy(&mut self) {
+        self.desc.destroy();
+        self.avail.destroy();
+        self.used.destroy();
     }
 }

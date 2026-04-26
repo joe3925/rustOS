@@ -2067,17 +2067,14 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
-    64 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    2 * 1024 * 1024,
-    4 * 1024 * 1024,
-    // 8 * 1024 * 1024,
-    // 16 * 1024 * 1024,
-    // 32 * 1024 * 1024,
-    // 1024 * 1024 * 1024,
+    // 64 * 1024,
+    // 512 * 1024,
+    // 1024 * 1024,
+    // 2 * 1024 * 1024,
+    // 4 * 1024 * 1024,
+    1024 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -2143,7 +2140,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            //OpenFlags::WriteThrough,
+            OpenFlags::WriteThrough,
         ],
     )
     .await
