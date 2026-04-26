@@ -176,6 +176,7 @@ impl VolumeCacheBackend for CacheBackend {
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_send_request(self.target.clone(), req).await;
             if status != DriverStatus::Success {
+                println!("Write failed with: {}", status);
                 return Err(status);
             }
             Ok(())

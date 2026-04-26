@@ -72,7 +72,10 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         fatfs::Error::InvalidInput => FileStatus::BadPath,
         fatfs::Error::NotEnoughSpace => FileStatus::NoSpace,
         fatfs::Error::CorruptedFileSystem => FileStatus::CorruptFilesystem,
-        _ => FileStatus::UnknownFail,
+        e => {
+            println!("Mapping {:#?} to UnknownFail", e);
+            FileStatus::UnknownFail
+        }
     }
 }
 

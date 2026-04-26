@@ -11,6 +11,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
+use kernel_api::kernel_types::dma::{Described, IoBuffer, ToDevice};
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
@@ -686,7 +687,8 @@ where
 
         {
             let data = page.data.read();
-            let mut borrow = BorrowedHandle::read_only(&mut req, &data.bytes[..]);
+            let io_buf = IoBuffer::<Described, ToDevice>::new(&data.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
             self.backend
                 .write_request(borrow.handle())
                 .await
@@ -739,7 +741,8 @@ where
 
         let write_res = {
             let data = page.data.read();
-            let mut borrow = BorrowedHandle::read_only(&mut req, &data.bytes[..]);
+            let io_buf = IoBuffer::<Described, ToDevice>::new(&data.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
             backend
                 .write_request(borrow.handle())
                 .await

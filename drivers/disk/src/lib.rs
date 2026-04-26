@@ -112,7 +112,10 @@ pub async fn disk_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) if data.view::<IoBuffer<'_, Described, FromDevice>>().map_or(false, |b| b.len() >= total) => {}
+        RequestDataView::FromDevice(data)
+            if data
+                .view::<IoBuffer<'_, Described, FromDevice>>()
+                .map_or(false, |b| b.len() >= total) => {}
         RequestDataView::FromDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
         }
@@ -162,15 +165,22 @@ pub async fn disk_write<'a, 'b>(
     if bs == 0 {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
-
-    match req.data() {
-        RequestDataView::ToDevice(data) if data.view::<IoBuffer<'_, Described, ToDevice>>().map_or(false, |b| b.len() >= total) => {}
-        RequestDataView::ToDevice(_) => {
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
-        }
+    let data = match req.data() {
+        RequestDataView::ToDevice(data) => data,
         RequestDataView::FromDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
         }
+    };
+
+    let buffer = match data.view::<IoBuffer<'_, Described, ToDevice>>() {
+        Some(buffer) => buffer,
+        None => {
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
+    };
+
+    if buffer.len() < total {
+        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
