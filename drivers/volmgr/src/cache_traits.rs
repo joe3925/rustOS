@@ -14,8 +14,6 @@ pub struct CacheConfig {
     pub dirty_high_watermark_blocks: usize,
     /// Background writeback keeps flushing until dirty pages drop to this count.
     pub dirty_low_watermark_blocks: usize,
-    /// Flush dirty pages whose last write is at least this many write epochs old.
-    pub dirty_age_threshold_ops: u64,
 }
 
 impl CacheConfig {
@@ -40,7 +38,6 @@ impl CacheConfig {
             lazy_index_allocation: false,
             dirty_high_watermark_blocks: high,
             dirty_low_watermark_blocks: low,
-            dirty_age_threshold_ops: 4096,
         }
     }
 
@@ -56,11 +53,6 @@ impl CacheConfig {
     pub const fn with_dirty_watermarks(mut self, high_blocks: usize, low_blocks: usize) -> Self {
         self.dirty_high_watermark_blocks = high_blocks;
         self.dirty_low_watermark_blocks = low_blocks;
-        self
-    }
-
-    pub const fn with_dirty_age_threshold_ops(mut self, threshold: u64) -> Self {
-        self.dirty_age_threshold_ops = threshold;
         self
     }
 }

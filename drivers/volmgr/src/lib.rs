@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
+use core::arch::asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
@@ -694,7 +695,9 @@ pub async fn vol_pdo_flush<'a, 'b>(
     if let Some(owner) = flush_owner {
         if should_block {
             match cache.flush_owner(owner).await {
-                Ok(()) => return DriverStep::complete(DriverStatus::Success),
+                Ok(()) => {
+                    return DriverStep::complete(DriverStatus::Success);
+                }
                 Err(err) => {
                     return DriverStep::complete(cache_error_status(
                         "vol_pdo_flush cache.flush_owner",

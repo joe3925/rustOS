@@ -93,7 +93,6 @@ struct Page<const BLOCK_SIZE: usize> {
     writeback: AtomicBool,
     generation: AtomicU64,
     wb_generation: AtomicU64,
-    dirty_epoch: AtomicU64,
     active_ops: AtomicUsize,
     /// File-level owner tag. 0 = unowned (included in all targeted flushes).
     owner: AtomicU64,
@@ -107,22 +106,19 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
             writeback: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
-            dirty_epoch: AtomicU64::new(0),
             active_ops: AtomicUsize::new(0),
             owner: AtomicU64::new(0),
         }
     }
 
-    fn mark_dirty(&self, dirty_epoch: u64) -> bool {
+    fn mark_dirty(&self) -> bool {
         self.owner.store(0, Ordering::Release);
-        self.dirty_epoch.store(dirty_epoch, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         !self.dirty.swap(true, Ordering::AcqRel)
     }
 
-    fn mark_dirty_with_owner(&self, owner: u64, dirty_epoch: u64) -> bool {
+    fn mark_dirty_with_owner(&self, owner: u64) -> bool {
         self.owner.store(owner, Ordering::Release);
-        self.dirty_epoch.store(dirty_epoch, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         !self.dirty.swap(true, Ordering::AcqRel)
     }
@@ -140,7 +136,6 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
         self.writeback.store(false, Ordering::Release);
         self.generation.store(0, Ordering::Release);
         self.wb_generation.store(0, Ordering::Release);
-        self.dirty_epoch.store(0, Ordering::Release);
         self.active_ops.store(0, Ordering::Release);
         self.owner.store(0, Ordering::Release);
     }
@@ -226,8 +221,6 @@ enum FlushFilter<'a> {
     BlockRange(&'a Range<u64>),
     /// Flush dirty pages belonging to the given owner.
     Owner(u64),
-    /// Flush dirty pages whose last write epoch is old enough for background writeback.
-    DirtyOlderOrEqual(u64),
 }
 
 impl FlushFilter<'_> {
@@ -239,9 +232,6 @@ impl FlushFilter<'_> {
             FlushFilter::Owner(owner) => {
                 let page_owner = page.owner.load(Ordering::Acquire);
                 page_owner == *owner
-            }
-            FlushFilter::DirtyOlderOrEqual(epoch) => {
-                page.dirty_epoch.load(Ordering::Acquire) <= *epoch
             }
         }
     }
@@ -293,7 +283,6 @@ where
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     dirty_pages: Arc<AtomicUsize>,
-    write_epoch: AtomicU64,
     background_writeback_active: AtomicBool,
     closed: AtomicBool,
     flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
@@ -370,7 +359,6 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             dirty_pages: Arc::new(AtomicUsize::new(0)),
-            write_epoch: AtomicU64::new(0),
             background_writeback_active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             flush_job: Mutex::new(None),
@@ -391,18 +379,11 @@ where
         Ok(())
     }
 
-    fn next_write_epoch(&self) -> u64 {
-        self.write_epoch
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1)
-    }
-
     fn mark_cached_page_dirty(&self, page: &Page<BLOCK_SIZE>, owner: u64) {
-        let epoch = self.next_write_epoch();
         let became_dirty = if owner == 0 {
-            page.mark_dirty(epoch)
+            page.mark_dirty()
         } else {
-            page.mark_dirty_with_owner(owner, epoch)
+            page.mark_dirty_with_owner(owner)
         };
 
         if became_dirty {
@@ -782,18 +763,15 @@ where
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let mut snapshot = Box::new([0u8; BLOCK_SIZE]);
         {
-            let data = page.data.read();
-            snapshot[..].copy_from_slice(&data.bytes[..]);
+            let data_guard = page.data.read();
+            let io_buf = IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+            self.backend
+                .write_request(borrow.handle())
+                .await
+                .map_err(CacheError::Backend)?;
         }
-
-        let io_buf = IoBuffer::<Described, ToDevice>::new(&snapshot[..]);
-        let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
-        self.backend
-            .write_request(borrow.handle())
-            .await
-            .map_err(CacheError::Backend)?;
 
         self.stats.backend_writes.fetch_add(1, Ordering::Relaxed);
         self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
@@ -840,18 +818,15 @@ where
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let mut snapshot = Box::new([0u8; BLOCK_SIZE]);
-        {
-            let data = page.data.read();
-            snapshot[..].copy_from_slice(&data.bytes[..]);
-        }
-
-        let io_buf = IoBuffer::<Described, ToDevice>::new(&snapshot[..]);
-        let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
-        let write_res = backend
-            .write_request(borrow.handle())
-            .await
-            .map_err(CacheError::Backend);
+        let write_res = {
+            let data_guard = page.data.read();
+            let io_buf = IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]);
+            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+            backend
+                .write_request(borrow.handle())
+                .await
+                .map_err(CacheError::Backend)
+        };
 
         match write_res {
             Ok(()) => {
@@ -890,23 +865,29 @@ where
         }
 
         joins.clear();
-        let first_error = Arc::new(Mutex::new(None));
-        let writebacks = Arc::new(AtomicUsize::new(0));
+        let first_error = Mutex::new(None);
+        let first_error_ptr = &first_error as *const _ as usize;
+        let writebacks = AtomicUsize::new(0);
+        let writebacks_ptr = &writebacks as *const _ as usize;
         let parallelism = parallelism.max(1);
 
         for (lba, page) in pages {
             let backend = Arc::clone(&backend);
             let stats = Arc::clone(&stats);
             let dirty_pages = Arc::clone(&dirty_pages);
-            let writebacks = Arc::clone(&writebacks);
             let page = Arc::clone(page);
             let lba = *lba;
-            let first_error_for_task = Arc::clone(&first_error);
+            let first_error_ptr_copy = first_error_ptr;
+            let writebacks_ptr_copy = writebacks_ptr;
 
             let handle = spawn(async move {
                 match Self::flush_page_task(backend, stats, dirty_pages, lba, page).await {
                     Ok(true) => {
-                        writebacks.fetch_add(1, Ordering::AcqRel);
+                        // SAFETY: We await all handles before returning from this function,
+                        // guaranteeing that `writebacks` safely outlives this spawned task.
+                        let writebacks_ref =
+                            unsafe { &*(writebacks_ptr_copy as *const AtomicUsize) };
+                        writebacks_ref.fetch_add(1, Ordering::AcqRel);
                     }
                     Ok(false) => {}
                     Err(err) => {
@@ -915,7 +896,12 @@ where
                             lba, err
                         );
 
-                        let mut slot = first_error_for_task.lock();
+                        // SAFETY: We await all handles before returning from this function,
+                        // guaranteeing that `first_error` safely outlives this spawned task.
+                        let first_error_ref = unsafe {
+                            &*(first_error_ptr_copy as *const Mutex<Option<CacheError<B::Error>>>)
+                        };
+                        let mut slot = first_error_ref.lock();
                         if slot.is_none() {
                             *slot = Some(err);
                         }
@@ -939,12 +925,11 @@ where
             handle.await;
         }
 
-        let first_error = { first_error.lock().take() };
-        if let Some(err) = first_error {
+        if let Some(err) = first_error.into_inner() {
             return Err(err);
         }
 
-        Ok(writebacks.load(Ordering::Acquire))
+        Ok(writebacks.into_inner())
     }
     async fn flush_shard_streaming(
         &self,
@@ -1186,40 +1171,7 @@ where
             return false;
         }
 
-        if dirty >= self.cfg.dirty_high_watermark_blocks {
-            return true;
-        }
-
-        let threshold = self.cfg.dirty_age_threshold_ops;
-        if threshold == 0 {
-            return false;
-        }
-
-        let epoch = self.write_epoch.load(Ordering::Acquire);
-        if epoch <= threshold {
-            return false;
-        }
-
-        let cutoff = epoch - threshold;
-        let mut shard_idx = 0usize;
-        while shard_idx < self.shards.len() {
-            let shard = self.shards[shard_idx].lock();
-            let mut found = false;
-            shard.index.for_each(|_, page| {
-                if !found
-                    && page.dirty.load(Ordering::Acquire)
-                    && page.dirty_epoch.load(Ordering::Acquire) <= cutoff
-                {
-                    found = true;
-                }
-            });
-            if found {
-                return true;
-            }
-            shard_idx += 1;
-        }
-
-        false
+        dirty >= self.cfg.dirty_high_watermark_blocks
     }
 
     async fn background_writeback_loop(&self) {
@@ -1235,16 +1187,9 @@ where
 
             let high = self.cfg.dirty_high_watermark_blocks;
             let low = self.cfg.dirty_low_watermark_blocks;
-            let threshold = self.cfg.dirty_age_threshold_ops;
 
             let filter = if dirty_before >= high {
                 FlushFilter::All
-            } else if threshold != 0 {
-                let epoch = self.write_epoch.load(Ordering::Acquire);
-                if epoch <= threshold {
-                    break;
-                }
-                FlushFilter::DirtyOlderOrEqual(epoch - threshold)
             } else {
                 break;
             };
@@ -1448,11 +1393,10 @@ where
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    let epoch = self.next_write_epoch();
                     if owner == 0 {
-                        page.mark_dirty(epoch);
+                        page.mark_dirty();
                     } else {
-                        page.mark_dirty_with_owner(owner, epoch);
+                        page.mark_dirty_with_owner(owner);
                     }
                     self.direct_write_page(lba, &page).await?;
                 }
