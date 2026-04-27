@@ -58,7 +58,10 @@ pub struct DeviceInitResult {
 
 /// Negotiate features and read device configuration.
 /// Returns DeviceInitResult with capacity and multiqueue information.
-pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceInitResult> {
+pub fn init_device(
+    common_cfg: VirtAddr,
+    device_cfg: VirtAddr,
+) -> Result<DeviceInitResult, &'static str> {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 
     unsafe {
@@ -89,7 +92,7 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
-        return None;
+        return Err("device does not advertise VIRTIO_F_VERSION_1");
     }
 
     // Check for feature support
@@ -101,7 +104,7 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
-        return None;
+        return Err("device does not advertise VIRTIO_F_ACCESS_PLATFORM");
     }
 
     // Negotiate VERSION_1 and other supported features
@@ -144,7 +147,7 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
-        return None;
+        return Err("device rejected negotiated feature set");
     }
 
     // Check if features were actually negotiated
@@ -169,7 +172,7 @@ pub fn init_device(common_cfg: VirtAddr, device_cfg: VirtAddr) -> Option<DeviceI
         1
     };
 
-    Some(DeviceInitResult {
+    Ok(DeviceInitResult {
         capacity,
         num_queues,
         mq_negotiated,

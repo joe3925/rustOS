@@ -843,7 +843,7 @@ impl PnpManager {
             return DriverStatus::NotImplemented;
         }
         if req.status != DriverStatus::Success {
-            return req.status;
+            return req.status.clone();
         }
 
         let children_to_start: Vec<Arc<DevNode>> = parent_dev_node

@@ -13,7 +13,7 @@ pub struct DeviceIds {
     pub compatible: Vec<String>,
 }
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriverStep {
     Continue,
     Complete { status: DriverStatus },

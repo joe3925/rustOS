@@ -574,7 +574,7 @@ extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
         if let Some(v) = p.data_out_ref().view::<Vec<u8>>() { out.extend_from_slice(v); }
     }
     unsafe {
-        *w.status.get() = req.status;
+        *w.status.get() = req.status.clone();
     }
     unsafe {
         *w.blob.get() = out;

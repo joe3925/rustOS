@@ -279,7 +279,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         return Err(st);
     }
     if ch.read().status != DriverStatus::Success {
-        return Err(ch.read().status);
+        return Err(ch.read().status.clone());
     }
 
     let mut di_opt = {

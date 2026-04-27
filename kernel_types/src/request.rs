@@ -1012,7 +1012,7 @@ impl<'a> RequestHandle<'a> {
 
     #[inline]
     pub fn status(&self) -> DriverStatus {
-        self.read().status
+        self.read().status.clone()
     }
 
     /// Acquire read access.
@@ -1055,8 +1055,8 @@ impl<'a> RequestHandle<'a> {
 
 impl<'a> RequestHandleResult<'a> {
     pub fn status(&self) -> DriverStatus {
-        match self.step {
-            DriverStep::Complete { status } => status,
+        match &self.step {
+            DriverStep::Complete { status } => status.clone(),
             DriverStep::Continue => todo!(),
         }
     }

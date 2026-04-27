@@ -391,7 +391,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     }
 
     let dx = ext::<VolExt>(&dev);
-    let status = query_req.read().status;
+    let status = query_req.read().status.clone();
     if status != DriverStatus::Success {
         println!(
             "volmgr: vol_prepare_hardware lower QueryResources completed with: {}",

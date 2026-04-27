@@ -1030,7 +1030,7 @@ pub async fn acpi_pdo_query_id<'a, 'b>(
             }
         }
 
-        w.status = status;
+        w.status = status.clone();
     }
 
     DriverStep::complete(status)

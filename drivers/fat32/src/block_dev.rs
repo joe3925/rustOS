@@ -27,7 +27,7 @@ pub struct BlockDev {
     pub(crate) current_owner: Arc<AtomicU64>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BlkError {
     InvalidInput,
     Io,

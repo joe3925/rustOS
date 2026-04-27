@@ -66,7 +66,7 @@ const TIMEOUT_MS: u64 = 10000;
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
     {
         let mut w = req.write();
-        w.status = status;
+        w.status = status.clone();
     }
     DriverStep::complete(status)
 }
@@ -149,7 +149,7 @@ async fn ide_pnp_start<'a, 'b>(
     );
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await;
     if st != DriverStatus::NoSuchDevice {
-        let qst = child_handle.read().status;
+        let qst = child_handle.read().status.clone();
         if qst != DriverStatus::Success {
             return complete_req(req, qst);
         }

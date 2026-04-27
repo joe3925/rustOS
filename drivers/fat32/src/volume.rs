@@ -690,7 +690,7 @@ pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>
     // Seek is fast-path: no FS lock needed, no thread spawn, no Arc clones.
     if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         let status = handle_seek_fast(dev, req);
-        req.write().status = status;
+        req.write().status = status.clone();
         return DriverStep::complete(status);
     }
 
@@ -725,6 +725,6 @@ pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>
         }
     }
 
-    req.write().status = status;
+    req.write().status = status.clone();
     DriverStep::complete(status)
 }

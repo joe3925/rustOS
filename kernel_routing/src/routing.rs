@@ -87,7 +87,7 @@ pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> D
 
     match result {
         DriverStep::Complete { status } => status,
-        DriverStep::Continue => handle.read().status,
+        DriverStep::Continue => handle.read().status.clone(),
     }
 }
 
@@ -156,7 +156,7 @@ pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
     let mut guard = handle.write();
 
     if guard.completed {
-        return guard.status;
+        return guard.status.clone();
     }
 
     if let Some(fp) = guard.completion_routine.take() {
@@ -171,7 +171,7 @@ pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
     guard.completion_context = 0;
     guard.completion_routine = None;
     guard.completed = true;
-    guard.status
+    guard.status.clone()
 }
 
 async fn call_device_handler(

@@ -48,7 +48,10 @@ use temp_benchmark::{
     bench_sweep, bench_sweep_params, sanitize_bench_params,
 };
 
-use blk::{BlkIoSlots, VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT};
+use blk::{
+    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_IN,
+    VIRTIO_BLK_T_OUT,
+};
 use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
 
@@ -64,6 +67,27 @@ fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
 #[inline(always)]
 fn continue_req(req: &mut RequestHandle) -> DriverStep {
     DriverStep::Continue
+}
+
+fn virtio_device_error(message: impl Into<alloc::string::String>) -> DriverStatus {
+    DriverStatus::DeviceError {
+        message: message.into(),
+    }
+}
+
+fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
+    match status {
+        VIRTIO_BLK_S_OK => DriverStatus::Success,
+        VIRTIO_BLK_S_IOERR => virtio_device_error(alloc::format!(
+            "virtio-blk: {operation} failed: device reported I/O error"
+        )),
+        VIRTIO_BLK_S_UNSUPP => virtio_device_error(alloc::format!(
+            "virtio-blk: {operation} failed: request unsupported by device"
+        )),
+        other => virtio_device_error(alloc::format!(
+            "virtio-blk: {operation} failed: unknown device status {other:#x}"
+        )),
+    }
 }
 
 fn take_from_device_buffer<'a>(
@@ -247,7 +271,7 @@ async fn virtio_pnp_start<'a, 'b>(
     let mapped_bars = pci::map_memory_bars(&resources);
     if mapped_bars.is_empty() {
         println!("virtio-blk: no memory BARs found");
-        return complete_req(req, DriverStatus::DeviceError);
+        return complete_req(req, virtio_device_error("virtio-blk: no memory BARs found"));
     }
 
     let (cfg_phys, cfg_len) = match pci::find_config_space(&resources) {
@@ -257,7 +281,10 @@ async fn virtio_pnp_start<'a, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return complete_req(req, DriverStatus::DeviceError);
+            return complete_req(
+                req,
+                virtio_device_error("virtio-blk: no PCI config space resource"),
+            );
         }
     };
 
@@ -271,7 +298,10 @@ async fn virtio_pnp_start<'a, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return complete_req(req, DriverStatus::DeviceError);
+            return complete_req(
+                req,
+                virtio_device_error("virtio-blk: failed to map PCI config space"),
+            );
         }
     };
 
@@ -283,20 +313,28 @@ async fn virtio_pnp_start<'a, 'b>(
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return complete_req(req, DriverStatus::DeviceError);
+            return complete_req(
+                req,
+                virtio_device_error("virtio-blk: failed to parse virtio PCI capabilities"),
+            );
         }
     };
 
     let _ = unmap_mmio_region(cfg_base, cfg_len);
 
     let init_result = match blk::init_device(caps.common_cfg, caps.device_cfg) {
-        Some(r) => r,
-        None => {
-            println!("virtio-blk: device init / feature negotiation failed");
+        Ok(r) => r,
+        Err(message) => {
+            println!("virtio-blk: device init / feature negotiation failed: {}", message);
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
-            return complete_req(req, DriverStatus::DeviceError);
+            return complete_req(
+                req,
+                virtio_device_error(alloc::format!(
+                    "virtio-blk: device init / feature negotiation failed: {message}"
+                )),
+            );
         }
     };
 
@@ -321,7 +359,12 @@ async fn virtio_pnp_start<'a, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unmap_mmio_region(va, sz);
         }
-        return complete_req(req, DriverStatus::DeviceError);
+        return complete_req(
+            req,
+            virtio_device_error(alloc::format!(
+                "virtio-blk: no queues created; requested {target_queue_count}"
+            )),
+        );
     }
 
     let actual_queue_count = virtqueues.len();
@@ -553,7 +596,12 @@ async fn virtio_pnp_start<'a, 'b>(
         for &(_idx, va, sz) in &mapped_bars {
             let _ = unmap_mmio_region(va, sz);
         }
-        return complete_req(req, DriverStatus::DeviceError);
+        return complete_req(
+            req,
+            virtio_device_error(alloc::format!(
+                "virtio-blk: device status bad after DRIVER_OK: status={status:#x}"
+            )),
+        );
     }
 
     let msix_pba = match msix_cap {
@@ -985,14 +1033,10 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
     let (head, rx) = submitted_head.unwrap();
     let status = match rx.await {
-        Ok(_) => {
-            if qs.arena.get_status(head) == VIRTIO_BLK_S_OK {
-                DriverStatus::Success
-            } else {
-                DriverStatus::DeviceError
-            }
-        }
-        Err(_) => DriverStatus::DeviceError,
+        Ok(_) => blk_status_to_driver_status("read", qs.arena.get_status(head)),
+        Err(_) => virtio_device_error(
+            "virtio-blk: read failed: completion channel closed before device status",
+        ),
     };
 
     restore_from_device_buffer(req, kernel_api::dma::unmap_buffer(mapped_buffer));
@@ -1095,14 +1139,10 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
     let (head, rx) = submitted_head.unwrap();
     let status = match rx.await {
-        Ok(_) => {
-            if qs.arena.get_status(head) == VIRTIO_BLK_S_OK {
-                DriverStatus::Success
-            } else {
-                DriverStatus::DeviceError
-            }
-        }
-        Err(_) => DriverStatus::DeviceError,
+        Ok(_) => blk_status_to_driver_status("write", qs.arena.get_status(head)),
+        Err(_) => virtio_device_error(
+            "virtio-blk: write failed: completion channel closed before device status",
+        ),
     };
 
     let _ = kernel_api::dma::unmap_buffer(mapped_buffer);
