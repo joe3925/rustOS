@@ -13,6 +13,7 @@ use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::dma::{Described, IoBuffer, ToDevice};
 use kernel_api::kernel_types::request::RequestData;
+use kernel_api::println;
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
@@ -780,15 +781,27 @@ where
         }
 
         joins.clear();
+        let first_error = Arc::new(Mutex::new(None));
 
         for (lba, page) in pages {
             let backend = Arc::clone(&backend);
             let stats = Arc::clone(&stats);
             let page = Arc::clone(page);
             let lba = *lba;
+            let first_error = Arc::clone(&first_error);
 
             let handle = spawn(async move {
-                let _ = Self::flush_page_task(backend, stats, lba, page).await;
+                if let Err(err) = Self::flush_page_task(backend, stats, lba, page).await {
+                    println!(
+                        "volmgr: VolumeCache::flush_pages_parallel failed at lba {}: {:?}",
+                        lba, err
+                    );
+
+                    let mut slot = first_error.lock();
+                    if slot.is_none() {
+                        *slot = Some(err);
+                    }
+                }
             });
 
             joins.push(handle);
@@ -796,6 +809,11 @@ where
 
         for handle in joins.drain(..) {
             handle.await;
+        }
+
+        let first_error = { first_error.lock().take() };
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         Ok(())
@@ -917,6 +935,12 @@ where
 
         let job_future = spawn(async move {
             let outcome = cache.flush_until_clean().await;
+            if let Err(err) = &outcome {
+                println!(
+                    "volmgr: VolumeCache::ensure_flush_job job {} failed: {:?}",
+                    id, err
+                );
+            }
             {
                 let mut slot = result_slot_clone.lock();
                 *slot = Some(outcome);
@@ -1043,8 +1067,16 @@ where
             let mut lba = range.start;
             while lba < range.end {
                 if cache.try_get_page(lba).await.is_none() {
-                    if let Ok(page) = cache.load_cache_page_from_backend(lba).await {
-                        let _ = cache.insert_page_or_get_existing(lba, page).await;
+                    match cache.load_cache_page_from_backend(lba).await {
+                        Ok(page) => {
+                            let _ = cache.insert_page_or_get_existing(lba, page).await;
+                        }
+                        Err(err) => {
+                            println!(
+                                "volmgr: VolumeCache::prefetch_range failed at lba {}: {:?}",
+                                lba, err
+                            );
+                        }
                     }
                 }
                 lba += 1;

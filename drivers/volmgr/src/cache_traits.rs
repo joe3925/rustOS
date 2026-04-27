@@ -86,7 +86,7 @@ impl<E: Clone> Clone for CacheError<E> {
 
 // Ffi future is used instead of BoxFuture here because we already have slab alloc for Ffi future.
 pub trait VolumeCacheBackend: Send + Sync + 'static {
-    type Error: Send + Sync + 'static;
+    type Error: Send + Sync + core::fmt::Debug + 'static;
 
     fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>>;
     fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>>;
