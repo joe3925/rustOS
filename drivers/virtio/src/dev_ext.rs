@@ -46,8 +46,9 @@ pub struct QueueState {
     pub use_indirect: bool,
     /// Per-descriptor-head oneshot sender slots, sized to the virtqueue depth.
     /// The submitter stores its sender here before notifying the device.
-    /// The drain task takes the sender and delivers the completion result.
-    pub completion_slots: Box<[Mutex<Option<oneshot::Sender<u32>>>]>,
+    /// The drain task takes the sender and delivers the device status before
+    /// returning the descriptor head to the free list.
+    pub completion_slots: Box<[Mutex<Option<oneshot::Sender<u8>>>]>,
 }
 
 unsafe impl Send for QueueState {}

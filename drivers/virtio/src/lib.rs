@@ -819,16 +819,18 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
         }
 
         let mut vq = qs.queue.write();
-        while let Some((head, len)) = vq.pop_used() {
+        while let Some((head, _len)) = vq.pop_used() {
             if head as usize >= qs.completion_slots.len() {
                 panic!(
                     "virtio: device returned out-of-bounds descriptor index {}",
                     head
                 );
             }
+            core::sync::atomic::fence(Ordering::Acquire);
+            let status = qs.arena.get_status(head);
             vq.free_chain(head);
             if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
-                let _ = tx.send(len);
+                let _ = tx.send(status);
             } else {
                 panic!("oops");
             }
@@ -986,7 +988,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
 
     let mut submitted_head = None;
     loop {
-        let (tx, rx) = futures_channel::oneshot::channel::<u32>();
+        let (tx, rx) = futures_channel::oneshot::channel::<u8>();
         let head_opt = {
             let mut vq = qs.queue.write();
             let segments = mapped_buffer.dma_segments();
@@ -1031,9 +1033,9 @@ pub async fn virtio_pdo_read<'a, 'b>(
         .await;
     }
 
-    let (head, rx) = submitted_head.unwrap();
+    let (_, rx) = submitted_head.unwrap();
     let status = match rx.await {
-        Ok(_) => blk_status_to_driver_status("read", qs.arena.get_status(head)),
+        Ok(device_status) => blk_status_to_driver_status("read", device_status),
         Err(_) => virtio_device_error(
             "virtio-blk: read failed: completion channel closed before device status",
         ),
@@ -1092,7 +1094,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
 
     let mut submitted_head = None;
     loop {
-        let (tx, rx) = futures_channel::oneshot::channel::<u32>();
+        let (tx, rx) = futures_channel::oneshot::channel::<u8>();
         let head_opt = {
             let mut vq = qs.queue.write();
             let segments = mapped_buffer.dma_segments();
@@ -1137,9 +1139,9 @@ pub async fn virtio_pdo_write<'a, 'b>(
         .await;
     }
 
-    let (head, rx) = submitted_head.unwrap();
+    let (_, rx) = submitted_head.unwrap();
     let status = match rx.await {
-        Ok(_) => blk_status_to_driver_status("write", qs.arena.get_status(head)),
+        Ok(device_status) => blk_status_to_driver_status("write", device_status),
         Err(_) => virtio_device_error(
             "virtio-blk: write failed: completion channel closed before device status",
         ),

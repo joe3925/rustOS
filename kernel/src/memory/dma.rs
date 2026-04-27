@@ -375,7 +375,6 @@ fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
     if let Some(rec_b) = pending.rec_b {
         unmap_record(&pending.domain, rec_b);
     }
-    iommu::invalidate(&pending.domain);
 }
 
 fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
@@ -416,7 +415,6 @@ fn rollback_mappings(domain: &IommuDomain, rec_a: Option<MappingRecord>, rec_b: 
     if let Some(rec_b) = rec_b {
         unmap_record(domain, rec_b);
     }
-    iommu::invalidate(domain);
 }
 
 fn collect_phys_runs(
