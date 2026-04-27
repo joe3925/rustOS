@@ -15,6 +15,9 @@ pub trait CacheIndex<V>: Send {
     fn insert(&mut self, key: u64, value: V) -> bool;
     fn remove(&mut self, key: &u64) -> Option<V>;
     fn pop_oldest(&mut self) -> Option<(u64, V)>;
+    fn oldest_matching<FN>(&self, f: FN) -> Option<u64>
+    where
+        FN: FnMut(u64, &V) -> bool;
     fn for_each<FN>(&self, f: FN)
     where
         FN: FnMut(u64, &V);
@@ -97,6 +100,19 @@ where
     #[inline]
     fn pop_oldest(&mut self) -> Option<(u64, V)> {
         self.inner.pop_oldest()
+    }
+
+    #[inline]
+    fn oldest_matching<FN>(&self, mut f: FN) -> Option<u64>
+    where
+        FN: FnMut(u64, &V) -> bool,
+    {
+        for (k, v) in self.inner.iter().rev() {
+            if f(*k, v) {
+                return Some(*k);
+            }
+        }
+        None
     }
 
     #[inline]

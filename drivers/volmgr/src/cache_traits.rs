@@ -10,10 +10,26 @@ pub struct CacheConfig {
     pub read_allocate: bool,
     pub lazy_page_allocation: bool,
     pub lazy_index_allocation: bool,
+    /// Start background writeback when dirty pages reach this count.
+    pub dirty_high_watermark_blocks: usize,
+    /// Background writeback keeps flushing until dirty pages drop to this count.
+    pub dirty_low_watermark_blocks: usize,
+    /// Flush dirty pages whose last write is at least this many write epochs old.
+    pub dirty_age_threshold_ops: u64,
 }
 
 impl CacheConfig {
     pub const fn new(capacity_blocks: usize) -> Self {
+        let high = if capacity_blocks > 4 {
+            (capacity_blocks * 3) / 4
+        } else {
+            capacity_blocks
+        };
+        let low = if capacity_blocks > 4 {
+            capacity_blocks / 2
+        } else {
+            0
+        };
         Self {
             capacity_blocks,
             shards: 16,
@@ -22,6 +38,9 @@ impl CacheConfig {
             read_allocate: true,
             lazy_page_allocation: false,
             lazy_index_allocation: false,
+            dirty_high_watermark_blocks: high,
+            dirty_low_watermark_blocks: low,
+            dirty_age_threshold_ops: 4096,
         }
     }
 
@@ -31,6 +50,17 @@ impl CacheConfig {
     }
     pub const fn with_lazy_index_allocation(mut self, enabled: bool) -> Self {
         self.lazy_index_allocation = enabled;
+        self
+    }
+
+    pub const fn with_dirty_watermarks(mut self, high_blocks: usize, low_blocks: usize) -> Self {
+        self.dirty_high_watermark_blocks = high_blocks;
+        self.dirty_low_watermark_blocks = low_blocks;
+        self
+    }
+
+    pub const fn with_dirty_age_threshold_ops(mut self, threshold: u64) -> Self {
+        self.dirty_age_threshold_ops = threshold;
         self
     }
 }

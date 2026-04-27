@@ -93,6 +93,7 @@ struct Page<const BLOCK_SIZE: usize> {
     writeback: AtomicBool,
     generation: AtomicU64,
     wb_generation: AtomicU64,
+    dirty_epoch: AtomicU64,
     active_ops: AtomicUsize,
     /// File-level owner tag. 0 = unowned (included in all targeted flushes).
     owner: AtomicU64,
@@ -106,20 +107,24 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
             writeback: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
+            dirty_epoch: AtomicU64::new(0),
             active_ops: AtomicUsize::new(0),
             owner: AtomicU64::new(0),
         }
     }
 
-    fn mark_dirty(&self) {
+    fn mark_dirty(&self, dirty_epoch: u64) -> bool {
+        self.owner.store(0, Ordering::Release);
+        self.dirty_epoch.store(dirty_epoch, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.dirty.store(true, Ordering::Release);
+        !self.dirty.swap(true, Ordering::AcqRel)
     }
 
-    fn mark_dirty_with_owner(&self, owner: u64) {
+    fn mark_dirty_with_owner(&self, owner: u64, dirty_epoch: u64) -> bool {
         self.owner.store(owner, Ordering::Release);
+        self.dirty_epoch.store(dirty_epoch, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
-        self.dirty.store(true, Ordering::Release);
+        !self.dirty.swap(true, Ordering::AcqRel)
     }
 
     fn enter_use(&self) {
@@ -135,6 +140,7 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
         self.writeback.store(false, Ordering::Release);
         self.generation.store(0, Ordering::Release);
         self.wb_generation.store(0, Ordering::Release);
+        self.dirty_epoch.store(0, Ordering::Release);
         self.active_ops.store(0, Ordering::Release);
         self.owner.store(0, Ordering::Release);
     }
@@ -218,8 +224,10 @@ enum FlushFilter<'a> {
     All,
     /// Flush dirty pages within a block range.
     BlockRange(&'a Range<u64>),
-    /// Flush dirty pages belonging to the given owner (and unowned pages where owner == 0).
+    /// Flush dirty pages belonging to the given owner.
     Owner(u64),
+    /// Flush dirty pages whose last write epoch is old enough for background writeback.
+    DirtyOlderOrEqual(u64),
 }
 
 impl FlushFilter<'_> {
@@ -230,7 +238,10 @@ impl FlushFilter<'_> {
             FlushFilter::BlockRange(r) => lba >= r.start && lba < r.end,
             FlushFilter::Owner(owner) => {
                 let page_owner = page.owner.load(Ordering::Acquire);
-                page_owner == *owner || page_owner == 0
+                page_owner == *owner
+            }
+            FlushFilter::DirtyOlderOrEqual(epoch) => {
+                page.dirty_epoch.load(Ordering::Acquire) <= *epoch
             }
         }
     }
@@ -281,6 +292,9 @@ where
     page_pool: Option<PagePool<BLOCK_SIZE>>,
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
+    dirty_pages: Arc<AtomicUsize>,
+    write_epoch: AtomicU64,
+    background_writeback_active: AtomicBool,
     closed: AtomicBool,
     flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
     flush_job_id: AtomicU64,
@@ -319,6 +333,16 @@ where
             cfg.flush_parallelism = 1;
         }
 
+        if cfg.dirty_high_watermark_blocks == 0
+            || cfg.dirty_high_watermark_blocks > cfg.capacity_blocks
+        {
+            cfg.dirty_high_watermark_blocks = cfg.capacity_blocks;
+        }
+
+        if cfg.dirty_low_watermark_blocks > cfg.dirty_high_watermark_blocks {
+            cfg.dirty_low_watermark_blocks = cfg.dirty_high_watermark_blocks;
+        }
+
         let shard_count = cfg.shards;
         let per_shard = (cfg.capacity_blocks + shard_count - 1) / shard_count;
         let mut shards = Vec::with_capacity(shard_count);
@@ -345,6 +369,9 @@ where
             page_pool,
             cfg,
             stats: Arc::new(StatsInner::new()),
+            dirty_pages: Arc::new(AtomicUsize::new(0)),
+            write_epoch: AtomicU64::new(0),
+            background_writeback_active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             flush_job: Mutex::new(None),
             flush_job_id: AtomicU64::new(0),
@@ -362,6 +389,25 @@ where
             return Err(CacheError::Closed);
         }
         Ok(())
+    }
+
+    fn next_write_epoch(&self) -> u64 {
+        self.write_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
+    }
+
+    fn mark_cached_page_dirty(&self, page: &Page<BLOCK_SIZE>, owner: u64) {
+        let epoch = self.next_write_epoch();
+        let became_dirty = if owner == 0 {
+            page.mark_dirty(epoch)
+        } else {
+            page.mark_dirty_with_owner(owner, epoch)
+        };
+
+        if became_dirty {
+            self.dirty_pages.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     fn end_offset(offset: u64, len: usize) -> Result<u64, CacheError<B::Error>> {
@@ -396,41 +442,36 @@ where
         page.is_evictable() && Arc::strong_count(page) == 1
     }
 
+    fn page_can_be_flushed_for_reclaim(page: &Arc<Page<BLOCK_SIZE>>) -> bool {
+        page.dirty.load(Ordering::Acquire)
+            && !page.writeback.load(Ordering::Acquire)
+            && page.active_ops.load(Ordering::Acquire) == 0
+    }
+
     fn recycle_or_drop_page(&self, page: Arc<Page<BLOCK_SIZE>>) {
         if let Some(pool) = &self.page_pool {
             pool.push(page);
         }
     }
 
+    /// Reclaims clean pages using the shard's least-recently-used clean page.
     fn reclaim_page_from_shard_locked(
         &self,
         shard: &mut Shard<F::Index>,
     ) -> Option<Arc<Page<BLOCK_SIZE>>> {
-        let mut skipped = Vec::new();
-        let mut scanned = 0usize;
-        let mut reclaimed = None;
+        let reclaim_key = shard
+            .index
+            .oldest_matching(|_, page| Self::page_can_be_reclaimed(page));
 
-        while let Some((lba, page)) = shard.index.pop_oldest() {
-            scanned += 1;
-
-            if Self::page_can_be_reclaimed(&page) {
-                self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-                reclaimed = Some(page);
-                break;
-            }
-
-            skipped.push((lba, page));
-        }
-
-        for (lba, page) in skipped {
-            let _ = shard.index.insert(lba, page);
-        }
-
-        if reclaimed.is_none() && scanned != 0 {
+        if reclaim_key.is_none() && shard.index.len() != 0 {
             self.stats.failed_evictions.fetch_add(1, Ordering::Relaxed);
         }
 
-        if let Some(mut page) = reclaimed {
+        if let Some(lba) = reclaim_key {
+            let Some(mut page) = shard.index.remove(&lba) else {
+                return None;
+            };
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
             if let Some(inner) = Arc::get_mut(&mut page) {
                 inner.reset_for_reuse();
                 return Some(page);
@@ -441,6 +482,8 @@ where
     }
 
     fn try_reclaim_cache_page(&self, preferred_idx: usize) -> Option<Arc<Page<BLOCK_SIZE>>> {
+        // The cache is sharded, so eviction is approximate LRU: prefer the
+        // target shard's oldest clean page, then fall back to other shards.
         {
             let mut shard = self.shards[preferred_idx].lock();
             if let Some(page) = self.reclaim_page_from_shard_locked(&mut shard) {
@@ -461,6 +504,59 @@ where
         }
 
         None
+    }
+
+    fn oldest_dirty_reclaim_candidate_in_shard(
+        &self,
+        shard_idx: usize,
+    ) -> Option<(u64, Arc<Page<BLOCK_SIZE>>)> {
+        let shard = self.shards[shard_idx].lock();
+        let lba = shard
+            .index
+            .oldest_matching(|_, page| Self::page_can_be_flushed_for_reclaim(page))?;
+        let page = shard.index.peek(&lba)?;
+        Some((lba, Arc::clone(page)))
+    }
+
+    fn oldest_dirty_reclaim_candidate(
+        &self,
+        preferred_idx: usize,
+    ) -> Option<(u64, Arc<Page<BLOCK_SIZE>>)> {
+        if let Some(candidate) = self.oldest_dirty_reclaim_candidate_in_shard(preferred_idx) {
+            return Some(candidate);
+        }
+
+        let mut idx = 0usize;
+        while idx < self.shards.len() {
+            if idx != preferred_idx {
+                if let Some(candidate) = self.oldest_dirty_reclaim_candidate_in_shard(idx) {
+                    return Some(candidate);
+                }
+            }
+            idx += 1;
+        }
+
+        None
+    }
+
+    async fn flush_oldest_dirty_reclaim_candidate(
+        &self,
+        preferred_idx: usize,
+    ) -> Result<bool, CacheError<B::Error>> {
+        let Some((lba, page)) = self.oldest_dirty_reclaim_candidate(preferred_idx) else {
+            return Ok(false);
+        };
+
+        Self::flush_page_task(
+            Arc::clone(&self.backend),
+            Arc::clone(&self.stats),
+            Arc::clone(&self.dirty_pages),
+            lba,
+            page,
+        )
+        .await?;
+
+        Ok(true)
     }
 
     fn trim_shard_locked(&self, shard: &mut Shard<F::Index>) {
@@ -495,19 +591,20 @@ where
             return Ok(page);
         }
 
-        self.flush_internal_all().await?;
-
-        if let Some(pool) = &self.page_pool {
-            if let Some(mut page) = pool.pop() {
-                if let Some(inner) = Arc::get_mut(&mut page) {
-                    inner.reset_for_reuse();
-                    return Ok(page);
-                }
+        let mut attempts = self.shards.len().saturating_mul(2).max(1);
+        while attempts != 0 {
+            if !self
+                .flush_oldest_dirty_reclaim_candidate(preferred_idx)
+                .await?
+            {
+                break;
             }
-        }
 
-        if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
-            return Ok(page);
+            if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
+                return Ok(page);
+            }
+
+            attempts -= 1;
         }
 
         Err(CacheError::NoFreePages)
@@ -586,7 +683,6 @@ where
         let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
         let data = page.data.get_mut();
         data.bytes[..].copy_from_slice(src);
-        page.mark_dirty();
         Ok(())
     }
 
@@ -686,15 +782,18 @@ where
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
+        let mut snapshot = Box::new([0u8; BLOCK_SIZE]);
         {
             let data = page.data.read();
-            let io_buf = IoBuffer::<Described, ToDevice>::new(&data.bytes[..]);
-            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
-            self.backend
-                .write_request(borrow.handle())
-                .await
-                .map_err(CacheError::Backend)?;
+            snapshot[..].copy_from_slice(&data.bytes[..]);
         }
+
+        let io_buf = IoBuffer::<Described, ToDevice>::new(&snapshot[..]);
+        let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+        self.backend
+            .write_request(borrow.handle())
+            .await
+            .map_err(CacheError::Backend)?;
 
         self.stats.backend_writes.fetch_add(1, Ordering::Relaxed);
         self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
@@ -705,25 +804,26 @@ where
     async fn flush_page_task(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
+        dirty_pages: Arc<AtomicUsize>,
         lba: u64,
         page: Arc<Page<BLOCK_SIZE>>,
-    ) -> Result<(), CacheError<B::Error>> {
+    ) -> Result<bool, CacheError<B::Error>> {
         stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
 
         if !page.dirty.load(Ordering::Acquire) {
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(false);
         }
 
         if page.writeback.swap(true, Ordering::AcqRel) {
             stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(false);
         }
 
         if !page.dirty.load(Ordering::Acquire) {
             page.writeback.store(false, Ordering::Release);
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            return Ok(false);
         }
 
         let wb_gen = page.generation.load(Ordering::Acquire);
@@ -740,30 +840,37 @@ where
         );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let write_res = {
+        let mut snapshot = Box::new([0u8; BLOCK_SIZE]);
+        {
             let data = page.data.read();
-            let io_buf = IoBuffer::<Described, ToDevice>::new(&data.bytes[..]);
-            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
-            backend
-                .write_request(borrow.handle())
-                .await
-                .map_err(CacheError::Backend)
-        };
+            snapshot[..].copy_from_slice(&data.bytes[..]);
+        }
+
+        let io_buf = IoBuffer::<Described, ToDevice>::new(&snapshot[..]);
+        let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+        let write_res = backend
+            .write_request(borrow.handle())
+            .await
+            .map_err(CacheError::Backend);
 
         match write_res {
             Ok(()) => {
                 stats.backend_writes.fetch_add(1, Ordering::Relaxed);
                 let cur_gen = page.generation.load(Ordering::Acquire);
                 if cur_gen == wb_gen {
-                    page.dirty.store(false, Ordering::Release);
+                    if page.dirty.swap(false, Ordering::AcqRel) {
+                        dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
                 page.writeback.store(false, Ordering::Release);
                 stats.flush_success.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(true)
             }
             Err(e) => {
                 page.writeback.store(false, Ordering::Release);
-                page.dirty.store(true, Ordering::Release);
+                if !page.dirty.swap(true, Ordering::AcqRel) {
+                    dirty_pages.fetch_add(1, Ordering::AcqRel);
+                }
                 Err(e)
             }
         }
@@ -773,38 +880,59 @@ where
     async fn flush_pages_parallel(
         backend: Arc<B>,
         stats: Arc<StatsInner>,
+        dirty_pages: Arc<AtomicUsize>,
         pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
         joins: &mut Vec<FfiFuture<()>>,
-    ) -> Result<(), CacheError<B::Error>> {
+        parallelism: usize,
+    ) -> Result<usize, CacheError<B::Error>> {
         if pages.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         joins.clear();
         let first_error = Arc::new(Mutex::new(None));
+        let writebacks = Arc::new(AtomicUsize::new(0));
+        let parallelism = parallelism.max(1);
 
         for (lba, page) in pages {
             let backend = Arc::clone(&backend);
             let stats = Arc::clone(&stats);
+            let dirty_pages = Arc::clone(&dirty_pages);
+            let writebacks = Arc::clone(&writebacks);
             let page = Arc::clone(page);
             let lba = *lba;
-            let first_error = Arc::clone(&first_error);
+            let first_error_for_task = Arc::clone(&first_error);
 
             let handle = spawn(async move {
-                if let Err(err) = Self::flush_page_task(backend, stats, lba, page).await {
-                    println!(
-                        "volmgr: VolumeCache::flush_pages_parallel failed at lba {}: {:?}",
-                        lba, err
-                    );
+                match Self::flush_page_task(backend, stats, dirty_pages, lba, page).await {
+                    Ok(true) => {
+                        writebacks.fetch_add(1, Ordering::AcqRel);
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        println!(
+                            "volmgr: VolumeCache::flush_pages_parallel failed at lba {}: {:?}",
+                            lba, err
+                        );
 
-                    let mut slot = first_error.lock();
-                    if slot.is_none() {
-                        *slot = Some(err);
+                        let mut slot = first_error_for_task.lock();
+                        if slot.is_none() {
+                            *slot = Some(err);
+                        }
                     }
                 }
             });
 
             joins.push(handle);
+
+            if joins.len() >= parallelism {
+                for handle in joins.drain(..) {
+                    handle.await;
+                }
+                if first_error.lock().is_some() {
+                    break;
+                }
+            }
         }
 
         for handle in joins.drain(..) {
@@ -816,80 +944,96 @@ where
             return Err(err);
         }
 
-        Ok(())
+        Ok(writebacks.load(Ordering::Acquire))
     }
     async fn flush_shard_streaming(
         &self,
         shard_idx: usize,
         filter: &FlushFilter<'_>,
         parallelism: usize,
-    ) -> Result<(), CacheError<B::Error>> {
-        let (batch, mut joins) = {
-            let mut scratch = self.flush_scratch.lock();
-            scratch.reset();
-            scratch.ensure_join_capacity(parallelism);
+    ) -> Result<(usize, usize), CacheError<B::Error>> {
+        let parallelism = parallelism.max(1);
+        let mut start = 0usize;
+        let mut matched = 0usize;
+        let mut writebacks = 0usize;
 
-            {
-                let shard = self.shards[shard_idx].lock();
-                let needed = shard.index.len();
-                let current = scratch.batch.capacity();
-                if current < needed {
-                    scratch.batch.reserve(needed - current);
+        loop {
+            let (walked, batch, mut joins) = {
+                let mut scratch = self.flush_scratch.lock();
+                scratch.reset();
+                scratch.ensure_join_capacity(parallelism);
+                let batch_capacity = scratch.batch.capacity();
+                if batch_capacity < parallelism {
+                    scratch.batch.reserve(parallelism - batch_capacity);
                 }
 
-                shard.index.for_each_chunk(0, usize::MAX, |k, v| {
-                    if filter.matches(k, v) {
-                        scratch.batch.push((k, Arc::clone(v)));
-                    }
-                });
+                let walked = {
+                    let shard = self.shards[shard_idx].lock();
+                    shard.index.for_each_chunk(start, parallelism, |k, v| {
+                        if v.dirty.load(Ordering::Acquire) && filter.matches(k, v) {
+                            scratch.batch.push((k, Arc::clone(v)));
+                        }
+                    })
+                };
+
+                if walked == 0 {
+                    return Ok((matched, writebacks));
+                }
+
+                let batch = core::mem::take(&mut scratch.batch);
+                let joins = core::mem::take(&mut scratch.joins);
+                (walked, batch, joins)
+            };
+
+            matched += batch.len();
+
+            if !batch.is_empty() {
+                writebacks += Self::flush_pages_parallel(
+                    Arc::clone(&self.backend),
+                    Arc::clone(&self.stats),
+                    Arc::clone(&self.dirty_pages),
+                    &batch,
+                    &mut joins,
+                    parallelism,
+                )
+                .await?;
             }
 
-            if scratch.batch.is_empty() {
-                return Ok(());
+            {
+                let mut scratch = self.flush_scratch.lock();
+                scratch.batch = batch;
+                scratch.joins = joins;
+                scratch.reset();
             }
 
-            let batch = core::mem::take(&mut scratch.batch);
-            let joins = core::mem::take(&mut scratch.joins);
-            (batch, joins)
-        };
-
-        Self::flush_pages_parallel(
-            Arc::clone(&self.backend),
-            Arc::clone(&self.stats),
-            &batch,
-            &mut joins,
-        )
-        .await?;
-
-        {
-            let mut scratch = self.flush_scratch.lock();
-            scratch.batch = batch;
-            scratch.joins = joins;
-            scratch.reset();
+            start += walked;
         }
-
-        Ok(())
     }
     async fn flush_shards_streaming_all(
         self: &Arc<Self>,
         parallelism: usize,
-    ) -> Result<(), CacheError<B::Error>> {
+    ) -> Result<(usize, usize), CacheError<B::Error>> {
         let mut shard_idx = 0usize;
+        let mut matched = 0usize;
+        let mut writebacks = 0usize;
         while shard_idx < self.shards.len() {
-            self.flush_shard_streaming(shard_idx, &FlushFilter::All, parallelism)
+            let (shard_matched, shard_writebacks) = self
+                .flush_shard_streaming(shard_idx, &FlushFilter::All, parallelism)
                 .await?;
+            matched += shard_matched;
+            writebacks += shard_writebacks;
             shard_idx += 1;
         }
-        Ok(())
+        Ok((matched, writebacks))
     }
 
-    async fn has_dirty_pages(&self) -> bool {
+    async fn has_dirty_pages_filtered(&self, filter: &FlushFilter<'_>) -> bool {
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
             let shard = self.shards[shard_idx].lock();
             let mut found = false;
-            shard.index.for_each(|_, page| {
-                if !found && page.dirty.load(Ordering::Acquire) {
+            shard.index.for_each(|lba, page| {
+                if !found && page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
                     found = true;
                 }
             });
@@ -902,13 +1046,8 @@ where
     }
 
     async fn flush_until_clean(&self) -> Result<(), CacheError<B::Error>> {
-        loop {
-            self.flush_internal_all().await?;
-            if !self.has_dirty_pages().await {
-                break;
-            }
-        }
-        Ok(())
+        self.flush_until_filtered_clean(&FlushFilter::All, true)
+            .await
     }
 
     async fn finish_flush_job(&self, id: u64) {
@@ -971,36 +1110,215 @@ where
     async fn flush_internal_filtered(
         &self,
         filter: &FlushFilter<'_>,
-    ) -> Result<(), CacheError<B::Error>> {
+        force_device_flush: bool,
+    ) -> Result<(usize, usize), CacheError<B::Error>> {
         self.check_open()?;
         let mut shard_idx = 0usize;
+        let mut matched = 0usize;
+        let mut writebacks = 0usize;
         while shard_idx < self.shards.len() {
-            self.flush_shard_streaming(shard_idx, filter, self.cfg.flush_parallelism)
+            let (shard_matched, shard_writebacks) = self
+                .flush_shard_streaming(shard_idx, filter, self.cfg.flush_parallelism)
                 .await?;
+            matched += shard_matched;
+            writebacks += shard_writebacks;
             shard_idx += 1;
         }
 
-        self.backend
-            .flush_device()
-            .await
-            .map_err(CacheError::Backend)
+        if force_device_flush || writebacks != 0 {
+            self.backend
+                .flush_device()
+                .await
+                .map_err(CacheError::Backend)?;
+        }
+
+        Ok((matched, writebacks))
+    }
+
+    async fn flush_until_filtered_clean(
+        &self,
+        filter: &FlushFilter<'_>,
+        force_device_flush: bool,
+    ) -> Result<(), CacheError<B::Error>> {
+        loop {
+            let dirty_before = self.dirty_pages.load(Ordering::Acquire);
+            self.flush_internal_filtered(filter, force_device_flush)
+                .await?;
+            if !self.has_dirty_pages_filtered(filter).await {
+                break;
+            }
+
+            let dirty_after = self.dirty_pages.load(Ordering::Acquire);
+            if dirty_after >= dirty_before {
+                self.flush_internal_filtered(filter, force_device_flush)
+                    .await?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn flush_internal_range(
         &self,
         block_range: Range<u64>,
     ) -> Result<(), CacheError<B::Error>> {
-        self.flush_internal_filtered(&FlushFilter::BlockRange(&block_range))
+        self.flush_until_filtered_clean(&FlushFilter::BlockRange(&block_range), true)
             .await
     }
 
     async fn flush_internal_all(&self) -> Result<(), CacheError<B::Error>> {
-        self.flush_internal_filtered(&FlushFilter::All).await
+        self.flush_until_filtered_clean(&FlushFilter::All, true)
+            .await
     }
 
     async fn flush_internal_owner(&self, owner: u64) -> Result<(), CacheError<B::Error>> {
-        self.flush_internal_filtered(&FlushFilter::Owner(owner))
+        self.flush_until_filtered_clean(&FlushFilter::Owner(owner), true)
             .await
+    }
+
+    fn should_start_background_writeback(&self) -> bool {
+        if self.closed.load(Ordering::Acquire) {
+            return false;
+        }
+
+        let dirty = self.dirty_pages.load(Ordering::Acquire);
+        if dirty == 0 {
+            return false;
+        }
+
+        if dirty >= self.cfg.dirty_high_watermark_blocks {
+            return true;
+        }
+
+        let threshold = self.cfg.dirty_age_threshold_ops;
+        if threshold == 0 {
+            return false;
+        }
+
+        let epoch = self.write_epoch.load(Ordering::Acquire);
+        if epoch <= threshold {
+            return false;
+        }
+
+        let cutoff = epoch - threshold;
+        let mut shard_idx = 0usize;
+        while shard_idx < self.shards.len() {
+            let shard = self.shards[shard_idx].lock();
+            let mut found = false;
+            shard.index.for_each(|_, page| {
+                if !found
+                    && page.dirty.load(Ordering::Acquire)
+                    && page.dirty_epoch.load(Ordering::Acquire) <= cutoff
+                {
+                    found = true;
+                }
+            });
+            if found {
+                return true;
+            }
+            shard_idx += 1;
+        }
+
+        false
+    }
+
+    async fn background_writeback_loop(&self) {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                break;
+            }
+
+            let dirty_before = self.dirty_pages.load(Ordering::Acquire);
+            if dirty_before == 0 {
+                break;
+            }
+
+            let high = self.cfg.dirty_high_watermark_blocks;
+            let low = self.cfg.dirty_low_watermark_blocks;
+            let threshold = self.cfg.dirty_age_threshold_ops;
+
+            let filter = if dirty_before >= high {
+                FlushFilter::All
+            } else if threshold != 0 {
+                let epoch = self.write_epoch.load(Ordering::Acquire);
+                if epoch <= threshold {
+                    break;
+                }
+                FlushFilter::DirtyOlderOrEqual(epoch - threshold)
+            } else {
+                break;
+            };
+
+            let (matched, writebacks) = match self.flush_internal_filtered(&filter, false).await {
+                Ok(pass) => pass,
+                Err(err) => {
+                    println!(
+                        "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
+                        err
+                    );
+                    break;
+                }
+            };
+
+            let dirty_after = self.dirty_pages.load(Ordering::Acquire);
+            if matched == 0 || writebacks == 0 || dirty_after >= dirty_before {
+                break;
+            }
+
+            if dirty_after <= low && !self.should_start_background_writeback() {
+                break;
+            }
+        }
+    }
+
+    fn maybe_start_background_writeback(cache: &Arc<Self>) {
+        if !cache.should_start_background_writeback() {
+            return;
+        }
+
+        if cache
+            .background_writeback_active
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let cache_for_task = Arc::clone(cache);
+        spawn_detached(async move {
+            cache_for_task.background_writeback_loop().await;
+            cache_for_task
+                .background_writeback_active
+                .store(false, Ordering::Release);
+            if cache_for_task.should_start_background_writeback()
+                && !cache_for_task
+                    .background_writeback_active
+                    .swap(true, Ordering::AcqRel)
+            {
+                let cache_for_followup = Arc::clone(&cache_for_task);
+                spawn_detached(async move {
+                    cache_for_followup.background_writeback_loop().await;
+                    cache_for_followup
+                        .background_writeback_active
+                        .store(false, Ordering::Release);
+                });
+            }
+        });
+    }
+
+    pub(crate) fn flush_owner_background(cache: &Arc<Self>, owner: u64) {
+        if cache.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let cache = Arc::clone(cache);
+        spawn_detached(async move {
+            if let Err(err) = cache.flush_internal_owner(owner).await {
+                println!(
+                    "volmgr: VolumeCache::flush_owner_background owner {} failed: {:?}",
+                    owner, err
+                );
+            }
+        });
     }
 
     async fn invalidate_blocks_after_flush(
@@ -1121,11 +1439,7 @@ where
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    if owner != 0 {
-                        page.mark_dirty_with_owner(owner);
-                    } else {
-                        page.mark_dirty();
-                    }
+                    self.mark_cached_page_dirty(&page, owner);
                 }
                 WriteAcquire::Direct(page) => {
                     {
@@ -1134,10 +1448,11 @@ where
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    if owner != 0 {
-                        page.mark_dirty_with_owner(owner);
+                    let epoch = self.next_write_epoch();
+                    if owner == 0 {
+                        page.mark_dirty(epoch);
                     } else {
-                        page.mark_dirty();
+                        page.mark_dirty_with_owner(owner, epoch);
                     }
                     self.direct_write_page(lba, &page).await?;
                 }
@@ -1193,7 +1508,9 @@ where
     }
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, 0).await
+        self.write_at_inner(offset, data, 0).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
+        Ok(())
     }
 
     async fn write_at_owned(
@@ -1202,7 +1519,9 @@ where
         data: &[u8],
         owner: u64,
     ) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, owner).await
+        self.write_at_inner(offset, data, owner).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
+        Ok(())
     }
 
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
@@ -1217,7 +1536,7 @@ where
         owner: u64,
     ) -> Result<(), Self::Error> {
         self.write_at_inner(offset, data, owner).await?;
-        self.flush_internal_owner(owner).await
+        self.flush_range(offset, data.len()).await
     }
 
     async fn flush(&self) -> Result<(), Self::Error> {

@@ -51,7 +51,7 @@ mod cache_traits;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const BLOCK_SIZE: usize = 1024 * 16;
-const CACHE_CAPACITY_BYTES: usize = 1024 * 1024 * 50;
+const CACHE_CAPACITY_BYTES: usize = 1024 * 1024 * 100;
 const LAZY_CACHE_PAGE_ALLOCATION: bool = false;
 const LAZY_INDEX_ALLOCATION: bool = false;
 struct CacheBackend {
@@ -507,6 +507,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
             let cfg = CacheConfig::new(CACHE_CAPACITY_BYTES / BLOCK_SIZE)
                 .with_lazy_page_allocation(LAZY_CACHE_PAGE_ALLOCATION)
                 .with_lazy_index_allocation(LAZY_INDEX_ALLOCATION);
+
             match VolCache::new(backend, cfg) {
                 Ok(cache) => {
                     pdx.cache.call_once(|| Arc::new(cache));
@@ -702,7 +703,7 @@ pub async fn vol_pdo_flush<'a, 'b>(
                 }
             }
         } else {
-            cache.flush_async().await;
+            VolCache::flush_owner_background(cache, owner);
             return DriverStep::complete(DriverStatus::Success);
         }
     }
