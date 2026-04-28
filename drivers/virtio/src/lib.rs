@@ -15,7 +15,6 @@ mod virtqueue;
 use alloc::{sync::Arc, vec, vec::Vec};
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::mem;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use kernel_api::benchmark::{
@@ -26,7 +25,7 @@ use kernel_api::irq::{
     IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
     irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -94,45 +93,56 @@ fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
 fn take_from_device_buffer<'a>(
     req: &mut RequestHandle<'a>,
     len: usize,
-) -> Result<IoBuffer<'a, Described, FromDevice>, DriverStatus> {
+) -> Result<IoBuffer<'a, PhysFramed, FromDevice>, DriverStatus> {
     let mut data = match req.data() {
         RequestDataView::FromDevice(data) => data,
         _ => return Err(DriverStatus::InvalidParameter),
     };
 
+    if let Some(buffer) = data.view::<IoBuffer<'_, PhysFramed, FromDevice>>() {
+        if buffer.len() < len {
+            return Err(DriverStatus::InsufficientResources);
+        }
+        return IoBuffer::<'a, PhysFramed, FromDevice>::new(
+            buffer.frame_offset(),
+            len,
+            buffer.physical_frames(),
+        )
+        .map_err(|_| DriverStatus::InsufficientResources);
+    }
+
     let buffer = data
-        .view_mut::<IoBuffer<'a, Described, FromDevice>>()
+        .view::<IoBuffer<'_, Described, FromDevice>>()
         .ok_or(DriverStatus::InsufficientResources)?;
     if buffer.len() < len {
         return Err(DriverStatus::InsufficientResources);
     }
 
-    let empty = IoBuffer::<Described, FromDevice>::new(unsafe {
-        core::slice::from_raw_parts_mut(buffer.as_mut_ptr(), 0)
-    });
-    Ok(mem::replace(buffer, empty))
-}
-
-fn restore_from_device_buffer<'a>(
-    req: &mut RequestHandle<'a>,
-    buffer: IoBuffer<'a, Described, FromDevice>,
-) {
-    let mut data = match req.data() {
-        RequestDataView::FromDevice(data) => data,
-        _ => panic!("virtio: read request buffer vanished before restore"),
-    };
-
-    let slot = data
-        .view_mut::<IoBuffer<'a, Described, FromDevice>>()
-        .expect("virtio: read request buffer type changed before restore");
-    *slot = buffer;
+    IoBuffer::<'a, PhysFramed, FromDevice>::new(
+        buffer.frame_offset(),
+        len,
+        buffer.physical_frames(),
+    )
+    .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 fn describe_to_device_buffer<'a>(
     req: &mut RequestHandle<'a>,
     len: usize,
-) -> Result<IoBuffer<'a, Described, ToDevice>, DriverStatus> {
+) -> Result<IoBuffer<'a, PhysFramed, ToDevice>, DriverStatus> {
     let data = req.data().read_only();
+    if let Some(buffer) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
+        if buffer.len() < len {
+            return Err(DriverStatus::InsufficientResources);
+        }
+        return IoBuffer::<'a, PhysFramed, ToDevice>::new(
+            buffer.frame_offset(),
+            len,
+            buffer.physical_frames(),
+        )
+        .map_err(|_| DriverStatus::InsufficientResources);
+    }
+
     let buffer = data
         .view::<IoBuffer<'_, Described, ToDevice>>()
         .ok_or(DriverStatus::InsufficientResources)?;
@@ -140,8 +150,12 @@ fn describe_to_device_buffer<'a>(
         return Err(DriverStatus::InsufficientResources);
     }
 
-    let slice = unsafe { core::slice::from_raw_parts(buffer.as_ptr(), len) };
-    Ok(IoBuffer::<Described, ToDevice>::new(slice))
+    IoBuffer::<'a, PhysFramed, ToDevice>::new(
+        buffer.frame_offset(),
+        len,
+        buffer.physical_frames(),
+    )
+    .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 #[cfg(not(test))]
@@ -1017,10 +1031,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         kernel_api::kernel_types::dma::DmaMappingStrategy::SingleContiguous,
     ) {
         Ok(b) => b,
-        Err((buffer, _)) => {
-            restore_from_device_buffer(req, buffer);
-            return complete_req(req, DriverStatus::InsufficientResources);
-        }
+        Err(_) => return complete_req(req, DriverStatus::InsufficientResources),
     };
 
     let completion = loop {
@@ -1096,7 +1107,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         }
     };
 
-    restore_from_device_buffer(req, kernel_api::dma::unmap_buffer(mapped_buffer));
+    let _ = kernel_api::dma::unmap_buffer(mapped_buffer);
     complete_req(req, status)
 }
 

@@ -15,7 +15,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::{Described, FromDevice, IoBuffer, ToDevice},
+        dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice},
         io::{DiskInfo, IoType},
         request::RequestData,
     },
@@ -38,6 +38,28 @@ fn panic(info: &PanicInfo) -> ! {
 
 const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
+
+fn has_from_device_buffer(
+    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::FromDevice>,
+    len: usize,
+) -> bool {
+    data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
+        .map_or(false, |b| b.len() >= len)
+        || data
+            .view::<IoBuffer<'_, Described, FromDevice>>()
+            .map_or(false, |b| b.len() >= len)
+}
+
+fn has_to_device_buffer(
+    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ToDevice>,
+    len: usize,
+) -> bool {
+    data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()
+        .map_or(false, |b| b.len() >= len)
+        || data
+            .view::<IoBuffer<'_, Described, ToDevice>>()
+            .map_or(false, |b| b.len() >= len)
+}
 
 #[repr(C)]
 struct DiskExt {
@@ -112,12 +134,10 @@ pub async fn disk_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data)
-            if data
-                .view::<IoBuffer<'_, Described, FromDevice>>()
-                .map_or(false, |b| b.len() >= total) => {}
-        RequestDataView::FromDevice(_) => {
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+        RequestDataView::FromDevice(data) => {
+            if !has_from_device_buffer(data, total) {
+                return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+            }
         }
         RequestDataView::ToDevice(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
@@ -172,14 +192,7 @@ pub async fn disk_write<'a, 'b>(
         }
     };
 
-    let buffer = match data.view::<IoBuffer<'_, Described, ToDevice>>() {
-        Some(buffer) => buffer,
-        None => {
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
-
-    if buffer.len() < total {
+    if !has_to_device_buffer(data, total) {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 

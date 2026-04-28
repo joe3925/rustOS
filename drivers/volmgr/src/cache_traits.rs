@@ -1,4 +1,5 @@
 use kernel_api::async_ffi::FfiFuture;
+use kernel_api::kernel_types::dma::{IoBuffer, PhysFramed, ToDevice};
 use kernel_api::request::RequestHandle;
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +83,7 @@ pub enum CacheError<E> {
     OffsetOverflow,
     Closed,
     NoFreePages,
+    InvalidIoBuffer,
 }
 
 impl<E: Clone> Clone for CacheError<E> {
@@ -92,6 +94,7 @@ impl<E: Clone> Clone for CacheError<E> {
             CacheError::OffsetOverflow => CacheError::OffsetOverflow,
             CacheError::Closed => CacheError::Closed,
             CacheError::NoFreePages => CacheError::NoFreePages,
+            CacheError::InvalidIoBuffer => CacheError::InvalidIoBuffer,
         }
     }
 }
@@ -115,6 +118,12 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
     fn write_request<'a>(
         &'a self,
         req: &'a mut RequestHandle<'_>,
+    ) -> FfiFuture<Result<(), Self::Error>>;
+    fn write_phys_framed<'a, 'buffer>(
+        &'a self,
+        lba: u64,
+        blocks: usize,
+        buffer: &'a IoBuffer<'buffer, PhysFramed, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>>;
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
 }

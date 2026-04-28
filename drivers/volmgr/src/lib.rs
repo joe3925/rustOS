@@ -18,7 +18,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -231,6 +231,68 @@ impl VolumeCacheBackend for CacheBackend {
         .into_ffi()
     }
 
+    fn write_phys_framed<'a, 'buffer>(
+        &'a self,
+        lba: u64,
+        blocks: usize,
+        buffer: &'a IoBuffer<'buffer, PhysFramed, ToDevice>,
+    ) -> FfiFuture<Result<(), Self::Error>> {
+        async move {
+            if blocks == 0 {
+                return Ok(());
+            }
+
+            let offset = lba
+                .checked_mul(BLOCK_SIZE as u64)
+                .ok_or(DriverStatus::InvalidParameter)?;
+            let mut total_len = 0usize;
+            let mut block_idx = 0usize;
+            while block_idx < blocks {
+                let block_lba = lba
+                    .checked_add(block_idx as u64)
+                    .ok_or(DriverStatus::InvalidParameter)?;
+                let block_len = self
+                    .block_len(block_lba)
+                    .ok_or(DriverStatus::InvalidParameter)?;
+                total_len = total_len
+                    .checked_add(block_len)
+                    .ok_or(DriverStatus::InvalidParameter)?;
+                block_idx += 1;
+            }
+
+            if buffer.len() < total_len {
+                return Err(DriverStatus::InvalidParameter);
+            }
+
+            let mut req = RequestHandle::new(
+                RequestType::Write {
+                    offset,
+                    len: total_len,
+                    flush_write_through: false,
+                    owner: 0,
+                },
+                RequestData::empty(),
+            );
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+            let status = {
+                let mut borrow = BorrowedHandle::read_only(&mut req, buffer);
+                pnp_send_request(self.target.clone(), borrow.handle()).await
+            };
+
+            if status != DriverStatus::Success {
+                println!(
+                    "volmgr: CacheBackend::write_phys_framed lower write failed at lba {} blocks {} len {}: {}",
+                    lba, blocks, total_len, status
+                );
+                return Err(status);
+            }
+
+            Ok(())
+        }
+        .into_ffi()
+    }
+
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let mut req = RequestHandle::new(
@@ -336,7 +398,10 @@ fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverSta
         }
         err => {
             println!("volmgr: {} cache error: {:?}", context, err);
-            DriverStatus::Unsuccessful
+            match err {
+                CacheError::InvalidIoBuffer => DriverStatus::InvalidParameter,
+                _ => DriverStatus::Unsuccessful,
+            }
         }
     }
 }

@@ -31,12 +31,15 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{
+    Described, FromDevice, IoBuffer, IoBufferPageFrame, PhysFramed, ToDevice,
+};
 use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
+use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 
 use dev_ext::{ControllerState, DevExt, Ports};
 
@@ -77,6 +80,110 @@ fn continue_req(req: &mut RequestHandle) -> DriverStep {
         w.status = DriverStatus::ContinueStep;
     }
     DriverStep::Continue
+}
+
+fn phys_byte_ptr(phys_addr: u64) -> *mut u8 {
+    (PHYSICAL_MEMORY_OFFSET.as_u64() + phys_addr) as *mut u8
+}
+
+struct PhysCursor<'a> {
+    frames: &'a [IoBufferPageFrame],
+    frame_idx: usize,
+    frame_offset: usize,
+    remaining: usize,
+}
+
+impl<'a> PhysCursor<'a> {
+    fn new<'buffer, D: kernel_api::kernel_types::dma::IoBufferDirection>(
+        buffer: &'a IoBuffer<'buffer, PhysFramed, D>,
+        len: usize,
+    ) -> Option<Self> {
+        if buffer.len() < len {
+            return None;
+        }
+        Some(Self {
+            frames: buffer.physical_frames(),
+            frame_idx: 0,
+            frame_offset: buffer.frame_offset(),
+            remaining: len,
+        })
+    }
+
+    fn phys_addr(&self) -> Option<u64> {
+        let frame = self.frames.get(self.frame_idx)?;
+        if self.frame_offset >= frame.byte_len as usize {
+            return None;
+        }
+        Some(frame.phys_addr + self.frame_offset as u64)
+    }
+
+    fn advance(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        let Some(frame) = self.frames.get(self.frame_idx) else {
+            return false;
+        };
+        self.remaining -= 1;
+        self.frame_offset += 1;
+        if self.frame_offset >= frame.byte_len as usize {
+            self.frame_idx += 1;
+            self.frame_offset = 0;
+        }
+        true
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let ptr = phys_byte_ptr(self.phys_addr()?) as *const u8;
+        let value = unsafe { core::ptr::read(ptr) };
+        self.advance().then_some(value)
+    }
+
+    fn write_u8(&mut self, value: u8) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        let Some(phys_addr) = self.phys_addr() else {
+            return false;
+        };
+        unsafe { core::ptr::write(phys_byte_ptr(phys_addr), value) };
+        self.advance()
+    }
+
+    fn read_u16_le(&mut self) -> Option<u16> {
+        let lo = self.read_u8()? as u16;
+        let hi = self.read_u8()? as u16;
+        Some(lo | (hi << 8))
+    }
+
+    fn write_u16_le(&mut self, value: u16) -> bool {
+        self.write_u8((value & 0xFF) as u8) && self.write_u8((value >> 8) as u8)
+    }
+}
+
+fn has_from_device_buffer(
+    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::FromDevice>,
+    len: usize,
+) -> bool {
+    data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
+        .map_or(false, |b| b.len() >= len)
+        || data
+            .view::<IoBuffer<'_, Described, FromDevice>>()
+            .map_or(false, |b| b.len() >= len)
+}
+
+fn has_to_device_buffer(
+    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ToDevice>,
+    len: usize,
+) -> bool {
+    data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()
+        .map_or(false, |b| b.len() >= len)
+        || data
+            .view::<IoBuffer<'_, Described, ToDevice>>()
+            .map_or(false, |b| b.len() >= len)
 }
 
 /// IDE interrupt service routine.
@@ -367,8 +474,11 @@ pub async fn ide_pdo_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) if data.view::<IoBuffer<'_, Described, FromDevice>>().map_or(false, |b| b.len() >= len) => {}
-        RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InsufficientResources),
+        RequestDataView::FromDevice(data) => {
+            if !has_from_device_buffer(data, len) {
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        }
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
 
@@ -380,11 +490,15 @@ pub async fn ide_pdo_read<'a, 'b>(
         RequestDataView::FromDevice(data) => data,
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     };
-    let buf = &mut data.view_mut::<IoBuffer<'_, Described, FromDevice>>()
-        .expect("read req missing buffer")
-        .as_mut_slice()[..len];
-
-    let ok = ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
+    let ok = if let Some(buf) = data.view_mut::<IoBuffer<'_, PhysFramed, FromDevice>>() {
+        ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await
+    } else {
+        let buf = &mut data
+            .view_mut::<IoBuffer<'_, Described, FromDevice>>()
+            .expect("read req missing buffer")
+            .as_mut_slice()[..len];
+        ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
+    };
     drop(ctrl);
     drop(data);
 
@@ -448,8 +562,11 @@ pub async fn ide_pdo_write<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::ToDevice(data) if data.view::<IoBuffer<'_, Described, ToDevice>>().map_or(false, |b| b.len() >= len) => {}
-        RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InsufficientResources),
+        RequestDataView::ToDevice(data) => {
+            if !has_to_device_buffer(data, len) {
+                return complete_req(req, DriverStatus::InsufficientResources);
+            }
+        }
         RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     }
 
@@ -461,11 +578,15 @@ pub async fn ide_pdo_write<'a, 'b>(
         RequestDataView::ToDevice(data) => data,
         RequestDataView::FromDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     };
-    let buf = &data.view::<IoBuffer<'_, Described, ToDevice>>()
-        .expect("write req missing buffer")
-        .as_slice()[..len];
-
-    let ok = ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await;
+    let ok = if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
+        ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await
+    } else {
+        let buf = &data
+            .view::<IoBuffer<'_, Described, ToDevice>>()
+            .expect("write req missing buffer")
+            .as_slice()[..len];
+        ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
+    };
     drop(ctrl);
     drop(data);
 
@@ -749,6 +870,67 @@ async fn ata_pio_read_async(
     true
 }
 
+async fn ata_pio_read_phys_async(
+    ctrl: &mut ControllerState,
+    irq: &Option<IrqHandle>,
+    dh: u8,
+    mut lba: u32,
+    mut sectors: u32,
+    buffer: &IoBuffer<'_, PhysFramed, FromDevice>,
+    len: usize,
+) -> bool {
+    let Some(mut out) = PhysCursor::new(buffer, len) else {
+        return false;
+    };
+    let p = &mut ctrl.ports;
+
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+            return false;
+        }
+
+        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+        unsafe { p.drive_head.write(devsel) };
+        io_wait_400ns(&mut p.control);
+
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+            return false;
+        }
+
+        unsafe {
+            p.sector_count.write(sc);
+            p.lba_lo.write((lba & 0xFF) as u8);
+            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+            p.command.write(ATA_CMD_READ_SECTORS);
+        }
+
+        for _ in 0..chunk {
+            if !wait_drq_async(p, irq, TIMEOUT_MS).await {
+                return false;
+            }
+            let st = unsafe { p.command.read() };
+            if (st & ATA_SR_DRQ) == 0 {
+                return false;
+            }
+            for _ in 0..256 {
+                let word: u16 = unsafe { p.data.read() };
+                if !out.write_u16_le(word) {
+                    return false;
+                }
+            }
+        }
+
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
+    }
+
+    true
+}
+
 async fn ata_pio_write_async(
     ctrl: &mut ControllerState,
     irq: &Option<IrqHandle>,
@@ -818,6 +1000,73 @@ async fn ata_pio_write_async(
     }
 
     // Flush cache
+    unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
+    wait_not_busy_async(p, irq, TIMEOUT_MS).await
+}
+
+async fn ata_pio_write_phys_async(
+    ctrl: &mut ControllerState,
+    irq: &Option<IrqHandle>,
+    dh: u8,
+    mut lba: u32,
+    mut sectors: u32,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    len: usize,
+) -> bool {
+    let Some(mut data) = PhysCursor::new(buffer, len) else {
+        return false;
+    };
+    let p = &mut ctrl.ports;
+
+    while sectors > 0 {
+        let chunk = core::cmp::min(sectors, 256);
+        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
+
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+            return false;
+        }
+
+        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
+        unsafe { p.drive_head.write(devsel) };
+        io_wait_400ns(&mut p.control);
+
+        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
+            return false;
+        }
+
+        unsafe {
+            p.sector_count.write(sc);
+            p.lba_lo.write((lba & 0xFF) as u8);
+            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
+            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
+            p.command.write(ATA_CMD_WRITE_SECTORS);
+        }
+
+        for sec_idx in 0..chunk {
+            if sec_idx == 0 {
+                if !wait_drq_poll_brief(p) {
+                    return false;
+                }
+            } else if !wait_drq_async(p, irq, TIMEOUT_MS).await {
+                return false;
+            }
+
+            for _ in 0..256 {
+                let Some(word) = data.read_u16_le() else {
+                    return false;
+                };
+                unsafe { p.data.write(word) };
+            }
+        }
+
+        lba = lba.wrapping_add(chunk);
+        sectors -= chunk;
+    }
+
+    if !wait_not_busy_async(p, irq, TIMEOUT_MS).await {
+        return false;
+    }
+
     unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
     wait_not_busy_async(p, irq, TIMEOUT_MS).await
 }

@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 use kernel_types::device::DeviceObject;
 pub use kernel_types::dma;
 use kernel_types::dma::{
-    Described, DmaMapError, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferDirection,
-    IoBufferInner, MappableIoBufferState,
+    DmaMapError, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferInner,
+    MappableIoBufferState,
 };
 use kernel_types::status::DriverStatus;
 
@@ -29,19 +29,19 @@ pub fn map_buffer<'a, S: MappableIoBufferState, D: IoBufferDirection>(
     device: &Arc<DeviceObject>,
     buffer: IoBuffer<'a, S, D>,
     strategy: DmaMappingStrategy,
-) -> Result<IoBuffer<'a, DmaMapped, D>, (IoBuffer<'a, S, D>, DmaMapError)> {
+) -> Result<IoBuffer<'a, DmaMapped<S>, D>, (IoBuffer<'a, S, D>, DmaMapError)> {
     let raw_buffer: IoBufferInner<'a> = buffer.into_inner();
     match unsafe { kernel_sys::kernel_dma_map_buffer(device, raw_buffer, strategy) } {
-        Ok(inner) => Ok(IoBuffer::<'a, DmaMapped, D>::from_inner(inner)),
+        Ok(inner) => Ok(IoBuffer::<'a, DmaMapped<S>, D>::from_inner(inner)),
         Err((inner, err)) => Err((IoBuffer::<'a, S, D>::from_inner(inner), err)),
     }
 }
 
-pub fn unmap_buffer<'a, D: IoBufferDirection>(
-    buffer: IoBuffer<'a, DmaMapped, D>,
-) -> IoBuffer<'a, Described, D> {
+pub fn unmap_buffer<'a, S: MappableIoBufferState, D: IoBufferDirection>(
+    buffer: IoBuffer<'a, DmaMapped<S>, D>,
+) -> IoBuffer<'a, S, D> {
     let raw_buffer: IoBufferInner<'a> = buffer.into_inner();
-    IoBuffer::<'a, Described, D>::from_inner(unsafe {
+    IoBuffer::<'a, S, D>::from_inner(unsafe {
         kernel_sys::kernel_dma_unmap_buffer(raw_buffer)
     })
 }

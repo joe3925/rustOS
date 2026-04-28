@@ -11,13 +11,22 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
-use kernel_api::kernel_types::dma::{Described, IoBuffer, ToDevice};
+use kernel_api::kernel_types::dma::{
+    Described, IOBUFFER_INLINE_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferPageFrame,
+    PhysFramed, ToDevice,
+};
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::println;
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
-use spin::{Mutex, RwLock};
+use spin::{Mutex, RwLock, RwLockReadGuard};
+
+const EMPTY_IOBUFFER_PAGE_FRAME: IoBufferPageFrame = IoBufferPageFrame {
+    phys_addr: 0,
+    byte_len: 0,
+};
+
 struct StatsInner {
     read_hits: AtomicU64,
     read_misses: AtomicU64,
@@ -75,20 +84,21 @@ impl StatsInner {
     }
 }
 
+#[repr(C, align(4096))]
 struct PageBuf<const BLOCK_SIZE: usize> {
-    bytes: Box<[u8; BLOCK_SIZE]>,
+    bytes: [u8; BLOCK_SIZE],
 }
 
 impl<const BLOCK_SIZE: usize> PageBuf<BLOCK_SIZE> {
-    fn zeroed() -> Self {
-        Self {
-            bytes: Box::new([0u8; BLOCK_SIZE]),
-        }
+    fn zeroed() -> Box<Self> {
+        Box::new(Self {
+            bytes: [0u8; BLOCK_SIZE],
+        })
     }
 }
 
 struct Page<const BLOCK_SIZE: usize> {
-    data: RwLock<PageBuf<BLOCK_SIZE>>,
+    data: RwLock<Box<PageBuf<BLOCK_SIZE>>>,
     dirty: AtomicBool,
     writeback: AtomicBool,
     generation: AtomicU64,
@@ -262,6 +272,12 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
             self.joins.reserve(target - self.joins.capacity());
         }
     }
+}
+
+struct PreparedFlushPage<const BLOCK_SIZE: usize> {
+    lba: u64,
+    page: Arc<Page<BLOCK_SIZE>>,
+    wb_generation: u64,
 }
 
 pub(crate) struct FlushJobHandle<E> {
@@ -1012,6 +1028,266 @@ where
         Ok((matched, writebacks))
     }
 
+    fn prepare_flush_page(
+        stats: &StatsInner,
+        lba: u64,
+        page: Arc<Page<BLOCK_SIZE>>,
+    ) -> Option<PreparedFlushPage<BLOCK_SIZE>> {
+        stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
+
+        if !page.dirty.load(Ordering::Acquire) {
+            stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        if page.writeback.swap(true, Ordering::AcqRel) {
+            stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        if !page.dirty.load(Ordering::Acquire) {
+            page.writeback.store(false, Ordering::Release);
+            stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+
+        let wb_generation = page.generation.load(Ordering::Acquire);
+        page.wb_generation.store(wb_generation, Ordering::Release);
+        Some(PreparedFlushPage {
+            lba,
+            page,
+            wb_generation,
+        })
+    }
+
+    fn finish_prepared_flush_pages(
+        stats: &StatsInner,
+        dirty_pages: &AtomicUsize,
+        pages: &[PreparedFlushPage<BLOCK_SIZE>],
+        success: bool,
+    ) {
+        for prepared in pages {
+            if success {
+                let cur_gen = prepared.page.generation.load(Ordering::Acquire);
+                if cur_gen == prepared.wb_generation
+                    && prepared.page.dirty.swap(false, Ordering::AcqRel)
+                {
+                    dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                }
+                stats.flush_success.fetch_add(1, Ordering::Relaxed);
+            } else if !prepared.page.dirty.swap(true, Ordering::AcqRel) {
+                dirty_pages.fetch_add(1, Ordering::AcqRel);
+            }
+            prepared.page.writeback.store(false, Ordering::Release);
+        }
+    }
+
+    fn append_described_4k_frames(
+        described: &IoBuffer<'_, Described, ToDevice>,
+        frames: &mut [IoBufferPageFrame; IOBUFFER_INLINE_FRAME_CAPACITY],
+        frame_count: &mut usize,
+    ) -> Result<(), CacheError<B::Error>> {
+        let mut remaining = described.len();
+        let mut first = true;
+
+        for source_frame in described.physical_frames() {
+            if remaining == 0 {
+                break;
+            }
+
+            let mut source_offset = if first {
+                described.frame_offset()
+            } else {
+                0
+            };
+            first = false;
+
+            if source_offset >= source_frame.byte_len as usize {
+                return Err(CacheError::InvalidIoBuffer);
+            }
+
+            let mut available = (source_frame.byte_len as usize)
+                .saturating_sub(source_offset)
+                .min(remaining);
+
+            while available != 0 {
+                if *frame_count >= IOBUFFER_INLINE_FRAME_CAPACITY {
+                    return Err(CacheError::InvalidIoBuffer);
+                }
+
+                let phys_addr = source_frame
+                    .phys_addr
+                    .checked_add(source_offset as u64)
+                    .ok_or(CacheError::InvalidIoBuffer)?;
+                if phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0 {
+                    return Err(CacheError::InvalidIoBuffer);
+                }
+
+                frames[*frame_count] = IoBufferPageFrame {
+                    phys_addr,
+                    byte_len: IOBUFFER_PAGE_SIZE as u64,
+                };
+                *frame_count += 1;
+
+                let chunk = available.min(IOBUFFER_PAGE_SIZE);
+                remaining -= chunk;
+                available -= chunk;
+                source_offset += chunk;
+            }
+        }
+
+        if remaining != 0 {
+            return Err(CacheError::InvalidIoBuffer);
+        }
+
+        Ok(())
+    }
+
+    async fn flush_prepared_run(
+        backend: &Arc<B>,
+        stats: &Arc<StatsInner>,
+        dirty_pages: &Arc<AtomicUsize>,
+        run: &[PreparedFlushPage<BLOCK_SIZE>],
+    ) -> Result<usize, CacheError<B::Error>> {
+        if run.is_empty() {
+            return Ok(0);
+        }
+
+        let mut guards: Vec<RwLockReadGuard<'_, Box<PageBuf<BLOCK_SIZE>>>> =
+            Vec::with_capacity(run.len());
+        let mut frames = [EMPTY_IOBUFFER_PAGE_FRAME; IOBUFFER_INLINE_FRAME_CAPACITY];
+        let mut frame_count = 0usize;
+        let mut write_len = 0usize;
+
+        for prepared in run {
+            let guard = prepared.page.data.read();
+            {
+                let described = IoBuffer::<Described, ToDevice>::new(&guard.bytes[..]);
+                if described.len() != BLOCK_SIZE {
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    return Err(CacheError::InvalidIoBuffer);
+                }
+
+                if let Err(err) =
+                    Self::append_described_4k_frames(&described, &mut frames, &mut frame_count)
+                {
+                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                    return Err(err);
+                }
+            }
+            write_len = write_len
+                .checked_add(BLOCK_SIZE)
+                .ok_or(CacheError::OffsetOverflow)?;
+            guards.push(guard);
+        }
+
+        let io_buf = IoBuffer::<PhysFramed, ToDevice>::new(0, write_len, &frames[..frame_count])
+            .map_err(|_| CacheError::InvalidIoBuffer)?;
+
+        let write_res = backend
+            .write_phys_framed(run[0].lba, run.len(), &io_buf)
+            .await
+            .map_err(CacheError::Backend);
+
+        drop(guards);
+
+        match write_res {
+            Ok(()) => {
+                stats
+                    .backend_writes
+                    .fetch_add(run.len() as u64, Ordering::Relaxed);
+                Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                Ok(run.len())
+            }
+            Err(err) => {
+                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                Err(err)
+            }
+        }
+    }
+
+    async fn flush_sorted_candidates_batched(
+        backend: &Arc<B>,
+        stats: &Arc<StatsInner>,
+        dirty_pages: &Arc<AtomicUsize>,
+        pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
+    ) -> Result<usize, CacheError<B::Error>> {
+        if pages.is_empty() {
+            return Ok(0);
+        }
+
+        let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
+        let max_blocks_per_buffer = if BLOCK_SIZE.is_multiple_of(IOBUFFER_PAGE_SIZE) {
+            (IOBUFFER_INLINE_FRAME_CAPACITY / frames_per_block.max(1)).max(1)
+        } else {
+            1
+        };
+        let mut run: Vec<PreparedFlushPage<BLOCK_SIZE>> =
+            Vec::with_capacity(max_blocks_per_buffer.min(pages.len()));
+        let mut writebacks = 0usize;
+
+        for (lba, page) in pages {
+            let contiguous = run
+                .last()
+                .map(|last| last.lba.checked_add(1) == Some(*lba))
+                .unwrap_or(true);
+            if !contiguous || run.len() >= max_blocks_per_buffer {
+                writebacks += Self::flush_prepared_run(backend, stats, dirty_pages, &run).await?;
+                run.clear();
+            }
+
+            if let Some(prepared) = Self::prepare_flush_page(stats, *lba, Arc::clone(page)) {
+                run.push(prepared);
+            } else if !run.is_empty() {
+                writebacks += Self::flush_prepared_run(backend, stats, dirty_pages, &run).await?;
+                run.clear();
+            }
+        }
+
+        writebacks += Self::flush_prepared_run(backend, stats, dirty_pages, &run).await?;
+        Ok(writebacks)
+    }
+
+    async fn flush_filtered_batched(
+        &self,
+        filter: &FlushFilter<'_>,
+    ) -> Result<(usize, usize), CacheError<B::Error>> {
+        let mut batch = {
+            let mut scratch = self.flush_scratch.lock();
+            scratch.reset();
+            core::mem::take(&mut scratch.batch)
+        };
+
+        let mut shard_idx = 0usize;
+        while shard_idx < self.shards.len() {
+            let shard = self.shards[shard_idx].lock();
+            shard.index.for_each(|lba, page| {
+                if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+                    batch.push((lba, Arc::clone(page)));
+                }
+            });
+            shard_idx += 1;
+        }
+
+        batch.sort_unstable_by_key(|(lba, _)| *lba);
+        let matched = batch.len();
+        let writebacks = Self::flush_sorted_candidates_batched(
+            &self.backend,
+            &self.stats,
+            &self.dirty_pages,
+            &batch,
+        )
+        .await?;
+
+        {
+            let mut scratch = self.flush_scratch.lock();
+            scratch.batch = batch;
+            scratch.reset();
+        }
+
+        Ok((matched, writebacks))
+    }
+
     async fn has_dirty_pages_filtered(&self, filter: &FlushFilter<'_>) -> bool {
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
@@ -1098,17 +1374,7 @@ where
         force_device_flush: bool,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
         self.check_open()?;
-        let mut shard_idx = 0usize;
-        let mut matched = 0usize;
-        let mut writebacks = 0usize;
-        while shard_idx < self.shards.len() {
-            let (shard_matched, shard_writebacks) = self
-                .flush_shard_streaming(shard_idx, filter, self.cfg.flush_parallelism)
-                .await?;
-            matched += shard_matched;
-            writebacks += shard_writebacks;
-            shard_idx += 1;
-        }
+        let (matched, writebacks) = self.flush_filtered_batched(filter).await?;
 
         if force_device_flush || writebacks != 0 {
             self.backend
