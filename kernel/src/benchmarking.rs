@@ -3083,15 +3083,21 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn print_level_table_row(mode: &str, lvl: &BenchLevelResult, tsc_hz: u64) {
+fn print_level_table_row(mode: &str, lvl: &BenchLevelResult, request_size: u32, tsc_hz: u64) {
     let tsc_hz_f = tsc_hz as f64;
     let avg_ms = (lvl.avg_cycles as f64 / tsc_hz_f) * 1000.0;
     let p50_ms = (lvl.p50_cycles as f64 / tsc_hz_f) * 1000.0;
     let p99_ms = (lvl.p99_cycles as f64 / tsc_hz_f) * 1000.0;
-    let p999_ms = (lvl.p999_cycles as f64 / tsc_hz_f) * 1000.0;
     let min_ms = (lvl.min_cycles as f64 / tsc_hz_f) * 1000.0;
     let max_ms = (lvl.max_cycles as f64 / tsc_hz_f) * 1000.0;
     let total_ms = (lvl.total_time_cycles as f64 / tsc_hz_f) * 1000.0;
+    let throughput_mib_s = if lvl.total_time_cycles != 0 {
+        let bytes = lvl.request_count as f64 * request_size as f64;
+        let secs = lvl.total_time_cycles as f64 / tsc_hz_f;
+        (bytes / (1024.0 * 1024.0)) / secs
+    } else {
+        0.0
+    };
 
     let wait_pct = lvl.idle_pct;
 
@@ -3104,7 +3110,7 @@ fn print_level_table_row(mode: &str, lvl: &BenchLevelResult, tsc_hz: u64) {
         avg_ms,
         p50_ms,
         p99_ms,
-        p999_ms,
+        throughput_mib_s,
         min_ms,
         max_ms,
         wait_pct,
@@ -3147,20 +3153,30 @@ fn print_bench_result_table(res: &BenchRunResult) {
         if both.msix_enabled != 0 { "Yes" } else { "No" }
     );
     println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
-    println!("| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) | P999(ms) |  Min(ms) |  Max(ms) |  Wait%  |");
+    println!("| Mode | Inflight |   Requests |  Total(ms) |  Avg(ms) |  P50(ms) |  P99(ms) |    MiB/s |  Min(ms) |  Max(ms) |  Wait%  |");
     println!("+------+----------+------------+------------+----------+----------+----------+----------+----------+----------+---------+");
 
     let irq_used = both.irq.used as usize;
     let mut i = 0usize;
     while i < irq_used && i < both.irq.levels.len() {
-        print_level_table_row("IRQ", &both.irq.levels[i], res.tsc_hz);
+        print_level_table_row(
+            "IRQ",
+            &both.irq.levels[i],
+            both.params_used.request_size,
+            res.tsc_hz,
+        );
         i += 1;
     }
 
     let poll_used = both.poll.used as usize;
     i = 0;
     while i < poll_used && i < both.poll.levels.len() {
-        print_level_table_row("POLL", &both.poll.levels[i], res.tsc_hz);
+        print_level_table_row(
+            "POLL",
+            &both.poll.levels[i],
+            both.params_used.request_size,
+            res.tsc_hz,
+        );
         i += 1;
     }
 
@@ -3242,10 +3258,10 @@ pub async fn run_virtio_bench_matrix() {
 }
 pub async fn run_virtio_bench_matrix_print() {
     let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
-    let total_bytes_list: [u64; 1] = [1 * 1024 * 1024 * 1024];
+    let total_bytes_list: [u64; 1] = [32 * 1024 * 1024];
 
     let request_size_list: [u32; _] = [
-        // 4 * 1024,
+        //4 * 1024,
         // 8 * 1024,
         // 16 * 1024,
         64 * 1024,
