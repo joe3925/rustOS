@@ -6,14 +6,16 @@
     "program": "$ZED_WORKTREE_ROOT/target/debug/kernel.efi",
     "cwd": "$ZED_WORKTREE_ROOT",
     "build": {
-      "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 3 -gdb 'tcp::1234' -device amd-iommu,dma-remap=on -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on' }",
+      // If you choose to use this config do not use a dynamic vhdx, these are broken on qemu and cause qemu to crash after it grows 1 - 10 gb.
+      // TODO: maybe add an issue on qemu about this
+      "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd ../os }; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64w.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine 'q35,accel=tcg' -smp 3 -S -gdb 'tcp::1234' -device amd-iommu,dma-remap=on -drive 'if=pflash,format=raw,readonly=on,file=C:/Program Files/qemu/OVMF_X64.fd' -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on' }",
     },
     "initCommands": [
       "settings set target.debug-file-search-paths \"drivers/target/x86_64-rustos-driver/debug/deps\"",
     ],
     "processCreateCommands": ["gdb-remote localhost:1234"],
     "postRunCommands": [
-      "target modules load --file kernel.efi .text 0xFFfFF850000001000",
+      "target modules load --file kernel.efi .text 0xFFFF850000001000",
 
       // "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/acpi.dll\"",
       // "target modules load --file \"acpi.dll\" .text 0xffff900007019000",

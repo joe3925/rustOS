@@ -12,7 +12,7 @@ use kernel_api::{
     status::DriverStatus,
 };
 
-use crate::volume::VolCtrlDevExt;
+use crate::volume::{METADATA_OWNER_ID, VolCtrlDevExt};
 
 pub struct BlockDev {
     volume: IoTarget,
@@ -23,7 +23,7 @@ pub struct BlockDev {
     req: RequestHandle<'static>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
-    /// Current file owner tag — set before FS writes, read by prep_write_req.
+    /// Current owner tag — set once per FS op, read by prep_write_req.
     pub(crate) current_owner: Arc<AtomicU64>,
 }
 
@@ -194,6 +194,8 @@ impl Write for BlockDev {
     }
 }
 pub fn flush(vdx: &VolCtrlDevExt) {
+    vdx.pending_flush_owner
+        .store(METADATA_OWNER_ID, Ordering::SeqCst);
     vdx.pending_flush_block.store(false, Ordering::SeqCst);
     vdx.should_flush.store(true, Ordering::SeqCst);
 }
