@@ -46,9 +46,9 @@ use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
-    IoBufferDmaSegment, IoBufferInner, IOBUFFER_INLINE_PAGE_CAPACITY,
-    IOBUFFER_INLINE_SEGMENT_CAPACITY, IOBUFFER_PAGE_SIZE, DMA_IOMMU_VENDOR_AMD_IVRS,
-    DMA_IOMMU_VENDOR_INTEL_DMAR, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
+    IoBufferDmaSegment, IoBufferInner, DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
+    DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, IOBUFFER_INLINE_PAGE_CAPACITY,
+    IOBUFFER_INLINE_SEGMENT_CAPACITY, IOBUFFER_PAGE_SIZE,
 };
 use kernel_types::status::DriverStatus;
 use raw_cpuid::CpuId;
@@ -127,9 +127,12 @@ pub fn map_buffer<'a>(
         return Err((buffer, DmaMapError::InvalidSize));
     }
     if page_count > IOBUFFER_INLINE_PAGE_CAPACITY {
-        return Err((buffer, DmaMapError::PageCapacityExceeded {
-            required: page_count,
-        }));
+        return Err((
+            buffer,
+            DmaMapError::PageCapacityExceeded {
+                required: page_count,
+            },
+        ));
     }
 
     let page_base = buffer.page_base_address();
@@ -150,9 +153,12 @@ pub fn map_buffer<'a>(
         }
     }
     if buffer.set_page_frames_len(page_count).is_err() {
-        return Err((buffer, DmaMapError::PageCapacityExceeded {
-            required: page_count,
-        }));
+        return Err((
+            buffer,
+            DmaMapError::PageCapacityExceeded {
+                required: page_count,
+            },
+        ));
     }
 
     let mut rec_a: Option<MappingRecord> = None;
@@ -233,9 +239,7 @@ pub fn map_buffer<'a>(
                 return Err((buffer, DmaMapError::InvalidSize));
             }
             if (chunk_size % IOBUFFER_PAGE_SIZE) != 0 {
-                return Err((buffer, DmaMapError::ChunkSizeNotPageAligned {
-                    chunk_size,
-                }));
+                return Err((buffer, DmaMapError::ChunkSizeNotPageAligned { chunk_size }));
             }
             if (buffer_len % chunk_size) != 0 {
                 return Err((
@@ -388,7 +392,11 @@ fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
     }
 }
 
-fn map_phys_pages(domain: &IommuDomain, iova_base: u64, phys_pages: &[u64]) -> Result<(), DmaMapError> {
+fn map_phys_pages(
+    domain: &IommuDomain,
+    iova_base: u64,
+    phys_pages: &[u64],
+) -> Result<(), DmaMapError> {
     if phys_pages.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
         return Err(DmaMapError::PageCapacityExceeded {
             required: phys_pages.len(),
@@ -404,11 +412,18 @@ fn map_phys_pages(domain: &IommuDomain, iova_base: u64, phys_pages: &[u64]) -> R
 fn unmap_record(domain: &IommuDomain, rec: MappingRecord) {
     iommu::unmap_pages(domain, rec.iova_base, rec.page_count);
     if !rec.is_identity {
-        domain.free_iova(rec.iova_base, rec.page_count as u64 * IOBUFFER_PAGE_SIZE as u64);
+        domain.free_iova(
+            rec.iova_base,
+            rec.page_count as u64 * IOBUFFER_PAGE_SIZE as u64,
+        );
     }
 }
 
-fn rollback_mappings(domain: &IommuDomain, rec_a: Option<MappingRecord>, rec_b: Option<MappingRecord>) {
+fn rollback_mappings(
+    domain: &IommuDomain,
+    rec_a: Option<MappingRecord>,
+    rec_b: Option<MappingRecord>,
+) {
     if let Some(rec_a) = rec_a {
         unmap_record(domain, rec_a);
     }

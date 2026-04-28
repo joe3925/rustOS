@@ -143,10 +143,7 @@ impl AmdViBackend {
         })
     }
 
-    pub fn create_domain(
-        &self,
-        identity: DmaPciDeviceIdentity,
-    ) -> Result<IommuDomain, IommuError> {
+    pub fn create_domain(&self, identity: DmaPciDeviceIdentity) -> Result<IommuDomain, IommuError> {
         let (unit_index, domain_id, iova_end) = {
             let mut inner = self.inner.lock();
             let unit_index = inner.select_unit_index(identity.segment, identity.requester_id)?;
@@ -180,8 +177,8 @@ impl AmdViBackend {
             return Err(IommuError::HardwareError);
         }
 
-        let dte_requester_id = resolve_requester_id_alias(unit, domain.requester_id)
-            .ok_or(IommuError::Unsupported)?;
+        let dte_requester_id =
+            resolve_requester_id_alias(unit, domain.requester_id).ok_or(IommuError::Unsupported)?;
         write_dte(unit.dev_table_va, dte_requester_id, domain);
         let commands = [
             invalidate_dte_cmd(dte_requester_id),

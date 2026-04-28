@@ -156,10 +156,7 @@ impl IntelVtdBackend {
         })
     }
 
-    pub fn create_domain(
-        &self,
-        identity: DmaPciDeviceIdentity,
-    ) -> Result<IommuDomain, IommuError> {
+    pub fn create_domain(&self, identity: DmaPciDeviceIdentity) -> Result<IommuDomain, IommuError> {
         let (unit_index, domain_id, iova_end) = {
             let mut inner = self.inner.lock();
             let unit_index = inner.select_unit_index(identity)?;

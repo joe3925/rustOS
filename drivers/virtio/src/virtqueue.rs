@@ -50,18 +50,14 @@ fn align_up(v: u64, align: u64) -> u64 {
 impl Virtqueue {
     /// Allocate and initialise a split virtqueue.
     /// Writes the physical addresses into the device via common_cfg.
-    pub fn new(
-        queue_idx: u16,
-        common_cfg: VirtAddr,
-        device: &Arc<DeviceObject>,
-    ) -> Option<Self> {
+    pub fn new(queue_idx: u16, common_cfg: VirtAddr, device: &Arc<DeviceObject>) -> Option<Self> {
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SELECT, queue_idx) };
 
         let max_size = unsafe { pci::common_read_u16(common_cfg, pci::COMMON_QUEUE_SIZE) };
         if max_size == 0 {
             return None;
         }
-        let size = max_size;
+        let size = max_size.min(crate::completion::MAX_COMPLETION_SLOTS as u16);
         unsafe { pci::common_write_u16(common_cfg, pci::COMMON_QUEUE_SIZE, size) };
 
         let desc_bytes = align_up(size as u64 * 16, 4096);

@@ -31,8 +31,8 @@ const PAGE_SIZE: usize = 4096;
 pub(crate) fn alloc_zeroed_pages(num_pages: usize) -> Result<VirtAddr, IommuError> {
     let size = (num_pages * PAGE_SIZE) as u64;
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-    let va = allocate_auto_kernel_range_mapped(size, flags)
-        .map_err(|_| IommuError::NoBackingFrame)?;
+    let va =
+        allocate_auto_kernel_range_mapped(size, flags).map_err(|_| IommuError::NoBackingFrame)?;
     unsafe {
         core::ptr::write_bytes(va.as_mut_ptr::<u8>(), 0, size as usize);
     }

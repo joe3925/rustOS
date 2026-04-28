@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod blk;
+mod completion;
 mod dev_ext;
 mod dma_region;
 mod pci;
@@ -325,7 +326,10 @@ async fn virtio_pnp_start<'a, 'b>(
     let init_result = match blk::init_device(caps.common_cfg, caps.device_cfg) {
         Ok(r) => r,
         Err(message) => {
-            println!("virtio-blk: device init / feature negotiation failed: {}", message);
+            println!(
+                "virtio-blk: device init / feature negotiation failed: {}",
+                message
+            );
             for &(_idx, va, sz) in &mapped_bars {
                 let _ = unmap_mmio_region(va, sz);
             }
@@ -545,10 +549,41 @@ async fn virtio_pnp_start<'a, 'b>(
 
         let max_request_bytes = ((max_data_segments * 4096) & !511).max(512) as u32;
 
-        let completion_slots = (0..vq_capacity)
-            .map(|_| spin::Mutex::new(None))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let completion_slots = match completion::CompletionTable::new(vq_capacity) {
+            Some(slots) => slots,
+            None => {
+                println!(
+                    "virtio-blk: failed to create completion slots for queue {} with size {}",
+                    i, vq.size
+                );
+
+                for qs in queue_states.iter() {
+                    if let Some(h) = unsafe { &*qs.irq_handle.get() } {
+                        h.unregister();
+                    }
+                    if let Some(vec) = qs.msix_vector {
+                        let _ = irq_free_vector(vec);
+                    }
+                    qs.queue
+                        .try_write()
+                        .expect("queue not locked during cleanup")
+                        .destroy();
+                }
+                vq.destroy();
+                for mut remaining_vq in virtqueue_iter.by_ref() {
+                    remaining_vq.destroy();
+                }
+                for &(_idx, va, sz) in &mapped_bars {
+                    let _ = unmap_mmio_region(va, sz);
+                }
+                return complete_req(
+                    req,
+                    virtio_device_error(alloc::format!(
+                        "virtio-blk: failed to create completion slots for queue {i}"
+                    )),
+                );
+            }
+        };
 
         queue_states.push(QueueState {
             queue: RwLock::new(vq),
@@ -675,11 +710,8 @@ async fn virtio_pnp_remove<'a, 'b>(
                 // before unmapping the queue's DMA memory.
                 qs.queue.write().destroy();
 
-                // Drop all pending completion senders so that in-flight submitters
-                // blocked on rx.await get Err(Canceled) instead of hanging forever.
-                for slot in qs.completion_slots.iter() {
-                    slot.lock().take();
-                }
+                // Cancel pending completions so in-flight submitters do not hang.
+                qs.completion_slots.cancel_all();
             }
 
             {
@@ -810,9 +842,7 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
         core::sync::atomic::fence(Ordering::Acquire);
         let status = qs.arena.get_status(head);
         vq.free_chain(head);
-        if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
-            let _ = tx.send(status);
-        } else {
+        if !qs.completion_slots.complete_head(head, status) {
             panic!("virtio: completed descriptor had no waiter");
         }
         drained += 1;
@@ -823,7 +853,7 @@ pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
 /// Drain loop run as one background task per queue.
 /// Waits for an IRQ, drains the entire used ring under the write lock,
 /// frees descriptor chains, and delivers completion results via the per-head
-/// oneshot slots. Exits when the IRQ handle is closed (device removal).
+/// completion slots. Exits when the IRQ handle is closed (device removal).
 async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle: IrqHandle) {
     let meta = IrqMeta {
         tag: 0,
@@ -993,10 +1023,29 @@ pub async fn virtio_pdo_read<'a, 'b>(
         }
     };
 
-    let mut submitted_head = None;
-    loop {
-        let (tx, rx) = futures_channel::oneshot::channel::<u8>();
-        let head_opt = {
+    let completion = loop {
+        let completion = match qs.completion_slots.alloc() {
+            Some(completion) => completion,
+            None => {
+                let drained = drain_queue_completions(qs);
+                if drained == 0 {
+                    let mut done = false;
+                    core::future::poll_fn(|cx| {
+                        if done {
+                            core::task::Poll::Ready(())
+                        } else {
+                            done = true;
+                            cx.waker().wake_by_ref();
+                            core::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                continue;
+            }
+        };
+        let mut completion = Some(completion);
+        let submitted = {
             let mut vq = qs.queue.write();
             let segments = mapped_buffer.dma_segments();
             match qs
@@ -1004,7 +1053,8 @@ pub async fn virtio_pdo_read<'a, 'b>(
                 .submit_request(&mut vq, VIRTIO_BLK_T_IN, sector, segments, false)
             {
                 Some(h) => {
-                    *qs.completion_slots[h as usize].lock() = Some(tx);
+                    qs.completion_slots
+                        .attach(h, completion.as_ref().expect("completion missing"));
                     let queue_full = vq.num_free == 0;
                     let _submit_guard = SubmitTasksGuard::new(
                         &qs.submitting_tasks,
@@ -1013,18 +1063,17 @@ pub async fn virtio_pdo_read<'a, 'b>(
                         inner.notify_off_multiplier,
                         queue_full,
                     );
-                    Some(h)
+                    true
                 }
                 None => {
                     vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                    None
+                    false
                 }
             }
         };
 
-        if let Some(h) = head_opt {
-            submitted_head = Some((h, rx));
-            break;
+        if submitted {
+            break completion.take().expect("completion missing");
         }
 
         let mut done = false;
@@ -1038,14 +1087,13 @@ pub async fn virtio_pdo_read<'a, 'b>(
             }
         })
         .await;
-    }
+    };
 
-    let (_, rx) = submitted_head.unwrap();
-    let status = match rx.await {
+    let status = match completion.await {
         Ok(device_status) => blk_status_to_driver_status("read", device_status),
-        Err(_) => virtio_device_error(
-            "virtio-blk: read failed: completion channel closed before device status",
-        ),
+        Err(_) => {
+            virtio_device_error("virtio-blk: read failed: completion canceled before device status")
+        }
     };
 
     restore_from_device_buffer(req, kernel_api::dma::unmap_buffer(mapped_buffer));
@@ -1099,10 +1147,29 @@ pub async fn virtio_pdo_write<'a, 'b>(
         Err(_) => return complete_req(req, DriverStatus::InsufficientResources),
     };
 
-    let mut submitted_head = None;
-    loop {
-        let (tx, rx) = futures_channel::oneshot::channel::<u8>();
-        let head_opt = {
+    let completion = loop {
+        let completion = match qs.completion_slots.alloc() {
+            Some(completion) => completion,
+            None => {
+                let drained = drain_queue_completions(qs);
+                if drained == 0 {
+                    let mut done = false;
+                    core::future::poll_fn(|cx| {
+                        if done {
+                            core::task::Poll::Ready(())
+                        } else {
+                            done = true;
+                            cx.waker().wake_by_ref();
+                            core::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                continue;
+            }
+        };
+        let mut completion = Some(completion);
+        let submitted = {
             let mut vq = qs.queue.write();
             let segments = mapped_buffer.dma_segments();
             match qs
@@ -1110,7 +1177,8 @@ pub async fn virtio_pdo_write<'a, 'b>(
                 .submit_request(&mut vq, VIRTIO_BLK_T_OUT, sector, segments, true)
             {
                 Some(h) => {
-                    *qs.completion_slots[h as usize].lock() = Some(tx);
+                    qs.completion_slots
+                        .attach(h, completion.as_ref().expect("completion missing"));
                     let queue_full = vq.num_free == 0;
                     let _submit_guard = SubmitTasksGuard::new(
                         &qs.submitting_tasks,
@@ -1119,18 +1187,17 @@ pub async fn virtio_pdo_write<'a, 'b>(
                         inner.notify_off_multiplier,
                         queue_full,
                     );
-                    Some(h)
+                    true
                 }
                 None => {
                     vq.notify(inner.notify_base, inner.notify_off_multiplier);
-                    None
+                    false
                 }
             }
         };
 
-        if let Some(h) = head_opt {
-            submitted_head = Some((h, rx));
-            break;
+        if submitted {
+            break completion.take().expect("completion missing");
         }
 
         let mut done = false;
@@ -1144,13 +1211,12 @@ pub async fn virtio_pdo_write<'a, 'b>(
             }
         })
         .await;
-    }
+    };
 
-    let (_, rx) = submitted_head.unwrap();
-    let status = match rx.await {
+    let status = match completion.await {
         Ok(device_status) => blk_status_to_driver_status("write", device_status),
         Err(_) => virtio_device_error(
-            "virtio-blk: write failed: completion channel closed before device status",
+            "virtio-blk: write failed: completion canceled before device status",
         ),
     };
 

@@ -217,17 +217,24 @@ impl File {
         }
     }
 
-    pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
+    pub async fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<usize, FileStatus> {
         let (wr, st) = file_provider::provider()
-            .write_at(self.fs_file_id, 0, data, self.write_through)
+            .write_at(self.fs_file_id, offset, data, self.write_through)
             .await;
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match wr.error {
-            None => Ok(()),
+            None => {
+                self.size = self.size.max(offset.saturating_add(wr.written as u64));
+                Ok(wr.written)
+            }
             Some(e) => Err(e),
         }
+    }
+
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), FileStatus> {
+        self.write_at(0, data).await.map(|_| ())
     }
 
     pub async fn move_no_copy(&self, dst: &Path) -> Result<(), FileStatus> {
@@ -404,9 +411,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     spawn_blocking(|| {
         spawn_detached(async move {
-            bench_c_drive_io_async().await;
-            bench_c_drive_io_async().await;
-
+            loop {
+                bench_c_drive_io_async().await;
+            }
             // bench_async_vs_sync_call_latency_async().await;
             //run_virtio_bench_matrix_print().await;
             //trigger_triple_fault();

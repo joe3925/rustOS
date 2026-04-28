@@ -26,7 +26,7 @@ use kernel_api::{
 };
 
 use crate::block_dev::BlockDev;
-use crate::volume::{VolCtrlDevExt, fs_op_dispatch};
+use crate::volume::{FIRST_FILE_OWNER_ID, METADATA_OWNER_ID, VolCtrlDevExt, fs_op_dispatch};
 use log::{Level, Metadata, Record};
 
 struct KernelLogger;
@@ -134,7 +134,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                     let target_clone = volume_fdo.clone();
                     let should_flush = Arc::new(AtomicBool::new(false));
                     let should_flush_blk = should_flush.clone();
-                    let current_owner = Arc::new(AtomicU64::new(0));
+                    let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
                     let current_owner_blk = current_owner.clone();
 
                     let result = spawn_blocking(move || {
@@ -158,7 +158,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
                             let ext = VolCtrlDevExt {
                                 fs: Arc::new(Mutex::new(fs)),
-                                next_id: AtomicU64::new(1),
+                                next_id: AtomicU64::new(FIRST_FILE_OWNER_ID),
                                 table: RwLock::new(BTreeMap::new()),
                                 volume_target: volume_fdo.clone(),
                                 should_flush,

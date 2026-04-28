@@ -465,7 +465,12 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn read_at_sync(&self, file_id: u64, offset: u64, buf: &mut [u8]) -> (FsReadResult, DriverStatus) {
+    fn read_at_sync(
+        &self,
+        file_id: u64,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> (FsReadResult, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {

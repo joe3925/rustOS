@@ -40,8 +40,13 @@ type TP = NullTimeProvider;
 type OCC = LossyOemCpConverter;
 
 type Fs = FatFsT<FatDev, TP, OCC>;
+type FatFile<'a> = fatfs::File<'a, FatDev, TP, OCC>;
 type FatDir<'a> = FatDirT<'a, FatDev, TP, OCC>;
 type FsError = FatError<<FatDev as IoBase>::Error>;
+
+pub(crate) const METADATA_OWNER_ID: u64 = 1;
+pub(crate) const FIRST_FILE_OWNER_ID: u64 = METADATA_OWNER_ID + 1;
+const SET_LEN_ZERO_CHUNK: usize = 64 * 1024;
 
 #[repr(C)]
 pub struct VolCtrlDevExt {
@@ -50,11 +55,11 @@ pub struct VolCtrlDevExt {
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
     pub should_flush: Arc<AtomicBool>,
-    /// Owner tag of the file that requested the pending flush (0 = flush all dirty).
+    /// Owner tag of the requested pending flush (0 = no targeted owner pending).
     pub pending_flush_owner: Arc<AtomicU64>,
     /// Whether the pending flush must block until the cache confirms writeback.
     pub pending_flush_block: Arc<AtomicBool>,
-    /// Current file owner tag — shared with BlockDev, set before FS writes.
+    /// Current owner tag — shared with BlockDev, set once before each FS op.
     pub current_owner: Arc<AtomicU64>,
 }
 
@@ -110,6 +115,95 @@ fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
     file.seek(SeekFrom::End(0))
 }
 
+fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
+    let old_size = file.seek(SeekFrom::End(0))?;
+    if new_size <= old_size {
+        file.seek(SeekFrom::Start(new_size))?;
+        file.truncate()?;
+    } else {
+        let zeros = vec![0u8; SET_LEN_ZERO_CHUNK];
+        let mut remaining = new_size - old_size;
+        while remaining != 0 {
+            let take = remaining.min(zeros.len() as u64) as usize;
+            file.write_all(&zeros[..take])?;
+            remaining -= take as u64;
+        }
+    }
+    file.flush()?;
+    Ok(())
+}
+
+fn next_file_id(vdx: &VolCtrlDevExt) -> u64 {
+    loop {
+        let id = vdx.next_id.fetch_add(1, Ordering::AcqRel);
+        if id >= FIRST_FILE_OWNER_ID {
+            return id;
+        }
+    }
+}
+
+fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_>) -> Result<u64, DriverStatus> {
+    match op {
+        FsOp::Open | FsOp::Create | FsOp::ReadDir | FsOp::SetInfo | FsOp::Delete | FsOp::Rename => {
+            Ok(METADATA_OWNER_ID)
+        }
+        FsOp::Close => req
+            .data()
+            .read_only()
+            .view::<FsCloseParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::Read => req
+            .data()
+            .read_only()
+            .view::<FsReadParams<'_>>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::Write => req
+            .data()
+            .read_only()
+            .view::<FsWriteParams<'_>>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::Flush => req
+            .data()
+            .read_only()
+            .view::<FsFlushParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::Seek => req
+            .data()
+            .read_only()
+            .view::<FsSeekParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::GetInfo => req
+            .data()
+            .read_only()
+            .view::<FsGetInfoParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::SetLen => req
+            .data()
+            .read_only()
+            .view::<FsSetLenParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::Append => req
+            .data()
+            .read_only()
+            .view::<FsAppendParams<'_>>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+        FsOp::ZeroRange => req
+            .data()
+            .read_only()
+            .view::<FsZeroRangeParams>()
+            .map(|p| p.fs_file_id)
+            .ok_or(DriverStatus::InvalidParameter),
+    }
+}
+
 fn execute_fs_work(
     dev: &Arc<DeviceObject>,
     fs_arc: &Arc<Mutex<Fs>>,
@@ -124,9 +218,13 @@ fn execute_fs_work(
         _ => return DriverStatus::InvalidParameter,
     };
 
-    match op {
-        FsOp::Seek => return DriverStatus::InvalidParameter, // handled in dispatcher
+    let owner = match current_owner_for_op(op, req) {
+        Ok(owner) => owner,
+        Err(status) => return status,
+    };
+    vdx.current_owner.store(owner, Ordering::Release);
 
+    match op {
         FsOp::Open => {
             let (path, flags, write_through) = {
                 let data = req.data().read_only();
@@ -156,7 +254,7 @@ fn execute_fs_work(
             };
             let result = match open_res {
                 Ok((is_dir, size)) => {
-                    let id = vdx.next_id.fetch_add(1, Ordering::AcqRel).max(1);
+                    let id = next_file_id(&vdx);
                     {
                         let mut tbl = vdx.table.write();
                         tbl.insert(
@@ -285,7 +383,6 @@ fn execute_fs_work(
             // BorrowedHandle drops after spawn_blocking returns.
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
-            vdx.current_owner.store(fs_file_id, Ordering::Release);
             let write_res: Result<usize, FileStatus> = {
                 let tbl = vdx.table.read();
                 match tbl.get(&fs_file_id) {
@@ -312,7 +409,6 @@ fn execute_fs_work(
                     },
                 }
             };
-            vdx.current_owner.store(0, Ordering::Release);
 
             if let Ok(written) = write_res {
                 let mut tbl = vdx.table.write();
@@ -348,7 +444,6 @@ fn execute_fs_work(
                 };
                 p.fs_file_id
             };
-            vdx.current_owner.store(fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&fs_file_id) {
@@ -360,7 +455,6 @@ fn execute_fs_work(
                     },
                 }
             };
-            vdx.current_owner.store(0, Ordering::Release);
             flush_owner_blocking(&vdx, fs_file_id);
             req.write().set_data_t(FsFlushResult { error: err });
             DriverStatus::Success
@@ -475,17 +569,16 @@ fn execute_fs_work(
                     None => Some(FileStatus::PathNotFound),
                     Some(ctx) if ctx.is_dir => Some(FileStatus::AccessDenied),
                     Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
-                        Ok(mut file) => match file.seek(SeekFrom::Start(new_size)) {
-                            Ok(_) => match file.truncate() {
-                                Ok(()) => None,
-                                Err(e) => Some(map_fatfs_err(&e)),
-                            },
-                            Err(e) => Some(map_fatfs_err(&e)),
-                        },
+                        Ok(mut file) => resize_file(&mut file, new_size)
+                            .err()
+                            .map(|e| map_fatfs_err(&e)),
                         Err(e) => Some(map_fatfs_err(&e)),
                     },
                 }
             };
+            if err.is_none() {
+                flush_owner_blocking(&vdx, fs_file_id);
+            }
             if err.is_none() {
                 let mut tbl = vdx.table.write();
                 if let Some(ctx) = tbl.get_mut(&fs_file_id) {
@@ -512,7 +605,6 @@ fn execute_fs_work(
             // BorrowedHandle drops after spawn_blocking returns.
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
-            vdx.current_owner.store(fs_file_id, Ordering::Release);
             let result: Result<(usize, u64), FileStatus> = {
                 let tbl = vdx.table.read();
                 match tbl.get(&fs_file_id) {
@@ -541,7 +633,6 @@ fn execute_fs_work(
                     },
                 }
             };
-            vdx.current_owner.store(0, Ordering::Release);
 
             if let Ok((_, new_size)) = result {
                 let mut tbl = vdx.table.write();
@@ -576,7 +667,6 @@ fn execute_fs_work(
                 };
                 (p.fs_file_id, p.offset, p.len)
             };
-            vdx.current_owner.store(fs_file_id, Ordering::Release);
             let err = {
                 let tbl = vdx.table.read();
                 match tbl.get(&fs_file_id) {
@@ -614,10 +704,11 @@ fn execute_fs_work(
                     },
                 }
             };
-            vdx.current_owner.store(0, Ordering::Release);
             req.write().set_data_t(FsZeroRangeResult { error: err });
             DriverStatus::Success
         }
+
+        FsOp::Seek => handle_seek_fast(dev, req),
 
         FsOp::SetInfo | FsOp::Delete => DriverStatus::NotImplemented,
     }
@@ -662,17 +753,6 @@ fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> Dri
     DriverStatus::Success
 }
 
-async fn send_flush_dirty(volume_target: IoTarget) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(
-        RequestType::FlushDirty {
-            should_block: false,
-        },
-        RequestData::empty(),
-    );
-    flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    pnp_send_request(volume_target, &mut flush_req).await
-}
-
 async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
     let mut flush_req = RequestHandle::new(
         RequestType::FlushOwner {
@@ -687,12 +767,14 @@ async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: boo
 
 #[request_handler]
 pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStep {
-    // Seek is fast-path: no FS lock needed, no thread spawn, no Arc clones.
+    // Seek is fast-path: no FS lock, no owner tagging, no metadata flush.
     if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         let status = handle_seek_fast(dev, req);
         req.write().status = status.clone();
         return DriverStep::complete(status);
     }
+    let flush_metadata_after_op =
+        matches!(req.read().kind, RequestType::Fs(FsOp::Close | FsOp::Flush));
 
     let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);
@@ -719,10 +801,12 @@ pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>
         let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
         let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
         if owner != 0 {
-            let _ = send_flush_owner(volume_target, owner, should_block).await;
-        } else {
-            let _ = send_flush_dirty(volume_target).await;
+            let _ = send_flush_owner(volume_target.clone(), owner, should_block).await;
         }
+    }
+
+    if flush_metadata_after_op {
+        let _ = send_flush_owner(volume_target, METADATA_OWNER_ID, true).await;
     }
 
     req.write().status = status.clone();

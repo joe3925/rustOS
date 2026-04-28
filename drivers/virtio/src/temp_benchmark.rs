@@ -1,12 +1,11 @@
 use crate::blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
+use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
 use crate::{SubmitTasksGuard, drain_queue_completions, rdtsc};
 use alloc::{sync::Arc, vec::Vec};
-use core::future::Future;
 use core::hint::spin_loop;
 use core::pin::Pin;
 use core::task::Poll;
-use futures_channel::oneshot;
 use kernel_api::benchmark::{
     BENCH_PARAMS_VERSION_1, BenchLevelResult, BenchSweepParams, BenchSweepResult,
 };
@@ -161,9 +160,9 @@ impl Drop for BenchDmaBuffer {
     }
 }
 
-struct BenchInflight {
+struct BenchInflight<'a> {
     start_tsc: u64,
-    rx: oneshot::Receiver<u8>,
+    completion: CompletionToken<'a>,
     _buffer: BenchDmaBuffer,
 }
 
@@ -177,16 +176,19 @@ fn benchmark_status_error(status: u8) -> DriverStatus {
     ))
 }
 
-fn submit_bench_read(
+fn submit_bench_read<'a>(
     parent: &Arc<DeviceObject>,
     inner: &DevExtInner,
-    bench_queue: &QueueState,
+    bench_queue: &'a QueueState,
     sector: u64,
     request_size: u32,
-) -> Result<Option<BenchInflight>, DriverStatus> {
+) -> Result<Option<BenchInflight<'a>>, DriverStatus> {
     let dma_buffer = BenchDmaBuffer::new_read(parent, request_size)?;
-    let (tx, rx) = oneshot::channel::<u8>();
-    let mut tx = Some(tx);
+    let completion = match bench_queue.completion_slots.alloc() {
+        Some(completion) => completion,
+        None => return Ok(None),
+    };
+    let mut completion = Some(completion);
     let mut start_tsc = 0u64;
 
     let submitted = {
@@ -199,7 +201,9 @@ fn submit_bench_read(
             false,
         ) {
             Some(head) => {
-                *bench_queue.completion_slots[head as usize].lock() = tx.take();
+                bench_queue
+                    .completion_slots
+                    .attach(head, completion.as_ref().expect("completion missing"));
                 let queue_full = vq.num_free == 0;
                 let _submit_guard = SubmitTasksGuard::new(
                     &bench_queue.submitting_tasks,
@@ -221,7 +225,7 @@ fn submit_bench_read(
     if submitted {
         Ok(Some(BenchInflight {
             start_tsc,
-            rx,
+            completion: completion.take().expect("completion missing"),
             _buffer: dma_buffer,
         }))
     } else {
@@ -230,7 +234,7 @@ fn submit_bench_read(
 }
 
 fn record_completion(
-    inflight: BenchInflight,
+    inflight: BenchInflight<'_>,
     status: u8,
     lat_samples: &mut Vec<u64>,
     completed: &mut u32,
@@ -250,7 +254,7 @@ fn record_completion(
 }
 
 fn collect_ready_completions(
-    slots: &mut [Option<BenchInflight>],
+    slots: &mut [Option<BenchInflight<'_>>],
     batch_submitted: usize,
     lat_samples: &mut Vec<u64>,
     completed: &mut u32,
@@ -260,13 +264,13 @@ fn collect_ready_completions(
     let mut made_progress = false;
     for slot in slots.iter_mut().take(batch_submitted) {
         let status = match slot.as_mut() {
-            Some(inflight) => match inflight.rx.try_recv() {
+            Some(inflight) => match inflight.completion.try_recv() {
                 Ok(Some(status)) => Some(status),
                 Ok(None) => None,
                 Err(_) => {
                     let _ = slot.take();
                     return Err(benchmark_device_error(
-                        "virtio-blk: benchmark completion channel closed",
+                        "virtio-blk: benchmark completion canceled",
                     ));
                 }
             },
@@ -290,17 +294,17 @@ fn collect_ready_completions(
     Ok(made_progress)
 }
 
-async fn await_one_irq_completion(
-    slots: &mut [Option<BenchInflight>],
+async fn await_one_irq_completion<'a>(
+    slots: &mut [Option<BenchInflight<'a>>],
     batch_submitted: usize,
-) -> Result<(BenchInflight, u8), DriverStatus> {
+) -> Result<(BenchInflight<'a>, u8), DriverStatus> {
     core::future::poll_fn(|cx| {
         let mut has_pending = false;
         for slot in slots.iter_mut().take(batch_submitted) {
             let poll_result = match slot.as_mut() {
                 Some(inflight) => {
                     has_pending = true;
-                    Pin::new(&mut inflight.rx).poll(cx)
+                    Pin::new(&mut inflight.completion).poll(cx)
                 }
                 None => continue,
             };
@@ -313,7 +317,7 @@ async fn await_one_irq_completion(
                 Poll::Ready(Err(_)) => {
                     let _ = slot.take();
                     return Poll::Ready(Err(benchmark_device_error(
-                        "virtio-blk: benchmark completion channel closed",
+                        "virtio-blk: benchmark completion canceled",
                     )));
                 }
                 Poll::Pending => {}
@@ -356,7 +360,7 @@ async fn bench_reads_direct(
     let mut result = BenchLevelResult::default();
     result.inflight = inflight as u32;
 
-    let mut slots: Vec<Option<BenchInflight>> = Vec::with_capacity(inflight);
+    let mut slots: Vec<Option<BenchInflight<'_>>> = Vec::with_capacity(inflight);
     slots.resize_with(inflight, || None);
 
     let bench_queue = inner.get_queue(0);

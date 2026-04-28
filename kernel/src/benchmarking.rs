@@ -2067,13 +2067,14 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
+    64 * 1024 * 1024,
     //1024 * 1024 * 1024,
 ];
 
@@ -2140,7 +2141,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            //OpenFlags::WriteThrough,
+            OpenFlags::WriteThrough,
         ],
     )
     .await
@@ -2155,9 +2156,22 @@ pub async fn bench_c_drive_io_async() {
         }
     };
 
-    if let Err(e) = file.set_len(0).await {
-        println!("[disk-bench] failed to truncate benchmark file: {:?}", e);
-        return;
+    let bench_len = DISK_BENCH_TOTAL_BYTES as u64;
+    if file.size != bench_len {
+        if let Err(e) = file.set_len(bench_len).await {
+            println!(
+                "[disk-bench] failed to size benchmark file to {} bytes: {:?}",
+                bench_len, e
+            );
+            return;
+        }
+        if let Err(e) = file.flush().await {
+            println!(
+                "[disk-bench] failed to flush benchmark file sizing: {:?}",
+                e
+            );
+            return;
+        }
     }
 
     let span_cfg = BenchWindowConfig {
@@ -2183,10 +2197,6 @@ pub async fn bench_c_drive_io_async() {
     let mut read_throughput: Vec<f64> = Vec::new();
 
     for &chunk_sz in DISK_BENCH_SIZES {
-        if let Err(e) = file.set_len(0).await {
-            println!("[disk-bench] failed to truncate benchmark file: {:?}", e);
-            return;
-        }
         let ops = (DISK_BENCH_TOTAL_BYTES / chunk_sz).max(1);
 
         let mut chunk = vec![0u8; chunk_sz];
@@ -2194,13 +2204,22 @@ pub async fn bench_c_drive_io_async() {
         let sw_write = Stopwatch::start();
         let mut write_elapsed = 0;
         let mut total_written = 0u64;
+        let mut offset = 0u64;
         println!("starting chunk size: {}", chunk_sz);
         for op in 0..ops {
             chunk[..8].copy_from_slice(&(op as u64).to_le_bytes());
             let sw_write = Stopwatch::start();
-            match file.append(&chunk).await {
-                Ok(_) => {
-                    total_written = total_written.saturating_add(chunk_sz as u64);
+            match file.write_at(offset, &chunk).await {
+                Ok(n) => {
+                    total_written = total_written.saturating_add(n as u64);
+                    offset = offset.saturating_add(n as u64);
+                    if n != chunk_sz {
+                        println!(
+                            "[disk-bench] short write at op {} (size {}): {} of {}",
+                            op, chunk_sz, n, chunk_sz
+                        );
+                        break;
+                    }
                 }
                 Err(e) => {
                     println!(

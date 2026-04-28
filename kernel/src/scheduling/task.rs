@@ -346,7 +346,7 @@ impl Task {
         self.context = unsafe { *context };
     }
 
-#[inline(always)]
+    #[inline(always)]
     pub fn mark_scheduled_in(&self, cpu_id: usize, now_cycles: u64) {
         self.last_cpu.store(cpu_id, Ordering::Relaxed);
         self.sched_in_cycles.store(now_cycles, Ordering::Relaxed);

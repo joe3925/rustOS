@@ -220,9 +220,16 @@ fn apply_delta(reg: &mut Registry, delta: &RegDelta) {
 /// Load snapshot from disk
 async fn load_snapshot() -> Option<Registry> {
     let snap_path = snap_path();
-    let f = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Open])
-        .await
-        .ok()?;
+    let f = File::open(
+        &snap_path,
+        &[
+            OpenFlags::ReadWrite,
+            OpenFlags::Open,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await
+    .ok()?;
     let buf = f.read().await.ok()?;
     let (reg, _) =
         bincode::decode_from_slice::<Registry, _>(&buf, bincode::config::standard()).ok()?;
@@ -237,7 +244,15 @@ async fn save_snapshot(reg: &Registry) -> Result<(), kernel_types::status::RegEr
         .map_err(|_| RegError::EncodingFailed)?;
 
     let snap_path = snap_path();
-    let mut file = File::open(&snap_path, &[OpenFlags::ReadWrite, OpenFlags::Create]).await?;
+    let mut file = File::open(
+        &snap_path,
+        &[
+            OpenFlags::ReadWrite,
+            OpenFlags::Create,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await?;
 
     file.set_len(0)
         .await

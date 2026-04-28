@@ -288,7 +288,10 @@ impl<'a> IoBufferInner<'a> {
         &self.dma_segments[..self.dma_segments_len]
     }
 
-    pub fn replace_page_frames(&mut self, frames: &[IoBufferPageFrame]) -> Result<(), IoBufferError> {
+    pub fn replace_page_frames(
+        &mut self,
+        frames: &[IoBufferPageFrame],
+    ) -> Result<(), IoBufferError> {
         if frames.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
                 required: frames.len(),

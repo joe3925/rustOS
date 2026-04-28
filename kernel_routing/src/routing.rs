@@ -10,9 +10,7 @@ use crossbeam_queue::SegQueue;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
-use kernel_types::request::{
-    Request, RequestHandle, RequestType, TraversalPolicy,
-};
+use kernel_types::request::{Request, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::DriverStatus;
 
 pub type CompletionRoutine =

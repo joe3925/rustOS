@@ -1,9 +1,7 @@
-use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use futures_channel::oneshot;
 
 use kernel_api::device::DeviceObject;
 use kernel_api::irq::IrqHandle;
@@ -13,6 +11,7 @@ use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, Once, RwLock, RwLockReadGuard};
 
 use crate::blk::BlkIoSlots;
+use crate::completion::CompletionTable;
 use crate::virtqueue::Virtqueue;
 
 /// Strategy for selecting which queue to use for I/O requests.
@@ -24,7 +23,7 @@ pub enum QueueSelectionStrategy {
     RoundRobin,
 }
 
-/// Per-queue state: queue, arena, IRQ handle, and per-head oneshot completion slots.
+/// Per-queue state: queue, arena, IRQ handle, and per-head completion slots.
 pub struct QueueState {
     /// The virtqueue for this request queue.
     pub queue: RwLock<Virtqueue>,
@@ -44,11 +43,8 @@ pub struct QueueState {
     pub submitting_tasks: AtomicU32,
     /// Whether to use indirect descriptors on this queue.
     pub use_indirect: bool,
-    /// Per-descriptor-head oneshot sender slots, sized to the virtqueue depth.
-    /// The submitter stores its sender here before notifying the device.
-    /// The drain task takes the sender and delivers the device status before
-    /// returning the descriptor head to the free list.
-    pub completion_slots: Box<[Mutex<Option<oneshot::Sender<u8>>>]>,
+    /// Per-descriptor-head completion slots, sized to the virtqueue depth.
+    pub completion_slots: CompletionTable,
 }
 
 unsafe impl Send for QueueState {}

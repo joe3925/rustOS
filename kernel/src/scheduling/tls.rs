@@ -67,10 +67,7 @@ impl KernelTls {
                 thread_pointer.add(TCB_SELF_POINTER_OFFSET).cast::<u64>(),
                 thread_pointer as u64,
             );
-            ptr::write_unaligned(
-                thread_pointer.add(TCB_RESERVED_OFFSET).cast::<u64>(),
-                0,
-            );
+            ptr::write_unaligned(thread_pointer.add(TCB_RESERVED_OFFSET).cast::<u64>(), 0);
         }
 
         Some(Self {
