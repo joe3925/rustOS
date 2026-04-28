@@ -2140,7 +2140,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
+            //OpenFlags::WriteThrough,
         ],
     )
     .await
