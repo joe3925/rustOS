@@ -797,6 +797,29 @@ impl<'a> Drop for SubmitTasksGuard<'a> {
     }
 }
 
+pub(crate) fn drain_queue_completions(qs: &QueueState) -> usize {
+    let mut drained = 0usize;
+    let mut vq = qs.queue.write();
+    while let Some((head, _len)) = vq.pop_used() {
+        if head as usize >= qs.completion_slots.len() {
+            panic!(
+                "virtio: device returned out-of-bounds descriptor index {}",
+                head
+            );
+        }
+        core::sync::atomic::fence(Ordering::Acquire);
+        let status = qs.arena.get_status(head);
+        vq.free_chain(head);
+        if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
+            let _ = tx.send(status);
+        } else {
+            panic!("virtio: completed descriptor had no waiter");
+        }
+        drained += 1;
+    }
+    drained
+}
+
 /// Drain loop run as one background task per queue.
 /// Waits for an IRQ, drains the entire used ring under the write lock,
 /// frees descriptor chains, and delivers completion results via the per-head
@@ -818,23 +841,7 @@ async fn queue_drain_loop(inner: Arc<DevExtInner>, queue_idx: usize, irq_handle:
             panic!("WHYYYYYYY");
         }
 
-        let mut vq = qs.queue.write();
-        while let Some((head, _len)) = vq.pop_used() {
-            if head as usize >= qs.completion_slots.len() {
-                panic!(
-                    "virtio: device returned out-of-bounds descriptor index {}",
-                    head
-                );
-            }
-            core::sync::atomic::fence(Ordering::Acquire);
-            let status = qs.arena.get_status(head);
-            vq.free_chain(head);
-            if let Some(tx) = qs.completion_slots[head as usize].lock().take() {
-                let _ = tx.send(status);
-            } else {
-                panic!("oops");
-            }
-        }
+        drain_queue_completions(qs);
     }
 }
 
@@ -1171,12 +1178,12 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         IOCTL_BLOCK_FLUSH => complete_req(req, DriverStatus::Success),
 
         IOCTL_BLOCK_BENCH_SWEEP => {
-            let (_parent, inner) = match get_parent_inner(pdo) {
+            let (parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };
 
-            match bench_sweep(&inner, true).await {
+            match bench_sweep(&parent, &inner, true).await {
                 Ok(r) => {
                     {
                         req.write().set_data_t(r);
@@ -1188,12 +1195,12 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         }
 
         IOCTL_BLOCK_BENCH_SWEEP_POLLING => {
-            let (_parent, inner) = match get_parent_inner(pdo) {
+            let (parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };
 
-            match bench_sweep(&inner, false).await {
+            match bench_sweep(&parent, &inner, false).await {
                 Ok(r) => {
                     {
                         req.write().set_data_t(r);
@@ -1205,7 +1212,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
         }
 
         IOCTL_BLOCK_BENCH_SWEEP_BOTH => {
-            let (_parent, inner) = match get_parent_inner(pdo) {
+            let (parent, inner) = match get_parent_inner(pdo) {
                 Ok(v) => v,
                 Err(s) => return complete_req(req, s),
             };
@@ -1221,7 +1228,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             let params_used = sanitize_bench_params(&inner, params_in);
 
             let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
-                match bench_sweep_params(&inner, &params_used, true).await {
+                match bench_sweep_params(&parent, &inner, &params_used, true).await {
                     Ok(r) => r,
                     Err(e) => return complete_req(req, e),
                 }
@@ -1230,7 +1237,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
             };
 
             let poll = if (params_used.flags & BENCH_FLAG_POLL) != 0 {
-                match bench_sweep_params(&inner, &params_used, false).await {
+                match bench_sweep_params(&parent, &inner, &params_used, false).await {
                     Ok(r) => r,
                     Err(e) => return complete_req(req, e),
                 }
