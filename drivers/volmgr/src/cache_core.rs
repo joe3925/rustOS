@@ -423,6 +423,17 @@ where
         Ok(start_block..end_block)
     }
 
+    fn start_flush_job_background(cache: &Arc<Self>) {
+        if cache.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let cache = Arc::clone(cache);
+        spawn_detached(async move {
+            let _ = cache.ensure_flush_job().await;
+        });
+    }
+
     fn shard_index(&self, lba: u64) -> usize {
         (lba as usize) % self.shards.len()
     }
@@ -587,6 +598,10 @@ where
             return Ok(page);
         }
 
+        if self.cfg.direct_io_on_no_free_pages {
+            return Err(CacheError::NoFreePages);
+        }
+
         let mut attempts = self.shards.len().saturating_mul(2).max(1);
         while attempts != 0 {
             if !self
@@ -601,12 +616,6 @@ where
             }
 
             attempts -= 1;
-        }
-
-        self.flush_internal_all().await?;
-
-        if let Some(page) = self.try_reclaim_cache_page(preferred_idx) {
-            return Ok(page);
         }
 
         Err(CacheError::NoFreePages)
@@ -766,6 +775,77 @@ where
 
         let page = self.load_detached_page_from_backend(lba).await?;
         Ok(WriteAcquire::Direct(page))
+    }
+
+    async fn direct_read_at(
+        &self,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<(), CacheError<B::Error>> {
+        if out.is_empty() {
+            return Ok(());
+        }
+
+        let mut dst_pos = 0usize;
+        let mut cur_off = offset;
+        let bs_u64 = Self::block_size_u64();
+
+        while dst_pos < out.len() {
+            let lba = cur_off / bs_u64;
+            let block_off = (cur_off % bs_u64) as usize;
+            let take = min(BLOCK_SIZE - block_off, out.len() - dst_pos);
+            let page = self.load_detached_page_from_backend(lba).await?;
+
+            {
+                let data = page.data.read();
+                out[dst_pos..dst_pos + take]
+                    .copy_from_slice(&data.bytes[block_off..block_off + take]);
+            }
+
+            dst_pos += take;
+            cur_off += take as u64;
+        }
+
+        Ok(())
+    }
+
+    async fn direct_write_at(
+        &self,
+        offset: u64,
+        data: &[u8],
+        _owner: u64,
+    ) -> Result<(), CacheError<B::Error>> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let mut src_pos = 0usize;
+        let mut cur_off = offset;
+        let bs_u64 = Self::block_size_u64();
+
+        while src_pos < data.len() {
+            let lba = cur_off / bs_u64;
+            let block_off = (cur_off % bs_u64) as usize;
+            let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
+            let src = &data[src_pos..src_pos + take];
+
+            if block_off == 0 && take == BLOCK_SIZE {
+                let page = self.new_detached_page_from_full_block_write(src)?;
+                self.direct_write_page(lba, &page).await?;
+            } else {
+                let page = self.load_detached_page_from_backend(lba).await?;
+                {
+                    let mut page_data = page.data.write();
+                    page_data.bytes[block_off..block_off + take].copy_from_slice(src);
+                }
+                self.direct_write_page(lba, &page).await?;
+            }
+
+            src_pos += take;
+            cur_off += take as u64;
+        }
+
+        Ok(())
     }
 
     async fn direct_write_page(
@@ -1662,12 +1742,12 @@ where
 
     /// Shared write implementation that optionally tags pages with an owner.
     async fn write_at_inner(
-        &self,
+        cache: &Arc<Self>,
         offset: u64,
         data: &[u8],
         owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        self.check_open()?;
+        cache.check_open()?;
         let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, data.len())?;
 
         if data.is_empty() {
@@ -1677,15 +1757,32 @@ where
         let mut src_pos = 0usize;
         let mut cur_off = offset;
         let bs_u64 = VolumeCache::<B, BLOCK_SIZE, F>::block_size_u64();
+        let mut no_free_flush_started = false;
 
         while src_pos < data.len() {
             let lba = cur_off / bs_u64;
             let block_off = (cur_off % bs_u64) as usize;
             let take = min(BLOCK_SIZE - block_off, data.len() - src_pos);
 
-            let acquired = self
+            let acquired = match cache
                 .get_or_create_write_page(lba, block_off, take, &data[src_pos..src_pos + take])
-                .await?;
+                .await
+            {
+                Ok(acquired) => acquired,
+                Err(CacheError::NoFreePages) if cache.cfg.direct_io_on_no_free_pages => {
+                    if !no_free_flush_started {
+                        Self::start_flush_job_background(cache);
+                        no_free_flush_started = true;
+                    }
+                    cache
+                        .direct_write_at(cur_off, &data[src_pos..src_pos + take], owner)
+                        .await?;
+                    src_pos += take;
+                    cur_off += take as u64;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             match acquired {
                 WriteAcquire::Cached(page) => {
@@ -1697,7 +1794,7 @@ where
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    self.mark_cached_page_dirty(&page, owner);
+                    cache.mark_cached_page_dirty(&page, owner);
                 }
                 WriteAcquire::Direct(page) => {
                     {
@@ -1711,7 +1808,7 @@ where
                     } else {
                         page.mark_dirty_with_owner(owner);
                     }
-                    self.direct_write_page(lba, &page).await?;
+                    cache.direct_write_page(lba, &page).await?;
                 }
             }
 
@@ -1742,13 +1839,28 @@ where
         let mut dst_pos = 0usize;
         let mut cur_off = offset;
         let bs_u64 = VolumeCache::<B, BLOCK_SIZE, F>::block_size_u64();
+        let mut no_free_flush_started = false;
 
         while dst_pos < out.len() {
             let lba = cur_off / bs_u64;
             let block_off = (cur_off % bs_u64) as usize;
             let take = min(BLOCK_SIZE - block_off, out.len() - dst_pos);
 
-            let page = self.get_or_create_read_page(lba).await?;
+            let page = match self.get_or_create_read_page(lba).await {
+                Ok(page) => page,
+                Err(CacheError::NoFreePages) if self.cfg.direct_io_on_no_free_pages => {
+                    if !no_free_flush_started {
+                        VolumeCache::<B, BLOCK_SIZE, F>::start_flush_job_background(self);
+                        no_free_flush_started = true;
+                    }
+                    self.direct_read_at(cur_off, &mut out[dst_pos..dst_pos + take])
+                        .await?;
+                    dst_pos += take;
+                    cur_off += take as u64;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
             let _use_guard = PageUseGuard::new(&page);
 
             {
@@ -1765,7 +1877,7 @@ where
     }
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, 0).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, 0).await?;
         VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
         Ok(())
     }
@@ -1776,13 +1888,13 @@ where
         data: &[u8],
         owner: u64,
     ) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, owner).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, owner).await?;
         VolumeCache::<B, BLOCK_SIZE, F>::maybe_start_background_writeback(self);
         Ok(())
     }
 
     async fn write_through_at(&self, offset: u64, data: &[u8]) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, 0).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, 0).await?;
         self.flush_range(offset, data.len()).await
     }
 
@@ -1792,7 +1904,7 @@ where
         data: &[u8],
         owner: u64,
     ) -> Result<(), Self::Error> {
-        self.write_at_inner(offset, data, owner).await?;
+        VolumeCache::<B, BLOCK_SIZE, F>::write_at_inner(self, offset, data, owner).await?;
         self.flush_range(offset, data.len()).await
     }
 

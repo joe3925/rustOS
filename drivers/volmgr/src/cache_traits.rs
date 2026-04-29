@@ -11,6 +11,9 @@ pub struct CacheConfig {
     pub read_allocate: bool,
     pub lazy_page_allocation: bool,
     pub lazy_index_allocation: bool,
+    /// When page allocation/reclaim cannot supply a cache page, bypass the cache
+    /// and issue the current request directly to the lower device.
+    pub direct_io_on_no_free_pages: bool,
     /// Start background writeback when dirty pages reach this count.
     pub dirty_high_watermark_blocks: usize,
     /// Background writeback keeps flushing until dirty pages drop to this count.
@@ -37,6 +40,7 @@ impl CacheConfig {
             read_allocate: true,
             lazy_page_allocation: false,
             lazy_index_allocation: false,
+            direct_io_on_no_free_pages: true,
             dirty_high_watermark_blocks: high,
             dirty_low_watermark_blocks: low,
         }
@@ -48,6 +52,10 @@ impl CacheConfig {
     }
     pub const fn with_lazy_index_allocation(mut self, enabled: bool) -> Self {
         self.lazy_index_allocation = enabled;
+        self
+    }
+    pub const fn with_direct_io_on_no_free_pages(mut self, enabled: bool) -> Self {
+        self.direct_io_on_no_free_pages = enabled;
         self
     }
 
