@@ -3,8 +3,8 @@ use alloc::{sync::Arc, vec::Vec};
 use kernel_api::device::DeviceObject;
 use kernel_api::dma;
 use kernel_api::kernel_types::dma::{
-    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IoBuffer,
-    IOBUFFER_INLINE_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
+    Bidirectional, Described, DmaMapped, DmaMappingStrategy, IOBUFFER_MAX_PAGE_CAPACITY,
+    IOBUFFER_PAGE_SIZE, IoBuffer,
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
@@ -12,7 +12,7 @@ use kernel_api::memory::{
 };
 use kernel_api::x86_64::VirtAddr;
 
-const MAX_DMA_MAP_BYTES: usize = IOBUFFER_INLINE_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE;
+const MAX_DMA_MAP_BYTES: usize = IOBUFFER_MAX_PAGE_CAPACITY * IOBUFFER_PAGE_SIZE;
 
 struct DmaChunk {
     byte_offset: usize,

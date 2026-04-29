@@ -1,9 +1,8 @@
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::ToString, sync::Arc, vec::Vec};
-use core::mem::{align_of, size_of};
+use alloc::{collections::btree_map::BTreeMap, string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
 use kernel_api::request::RequestDataView;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
@@ -21,7 +20,7 @@ use kernel_api::{
     println,
     request::{RequestHandle, RequestType, TraversalPolicy},
     request_handler,
-    runtime::{spawn_blocking, spawn_detached},
+    runtime::spawn_detached,
     status::DriverStatus,
 };
 
@@ -73,7 +72,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
     match code {
         IOCTL_FS_IDENTIFY => {
             let volume_fdo = {
-                let mut r = req.write();
+                let r = req.write();
 
                 let volume_fdo = match r.data() {
                     RequestDataView::FromDevice(mut data) => data
@@ -108,7 +107,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 let mut total_sectors = None;
 
                 if st == DriverStatus::Success {
-                    let mut q = query.write();
+                    let q = query.write();
 
                     if let Some(pnp) = q.pnp.as_mut() {
                         if let Some(pi) = pnp.data_out.try_take::<PartitionInfo>() {
@@ -137,27 +136,25 @@ pub async fn fs_root_ioctl<'a, 'b>(
                     let current_owner = Arc::new(AtomicU64::new(METADATA_OWNER_ID));
                     let current_owner_blk = current_owner.clone();
 
-                    let result = spawn_blocking(move || {
-                        fatfs::FileSystem::new(
-                            BlockDev::new(
-                                target_clone,
-                                sector_size,
-                                total_sectors,
-                                should_flush_blk,
-                                current_owner_blk,
-                            ),
-                            options,
-                        )
-                    })
+                    let result = fatfs::FileSystem::new(
+                        BlockDev::new(
+                            target_clone,
+                            sector_size,
+                            total_sectors,
+                            should_flush_blk,
+                            current_owner_blk,
+                        ),
+                        options,
+                    )
                     .await;
 
                     match result {
                         Ok(fs) => {
-                            let mut io_vtable = IoVtable::new();
+                            let io_vtable = IoVtable::new();
                             io_vtable.set(IoType::Fs(fs_op_dispatch), 1);
 
                             let ext = VolCtrlDevExt {
-                                fs: Arc::new(Mutex::new(fs)),
+                                fs: Arc::new(AsyncMutex::new(fs)),
                                 next_id: AtomicU64::new(FIRST_FILE_OWNER_ID),
                                 table: RwLock::new(BTreeMap::new()),
                                 volume_target: volume_fdo.clone(),
@@ -221,7 +218,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
-    let mut io_vtable = IoVtable::new();
+    let io_vtable = IoVtable::new();
     io_vtable.set(IoType::DeviceControl(fs_root_ioctl), 0);
     let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();

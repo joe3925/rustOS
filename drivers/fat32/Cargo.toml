@@ -27,7 +27,7 @@ opt-level = "z"
 kernel_api = { workspace = true }
 bitflags = "2.6.0"
 spin = { version = "0.10", default-features = false, features = ["mutex"] }
-fatfs = { default-features = false, git = "https://github.com/rafalh/rust-fatfs", features = [
+fatfs = { path = "../../third_party/rust-fatfs", default-features = false, features = [
     "alloc",
     "lfn",
     "unicode",

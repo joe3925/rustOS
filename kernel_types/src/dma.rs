@@ -1,4 +1,6 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -50,8 +52,10 @@ pub const IOBUFFER_PAGE_SIZE: usize = 4096;
 pub const IOBUFFER_FRAME_SIZE_4KIB: u64 = 4 * 1024;
 pub const IOBUFFER_FRAME_SIZE_2MIB: u64 = 2 * 1024 * 1024;
 pub const IOBUFFER_FRAME_SIZE_1GIB: u64 = 1024 * 1024 * 1024;
-pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 512;
+pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 8;
+pub const IOBUFFER_MAX_PAGE_CAPACITY: usize = 512;
 pub const IOBUFFER_INLINE_FRAME_CAPACITY: usize = IOBUFFER_INLINE_PAGE_CAPACITY;
+pub const IOBUFFER_MAX_FRAME_CAPACITY: usize = IOBUFFER_MAX_PAGE_CAPACITY;
 pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
 
 pub enum Described {}
@@ -128,7 +132,7 @@ pub enum DmaMapError {
     },
     /// `chunk_size` is not a multiple of `IOBUFFER_PAGE_SIZE`.
     ChunkSizeNotPageAligned { chunk_size: usize },
-    /// Buffer spans more frames than inline frame storage can describe
+    /// Buffer spans more frames than frame storage can describe
     /// (capacity = 512).
     PageCapacityExceeded { required: usize },
     /// Too many resulting segments to fit in inline storage (capacity = 32).
@@ -311,11 +315,12 @@ fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> 
 fn describe_virtual_buffer(
     virt_addr: usize,
     byte_len: usize,
-    frames: &mut [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY],
-) -> Result<(usize, usize), IoBufferError> {
-    frames.fill(EMPTY_PAGE_FRAME);
+) -> Result<(PageFrameStorage, usize, usize), IoBufferError> {
+    let mut inline_frames = [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY];
+    let mut heap_frames: Option<Vec<IoBufferPageFrame>> = None;
+
     if byte_len == 0 {
-        return Ok((0, 0));
+        return Ok((PageFrameStorage::empty(), 0, 0));
     }
 
     let mut consumed = 0usize;
@@ -329,10 +334,10 @@ fn describe_virtual_buffer(
         let translated = translate_virtual_frame(current)
             .ok_or(IoBufferError::TranslationFailed { virt_addr: current })?;
 
-        if frame_count >= IOBUFFER_INLINE_PAGE_CAPACITY {
+        if frame_count >= IOBUFFER_MAX_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
                 required: frame_count + 1,
-                capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
+                capacity: IOBUFFER_MAX_PAGE_CAPACITY,
             });
         }
 
@@ -340,17 +345,36 @@ fn describe_virtual_buffer(
             first_frame_offset = translated.offset as usize;
         }
 
-        frames[frame_count] = IoBufferPageFrame {
+        let frame = IoBufferPageFrame {
             phys_addr: translated.phys_addr,
             byte_len: translated.byte_len,
         };
+
+        if let Some(frames) = heap_frames.as_mut() {
+            frames.push(frame);
+        } else if frame_count < IOBUFFER_INLINE_PAGE_CAPACITY {
+            inline_frames[frame_count] = frame;
+        } else {
+            let mut frames = Vec::with_capacity(
+                (IOBUFFER_INLINE_PAGE_CAPACITY * 2).min(IOBUFFER_MAX_PAGE_CAPACITY),
+            );
+            frames.extend_from_slice(&inline_frames);
+            frames.push(frame);
+            heap_frames = Some(frames);
+        }
+
         frame_count += 1;
 
         let bytes_in_frame = (translated.byte_len - translated.offset) as usize;
         consumed += (byte_len - consumed).min(bytes_in_frame);
     }
 
-    Ok((frame_count, first_frame_offset))
+    let storage = match heap_frames {
+        Some(frames) => PageFrameStorage::from_boxed(frames.into_boxed_slice()),
+        None => PageFrameStorage::from_inline(inline_frames),
+    };
+
+    Ok((storage, frame_count, first_frame_offset))
 }
 
 fn validate_physical_frames(
@@ -358,10 +382,10 @@ fn validate_physical_frames(
     byte_len: usize,
     frames: &[IoBufferPageFrame],
 ) -> Result<(), IoBufferError> {
-    if frames.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
+    if frames.len() > IOBUFFER_MAX_PAGE_CAPACITY {
         return Err(IoBufferError::PageCapacityExceeded {
             required: frames.len(),
-            capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
+            capacity: IOBUFFER_MAX_PAGE_CAPACITY,
         });
     }
 
@@ -458,6 +482,109 @@ impl<'a> IoBufferBorrow<'a> {
     }
 }
 
+struct PageFrameStorage {
+    inline: [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY],
+    heap: Option<Box<[IoBufferPageFrame]>>,
+}
+
+impl PageFrameStorage {
+    fn empty() -> Self {
+        Self {
+            inline: [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY],
+            heap: None,
+        }
+    }
+
+    fn from_inline(inline: [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY]) -> Self {
+        Self { inline, heap: None }
+    }
+
+    fn from_boxed(heap: Box<[IoBufferPageFrame]>) -> Self {
+        Self {
+            inline: [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY],
+            heap: Some(heap),
+        }
+    }
+
+    fn boxed_empty(capacity: usize) -> Box<[IoBufferPageFrame]> {
+        let mut frames = Vec::with_capacity(capacity);
+        frames.resize(capacity, EMPTY_PAGE_FRAME);
+        frames.into_boxed_slice()
+    }
+
+    fn from_slice(frames: &[IoBufferPageFrame]) -> Result<Self, IoBufferError> {
+        if frames.len() > IOBUFFER_MAX_PAGE_CAPACITY {
+            return Err(IoBufferError::PageCapacityExceeded {
+                required: frames.len(),
+                capacity: IOBUFFER_MAX_PAGE_CAPACITY,
+            });
+        }
+
+        let mut storage = Self::empty();
+        storage.replace(frames)?;
+        Ok(storage)
+    }
+
+    fn as_slice(&self, len: usize) -> &[IoBufferPageFrame] {
+        match self.heap.as_ref() {
+            Some(frames) => &frames[..len],
+            None => &self.inline[..len],
+        }
+    }
+
+    fn replace(&mut self, frames: &[IoBufferPageFrame]) -> Result<(), IoBufferError> {
+        if frames.len() > IOBUFFER_MAX_PAGE_CAPACITY {
+            return Err(IoBufferError::PageCapacityExceeded {
+                required: frames.len(),
+                capacity: IOBUFFER_MAX_PAGE_CAPACITY,
+            });
+        }
+
+        self.inline.fill(EMPTY_PAGE_FRAME);
+        if frames.len() <= IOBUFFER_INLINE_PAGE_CAPACITY {
+            self.heap = None;
+            self.inline[..frames.len()].copy_from_slice(frames);
+        } else {
+            let mut heap = Self::boxed_empty(frames.len());
+            heap.copy_from_slice(frames);
+            self.heap = Some(heap);
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity(&mut self, capacity: usize) -> Result<(), IoBufferError> {
+        if capacity > IOBUFFER_MAX_PAGE_CAPACITY {
+            return Err(IoBufferError::PageCapacityExceeded {
+                required: capacity,
+                capacity: IOBUFFER_MAX_PAGE_CAPACITY,
+            });
+        }
+
+        if capacity <= IOBUFFER_INLINE_PAGE_CAPACITY {
+            return Ok(());
+        }
+
+        let needs_heap = self
+            .heap
+            .as_ref()
+            .map(|frames| frames.len() < capacity)
+            .unwrap_or(true);
+        if needs_heap {
+            let mut heap = Self::boxed_empty(capacity);
+            heap[..IOBUFFER_INLINE_PAGE_CAPACITY].copy_from_slice(&self.inline);
+            self.heap = Some(heap);
+        }
+        Ok(())
+    }
+
+    fn capacity_slice_mut(&mut self) -> &mut [IoBufferPageFrame] {
+        match self.heap.as_mut() {
+            Some(frames) => frames,
+            None => &mut self.inline,
+        }
+    }
+}
+
 /// ABI-erased `IoBuffer` storage passed across the kernel DMA map/unmap calls.
 #[repr(C)]
 pub struct IoBufferInner<'a> {
@@ -465,7 +592,7 @@ pub struct IoBufferInner<'a> {
     virt_addr: usize,
     byte_len: usize,
     frame_offset: usize,
-    page_frames: [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY],
+    page_frames: PageFrameStorage,
     page_frames_len: usize,
     dma_segments: [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
     dma_segments_len: usize,
@@ -485,10 +612,8 @@ impl<'a> IoBufferInner<'a> {
     fn new_virtual(borrow: IoBufferBorrow<'a>) -> Self {
         let virt_addr = borrow.as_ptr() as usize;
         let len = borrow.len();
-        let mut page_frames = [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY];
-        let (page_frames_len, frame_offset) =
-            describe_virtual_buffer(virt_addr, len, &mut page_frames)
-                .expect("IoBuffer<Described> could not describe virtual backing");
+        let (page_frames, page_frames_len, frame_offset) = describe_virtual_buffer(virt_addr, len)
+            .expect("IoBuffer<Described> could not describe virtual backing");
 
         Self {
             borrow: Some(borrow),
@@ -510,9 +635,7 @@ impl<'a> IoBufferInner<'a> {
         frames: &[IoBufferPageFrame],
     ) -> Result<Self, IoBufferError> {
         validate_physical_frames(frame_offset, byte_len, frames)?;
-
-        let mut page_frames = [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY];
-        page_frames[..frames.len()].copy_from_slice(frames);
+        let page_frames = PageFrameStorage::from_slice(frames)?;
 
         Ok(Self {
             borrow: None,
@@ -561,7 +684,7 @@ impl<'a> IoBufferInner<'a> {
     }
 
     pub fn page_frames(&self) -> &[IoBufferPageFrame] {
-        &self.page_frames[..self.page_frames_len]
+        self.page_frames.as_slice(self.page_frames_len)
     }
 
     pub fn dma_segments(&self) -> &[IoBufferDmaSegment] {
@@ -572,15 +695,7 @@ impl<'a> IoBufferInner<'a> {
         &mut self,
         frames: &[IoBufferPageFrame],
     ) -> Result<(), IoBufferError> {
-        if frames.len() > IOBUFFER_INLINE_PAGE_CAPACITY {
-            return Err(IoBufferError::PageCapacityExceeded {
-                required: frames.len(),
-                capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
-            });
-        }
-
-        self.page_frames.fill(EMPTY_PAGE_FRAME);
-        self.page_frames[..frames.len()].copy_from_slice(frames);
+        self.page_frames.replace(frames)?;
         self.page_frames_len = frames.len();
         Ok(())
     }
@@ -624,19 +739,21 @@ impl<'a> IoBufferInner<'a> {
         self.page_frames_len
     }
 
-    pub fn page_frames_storage_mut(
-        &mut self,
-    ) -> &mut [IoBufferPageFrame; IOBUFFER_INLINE_PAGE_CAPACITY] {
-        &mut self.page_frames
+    pub fn page_frames_storage_mut(&mut self) -> &mut [IoBufferPageFrame] {
+        self.page_frames
+            .ensure_capacity(IOBUFFER_MAX_PAGE_CAPACITY)
+            .expect("IoBuffer page frame storage could not grow to max capacity");
+        self.page_frames.capacity_slice_mut()
     }
 
     pub fn set_page_frames_len(&mut self, len: usize) -> Result<(), IoBufferError> {
-        if len > IOBUFFER_INLINE_PAGE_CAPACITY {
+        if len > IOBUFFER_MAX_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
                 required: len,
-                capacity: IOBUFFER_INLINE_PAGE_CAPACITY,
+                capacity: IOBUFFER_MAX_PAGE_CAPACITY,
             });
         }
+        self.page_frames.ensure_capacity(len)?;
         self.page_frames_len = len;
         Ok(())
     }

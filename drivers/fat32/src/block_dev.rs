@@ -8,7 +8,6 @@ use kernel_api::{
     pnp::pnp_send_request,
     println,
     request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy},
-    runtime::block_on,
     status::DriverStatus,
 };
 
@@ -149,7 +148,7 @@ impl BlockDev {
         }
     }
 
-    fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, DriverStatus> {
+    async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, DriverStatus> {
         if dst.is_empty() {
             return Ok(0);
         }
@@ -158,12 +157,12 @@ impl BlockDev {
             return Ok(0);
         }
         let len = min(dst.len(), (cap_bytes - self.pos) as usize);
-        block_on(self.send_read(self.pos, &mut dst[..len]))?;
+        self.send_read(self.pos, &mut dst[..len]).await?;
         self.pos += len as u64;
         Ok(len)
     }
 
-    fn write_bytes(&mut self, src: &[u8]) -> Result<usize, DriverStatus> {
+    async fn write_bytes(&mut self, src: &[u8]) -> Result<usize, DriverStatus> {
         if src.is_empty() {
             return Ok(0);
         }
@@ -172,25 +171,27 @@ impl BlockDev {
             return Ok(0);
         }
         let len = min(src.len(), (cap_bytes - self.pos) as usize);
-        block_on(self.send_write_immut(self.pos, &src[..len]))?;
+        self.send_write_immut(self.pos, &src[..len]).await?;
         self.pos += len as u64;
         Ok(len)
     }
 }
 
+use kernel_api::kernel_types::async_ffi::{FfiFuture, FutureExt};
+
 impl Read for BlockDev {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.read_bytes(buf).map_err(|_| ())
+    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+        async move { self.read_bytes(buf).await.map_err(|_| ()) }.into_ffi()
     }
 }
 
 impl Write for BlockDev {
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.write_bytes(buf).map_err(|_| ())
+    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+        async move { self.write_bytes(buf).await.map_err(|_| ()) }.into_ffi()
     }
 
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+    fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
+        async move { Ok(()) }.into_ffi()
     }
 }
 pub fn flush(vdx: &VolCtrlDevExt) {

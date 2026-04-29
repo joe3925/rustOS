@@ -45,7 +45,7 @@ use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
     IoBufferDmaSegment, IoBufferInner, IoBufferPageFrame, DMA_IOMMU_VENDOR_AMD_IVRS,
     DMA_IOMMU_VENDOR_INTEL_DMAR, DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE,
-    IOBUFFER_INLINE_PAGE_CAPACITY, IOBUFFER_INLINE_SEGMENT_CAPACITY, IOBUFFER_PAGE_SIZE,
+    IOBUFFER_INLINE_SEGMENT_CAPACITY, IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
 };
 use kernel_types::status::DriverStatus;
 use raw_cpuid::CpuId;
@@ -121,7 +121,7 @@ pub fn map_buffer<'a>(
     if buffer_len == 0 || frame_count == 0 {
         return Err((buffer, DmaMapError::InvalidSize));
     }
-    if frame_count > IOBUFFER_INLINE_PAGE_CAPACITY {
+    if frame_count > IOBUFFER_MAX_PAGE_CAPACITY {
         return Err((
             buffer,
             DmaMapError::PageCapacityExceeded {
@@ -497,11 +497,11 @@ fn map_phys_run_to_iova(
     phys_base: u64,
     page_count: usize,
 ) -> Result<(), DmaMapError> {
-    let mut pfns = [0u64; IOBUFFER_INLINE_PAGE_CAPACITY];
+    let mut pfns = [0u64; IOBUFFER_MAX_PAGE_CAPACITY];
     let mut mapped = 0usize;
 
     while mapped < page_count {
-        let chunk_pages = (page_count - mapped).min(IOBUFFER_INLINE_PAGE_CAPACITY);
+        let chunk_pages = (page_count - mapped).min(IOBUFFER_MAX_PAGE_CAPACITY);
         for (idx, pfn) in pfns[..chunk_pages].iter_mut().enumerate() {
             *pfn = (phys_base + ((mapped + idx) * IOBUFFER_PAGE_SIZE) as u64) >> 12;
         }
@@ -785,14 +785,14 @@ struct RegisteredDmaDevice {
 
 #[derive(Clone)]
 struct PendingMappingRecords {
-    records: [MappingRecord; IOBUFFER_INLINE_PAGE_CAPACITY],
+    records: [MappingRecord; IOBUFFER_MAX_PAGE_CAPACITY],
     len: usize,
 }
 
 impl PendingMappingRecords {
     fn new() -> Self {
         Self {
-            records: [EMPTY_MAPPING_RECORD; IOBUFFER_INLINE_PAGE_CAPACITY],
+            records: [EMPTY_MAPPING_RECORD; IOBUFFER_MAX_PAGE_CAPACITY],
             len: 0,
         }
     }
@@ -806,7 +806,7 @@ impl PendingMappingRecords {
     }
 
     fn push(&mut self, rec: MappingRecord) -> Result<(), DmaMapError> {
-        if self.len >= IOBUFFER_INLINE_PAGE_CAPACITY {
+        if self.len >= IOBUFFER_MAX_PAGE_CAPACITY {
             return Err(DmaMapError::PageCapacityExceeded {
                 required: self.len + 1,
             });

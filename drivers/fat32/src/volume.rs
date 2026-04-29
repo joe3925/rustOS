@@ -10,15 +10,14 @@ use fatfs::{
 };
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::println;
-use kernel_api::request::type_name_stripped;
-use kernel_api::runtime::spawn_blocking;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 use kernel_api::device::DeviceObject;
+use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{DriverStep, pnp_send_request};
-use kernel_api::request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
@@ -50,7 +49,7 @@ const SET_LEN_ZERO_CHUNK: usize = 64 * 1024;
 
 #[repr(C)]
 pub struct VolCtrlDevExt {
-    pub fs: Arc<Mutex<Fs>>,
+    pub fs: Arc<AsyncMutex<Fs>>,
     pub(crate) next_id: AtomicU64,
     pub(crate) table: RwLock<BTreeMap<u64, FileCtx>>,
     pub(crate) volume_target: IoTarget,
@@ -64,7 +63,7 @@ pub struct VolCtrlDevExt {
 }
 
 pub struct FileCtx {
-    path: Path,
+    path: Arc<Path>,
     is_dir: bool,
     pos: u64,
     size: u64,
@@ -84,25 +83,28 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
     }
 }
 
-fn create_entry(fs: &mut Fs, path: &Path, dir: bool) -> Result<(), FsError> {
+async fn create_entry(fs: &mut Fs, path: &Path, dir: bool) -> Result<(), FsError> {
     let path_str = path.as_str();
     if dir {
-        let _ = fs.root_dir().create_dir(path_str)?;
+        let _ = fs.root_dir().create_dir(path_str).await?;
     } else {
-        let _ = fs.root_dir().create_file(path_str)?;
+        let _ = fs.root_dir().create_file(path_str).await?;
     }
     Ok(())
 }
 
-fn rename_entry(fs: &mut Fs, src: &Path, dst: &Path) -> Result<(), FsError> {
+async fn rename_entry(fs: &mut Fs, src: &Path, dst: &Path) -> Result<(), FsError> {
     let dst_dir = fs.root_dir();
-    fs.root_dir().rename(src.as_str(), &dst_dir, dst.as_str())
+    fs.root_dir()
+        .rename(src.as_str(), &dst_dir, dst.as_str())
+        .await
 }
 
-fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
-    let dir: FatDir = fs.root_dir().open_dir(path.as_str())?;
+async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
+    let dir: FatDir = fs.root_dir().open_dir(path.as_str()).await?;
     let mut out = Vec::new();
-    for r in dir.iter() {
+    let mut iter = dir.iter();
+    while let Some(r) = iter.next().await {
         let e = r?;
         let name = e.file_name();
         out.push(name);
@@ -110,26 +112,26 @@ fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
     Ok(out)
 }
 
-fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
-    let mut file = fs.root_dir().open_file(path.as_str())?;
-    file.seek(SeekFrom::End(0))
+async fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
+    let mut file = fs.root_dir().open_file(path.as_str()).await?;
+    file.seek(SeekFrom::End(0)).await
 }
 
-fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
-    let old_size = file.seek(SeekFrom::End(0))?;
+async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
+    let old_size = file.seek(SeekFrom::End(0)).await?;
     if new_size <= old_size {
-        file.seek(SeekFrom::Start(new_size))?;
-        file.truncate()?;
+        file.seek(SeekFrom::Start(new_size)).await?;
+        file.truncate().await?;
     } else {
         let zeros = vec![0u8; SET_LEN_ZERO_CHUNK];
         let mut remaining = new_size - old_size;
         while remaining != 0 {
             let take = remaining.min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..take])?;
+            file.write_all(&zeros[..take]).await?;
             remaining -= take as u64;
         }
     }
-    file.flush()?;
+    file.flush().await?;
     Ok(())
 }
 
@@ -204,13 +206,13 @@ fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_>) -> Result<u64, Dr
     }
 }
 
-fn execute_fs_work(
+async fn execute_fs_work(
     dev: &Arc<DeviceObject>,
-    fs_arc: &Arc<Mutex<Fs>>,
+    fs_arc: &Arc<AsyncMutex<Fs>>,
     req: &mut RequestHandle<'_>,
 ) -> DriverStatus {
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
-    let mut fs = fs_arc.lock();
+    let mut fs = fs_arc.lock().await;
 
     let op = match req.read().kind {
         RequestType::Fs(op) => op,
@@ -226,60 +228,58 @@ fn execute_fs_work(
 
     match op {
         FsOp::Open => {
-            let (path, flags, write_through) = {
+            let result = {
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsOpenParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
-                (p.path.clone(), p.flags, p.write_through)
-            };
-            let _ = (flags, write_through); // driver uses path only; flags handled by VFS
-            let path_str = path.as_str();
-            let open_res = {
+                let _ = (p.flags, p.write_through); // driver uses path only; flags handled by VFS
+                let path = &p.path;
+                let path_str = path.as_str();
                 let root = fs.root_dir();
-                match root.open_file(path_str) {
-                    Ok(mut f) => match f.seek(SeekFrom::End(0)) {
+                let open_res = match root.open_file(path_str).await {
+                    Ok(mut f) => match f.seek(SeekFrom::End(0)).await {
                         Ok(end) => Ok((false, end)),
                         Err(e) => Err(e),
                     },
                     Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
-                        match root.open_dir(path_str) {
+                        match root.open_dir(path_str).await {
                             Ok(_d) => Ok((true, 0)),
                             Err(e) => Err(e),
                         }
                     }
                     Err(e) => Err(e),
-                }
-            };
-            let result = match open_res {
-                Ok((is_dir, size)) => {
-                    let id = next_file_id(&vdx);
-                    {
-                        let mut tbl = vdx.table.write();
-                        tbl.insert(
-                            id,
-                            FileCtx {
-                                path,
-                                is_dir,
-                                pos: 0,
-                                size,
-                            },
-                        );
+                };
+                match open_res {
+                    Ok((is_dir, size)) => {
+                        let id = next_file_id(&vdx);
+                        {
+                            let mut tbl = vdx.table.write();
+                            tbl.insert(
+                                id,
+                                FileCtx {
+                                    path: Arc::new(path.clone()),
+                                    is_dir,
+                                    pos: 0,
+                                    size,
+                                },
+                            );
+                        }
+                        FsOpenResult {
+                            fs_file_id: id,
+                            is_dir,
+                            size,
+                            error: None,
+                        }
                     }
-                    FsOpenResult {
-                        fs_file_id: id,
-                        is_dir,
-                        size,
-                        error: None,
-                    }
+                    Err(e) => FsOpenResult {
+                        fs_file_id: 0,
+                        is_dir: false,
+                        size: 0,
+                        error: Some(map_fatfs_err(&e)),
+                    },
                 }
-                Err(e) => FsOpenResult {
-                    fs_file_id: 0,
-                    is_dir: false,
-                    size: 0,
-                    error: Some(map_fatfs_err(&e)),
-                },
             };
 
             req.write().set_data_t(result);
@@ -324,16 +324,21 @@ fn execute_fs_work(
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
             let result: Result<usize, FileStatus> = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Err(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
+                    Some((_, true)) => Err(FileStatus::AccessDenied),
+                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => {
-                            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
-                                match file.read(buf) {
+                                match file.read(buf).await {
                                     Ok(n) => Ok(n),
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
@@ -384,17 +389,22 @@ fn execute_fs_work(
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
             let write_res: Result<usize, FileStatus> = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Err(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
+                    Some((_, true)) => Err(FileStatus::AccessDenied),
+                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => {
                             let n = data.len();
-                            if let Err(e) = file.seek(SeekFrom::Start(offset)) {
+                            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
-                                match file.write_all(data) {
+                                match file.write_all(data).await {
                                     Ok(()) => {
                                         if write_through {
                                             flush_owner_blocking(&vdx, fs_file_id);
@@ -445,12 +455,17 @@ fn execute_fs_work(
                 p.fs_file_id
             };
             let err = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Some(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => None,
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
-                        Ok(mut f) => f.flush().err().map(|e| map_fatfs_err(&e)),
+                    Some((_, true)) => None,
+                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
+                        Ok(mut f) => f.flush().await.err().map(|e| map_fatfs_err(&e)),
                         Err(e) => Some(map_fatfs_err(&e)),
                     },
                 }
@@ -468,7 +483,7 @@ fn execute_fs_work(
                     return DriverStatus::InvalidParameter;
                 };
                 let dir = p.dir;
-                match create_entry(&mut *fs, &p.path, dir) {
+                match create_entry(&mut *fs, &p.path, dir).await {
                     Ok(()) => None,
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
@@ -478,23 +493,23 @@ fn execute_fs_work(
         }
 
         FsOp::Rename => {
-            let (src, dst) = {
+            let err = {
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsRenameParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
-                (p.src.clone(), p.dst.clone())
-            };
-            let err = match rename_entry(&mut *fs, &src, &dst) {
-                Ok(()) => {
-                    let mut tbl = vdx.table.write();
-                    if let Some(ctx) = tbl.values_mut().find(|ctx| ctx.path == src) {
-                        ctx.path = dst;
+                match rename_entry(&mut *fs, &p.src, &p.dst).await {
+                    Ok(()) => {
+                        let mut tbl = vdx.table.write();
+                        if let Some(ctx) = tbl.values_mut().find(|ctx| ctx.path.as_ref() == &p.src)
+                        {
+                            ctx.path = Arc::new(p.dst.clone());
+                        }
+                        None
                     }
-                    None
+                    Err(e) => Some(map_fatfs_err(&e)),
                 }
-                Err(e) => Some(map_fatfs_err(&e)),
             };
             req.write().set_data_t(FsRenameResult { error: err });
             DriverStatus::Success
@@ -507,7 +522,7 @@ fn execute_fs_work(
                 let Some(p) = data.view::<FsListDirParams>() else {
                     return DriverStatus::InvalidParameter;
                 };
-                match list_names(&mut *fs, &p.path) {
+                match list_names(&mut *fs, &p.path).await {
                     Ok(names) => FsListDirResult { names, error: None },
                     Err(e) => FsListDirResult {
                         names: Vec::new(),
@@ -564,12 +579,18 @@ fn execute_fs_work(
                 (p.fs_file_id, p.new_size)
             };
             let err = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Some(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => Some(FileStatus::AccessDenied),
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
+                    Some((_, true)) => Some(FileStatus::AccessDenied),
+                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => resize_file(&mut file, new_size)
+                            .await
                             .err()
                             .map(|e| map_fatfs_err(&e)),
                         Err(e) => Some(map_fatfs_err(&e)),
@@ -606,31 +627,38 @@ fn execute_fs_work(
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
             let result: Result<(usize, u64), FileStatus> = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.size, ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Err(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => Err(FileStatus::AccessDenied),
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
-                        Ok(mut file) => {
-                            let start_off = ctx.size;
-                            match file.seek(SeekFrom::Start(start_off)) {
-                                Ok(_) => {
-                                    let n = data.len();
-                                    match file.write_all(data) {
-                                        Ok(()) => {
-                                            if write_through {
-                                                flush_owner_blocking(&vdx, fs_file_id);
+                    Some((_, _, true)) => Err(FileStatus::AccessDenied),
+                    Some((path, size, false)) => {
+                        match fs.root_dir().open_file(path.as_str()).await {
+                            Ok(mut file) => {
+                                let start_off = size;
+                                match file.seek(SeekFrom::Start(start_off)).await {
+                                    Ok(_) => {
+                                        let n = data.len();
+                                        match file.write_all(data).await {
+                                            Ok(()) => {
+                                                if write_through {
+                                                    flush_owner_blocking(&vdx, fs_file_id);
+                                                }
+                                                Ok((n, start_off + n as u64))
                                             }
-                                            Ok((n, start_off + n as u64))
+                                            Err(e) => Err(map_fatfs_err(&e)),
                                         }
-                                        Err(e) => Err(map_fatfs_err(&e)),
                                     }
+                                    Err(e) => Err(map_fatfs_err(&e)),
                                 }
-                                Err(e) => Err(map_fatfs_err(&e)),
                             }
+                            Err(e) => Err(map_fatfs_err(&e)),
                         }
-                        Err(e) => Err(map_fatfs_err(&e)),
-                    },
+                    }
                 }
             };
 
@@ -668,13 +696,18 @@ fn execute_fs_work(
                 (p.fs_file_id, p.offset, p.len)
             };
             let err = {
-                let tbl = vdx.table.read();
-                match tbl.get(&fs_file_id) {
+                let ctx_opt = {
+                    vdx.table
+                        .read()
+                        .get(&fs_file_id)
+                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
+                };
+                match ctx_opt {
                     None => Some(FileStatus::PathNotFound),
-                    Some(ctx) if ctx.is_dir => Some(FileStatus::AccessDenied),
-                    Some(ctx) => match fs.root_dir().open_file(ctx.path.as_str()) {
+                    Some((_, true)) => Some(FileStatus::AccessDenied),
+                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => {
-                            let file_len = file.seek(SeekFrom::End(0)).unwrap_or(0);
+                            let file_len = file.seek(SeekFrom::End(0)).await.unwrap_or(0);
                             let end = offset.saturating_add(len);
                             if offset > file_len {
                                 Some(FileStatus::BadPath)
@@ -684,10 +717,10 @@ fn execute_fs_work(
                                 if zero_len == 0 {
                                     None
                                 } else {
-                                    match file.seek(SeekFrom::Start(offset)) {
+                                    match file.seek(SeekFrom::Start(offset)).await {
                                         Ok(_) => {
                                             let zeros = vec![0u8; zero_len as usize];
-                                            match file.write_all(&zeros) {
+                                            match file.write_all(&zeros).await {
                                                 Ok(()) => {
                                                     flush_owner(&vdx, fs_file_id);
                                                     None
@@ -787,15 +820,7 @@ pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>
         )
     };
 
-    let dev_cloned = dev.clone();
-    // SAFETY: req is valid for the entire duration of this async fn. spawn_blocking is
-    // .awaited to completion before req could be dropped, so the pointer is valid throughout.
-    let req_ptr = req as *mut RequestHandle<'_> as usize;
-    let join = spawn_blocking(move || {
-        let req = unsafe { &mut *(req_ptr as *mut RequestHandle<'_>) };
-        execute_fs_work(&dev_cloned, &fs_arc, req)
-    });
-    let status = join.await;
+    let status = execute_fs_work(dev, &fs_arc, req).await;
 
     if flush_flag.swap(false, Ordering::AcqRel) {
         let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
