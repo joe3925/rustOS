@@ -143,6 +143,7 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
             frames.push(IoBufferPageFrame {
                 phys_addr,
                 byte_len: IOBUFFER_PAGE_SIZE as u64,
+                virt_addr: Some(virt_addr as usize),
             });
 
             offset = offset.checked_add(IOBUFFER_PAGE_SIZE)?;

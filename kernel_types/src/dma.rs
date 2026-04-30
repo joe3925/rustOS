@@ -58,8 +58,16 @@ pub const IOBUFFER_INLINE_FRAME_CAPACITY: usize = IOBUFFER_INLINE_PAGE_CAPACITY;
 pub const IOBUFFER_MAX_FRAME_CAPACITY: usize = IOBUFFER_MAX_PAGE_CAPACITY;
 pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
 
+/// Region described from a virtual borrow.
+///
+/// A `Described` buffer has both virtual backing and physical frame backing.
 pub enum Described {}
-pub enum Pinned {}
+
+/// Region described directly from physical frames.
+///
+/// A `PhysFramed` buffer has physical frame backing, but no required virtual
+/// backing. This can represent a region that is not mapped in this address
+/// space.
 pub enum PhysFramed {}
 pub struct DmaMapped<Source = Described>(PhantomData<fn() -> Source>);
 
@@ -85,7 +93,6 @@ pub trait WritableIoBufferDirection: IoBufferDirection + sealed::WritableDirecti
 impl<T: IoBufferDirection + sealed::WritableDirection> WritableIoBufferDirection for T {}
 
 impl sealed::IoBufferState for Described {}
-impl sealed::IoBufferState for Pinned {}
 impl sealed::IoBufferState for PhysFramed {}
 impl<S: sealed::IoBufferState> sealed::IoBufferState for DmaMapped<S> {}
 
@@ -96,11 +103,9 @@ pub trait VirtualBackedIoBufferState: IoBufferState + sealed::VirtualBackedState
 impl<T: IoBufferState + sealed::VirtualBackedState> VirtualBackedIoBufferState for T {}
 
 impl sealed::MappableState for Described {}
-impl sealed::MappableState for Pinned {}
 impl sealed::MappableState for PhysFramed {}
 
 impl sealed::VirtualBackedState for Described {}
-impl sealed::VirtualBackedState for Pinned {}
 impl<S: sealed::VirtualBackedState> sealed::VirtualBackedState for DmaMapped<S> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +158,31 @@ impl sealed::WritableDirection for Bidirectional {}
 pub struct IoBufferPageFrame {
     pub phys_addr: u64,
     pub byte_len: u64,
+    /// Base virtual address for this physical frame, if it has virtual backing
+    /// in the current address space.
+    pub virt_addr: Option<usize>,
+}
+
+impl IoBufferPageFrame {
+    pub const fn new(phys_addr: u64, byte_len: u64) -> Self {
+        Self {
+            phys_addr,
+            byte_len,
+            virt_addr: None,
+        }
+    }
+
+    pub const fn with_virtual(phys_addr: u64, byte_len: u64, virt_addr: usize) -> Self {
+        Self {
+            phys_addr,
+            byte_len,
+            virt_addr: Some(virt_addr),
+        }
+    }
+
+    pub fn virtual_address(&self) -> Option<usize> {
+        self.virt_addr
+    }
 }
 
 #[repr(C)]
@@ -190,10 +220,7 @@ pub enum IoBufferError {
     },
 }
 
-const EMPTY_PAGE_FRAME: IoBufferPageFrame = IoBufferPageFrame {
-    phys_addr: 0,
-    byte_len: 0,
-};
+const EMPTY_PAGE_FRAME: IoBufferPageFrame = IoBufferPageFrame::new(0, 0);
 const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     dma_addr: 0,
     byte_len: 0,
@@ -345,10 +372,11 @@ fn describe_virtual_buffer(
             first_frame_offset = translated.offset as usize;
         }
 
-        let frame = IoBufferPageFrame {
-            phys_addr: translated.phys_addr,
-            byte_len: translated.byte_len,
-        };
+        let frame = IoBufferPageFrame::with_virtual(
+            translated.phys_addr,
+            translated.byte_len,
+            current - translated.offset as usize,
+        );
 
         if let Some(frames) = heap_frames.as_mut() {
             frames.push(frame);
@@ -479,6 +507,144 @@ impl<'a> IoBufferBorrow<'a> {
             Self::Writable(buf) => buf,
             Self::ReadOnly(_) => unreachable!("mutable IoBuffer access on read-only borrow"),
         }
+    }
+}
+
+/// A run of `IoBufferPageFrame`s with one virtual-backing shape.
+///
+/// A mapped run stays in the same region only while every next frame's virtual
+/// base is exactly the previous frame's virtual base plus its byte length.
+/// Consecutive unmapped frames are grouped into one physical-only region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoBufferRegion<'a> {
+    virtual_addr: Option<usize>,
+    frame_offset: usize,
+    byte_len: usize,
+    page_frames: &'a [IoBufferPageFrame],
+}
+
+impl<'a> IoBufferRegion<'a> {
+    pub fn virtual_address(&self) -> Option<usize> {
+        self.virtual_addr
+    }
+
+    pub fn has_virtual_backing(&self) -> bool {
+        self.virtual_addr.is_some()
+    }
+
+    pub fn frame_offset(&self) -> usize {
+        self.frame_offset
+    }
+
+    pub fn page_offset(&self) -> usize {
+        self.frame_offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+
+    pub fn page_frames(&self) -> &'a [IoBufferPageFrame] {
+        self.page_frames
+    }
+
+    pub fn physical_frames(&self) -> &'a [IoBufferPageFrame] {
+        self.page_frames
+    }
+}
+
+pub struct IoBufferRegionIter<'a> {
+    page_frames: &'a [IoBufferPageFrame],
+    next_frame: usize,
+    frame_offset: usize,
+    remaining: usize,
+}
+
+impl<'a> IoBufferRegionIter<'a> {
+    fn new(
+        page_frames: &'a [IoBufferPageFrame],
+        frame_offset: usize,
+        byte_len: usize,
+    ) -> Self {
+        Self {
+            page_frames,
+            next_frame: 0,
+            frame_offset,
+            remaining: byte_len,
+        }
+    }
+}
+
+impl<'a> Iterator for IoBufferRegionIter<'a> {
+    type Item = IoBufferRegion<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 || self.next_frame >= self.page_frames.len() {
+            return None;
+        }
+
+        let start_frame = self.next_frame;
+        let start_offset = self.frame_offset;
+        let first_frame = self.page_frames[start_frame];
+        let first_frame_len = first_frame.byte_len as usize;
+        if start_offset >= first_frame_len {
+            self.remaining = 0;
+            return None;
+        }
+
+        let virtual_addr = first_frame
+            .virtual_address()
+            .and_then(|addr| addr.checked_add(start_offset));
+        let mut byte_len = 0usize;
+        let mut current_frame = start_frame;
+        let mut current_offset = start_offset;
+
+        loop {
+            let frame = self.page_frames[current_frame];
+            let frame_len = frame.byte_len as usize;
+            if current_offset >= frame_len {
+                self.remaining = 0;
+                return None;
+            }
+
+            let frame_bytes = (frame_len - current_offset).min(self.remaining);
+            byte_len += frame_bytes;
+            self.remaining -= frame_bytes;
+            current_frame += 1;
+
+            if self.remaining == 0 || current_frame >= self.page_frames.len() {
+                break;
+            }
+
+            let next_frame = self.page_frames[current_frame];
+            let same_region = match (frame.virtual_address(), next_frame.virtual_address()) {
+                (Some(current), Some(next)) => current
+                    .checked_add(frame_len)
+                    .map_or(false, |expected| expected == next),
+                (None, None) => true,
+                _ => false,
+            };
+
+            if !same_region {
+                break;
+            }
+
+            current_offset = 0;
+        }
+
+        self.next_frame = current_frame;
+        self.frame_offset = 0;
+
+        Some(IoBufferRegion {
+            virtual_addr,
+            frame_offset: start_offset,
+            byte_len,
+            page_frames: &self.page_frames[start_frame..current_frame],
+        })
     }
 }
 
@@ -628,7 +794,10 @@ impl<'a> IoBufferInner<'a> {
             dma_drop: None,
         }
     }
-
+    /// Creates a new `IoBuffer` from physical page frames.
+    ///
+    /// The frames are the required physical backing and should be in order
+    /// from start to end of the buffer. Virtual backing is optional.
     fn new_physical(
         frame_offset: usize,
         byte_len: usize,
@@ -689,6 +858,10 @@ impl<'a> IoBufferInner<'a> {
 
     pub fn dma_segments(&self) -> &[IoBufferDmaSegment] {
         &self.dma_segments[..self.dma_segments_len]
+    }
+
+    pub fn iter(&self) -> IoBufferRegionIter<'_> {
+        IoBufferRegionIter::new(self.page_frames(), self.frame_offset, self.byte_len)
     }
 
     pub fn replace_page_frames(
@@ -790,6 +963,15 @@ impl<'a> IoBufferInner<'a> {
     }
 }
 
+impl<'inner, 'a> IntoIterator for &'inner IoBufferInner<'a> {
+    type Item = IoBufferRegion<'inner>;
+    type IntoIter = IoBufferRegionIter<'inner>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 #[repr(C)]
 #[derive(RequestPayload)]
 pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
@@ -854,6 +1036,21 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
 
     pub fn dma_segments(&self) -> &[IoBufferDmaSegment] {
         self.inner.dma_segments()
+    }
+
+    pub fn iter(&self) -> IoBufferRegionIter<'_> {
+        self.inner.iter()
+    }
+}
+
+impl<'iter, 'a, State: IoBufferState, Direction: IoBufferDirection> IntoIterator
+    for &'iter IoBuffer<'a, State, Direction>
+{
+    type Item = IoBufferRegion<'iter>;
+    type IntoIter = IoBufferRegionIter<'iter>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 

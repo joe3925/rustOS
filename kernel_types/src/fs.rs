@@ -609,6 +609,15 @@ impl Path {
         if comp.is_empty() {
             return;
         }
+
+        if comp == "." || comp == ".." {
+            panic!("Invalid path component '{}'", comp);
+        }
+
+        if comp.as_bytes().iter().any(|&b| b == b'/' || b == b'\\') {
+            panic!("Path::push expects a single component, got '{}'", comp);
+        }
+
         self.push_in_place(comp);
     }
 

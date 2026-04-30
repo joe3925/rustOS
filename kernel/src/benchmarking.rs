@@ -2088,15 +2088,15 @@ pub fn benchmark_async() {
 // Benchmark
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
-const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 128 * 1024 * 1024;
+const DISK_BENCH_FILE: &str = "io_bench.bin";
+const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
     512 * 1024,
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
-    64 * 1024 * 1024,
+    //64 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -2147,7 +2147,7 @@ pub fn bench_c_drive_io() {
 
 pub async fn bench_c_drive_io_async() {
     // Ensure the target directory exists so the benchmark file can be created.
-    let dir_path = Path::from_string(DISK_BENCH_DIR);
+    let mut dir_path = Path::from_string(DISK_BENCH_DIR);
     if let Err(e) = File::make_dir(&dir_path).await {
         println!(
             "[disk-bench] failed to create bench dir {}: {:?}",
@@ -2155,10 +2155,9 @@ pub async fn bench_c_drive_io_async() {
         );
         return;
     }
-
-    let test_path = Path::from_string(DISK_BENCH_FILE);
+    dir_path.push(DISK_BENCH_FILE);
     let mut file = match File::open(
-        &test_path,
+        &dir_path,
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
