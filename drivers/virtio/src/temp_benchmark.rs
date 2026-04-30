@@ -525,7 +525,7 @@ pub async fn bench_sweep_params(
     let mut result = BenchSweepResult::default();
     let current_sector: u64 = params.start_sector;
     for level in levels {
-        println!("Starting level: {}", level);
+        //println!("Starting level: {}", level);
         if (result.used as usize) >= result.levels.len() {
             break;
         }

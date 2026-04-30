@@ -180,7 +180,7 @@ impl Vfs {
             println!("Send request failed with status: {}", status);
             return Err(status);
         }
-
+        // TODO: debug further there is some type of double free of the data
         if let Some(res) = borrow.handle().write().data().read_only().view::<TResult>() {
             return Ok(res.clone());
         } else {
@@ -727,7 +727,7 @@ impl Vfs {
             Err(e) => {
                 return (
                     FsListDirResult {
-                        names: Vec::new(),
+                        names: None,
                         error: Some(e),
                     },
                     DriverStatus::Success,
@@ -747,7 +747,7 @@ impl Vfs {
             Ok(r) => (r, DriverStatus::Success),
             Err(st) => (
                 FsListDirResult {
-                    names: Vec::new(),
+                    names: None,
                     error: Some(FileStatus::UnknownFail),
                 },
                 st,

@@ -523,9 +523,12 @@ async fn execute_fs_work(
                     return DriverStatus::InvalidParameter;
                 };
                 match list_names(&mut *fs, &p.path).await {
-                    Ok(names) => FsListDirResult { names, error: None },
+                    Ok(names) => FsListDirResult {
+                        names: Some(names),
+                        error: None,
+                    },
                     Err(e) => FsListDirResult {
-                        names: Vec::new(),
+                        names: None,
                         error: Some(map_fatfs_err(&e)),
                     },
                 }

@@ -40,7 +40,7 @@ const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 fn has_from_device_buffer(
-    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::FromDevice>,
+    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::Writable>,
     len: usize,
 ) -> bool {
     data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
@@ -51,7 +51,7 @@ fn has_from_device_buffer(
 }
 
 fn has_to_device_buffer(
-    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ToDevice>,
+    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ReadOnly>,
     len: usize,
 ) -> bool {
     data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()

@@ -6,6 +6,7 @@
 #![feature(const_type_name)]
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
+#![feature(const_trait_impl)]
 extern crate alloc;
 extern crate self as kernel_types;
 

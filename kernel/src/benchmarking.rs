@@ -36,7 +36,7 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -2015,7 +2015,15 @@ fn ilog2_u64(mut x: u64) -> u32 {
 }
 
 async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
-    let try_existing = File::open(path, &[OpenFlags::Open, OpenFlags::WriteOnly]).await;
+    let try_existing = File::open(
+        path,
+        &[
+            OpenFlags::Open,
+            OpenFlags::WriteOnly,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await;
 
     if try_existing.is_ok() {
         return try_existing;
@@ -2023,13 +2031,27 @@ async fn open_for_append(path: &Path) -> Result<File, FileStatus> {
 
     File::open(
         path,
-        &[OpenFlags::Create, OpenFlags::Open, OpenFlags::WriteOnly],
+        &[
+            OpenFlags::Create,
+            OpenFlags::Open,
+            OpenFlags::WriteOnly,
+            OpenFlags::WriteThrough,
+        ],
     )
     .await
 }
 
 async fn ensure_csv_header(path: &Path, header: &str) -> Result<(), FileStatus> {
-    if let Ok(f) = File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
+    if let Ok(f) = File::open(
+        path,
+        &[
+            OpenFlags::Open,
+            OpenFlags::ReadOnly,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await
+    {
         if f.size != 0 {
             return Ok(());
         }
@@ -2067,14 +2089,14 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 512 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    2 * 1024 * 1024,
-    4 * 1024 * 1024,
-    64 * 1024 * 1024,
+    // 512 * 1024,
+    // 1024 * 1024,
+    // 2 * 1024 * 1024,
+    // 4 * 1024 * 1024,
+    // 64 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -2172,22 +2194,6 @@ pub async fn bench_c_drive_io_async() {
             return;
         }
     }
-
-    let span_cfg = BenchWindowConfig {
-        name: "disk-io-spans",
-        folder: "C:\\system\\logs",
-        log_samples: false,
-        log_spans: true,
-        disable_per_core: true,
-        log_mem_on_persist: false,
-        end_on_drop: false,
-        timeout_ms: None,
-        auto_persist_secs: None,
-        sample_reserve: 64,
-        span_reserve: 4096,
-    };
-    let span_window = BenchWindow::new(span_cfg);
-    span_window.start();
 
     let mut size_bytes: Vec<u64> = Vec::new();
     let mut write_ns_per_op: Vec<u64> = Vec::new();
@@ -2358,8 +2364,6 @@ pub async fn bench_c_drive_io_async() {
             ops_10
         );
     }
-
-    span_window.stop_and_persist().await;
 }
 
 pub async fn benchmark_async_async() {

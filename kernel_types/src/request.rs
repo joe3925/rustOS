@@ -5,6 +5,7 @@ use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicBool;
 use core::{
     alloc::Layout,
     marker::PhantomData,
@@ -73,8 +74,7 @@ impl core::fmt::Debug for InlineBuffer {
 }
 
 /// Dropper function signature - only does drop_in_place, never deallocates
-type DropperFn = fn(*mut u8);
-
+type DropperFn = extern "win64" fn(*mut u8);
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be used as RequestPayload without an outer layout guarantee",
     label = "missing outer layout guarantee for `{Self}`",
@@ -284,12 +284,12 @@ impl core::fmt::Debug for RequestData {
 
 /// Marker for request data flowing toward a lower device.
 #[derive(Debug, Clone, Copy)]
-pub struct ToDevice;
+pub struct ReadOnly;
 
 /// Marker for request data flowing back from a lower device, or owned by the request and thus
 /// still mutable/replaceable.
 #[derive(Debug, Clone, Copy)]
-pub struct FromDevice;
+pub struct Writable;
 
 /// Shared directional request-data view.
 #[derive(Debug)]
@@ -319,7 +319,7 @@ impl<'a, Direction> RequestDataRefMut<'a, Direction> {
     }
 
     #[inline]
-    pub fn read_only(self) -> RequestDataRef<'a, ToDevice> {
+    pub fn read_only(self) -> RequestDataRef<'a, ReadOnly> {
         RequestDataRef {
             data: &*self.data,
             _direction: PhantomData,
@@ -327,25 +327,29 @@ impl<'a, Direction> RequestDataRefMut<'a, Direction> {
     }
 }
 
-impl<'a> RequestDataRefMut<'a, FromDevice> {
+impl<'a> RequestDataRefMut<'a, Writable> {
     #[inline]
     pub fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
         unsafe { self.data.view_mut::<T>() }
+    }
+    #[inline]
+    pub fn try_take<T: 'static + RequestPayload>(&mut self) -> Option<T> {
+        self.data.try_take::<T>()
     }
 }
 
 /// Runtime view over the currently installed request payload.
 #[derive(Debug)]
 pub enum RequestDataView<'a> {
-    ToDevice(RequestDataRef<'a, ToDevice>),
-    FromDevice(RequestDataRefMut<'a, FromDevice>),
+    ToDevice(RequestDataRef<'a, ReadOnly>),
+    FromDevice(RequestDataRefMut<'a, Writable>),
 }
 
 impl<'a> RequestDataView<'a> {
     /// Obtain a shared `ToDevice` view regardless of the backing mode so callers that only need
     /// read access do not need to match on direction first.
     #[inline]
-    pub fn read_only(self) -> RequestDataRef<'a, ToDevice> {
+    pub fn read_only(self) -> RequestDataRef<'a, ReadOnly> {
         match self {
             Self::ToDevice(view) => view,
             Self::FromDevice(view) => view.read_only(),
@@ -354,7 +358,7 @@ impl<'a> RequestDataView<'a> {
 }
 impl PnpRequest {
     #[inline]
-    pub fn data_out_ref(&self) -> RequestDataRef<'_, ToDevice> {
+    pub fn data_out_ref(&self) -> RequestDataRef<'_, ReadOnly> {
         RequestDataRef {
             data: &self.data_out,
             _direction: PhantomData,
@@ -465,7 +469,7 @@ pub const fn type_tag<T: ?Sized>() -> u64 {
 }
 
 /// No-op dropper for raw bytes or empty data
-fn noop_dropper(_: *mut u8) {}
+extern "win64" fn noop_dropper(_: *mut u8) {}
 
 impl RequestData {
     pub fn empty() -> Self {
@@ -501,7 +505,7 @@ impl RequestData {
         let align = align_of::<T>();
 
         /// Typed dropper that only runs T's destructor (no deallocation)
-        fn typed_dropper<T>(ptr: *mut u8) {
+        extern "win64" fn typed_dropper<T>(ptr: *mut u8) {
             unsafe { core::ptr::drop_in_place(ptr as *mut T) };
         }
 

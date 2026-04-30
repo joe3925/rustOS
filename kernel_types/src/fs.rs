@@ -2,7 +2,9 @@ use crate::status::FileStatus;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::hint::black_box;
 use core::ptr;
+use core::sync::atomic::AtomicU64;
 use kernel_macros;
 #[repr(C)]
 pub struct File {
@@ -256,14 +258,12 @@ pub struct FsRenameResult {
 pub struct FsListDirParams {
     pub path: Path,
 }
-
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsListDirResult {
-    pub names: Vec<String>,
+    pub names: Option<Vec<String>>,
     pub error: Option<FileStatus>,
 }
-
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsGetInfoParams {

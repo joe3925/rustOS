@@ -1,5 +1,6 @@
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
 use crate::util::trigger_triple_fault;
+use crate::util::DRIVE_WINDOW;
 use alloc::{
     string::{String, ToString},
     vec::Vec,
@@ -12,6 +13,7 @@ use kernel_types::{
 };
 use rand_core::block;
 
+use crate::file_system::file_provider::provider;
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     drivers::interrupt_index::wait_duration,
@@ -22,7 +24,6 @@ use crate::{
     scheduling::runtime::runtime::spawn_detached,
     util::TOTAL_TIME,
 };
-use crate::{file_system::file_provider::provider, util::BOOT_WINDOW};
 
 #[derive(Debug)]
 pub struct File {
@@ -126,9 +127,9 @@ impl File {
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
-        match r.error {
-            None => Ok(r.names),
-            Some(e) => Err(e),
+        match &r.names {
+            Some(names) => Ok(names.clone()),
+            None => Err(r.error.expect("Names is none but there is no error")),
         }
     }
 
@@ -357,12 +358,12 @@ impl Drop for File {
     }
 }
 
-async fn list(dir: &Path) -> alloc::vec::Vec<alloc::string::String> {
+async fn list(dir: &Path) -> Option<alloc::vec::Vec<alloc::string::String>> {
     let (res, _) = provider().list_dir_path(dir).await;
     if res.error.is_none() {
-        res.names
+        res.names.clone()
     } else {
-        alloc::vec::Vec::new()
+        None
     }
 }
 
@@ -400,7 +401,6 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     let used_bytes = USED_MEMORY.load(core::sync::atomic::Ordering::Acquire);
     let used_mib = used_bytes / (1024 * 1024);
     let used_mib_frac = (used_bytes % (1024 * 1024)) * 1000 / (1024 * 1024);
-    BOOT_WINDOW.stop_and_persist().await;
     println!(
         "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
         secs, frac, used_mib, used_mib_frac
@@ -411,11 +411,14 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     spawn_blocking(|| {
         spawn_detached(async move {
-            loop {
-                bench_c_drive_io_async().await;
-            }
+            // loop {
+            //
+            // }
             // bench_async_vs_sync_call_latency_async().await;
-            //run_virtio_bench_matrix_print().await;
+            DRIVE_WINDOW.start();
+            bench_c_drive_io_async().await;
+            DRIVE_WINDOW.stop_and_persist().await;
+            run_virtio_bench_matrix_print().await;
             //trigger_triple_fault();
         });
     });

@@ -595,7 +595,7 @@ impl<'a> BootstrapProvider<'a> {
             Err(e) => {
                 return (
                     FsListDirResult {
-                        names: Vec::new(),
+                        names: None,
                         error: Some(e),
                     },
                     DriverStatus::Success,
@@ -619,7 +619,7 @@ impl<'a> BootstrapProvider<'a> {
         if !exists {
             return (
                 FsListDirResult {
-                    names: Vec::new(),
+                    names: None,
                     error: Some(FileStatus::PathNotFound),
                 },
                 DriverStatus::Success,
@@ -628,14 +628,17 @@ impl<'a> BootstrapProvider<'a> {
         if !is_dir {
             return (
                 FsListDirResult {
-                    names: Vec::new(),
+                    names: None,
                     error: Some(FileStatus::BadPath),
                 },
                 DriverStatus::Success,
             );
         }
         (
-            FsListDirResult { names, error: None },
+            FsListDirResult {
+                names: Some(names),
+                error: None,
+            },
             DriverStatus::Success,
         )
     }

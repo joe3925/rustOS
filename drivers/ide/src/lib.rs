@@ -22,6 +22,10 @@ use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
     IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
+use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
+use kernel_api::kernel_types::dma::{
+    Described, FromDevice, IoBuffer, IoBufferPageFrame, PhysFramed, ToDevice,
+};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::IrqMeta;
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -31,15 +35,11 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IoBuffer, IoBufferPageFrame, PhysFramed, ToDevice,
-};
 use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
 use kernel_api::x86_64::instructions::port::Port;
-use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 
 use dev_ext::{ControllerState, DevExt, Ports};
 
@@ -165,7 +165,7 @@ impl<'a> PhysCursor<'a> {
 }
 
 fn has_from_device_buffer(
-    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::FromDevice>,
+    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::Writable>,
     len: usize,
 ) -> bool {
     data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
@@ -176,7 +176,7 @@ fn has_from_device_buffer(
 }
 
 fn has_to_device_buffer(
-    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ToDevice>,
+    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ReadOnly>,
     len: usize,
 ) -> bool {
     data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()
@@ -262,7 +262,14 @@ async fn ide_pnp_start<'a, 'b>(
         }
         let binding = child_handle.read();
         let bars = {
-            let data = binding.pnp.as_ref().unwrap().data_out_ref().view::<Vec<u8>>().map(|v| v.as_slice()).unwrap_or(&[]);
+            let data = binding
+                .pnp
+                .as_ref()
+                .unwrap()
+                .data_out_ref()
+                .view::<Vec<u8>>()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             parse_ide_bars(data)
         };
 

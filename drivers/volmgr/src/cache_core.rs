@@ -16,10 +16,12 @@ use kernel_api::kernel_types::dma::{
     PhysFramed, ToDevice,
 };
 use kernel_api::kernel_types::request::RequestData;
+use kernel_api::memory::virt_to_phys;
 use kernel_api::println;
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
+use kernel_api::x86_64::VirtAddr;
 use spin::{Mutex, RwLock, RwLockReadGuard};
 
 struct StatsInner {
@@ -94,6 +96,7 @@ impl<const BLOCK_SIZE: usize> PageBuf<BLOCK_SIZE> {
 
 struct Page<const BLOCK_SIZE: usize> {
     data: RwLock<Box<PageBuf<BLOCK_SIZE>>>,
+    data_phys_frames: Box<[IoBufferPageFrame]>,
     dirty: AtomicBool,
     writeback: AtomicBool,
     generation: AtomicU64,
@@ -104,16 +107,52 @@ struct Page<const BLOCK_SIZE: usize> {
 }
 
 impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
-    fn new_zeroed() -> Self {
-        Self {
-            data: RwLock::new(PageBuf::zeroed()),
+    fn new_zeroed() -> Option<Self> {
+        let data = PageBuf::zeroed();
+        let data_phys_frames = Self::describe_data_phys_frames(&data)?;
+
+        Some(Self {
+            data: RwLock::new(data),
+            data_phys_frames,
             dirty: AtomicBool::new(false),
             writeback: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             wb_generation: AtomicU64::new(0),
             active_ops: AtomicUsize::new(0),
             owner: AtomicU64::new(0),
+        })
+    }
+
+    fn describe_data_phys_frames(data: &PageBuf<BLOCK_SIZE>) -> Option<Box<[IoBufferPageFrame]>> {
+        let frame_count = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
+        if frame_count > IOBUFFER_MAX_FRAME_CAPACITY {
+            return None;
         }
+
+        let mut frames = Vec::with_capacity(frame_count);
+        let base = data.bytes.as_ptr() as u64;
+        let mut offset = 0usize;
+
+        while offset < BLOCK_SIZE {
+            let virt_addr = base.checked_add(offset as u64)?;
+            let phys_addr = virt_to_phys(VirtAddr::new(virt_addr))?.as_u64();
+            if phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0 {
+                return None;
+            }
+
+            frames.push(IoBufferPageFrame {
+                phys_addr,
+                byte_len: IOBUFFER_PAGE_SIZE as u64,
+            });
+
+            offset = offset.checked_add(IOBUFFER_PAGE_SIZE)?;
+        }
+
+        Some(frames.into_boxed_slice())
+    }
+
+    fn data_phys_frames(&self) -> &[IoBufferPageFrame] {
+        &self.data_phys_frames
     }
 
     fn mark_dirty(&self) -> bool {
@@ -188,17 +227,17 @@ struct PagePool<const BLOCK_SIZE: usize> {
 }
 
 impl<const BLOCK_SIZE: usize> PagePool<BLOCK_SIZE> {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Option<Self> {
         let mut free = Vec::with_capacity(capacity);
         let mut i = 0usize;
         while i < capacity {
-            free.push(Arc::new(Page::new_zeroed()));
+            free.push(Arc::new(Page::new_zeroed()?));
             i += 1;
         }
 
-        Self {
+        Some(Self {
             free: Mutex::new(free),
-        }
+        })
     }
 
     fn pop(&self) -> Option<Arc<Page<BLOCK_SIZE>>> {
@@ -363,7 +402,7 @@ where
         let page_pool = if cfg.lazy_page_allocation {
             None
         } else {
-            Some(PagePool::new(cfg.capacity_blocks))
+            Some(PagePool::new(cfg.capacity_blocks).ok_or(CacheError::InvalidIoBuffer)?)
         };
 
         Ok(Self {
@@ -581,7 +620,9 @@ where
         lba: u64,
     ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
         if self.cfg.lazy_page_allocation {
-            return Ok(Arc::new(Page::new_zeroed()));
+            return Ok(Arc::new(
+                Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?,
+            ));
         }
 
         if let Some(pool) = &self.page_pool {
@@ -668,7 +709,7 @@ where
         &self,
         lba: u64,
     ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = Arc::new(Page::new_zeroed());
+        let mut page = Arc::new(Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?);
         self.read_block_into_unique_page(lba, &mut page).await?;
         Ok(page)
     }
@@ -714,7 +755,7 @@ where
         &self,
         src: &[u8],
     ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        let mut page = Arc::new(Page::new_zeroed());
+        let mut page = Arc::new(Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?);
         Self::fill_unique_page_from_full_block_write(&mut page, src)?;
         Ok(page)
     }
@@ -1167,61 +1208,6 @@ where
         }
     }
 
-    fn append_described_4k_frames(
-        described: &IoBuffer<'_, Described, ToDevice>,
-        frames: &mut Vec<IoBufferPageFrame>,
-    ) -> Result<(), CacheError<B::Error>> {
-        let mut remaining = described.len();
-        let mut first = true;
-
-        for source_frame in described.physical_frames() {
-            if remaining == 0 {
-                break;
-            }
-
-            let mut source_offset = if first { described.frame_offset() } else { 0 };
-            first = false;
-
-            if source_offset >= source_frame.byte_len as usize {
-                return Err(CacheError::InvalidIoBuffer);
-            }
-
-            let mut available = (source_frame.byte_len as usize)
-                .saturating_sub(source_offset)
-                .min(remaining);
-
-            while available != 0 {
-                if frames.len() >= IOBUFFER_MAX_FRAME_CAPACITY {
-                    return Err(CacheError::InvalidIoBuffer);
-                }
-
-                let phys_addr = source_frame
-                    .phys_addr
-                    .checked_add(source_offset as u64)
-                    .ok_or(CacheError::InvalidIoBuffer)?;
-                if phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0 {
-                    return Err(CacheError::InvalidIoBuffer);
-                }
-
-                frames.push(IoBufferPageFrame {
-                    phys_addr,
-                    byte_len: IOBUFFER_PAGE_SIZE as u64,
-                });
-
-                let chunk = available.min(IOBUFFER_PAGE_SIZE);
-                remaining -= chunk;
-                available -= chunk;
-                source_offset += chunk;
-            }
-        }
-
-        if remaining != 0 {
-            return Err(CacheError::InvalidIoBuffer);
-        }
-
-        Ok(())
-    }
-
     async fn flush_prepared_run(
         backend: &Arc<B>,
         stats: &Arc<StatsInner>,
@@ -1244,18 +1230,17 @@ where
 
         for prepared in run {
             let guard = prepared.page.data.read();
+            let page_frames = prepared.page.data_phys_frames();
+            if frames
+                .len()
+                .checked_add(page_frames.len())
+                .is_none_or(|len| len > IOBUFFER_MAX_FRAME_CAPACITY)
             {
-                let described = IoBuffer::<Described, ToDevice>::new(&guard.bytes[..]);
-                if described.len() != BLOCK_SIZE {
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                    return Err(CacheError::InvalidIoBuffer);
-                }
-
-                if let Err(err) = Self::append_described_4k_frames(&described, &mut frames) {
-                    Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                    return Err(err);
-                }
+                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                return Err(CacheError::InvalidIoBuffer);
             }
+            frames.extend_from_slice(page_frames);
+
             write_len = write_len
                 .checked_add(BLOCK_SIZE)
                 .ok_or(CacheError::OffsetOverflow)?;
