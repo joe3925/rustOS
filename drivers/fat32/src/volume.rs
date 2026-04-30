@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
     Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
-    NullTimeProvider, Read, Seek, SeekFrom, Write,
+    NullTimeProvider, Read, SeekFrom, Write,
 };
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::println;
@@ -76,6 +76,7 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         fatfs::Error::InvalidInput => FileStatus::BadPath,
         fatfs::Error::NotEnoughSpace => FileStatus::NoSpace,
         fatfs::Error::CorruptedFileSystem => FileStatus::CorruptFilesystem,
+        fatfs::Error::FileTooLarge => FileStatus::FileTooLarge,
         e => {
             println!("Mapping {:#?} to UnknownFail", e);
             FileStatus::UnknownFail
@@ -88,7 +89,8 @@ async fn create_entry(fs: &mut Fs, path: &Path, dir: bool) -> Result<(), FsError
     if dir {
         let _ = fs.root_dir().create_dir(path_str).await?;
     } else {
-        let _ = fs.root_dir().create_file(path_str).await?;
+        let mut file = fs.root_dir().create_file(path_str).await?;
+        file.flush().await?;
     }
     Ok(())
 }
@@ -114,11 +116,17 @@ async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
 
 async fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
     let mut file = fs.root_dir().open_file(path.as_str()).await?;
-    file.seek(SeekFrom::End(0)).await
+    let res = file.seek(SeekFrom::End(0)).await;
+    file.flush().await?;
+    res
 }
 
 async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
     let old_size = file.seek(SeekFrom::End(0)).await?;
+    // The resize will fail
+    if new_size as u32 > u32::MAX {
+        return Err(FsError::FileTooLarge);
+    }
     if new_size <= old_size {
         file.seek(SeekFrom::Start(new_size)).await?;
         file.truncate().await?;
@@ -239,10 +247,16 @@ async fn execute_fs_work(
                 let path_str = path.as_str();
                 let root = fs.root_dir();
                 let open_res = match root.open_file(path_str).await {
-                    Ok(mut f) => match f.seek(SeekFrom::End(0)).await {
-                        Ok(end) => Ok((false, end)),
-                        Err(e) => Err(e),
-                    },
+                    Ok(mut f) => {
+                        let res = match f.seek(SeekFrom::End(0)).await {
+                            Ok(end) => Ok((false, end)),
+                            Err(e) => Err(e),
+                        };
+                        match f.flush().await {
+                            Ok(_) => res,
+                            Err(e) => Err(e),
+                        }
+                    }
                     Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
                         match root.open_dir(path_str).await {
                             Ok(_d) => Ok((true, 0)),
@@ -335,13 +349,17 @@ async fn execute_fs_work(
                     Some((_, true)) => Err(FileStatus::AccessDenied),
                     Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => {
-                            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+                            let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
                                 match file.read(buf).await {
                                     Ok(n) => Ok(n),
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
+                            };
+                            match file.flush().await {
+                                Ok(_) => res,
+                                Err(e) => Err(map_fatfs_err(&e)),
                             }
                         }
                         Err(e) => Err(map_fatfs_err(&e)),
@@ -401,7 +419,7 @@ async fn execute_fs_work(
                     Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
                         Ok(mut file) => {
                             let n = data.len();
-                            if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+                            let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
                                 match file.write_all(data).await {
@@ -413,6 +431,10 @@ async fn execute_fs_work(
                                     }
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
+                            };
+                            match file.flush().await {
+                                Ok(_) => res,
+                                Err(e) => Err(map_fatfs_err(&e)),
                             }
                         }
                         Err(e) => Err(map_fatfs_err(&e)),
@@ -643,7 +665,7 @@ async fn execute_fs_work(
                         match fs.root_dir().open_file(path.as_str()).await {
                             Ok(mut file) => {
                                 let start_off = size;
-                                match file.seek(SeekFrom::Start(start_off)).await {
+                                let res = match file.seek(SeekFrom::Start(start_off)).await {
                                     Ok(_) => {
                                         let n = data.len();
                                         match file.write_all(data).await {
@@ -656,6 +678,10 @@ async fn execute_fs_work(
                                             Err(e) => Err(map_fatfs_err(&e)),
                                         }
                                     }
+                                    Err(e) => Err(map_fatfs_err(&e)),
+                                };
+                                match file.flush().await {
+                                    Ok(_) => res,
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
                             }
@@ -712,7 +738,7 @@ async fn execute_fs_work(
                         Ok(mut file) => {
                             let file_len = file.seek(SeekFrom::End(0)).await.unwrap_or(0);
                             let end = offset.saturating_add(len);
-                            if offset > file_len {
+                            let res = if offset > file_len {
                                 Some(FileStatus::BadPath)
                             } else {
                                 let actual_end = end.min(file_len);
@@ -734,6 +760,10 @@ async fn execute_fs_work(
                                         Err(e) => Some(map_fatfs_err(&e)),
                                     }
                                 }
+                            };
+                            match file.flush().await {
+                                Ok(_) => res,
+                                Err(e) => Some(map_fatfs_err(&e)),
                             }
                         }
                         Err(e) => Some(map_fatfs_err(&e)),

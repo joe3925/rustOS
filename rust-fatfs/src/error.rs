@@ -26,6 +26,9 @@ pub enum Error<T> {
     InvalidFileNameLength,
     /// The provided file name contains an invalid character.
     UnsupportedFileNameCharacter,
+
+    /// The write would cause the file to exceed the max file size for fat 32
+    FileTooLarge,
 }
 
 impl<T: IoError> From<T> for Error<T> {
@@ -48,6 +51,10 @@ impl<T: core::fmt::Display> core::fmt::Display for Error<T> {
             Error::NotFound => write!(f, "No such file or directory"),
             Error::AlreadyExists => write!(f, "File or directory already exists"),
             Error::CorruptedFileSystem => write!(f, "Corrupted file system"),
+            Error::FileTooLarge => write!(
+                f,
+                "The operation would cause the file to exceed the max file size for fat 32"
+            ),
         }
     }
 }

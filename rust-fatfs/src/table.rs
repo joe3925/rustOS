@@ -176,7 +176,11 @@ where
     Ok(FsStatusFlags { dirty, io_error })
 }
 
-pub(crate) async fn count_free_clusters<S, E>(fat: &mut S, fat_type: FatType, total_clusters: u32) -> Result<u32, Error<E>>
+pub(crate) async fn count_free_clusters<S, E>(
+    fat: &mut S,
+    fat_type: FatType,
+    total_clusters: u32,
+) -> Result<u32, Error<E>>
 where
     S: Read + Seek,
     E: IoError,

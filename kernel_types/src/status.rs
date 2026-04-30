@@ -247,11 +247,11 @@ pub enum TaskError {
 #[derive(Debug, Clone, Copy)]
 #[repr(u32)]
 pub enum FileStatus {
-    Success = 0x00,
-    FileAlreadyExist = 0x01,
-    PathNotFound = 0x02,
-    UnknownFail = 0x03,
-    NotFat = 0x04,
+    Success,
+    FileAlreadyExist,
+    PathNotFound,
+    UnknownFail,
+    NotFat,
     DriveNotFound,
     IncompatibleFlags,
     CorruptFilesystem,
@@ -259,6 +259,7 @@ pub enum FileStatus {
     BadPath,
     AccessDenied,
     NoSpace,
+    FileTooLarge,
 }
 
 impl FileStatus {
@@ -276,6 +277,7 @@ impl FileStatus {
             FileStatus::BadPath => "Invalid path",
             FileStatus::AccessDenied => "Insufficient permissions to access the current file",
             FileStatus::NoSpace => "Insufficient space on drive to write the requested data",
+            FileStatus::FileTooLarge => "The op would cause the file to exceed the max file size",
         }
     }
 }

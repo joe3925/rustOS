@@ -36,7 +36,7 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = true;
+const BENCH_ENABLED: bool = false;
 
 const MAX_STACK_DEPTH: usize = 8;
 const BENCH_RING_CAPACITY: usize = 8192;
@@ -2089,14 +2089,14 @@ pub fn benchmark_async() {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "C:\\bench\\io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     64 * 1024,
-    // 512 * 1024,
+    512 * 1024,
     // 1024 * 1024,
     // 2 * 1024 * 1024,
     // 4 * 1024 * 1024,
-    // 64 * 1024 * 1024,
+    64 * 1024 * 1024,
 ];
 
 #[inline(always)]

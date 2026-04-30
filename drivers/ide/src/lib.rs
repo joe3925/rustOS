@@ -493,30 +493,41 @@ pub async fn ide_pdo_read<'a, 'b>(
     let irq = unsafe { dx.irq() };
 
     let mut ctrl = dx.controller.lock().await;
-    let mut data = match req.data() {
+    let data = match req.data() {
         RequestDataView::FromDevice(data) => data,
         RequestDataView::ToDevice(_) => return complete_req(req, DriverStatus::InvalidParameter),
     };
-    let ok = if let Some(buf) = data.view_mut::<IoBuffer<'_, PhysFramed, FromDevice>>() {
-        ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await
+    let read_status = if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, FromDevice>>() {
+        if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await {
+            DriverStatus::Success
+        } else {
+            DriverStatus::Unsuccessful
+        }
     } else {
-        let buf = &mut data
-            .view_mut::<IoBuffer<'_, Described, FromDevice>>()
-            .expect("read req missing buffer")
-            .as_mut_slice()[..len];
-        ata_pio_read_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
+        let described = data
+            .view::<IoBuffer<'_, Described, FromDevice>>()
+            .expect("read req missing buffer");
+        match IoBuffer::<PhysFramed, FromDevice>::new(
+            described.frame_offset(),
+            len,
+            described.physical_frames(),
+        ) {
+            Ok(phys_buf) => {
+                if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, &phys_buf, len)
+                    .await
+                {
+                    DriverStatus::Success
+                } else {
+                    DriverStatus::Unsuccessful
+                }
+            }
+            Err(_) => DriverStatus::InsufficientResources,
+        }
     };
     drop(ctrl);
     drop(data);
 
-    complete_req(
-        req,
-        if ok {
-            DriverStatus::Success
-        } else {
-            DriverStatus::Unsuccessful
-        },
-    )
+    complete_req(req, read_status)
 }
 
 #[request_handler]
@@ -814,67 +825,6 @@ fn ata_identify_words_sync(ports: &mut Ports, dh: u8) -> Option<[u16; 256]> {
 
 fn ata_probe_drive_sync(ports: &mut Ports, dh: u8) -> bool {
     ata_identify_words_sync(ports, dh).is_some()
-}
-
-async fn ata_pio_read_async(
-    ctrl: &mut ControllerState,
-    irq: &Option<IrqHandle>,
-    dh: u8,
-    mut lba: u32,
-    mut sectors: u32,
-    out: &mut [u8],
-) -> bool {
-    let mut off = 0usize;
-    let p = &mut ctrl.ports;
-
-    while sectors > 0 {
-        let chunk = core::cmp::min(sectors, 256);
-        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-        unsafe { p.drive_head.write(devsel) };
-        io_wait_400ns(&mut p.control);
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        unsafe {
-            p.sector_count.write(sc);
-            p.lba_lo.write((lba & 0xFF) as u8);
-            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-            p.command.write(ATA_CMD_READ_SECTORS);
-        }
-
-        for _ in 0..chunk {
-            if !wait_drq_async(p, irq, TIMEOUT_MS).await {
-                return false;
-            }
-            let st = unsafe { p.command.read() };
-            if (st & ATA_SR_DRQ) == 0 {
-                return false;
-            }
-            if off + 512 > out.len() {
-                return false;
-            }
-            for _ in 0..256 {
-                let w: u16 = unsafe { p.data.read() };
-                out[off] = (w & 0xFF) as u8;
-                out[off + 1] = (w >> 8) as u8;
-                off += 2;
-            }
-        }
-
-        lba = lba.wrapping_add(chunk);
-        sectors -= chunk;
-    }
-
-    true
 }
 
 async fn ata_pio_read_phys_async(

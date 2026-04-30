@@ -418,7 +418,8 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
             DRIVE_WINDOW.start();
             bench_c_drive_io_async().await;
             DRIVE_WINDOW.stop_and_persist().await;
-            run_virtio_bench_matrix_print().await;
+            //run_virtio_bench_matrix_print().await;
+
             //trigger_triple_fault();
         });
     });

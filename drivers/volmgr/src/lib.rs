@@ -18,7 +18,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -83,87 +83,69 @@ impl CacheBackend {
 impl VolumeCacheBackend for CacheBackend {
     type Error = DriverStatus;
 
-    fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>> {
+    fn read_phys_framed<'a, 'buffer>(
+        &'a self,
+        lba: u64,
+        blocks: usize,
+        buffer: &'a mut IoBuffer<'buffer, PhysFramed, FromDevice>,
+    ) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
-            let block_len = match self.block_len(lba) {
-                Some(block_len) => block_len,
-                None => {
-                    println!(
-                        "volmgr: CacheBackend::read_block invalid lba {} for volume length {}",
-                        lba, self.volume_bytes
-                    );
-                    return Err(DriverStatus::InvalidParameter);
-                }
-            };
-
-            let offset = lba * BLOCK_SIZE as u64;
-            let len = block_len;
-
-            let mut req =
-                RequestHandle::new(RequestType::Read { offset, len }, RequestData::empty());
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
-            let status = {
-                let mut io_buf = IoBuffer::<Described, FromDevice>::new(&mut out[..len]);
-                let mut borrow = BorrowedHandle::writable(&mut req, &mut io_buf);
-                pnp_send_request(self.target.clone(), borrow.handle()).await
-            };
-
-            if status != DriverStatus::Success {
-                println!(
-                    "volmgr: CacheBackend::read_block lower read failed at lba {} offset {} len {}: {}",
-                    lba, offset, len, status
-                );
-                return Err(status);
+            if blocks == 0 {
+                return Ok(0);
             }
 
-            if len < out.len() {
-                out[len..].fill(0);
+            let offset = lba
+                .checked_mul(BLOCK_SIZE as u64)
+                .ok_or(DriverStatus::InvalidParameter)?;
+            let mut total_len = 0usize;
+            let mut block_idx = 0usize;
+            while block_idx < blocks {
+                let block_lba = lba
+                    .checked_add(block_idx as u64)
+                    .ok_or(DriverStatus::InvalidParameter)?;
+                let block_len = match self.block_len(block_lba) {
+                    Some(block_len) => block_len,
+                    None => {
+                        println!(
+                            "volmgr: CacheBackend::read_phys_framed invalid lba {} for volume length {}",
+                            block_lba, self.volume_bytes
+                        );
+                        return Err(DriverStatus::InvalidParameter);
+                    }
+                };
+                total_len = total_len
+                    .checked_add(block_len)
+                    .ok_or(DriverStatus::InvalidParameter)?;
+                block_idx += 1;
             }
-            Ok(())
-        }
-        .into_ffi()
-    }
 
-    fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>> {
-        async move {
-            let block_len = match self.block_len(lba) {
-                Some(block_len) => block_len,
-                None => {
-                    println!(
-                        "volmgr: CacheBackend::write_block invalid lba {} for volume length {}",
-                        lba, self.volume_bytes
-                    );
-                    return Err(DriverStatus::InvalidParameter);
-                }
-            };
+            if buffer.len() < total_len {
+                return Err(DriverStatus::InvalidParameter);
+            }
 
-            let offset = lba * BLOCK_SIZE as u64;
             let mut req = RequestHandle::new(
-                RequestType::Write {
+                RequestType::Read {
                     offset,
-                    len: block_len,
-                    flush_write_through: false,
-                    owner: 0,
+                    len: total_len,
                 },
                 RequestData::empty(),
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let io_buf = IoBuffer::<Described, ToDevice>::new(&data[..block_len]);
             let status = {
-                let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+                let mut borrow = BorrowedHandle::writable(&mut req, buffer);
                 pnp_send_request(self.target.clone(), borrow.handle()).await
             };
 
             if status != DriverStatus::Success {
                 println!(
-                    "volmgr: CacheBackend::write_block lower write failed at lba {} offset {} len {}: {}",
-                    lba, offset, block_len, status
+                    "volmgr: CacheBackend::read_phys_framed lower read failed at lba {} blocks {} len {}: {}",
+                    lba, blocks, total_len, status
                 );
                 return Err(status);
             }
-            Ok(())
+
+            Ok(total_len)
         }
         .into_ffi()
     }

@@ -168,11 +168,22 @@ impl BlockDev {
         }
         let cap_bytes = self.capacity_bytes();
         if self.pos >= cap_bytes {
+            println!(
+                "attempt to sec to pos {}, with capacity {}",
+                cap_bytes,
+                self.capacity_bytes()
+            );
             return Ok(0);
         }
-        let len = min(src.len(), (cap_bytes - self.pos) as usize);
+        let len = min(
+            src.len(),
+            (cap_bytes.checked_sub(self.pos).unwrap()) as usize,
+        );
         self.send_write_immut(self.pos, &src[..len]).await?;
         self.pos += len as u64;
+        if (len == 0) {
+            println!("len is zero cap is {}", self.capacity_bytes())
+        }
         Ok(len)
     }
 }

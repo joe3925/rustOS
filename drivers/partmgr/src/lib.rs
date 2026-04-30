@@ -13,6 +13,7 @@ use core::ptr;
 use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_routing::println;
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
     DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo,
 };
@@ -23,7 +24,6 @@ use kernel_api::pnp::{
     pnp_create_child_devnode_and_pdo_with_init, pnp_forward_request_to_next_lower,
     pnp_send_request_to_stack_top,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
@@ -258,7 +258,7 @@ async fn read_from_lower_async(
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let status = {
-        let mut io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]);
+        let mut io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
         let mut borrow = BorrowedHandle::writable(&mut child_req, &mut io_buf);
         pnp_forward_request_to_next_lower(dev.clone(), borrow.handle()).await
     };

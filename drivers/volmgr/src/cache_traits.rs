@@ -1,5 +1,5 @@
 use kernel_api::async_ffi::FfiFuture;
-use kernel_api::kernel_types::dma::{IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::request::RequestHandle;
 
 #[derive(Debug, Clone, Copy)]
@@ -112,8 +112,7 @@ impl<E: Clone> Clone for CacheError<E> {
 /// Implement this on your volume device wrapper (or a small adapter around it).
 ///
 /// Requirements:
-/// - `read_block` and `write_block` must operate on exactly one logical block.
-/// - `out.len()` / `data.len()` will always equal the cache block size (`BLOCK_SIZE`).
+/// - `read_phys_framed` and `write_phys_framed` operate on one or more contiguous logical blocks.
 /// - `lba` is a logical block index, not a byte offset.
 /// - `flush_device` should commit device-side writeback state (if any).
 
@@ -121,8 +120,12 @@ impl<E: Clone> Clone for CacheError<E> {
 pub trait VolumeCacheBackend: Send + Sync + 'static {
     type Error: Send + Sync + core::fmt::Debug + 'static;
 
-    fn read_block<'a>(&'a self, lba: u64, out: &'a mut [u8]) -> FfiFuture<Result<(), Self::Error>>;
-    fn write_block<'a>(&'a self, lba: u64, data: &'a [u8]) -> FfiFuture<Result<(), Self::Error>>;
+    fn read_phys_framed<'a, 'buffer>(
+        &'a self,
+        lba: u64,
+        blocks: usize,
+        buffer: &'a mut IoBuffer<'buffer, PhysFramed, FromDevice>,
+    ) -> FfiFuture<Result<usize, Self::Error>>;
     fn write_request<'a>(
         &'a self,
         req: &'a mut RequestHandle<'_>,

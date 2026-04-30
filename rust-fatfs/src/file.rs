@@ -8,7 +8,7 @@ use crate::time::{Date, DateTime, TimeProvider};
 
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 
-const MAX_FILE_SIZE: u32 = u32::MAX;
+pub const MAX_FILE_SIZE: u32 = u32::MAX;
 
 /// A FAT filesystem file object used for reading and writing data.
 ///
@@ -319,12 +319,14 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
             let cluster_size = self.fs.cluster_size();
             let offset_in_cluster = self.offset % cluster_size;
             let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
-            let bytes_left_until_max_file_size = (MAX_FILE_SIZE - self.offset) as usize;
-            let write_size = buf.len().min(bytes_left_in_cluster).min(bytes_left_until_max_file_size);
-            // Exit early if we are going to write no data
-            if write_size == 0 {
+            let bytes_left_until_max_file_size = u64::from(MAX_FILE_SIZE - self.offset);
+            if buf.is_empty() {
                 return Ok(0);
             }
+            if buf.len() as u64 > bytes_left_until_max_file_size {
+                return Err(Error::FileTooLarge);
+            }
+            let write_size = buf.len().min(bytes_left_in_cluster);
             // Mark the volume 'dirty'
             self.fs.set_dirty_flag(true).await?;
             // Get cluster for write possibly allocating new one
@@ -379,9 +381,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
     }
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move {
-            Self::flush(self).await
-        }.into_ffi()
+        async move { Self::flush(self).await }.into_ffi()
     }
 }
 

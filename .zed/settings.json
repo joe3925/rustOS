@@ -21,6 +21,7 @@
         "linkedProjects": [
           "drivers/Cargo.toml",
           "kernel/Cargo.toml",
+          "rust-fatfs/Cargo.toml",
           "Cargo.toml",
         ],
       },

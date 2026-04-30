@@ -12,8 +12,8 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::dma::{
-    Described, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferPageFrame,
-    PhysFramed, ToDevice,
+    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
+    IoBufferPageFrame, PhysFramed, ToDevice,
 };
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::virt_to_phys;
@@ -695,11 +695,21 @@ where
         page: &mut Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
         let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
-        let data = page.data.get_mut();
-        self.backend
-            .read_block(lba, &mut data.bytes[..])
+        let mut io_buf =
+            IoBuffer::<PhysFramed, FromDevice>::new(0, BLOCK_SIZE, page.data_phys_frames())
+                .map_err(|_| CacheError::InvalidIoBuffer)?;
+        let bytes_read = self
+            .backend
+            .read_phys_framed(lba, 1, &mut io_buf)
             .await
             .map_err(CacheError::Backend)?;
+        if bytes_read > BLOCK_SIZE {
+            return Err(CacheError::InvalidIoBuffer);
+        }
+        if bytes_read < BLOCK_SIZE {
+            let data = page.data.get_mut();
+            data.bytes[bytes_read..].fill(0);
+        }
 
         self.stats.backend_reads.fetch_add(1, Ordering::Relaxed);
         Ok(())
