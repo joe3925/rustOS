@@ -260,53 +260,107 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
     fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::read");
+
+            if buf.is_empty() {
+                return Ok(0);
+            }
+
             let cluster_size = self.fs.cluster_size();
-            let current_cluster_opt = if self.offset % cluster_size == 0 {
-                // next cluster
-                match self.current_cluster {
-                    None => self.first_cluster,
-                    Some(n) => {
-                        let r = self.fs.cluster_iter(n).next().await;
-                        match r {
-                            Some(Err(err)) => return Err(err),
-                            Some(Ok(n)) => Some(n),
-                            None => None,
+            let mut total_read = 0usize;
+
+            while total_read < buf.len() {
+                let offset_in_cluster = self.offset % cluster_size;
+
+                let current_cluster_opt = if offset_in_cluster == 0 {
+                    match self.current_cluster {
+                        None => self.first_cluster,
+                        Some(n) => {
+                            let r = self.fs.cluster_iter(n).next().await;
+                            match r {
+                                Some(Err(err)) => return Err(err),
+                                Some(Ok(n)) => Some(n),
+                                None => None,
+                            }
                         }
                     }
-                }
-            } else {
-                self.current_cluster
-            };
-            let Some(current_cluster) = current_cluster_opt else {
-                return Ok(0);
-            };
-            let offset_in_cluster = self.offset % cluster_size;
-            let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
-            let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(bytes_left_in_cluster);
-            let read_size = buf.len().min(bytes_left_in_cluster).min(bytes_left_in_file);
-            if read_size == 0 {
-                return Ok(0);
-            }
-            trace!("read {} bytes in cluster {}", read_size, current_cluster);
-            let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
-            let read_bytes = {
-                let mut disk = self.fs.disk.borrow_mut();
-                disk.seek(SeekFrom::Start(offset_in_fs))?;
-                disk.read(&mut buf[..read_size]).await?
-            };
-            if read_bytes == 0 {
-                return Ok(0);
-            }
-            self.offset += read_bytes as u32;
-            self.current_cluster = Some(current_cluster);
+                } else {
+                    self.current_cluster
+                };
 
-            if let Some(ref mut e) = self.entry {
-                if self.fs.options.update_accessed_date {
-                    let now = self.fs.options.time_provider.get_current_date();
-                    e.set_accessed(now);
+                let Some(current_cluster) = current_cluster_opt else {
+                    return Ok(total_read);
+                };
+
+                let remaining = &mut buf[total_read..];
+                let bytes_left_in_file = self.bytes_left_in_file().unwrap_or(remaining.len());
+
+                if bytes_left_in_file == 0 {
+                    return Ok(total_read);
+                }
+
+                let max_read_size = remaining.len().min(bytes_left_in_file);
+                let mut read_size = max_read_size.min((cluster_size - offset_in_cluster) as usize);
+                let mut last_cluster = current_cluster;
+
+                while read_size < max_read_size {
+                    let next_cluster = match self.fs.cluster_iter(last_cluster).next().await {
+                        Some(Err(err)) => return Err(err),
+                        Some(Ok(n)) => n,
+                        None => break,
+                    };
+
+                    if next_cluster != last_cluster + 1 {
+                        break;
+                    }
+
+                    last_cluster = next_cluster;
+
+                    let remaining_capacity = max_read_size - read_size;
+                    read_size += remaining_capacity.min(cluster_size as usize);
+                }
+
+                if read_size == 0 {
+                    return Ok(total_read);
+                }
+
+                trace!(
+                    "read {} bytes starting in cluster {} ending in cluster {}",
+                    read_size,
+                    current_cluster,
+                    last_cluster
+                );
+
+                let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+
+                let read_bytes = {
+                    let mut disk = self.fs.disk.borrow_mut();
+                    disk.seek(SeekFrom::Start(offset_in_fs))?;
+                    disk.read(&mut remaining[..read_size]).await?
+                };
+
+                if read_bytes == 0 {
+                    return Ok(total_read);
+                }
+
+                let cluster_advance =
+                    ((u64::from(offset_in_cluster) + read_bytes as u64 - 1) / u64::from(cluster_size)) as u32;
+
+                self.offset += read_bytes as u32;
+                self.current_cluster = Some(current_cluster + cluster_advance);
+
+                total_read += read_bytes;
+            }
+
+            if total_read != 0 {
+                if let Some(ref mut e) = self.entry {
+                    if self.fs.options.update_accessed_date {
+                        let now = self.fs.options.time_provider.get_current_date();
+                        e.set_accessed(now);
+                    }
                 }
             }
-            Ok(read_bytes)
+
+            Ok(total_read)
         }
         .into_ffi()
     }
@@ -316,66 +370,112 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
     fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::write");
-            let cluster_size = self.fs.cluster_size();
-            let offset_in_cluster = self.offset % cluster_size;
-            let bytes_left_in_cluster = (cluster_size - offset_in_cluster) as usize;
-            let bytes_left_until_max_file_size = u64::from(MAX_FILE_SIZE - self.offset);
+
             if buf.is_empty() {
                 return Ok(0);
             }
+
+            let cluster_size = self.fs.cluster_size();
+            let bytes_left_until_max_file_size = u64::from(MAX_FILE_SIZE - self.offset);
+
             if buf.len() as u64 > bytes_left_until_max_file_size {
                 return Err(Error::FileTooLarge);
             }
-            let write_size = buf.len().min(bytes_left_in_cluster);
-            // Mark the volume 'dirty'
+
             self.fs.set_dirty_flag(true).await?;
-            // Get cluster for write possibly allocating new one
-            let current_cluster = if self.offset % cluster_size == 0 {
-                // next cluster
-                let next_cluster = match self.current_cluster {
-                    None => self.first_cluster,
-                    Some(n) => {
-                        let r = self.fs.cluster_iter(n).next().await;
-                        match r {
-                            Some(Err(err)) => return Err(err),
-                            Some(Ok(n)) => Some(n),
-                            None => None,
+
+            let mut total_written = 0usize;
+
+            while total_written < buf.len() {
+                let offset_in_cluster = self.offset % cluster_size;
+                let remaining = &buf[total_written..];
+
+                let current_cluster = if offset_in_cluster == 0 {
+                    let next_cluster = match self.current_cluster {
+                        None => self.first_cluster,
+                        Some(n) => {
+                            let r = self.fs.cluster_iter(n).next().await;
+                            match r {
+                                Some(Err(err)) => return Err(err),
+                                Some(Ok(n)) => Some(n),
+                                None => None,
+                            }
                         }
+                    };
+
+                    if let Some(n) = next_cluster {
+                        n
+                    } else {
+                        let new_cluster = self.fs.alloc_cluster(self.current_cluster, self.is_dir()).await?;
+                        trace!("allocated cluster {}", new_cluster);
+
+                        if self.first_cluster.is_none() {
+                            self.set_first_cluster(new_cluster);
+                        }
+
+                        new_cluster
+                    }
+                } else {
+                    match self.current_cluster {
+                        Some(n) => n,
+                        None => panic!("Offset inside cluster but no cluster allocated"),
                     }
                 };
-                if let Some(n) = next_cluster {
-                    n
-                } else {
-                    // end of chain reached - allocate new cluster
-                    let new_cluster = self.fs.alloc_cluster(self.current_cluster, self.is_dir()).await?;
-                    trace!("allocated cluster {}", new_cluster);
-                    if self.first_cluster.is_none() {
-                        self.set_first_cluster(new_cluster);
+
+                let mut last_cluster = current_cluster;
+                let mut write_size = remaining.len().min((cluster_size - offset_in_cluster) as usize);
+
+                while write_size < remaining.len() {
+                    let next_cluster = match self.fs.cluster_iter(last_cluster).next().await {
+                        Some(Err(err)) => return Err(err),
+                        Some(Ok(n)) => n,
+                        None => {
+                            let new_cluster = self.fs.alloc_cluster(Some(last_cluster), self.is_dir()).await?;
+                            trace!("allocated cluster {}", new_cluster);
+                            new_cluster
+                        }
+                    };
+
+                    if next_cluster != last_cluster + 1 {
+                        break;
                     }
-                    new_cluster
+
+                    last_cluster = next_cluster;
+
+                    let remaining_capacity = remaining.len() - write_size;
+                    write_size += remaining_capacity.min(cluster_size as usize);
                 }
-            } else {
-                // self.current_cluster should be a valid cluster
-                match self.current_cluster {
-                    Some(n) => n,
-                    None => panic!("Offset inside cluster but no cluster allocated"),
+
+                trace!(
+                    "write {} bytes starting in cluster {} ending in cluster {}",
+                    write_size,
+                    current_cluster,
+                    last_cluster
+                );
+
+                let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
+
+                let written_bytes = {
+                    let mut disk = self.fs.disk.borrow_mut();
+                    disk.seek(SeekFrom::Start(offset_in_fs))?;
+                    disk.write(&remaining[..write_size]).await?
+                };
+
+                if written_bytes == 0 {
+                    return Ok(total_written);
                 }
-            };
-            trace!("write {} bytes in cluster {}", write_size, current_cluster);
-            let offset_in_fs = self.fs.offset_from_cluster(current_cluster) + u64::from(offset_in_cluster);
-            let written_bytes = {
-                let mut disk = self.fs.disk.borrow_mut();
-                disk.seek(SeekFrom::Start(offset_in_fs))?;
-                disk.write(&buf[..write_size]).await?
-            };
-            if written_bytes == 0 {
-                return Ok(0);
+
+                let cluster_advance =
+                    ((u64::from(offset_in_cluster) + written_bytes as u64 - 1) / u64::from(cluster_size)) as u32;
+
+                self.offset += written_bytes as u32;
+                self.current_cluster = Some(current_cluster + cluster_advance);
+                self.update_dir_entry_after_write();
+
+                total_written += written_bytes;
             }
-            // some bytes were writter - update position and optionally size
-            self.offset += written_bytes as u32;
-            self.current_cluster = Some(current_cluster);
-            self.update_dir_entry_after_write();
-            Ok(written_bytes)
+
+            Ok(total_written)
         }
         .into_ffi()
     }
