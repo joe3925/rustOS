@@ -59,7 +59,7 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 #[request_handler]
 pub async fn fs_root_ioctl<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let code = {
         let r = req.read();
@@ -75,10 +75,10 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 let r = req.write();
 
                 let volume_fdo = match r.data() {
-                    RequestDataView::FromDevice(mut data) => data
+                    RequestDataView::Writable(mut data) => data
                         .view_mut::<FsIdentify>()
                         .map(|id| id.volume_fdo.clone()),
-                    RequestDataView::ToDevice(_) => None,
+                    RequestDataView::ReadOnly(_) => None,
                 };
 
                 let Some(volume_fdo) = volume_fdo else {
@@ -184,7 +184,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
             {
                 let r = req.write();
                 match r.data() {
-                    RequestDataView::FromDevice(mut data) => {
+                    RequestDataView::Writable(mut data) => {
                         if let Some(id) = data.view_mut::<FsIdentify>() {
                             id.mount_device = mount_device;
                             id.can_mount = can_mount;
@@ -196,7 +196,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                             });
                         }
                     }
-                    RequestDataView::ToDevice(_) => {
+                    RequestDataView::ReadOnly(_) => {
                         r.set_data_t(FsIdentify {
                             mount_device,
                             can_mount,

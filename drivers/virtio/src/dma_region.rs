@@ -103,7 +103,12 @@ impl ContiguousDmaRegion {
             };
 
             let segments = mapped.dma_segments();
-            if segments.len() != 1 || segments[0].byte_len as usize != byte_len {
+            let Some(segment) = segments.first() else {
+                let _ = dma::unmap_buffer(mapped);
+                region.destroy();
+                return None;
+            };
+            if segments.len() != 1 || segment.byte_len as usize != byte_len {
                 let _ = dma::unmap_buffer(mapped);
                 region.destroy();
                 return None;
@@ -112,7 +117,7 @@ impl ContiguousDmaRegion {
             region.chunks.push(DmaChunk {
                 byte_offset,
                 byte_len,
-                dma_addr: segments[0].dma_addr,
+                dma_addr: segment.dma_addr,
                 buffer: Some(mapped),
             });
             byte_offset += byte_len;

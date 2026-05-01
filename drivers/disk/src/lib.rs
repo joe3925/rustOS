@@ -40,25 +40,15 @@ const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 fn has_from_device_buffer(
-    data: kernel_api::request::RequestDataRefMut<'_, kernel_api::request::Writable>,
-    len: usize,
+    data: kernel_api::request::RequestDataRefMut<'_, '_, kernel_api::request::Writable>,
 ) -> bool {
-    data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
-        .map_or(false, |b| b.len() >= len)
-        || data
-            .view::<IoBuffer<'_, Described, FromDevice>>()
-            .map_or(false, |b| b.len() >= len)
+    data.can_require::<IoBuffer<'_, PhysFramed, FromDevice>>()
 }
 
 fn has_to_device_buffer(
-    data: kernel_api::request::RequestDataRef<'_, kernel_api::request::ReadOnly>,
-    len: usize,
+    data: kernel_api::request::RequestDataRef<'_, '_, kernel_api::request::ReadOnly>,
 ) -> bool {
-    data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()
-        .map_or(false, |b| b.len() >= len)
-        || data
-            .view::<IoBuffer<'_, Described, ToDevice>>()
-            .map_or(false, |b| b.len() >= len)
+    data.can_require::<IoBuffer<'_, PhysFramed, ToDevice>>()
 }
 
 #[repr(C)]
@@ -101,7 +91,7 @@ pub extern "win64" fn disk_device_add(
 #[request_handler]
 async fn disk_pnp_remove<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> kernel_api::pnp::DriverStep {
     kernel_api::pnp::DriverStep::Continue
 }
@@ -109,7 +99,7 @@ async fn disk_pnp_remove<'a, 'b>(
 #[request_handler]
 pub async fn disk_read<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
     let (off, total) = match req.read().kind {
@@ -134,12 +124,12 @@ pub async fn disk_read<'a, 'b>(
     }
 
     match req.data() {
-        RequestDataView::FromDevice(data) => {
-            if !has_from_device_buffer(data, total) {
+        RequestDataView::Writable(data) => {
+            if !has_from_device_buffer(data) {
                 return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
-        RequestDataView::ToDevice(_) => {
+        RequestDataView::ReadOnly(_) => {
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
         }
     }
@@ -157,7 +147,7 @@ pub async fn disk_read<'a, 'b>(
 #[request_handler]
 pub async fn disk_write<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
     let (off, total) = match req.read().kind {
@@ -185,14 +175,9 @@ pub async fn disk_write<'a, 'b>(
     if bs == 0 {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
-    let data = match req.data() {
-        RequestDataView::ToDevice(data) => data,
-        RequestDataView::FromDevice(_) => {
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
+    let data = req.data().read_only();
 
-    if !has_to_device_buffer(data, total) {
+    if !has_to_device_buffer(data) {
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
@@ -209,7 +194,7 @@ pub async fn disk_write<'a, 'b>(
 #[request_handler]
 pub async fn disk_ioctl<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> kernel_api::pnp::DriverStep {
     let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,

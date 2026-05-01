@@ -87,7 +87,7 @@ struct PartDevExt {
 #[request_handler]
 async fn partition_pdo_query_resources<'a, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'a>,
+    request: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     {
         let mut w = request.write();
@@ -102,16 +102,16 @@ async fn partition_pdo_query_resources<'a, 'b>(
     DriverStep::complete(DriverStatus::Success)
 }
 
-async fn send_req_parent<'h, 'd>(
+async fn send_req_parent<'h, 'req, 'data>(
     parent: &Weak<DevNode>,
-    req: &'h mut RequestHandle<'d>,
+    req: &'h mut RequestHandle<'req, 'data>,
 ) -> DriverStatus {
     pnp_send_request_to_stack_top(parent.clone(), req).await
 }
 #[request_handler]
 pub async fn partition_pdo_read<'a, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'a>,
+    request: &'b mut RequestHandle<'a, '_>,
     buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
@@ -164,7 +164,7 @@ pub async fn partition_pdo_read<'a, 'b>(
 #[request_handler]
 pub async fn partition_pdo_write<'a, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'a>,
+    request: &'b mut RequestHandle<'a, '_>,
     buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<PartDevExt>(&device);
@@ -225,7 +225,7 @@ pub async fn partition_pdo_write<'a, 'b>(
 #[request_handler]
 pub async fn partmgr_start<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let dx = ext::<PartMgrExt>(&dev);
 
@@ -254,14 +254,13 @@ async fn read_from_lower_async(
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
     let mut data = vec![0u8; len];
-    let mut child_req = RequestHandle::new(RequestType::Read { offset, len }, RequestData::empty());
+    let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
+    let mut child_req = RequestHandle::new_t(RequestType::Read { offset, len }, io_buf);
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-    let status = {
-        let mut io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
-        let mut borrow = BorrowedHandle::writable(&mut child_req, &mut io_buf);
-        pnp_forward_request_to_next_lower(dev.clone(), borrow.handle()).await
-    };
+    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;
+
+    drop(child_req);
 
     if status == DriverStatus::Success {
         Ok(data.into_boxed_slice())
@@ -273,7 +272,7 @@ async fn read_from_lower_async(
 #[request_handler]
 pub async fn partmgr_pnp_query_devrels<'a, 'b>(
     device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'a>,
+    request: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let relation = { request.read().pnp.as_ref().unwrap().relation };
     if relation != DeviceRelationType::BusRelations {

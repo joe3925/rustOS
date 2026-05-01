@@ -69,7 +69,7 @@ pub extern "win64" fn ps2_device_add(
 #[request_handler]
 pub async fn ps2_start<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
@@ -86,7 +86,7 @@ pub async fn ps2_start<'a, 'b>(
 #[request_handler]
 pub async fn ps2_query_devrels<'a, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
     let relation = req.read().pnp.as_ref().unwrap().relation;
@@ -175,7 +175,7 @@ fn make_child_pdo(
 #[request_handler]
 async fn ps2_child_query_id<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
@@ -233,7 +233,7 @@ async fn ps2_child_query_id<'a, 'b>(
 #[request_handler]
 async fn ps2_child_start<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

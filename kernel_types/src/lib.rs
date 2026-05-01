@@ -43,35 +43,35 @@ pub type EvtDriverDeviceAdd = extern "win64" fn(
 pub type EvtDriverUnload =
     extern "win64" fn(driver: Arc<device::DriverObject>) -> FfiFuture<DriverStep>;
 
-pub type EvtIoRead = for<'a, 'b> extern "win64" fn(
+pub type EvtIoRead = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
     usize,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoWrite = for<'a, 'b> extern "win64" fn(
+pub type EvtIoWrite = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
     usize,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoDeviceControl = for<'a, 'b> extern "win64" fn(
+pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFs = for<'a, 'b> extern "win64" fn(
+pub type EvtIoFs = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlush = for<'a, 'b> extern "win64" fn(
+pub type EvtIoFlush = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
 ) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
-pub type CompletionRoutine =
-    extern "win64" fn(request: &mut Request, context: usize) -> DriverStatus;
-pub type PnpMinorCallback = for<'a, 'b> extern "win64" fn(
+pub type CompletionRoutine<'data> =
+    extern "win64" fn(request: &mut Request<'data>, context: usize) -> DriverStatus;
+pub type PnpMinorCallback = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'a>,
+    &'b mut RequestHandle<'req, 'data>,
 ) -> FfiFuture<DriverStep>;
 
 pub type DpcFn = extern "win64" fn(usize);

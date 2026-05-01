@@ -2092,11 +2092,11 @@ const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
-    // 64 * 1024,
-    // 512 * 1024,
-    // 1024 * 1024,
-    // 2 * 1024 * 1024,
-    // 4 * 1024 * 1024,
+    64 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
     //64 * 1024 * 1024,
 ];
 
@@ -2162,7 +2162,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
+            // OpenFlags::WriteThrough,
         ],
     )
     .await

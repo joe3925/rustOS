@@ -90,46 +90,6 @@ fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
     }
 }
 
-fn take_from_device_buffer<'a>(
-    req: &mut RequestHandle<'a>,
-    len: usize,
-) -> Result<IoBuffer<'a, PhysFramed, FromDevice>, DriverStatus> {
-    let data = match req.data() {
-        RequestDataView::FromDevice(data) => data,
-        _ => return Err(DriverStatus::InvalidParameter),
-    };
-
-    let buffer = data
-        .view::<IoBuffer<'_, PhysFramed, FromDevice>>()
-        .ok_or(DriverStatus::InsufficientResources)?;
-    if buffer.len() < len {
-        return Err(DriverStatus::InsufficientResources);
-    }
-
-    IoBuffer::<'a, PhysFramed, FromDevice>::new(
-        buffer.frame_offset(),
-        len,
-        buffer.physical_frames(),
-    )
-    .map_err(|_| DriverStatus::InsufficientResources)
-}
-
-fn describe_to_device_buffer<'a>(
-    req: &mut RequestHandle<'a>,
-    len: usize,
-) -> Result<IoBuffer<'a, PhysFramed, ToDevice>, DriverStatus> {
-    let data = req.data().read_only();
-    let buffer = data
-        .view::<IoBuffer<'_, PhysFramed, ToDevice>>()
-        .ok_or(DriverStatus::InsufficientResources)?;
-    if buffer.len() < len {
-        return Err(DriverStatus::InsufficientResources);
-    }
-
-    IoBuffer::<'a, PhysFramed, ToDevice>::new(buffer.frame_offset(), len, buffer.physical_frames())
-        .map_err(|_| DriverStatus::InsufficientResources)
-}
-
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
@@ -225,7 +185,7 @@ async fn setup_msix_via_pci(
 #[request_handler]
 async fn virtio_pnp_start<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let mut query_req = RequestHandle::new_pnp(
         PnpRequest {
@@ -675,7 +635,7 @@ async fn virtio_pnp_start<'a, 'b>(
 #[request_handler]
 async fn virtio_pnp_remove<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     if let Ok(dx) = dev.try_devext::<DevExt>() {
         if let Some(inner) = dx.inner.get().cloned() {
@@ -715,7 +675,7 @@ async fn virtio_pnp_remove<'a, 'b>(
 #[request_handler]
 async fn virtio_pnp_query_devrels<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
@@ -880,7 +840,7 @@ fn rdtsc() -> u64 {
 #[request_handler]
 pub async fn virtio_pdo_start<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }
@@ -888,7 +848,7 @@ pub async fn virtio_pdo_start<'a, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_query_id<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let ty = { req.read().pnp.as_ref().unwrap().id_type };
     let status = {
@@ -922,7 +882,7 @@ pub async fn virtio_pdo_query_id<'a, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_query_resources<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
@@ -964,7 +924,7 @@ fn get_parent_inner(
 #[request_handler]
 pub async fn virtio_pdo_read<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     _buf_len: usize,
 ) -> DriverStep {
     let (parent, inner) = match get_parent_inner(pdo) {
@@ -993,9 +953,12 @@ pub async fn virtio_pdo_read<'a, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let buffer = match take_from_device_buffer(req, len) {
-        Ok(buffer) => buffer,
-        Err(status) => return complete_req(req, status),
+    let buffer = match req.data().try_writable() {
+        Some(mut data) => match data.require::<IoBuffer<'_, PhysFramed, FromDevice>>() {
+            Ok(buffer) => buffer,
+            Err(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        },
+        None => return complete_req(req, DriverStatus::InvalidParameter),
     };
     let mapped_buffer = match kernel_api::dma::map_buffer(
         &parent,
@@ -1086,7 +1049,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_write<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     _buf_len: usize,
 ) -> DriverStep {
     let (parent, inner) = match get_parent_inner(pdo) {
@@ -1116,9 +1079,12 @@ pub async fn virtio_pdo_write<'a, 'b>(
     let queue_idx = inner.select_queue();
     let qs = inner.get_queue(queue_idx);
 
-    let buffer = match describe_to_device_buffer(req, len) {
-        Ok(buffer) => buffer,
-        Err(status) => return complete_req(req, status),
+    let buffer = match req.data().try_writable() {
+        Some(mut data) => match data.require::<IoBuffer<'_, PhysFramed, ToDevice>>() {
+            Ok(buffer) => buffer,
+            Err(_) => return DriverStep::complete(DriverStatus::InvalidParameter),
+        },
+        None => return complete_req(req, DriverStatus::InvalidParameter),
     };
 
     let mapped_buffer = match kernel_api::dma::map_buffer(
@@ -1210,7 +1176,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
 #[request_handler]
 pub async fn virtio_pdo_ioctl<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let code = match {
         let r = req.read();

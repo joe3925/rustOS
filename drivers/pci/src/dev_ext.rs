@@ -116,9 +116,9 @@ pub struct PciPdoExt {
 }
 
 #[repr(C)]
-pub struct PrepareHardwareCtx {
+pub struct PrepareHardwareCtx<'a> {
     pub(crate) original_device: Arc<DeviceObject>,
-    pub(crate) original_request: Arc<RwLock<Request>>,
+    pub(crate) original_request: Arc<RwLock<Request<'a>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -183,16 +183,20 @@ unsafe fn unmap_cfg_page(va: VirtAddr, size: u64) {
 }
 
 #[inline]
-unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 { unsafe {
-    let p = (base.as_u64() + off as u64) as *const u32;
-    core::ptr::read_volatile(p)
-}}
+unsafe fn cfg_read32(base: VirtAddr, off: u16) -> u32 {
+    unsafe {
+        let p = (base.as_u64() + off as u64) as *const u32;
+        core::ptr::read_volatile(p)
+    }
+}
 
 #[inline]
-unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) { unsafe {
-    let p = (base.as_u64() + off as u64) as *mut u32;
-    core::ptr::write_volatile(p, v);
-}}
+unsafe fn cfg_write32(base: VirtAddr, off: u16, v: u32) {
+    unsafe {
+        let p = (base.as_u64() + off as u64) as *mut u32;
+        core::ptr::write_volatile(p, v);
+    }
+}
 
 #[inline]
 pub fn map_cfg_page(
@@ -571,7 +575,9 @@ extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
     if let Some(p) = req.pnp.as_ref() {
-        if let Some(v) = p.data_out_ref().view::<Vec<u8>>() { out.extend_from_slice(v); }
+        if let Some(v) = p.data_out_ref().view::<Vec<u8>>() {
+            out.extend_from_slice(v);
+        }
     }
     unsafe {
         *w.status.get() = req.status.clone();
@@ -669,7 +675,8 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         .read()
         .pnp
         .as_ref()
-        .and_then(|p| p.data_out_ref().view::<Vec<u8>>()).cloned()
+        .and_then(|p| p.data_out_ref().view::<Vec<u8>>())
+        .cloned()
         .unwrap_or_default();
 
     let segs: Vec<McfgSegment> = parse_ecam_segments_from_blob(&blob);
@@ -689,38 +696,46 @@ fn cfg1_addr(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
 }
 
 #[inline]
-unsafe fn outl(port: u16, val: u32) { unsafe {
-    asm!(
-        "out dx, eax",
-        in("dx") port,
-        in("eax") val,
-        options(nostack, preserves_flags)
-    );
-}}
+unsafe fn outl(port: u16, val: u32) {
+    unsafe {
+        asm!(
+            "out dx, eax",
+            in("dx") port,
+            in("eax") val,
+            options(nostack, preserves_flags)
+        );
+    }
+}
 
 #[inline]
-unsafe fn inl(port: u16) -> u32 { unsafe {
-    let v: u32;
-    asm!(
-        "in eax, dx",
-        in("dx") port,
-        out("eax") v,
-        options(nostack, preserves_flags)
-    );
-    v
-}}
+unsafe fn inl(port: u16) -> u32 {
+    unsafe {
+        let v: u32;
+        asm!(
+            "in eax, dx",
+            in("dx") port,
+            out("eax") v,
+            options(nostack, preserves_flags)
+        );
+        v
+    }
+}
 
 #[inline]
-unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 { unsafe {
-    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-    inl(PCI_CFG1_DATA)
-}}
+unsafe fn cfg1_read32_unlocked(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
+    unsafe {
+        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
+        inl(PCI_CFG1_DATA)
+    }
+}
 
 #[inline]
-unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) { unsafe {
-    outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
-    outl(PCI_CFG1_DATA, val);
-}}
+unsafe fn cfg1_write32_unlocked(bus: u8, dev: u8, func: u8, offset: u16, val: u32) {
+    unsafe {
+        outl(PCI_CFG1_ADDR, cfg1_addr(bus, dev, func, offset));
+        outl(PCI_CFG1_DATA, val);
+    }
+}
 
 #[inline]
 fn cfg1_read32(bus: u8, dev: u8, func: u8, offset: u16) -> u32 {
@@ -737,44 +752,46 @@ fn cfg1_write32(bus: u8, dev: u8, func: u8, offset: u16, val: u32) -> u32 {
     }
 }
 
-unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> { unsafe {
-    let status = (cfg1_read32_unlocked(bus, dev, func, 0x04) >> 16) as u16;
-    if (status & (1 << 4)) == 0 {
-        return None;
-    }
-
-    let mut cap_ptr = (cfg1_read32_unlocked(bus, dev, func, 0x34) & 0xFF) as u16;
-
-    while cap_ptr != 0 && cap_ptr < 0x100 {
-        let cap_header = cfg1_read32_unlocked(bus, dev, func, cap_ptr);
-        let cap_id = (cap_header & 0xFF) as u8;
-        let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
-
-        if cap_id == 0x11 {
-            let msg_ctrl = (cap_header >> 16) as u16;
-            let table_size = (msg_ctrl & 0x7FF) + 1;
-
-            let table_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 4);
-            let table_bar = (table_reg & 0x7) as u8;
-            let table_offset = table_reg & !0x7;
-
-            let pba_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 8);
-            let pba_bar = (pba_reg & 0x7) as u8;
-            let pba_offset = pba_reg & !0x7;
-
-            return Some(MsixInfo {
-                cap_offset: cap_ptr,
-                table_bar,
-                table_offset,
-                table_size,
-                pba_bar,
-                pba_offset,
-            });
+unsafe fn probe_msix_capability_legacy(bus: u8, dev: u8, func: u8) -> Option<MsixInfo> {
+    unsafe {
+        let status = (cfg1_read32_unlocked(bus, dev, func, 0x04) >> 16) as u16;
+        if (status & (1 << 4)) == 0 {
+            return None;
         }
-        cap_ptr = next_ptr;
+
+        let mut cap_ptr = (cfg1_read32_unlocked(bus, dev, func, 0x34) & 0xFF) as u16;
+
+        while cap_ptr != 0 && cap_ptr < 0x100 {
+            let cap_header = cfg1_read32_unlocked(bus, dev, func, cap_ptr);
+            let cap_id = (cap_header & 0xFF) as u8;
+            let next_ptr = ((cap_header >> 8) & 0xFF) as u16;
+
+            if cap_id == 0x11 {
+                let msg_ctrl = (cap_header >> 16) as u16;
+                let table_size = (msg_ctrl & 0x7FF) + 1;
+
+                let table_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 4);
+                let table_bar = (table_reg & 0x7) as u8;
+                let table_offset = table_reg & !0x7;
+
+                let pba_reg = cfg1_read32_unlocked(bus, dev, func, cap_ptr + 8);
+                let pba_bar = (pba_reg & 0x7) as u8;
+                let pba_offset = pba_reg & !0x7;
+
+                return Some(MsixInfo {
+                    cap_offset: cap_ptr,
+                    table_bar,
+                    table_offset,
+                    table_size,
+                    pba_bar,
+                    pba_offset,
+                });
+            }
+            cap_ptr = next_ptr;
+        }
+        None
     }
-    None
-}}
+}
 
 pub fn header_type_legacy(bus: u8, dev: u8) -> Option<u8> {
     let vid = cfg1_read32(bus, dev, 0, 0x00) & 0xFFFF;

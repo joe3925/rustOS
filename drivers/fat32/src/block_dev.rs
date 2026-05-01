@@ -18,8 +18,6 @@ pub struct BlockDev {
     sector_size: u16,
     total_sectors: u64,
     pos: u64,
-    /// Reusable request — data slot is overwritten each call via BorrowedHandle.
-    req: RequestHandle<'static>,
     /// Shared flush flag with VolCtrlDevExt
     pub(crate) should_flush: Arc<AtomicBool>,
     /// Current owner tag — set once per FS op, read by prep_write_req.
@@ -51,16 +49,11 @@ impl BlockDev {
         should_flush: Arc<AtomicBool>,
         current_owner: Arc<AtomicU64>,
     ) -> Self {
-        let req = RequestHandle::new(
-            RequestType::Read { offset: 0, len: 0 },
-            RequestData::empty(),
-        );
         Self {
             volume,
             sector_size,
             total_sectors,
             pos: 0,
-            req,
             should_flush,
             current_owner,
         }
@@ -71,53 +64,20 @@ impl BlockDev {
         self.total_sectors.saturating_mul(self.sector_size as u64)
     }
 
-    /// Reset the request header for a read, leaving data empty.
-    #[inline]
-    fn prep_req_read(&mut self, offset: u64, len: usize) {
-        match &mut self.req {
-            RequestHandle::Owned(r) => {
-                r.kind = RequestType::Read { offset, len };
-                r.completed = false;
-                r.status = DriverStatus::ContinueStep;
-                r.traversal_policy = TraversalPolicy::ForwardLower;
-                r.pnp = None;
-                r.completion_routine = None;
-                r.completion_context = 0;
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// Reset the request header for a write, leaving data empty.
-    #[inline]
-    fn prep_req_write(&mut self, offset: u64, len: usize, flush_write_through: bool) {
-        match &mut self.req {
-            RequestHandle::Owned(r) => {
-                r.kind = RequestType::Write {
-                    offset,
-                    len,
-                    flush_write_through,
-                    owner: self.current_owner.load(Ordering::Acquire),
-                };
-                r.completed = false;
-                r.status = DriverStatus::ContinueStep;
-                r.traversal_policy = TraversalPolicy::ForwardLower;
-                r.pnp = None;
-                r.completion_routine = None;
-                r.completion_context = 0;
-            }
-            _ => unreachable!(),
-        }
-    }
-
     /// Send a read, borrowing `dst` directly so the lower driver writes into it.
     async fn send_read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), DriverStatus> {
-        let len = dst.len();
         let volume = self.volume.clone();
-        self.prep_req_read(offset, len);
+        let mut req = RequestHandle::new(
+            RequestType::Read {
+                offset,
+                len: dst.len(),
+            },
+            RequestData::empty(),
+        );
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = {
-            let mut borrow = BorrowedHandle::writable(&mut self.req, dst);
+            let mut borrow = BorrowedHandle::writable(&mut req, dst);
             pnp_send_request(volume, borrow.handle()).await
         };
 
@@ -131,12 +91,20 @@ impl BlockDev {
 
     /// Send a write from an immutable source.
     async fn send_write_immut(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
-        let len = src.len();
         let volume = self.volume.clone();
-        self.prep_req_write(offset, len, false);
+        let mut req = RequestHandle::new(
+            RequestType::Write {
+                offset,
+                len: src.len(),
+                flush_write_through: false,
+                owner: self.current_owner.load(Ordering::Acquire),
+            },
+            RequestData::empty(),
+        );
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = {
-            let mut borrow = BorrowedHandle::read_only(&mut self.req, src);
+            let mut borrow = BorrowedHandle::read_only(&mut req, src);
             pnp_send_request(volume, borrow.handle()).await
         };
 

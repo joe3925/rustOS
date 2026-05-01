@@ -102,15 +102,15 @@ impl PnpVtable {
 
 #[repr(C)]
 #[derive(Debug)]
-pub struct PnpRequest {
+pub struct PnpRequest<'data> {
     pub minor_function: PnpMinorFunction,
     pub relation: DeviceRelationType,
     pub id_type: QueryIdType,
     pub ids_out: Vec<String>,
-    pub data_out: RequestData,
+    pub data_out: RequestData<'data>,
 }
 
-impl PnpRequest {
+impl<'data> PnpRequest<'data> {
     /// Print metadata without the actual data payload
     pub fn print_meta(&self) -> alloc::string::String {
         alloc::format!(

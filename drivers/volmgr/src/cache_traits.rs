@@ -124,17 +124,17 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: &'a mut IoBuffer<'buffer, PhysFramed, FromDevice>,
+        buffer: IoBuffer<'buffer, PhysFramed, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>>;
     fn write_request<'a>(
         &'a self,
-        req: &'a mut RequestHandle<'_>,
+        req: &'a mut RequestHandle<'_, '_>,
     ) -> FfiFuture<Result<(), Self::Error>>;
     fn write_phys_framed<'a, 'buffer>(
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: &'a IoBuffer<'buffer, PhysFramed, ToDevice>,
+        buffer: IoBuffer<'buffer, PhysFramed, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>>;
     fn flush_device(&self) -> FfiFuture<Result<(), Self::Error>>;
 }

@@ -249,7 +249,7 @@ impl BlkIoSlots {
         vq: &mut Virtqueue,
         req_type: u32,
         sector: u64,
-        data_segments: &[kernel_api::kernel_types::dma::IoBufferDmaSegment],
+        data_segments: impl IntoIterator<Item = kernel_api::kernel_types::dma::IoBufferDmaSegment>,
         is_write: bool,
     ) -> Option<u16> {
         let head = vq.alloc_desc()?;

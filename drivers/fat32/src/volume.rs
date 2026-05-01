@@ -152,7 +152,7 @@ fn next_file_id(vdx: &VolCtrlDevExt) -> u64 {
     }
 }
 
-fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_>) -> Result<u64, DriverStatus> {
+fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_, '_>) -> Result<u64, DriverStatus> {
     match op {
         FsOp::Open | FsOp::Create | FsOp::ReadDir | FsOp::SetInfo | FsOp::Delete | FsOp::Rename => {
             Ok(METADATA_OWNER_ID)
@@ -217,7 +217,7 @@ fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_>) -> Result<u64, Dr
 async fn execute_fs_work(
     dev: &Arc<DeviceObject>,
     fs_arc: &Arc<AsyncMutex<Fs>>,
-    req: &mut RequestHandle<'_>,
+    req: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
     let mut fs = fs_arc.lock().await;
@@ -780,7 +780,7 @@ async fn execute_fs_work(
     }
 }
 
-fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStatus {
+fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) -> DriverStatus {
     let (fs_file_id, origin, offset) = {
         let data = req.data().read_only();
 
@@ -832,7 +832,10 @@ async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: boo
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStep {
+pub async fn fs_op_dispatch(
+    dev: &Arc<DeviceObject>,
+    req: &mut RequestHandle<'_, '_>,
+) -> DriverStep {
     // Seek is fast-path: no FS lock, no owner tagging, no metadata flush.
     if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
         let status = handle_seek_fast(dev, req);

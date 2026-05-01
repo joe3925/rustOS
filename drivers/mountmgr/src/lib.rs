@@ -132,7 +132,7 @@ pub extern "win64" fn volclass_device_add(
 #[request_handler]
 pub async fn volclass_start<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
@@ -143,7 +143,7 @@ pub async fn volclass_start<'a, 'b>(
 #[request_handler]
 pub async fn volclass_ioctl<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
@@ -200,7 +200,7 @@ pub async fn volclass_ioctl<'a, 'b>(
 #[request_handler]
 pub async fn volclass_ctrl_ioctl<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,

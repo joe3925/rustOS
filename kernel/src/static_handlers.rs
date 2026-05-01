@@ -323,7 +323,7 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_forward_request_to_next_lower<'h, 'd>(
     from: &Arc<DeviceObject>,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     let from = from.clone();
     BorrowingFfiFuture::from_owned_ffi(
@@ -334,7 +334,7 @@ pub extern "win64" fn pnp_forward_request_to_next_lower<'h, 'd>(
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_forward_request_to_next_upper<'h, 'd>(
     from: &Arc<DeviceObject>,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     let from = from.clone();
     BorrowingFfiFuture::from_owned_ffi(
@@ -345,7 +345,7 @@ pub extern "win64" fn pnp_forward_request_to_next_upper<'h, 'd>(
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_send_request<'h, 'd>(
     target: IoTarget,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     BorrowingFfiFuture::from_owned_ffi(
         async move { PNP_MANAGER.send_request(target, handle).await }.into_ffi(),
@@ -353,7 +353,7 @@ pub extern "win64" fn pnp_send_request<'h, 'd>(
 }
 
 pub extern "win64" fn pnp_complete_request<'h, 'd>(
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> DriverStatus {
     PNP_MANAGER.complete_request(handle)
 }
@@ -361,7 +361,7 @@ pub extern "win64" fn pnp_complete_request<'h, 'd>(
 #[unsafe(no_mangle)]
 pub extern "win64" fn pnp_send_request_via_symlink<'h, 'd>(
     link_path: String,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     BorrowingFfiFuture::from_owned_ffi(
         async move {
@@ -377,7 +377,7 @@ pub extern "win64" fn pnp_send_request_via_symlink<'h, 'd>(
 pub extern "win64" fn pnp_ioctl_via_symlink<'h, 'd>(
     link_path: String,
     control_code: u32,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     BorrowingFfiFuture::from_owned_ffi(
         async move {
@@ -392,7 +392,7 @@ pub extern "win64" fn pnp_ioctl_via_symlink<'h, 'd>(
 #[no_mangle]
 pub extern "win64" fn pnp_send_request_to_stack_top<'h, 'd>(
     dev_node_weak: alloc::sync::Weak<DevNode>,
-    handle: &'h mut RequestHandle<'d>,
+    handle: &'h mut RequestHandle<'d, 'd>,
 ) -> BorrowingFfiFuture<'d, DriverStatus> {
     BorrowingFfiFuture::from_owned_ffi(
         async move {

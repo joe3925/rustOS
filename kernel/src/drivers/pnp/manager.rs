@@ -991,7 +991,7 @@ impl PnpManager {
     pub async fn send_request(
         &self,
         target: IoTarget,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::send_request(target, handle).await
     }
@@ -999,7 +999,7 @@ impl PnpManager {
     pub async fn send_request_to_next_lower(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_next_lower(from, handle).await
     }
@@ -1007,19 +1007,19 @@ impl PnpManager {
     pub async fn send_request_to_next_upper(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_next_upper(from, handle).await
     }
 
-    pub fn complete_request(&self, handle: &mut RequestHandle<'_>) -> DriverStatus {
+    pub fn complete_request(&self, handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
         kernel_routing::complete_request(handle)
     }
 
     pub async fn send_request_via_symlink(
         &self,
         link_path: String,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::send_request_via_symlink(link_path, handle).await
     }
@@ -1027,7 +1027,7 @@ impl PnpManager {
     pub async fn send_request_to_stack_top(
         &self,
         dev_node_weak: alloc::sync::Weak<DevNode>,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_stack_top(dev_node_weak, handle).await
     }
@@ -1036,7 +1036,7 @@ impl PnpManager {
         &self,
         link_path: String,
         control_code: u32,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'_, '_>,
     ) -> DriverStatus {
         kernel_routing::ioctl_via_symlink(link_path, control_code, handle).await
     }

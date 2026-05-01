@@ -68,7 +68,7 @@ macro_rules! println {
 
 /// Send a request to a target device.
 /// This is the main entry point for request routing.
-pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> DriverStatus {
+pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
     {
         let mut guard = handle.write();
         guard.status = DriverStatus::ContinueStep;
@@ -92,7 +92,7 @@ pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_>) -> D
 /// Forward a request to the next lower device in the stack.
 pub async fn send_request_to_next_lower(
     from: Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     let Some(target_dev) = from.lower_device.get() else {
         return DriverStatus::NoSuchDevice;
@@ -104,7 +104,7 @@ pub async fn send_request_to_next_lower(
 /// Forward a request to the next upper device in the stack.
 pub async fn send_request_to_next_upper(
     from: Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     let Some(target_dev_weak) = from.upper_device.get() else {
         return DriverStatus::NoSuchDevice;
@@ -120,7 +120,7 @@ pub async fn send_request_to_next_upper(
 /// Send a request via a symlink path.
 pub async fn send_request_via_symlink(
     link_path: String,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     match resolve_path_to_device(&link_path) {
         Some(tgt) => send_request(tgt, handle).await,
@@ -133,7 +133,7 @@ pub async fn send_request_via_symlink(
 pub async fn ioctl_via_symlink(
     link_path: String,
     _control_code: u32,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     send_request_via_symlink(link_path, handle).await
 }
@@ -141,7 +141,7 @@ pub async fn ioctl_via_symlink(
 /// Send a request to the top of a device stack.
 pub async fn send_request_to_stack_top(
     dev_node_weak: Weak<DevNode>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStatus {
     match get_stack_top_from_weak(&dev_node_weak) {
         Some(tgt) => send_request(tgt, handle).await,
@@ -150,7 +150,7 @@ pub async fn send_request_to_stack_top(
 }
 
 /// Complete a request.
-pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
+pub fn complete_request(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
     let mut guard = handle.write();
 
     if guard.completed {
@@ -174,7 +174,7 @@ pub fn complete_request(handle: &mut RequestHandle<'_>) -> DriverStatus {
 
 async fn call_device_handler(
     mut dev: Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
     kind: RequestType,
     policy: TraversalPolicy,
 ) -> DriverStep {
@@ -186,7 +186,7 @@ async fn call_device_handler(
 
         if matches!(kind, RequestType::Pnp) {
             let step = {
-                let h: &mut RequestHandle<'_> = handle;
+                let h: &mut RequestHandle<'_, '_> = handle;
                 pnp_minor_dispatch(&dev, h).await
             };
             match step {
@@ -250,7 +250,7 @@ async fn call_device_handler(
 
 async fn invoke_io_handler(
     dev: &Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
     kind: &RequestType,
 ) -> Option<DriverStep> {
     // let addr: usize = 0xFFFF_8500_0000_0000;
@@ -281,7 +281,7 @@ async fn invoke_io_handler(
 
 async fn pnp_minor_dispatch(
     device: &Arc<DeviceObject>,
-    handle: &mut RequestHandle<'_>,
+    handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStep {
     let (minor_opt, policy) = {
         let r = handle.read();

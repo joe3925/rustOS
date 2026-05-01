@@ -87,7 +87,7 @@ impl VolumeCacheBackend for CacheBackend {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: &'a mut IoBuffer<'buffer, PhysFramed, FromDevice>,
+        buffer: IoBuffer<'buffer, PhysFramed, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             if blocks == 0 {
@@ -123,19 +123,16 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(DriverStatus::InvalidParameter);
             }
 
-            let mut req = RequestHandle::new(
+            let mut req = RequestHandle::new_t(
                 RequestType::Read {
                     offset,
                     len: total_len,
                 },
-                RequestData::empty(),
+                buffer,
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let status = {
-                let mut borrow = BorrowedHandle::writable(&mut req, buffer);
-                pnp_send_request(self.target.clone(), borrow.handle()).await
-            };
+            let status = pnp_send_request(self.target.clone(), &mut req).await;
 
             if status != DriverStatus::Success {
                 println!(
@@ -152,7 +149,7 @@ impl VolumeCacheBackend for CacheBackend {
 
     fn write_request<'a>(
         &'a self,
-        req: &'a mut RequestHandle<'_>,
+        req: &'a mut RequestHandle<'_, '_>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             let mut write_offset = 0u64;
@@ -217,7 +214,7 @@ impl VolumeCacheBackend for CacheBackend {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: &'a IoBuffer<'buffer, PhysFramed, ToDevice>,
+        buffer: IoBuffer<'buffer, PhysFramed, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             if blocks == 0 {
@@ -246,21 +243,18 @@ impl VolumeCacheBackend for CacheBackend {
                 return Err(DriverStatus::InvalidParameter);
             }
 
-            let mut req = RequestHandle::new(
+            let mut req = RequestHandle::new_t(
                 RequestType::Write {
                     offset,
                     len: total_len,
                     flush_write_through: false,
                     owner: 0,
                 },
-                RequestData::empty(),
+                buffer,
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-            let status = {
-                let mut borrow = BorrowedHandle::read_only(&mut req, buffer);
-                pnp_send_request(self.target.clone(), borrow.handle()).await
-            };
+            let status = pnp_send_request(self.target.clone(), &mut req).await;
 
             if status != DriverStatus::Success {
                 println!(
@@ -413,7 +407,7 @@ pub extern "win64" fn vol_device_add(
 #[request_handler]
 pub async fn vol_prepare_hardware<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let mut query_req = RequestHandle::new_pnp(
         PnpRequest {
@@ -463,7 +457,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
 #[request_handler]
 pub async fn vol_enumerate_devices<'a, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let dx = ext::<VolExt>(&device);
 
@@ -573,7 +567,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
 #[request_handler]
 pub async fn vol_pdo_read<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
@@ -608,8 +602,8 @@ pub async fn vol_pdo_read<'a, 'b>(
     }
 
     let req_data_len = match req.data() {
-        RequestDataView::FromDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
-        RequestDataView::ToDevice(_) => {
+        RequestDataView::Writable(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
+        RequestDataView::ReadOnly(_) => {
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     };
@@ -624,8 +618,8 @@ pub async fn vol_pdo_read<'a, 'b>(
     }
 
     let mut data = match req.data() {
-        RequestDataView::FromDevice(data) => data,
-        RequestDataView::ToDevice(_) => {
+        RequestDataView::Writable(data) => data,
+        RequestDataView::ReadOnly(_) => {
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     };
@@ -642,7 +636,7 @@ pub async fn vol_pdo_read<'a, 'b>(
 #[request_handler]
 pub async fn vol_pdo_write<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
     buf_len: usize,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(&dev);
@@ -683,8 +677,8 @@ pub async fn vol_pdo_write<'a, 'b>(
     len = core::cmp::min(
         len,
         match req.data() {
-            RequestDataView::ToDevice(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
-            RequestDataView::FromDevice(_) => {
+            RequestDataView::ReadOnly(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
+            RequestDataView::Writable(_) => {
                 return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         },
@@ -696,8 +690,8 @@ pub async fn vol_pdo_write<'a, 'b>(
     }
 
     let data = match req.data() {
-        RequestDataView::ToDevice(data) => data,
-        RequestDataView::FromDevice(_) => {
+        RequestDataView::ReadOnly(data) => data,
+        RequestDataView::Writable(_) => {
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     };
@@ -719,7 +713,7 @@ pub async fn vol_pdo_write<'a, 'b>(
 #[request_handler]
 pub async fn vol_pdo_flush<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -775,7 +769,7 @@ pub async fn vol_pdo_flush<'a, 'b>(
 #[request_handler]
 pub async fn vol_pdo_remove_device<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
@@ -791,7 +785,7 @@ pub async fn vol_pdo_remove_device<'a, 'b>(
 #[request_handler]
 async fn vol_pdo_query_resources<'a, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let status = {
         let mut w = req.write();

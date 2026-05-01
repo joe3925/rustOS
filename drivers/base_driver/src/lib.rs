@@ -39,7 +39,7 @@ pub extern "win64" fn bus_driver_device_add(
 #[request_handler]
 pub async fn bus_driver_prepare_hardware<'a, 'b>(
     _device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     DriverStep::complete(DriverStatus::Success)

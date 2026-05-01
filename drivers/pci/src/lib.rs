@@ -83,7 +83,7 @@ pub extern "win64" fn bus_driver_device_add(
 #[request_handler]
 pub async fn pci_bus_pnp_start<'a, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let mut query_handle = RequestHandle::new_pnp(
         PnpRequest {
@@ -145,7 +145,7 @@ pub async fn pci_bus_pnp_start<'a, 'b>(
 #[request_handler]
 pub async fn pci_bus_pnp_query_devrels<'a, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let relation = { req.read().pnp.as_ref().unwrap().relation };
     if relation == DeviceRelationType::BusRelations {
@@ -362,7 +362,7 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
 #[request_handler]
 pub async fn pci_pdo_query_id<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
@@ -407,7 +407,7 @@ pub async fn pci_pdo_query_id<'a, 'b>(
 #[request_handler]
 pub async fn pci_pdo_query_resources<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(g) => g,
@@ -431,7 +431,7 @@ pub async fn pci_pdo_query_resources<'a, 'b>(
 #[request_handler]
 pub async fn pci_pdo_start<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }
@@ -439,7 +439,7 @@ pub async fn pci_pdo_start<'a, 'b>(
 #[request_handler]
 pub async fn pci_pdo_query_devrels<'a, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a>,
+    _req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }
@@ -447,7 +447,7 @@ pub async fn pci_pdo_query_devrels<'a, 'b>(
 #[request_handler]
 pub async fn pci_pdo_ioctl<'a, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a>,
+    req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
     let code = match {
         let r = req.read();

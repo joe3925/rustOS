@@ -239,12 +239,33 @@ fn request_view_case_items(
     spec: &RequestViewSpec,
     index: usize,
 ) -> (syn::Ident, TokenStream2) {
+    let mut generics_with_data = generics.clone();
+    generics_with_data
+        .params
+        .insert(0, syn::parse_quote!('__request_payload_data));
+    let (impl_generics_with_data, _, _) = generics_with_data.split_for_impl();
     let (impl_generics, ty_generics, base_where_clause) = generics.split_for_impl();
+
     let source = &spec.source;
     let target = &spec.target;
     let predicates = where_predicates(generics.where_clause.as_ref(), spec.where_clause.as_ref());
     let (source_impl_generics, source_predicates) =
         filtered_impl_generics_and_predicates(generics, source, &predicates);
+
+    let source_impl_generics_with_data_str = source_impl_generics.to_string();
+    let source_impl_generics_with_data = if source_impl_generics_with_data_str.is_empty() {
+        quote! { <'__request_payload_data> }
+    } else {
+        if source_impl_generics_with_data_str.starts_with('<') {
+            let inner = &source_impl_generics_with_data_str
+                [1..source_impl_generics_with_data_str.len() - 1];
+            let inner_tokens: TokenStream2 = inner.parse().unwrap();
+            quote! { <'__request_payload_data, #inner_tokens> }
+        } else {
+            quote! { <'__request_payload_data> }
+        }
+    };
+
     let check_where = check_where_clause(&predicates);
     let case_ident = match spec.kind {
         RequestViewKind::Shared => {
@@ -267,28 +288,28 @@ fn request_view_case_items(
 
     let (view_bound, check_view_bound, projection_body) = match spec.kind {
         RequestViewKind::Shared => (
-            quote! { ::kernel_types::request::RequestPayloadView<#target> },
-            quote! { ::kernel_types::request::RequestPayloadView<__RequestViewTarget> },
+            quote! { ::kernel_types::request::RequestPayloadView<'__request_payload_data, #target> },
+            quote! { ::kernel_types::request::RequestPayloadView<'__request_payload_data, __RequestViewTarget> },
             quote! {
                 let source = unsafe {
-                    <#source as ::kernel_types::request::RequestPayload>::shared_from_raw_parts(parts)
+                    <#source as ::kernel_types::request::RequestPayload<'__request_payload_data>>::shared_from_raw_parts(parts)
                 };
                 let target = <#source as ::core::convert::AsRef<#target>>::as_ref(source);
                 ::core::option::Option::Some(
-                    <#target as ::kernel_types::request::RequestPayload>::shared_raw_parts(target)
+                    <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::shared_raw_parts(target)
                 )
             },
         ),
         RequestViewKind::Mutable => (
-            quote! { ::kernel_types::request::RequestPayloadViewMut<#target> },
-            quote! { ::kernel_types::request::RequestPayloadViewMut<__RequestViewTarget> },
+            quote! { ::kernel_types::request::RequestPayloadViewMut<'__request_payload_data, #target> },
+            quote! { ::kernel_types::request::RequestPayloadViewMut<'__request_payload_data, __RequestViewTarget> },
             quote! {
                 let source = unsafe {
-                    <#source as ::kernel_types::request::RequestPayload>::mut_from_raw_parts(parts)
+                    <#source as ::kernel_types::request::RequestPayload<'__request_payload_data>>::mut_from_raw_parts(parts)
                 };
                 let target = <#source as ::core::convert::AsMut<#target>>::as_mut(source);
                 ::core::option::Option::Some(
-                    <#target as ::kernel_types::request::RequestPayload>::mut_raw_parts(target)
+                    <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::mut_raw_parts(target)
                 )
             },
         ),
@@ -298,14 +319,14 @@ fn request_view_case_items(
     let items = quote! {
         #[allow(non_camel_case_types)]
         #[doc(hidden)]
-        trait #case_ident {
+        trait #case_ident<'__request_payload_data> {
             unsafe extern "win64" fn request_payload_view_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts>;
         }
 
-        impl #impl_generics #case_ident for #ident #ty_generics #base_where_clause {
+        impl #impl_generics_with_data #case_ident<'__request_payload_data> for #ident #ty_generics #base_where_clause {
             #[inline]
             default unsafe extern "win64" fn request_payload_view_case(
                 _target_tag: u64,
@@ -315,10 +336,10 @@ fn request_view_case_items(
             }
         }
 
-        impl #source_impl_generics #case_ident for #source
+        impl #source_impl_generics_with_data #case_ident<'__request_payload_data> for #source
         where
             #source: #view_bound,
-            #target: ::kernel_types::request::RequestPayload,
+            #target: ::kernel_types::request::RequestPayload<'__request_payload_data>,
             #(#source_predicates,)*
         {
             #[inline]
@@ -327,7 +348,7 @@ fn request_view_case_items(
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
                 if target_tag
-                    != <#target as ::kernel_types::request::RequestPayload>::runtime_tag()
+                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
                 {
                     return ::core::option::Option::None;
                 }
@@ -338,10 +359,10 @@ fn request_view_case_items(
 
         #[allow(non_snake_case, dead_code)]
         fn #check_ident #impl_generics () #check_where {
-            fn assert_request_view<__RequestViewSource, __RequestViewTarget>()
+            fn assert_request_view<'__request_payload_data, __RequestViewSource, __RequestViewTarget>()
             where
                 __RequestViewSource: ?Sized + #check_view_bound,
-                __RequestViewTarget: ?Sized + ::kernel_types::request::RequestPayload,
+                __RequestViewTarget: ?Sized + ::kernel_types::request::RequestPayload<'__request_payload_data>,
             {
             }
 
@@ -358,12 +379,33 @@ fn request_into_case_items(
     spec: &RequestViewSpec,
     index: usize,
 ) -> (syn::Ident, TokenStream2) {
+    let mut generics_with_data = generics.clone();
+    generics_with_data
+        .params
+        .insert(0, syn::parse_quote!('__request_payload_data));
+    let (impl_generics_with_data, _, _) = generics_with_data.split_for_impl();
     let (impl_generics, ty_generics, base_where_clause) = generics.split_for_impl();
+
     let source = &spec.source;
     let target = &spec.target;
     let predicates = where_predicates(generics.where_clause.as_ref(), spec.where_clause.as_ref());
     let (source_impl_generics, source_predicates) =
         filtered_impl_generics_and_predicates(generics, source, &predicates);
+
+    let source_impl_generics_with_data_str = source_impl_generics.to_string();
+    let source_impl_generics_with_data = if source_impl_generics_with_data_str.is_empty() {
+        quote! { <'__request_payload_data> }
+    } else {
+        if source_impl_generics_with_data_str.starts_with('<') {
+            let inner = &source_impl_generics_with_data_str
+                [1..source_impl_generics_with_data_str.len() - 1];
+            let inner_tokens: TokenStream2 = inner.parse().unwrap();
+            quote! { <'__request_payload_data, #inner_tokens> }
+        } else {
+            quote! { <'__request_payload_data> }
+        }
+    };
+
     let check_where = check_where_clause(&predicates);
     let case_ident = format_ident!("__request_payload_into_case_for_{}_{}", ident, index);
     let check_ident = format_ident!("__request_payload_into_check_for_{}_{}", ident, index);
@@ -371,7 +413,7 @@ fn request_into_case_items(
     let items = quote! {
         #[allow(non_camel_case_types)]
         #[doc(hidden)]
-        trait #case_ident {
+        trait #case_ident<'__request_payload_data> {
             unsafe extern "win64" fn can_request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
@@ -380,11 +422,11 @@ fn request_into_case_items(
             unsafe extern "win64" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData,
+                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
             ) -> bool;
         }
 
-        impl #impl_generics #case_ident for #ident #ty_generics #base_where_clause {
+        impl #impl_generics_with_data #case_ident<'__request_payload_data> for #ident #ty_generics #base_where_clause {
             #[inline]
             default unsafe extern "win64" fn can_request_payload_into_case(
                 _target_tag: u64,
@@ -397,16 +439,16 @@ fn request_into_case_items(
             default unsafe extern "win64" fn request_payload_into_case(
                 _target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
-                _out: *mut ::kernel_types::request::RequestData,
+                _out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
             ) -> bool {
                 false
             }
         }
 
-        impl #source_impl_generics #case_ident for #source
+        impl #source_impl_generics_with_data #case_ident<'__request_payload_data> for #source
         where
-            #source: ::kernel_types::request::RequestPayloadInto<#target>,
-            #target: 'static + ::kernel_types::request::RequestPayload,
+            #source: ::kernel_types::request::RequestPayloadInto<'__request_payload_data, #target>,
+            #target: ::kernel_types::request::RequestPayload<'__request_payload_data>,
             #(#source_predicates,)*
         {
             #[inline]
@@ -414,17 +456,17 @@ fn request_into_case_items(
                 target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool {
-                target_tag == <#target as ::kernel_types::request::RequestPayload>::runtime_tag()
+                target_tag == <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
             }
 
             #[inline]
             unsafe extern "win64" fn request_payload_into_case(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData,
+                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
             ) -> bool {
                 if target_tag
-                    != <#target as ::kernel_types::request::RequestPayload>::runtime_tag()
+                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
                 {
                     return false;
                 }
@@ -440,11 +482,11 @@ fn request_into_case_items(
 
         #[allow(non_snake_case, dead_code)]
         fn #check_ident #impl_generics () #check_where {
-            fn assert_request_into<__RequestIntoSource, __RequestIntoTarget>()
+            fn assert_request_into<'__request_payload_data, __RequestIntoSource, __RequestIntoTarget>()
             where
                 __RequestIntoSource:
-                    ::kernel_types::request::RequestPayloadInto<__RequestIntoTarget>,
-                __RequestIntoTarget: 'static + ::kernel_types::request::RequestPayload,
+                    ::kernel_types::request::RequestPayloadInto<'__request_payload_data, __RequestIntoTarget>,
+                __RequestIntoTarget: ::kernel_types::request::RequestPayload<'__request_payload_data>,
             {
             }
 
@@ -526,7 +568,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
 
     let ident = input.ident;
     let generics = input.generics;
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let (_, ty_generics, where_clause) = generics.split_for_impl();
     let mut request_view_case_items_out = Vec::new();
     let mut shared_case_idents = Vec::new();
     let mut mut_case_idents = Vec::new();
@@ -547,6 +589,8 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
         request_view_case_items_out.push(items);
     }
 
+    let (impl_generics, _, _) = generics.split_for_impl();
+
     let ffi_safe_check_item = if needs_ffi_safe {
         let helper_ident = format_ident!("__request_payload_ffi_safe_check_for_{}", ident);
 
@@ -561,6 +605,19 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
         quote! {}
     };
 
+    let mut generics_with_data = generics.clone();
+    generics_with_data
+        .params
+        .insert(0, syn::parse_quote!('__request_payload_data));
+    let (impl_generics_with_data, _, _) = generics_with_data.split_for_impl();
+    let mut where_clause_with_data = where_clause.cloned().unwrap_or_else(|| syn::WhereClause {
+        where_token: syn::parse_quote!(where),
+        predicates: syn::punctuated::Punctuated::new(),
+    });
+    where_clause_with_data
+        .predicates
+        .push(syn::parse_quote!(Self: '__request_payload_data));
+
     let shared_view_method = if shared_case_idents.is_empty() {
         quote! {}
     } else {
@@ -572,7 +629,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
                 #(
                     if let ::core::option::Option::Some(target_parts) = unsafe {
-                        <Self as #shared_case_idents>::request_payload_view_case(
+                        <Self as #shared_case_idents<'__request_payload_data>>::request_payload_view_case(
                             target_tag,
                             parts,
                         )
@@ -597,7 +654,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
                 #(
                     if let ::core::option::Option::Some(target_parts) = unsafe {
-                        <Self as #mut_case_idents>::request_payload_view_case(
+                        <Self as #mut_case_idents<'__request_payload_data>>::request_payload_view_case(
                             target_tag,
                             parts,
                         )
@@ -622,7 +679,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             ) -> bool {
                 #(
                     if unsafe {
-                        <Self as #into_case_idents>::can_request_payload_into_case(
+                        <Self as #into_case_idents<'__request_payload_data>>::can_request_payload_into_case(
                             target_tag,
                             parts,
                         )
@@ -638,11 +695,11 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
             unsafe extern "win64" fn into_request_data(
                 target_tag: u64,
                 parts: ::kernel_types::request::RequestPayloadRawParts,
-                out: *mut ::kernel_types::request::RequestData,
+                out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
             ) -> bool {
                 #(
                     if unsafe {
-                        <Self as #into_case_idents>::request_payload_into_case(
+                        <Self as #into_case_idents<'__request_payload_data>>::request_payload_into_case(
                             target_tag,
                             parts,
                             out,
@@ -661,8 +718,8 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
         #ffi_safe_check_item
         #(#request_view_case_items_out)*
 
-        unsafe impl #impl_generics ::kernel_types::request::RequestPayload
-            for #ident #ty_generics #where_clause
+        unsafe impl #impl_generics_with_data ::kernel_types::request::RequestPayload<'__request_payload_data>
+            for #ident #ty_generics #where_clause_with_data
         {
             #[inline]
             extern "win64" fn runtime_tag() -> u64 {

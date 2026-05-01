@@ -64,7 +64,7 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 }
 
 /// Program MSI-X table and enable MSI-X capability.
-pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_>) -> DriverStep {
+pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),

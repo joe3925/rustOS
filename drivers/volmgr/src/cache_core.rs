@@ -284,6 +284,7 @@ impl FlushFilter<'_> {
 
 struct FlushScratch<const BLOCK_SIZE: usize> {
     batch: Vec<(u64, Arc<Page<BLOCK_SIZE>>)>,
+    frames: Vec<IoBufferPageFrame>,
     keys: Vec<u64>,
     joins: Vec<FfiFuture<()>>,
 }
@@ -293,6 +294,7 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         let capacity = if join_cap == 0 { 1 } else { join_cap };
         Self {
             batch: Vec::new(),
+            frames: Vec::new(),
             keys: Vec::new(),
             joins: Vec::with_capacity(capacity),
         }
@@ -300,6 +302,7 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
 
     fn reset(&mut self) {
         self.batch.clear();
+        self.frames.clear();
         self.keys.clear();
         self.joins.clear();
     }
@@ -308,6 +311,43 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         let target = if requested == 0 { 1 } else { requested };
         if self.joins.capacity() < target {
             self.joins.reserve(target - self.joins.capacity());
+        }
+    }
+}
+
+struct FlushFrameScratchLease<'a, const BLOCK_SIZE: usize> {
+    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
+    frames: Option<Vec<IoBufferPageFrame>>,
+}
+
+impl<'a, const BLOCK_SIZE: usize> FlushFrameScratchLease<'a, BLOCK_SIZE> {
+    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
+        let frames = {
+            let mut scratch = scratch.lock();
+            core::mem::take(&mut scratch.frames)
+        };
+        Self {
+            scratch,
+            frames: Some(frames),
+        }
+    }
+
+    fn frames_mut(&mut self) -> &mut Vec<IoBufferPageFrame> {
+        self.frames
+            .as_mut()
+            .expect("flush frame scratch lease used after drop")
+    }
+}
+
+impl<const BLOCK_SIZE: usize> Drop for FlushFrameScratchLease<'_, BLOCK_SIZE> {
+    fn drop(&mut self) {
+        let Some(mut frames) = self.frames.take() else {
+            return;
+        };
+        frames.clear();
+        let mut scratch = self.scratch.lock();
+        if scratch.frames.capacity() < frames.capacity() {
+            scratch.frames = frames;
         }
     }
 }
@@ -701,7 +741,7 @@ where
                 .map_err(|_| CacheError::InvalidIoBuffer)?;
         let bytes_read = self
             .backend
-            .read_phys_framed(lba, 1, &mut io_buf)
+            .read_phys_framed(lba, 1, io_buf)
             .await
             .map_err(CacheError::Backend)?;
         if bytes_read > BLOCK_SIZE {
@@ -905,23 +945,23 @@ where
         lba: u64,
         page: &Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
-        let mut req = RequestHandle::new(
-            RequestType::Write {
-                offset: lba * BLOCK_SIZE as u64,
-                len: BLOCK_SIZE,
-                flush_write_through: false,
-                owner: 0,
-            },
-            RequestData::empty(),
-        );
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
         {
             let data_guard = page.data.read();
-            let io_buf = IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]);
-            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
+            let io_buf =
+                IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]).into_phys_framed();
+            let mut req = RequestHandle::new_t(
+                RequestType::Write {
+                    offset: lba * BLOCK_SIZE as u64,
+                    len: BLOCK_SIZE,
+                    flush_write_through: false,
+                    owner: 0,
+                },
+                io_buf,
+            );
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
             self.backend
-                .write_request(borrow.handle())
+                .write_request(&mut req)
                 .await
                 .map_err(CacheError::Backend)?;
         }
@@ -960,25 +1000,26 @@ where
         let wb_gen = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_gen, Ordering::Release);
 
-        let mut req = RequestHandle::new(
-            RequestType::Write {
-                offset: lba * BLOCK_SIZE as u64,
-                len: BLOCK_SIZE,
-                flush_write_through: false,
-                owner: 0,
-            },
-            RequestData::empty(),
-        );
-        req.set_traversal_policy(TraversalPolicy::ForwardLower);
-
         let write_res = {
             let data_guard = page.data.read();
-            let io_buf = IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]);
-            let mut borrow = BorrowedHandle::read_only(&mut req, &io_buf);
-            backend
-                .write_request(borrow.handle())
+            let io_buf =
+                IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]).into_phys_framed();
+            let mut req = RequestHandle::new_t(
+                RequestType::Write {
+                    offset: lba * BLOCK_SIZE as u64,
+                    len: BLOCK_SIZE,
+                    flush_write_through: false,
+                    owner: 0,
+                },
+                io_buf,
+            );
+            req.set_traversal_policy(TraversalPolicy::ForwardLower);
+            let res = backend
+                .write_request(&mut req)
                 .await
-                .map_err(CacheError::Backend)
+                .map_err(CacheError::Backend);
+            drop(req);
+            res
         };
 
         match write_res {
@@ -1224,11 +1265,13 @@ where
         stats: &Arc<StatsInner>,
         dirty_pages: &Arc<AtomicUsize>,
         run: &[PreparedFlushPage<BLOCK_SIZE>],
+        frames: &mut Vec<IoBufferPageFrame>,
     ) -> Result<usize, CacheError<B::Error>> {
         if run.is_empty() {
             return Ok(0);
         }
 
+        frames.clear();
         let mut guards: Vec<RwLockReadGuard<'_, Box<PageBuf<BLOCK_SIZE>>>> =
             Vec::with_capacity(run.len());
         let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
@@ -1236,7 +1279,9 @@ where
             .len()
             .saturating_mul(frames_per_block)
             .min(IOBUFFER_MAX_FRAME_CAPACITY);
-        let mut frames = Vec::with_capacity(frame_capacity);
+        if frames.capacity() < frame_capacity {
+            frames.reserve(frame_capacity - frames.capacity());
+        }
         let mut write_len = 0usize;
 
         for prepared in run {
@@ -1258,15 +1303,22 @@ where
             guards.push(guard);
         }
 
-        let io_buf = IoBuffer::<PhysFramed, ToDevice>::new(0, write_len, &frames[..])
-            .map_err(|_| CacheError::InvalidIoBuffer)?;
+        let io_buf = match IoBuffer::<PhysFramed, ToDevice>::new(0, write_len, &frames[..]) {
+            Ok(io_buf) => io_buf,
+            Err(_) => {
+                frames.clear();
+                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                return Err(CacheError::InvalidIoBuffer);
+            }
+        };
 
         let write_res = backend
-            .write_phys_framed(run[0].lba, run.len(), &io_buf)
+            .write_phys_framed(run[0].lba, run.len(), io_buf)
             .await
             .map_err(CacheError::Backend);
 
         drop(guards);
+        frames.clear();
 
         match write_res {
             Ok(()) => {
@@ -1322,7 +1374,9 @@ where
 
         let mut run: Vec<PreparedFlushPage<BLOCK_SIZE>> =
             Vec::with_capacity(max_blocks_per_buffer.min(keys.len()));
+        let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
         let mut writebacks = 0usize;
+        let mut result = Ok(());
 
         for lba in keys {
             let contiguous = run
@@ -1331,21 +1385,45 @@ where
                 .unwrap_or(true);
 
             if !contiguous || run.len() >= max_blocks_per_buffer {
-                writebacks +=
-                    Self::flush_prepared_run(&self.backend, &self.stats, &self.dirty_pages, &run)
-                        .await?;
+                match Self::flush_prepared_run(
+                    &self.backend,
+                    &self.stats,
+                    &self.dirty_pages,
+                    &run,
+                    frame_scratch.frames_mut(),
+                )
+                .await
+                {
+                    Ok(flushed) => writebacks += flushed,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
                 run.clear();
+            }
+
+            if result.is_err() {
+                break;
             }
 
             let Some(page) = self.page_for_flush_key(*lba, filter) else {
                 if !run.is_empty() {
-                    writebacks += Self::flush_prepared_run(
+                    match Self::flush_prepared_run(
                         &self.backend,
                         &self.stats,
                         &self.dirty_pages,
                         &run,
+                        frame_scratch.frames_mut(),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(flushed) => writebacks += flushed,
+                        Err(err) => {
+                            result = Err(err);
+                            break;
+                        }
+                    }
                     run.clear();
                 }
                 continue;
@@ -1354,17 +1432,42 @@ where
             if let Some(prepared) = Self::prepare_flush_page(&self.stats, *lba, page) {
                 run.push(prepared);
             } else if !run.is_empty() {
-                writebacks +=
-                    Self::flush_prepared_run(&self.backend, &self.stats, &self.dirty_pages, &run)
-                        .await?;
+                match Self::flush_prepared_run(
+                    &self.backend,
+                    &self.stats,
+                    &self.dirty_pages,
+                    &run,
+                    frame_scratch.frames_mut(),
+                )
+                .await
+                {
+                    Ok(flushed) => writebacks += flushed,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
                 run.clear();
             }
         }
 
-        writebacks +=
-            Self::flush_prepared_run(&self.backend, &self.stats, &self.dirty_pages, &run).await?;
+        if result.is_ok() {
+            match Self::flush_prepared_run(
+                &self.backend,
+                &self.stats,
+                &self.dirty_pages,
+                &run,
+                frame_scratch.frames_mut(),
+            )
+            .await
+            {
+                Ok(flushed) => writebacks += flushed,
+                Err(err) => result = Err(err),
+            }
+        }
         run.clear();
-        Ok(writebacks)
+
+        result.map(|()| writebacks)
     }
 
     async fn flush_filtered_batched(

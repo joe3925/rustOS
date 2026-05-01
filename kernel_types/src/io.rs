@@ -96,10 +96,10 @@ impl IoType {
     }
 
     #[inline]
-    pub async fn invoke(
+    pub async fn invoke<'req, 'data>(
         &self,
         dev: &Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_>,
+        handle: &mut RequestHandle<'req, 'data>,
     ) -> DriverStep {
         match *self {
             IoType::Read(h) | IoType::Write(h) => match handle.read().kind {

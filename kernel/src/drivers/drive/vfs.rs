@@ -8,7 +8,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
-use kernel_types::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::request::{
+    BorrowedHandle, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
+};
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::{
     fs::{Path, *},
@@ -151,7 +153,7 @@ impl Vfs {
         Some(tgt)
     }
 
-    async fn call_fs<TParam, TResult>(
+    async fn call_fs<'a, TParam, TResult>(
         &self,
         volume_symlink: &str,
         target: Option<IoTarget>,
@@ -159,32 +161,42 @@ impl Vfs {
         param: TParam,
     ) -> Result<TResult, DriverStatus>
     where
-        TParam: RequestPayload,
-        TResult: 'static + Clone + RequestPayload,
+        TParam: RequestPayload<'a>,
+        TResult: 'static + Clone + RequestPayload<'a>,
     {
-        let mut request_handle = RequestHandle::new(RequestType::Fs(op), RequestData::empty());
+        let mut request_handle = RequestHandle::new_t(RequestType::Fs(op), param);
         request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-        let mut borrow = BorrowedHandle::read_only(&mut request_handle, &param);
 
         let status = {
             if let Some(tgt) = target {
-                PNP_MANAGER.send_request(tgt, borrow.handle()).await
+                PNP_MANAGER.send_request(tgt, &mut request_handle).await
             } else {
                 PNP_MANAGER
-                    .send_request_via_symlink(volume_symlink.to_string(), borrow.handle())
+                    .send_request_via_symlink(volume_symlink.to_string(), &mut request_handle)
                     .await
             }
         };
-
         if status != DriverStatus::Success {
             println!("Send request failed with status: {}", status);
             return Err(status);
         }
-        // TODO: debug further there is some type of double free of the data
-        if let Some(res) = borrow.handle().write().data().read_only().view::<TResult>() {
-            return Ok(res.clone());
-        } else {
-            return Err(DriverStatus::InvalidParameter);
+
+        let mut data = request_handle.data();
+        match data {
+            RequestDataView::Writable(mut d) => {
+                let result = d.take_exact::<TResult>();
+                match result {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        println!("VFS: Failed to take result: {:?}\n", e);
+                        Err(DriverStatus::InvalidParameter)
+                    }
+                }
+            }
+            RequestDataView::ReadOnly(_) => {
+                println!("VFS: Result data is read-only\n");
+                Err(DriverStatus::Unsuccessful)
+            }
         }
     }
     pub async fn open(&self, p: FsOpenParams) -> (FsOpenResult, DriverStatus) {

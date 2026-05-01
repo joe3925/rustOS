@@ -14,7 +14,7 @@ use core::{
 };
 
 /// Maximum size for inline storage (bytes)
-const INLINE_THRESHOLD: usize = 64;
+const INLINE_THRESHOLD: usize = 512;
 
 /// Alignment for inline buffer
 const INLINE_ALIGN: usize = 8;
@@ -78,8 +78,8 @@ type DropperFn = extern "win64" fn(*mut u8);
 type RequestPayloadViewFn =
     unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> Option<RequestPayloadRawParts>;
 type RequestPayloadCanIntoFn = unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> bool;
-type RequestPayloadIntoFn =
-    unsafe extern "win64" fn(u64, RequestPayloadRawParts, *mut RequestData) -> bool;
+type RequestPayloadIntoFn<'data> =
+    unsafe extern "win64" fn(u64, RequestPayloadRawParts, *mut RequestData<'data>) -> bool;
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be used as RequestPayload without an outer layout guarantee",
     label = "missing outer layout guarantee for `{Self}`",
@@ -117,7 +117,7 @@ pub struct RequestPayloadRawParts {
     pub bytes: usize,
 }
 
-pub unsafe trait RequestPayload: Send {
+pub unsafe trait RequestPayload<'data>: Send + 'data {
     /// Stable runtime tag for matching this payload type. Either impl or use type_tag::<T>()
     extern "win64" fn runtime_tag() -> u64;
 
@@ -176,7 +176,7 @@ pub unsafe trait RequestPayload: Send {
     unsafe extern "win64" fn into_request_data(
         _target_tag: u64,
         _parts: RequestPayloadRawParts,
-        _out: *mut RequestData,
+        _out: *mut RequestData<'data>,
     ) -> bool {
         false
     }
@@ -200,15 +200,15 @@ pub unsafe trait RequestPayload: Send {
     label = "missing shared request view conversion from `{Self}` to `{Target}`",
     note = "`#[request_view(Source => Target)]` requires Source: RequestPayload, Target: RequestPayload, and Source: AsRef<Target>"
 )]
-pub trait RequestPayloadView<Target: RequestPayload + ?Sized>:
-    RequestPayload + AsRef<Target>
+pub trait RequestPayloadView<'data, Target: RequestPayload<'data> + ?Sized>:
+    RequestPayload<'data> + AsRef<Target>
 {
 }
 
-impl<Source, Target> RequestPayloadView<Target> for Source
+impl<'data, Source, Target> RequestPayloadView<'data, Target> for Source
 where
-    Source: RequestPayload + AsRef<Target> + ?Sized,
-    Target: RequestPayload + ?Sized,
+    Source: RequestPayload<'data> + AsRef<Target> + ?Sized,
+    Target: RequestPayload<'data> + ?Sized,
 {
 }
 
@@ -217,32 +217,32 @@ where
     label = "missing mutable request view conversion from `{Self}` to `{Target}`",
     note = "`#[request_view_mut(Source => Target)]` requires Source: RequestPayload, Target: RequestPayload, and Source: AsMut<Target>"
 )]
-pub trait RequestPayloadViewMut<Target: RequestPayload + ?Sized>:
-    RequestPayload + AsMut<Target>
+pub trait RequestPayloadViewMut<'data, Target: RequestPayload<'data> + ?Sized>:
+    RequestPayload<'data> + AsMut<Target>
 {
 }
 
-impl<Source, Target> RequestPayloadViewMut<Target> for Source
+impl<'data, Source, Target> RequestPayloadViewMut<'data, Target> for Source
 where
-    Source: RequestPayload + AsMut<Target> + ?Sized,
-    Target: RequestPayload + ?Sized,
+    Source: RequestPayload<'data> + AsMut<Target> + ?Sized,
+    Target: RequestPayload<'data> + ?Sized,
 {
 }
 
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be consumed as request data into `{Target}`",
     label = "missing owned request-data conversion from `{Self}` to `{Target}`",
-    note = "`#[request_into(Source => Target)]` requires Source: RequestPayload + Into<Target> and Target: 'static + RequestPayload"
+    note = "`#[request_into(Source => Target)]` requires Source: RequestPayload + Into<Target> and Target: RequestPayload"
 )]
-pub trait RequestPayloadInto<Target: 'static + RequestPayload>:
-    RequestPayload + Into<Target>
+pub trait RequestPayloadInto<'data, Target: RequestPayload<'data>>:
+    RequestPayload<'data> + Into<Target>
 {
 }
 
-impl<Source, Target> RequestPayloadInto<Target> for Source
+impl<'data, Source, Target> RequestPayloadInto<'data, Target> for Source
 where
-    Source: RequestPayload + Into<Target>,
-    Target: 'static + RequestPayload,
+    Source: RequestPayload<'data> + Into<Target>,
+    Target: RequestPayload<'data>,
 {
 }
 
@@ -253,10 +253,10 @@ unsafe extern "win64" fn no_payload_view(
     None
 }
 
-unsafe extern "win64" fn no_payload_into(
+unsafe extern "win64" fn no_payload_into<'data>(
     _target_tag: u64,
     _parts: RequestPayloadRawParts,
-    _out: *mut RequestData,
+    _out: *mut RequestData<'data>,
 ) -> bool {
     false
 }
@@ -270,7 +270,7 @@ unsafe extern "win64" fn no_payload_can_into(
 
 macro_rules! impl_nominal_request_payload {
     ($ty:path) => {
-        unsafe impl RequestPayload for $ty {
+        unsafe impl<'data> RequestPayload<'data> for $ty {
             #[inline]
             extern "win64" fn runtime_tag() -> u64 {
                 type_tag::<Self>()
@@ -316,7 +316,7 @@ macro_rules! impl_nominal_request_payload {
     };
 }
 
-unsafe impl RequestPayload for [u8] {
+unsafe impl<'data> RequestPayload<'data> for [u8] {
     #[inline]
     extern "win64" fn runtime_tag() -> u64 {
         type_tag::<[u8]>()
@@ -351,7 +351,7 @@ unsafe impl RequestPayload for [u8] {
     }
 }
 
-unsafe impl RequestPayload for str {
+unsafe impl<'data> RequestPayload<'data> for str {
     #[inline]
     extern "win64" fn runtime_tag() -> u64 {
         type_tag::<str>()
@@ -392,7 +392,7 @@ unsafe impl RequestPayload for str {
 impl_nominal_request_payload!(Vec<u8>);
 
 #[repr(C)]
-pub struct RequestData {
+pub struct RequestData<'data> {
     /// Inline buffer for small data (always present, may be unused)
     inline: InlineBuffer,
     /// Erased data pointer used for heap-backed or borrowed payloads
@@ -410,16 +410,17 @@ pub struct RequestData {
     /// Source-type hook for checking owned request-data conversions.
     can_into_converter: RequestPayloadCanIntoFn,
     /// Source-type hook for owned request-data conversions.
-    into_converter: RequestPayloadIntoFn,
+    into_converter: RequestPayloadIntoFn<'data>,
     /// Custom drop function that runs T's destructor (drop_in_place only, no dealloc)
     dropper: DropperFn,
     /// Size of contained data in bytes
     size: usize,
     /// Storage mode indicator
     mode: StorageMode,
+    _marker: PhantomData<&'data ()>,
 }
 
-impl core::fmt::Debug for RequestData {
+impl<'data> core::fmt::Debug for RequestData<'data> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RequestData")
             .field("tag", &self.tag)
@@ -440,33 +441,43 @@ pub struct Writable;
 
 /// Shared directional request-data view.
 #[derive(Debug)]
-pub struct RequestDataRef<'a, Direction> {
-    data: &'a RequestData,
+pub struct RequestDataRef<'a, 'data, Direction> {
+    data: &'a RequestData<'data>,
     _direction: PhantomData<Direction>,
 }
 
-impl<'a, Direction> RequestDataRef<'a, Direction> {
+impl<'a, 'data, Direction> RequestDataRef<'a, 'data, Direction> {
     #[inline]
-    pub fn view<T: RequestPayload + ?Sized>(&self) -> Option<&'a T> {
+    pub fn view<T: RequestPayload<'data> + ?Sized>(&self) -> Option<&'a T> {
         self.data.view::<T>()
+    }
+
+    #[inline]
+    pub fn can_take_exact<T: RequestPayload<'data>>(&self) -> bool {
+        self.data.can_take_exact::<T>()
+    }
+
+    #[inline]
+    pub fn can_require<T: RequestPayload<'data>>(&self) -> bool {
+        self.data.can_require::<T>()
     }
 }
 
 /// Mutable directional request-data view.
 #[derive(Debug)]
-pub struct RequestDataRefMut<'a, Direction> {
-    data: &'a mut RequestData,
+pub struct RequestDataRefMut<'a, 'data, Direction> {
+    data: &'a mut RequestData<'data>,
     _direction: PhantomData<Direction>,
 }
 
-impl<'a, Direction> RequestDataRefMut<'a, Direction> {
+impl<'a, 'data, Direction> RequestDataRefMut<'a, 'data, Direction> {
     #[inline]
-    pub fn view<T: RequestPayload + ?Sized>(&self) -> Option<&T> {
+    pub fn view<T: RequestPayload<'data> + ?Sized>(&self) -> Option<&T> {
         self.data.view::<T>()
     }
 
     #[inline]
-    pub fn read_only(self) -> RequestDataRef<'a, ReadOnly> {
+    pub fn read_only(self) -> RequestDataRef<'a, 'data, ReadOnly> {
         RequestDataRef {
             data: &*self.data,
             _direction: PhantomData,
@@ -474,53 +485,60 @@ impl<'a, Direction> RequestDataRefMut<'a, Direction> {
     }
 }
 
-impl<'a> RequestDataRefMut<'a, Writable> {
+impl<'a, 'data> RequestDataRefMut<'a, 'data, Writable> {
     #[inline]
-    pub fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
+    pub fn view_mut<T: RequestPayload<'data> + ?Sized>(&mut self) -> Option<&mut T> {
         unsafe { self.data.view_mut::<T>() }
     }
     #[inline]
-    pub fn can_take_exact<T: 'static + RequestPayload>(&self) -> bool {
+    pub fn can_take_exact<T: RequestPayload<'data>>(&self) -> bool {
         self.data.can_take_exact::<T>()
     }
 
     #[inline]
-    pub fn take_exact<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+    pub fn take_exact<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         self.data.take_exact::<T>()
     }
 
     #[inline]
-    pub fn can_require<T: 'static + RequestPayload>(&self) -> bool {
+    pub fn can_require<T: RequestPayload<'data>>(&self) -> bool {
         self.data.can_require::<T>()
     }
 
     #[inline]
-    pub fn require<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+    pub fn require<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         self.data.require::<T>()
     }
 }
 
 /// Runtime view over the currently installed request payload.
 #[derive(Debug)]
-pub enum RequestDataView<'a> {
-    ToDevice(RequestDataRef<'a, ReadOnly>),
-    FromDevice(RequestDataRefMut<'a, Writable>),
+pub enum RequestDataView<'a, 'data> {
+    ReadOnly(RequestDataRef<'a, 'data, ReadOnly>),
+    Writable(RequestDataRefMut<'a, 'data, Writable>),
 }
 
-impl<'a> RequestDataView<'a> {
-    /// Obtain a shared `ToDevice` view regardless of the backing mode so callers that only need
+impl<'a, 'data> RequestDataView<'a, 'data> {
+    /// Obtain a shared `ReadOnly` view regardless of the backing mode so callers that only need
     /// read access do not need to match on direction first.
     #[inline]
-    pub fn read_only(self) -> RequestDataRef<'a, ReadOnly> {
+    pub fn read_only(self) -> RequestDataRef<'a, 'data, ReadOnly> {
         match self {
-            Self::ToDevice(view) => view,
-            Self::FromDevice(view) => view.read_only(),
+            Self::ReadOnly(view) => view,
+            Self::Writable(view) => view.read_only(),
+        }
+    }
+    #[inline]
+    pub fn try_writable(self) -> Option<RequestDataRefMut<'a, 'data, Writable>> {
+        match self {
+            Self::ReadOnly(_) => None,
+            Self::Writable(view) => Some(view),
         }
     }
 }
-impl PnpRequest {
+impl<'data> PnpRequest<'data> {
     #[inline]
-    pub fn data_out_ref(&self) -> RequestDataRef<'_, ReadOnly> {
+    pub fn data_out_ref<'a>(&'a self) -> RequestDataRef<'a, 'data, ReadOnly> {
         RequestDataRef {
             data: &self.data_out,
             _direction: PhantomData,
@@ -603,7 +621,7 @@ pub fn type_name_stripped<T>() -> String {
 // SAFETY: RequestData owns its heap allocation exclusively (HeapTyped) or holds a non-owning
 // pointer to driver-owned data in one of the borrowed modes. Borrowed payloads are installed
 // through BorrowedHandle, which enforces both the lifetime and T: RequestPayload bounds.
-unsafe impl Send for RequestData {}
+unsafe impl Send for RequestData<'_> {}
 
 /// Compute a type tag for `T`, stripping lifetime parameters from generic argument lists
 /// so that e.g. `FsAppendParams<'_>` and `FsAppendParams<'data>` produce the same hash,
@@ -640,7 +658,7 @@ pub enum RequestDataError {
 /// No-op dropper for raw bytes or empty data
 extern "win64" fn noop_dropper(_: *mut u8) {}
 
-impl RequestData {
+impl<'data> RequestData<'data> {
     pub fn empty() -> Self {
         Self {
             inline: InlineBuffer::new(),
@@ -655,12 +673,13 @@ impl RequestData {
             dropper: noop_dropper,
             size: 0,
             mode: StorageMode::Inline,
+            _marker: PhantomData,
         }
     }
 
     /// Install a non-owning borrow of driver-owned data. Only called by BorrowedHandle.
     /// The driver retains ownership; this RequestData must not drop or deallocate the pointer.
-    fn from_borrowed_raw<T: RequestPayload + ?Sized>(
+    fn from_borrowed_raw<T: RequestPayload<'data> + ?Sized>(
         parts: RequestPayloadRawParts,
         mode: StorageMode,
     ) -> Self {
@@ -677,10 +696,11 @@ impl RequestData {
             dropper: noop_dropper,
             size: parts.bytes,
             mode,
+            _marker: PhantomData,
         }
     }
 
-    pub fn from_t<T: 'static + RequestPayload>(value: T) -> Self {
+    pub fn from_t<T: RequestPayload<'data>>(value: T) -> Self {
         let size = size_of::<T>();
         let align = align_of::<T>();
 
@@ -704,6 +724,7 @@ impl RequestData {
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::Inline,
+                _marker: PhantomData,
             };
 
             unsafe {
@@ -738,6 +759,7 @@ impl RequestData {
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::HeapTyped,
+                _marker: PhantomData,
             }
         }
     }
@@ -761,7 +783,7 @@ impl RequestData {
         }
     }
 
-    fn matches<T: RequestPayload + ?Sized>(&self) -> bool {
+    fn matches<T: RequestPayload<'data> + ?Sized>(&self) -> bool {
         if self.tag != Some(T::runtime_tag()) {
             return false;
         }
@@ -769,7 +791,7 @@ impl RequestData {
         Self::matches_static_size::<T>(self.size)
     }
 
-    fn matches_static_size<T: RequestPayload + ?Sized>(bytes: usize) -> bool {
+    fn matches_static_size<T: RequestPayload<'data> + ?Sized>(bytes: usize) -> bool {
         match T::static_size() {
             Some(expected) => bytes == expected,
             None => true,
@@ -780,7 +802,7 @@ impl RequestData {
         self.tag
     }
 
-    pub(crate) fn view<T: RequestPayload + ?Sized>(&self) -> Option<&T> {
+    pub(crate) fn view<T: RequestPayload<'data> + ?Sized>(&self) -> Option<&T> {
         let parts = self.raw_parts();
         if parts.data.is_null() {
             return None;
@@ -798,7 +820,7 @@ impl RequestData {
         Some(unsafe { T::shared_from_raw_parts(target_parts) })
     }
 
-    pub(crate) unsafe fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
+    pub(crate) unsafe fn view_mut<T: RequestPayload<'data> + ?Sized>(&mut self) -> Option<&mut T> {
         let parts = RequestPayloadRawParts {
             data: match self.mode {
                 StorageMode::Inline => self.inline.as_mut_ptr(),
@@ -850,7 +872,7 @@ impl RequestData {
         self.reset_after_payload_move();
     }
 
-    fn take_exact_owned<T: 'static + RequestPayload>(&mut self) -> Option<T> {
+    fn take_exact_owned<T: RequestPayload<'data>>(&mut self) -> Option<T> {
         let value = match self.mode {
             StorageMode::Inline => unsafe {
                 let ptr = self.inline.as_ptr() as *const T;
@@ -880,14 +902,14 @@ impl RequestData {
 
         Some(value)
     }
-    fn convert_then_take<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+    fn convert_then_take<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         let parts = self.raw_parts();
 
         if unsafe { !(self.can_into_converter)(T::runtime_tag(), parts) } {
             return Err(RequestDataError::ConversionUnavailable);
         }
 
-        let mut converted = MaybeUninit::<RequestData>::uninit();
+        let mut converted = MaybeUninit::<RequestData<'data>>::uninit();
 
         let did_convert =
             unsafe { (self.into_converter)(T::runtime_tag(), parts, converted.as_mut_ptr()) };
@@ -902,11 +924,11 @@ impl RequestData {
 
         converted.take_exact::<T>()
     }
-    pub fn can_take_exact<T: 'static + RequestPayload>(&self) -> bool {
+    pub fn can_take_exact<T: RequestPayload<'data>>(&self) -> bool {
         !self.mode.is_borrowed() && self.matches::<T>()
     }
 
-    pub fn take_exact<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+    pub fn take_exact<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         if self.tag.is_none() {
             return Err(RequestDataError::Missing);
         }
@@ -923,7 +945,7 @@ impl RequestData {
             .ok_or(RequestDataError::Missing)
     }
 
-    pub fn can_require<T: 'static + RequestPayload>(&self) -> bool {
+    pub fn can_require<T: RequestPayload<'data>>(&self) -> bool {
         if self.mode.is_borrowed() {
             return false;
         }
@@ -941,7 +963,7 @@ impl RequestData {
         unsafe { (self.can_into_converter)(T::runtime_tag(), parts) }
     }
 
-    pub fn require<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+    pub fn require<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         if self.tag.is_none() {
             return Err(RequestDataError::Missing);
         }
@@ -962,7 +984,7 @@ impl RequestData {
     }
 }
 
-impl Drop for RequestData {
+impl<'data> Drop for RequestData<'data> {
     fn drop(&mut self) {
         match self.mode {
             StorageMode::Inline => {
@@ -990,7 +1012,7 @@ impl Drop for RequestData {
     }
 }
 
-impl RequestData {
+impl<'data> RequestData<'data> {
     /// Print metadata without the actual data payload
     pub fn print_meta(&self) -> alloc::string::String {
         alloc::format!(
@@ -1048,20 +1070,20 @@ pub enum TraversalPolicy {
 #[derive(Debug)]
 #[repr(C)]
 #[non_exhaustive]
-pub struct Request {
+pub struct Request<'data> {
     pub kind: RequestType,
-    pub(crate) data: RequestData,
+    pub(crate) data: RequestData<'data>,
     pub completed: bool,
     pub status: DriverStatus,
     pub traversal_policy: TraversalPolicy,
-    pub pnp: Option<PnpRequest>,
-    pub completion_routine: Option<CompletionRoutine>,
+    pub pnp: Option<PnpRequest<'data>>,
+    pub completion_routine: Option<CompletionRoutine<'data>>,
     pub completion_context: usize,
 }
 
-impl Request {
+impl<'data> Request<'data> {
     /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
-    pub(crate) fn new(kind: RequestType, data: RequestData) -> Self {
+    pub(crate) fn new(kind: RequestType, data: RequestData<'data>) -> Self {
         if matches!(kind, RequestType::Pnp) {
             panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
         }
@@ -1080,7 +1102,7 @@ impl Request {
 
     /// Create a PnP request.
     #[inline]
-    pub(crate) fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+    pub(crate) fn new_pnp(pnp_request: PnpRequest<'data>, data: RequestData<'data>) -> Self {
         Self {
             kind: RequestType::Pnp,
             data,
@@ -1095,13 +1117,13 @@ impl Request {
 
     /// Create a request with typed payload.
     #[inline]
-    pub(crate) fn new_t<T: 'static + RequestPayload>(kind: RequestType, data: T) -> Self {
+    pub(crate) fn new_t<T: RequestPayload<'data>>(kind: RequestType, data: T) -> Self {
         Self::new(kind, RequestData::from_t(data))
     }
 
     /// Create a PnP request with typed payload.
     #[inline]
-    pub(crate) fn new_pnp_t<T: 'static + RequestPayload>(pnp: PnpRequest, data: T) -> Self {
+    pub(crate) fn new_pnp_t<T: RequestPayload<'data>>(pnp: PnpRequest<'data>, data: T) -> Self {
         Self::new_pnp(pnp, RequestData::from_t(data))
     }
 
@@ -1112,24 +1134,24 @@ impl Request {
     }
 
     #[inline]
-    pub fn set_data(&mut self, data: RequestData) {
+    pub fn set_data(&mut self, data: RequestData<'data>) {
         self.data = data;
     }
 
     #[inline]
-    pub fn set_data_t<T: 'static + RequestPayload>(&mut self, data: T) {
+    pub fn set_data_t<T: RequestPayload<'data>>(&mut self, data: T) {
         self.data = RequestData::from_t(data);
     }
 
     #[inline]
-    pub fn data(&mut self) -> RequestDataView<'_> {
+    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
         match self.data.mode {
-            StorageMode::BorrowedReadOnly => RequestDataView::ToDevice(RequestDataRef {
+            StorageMode::BorrowedReadOnly => RequestDataView::ReadOnly(RequestDataRef {
                 data: &self.data,
                 _direction: PhantomData,
             }),
             StorageMode::BorrowedWritable | StorageMode::Inline | StorageMode::HeapTyped => {
-                RequestDataView::FromDevice(RequestDataRefMut {
+                RequestDataView::Writable(RequestDataRefMut {
                     data: &mut self.data,
                     _direction: PhantomData,
                 })
@@ -1170,7 +1192,7 @@ impl Request {
         }
     }
 
-    pub fn add_completion(&mut self, func: CompletionRoutine, ctx: usize) {
+    pub fn add_completion(&mut self, func: CompletionRoutine<'data>, ctx: usize) {
         match self.completion_routine {
             None => {
                 self.completion_routine = Some(func);
@@ -1196,7 +1218,7 @@ impl Request {
             if let Some(fp) = self.completion_routine.take() {
                 drop_chain =
                     fp as usize == chained_completion as usize && self.completion_context != 0;
-                let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
+                let f: CompletionRoutine<'data> = unsafe { core::mem::transmute(fp) };
                 let context = self.completion_context;
                 self.status = f(&mut *self, context);
             }
@@ -1212,41 +1234,43 @@ impl Request {
         if let Some(ctx) = should_drop_chain_ctx {
             unsafe {
                 drop(alloc::sync::Arc::from_raw(
-                    ctx as *const alloc::vec::Vec<CompletionEntry>,
+                    ctx as *const alloc::vec::Vec<CompletionEntry<'data>>,
                 ));
             }
             self.completion_context = 0;
         }
     }
 }
-impl Drop for Request {
+impl<'data> Drop for Request<'data> {
     fn drop(&mut self) {
         self.complete_for_drop();
     }
 }
-type CompletionEntry = (CompletionRoutine, usize);
+type CompletionEntry<'data> = (CompletionRoutine<'data>, usize);
 
-fn store_prev_and_new(
-    prev: CompletionRoutine,
+fn store_prev_and_new<'data>(
+    prev: CompletionRoutine<'data>,
     prev_ctx: usize,
-    next: CompletionRoutine,
+    next: CompletionRoutine<'data>,
     next_ctx: usize,
 ) -> usize {
-    let mut entries: alloc::vec::Vec<CompletionEntry> = alloc::vec::Vec::with_capacity(2);
+    let mut entries: alloc::vec::Vec<CompletionEntry<'data>> = alloc::vec::Vec::with_capacity(2);
     entries.push((next, next_ctx)); // newest first
     entries.push((prev, prev_ctx));
-    let arc: alloc::sync::Arc<alloc::vec::Vec<CompletionEntry>> = alloc::sync::Arc::new(entries);
+    let arc: alloc::sync::Arc<alloc::vec::Vec<CompletionEntry<'data>>> =
+        alloc::sync::Arc::new(entries);
     alloc::sync::Arc::into_raw(arc) as usize
 }
 
-extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverStatus {
+extern "win64" fn chained_completion(req: &mut Request<'_>, ctx: usize) -> DriverStatus {
     if ctx == 0 {
         return DriverStatus::Success;
     }
 
     // Temporarily borrow the chain without consuming the original Arc so
     // repeated invocations stay safe.
-    let arc = unsafe { alloc::sync::Arc::from_raw(ctx as *const alloc::vec::Vec<CompletionEntry>) };
+    let arc =
+        unsafe { alloc::sync::Arc::from_raw(ctx as *const alloc::vec::Vec<CompletionEntry<'_>>) };
     let keep_alive = arc.clone();
     let _ = alloc::sync::Arc::into_raw(arc);
 
@@ -1264,35 +1288,35 @@ extern "win64" fn chained_completion(req: &mut Request, ctx: usize) -> DriverSta
 /// Handle to a request - stack-borrowed or owned.
 #[repr(C)]
 #[derive(Debug)]
-pub enum RequestHandle<'a> {
+pub enum RequestHandle<'req, 'data> {
     /// Mutable borrow of a stack-allocated request.
-    Stack(&'a mut Request),
+    Stack(&'req mut Request<'data>),
     /// Owned request - the RequestHandle owns the Request directly.
-    Owned(Request),
+    Owned(Request<'data>),
 }
 
-impl<'a> RequestHandle<'a> {
+impl<'req, 'data> RequestHandle<'req, 'data> {
     /// Create a non-PnP request owned by the RequestHandle. Panics if called with `RequestType::Pnp`.
     #[inline]
-    pub fn new(kind: RequestType, data: RequestData) -> Self {
+    pub fn new(kind: RequestType, data: RequestData<'data>) -> Self {
         RequestHandle::Owned(Request::new(kind, data))
     }
 
     /// Create a PnP request owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp(pnp_request: PnpRequest, data: RequestData) -> Self {
+    pub fn new_pnp(pnp_request: PnpRequest<'data>, data: RequestData<'data>) -> Self {
         RequestHandle::Owned(Request::new_pnp(pnp_request, data))
     }
 
     /// Create a request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_t<T: 'static + RequestPayload>(kind: RequestType, data: T) -> Self {
+    pub fn new_t<T: RequestPayload<'data>>(kind: RequestType, data: T) -> Self {
         RequestHandle::Owned(Request::new_t(kind, data))
     }
 
     /// Create a PnP request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp_t<T: 'static + RequestPayload>(pnp: PnpRequest, data: T) -> Self {
+    pub fn new_pnp_t<T: RequestPayload<'data>>(pnp: PnpRequest<'data>, data: T) -> Self {
         RequestHandle::Owned(Request::new_pnp_t(pnp, data))
     }
 
@@ -1313,7 +1337,7 @@ impl<'a> RequestHandle<'a> {
 
     /// Acquire read access.
     #[inline]
-    pub fn read(&self) -> &Request {
+    pub fn read(&self) -> &Request<'data> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
@@ -1322,7 +1346,7 @@ impl<'a> RequestHandle<'a> {
 
     /// Acquire write access.
     #[inline]
-    pub fn write(&mut self) -> &mut Request {
+    pub fn write(&mut self) -> &mut Request<'data> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
@@ -1330,7 +1354,7 @@ impl<'a> RequestHandle<'a> {
     }
 
     #[inline]
-    pub fn data(&mut self) -> RequestDataView<'_> {
+    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
         self.write().data()
     }
 
@@ -1341,15 +1365,15 @@ impl<'a> RequestHandle<'a> {
 
     /// Returns a raw pointer to the inner Request. Only for use by BorrowedHandle within
     /// this module — not accessible outside request.rs.
-    pub(super) fn write_raw(&mut self) -> *mut Request {
+    pub(super) fn write_raw(&mut self) -> *mut Request<'data> {
         match self {
-            RequestHandle::Stack(r) => *r as *mut Request,
-            RequestHandle::Owned(r) => r as *mut Request,
+            RequestHandle::Stack(r) => *r as *mut Request<'data>,
+            RequestHandle::Owned(r) => r as *mut Request<'data>,
         }
     }
 }
 
-impl<'a> RequestHandleResult<'a> {
+impl<'req, 'data> RequestHandleResult<'req, 'data> {
     pub fn status(&self) -> DriverStatus {
         match &self.step {
             DriverStep::Complete { status } => status.clone(),
@@ -1360,9 +1384,9 @@ impl<'a> RequestHandleResult<'a> {
 
 /// Handler return type. Carries step + handle back to dispatcher.
 #[repr(C)]
-pub struct RequestHandleResult<'a> {
+pub struct RequestHandleResult<'req, 'data> {
     pub step: DriverStep,
-    pub handle: RequestHandle<'a>,
+    pub handle: RequestHandle<'req, 'data>,
 }
 // ============================================================================
 // BorrowedHandle — zero-copy driver-owned data borrow for forwarded requests
@@ -1391,14 +1415,14 @@ enum BorrowedStorage<'data, T: ?Sized> {
     Writable(&'data mut T),
 }
 
-pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> {
-    handle: &'req mut RequestHandle<'h>,
+pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> {
+    handle: &'req mut RequestHandle<'h, 'data>,
     borrow: BorrowedStorage<'data, T>,
 }
 
-impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> BorrowedHandle<'data, 'req, 'h, T> {
     fn install(
-        handle: &'req mut RequestHandle<'h>,
+        handle: &'req mut RequestHandle<'h, 'data>,
         parts: RequestPayloadRawParts,
         mode: StorageMode,
         borrow: BorrowedStorage<'data, T>,
@@ -1407,7 +1431,7 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
         Self { handle, borrow }
     }
 
-    pub fn read_only(handle: &'req mut RequestHandle<'h>, data: &'data T) -> Self {
+    pub fn read_only(handle: &'req mut RequestHandle<'h, 'data>, data: &'data T) -> Self {
         Self::install(
             handle,
             T::shared_raw_parts(data),
@@ -1416,7 +1440,7 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
         )
     }
 
-    pub fn writable(handle: &'req mut RequestHandle<'h>, data: &'data mut T) -> Self {
+    pub fn writable(handle: &'req mut RequestHandle<'h, 'data>, data: &'data mut T) -> Self {
         Self::install(
             handle,
             T::mut_raw_parts(data),
@@ -1426,12 +1450,12 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
     }
 
     /// Returns the inner handle for passing to lower drivers.
-    pub fn handle(&mut self) -> &mut RequestHandle<'h> {
+    pub fn handle(&mut self) -> &mut RequestHandle<'h, 'data> {
         self.handle
     }
 }
 
-impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> Drop
+impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> Drop
     for BorrowedHandle<'data, 'req, 'h, T>
 {
     fn drop(&mut self) {
