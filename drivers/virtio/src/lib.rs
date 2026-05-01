@@ -25,7 +25,7 @@ use kernel_api::irq::{
     IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
     irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -94,25 +94,13 @@ fn take_from_device_buffer<'a>(
     req: &mut RequestHandle<'a>,
     len: usize,
 ) -> Result<IoBuffer<'a, PhysFramed, FromDevice>, DriverStatus> {
-    let mut data = match req.data() {
+    let data = match req.data() {
         RequestDataView::FromDevice(data) => data,
         _ => return Err(DriverStatus::InvalidParameter),
     };
 
-    if let Some(buffer) = data.view::<IoBuffer<'_, PhysFramed, FromDevice>>() {
-        if buffer.len() < len {
-            return Err(DriverStatus::InsufficientResources);
-        }
-        return IoBuffer::<'a, PhysFramed, FromDevice>::new(
-            buffer.frame_offset(),
-            len,
-            buffer.physical_frames(),
-        )
-        .map_err(|_| DriverStatus::InsufficientResources);
-    }
-
     let buffer = data
-        .view::<IoBuffer<'_, Described, FromDevice>>()
+        .view::<IoBuffer<'_, PhysFramed, FromDevice>>()
         .ok_or(DriverStatus::InsufficientResources)?;
     if buffer.len() < len {
         return Err(DriverStatus::InsufficientResources);
@@ -131,31 +119,15 @@ fn describe_to_device_buffer<'a>(
     len: usize,
 ) -> Result<IoBuffer<'a, PhysFramed, ToDevice>, DriverStatus> {
     let data = req.data().read_only();
-    if let Some(buffer) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
-        if buffer.len() < len {
-            return Err(DriverStatus::InsufficientResources);
-        }
-        return IoBuffer::<'a, PhysFramed, ToDevice>::new(
-            buffer.frame_offset(),
-            len,
-            buffer.physical_frames(),
-        )
-        .map_err(|_| DriverStatus::InsufficientResources);
-    }
-
     let buffer = data
-        .view::<IoBuffer<'_, Described, ToDevice>>()
+        .view::<IoBuffer<'_, PhysFramed, ToDevice>>()
         .ok_or(DriverStatus::InsufficientResources)?;
     if buffer.len() < len {
         return Err(DriverStatus::InsufficientResources);
     }
 
-    IoBuffer::<'a, PhysFramed, ToDevice>::new(
-        buffer.frame_offset(),
-        len,
-        buffer.physical_frames(),
-    )
-    .map_err(|_| DriverStatus::InsufficientResources)
+    IoBuffer::<'a, PhysFramed, ToDevice>::new(buffer.frame_offset(), len, buffer.physical_frames())
+        .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 #[cfg(not(test))]

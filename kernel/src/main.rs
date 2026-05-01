@@ -21,6 +21,7 @@
 #![feature(linked_list_cursors)]
 #![allow(async_fn_in_trait)]
 #![feature(thread_local)]
+#![feature(specialization)]
 
 extern crate alloc;
 

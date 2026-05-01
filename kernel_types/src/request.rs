@@ -75,6 +75,11 @@ impl core::fmt::Debug for InlineBuffer {
 
 /// Dropper function signature - only does drop_in_place, never deallocates
 type DropperFn = extern "win64" fn(*mut u8);
+type RequestPayloadViewFn =
+    unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> Option<RequestPayloadRawParts>;
+type RequestPayloadCanIntoFn = unsafe extern "win64" fn(u64, RequestPayloadRawParts) -> bool;
+type RequestPayloadIntoFn =
+    unsafe extern "win64" fn(u64, RequestPayloadRawParts, *mut RequestData) -> bool;
 #[diagnostic::on_unimplemented(
     message = "`{Self}` cannot be used as RequestPayload without an outer layout guarantee",
     label = "missing outer layout guarantee for `{Self}`",
@@ -104,50 +109,180 @@ pub unsafe trait FfiSafe {}
 
 /// Erased raw payload parts stored inside [`RequestData`].
 #[doc(hidden)]
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct RequestPayloadRawParts {
     pub data: *mut u8,
     pub metadata: usize,
     pub bytes: usize,
 }
+
 pub unsafe trait RequestPayload: Send {
     /// Stable runtime tag for matching this payload type. Either impl or use type_tag::<T>()
-    fn runtime_tag() -> u64;
+    extern "win64" fn runtime_tag() -> u64;
 
     /// Static byte size for nominal sized payloads.
     #[inline]
-    fn static_size() -> Option<usize> {
+    extern "win64" fn static_size() -> Option<usize> {
         None
     }
 
     /// Erase a shared borrow into raw transport parts.
-    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts;
+    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts;
 
     /// Erase a mutable borrow into raw transport parts.
-    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts;
+    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts;
 
     /// Rebuild a shared view from erased raw transport parts.
-    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self;
+    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self;
 
     /// Rebuild a mutable view from erased raw transport parts.
-    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self;
+    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self;
+
+    /// Try to project this concrete payload into a shared target payload view.
+    ///
+    /// The default implementation exposes no coercions. Derives may override
+    /// this through `#[request_view(Source => Target)]` helper attributes.
+    #[inline]
+    unsafe extern "win64" fn shared_view_raw_parts(
+        _target_tag: u64,
+        _parts: RequestPayloadRawParts,
+    ) -> Option<RequestPayloadRawParts> {
+        None
+    }
+
+    /// Try to project this concrete payload into a mutable target payload view.
+    ///
+    /// The default implementation exposes no coercions. Derives may override
+    /// this through `#[request_view_mut(Source => Target)]` helper attributes.
+    #[inline]
+    unsafe extern "win64" fn mut_view_raw_parts(
+        _target_tag: u64,
+        _parts: RequestPayloadRawParts,
+    ) -> Option<RequestPayloadRawParts> {
+        None
+    }
+
+    /// Try to consume this concrete owned payload into a target payload.
+    ///
+    /// The default implementation exposes no conversions. Derives may override
+    /// this through `#[request_into(Source => Target)]` helper attributes.
+    ///
+    /// # Safety
+    ///
+    /// `out` must be valid for writes. Implementations must only write to `out`
+    /// and consume `parts` when returning `true`.
+    #[inline]
+    unsafe extern "win64" fn into_request_data(
+        _target_tag: u64,
+        _parts: RequestPayloadRawParts,
+        _out: *mut RequestData,
+    ) -> bool {
+        false
+    }
+
+    /// Try to determine whether this concrete owned payload can be consumed into
+    /// a target payload without consuming it.
+    ///
+    /// The default implementation exposes no conversions. Derives may override
+    /// this through `#[request_into(Source => Target)]` helper attributes.
+    #[inline]
+    unsafe extern "win64" fn can_into_request_data(
+        _target_tag: u64,
+        _parts: RequestPayloadRawParts,
+    ) -> bool {
+        false
+    }
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as a shared request view of `{Target}`",
+    label = "missing shared request view conversion from `{Self}` to `{Target}`",
+    note = "`#[request_view(Source => Target)]` requires Source: RequestPayload, Target: RequestPayload, and Source: AsRef<Target>"
+)]
+pub trait RequestPayloadView<Target: RequestPayload + ?Sized>:
+    RequestPayload + AsRef<Target>
+{
+}
+
+impl<Source, Target> RequestPayloadView<Target> for Source
+where
+    Source: RequestPayload + AsRef<Target> + ?Sized,
+    Target: RequestPayload + ?Sized,
+{
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as a mutable request view of `{Target}`",
+    label = "missing mutable request view conversion from `{Self}` to `{Target}`",
+    note = "`#[request_view_mut(Source => Target)]` requires Source: RequestPayload, Target: RequestPayload, and Source: AsMut<Target>"
+)]
+pub trait RequestPayloadViewMut<Target: RequestPayload + ?Sized>:
+    RequestPayload + AsMut<Target>
+{
+}
+
+impl<Source, Target> RequestPayloadViewMut<Target> for Source
+where
+    Source: RequestPayload + AsMut<Target> + ?Sized,
+    Target: RequestPayload + ?Sized,
+{
+}
+
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be consumed as request data into `{Target}`",
+    label = "missing owned request-data conversion from `{Self}` to `{Target}`",
+    note = "`#[request_into(Source => Target)]` requires Source: RequestPayload + Into<Target> and Target: 'static + RequestPayload"
+)]
+pub trait RequestPayloadInto<Target: 'static + RequestPayload>:
+    RequestPayload + Into<Target>
+{
+}
+
+impl<Source, Target> RequestPayloadInto<Target> for Source
+where
+    Source: RequestPayload + Into<Target>,
+    Target: 'static + RequestPayload,
+{
+}
+
+unsafe extern "win64" fn no_payload_view(
+    _target_tag: u64,
+    _parts: RequestPayloadRawParts,
+) -> Option<RequestPayloadRawParts> {
+    None
+}
+
+unsafe extern "win64" fn no_payload_into(
+    _target_tag: u64,
+    _parts: RequestPayloadRawParts,
+    _out: *mut RequestData,
+) -> bool {
+    false
+}
+
+unsafe extern "win64" fn no_payload_can_into(
+    _target_tag: u64,
+    _parts: RequestPayloadRawParts,
+) -> bool {
+    false
 }
 
 macro_rules! impl_nominal_request_payload {
     ($ty:path) => {
         unsafe impl RequestPayload for $ty {
             #[inline]
-            fn runtime_tag() -> u64 {
+            extern "win64" fn runtime_tag() -> u64 {
                 type_tag::<Self>()
             }
 
             #[inline]
-            fn static_size() -> Option<usize> {
+            extern "win64" fn static_size() -> Option<usize> {
                 Some(size_of::<Self>())
             }
 
             #[inline]
-            fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+            extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
                 RequestPayloadRawParts {
                     data: payload as *const Self as *mut u8,
                     metadata: 0,
@@ -156,7 +291,7 @@ macro_rules! impl_nominal_request_payload {
             }
 
             #[inline]
-            fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+            extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
                 RequestPayloadRawParts {
                     data: payload as *mut Self as *mut u8,
                     metadata: 0,
@@ -165,12 +300,16 @@ macro_rules! impl_nominal_request_payload {
             }
 
             #[inline]
-            unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+            unsafe extern "win64" fn shared_from_raw_parts<'a>(
+                parts: RequestPayloadRawParts,
+            ) -> &'a Self {
                 unsafe { &*(parts.data as *const Self) }
             }
 
             #[inline]
-            unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+            unsafe extern "win64" fn mut_from_raw_parts<'a>(
+                parts: RequestPayloadRawParts,
+            ) -> &'a mut Self {
                 unsafe { &mut *(parts.data as *mut Self) }
             }
         }
@@ -179,12 +318,12 @@ macro_rules! impl_nominal_request_payload {
 
 unsafe impl RequestPayload for [u8] {
     #[inline]
-    fn runtime_tag() -> u64 {
+    extern "win64" fn runtime_tag() -> u64 {
         type_tag::<[u8]>()
     }
 
     #[inline]
-    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_ptr() as *mut u8,
             metadata: payload.len(),
@@ -193,7 +332,7 @@ unsafe impl RequestPayload for [u8] {
     }
 
     #[inline]
-    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_mut_ptr(),
             metadata: payload.len(),
@@ -202,24 +341,24 @@ unsafe impl RequestPayload for [u8] {
     }
 
     #[inline]
-    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
         unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) }
     }
 
     #[inline]
-    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
         unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) }
     }
 }
 
 unsafe impl RequestPayload for str {
     #[inline]
-    fn runtime_tag() -> u64 {
+    extern "win64" fn runtime_tag() -> u64 {
         type_tag::<str>()
     }
 
     #[inline]
-    fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
+    extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
         let bytes = payload.as_bytes();
         RequestPayloadRawParts {
             data: bytes.as_ptr() as *mut u8,
@@ -229,7 +368,7 @@ unsafe impl RequestPayload for str {
     }
 
     #[inline]
-    fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
+    extern "win64" fn mut_raw_parts(payload: &mut Self) -> RequestPayloadRawParts {
         RequestPayloadRawParts {
             data: payload.as_ptr() as *mut u8,
             metadata: payload.len(),
@@ -238,13 +377,13 @@ unsafe impl RequestPayload for str {
     }
 
     #[inline]
-    unsafe fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
+    unsafe extern "win64" fn shared_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a Self {
         let bytes = unsafe { core::slice::from_raw_parts(parts.data as *const u8, parts.metadata) };
         unsafe { core::str::from_utf8_unchecked(bytes) }
     }
 
     #[inline]
-    unsafe fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
+    unsafe extern "win64" fn mut_from_raw_parts<'a>(parts: RequestPayloadRawParts) -> &'a mut Self {
         let bytes = unsafe { core::slice::from_raw_parts_mut(parts.data, parts.metadata) };
         unsafe { core::str::from_utf8_unchecked_mut(bytes) }
     }
@@ -264,6 +403,14 @@ pub struct RequestData {
     heap_layout: Layout,
     /// Type tag for runtime type checking
     tag: Option<u64>,
+    /// Source-type hook for shared request view coercions.
+    shared_viewer: RequestPayloadViewFn,
+    /// Source-type hook for mutable request view coercions.
+    mut_viewer: RequestPayloadViewFn,
+    /// Source-type hook for checking owned request-data conversions.
+    can_into_converter: RequestPayloadCanIntoFn,
+    /// Source-type hook for owned request-data conversions.
+    into_converter: RequestPayloadIntoFn,
     /// Custom drop function that runs T's destructor (drop_in_place only, no dealloc)
     dropper: DropperFn,
     /// Size of contained data in bytes
@@ -333,8 +480,23 @@ impl<'a> RequestDataRefMut<'a, Writable> {
         unsafe { self.data.view_mut::<T>() }
     }
     #[inline]
-    pub fn try_take<T: 'static + RequestPayload>(&mut self) -> Option<T> {
-        self.data.try_take::<T>()
+    pub fn can_take_exact<T: 'static + RequestPayload>(&self) -> bool {
+        self.data.can_take_exact::<T>()
+    }
+
+    #[inline]
+    pub fn take_exact<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+        self.data.take_exact::<T>()
+    }
+
+    #[inline]
+    pub fn can_require<T: 'static + RequestPayload>(&self) -> bool {
+        self.data.can_require::<T>()
+    }
+
+    #[inline]
+    pub fn require<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+        self.data.require::<T>()
     }
 }
 
@@ -467,7 +629,14 @@ pub const fn type_tag<T: ?Sized>() -> u64 {
     let len = strip_lifetimes_and_borrows(core::any::type_name::<T>().as_bytes(), &mut buf);
     fnv1a(&buf, len)
 }
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestDataError {
+    Missing,
+    WrongType,
+    BorrowedCannotBeConsumed,
+    ConversionUnavailable,
+    ConversionFailed,
+}
 /// No-op dropper for raw bytes or empty data
 extern "win64" fn noop_dropper(_: *mut u8) {}
 
@@ -479,6 +648,10 @@ impl RequestData {
             metadata: 0,
             heap_layout: Layout::new::<()>(),
             tag: None,
+            shared_viewer: no_payload_view,
+            mut_viewer: no_payload_view,
+            can_into_converter: no_payload_can_into,
+            into_converter: no_payload_into,
             dropper: noop_dropper,
             size: 0,
             mode: StorageMode::Inline,
@@ -487,13 +660,20 @@ impl RequestData {
 
     /// Install a non-owning borrow of driver-owned data. Only called by BorrowedHandle.
     /// The driver retains ownership; this RequestData must not drop or deallocate the pointer.
-    fn from_borrowed_raw(parts: RequestPayloadRawParts, tag: u64, mode: StorageMode) -> Self {
+    fn from_borrowed_raw<T: RequestPayload + ?Sized>(
+        parts: RequestPayloadRawParts,
+        mode: StorageMode,
+    ) -> Self {
         Self {
             inline: InlineBuffer::new(),
             data_ptr: parts.data,
             metadata: parts.metadata,
             heap_layout: Layout::new::<()>(),
-            tag: Some(tag),
+            tag: Some(T::runtime_tag()),
+            shared_viewer: T::shared_view_raw_parts,
+            mut_viewer: T::mut_view_raw_parts,
+            can_into_converter: T::can_into_request_data,
+            into_converter: T::into_request_data,
             dropper: noop_dropper,
             size: parts.bytes,
             mode,
@@ -517,6 +697,10 @@ impl RequestData {
                 metadata: 0,
                 heap_layout: Layout::new::<()>(),
                 tag: Some(T::runtime_tag()),
+                shared_viewer: T::shared_view_raw_parts,
+                mut_viewer: T::mut_view_raw_parts,
+                can_into_converter: T::can_into_request_data,
+                into_converter: T::into_request_data,
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::Inline,
@@ -547,6 +731,10 @@ impl RequestData {
                 metadata: 0,
                 heap_layout: layout,
                 tag: Some(T::runtime_tag()),
+                shared_viewer: T::shared_view_raw_parts,
+                mut_viewer: T::mut_view_raw_parts,
+                can_into_converter: T::can_into_request_data,
+                into_converter: T::into_request_data,
                 dropper: typed_dropper::<T>,
                 size,
                 mode: StorageMode::HeapTyped,
@@ -578,8 +766,12 @@ impl RequestData {
             return false;
         }
 
+        Self::matches_static_size::<T>(self.size)
+    }
+
+    fn matches_static_size<T: RequestPayload + ?Sized>(bytes: usize) -> bool {
         match T::static_size() {
-            Some(expected) => self.size == expected,
+            Some(expected) => bytes == expected,
             None => true,
         }
     }
@@ -589,24 +781,24 @@ impl RequestData {
     }
 
     pub(crate) fn view<T: RequestPayload + ?Sized>(&self) -> Option<&T> {
-        if !self.matches::<T>() {
-            return None;
-        }
-
         let parts = self.raw_parts();
-
         if parts.data.is_null() {
             return None;
         }
 
-        Some(unsafe { T::shared_from_raw_parts(parts) })
-    }
+        if self.matches::<T>() {
+            return Some(unsafe { T::shared_from_raw_parts(parts) });
+        }
 
-    pub(crate) unsafe fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
-        if !self.matches::<T>() {
+        let target_parts = unsafe { (self.shared_viewer)(T::runtime_tag(), parts) }?;
+        if target_parts.data.is_null() || !Self::matches_static_size::<T>(target_parts.bytes) {
             return None;
         }
 
+        Some(unsafe { T::shared_from_raw_parts(target_parts) })
+    }
+
+    pub(crate) unsafe fn view_mut<T: RequestPayload + ?Sized>(&mut self) -> Option<&mut T> {
         let parts = RequestPayloadRawParts {
             data: match self.mode {
                 StorageMode::Inline => self.inline.as_mut_ptr(),
@@ -621,52 +813,152 @@ impl RequestData {
             return None;
         }
 
-        Some(unsafe { T::mut_from_raw_parts(parts) })
-    }
+        if self.matches::<T>() {
+            return Some(unsafe { T::mut_from_raw_parts(parts) });
+        }
 
-    pub fn try_take<T: 'static + RequestPayload>(&mut self) -> Option<T> {
-        if !self.matches::<T>() {
+        let target_parts = unsafe { (self.mut_viewer)(T::runtime_tag(), parts) }?;
+        if target_parts.data.is_null() || !Self::matches_static_size::<T>(target_parts.bytes) {
             return None;
         }
 
-        let value = match self.mode {
-            StorageMode::Inline => {
-                // Read from inline storage
+        Some(unsafe { T::mut_from_raw_parts(target_parts) })
+    }
+
+    fn reset_after_payload_move(&mut self) {
+        self.data_ptr = null_mut();
+        self.metadata = 0;
+        self.tag = None;
+        self.size = 0;
+        self.mode = StorageMode::Inline;
+        self.shared_viewer = no_payload_view;
+        self.mut_viewer = no_payload_view;
+        self.can_into_converter = no_payload_can_into;
+        self.into_converter = no_payload_into;
+        self.dropper = noop_dropper;
+    }
+
+    fn release_owned_storage_without_drop(&mut self) {
+        if let StorageMode::HeapTyped = self.mode {
+            if !self.data_ptr.is_null() {
                 unsafe {
-                    let ptr = self.inline.as_ptr() as *const T;
-                    core::ptr::read(ptr)
+                    alloc::alloc::dealloc(self.data_ptr, self.heap_layout);
                 }
             }
+        }
+
+        self.reset_after_payload_move();
+    }
+
+    fn take_exact_owned<T: 'static + RequestPayload>(&mut self) -> Option<T> {
+        let value = match self.mode {
+            StorageMode::Inline => unsafe {
+                let ptr = self.inline.as_ptr() as *const T;
+                core::ptr::read(ptr)
+            },
+
             StorageMode::HeapTyped => {
-                // Read from heap, then deallocate the memory
                 if self.data_ptr.is_null() {
                     return None;
                 }
 
                 let value = unsafe { core::ptr::read(self.data_ptr as *const T) };
 
-                // Deallocate the memory (we've taken ownership of the value)
                 unsafe {
                     alloc::alloc::dealloc(self.data_ptr, self.heap_layout);
                 }
 
                 value
             }
+
             StorageMode::BorrowedReadOnly | StorageMode::BorrowedWritable => {
-                // Cannot move out of a borrow — driver retains ownership
                 return None;
             }
         };
 
-        // Reset to empty state (don't run dropper - we took ownership)
-        self.data_ptr = null_mut();
-        self.metadata = 0;
-        self.tag = None;
-        self.size = 0;
-        self.mode = StorageMode::Inline;
-        self.dropper = noop_dropper;
+        self.reset_after_payload_move();
 
         Some(value)
+    }
+    fn convert_then_take<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+        let parts = self.raw_parts();
+
+        if unsafe { !(self.can_into_converter)(T::runtime_tag(), parts) } {
+            return Err(RequestDataError::ConversionUnavailable);
+        }
+
+        let mut converted = MaybeUninit::<RequestData>::uninit();
+
+        let did_convert =
+            unsafe { (self.into_converter)(T::runtime_tag(), parts, converted.as_mut_ptr()) };
+
+        if !did_convert {
+            return Err(RequestDataError::ConversionFailed);
+        }
+
+        self.release_owned_storage_without_drop();
+
+        let mut converted = unsafe { converted.assume_init() };
+
+        converted.take_exact::<T>()
+    }
+    pub fn can_take_exact<T: 'static + RequestPayload>(&self) -> bool {
+        !self.mode.is_borrowed() && self.matches::<T>()
+    }
+
+    pub fn take_exact<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+        if self.tag.is_none() {
+            return Err(RequestDataError::Missing);
+        }
+
+        if self.mode.is_borrowed() {
+            return Err(RequestDataError::BorrowedCannotBeConsumed);
+        }
+
+        if !self.matches::<T>() {
+            return Err(RequestDataError::WrongType);
+        }
+
+        self.take_exact_owned::<T>()
+            .ok_or(RequestDataError::Missing)
+    }
+
+    pub fn can_require<T: 'static + RequestPayload>(&self) -> bool {
+        if self.mode.is_borrowed() {
+            return false;
+        }
+
+        if self.matches::<T>() {
+            return true;
+        }
+
+        let parts = self.raw_parts();
+
+        if parts.data.is_null() {
+            return false;
+        }
+
+        unsafe { (self.can_into_converter)(T::runtime_tag(), parts) }
+    }
+
+    pub fn require<T: 'static + RequestPayload>(&mut self) -> Result<T, RequestDataError> {
+        if self.tag.is_none() {
+            return Err(RequestDataError::Missing);
+        }
+
+        if self.mode.is_borrowed() {
+            return Err(RequestDataError::BorrowedCannotBeConsumed);
+        }
+
+        if self.matches::<T>() {
+            return self.take_exact::<T>();
+        }
+
+        if self.raw_parts().data.is_null() {
+            return Err(RequestDataError::Missing);
+        }
+
+        self.convert_then_take::<T>()
     }
 }
 
@@ -1111,8 +1403,7 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload + ?Sized> BorrowedHandle<'data, 'r
         mode: StorageMode,
         borrow: BorrowedStorage<'data, T>,
     ) -> Self {
-        unsafe { &mut *handle.write_raw() }.data =
-            RequestData::from_borrowed_raw(parts, T::runtime_tag(), mode);
+        unsafe { &mut *handle.write_raw() }.data = RequestData::from_borrowed_raw::<T>(parts, mode);
         Self { handle, borrow }
     }
 

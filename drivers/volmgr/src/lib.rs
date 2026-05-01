@@ -451,7 +451,7 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     let pi_opt: Option<PartitionInfo> = {
         let mut req = query_req.write();
         let pnp = req.pnp.as_mut().unwrap();
-        pnp.data_out.try_take::<PartitionInfo>()
+        pnp.data_out.take_exact::<PartitionInfo>().ok()
     };
     if let Some(pi) = pi_opt {
         dx.part.call_once(|| pi);

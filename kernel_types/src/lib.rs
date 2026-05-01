@@ -7,6 +7,7 @@
 #![allow(static_mut_refs)]
 #![feature(generic_const_exprs)]
 #![feature(const_trait_impl)]
+#![feature(specialization)]
 extern crate alloc;
 extern crate self as kernel_types;
 
@@ -26,7 +27,7 @@ pub mod runtime;
 pub mod status;
 use alloc::sync::Arc;
 pub use kernel_macros::RequestPayload;
-pub use request::RequestPayload;
+pub use request::{RequestPayload, RequestPayloadInto};
 use x86_64::VirtAddr;
 
 use crate::async_ffi::FfiFuture;

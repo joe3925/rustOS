@@ -227,7 +227,7 @@ const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     reserved: 0,
 };
 
-pub type DmaUnmapFn = fn(&Arc<DeviceObject>, usize);
+pub type DmaUnmapFn = extern "win64" fn(&Arc<DeviceObject>, usize);
 
 #[repr(C)]
 struct DmaDropContext {
@@ -565,11 +565,7 @@ pub struct IoBufferRegionIter<'a> {
 }
 
 impl<'a> IoBufferRegionIter<'a> {
-    fn new(
-        page_frames: &'a [IoBufferPageFrame],
-        frame_offset: usize,
-        byte_len: usize,
-    ) -> Self {
+    fn new(page_frames: &'a [IoBufferPageFrame], frame_offset: usize, byte_len: usize) -> Self {
         Self {
             page_frames,
             next_frame: 0,
@@ -974,6 +970,14 @@ impl<'inner, 'a> IntoIterator for &'inner IoBufferInner<'a> {
 
 #[repr(C)]
 #[derive(RequestPayload)]
+#[request_view(
+    IoBuffer<'a, Described, Direction> => IoBuffer<'a, PhysFramed, Direction>
+    where Direction: WritableIoBufferDirection
+)]
+#[request_view_mut(
+    IoBuffer<'a, Described, Direction> => IoBuffer<'a, PhysFramed, Direction>
+    where Direction: WritableIoBufferDirection
+)]
 pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
     inner: IoBufferInner<'a>,
     _state: PhantomData<fn() -> State>,
@@ -997,7 +1001,6 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
         unsafe { ptr::read(&this.inner) }
     }
 
-    #[allow(dead_code)]
     fn cast_state<NextState: IoBufferState>(self) -> IoBuffer<'a, NextState, Direction> {
         IoBuffer::<'a, NextState, Direction>::from_inner(self.into_inner())
     }
@@ -1127,10 +1130,58 @@ impl<'a, Direction: IoBufferDirection> IoBuffer<'a, PhysFramed, Direction> {
 }
 
 impl<'a, Direction: IoBufferDirection> IoBuffer<'a, Described, Direction> {
+    /// Reborrow this described buffer as a physical-frame-only view.
+    ///
+    /// `Described` already carries valid physical frame backing. This conversion
+    /// only hides the virtual-backed API at the type level; it does not rebuild
+    /// frame storage or remove the underlying virtual borrow.
+    pub fn as_phys_framed(&self) -> &IoBuffer<'a, PhysFramed, Direction> {
+        // SAFETY: `IoBuffer` stores its state marker only in zero-sized
+        // `PhantomData` fields. `Described` satisfies the `PhysFramed`
+        // invariant because described buffers always carry physical frames.
+        unsafe { &*(self as *const Self as *const IoBuffer<'a, PhysFramed, Direction>) }
+    }
+
+    /// Mutably reborrow this described buffer as a physical-frame-only view.
+    ///
+    /// This is the mutable counterpart to [`Self::as_phys_framed`].
+    pub fn as_phys_framed_mut(&mut self) -> &mut IoBuffer<'a, PhysFramed, Direction> {
+        // SAFETY: same type-state-only cast as `as_phys_framed`, with the
+        // caller's exclusive borrow preserving mutable aliasing rules.
+        unsafe { &mut *(self as *mut Self as *mut IoBuffer<'a, PhysFramed, Direction>) }
+    }
+
+    /// Convert this described buffer into a physical-frame-only buffer.
+    ///
+    /// This is a zero-cost type-state conversion. The virtual backing remains
+    /// owned by the buffer, but the returned type exposes only the APIs common
+    /// to physical-frame-backed buffers.
     pub fn into_phys_framed(self) -> IoBuffer<'a, PhysFramed, Direction> {
-        let mut inner = self.into_inner();
-        inner.remove_virtual_backing_in_place();
-        IoBuffer::<'a, PhysFramed, Direction>::from_inner(inner)
+        self.cast_state()
+    }
+}
+
+impl<'a, Direction: IoBufferDirection> core::convert::AsRef<IoBuffer<'a, PhysFramed, Direction>>
+    for IoBuffer<'a, Described, Direction>
+{
+    fn as_ref(&self) -> &IoBuffer<'a, PhysFramed, Direction> {
+        self.as_phys_framed()
+    }
+}
+
+impl<'a, Direction: IoBufferDirection> core::convert::AsMut<IoBuffer<'a, PhysFramed, Direction>>
+    for IoBuffer<'a, Described, Direction>
+{
+    fn as_mut(&mut self) -> &mut IoBuffer<'a, PhysFramed, Direction> {
+        self.as_phys_framed_mut()
+    }
+}
+
+impl<'a, Direction: IoBufferDirection> From<IoBuffer<'a, Described, Direction>>
+    for IoBuffer<'a, PhysFramed, Direction>
+{
+    fn from(buffer: IoBuffer<'a, Described, Direction>) -> Self {
+        buffer.into_phys_framed()
     }
 }
 

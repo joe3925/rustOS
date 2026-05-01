@@ -110,7 +110,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
                     let q = query.write();
 
                     if let Some(pnp) = q.pnp.as_mut() {
-                        if let Some(pi) = pnp.data_out.try_take::<PartitionInfo>() {
+                        if let Some(pi) = pnp.data_out.take_exact::<PartitionInfo>().ok() {
                             sector_size = Some(if pi.disk.logical_block_size != 0 {
                                 pi.disk.logical_block_size as u16
                             } else {

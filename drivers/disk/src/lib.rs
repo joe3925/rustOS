@@ -238,7 +238,7 @@ pub async fn disk_ioctl<'a, 'b>(
                 let mut wr = ch.write();
                 wr.pnp
                     .as_mut()
-                    .and_then(|p| p.data_out.try_take::<DiskInfo>())
+                    .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
             };
             if info_opt.is_none() {
                 info_opt = ch
@@ -299,7 +299,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
         let mut req = ch.write();
         req.pnp
             .as_mut()
-            .and_then(|p| p.data_out.try_take::<DiskInfo>())
+            .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
     };
 
     if di_opt.is_none() {

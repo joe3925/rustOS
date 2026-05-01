@@ -354,7 +354,7 @@ pub fn unmap_buffer<'a>(mut buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
     buffer
 }
 
-fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
+extern "win64" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
     let m = manager();
     let mut state = m.state.lock();
     let Some(pending) = state.pending_unmaps.remove(&(cookie as u64)) else {
