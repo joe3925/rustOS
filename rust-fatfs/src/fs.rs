@@ -16,6 +16,7 @@ use crate::table::{
     alloc_cluster, count_free_clusters, format_fat, read_fat_flags, ClusterIterator, RESERVED_FAT_ENTRIES,
 };
 use crate::time::{DefaultTimeProvider, TimeProvider};
+use crate::IoKind;
 
 // FAT implementation based on:
 //   http://wiki.osdev.org/FAT
@@ -136,24 +137,24 @@ impl FsInfoSector {
     const TRAIL_SIG: u32 = 0xAA55_0000;
 
     async fn deserialize<R: Read>(rdr: &mut R) -> Result<Self, Error<R::Error>> {
-        let lead_sig = rdr.read_u32_le().await?;
+        let lead_sig = rdr.read_u32_le(IoKind::Metadata).await?;
         if lead_sig != Self::LEAD_SIG {
             error!("invalid lead_sig in FsInfo sector: {}", lead_sig);
             return Err(Error::CorruptedFileSystem);
         }
         let mut reserved = [0_u8; 480];
-        rdr.read_exact(&mut reserved).await?;
-        let struc_sig = rdr.read_u32_le().await?;
+        rdr.read_exact(&mut reserved, IoKind::Metadata).await?;
+        let struc_sig = rdr.read_u32_le(IoKind::Metadata).await?;
         if struc_sig != Self::STRUC_SIG {
             error!("invalid struc_sig in FsInfo sector: {}", struc_sig);
             return Err(Error::CorruptedFileSystem);
         }
-        let free_cluster_count = match rdr.read_u32_le().await? {
+        let free_cluster_count = match rdr.read_u32_le(IoKind::Metadata).await? {
             0xFFFF_FFFF => None,
             // Note: value is validated in FileSystem::new function using values from BPB
             n => Some(n),
         };
-        let next_free_cluster = match rdr.read_u32_le().await? {
+        let next_free_cluster = match rdr.read_u32_le(IoKind::Metadata).await? {
             0xFFFF_FFFF => None,
             0 | 1 => {
                 warn!("invalid next_free_cluster in FsInfo sector (values 0 and 1 are reserved)");
@@ -163,8 +164,8 @@ impl FsInfoSector {
             n => Some(n),
         };
         let mut reserved2 = [0_u8; 12];
-        rdr.read_exact(&mut reserved2).await?;
-        let trail_sig = rdr.read_u32_le().await?;
+        rdr.read_exact(&mut reserved2, IoKind::Metadata).await?;
+        let trail_sig = rdr.read_u32_le(IoKind::Metadata).await?;
         if trail_sig != Self::TRAIL_SIG {
             error!("invalid trail_sig in FsInfo sector: {}", trail_sig);
             return Err(Error::CorruptedFileSystem);
@@ -177,15 +178,17 @@ impl FsInfoSector {
     }
 
     async fn serialize<W: Write>(&self, wrt: &mut W) -> Result<(), Error<W::Error>> {
-        wrt.write_u32_le(Self::LEAD_SIG).await?;
+        wrt.write_u32_le(Self::LEAD_SIG, IoKind::Metadata).await?;
         let reserved = [0_u8; 480];
-        wrt.write_all(&reserved).await?;
-        wrt.write_u32_le(Self::STRUC_SIG).await?;
-        wrt.write_u32_le(self.free_cluster_count.unwrap_or(0xFFFF_FFFF)).await?;
-        wrt.write_u32_le(self.next_free_cluster.unwrap_or(0xFFFF_FFFF)).await?;
+        wrt.write_all(&reserved, IoKind::Metadata).await?;
+        wrt.write_u32_le(Self::STRUC_SIG, IoKind::Metadata).await?;
+        wrt.write_u32_le(self.free_cluster_count.unwrap_or(0xFFFF_FFFF), IoKind::Metadata)
+            .await?;
+        wrt.write_u32_le(self.next_free_cluster.unwrap_or(0xFFFF_FFFF), IoKind::Metadata)
+            .await?;
         let reserved2 = [0_u8; 12];
-        wrt.write_all(&reserved2).await?;
-        wrt.write_u32_le(Self::TRAIL_SIG).await?;
+        wrt.write_all(&reserved2, IoKind::Metadata).await?;
+        wrt.write_u32_le(Self::TRAIL_SIG, IoKind::Metadata).await?;
         Ok(())
     }
 
@@ -503,7 +506,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         if zero {
             let mut disk = self.disk.borrow_mut();
             disk.seek(SeekFrom::Start(self.offset_from_cluster(cluster)))?;
-            write_zeros(&mut *disk, u64::from(self.cluster_size())).await?;
+            write_zeros(&mut *disk, u64::from(self.cluster_size()), IoKind::Data).await?;
         }
         let mut fs_info = self.fs_info.borrow_mut();
         fs_info.set_next_free_cluster(cluster + 1);
@@ -604,7 +607,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         };
         let mut disk = self.disk.borrow_mut();
         disk.seek(io::SeekFrom::Start(offset))?;
-        disk.write_u8(encoded).await?;
+        disk.write_u8(encoded, IoKind::Metadata).await?;
         self.current_status_flags.set(flags);
         Ok(())
     }
@@ -618,6 +621,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
                     self.first_data_sector - self.root_dir_sectors,
                     self.root_dir_sectors,
                     1,
+                    IoKind::Metadata,
                     &self.bpb,
                     FsIoAdapter { fs: self },
                 )),
@@ -705,18 +709,15 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
-        async move {
-            self.fs.disk.borrow_mut().read(buf).await
-        }
-        .into_ffi()
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
+        async move { self.fs.disk.borrow_mut().read(buf, kind).await }.into_ffi()
     }
 }
 
 impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
-            let size = self.fs.disk.borrow_mut().write(buf).await?;
+            let size = self.fs.disk.borrow_mut().write(buf, kind).await?;
             if size > 0 {
                 self.fs.set_dirty_flag(true).await?;
             }
@@ -726,10 +727,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     }
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move {
-            self.fs.disk.borrow_mut().flush().await
-        }
-        .into_ffi()
+        async move { self.fs.disk.borrow_mut().flush().await }.into_ffi()
     }
 }
 
@@ -759,7 +757,7 @@ fn fat_slice<S: ReadWriteSeek, B: BorrowMut<S>>(
         let fat_first_sector = (bpb.reserved_sectors()) + active_fat * sectors_per_fat;
         (fat_first_sector, 1)
     };
-    DiskSlice::from_sectors(fat_first_sector, sectors_per_fat, mirrors, bpb, io)
+    DiskSlice::from_sectors(fat_first_sector, sectors_per_fat, mirrors, IoKind::Fat, bpb, io)
 }
 
 pub(crate) struct DiskSlice<B, S = B> {
@@ -767,27 +765,37 @@ pub(crate) struct DiskSlice<B, S = B> {
     size: u64,
     offset: u64,
     mirrors: u8,
+    kind: IoKind,
     inner: B,
     phantom: PhantomData<S>,
 }
 
 impl<B: BorrowMut<S>, S: ReadWriteSeek> DiskSlice<B, S> {
-    pub(crate) fn new(begin: u64, size: u64, mirrors: u8, inner: B) -> Self {
+    pub(crate) fn new(begin: u64, size: u64, mirrors: u8, kind: IoKind, inner: B) -> Self {
         Self {
             begin,
             size,
             mirrors,
+            kind,
             inner,
             offset: 0,
             phantom: PhantomData,
         }
     }
 
-    fn from_sectors(first_sector: u32, sector_count: u32, mirrors: u8, bpb: &BiosParameterBlock, inner: B) -> Self {
+    fn from_sectors(
+        first_sector: u32,
+        sector_count: u32,
+        mirrors: u8,
+        kind: IoKind,
+        bpb: &BiosParameterBlock,
+        inner: B,
+    ) -> Self {
         Self::new(
             bpb.bytes_from_sectors(first_sector),
             bpb.bytes_from_sectors(sector_count),
             mirrors,
+            kind,
             inner,
         )
     }
@@ -805,6 +813,7 @@ impl<B: Clone, S> Clone for DiskSlice<B, S> {
             size: self.size,
             offset: self.offset,
             mirrors: self.mirrors,
+            kind: self.kind,
             inner: self.inner.clone(),
             // phantom is needed to add type bounds on the storage type
             phantom: PhantomData,
@@ -817,12 +826,12 @@ impl<B, S: IoBase> IoBase for DiskSlice<B, S> {
 }
 
 impl<B: BorrowMut<S>, S: Read + Seek> Read for DiskSlice<B, S> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
             let read_size = (buf.len() as u64).min(self.size - self.offset) as usize;
             self.inner.borrow_mut().seek(SeekFrom::Start(offset))?;
-            let size = self.inner.borrow_mut().read(&mut buf[..read_size]).await?;
+            let size = self.inner.borrow_mut().read(&mut buf[..read_size], self.kind).await?;
             self.offset += size as u64;
             Ok(size)
         }
@@ -831,7 +840,7 @@ impl<B: BorrowMut<S>, S: Read + Seek> Read for DiskSlice<B, S> {
 }
 
 impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
             let write_size = (buf.len() as u64).min(self.size - self.offset) as usize;
@@ -843,7 +852,7 @@ impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
                 let mut storage = self.inner.borrow_mut();
                 for i in 0..self.mirrors {
                     storage.seek(SeekFrom::Start(offset + u64::from(i) * self.size))?;
-                    storage.write_all(&buf[..write_size]).await?;
+                    storage.write_all(&buf[..write_size], self.kind).await?;
                 }
             }
             self.offset += write_size as u64;
@@ -853,10 +862,7 @@ impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
     }
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {
-        async move {
-            Ok(self.inner.borrow_mut().flush().await?)
-        }
-        .into_ffi()
+        async move { Ok(self.inner.borrow_mut().flush().await?) }.into_ffi()
     }
 }
 
@@ -927,25 +933,27 @@ impl OemCpConverter for LossyOemCpConverter {
     }
 }
 
-pub(crate) async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, mut len: u64) -> Result<(), IO::Error> {
-        const ZEROS: [u8; 512] = [0_u8; 512];
-        while len > 0 {
-            let write_size = len.min(ZEROS.len() as u64) as usize;
-            disk.write_all(&ZEROS[..write_size]).await?;
-            len -= write_size as u64;
-        }
-        Ok(())
-    }
-
-async fn write_zeros_until_end_of_sector<IO: ReadWriteSeek>(disk: &mut IO, bytes_per_sector: u16) -> Result<(), IO::Error> {
-    let pos = disk.seek(SeekFrom::Current(0))?;
-    let total_bytes_to_write = u64::from(bytes_per_sector) - (pos % u64::from(bytes_per_sector));
-    if total_bytes_to_write != u64::from(bytes_per_sector) {
-        write_zeros(disk, total_bytes_to_write).await?;
+pub(crate) async fn write_zeros<IO: ReadWriteSeek>(disk: &mut IO, mut len: u64, kind: IoKind) -> Result<(), IO::Error> {
+    const ZEROS: [u8; 512] = [0_u8; 512];
+    while len > 0 {
+        let write_size = len.min(ZEROS.len() as u64) as usize;
+        disk.write_all(&ZEROS[..write_size], kind).await?;
+        len -= write_size as u64;
     }
     Ok(())
 }
-
+async fn write_zeros_until_end_of_sector<IO: ReadWriteSeek>(
+    disk: &mut IO,
+    bytes_per_sector: u16,
+    kind: IoKind,
+) -> Result<(), IO::Error> {
+    let pos = disk.seek(SeekFrom::Current(0))?;
+    let total_bytes_to_write = u64::from(bytes_per_sector) - (pos % u64::from(bytes_per_sector));
+    if total_bytes_to_write != u64::from(bytes_per_sector) {
+        write_zeros(disk, total_bytes_to_write, kind).await?;
+    }
+    Ok(())
+}
 /// A FAT filesystem formatting options
 ///
 /// This struct implements a builder pattern.
@@ -1158,7 +1166,10 @@ impl FormatVolumeOptions {
 ///
 /// Panics in non-optimized build if `storage` position returned by `seek` is not zero.
 #[allow(clippy::needless_pass_by_value)]
-pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVolumeOptions) -> Result<(), Error<S::Error>> {
+pub async fn format_volume<S: ReadWriteSeek>(
+    storage: &mut S,
+    options: FormatVolumeOptions,
+) -> Result<(), Error<S::Error>> {
     trace!("format_volume");
     debug_assert!(storage.seek(SeekFrom::Current(0))? == 0);
 
@@ -1183,14 +1194,14 @@ pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVol
     boot.serialize(storage).await?;
     // Make sure entire logical sector is updated (serialize method always writes 512 bytes)
     let bytes_per_sector = boot.bpb.bytes_per_sector;
-    write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
+    write_zeros_until_end_of_sector(storage, bytes_per_sector, IoKind::Metadata).await?;
 
     let bpb = &boot.bpb;
     if bpb.is_fat32() {
         // backup boot sector
         storage.seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.backup_boot_sector())))?;
         boot.serialize(storage).await?;
-        write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
+        write_zeros_until_end_of_sector(storage, bytes_per_sector, IoKind::Metadata).await?;
     }
 
     // format File Allocation Table
@@ -1198,7 +1209,7 @@ pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVol
     let fat_pos = bpb.bytes_from_sectors(reserved_sectors);
     let sectors_per_all_fats = bpb.sectors_per_all_fats();
     storage.seek(SeekFrom::Start(fat_pos))?;
-    write_zeros(storage, bpb.bytes_from_sectors(sectors_per_all_fats)).await?;
+    write_zeros(storage, bpb.bytes_from_sectors(sectors_per_all_fats), IoKind::Fat).await?;
     {
         let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
         let sectors_per_fat = bpb.sectors_per_fat();
@@ -1211,7 +1222,7 @@ pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVol
     let root_dir_sectors = bpb.root_dir_sectors();
     let root_dir_pos = bpb.bytes_from_sectors(root_dir_first_sector);
     storage.seek(SeekFrom::Start(root_dir_pos))?;
-    write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors)).await?;
+    write_zeros(storage, bpb.bytes_from_sectors(root_dir_sectors), IoKind::Metadata).await?;
     if fat_type == FatType::Fat32 {
         let root_dir_first_cluster = {
             let mut fat_slice = fat_slice::<S, &mut S>(storage, bpb);
@@ -1223,7 +1234,7 @@ pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVol
         let fat32_root_dir_first_sector = first_data_sector + data_sectors_before_root_dir;
         let fat32_root_dir_pos = bpb.bytes_from_sectors(fat32_root_dir_first_sector);
         storage.seek(SeekFrom::Start(fat32_root_dir_pos))?;
-        write_zeros(storage, u64::from(bpb.cluster_size())).await?;
+        write_zeros(storage, u64::from(bpb.cluster_size()), IoKind::Metadata).await?;
 
         let free_cluster_count = bpb.total_clusters() - 1;
         let fs_info_sector = FsInfoSector {
@@ -1233,7 +1244,7 @@ pub async fn format_volume<S: ReadWriteSeek>(storage: &mut S, options: FormatVol
         };
         storage.seek(SeekFrom::Start(bpb.bytes_from_sectors(bpb.fs_info_sector())))?;
         fs_info_sector.serialize(storage).await?;
-        write_zeros_until_end_of_sector(storage, bytes_per_sector).await?;
+        write_zeros_until_end_of_sector(storage, bytes_per_sector, IoKind::Metadata).await?;
     }
 
     // Create volume label directory entry if volume label is specified in options

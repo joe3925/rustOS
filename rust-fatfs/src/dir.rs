@@ -1,3 +1,4 @@
+use crate::IoKind;
 #[cfg(all(feature = "alloc", feature = "lfn"))]
 use alloc::vec::Vec;
 use core::num;
@@ -64,11 +65,11 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for DirRawStream<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for DirRawStream<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             match self {
-                DirRawStream::File(file) => file.read(buf).await,
-                DirRawStream::Root(raw) => raw.read(buf).await,
+                DirRawStream::File(file) => file.read(buf, kind).await,
+                DirRawStream::Root(raw) => raw.read(buf, kind).await,
             }
         }
         .into_ffi()
@@ -76,11 +77,11 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for DirRawStream<'_, IO, TP,
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for DirRawStream<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             match self {
-                DirRawStream::File(file) => file.write(buf).await,
-                DirRawStream::Root(raw) => raw.write(buf).await,
+                DirRawStream::File(file) => file.write(buf, kind).await,
+                DirRawStream::Root(raw) => raw.write(buf, kind).await,
             }
         }
         .into_ffi()

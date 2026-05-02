@@ -129,7 +129,7 @@ async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsErro
         let mut remaining = new_size - old_size;
         while remaining != 0 {
             let take = remaining.min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..take]).await?;
+            file.write_all(&zeros[..take], fatfs::IoKind::Data).await?;
             remaining -= take as u64;
         }
     }
@@ -372,7 +372,7 @@ async fn execute_fs_work(
                             let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
-                                match file.read(buf).await {
+                                match file.read(buf, fatfs::IoKind::Data).await {
                                     Ok(n) => Ok(n),
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
@@ -447,7 +447,7 @@ async fn execute_fs_work(
                             let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
-                                match file.write_all(data).await {
+                                match file.write_all(data, fatfs::IoKind::Data).await {
                                     Ok(()) => {
                                         if write_through {
                                             flush_owner_blocking(&vdx, fs_file_id);
@@ -711,7 +711,7 @@ async fn execute_fs_work(
                             let res = match file.seek(SeekFrom::Start(start_off)).await {
                                 Ok(_) => {
                                     let n = data.len();
-                                    match file.write_all(data).await {
+                                    match file.write_all(data, fatfs::IoKind::Data).await {
                                         Ok(()) => {
                                             if write_through {
                                                 flush_owner_blocking(&vdx, fs_file_id);
@@ -796,7 +796,8 @@ async fn execute_fs_work(
                                     match file.seek(SeekFrom::Start(offset)).await {
                                         Ok(_) => {
                                             let zeros = vec![0u8; zero_len as usize];
-                                            match file.write_all(&zeros).await {
+                                            match file.write_all(&zeros, fatfs::IoKind::Data).await
+                                            {
                                                 Ok(()) => {
                                                     flush_owner(&vdx, fs_file_id);
                                                     None

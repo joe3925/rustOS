@@ -1,3 +1,4 @@
+use crate::IoKind;
 #[cfg(feature = "alloc")]
 use alloc::string::String;
 use bitflags::bitflags;
@@ -252,18 +253,18 @@ impl DirFileEntryData {
     }
 
     pub(crate) async fn serialize<W: Write>(&self, wrt: &mut W) -> Result<(), W::Error> {
-        wrt.write_all(&self.name).await?;
-        wrt.write_u8(self.attrs.bits()).await?;
-        wrt.write_u8(self.reserved_0).await?;
-        wrt.write_u8(self.create_time_0).await?;
-        wrt.write_u16_le(self.create_time_1).await?;
-        wrt.write_u16_le(self.create_date).await?;
-        wrt.write_u16_le(self.access_date).await?;
-        wrt.write_u16_le(self.first_cluster_hi).await?;
-        wrt.write_u16_le(self.modify_time).await?;
-        wrt.write_u16_le(self.modify_date).await?;
-        wrt.write_u16_le(self.first_cluster_lo).await?;
-        wrt.write_u32_le(self.size).await?;
+        wrt.write_all(&self.name, IoKind::Metadata).await?;
+        wrt.write_u8(self.attrs.bits(), IoKind::Metadata).await?;
+        wrt.write_u8(self.reserved_0, IoKind::Metadata).await?;
+        wrt.write_u8(self.create_time_0, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.create_time_1, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.create_date, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.access_date, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.first_cluster_hi, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.modify_time, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.modify_date, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.first_cluster_lo, IoKind::Metadata).await?;
+        wrt.write_u32_le(self.size, IoKind::Metadata).await?;
         Ok(())
     }
 
@@ -321,19 +322,19 @@ impl DirLfnEntryData {
     }
 
     pub(crate) async fn serialize<W: Write>(&self, wrt: &mut W) -> Result<(), W::Error> {
-        wrt.write_u8(self.order).await?;
+        wrt.write_u8(self.order, IoKind::Metadata).await?;
         for ch in &self.name_0 {
-            wrt.write_u16_le(*ch).await?;
+            wrt.write_u16_le(*ch, IoKind::Metadata).await?;
         }
-        wrt.write_u8(self.attrs.bits()).await?;
-        wrt.write_u8(self.entry_type).await?;
-        wrt.write_u8(self.checksum).await?;
+        wrt.write_u8(self.attrs.bits(), IoKind::Metadata).await?;
+        wrt.write_u8(self.entry_type, IoKind::Metadata).await?;
+        wrt.write_u8(self.checksum, IoKind::Metadata).await?;
         for ch in &self.name_1 {
-            wrt.write_u16_le(*ch).await?;
+            wrt.write_u16_le(*ch, IoKind::Metadata).await?;
         }
-        wrt.write_u16_le(self.reserved_0).await?;
+        wrt.write_u16_le(self.reserved_0, IoKind::Metadata).await?;
         for ch in &self.name_2 {
-            wrt.write_u16_le(*ch).await?;
+            wrt.write_u16_le(*ch, IoKind::Metadata).await?;
         }
         Ok(())
     }
@@ -377,7 +378,7 @@ impl DirEntryData {
     pub(crate) async fn deserialize<E: IoError, R: Read<Error = Error<E>>>(rdr: &mut R) -> Result<Self, Error<E>> {
         trace!("DirEntryData::deserialize");
         let mut name = [0; SFN_SIZE];
-        match rdr.read_exact(&mut name).await {
+        match rdr.read_exact(&mut name, IoKind::Metadata).await {
             Err(Error::UnexpectedEof) => {
                 // entries can occupy all clusters of directory so there is no zero entry at the end
                 // handle it here by returning non-existing empty entry
@@ -388,7 +389,7 @@ impl DirEntryData {
             }
             Ok(()) => {}
         }
-        let attrs = FileAttributes::from_bits_truncate(rdr.read_u8().await?);
+        let attrs = FileAttributes::from_bits_truncate(rdr.read_u8(IoKind::Metadata).await?);
         if attrs & FileAttributes::LFN == FileAttributes::LFN {
             // read long name entry
             let mut data = DirLfnEntryData {
@@ -402,14 +403,14 @@ impl DirEntryData {
                 *dst = u16::from_le_bytes(src.try_into().unwrap());
             }
 
-            data.entry_type = rdr.read_u8().await?;
-            data.checksum = rdr.read_u8().await?;
+            data.entry_type = rdr.read_u8(IoKind::Metadata).await?;
+            data.checksum = rdr.read_u8(IoKind::Metadata).await?;
             for x in &mut data.name_1 {
-                *x = rdr.read_u16_le().await?;
+                *x = rdr.read_u16_le(IoKind::Metadata).await?;
             }
-            data.reserved_0 = rdr.read_u16_le().await?;
+            data.reserved_0 = rdr.read_u16_le(IoKind::Metadata).await?;
             for x in &mut data.name_2 {
-                *x = rdr.read_u16_le().await?;
+                *x = rdr.read_u16_le(IoKind::Metadata).await?;
             }
             Ok(DirEntryData::Lfn(data))
         } else {
@@ -417,16 +418,16 @@ impl DirEntryData {
             let data = DirFileEntryData {
                 name,
                 attrs,
-                reserved_0: rdr.read_u8().await?,
-                create_time_0: rdr.read_u8().await?,
-                create_time_1: rdr.read_u16_le().await?,
-                create_date: rdr.read_u16_le().await?,
-                access_date: rdr.read_u16_le().await?,
-                first_cluster_hi: rdr.read_u16_le().await?,
-                modify_time: rdr.read_u16_le().await?,
-                modify_date: rdr.read_u16_le().await?,
-                first_cluster_lo: rdr.read_u16_le().await?,
-                size: rdr.read_u32_le().await?,
+                reserved_0: rdr.read_u8(IoKind::Metadata).await?,
+                create_time_0: rdr.read_u8(IoKind::Metadata).await?,
+                create_time_1: rdr.read_u16_le(IoKind::Metadata).await?,
+                create_date: rdr.read_u16_le(IoKind::Metadata).await?,
+                access_date: rdr.read_u16_le(IoKind::Metadata).await?,
+                first_cluster_hi: rdr.read_u16_le(IoKind::Metadata).await?,
+                modify_time: rdr.read_u16_le(IoKind::Metadata).await?,
+                modify_date: rdr.read_u16_le(IoKind::Metadata).await?,
+                first_cluster_lo: rdr.read_u16_le(IoKind::Metadata).await?,
+                size: rdr.read_u32_le(IoKind::Metadata).await?,
             };
             Ok(DirEntryData::File(data))
         }
@@ -512,7 +513,10 @@ impl DirEntryEditor {
         }
     }
 
-    pub(crate) async fn flush<IO: ReadWriteSeek, TP, OCC>(&mut self, fs: &FileSystem<IO, TP, OCC>) -> Result<(), IO::Error> {
+    pub(crate) async fn flush<IO: ReadWriteSeek, TP, OCC>(
+        &mut self,
+        fs: &FileSystem<IO, TP, OCC>,
+    ) -> Result<(), IO::Error> {
         if self.dirty {
             self.write(fs).await?;
             self.dirty = false;

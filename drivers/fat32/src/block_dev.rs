@@ -2,7 +2,7 @@ use core::cmp::min;
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use fatfs::{IoBase, Read, Seek, SeekFrom, Write};
+use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
 use kernel_api::{
     kernel_types::{io::IoTarget, request::RequestData},
     pnp::pnp_send_request,
@@ -65,7 +65,12 @@ impl BlockDev {
     }
 
     /// Send a read, borrowing `dst` directly so the lower driver writes into it.
-    async fn send_read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), DriverStatus> {
+    async fn send_read(
+        &mut self,
+        offset: u64,
+        dst: &mut [u8],
+        kind: IoKind,
+    ) -> Result<(), DriverStatus> {
         let volume = self.volume.clone();
         let mut req = RequestHandle::new(
             RequestType::Read {
@@ -90,7 +95,12 @@ impl BlockDev {
     }
 
     /// Send a write from an immutable source.
-    async fn send_write_immut(&mut self, offset: u64, src: &[u8]) -> Result<(), DriverStatus> {
+    async fn send_write_immut(
+        &mut self,
+        offset: u64,
+        src: &[u8],
+        kind: IoKind,
+    ) -> Result<(), DriverStatus> {
         let volume = self.volume.clone();
         let mut req = RequestHandle::new(
             RequestType::Write {
@@ -116,7 +126,7 @@ impl BlockDev {
         }
     }
 
-    async fn read_bytes(&mut self, dst: &mut [u8]) -> Result<usize, DriverStatus> {
+    async fn read_bytes(&mut self, dst: &mut [u8], kind: IoKind) -> Result<usize, DriverStatus> {
         if dst.is_empty() {
             return Ok(0);
         }
@@ -125,12 +135,12 @@ impl BlockDev {
             return Ok(0);
         }
         let len = min(dst.len(), (cap_bytes - self.pos) as usize);
-        self.send_read(self.pos, &mut dst[..len]).await?;
+        self.send_read(self.pos, &mut dst[..len], kind).await?;
         self.pos += len as u64;
         Ok(len)
     }
 
-    async fn write_bytes(&mut self, src: &[u8]) -> Result<usize, DriverStatus> {
+    async fn write_bytes(&mut self, src: &[u8], kind: IoKind) -> Result<usize, DriverStatus> {
         if src.is_empty() {
             return Ok(0);
         }
@@ -147,7 +157,7 @@ impl BlockDev {
             src.len(),
             (cap_bytes.checked_sub(self.pos).unwrap()) as usize,
         );
-        self.send_write_immut(self.pos, &src[..len]).await?;
+        self.send_write_immut(self.pos, &src[..len], kind).await?;
         self.pos += len as u64;
         Ok(len)
     }
@@ -156,14 +166,22 @@ impl BlockDev {
 use kernel_api::kernel_types::async_ffi::{FfiFuture, FutureExt};
 
 impl Read for BlockDev {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.read_bytes(buf).await.map_err(|_| ()) }.into_ffi()
+    fn read<'a>(
+        &'a mut self,
+        buf: &'a mut [u8],
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>> {
+        async move { self.read_bytes(buf, kind).await.map_err(|_| ()) }.into_ffi()
     }
 }
 
 impl Write for BlockDev {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
-        async move { self.write_bytes(buf).await.map_err(|_| ()) }.into_ffi()
+    fn write<'a>(
+        &'a mut self,
+        buf: &'a [u8],
+        kind: IoKind,
+    ) -> FfiFuture<Result<usize, Self::Error>> {
+        async move { self.write_bytes(buf, kind).await.map_err(|_| ()) }.into_ffi()
     }
 
     fn flush(&mut self) -> FfiFuture<Result<(), Self::Error>> {

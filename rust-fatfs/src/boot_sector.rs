@@ -1,3 +1,4 @@
+use crate::IoKind;
 use core::slice;
 
 use crate::dir_entry::DIR_ENTRY_SIZE;
@@ -46,37 +47,37 @@ pub(crate) struct BiosParameterBlock {
 impl BiosParameterBlock {
     pub(crate) async fn deserialize<R: Read>(rdr: &mut R) -> Result<Self, R::Error> {
         let mut bpb = Self {
-            bytes_per_sector: rdr.read_u16_le().await?,
-            sectors_per_cluster: rdr.read_u8().await?,
-            reserved_sectors: rdr.read_u16_le().await?,
-            fats: rdr.read_u8().await?,
-            root_entries: rdr.read_u16_le().await?,
-            total_sectors_16: rdr.read_u16_le().await?,
-            media: rdr.read_u8().await?,
-            sectors_per_fat_16: rdr.read_u16_le().await?,
-            sectors_per_track: rdr.read_u16_le().await?,
-            heads: rdr.read_u16_le().await?,
-            hidden_sectors: rdr.read_u32_le().await?,
-            total_sectors_32: rdr.read_u32_le().await?,
+            bytes_per_sector: rdr.read_u16_le(IoKind::Metadata).await?,
+            sectors_per_cluster: rdr.read_u8(IoKind::Metadata).await?,
+            reserved_sectors: rdr.read_u16_le(IoKind::Metadata).await?,
+            fats: rdr.read_u8(IoKind::Metadata).await?,
+            root_entries: rdr.read_u16_le(IoKind::Metadata).await?,
+            total_sectors_16: rdr.read_u16_le(IoKind::Metadata).await?,
+            media: rdr.read_u8(IoKind::Metadata).await?,
+            sectors_per_fat_16: rdr.read_u16_le(IoKind::Metadata).await?,
+            sectors_per_track: rdr.read_u16_le(IoKind::Metadata).await?,
+            heads: rdr.read_u16_le(IoKind::Metadata).await?,
+            hidden_sectors: rdr.read_u32_le(IoKind::Metadata).await?,
+            total_sectors_32: rdr.read_u32_le(IoKind::Metadata).await?,
             ..Self::default()
         };
 
         if bpb.is_fat32() {
-            bpb.sectors_per_fat_32 = rdr.read_u32_le().await?;
-            bpb.extended_flags = rdr.read_u16_le().await?;
-            bpb.fs_version = rdr.read_u16_le().await?;
-            bpb.root_dir_first_cluster = rdr.read_u32_le().await?;
-            bpb.fs_info_sector = rdr.read_u16_le().await?;
-            bpb.backup_boot_sector = rdr.read_u16_le().await?;
-            rdr.read_exact(&mut bpb.reserved_0).await?;
+            bpb.sectors_per_fat_32 = rdr.read_u32_le(IoKind::Metadata).await?;
+            bpb.extended_flags = rdr.read_u16_le(IoKind::Metadata).await?;
+            bpb.fs_version = rdr.read_u16_le(IoKind::Metadata).await?;
+            bpb.root_dir_first_cluster = rdr.read_u32_le(IoKind::Metadata).await?;
+            bpb.fs_info_sector = rdr.read_u16_le(IoKind::Metadata).await?;
+            bpb.backup_boot_sector = rdr.read_u16_le(IoKind::Metadata).await?;
+            rdr.read_exact(&mut bpb.reserved_0, IoKind::Metadata).await?;
         }
 
-        bpb.drive_num = rdr.read_u8().await?;
-        bpb.reserved_1 = rdr.read_u8().await?;
-        bpb.ext_sig = rdr.read_u8().await?; // 0x29
-        bpb.volume_id = rdr.read_u32_le().await?;
-        rdr.read_exact(&mut bpb.volume_label).await?;
-        rdr.read_exact(&mut bpb.fs_type_label).await?;
+        bpb.drive_num = rdr.read_u8(IoKind::Metadata).await?;
+        bpb.reserved_1 = rdr.read_u8(IoKind::Metadata).await?;
+        bpb.ext_sig = rdr.read_u8(IoKind::Metadata).await?; // 0x29
+        bpb.volume_id = rdr.read_u32_le(IoKind::Metadata).await?;
+        rdr.read_exact(&mut bpb.volume_label, IoKind::Metadata).await?;
+        rdr.read_exact(&mut bpb.fs_type_label, IoKind::Metadata).await?;
 
         // when the extended boot signature is anything other than 0x29, the fields are invalid
         if bpb.ext_sig != 0x29 {
@@ -90,35 +91,35 @@ impl BiosParameterBlock {
     }
 
     pub(crate) async fn serialize<W: Write>(&self, wrt: &mut W) -> Result<(), W::Error> {
-        wrt.write_u16_le(self.bytes_per_sector).await?;
-        wrt.write_u8(self.sectors_per_cluster).await?;
-        wrt.write_u16_le(self.reserved_sectors).await?;
-        wrt.write_u8(self.fats).await?;
-        wrt.write_u16_le(self.root_entries).await?;
-        wrt.write_u16_le(self.total_sectors_16).await?;
-        wrt.write_u8(self.media).await?;
-        wrt.write_u16_le(self.sectors_per_fat_16).await?;
-        wrt.write_u16_le(self.sectors_per_track).await?;
-        wrt.write_u16_le(self.heads).await?;
-        wrt.write_u32_le(self.hidden_sectors).await?;
-        wrt.write_u32_le(self.total_sectors_32).await?;
+        wrt.write_u16_le(self.bytes_per_sector, IoKind::Metadata).await?;
+        wrt.write_u8(self.sectors_per_cluster, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.reserved_sectors, IoKind::Metadata).await?;
+        wrt.write_u8(self.fats, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.root_entries, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.total_sectors_16, IoKind::Metadata).await?;
+        wrt.write_u8(self.media, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.sectors_per_fat_16, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.sectors_per_track, IoKind::Metadata).await?;
+        wrt.write_u16_le(self.heads, IoKind::Metadata).await?;
+        wrt.write_u32_le(self.hidden_sectors, IoKind::Metadata).await?;
+        wrt.write_u32_le(self.total_sectors_32, IoKind::Metadata).await?;
 
         if self.is_fat32() {
-            wrt.write_u32_le(self.sectors_per_fat_32).await?;
-            wrt.write_u16_le(self.extended_flags).await?;
-            wrt.write_u16_le(self.fs_version).await?;
-            wrt.write_u32_le(self.root_dir_first_cluster).await?;
-            wrt.write_u16_le(self.fs_info_sector).await?;
-            wrt.write_u16_le(self.backup_boot_sector).await?;
-            wrt.write_all(&self.reserved_0).await?;
+            wrt.write_u32_le(self.sectors_per_fat_32, IoKind::Metadata).await?;
+            wrt.write_u16_le(self.extended_flags, IoKind::Metadata).await?;
+            wrt.write_u16_le(self.fs_version, IoKind::Metadata).await?;
+            wrt.write_u32_le(self.root_dir_first_cluster, IoKind::Metadata).await?;
+            wrt.write_u16_le(self.fs_info_sector, IoKind::Metadata).await?;
+            wrt.write_u16_le(self.backup_boot_sector, IoKind::Metadata).await?;
+            wrt.write_all(&self.reserved_0, IoKind::Metadata).await?;
         }
 
-        wrt.write_u8(self.drive_num).await?;
-        wrt.write_u8(self.reserved_1).await?;
-        wrt.write_u8(self.ext_sig).await?; // 0x29
-        wrt.write_u32_le(self.volume_id).await?;
-        wrt.write_all(&self.volume_label).await?;
-        wrt.write_all(&self.fs_type_label).await?;
+        wrt.write_u8(self.drive_num, IoKind::Metadata).await?;
+        wrt.write_u8(self.reserved_1, IoKind::Metadata).await?;
+        wrt.write_u8(self.ext_sig, IoKind::Metadata).await?; // 0x29
+        wrt.write_u32_le(self.volume_id, IoKind::Metadata).await?;
+        wrt.write_all(&self.volume_label, IoKind::Metadata).await?;
+        wrt.write_all(&self.fs_type_label, IoKind::Metadata).await?;
         Ok(())
     }
 
@@ -420,30 +421,30 @@ pub(crate) struct BootSector {
 impl BootSector {
     pub(crate) async fn deserialize<R: Read>(rdr: &mut R) -> Result<Self, R::Error> {
         let mut boot = Self::default();
-        rdr.read_exact(&mut boot.bootjmp).await?;
-        rdr.read_exact(&mut boot.oem_name).await?;
+        rdr.read_exact(&mut boot.bootjmp, IoKind::Metadata).await?;
+        rdr.read_exact(&mut boot.oem_name, IoKind::Metadata).await?;
         boot.bpb = BiosParameterBlock::deserialize(rdr).await?;
 
         if boot.bpb.is_fat32() {
-            rdr.read_exact(&mut boot.boot_code[0..420]).await?;
+            rdr.read_exact(&mut boot.boot_code[0..420], IoKind::Metadata).await?;
         } else {
-            rdr.read_exact(&mut boot.boot_code[0..448]).await?;
+            rdr.read_exact(&mut boot.boot_code[0..448], IoKind::Metadata).await?;
         }
-        rdr.read_exact(&mut boot.boot_sig).await?;
+        rdr.read_exact(&mut boot.boot_sig, IoKind::Metadata).await?;
         Ok(boot)
     }
 
     pub(crate) async fn serialize<W: Write>(&self, wrt: &mut W) -> Result<(), W::Error> {
-        wrt.write_all(&self.bootjmp).await?;
-        wrt.write_all(&self.oem_name).await?;
+        wrt.write_all(&self.bootjmp, IoKind::Metadata).await?;
+        wrt.write_all(&self.oem_name, IoKind::Metadata).await?;
         self.bpb.serialize(&mut *wrt).await?;
 
         if self.bpb.is_fat32() {
-            wrt.write_all(&self.boot_code[0..420]).await?;
+            wrt.write_all(&self.boot_code[0..420], IoKind::Metadata).await?;
         } else {
-            wrt.write_all(&self.boot_code[0..448]).await?;
+            wrt.write_all(&self.boot_code[0..448], IoKind::Metadata).await?;
         }
-        wrt.write_all(&self.boot_sig).await?;
+        wrt.write_all(&self.boot_sig, IoKind::Metadata).await?;
         Ok(())
     }
 

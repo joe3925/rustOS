@@ -1,3 +1,4 @@
+use crate::IoKind;
 use core::convert::TryFrom;
 
 use crate::dir_entry::DirEntryEditor;
@@ -301,7 +302,7 @@ impl<IO: ReadWriteSeek, TP, OCC> IoBase for File<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
-    fn read<'a>(&'a mut self, buf: &'a mut [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::read");
 
@@ -379,7 +380,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
                 let read_bytes = {
                     let mut disk = self.fs.disk.borrow_mut();
                     disk.seek(SeekFrom::Start(offset_in_fs))?;
-                    disk.read(&mut remaining[..read_size]).await?
+                    disk.read(&mut remaining[..read_size], kind).await?
                 };
 
                 if read_bytes == 0 {
@@ -411,7 +412,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
 }
 
 impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
-    fn write<'a>(&'a mut self, buf: &'a [u8]) -> FfiFuture<Result<usize, Self::Error>> {
+    fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::write");
 
@@ -502,7 +503,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
                 let written_bytes = {
                     let mut disk = self.fs.disk.borrow_mut();
                     disk.seek(SeekFrom::Start(offset_in_fs))?;
-                    disk.write(&remaining[..write_size]).await?
+                    disk.write(&remaining[..write_size], kind).await?
                 };
 
                 if written_bytes == 0 {
