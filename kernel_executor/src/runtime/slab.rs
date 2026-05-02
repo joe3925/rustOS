@@ -1541,9 +1541,6 @@ pub fn decode_slab_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
     let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
     let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
 
-    if shard_idx >= NUM_SHARDS {
-        return None;
-    }
     Some((shard_idx, local_idx, generation))
 }
 
@@ -1564,9 +1561,6 @@ pub fn decode_joinable_slab_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
     let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
     let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
 
-    if shard_idx >= NUM_SHARDS {
-        return None;
-    }
     Some((shard_idx, local_idx, generation))
 }
 

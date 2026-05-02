@@ -362,7 +362,6 @@ pub async fn partmgr_pnp_query_devrels<'a, 'b>(
             continue;
         }
 
-        const ZERO: [u8; 16] = [0; 16];
         const EFI_SYSTEM: [u8; 16] = [
             0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E,
             0xC9, 0x3B,
@@ -372,7 +371,7 @@ pub async fn partmgr_pnp_query_devrels<'a, 'b>(
             0x46, 0x49,
         ];
         let ptype = e.partition_type_guid;
-        if ptype == ZERO || ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
+        if ptype == EFI_SYSTEM || ptype == BIOS_BOOT {
             continue;
         }
 

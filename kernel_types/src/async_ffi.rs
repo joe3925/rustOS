@@ -57,20 +57,14 @@ impl<const N: usize, const W: usize> BitmapFreelist<N, W> {
 
     #[inline(always)]
     fn push(&self, idx: usize) {
-        if SLAB_CHECKS {
-            debug_assert!(idx < N);
-        }
+        debug_assert!(!SLAB_CHECKS || idx < N);
         let wi = idx / USIZE_BITS;
         let bi = idx % USIZE_BITS;
-        if SLAB_CHECKS {
-            debug_assert!(wi < W);
-        }
+        debug_assert!(!SLAB_CHECKS || wi < W);
         let mask = 1usize << bi;
 
         let prev = self.words[wi].fetch_or(mask, Ordering::Release);
-        if SLAB_CHECKS {
-            debug_assert!((prev & mask) == 0, "double free");
-        }
+        debug_assert!(!SLAB_CHECKS || (prev & mask) == 0, "double free");
     }
 
     #[inline(always)]

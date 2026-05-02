@@ -973,7 +973,9 @@ impl<'data> RequestData<'data> {
         }
 
         if self.matches::<T>() {
-            return self.take_exact::<T>();
+            return self
+                .take_exact_owned::<T>()
+                .ok_or(RequestDataError::Missing);
         }
 
         if self.raw_parts().data.is_null() {

@@ -3,7 +3,7 @@ use core::convert::TryFrom;
 use crate::dir_entry::DirEntryEditor;
 use crate::error::Error;
 use crate::fs::{FileSystem, ReadWriteSeek};
-use crate::io::{IoBase, Read, Seek, SeekFrom, Write};
+use crate::io::{IoBase, Read, SeekFrom, Write};
 use crate::time::{Date, DateTime, TimeProvider};
 
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
@@ -24,6 +24,33 @@ pub struct File<'a, IO: ReadWriteSeek, TP, OCC> {
     entry: Option<DirEntryEditor>,
     // file-system reference
     fs: &'a FileSystem<IO, TP, OCC>,
+}
+
+/// Cached state for an opened FAT file.
+///
+/// This stores the path-independent state needed to recreate a [`File`] while
+/// holding a [`FileSystem`] reference, avoiding repeated directory traversal for
+/// each file operation.
+#[derive(Clone, Debug)]
+pub struct CachedFileState {
+    first_cluster: Option<u32>,
+    current_cluster: Option<u32>,
+    offset: u32,
+    entry: Option<DirEntryEditor>,
+}
+
+impl CachedFileState {
+    /// Recreates a [`File`] from cached open state.
+    #[must_use]
+    pub fn into_file<'a, IO: ReadWriteSeek, TP, OCC>(self, fs: &'a FileSystem<IO, TP, OCC>) -> File<'a, IO, TP, OCC> {
+        File {
+            first_cluster: self.first_cluster,
+            current_cluster: self.current_cluster,
+            offset: self.offset,
+            entry: self.entry,
+            fs,
+        }
+    }
 }
 
 /// An extent containing a file's data on disk.
@@ -50,6 +77,23 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
             current_cluster: None, // cluster before first one
             offset: 0,
         }
+    }
+
+    /// Converts this file handle into path-independent cached open state.
+    #[must_use]
+    pub fn into_cached_state(self) -> CachedFileState {
+        CachedFileState {
+            first_cluster: self.first_cluster,
+            current_cluster: self.current_cluster,
+            offset: self.offset,
+            entry: self.entry.clone(),
+        }
+    }
+
+    /// Recreates a file handle from cached open state.
+    #[must_use]
+    pub fn from_cached_state(state: CachedFileState, fs: &'a FileSystem<IO, TP, OCC>) -> Self {
+        state.into_file(fs)
     }
 
     /// Truncate file in current position.

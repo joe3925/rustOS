@@ -300,9 +300,7 @@ impl<T> AsyncRwLock<T> {
 
         if now == 0 {
             let mut ww = self.w_waiters.lock();
-            if !ww.is_empty() {
-                wake_one(&mut ww);
-            }
+            wake_one(&mut ww);
         }
     }
 

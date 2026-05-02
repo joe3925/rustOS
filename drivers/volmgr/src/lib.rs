@@ -611,7 +611,6 @@ pub async fn vol_pdo_read<'a, 'b>(
     let mut len = len_req;
     len = core::cmp::min(len, buf_len);
     len = core::cmp::min(len, req_data_len);
-    len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);
@@ -683,7 +682,6 @@ pub async fn vol_pdo_write<'a, 'b>(
             }
         },
     );
-    len = core::cmp::min(len, (vol_len - offset) as usize);
 
     if len == 0 {
         return DriverStep::complete(DriverStatus::Success);

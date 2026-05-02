@@ -113,18 +113,13 @@ impl KernelFpuGuard {
         let cpu_id = current_cpu_id();
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
             // Avoid blocking inside interrupts; skip if the lock is contended.
-            let locked = {
+            {
                 let mut guard = task.inner.try_write().expect(
                     "Failed to acquire task lock for saving FPU state in interrupt handler",
                 );
                 guard.save_fpu_state();
-                true
-            };
-            if locked {
-                Some(task)
-            } else {
-                None
             }
+            Some(task)
         } else {
             None
         };
@@ -554,14 +549,14 @@ impl Scheduler {
     }
 
     pub fn park_current_if(&self, reason: BlockReason, should_park: bool) {
+        if !should_park {
+            return;
+        }
+
         let cpu_id = current_cpu_id();
         let Some(core) = self.core(cpu_id) else {
             return;
         };
-
-        if !should_park {
-            return;
-        }
 
         let current = {
             let state = core.sched_lock.read();

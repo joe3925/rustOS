@@ -119,9 +119,6 @@ pub async fn disk_read<'a, 'b>(
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
-    if bs == 0 {
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-    }
 
     match req.data() {
         RequestDataView::Writable(data) => {
@@ -172,9 +169,6 @@ pub async fn disk_write<'a, 'b>(
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
-    if bs == 0 {
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-    }
     let data = req.data().read_only();
 
     if !has_to_device_buffer(data) {

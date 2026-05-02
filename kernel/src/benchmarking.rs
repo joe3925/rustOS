@@ -2092,11 +2092,11 @@ const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
-    64 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    2 * 1024 * 1024,
-    4 * 1024 * 1024,
+    // 64 * 1024,
+    // 512 * 1024,
+    // 1024 * 1024,
+    // 2 * 1024 * 1024,
+    // 4 * 1024 * 1024,
     //64 * 1024 * 1024,
 ];
 
@@ -2162,7 +2162,7 @@ pub async fn bench_c_drive_io_async() {
         &[
             OpenFlags::Create,
             OpenFlags::ReadWrite,
-            // OpenFlags::WriteThrough,
+            OpenFlags::WriteThrough,
         ],
     )
     .await
@@ -3280,13 +3280,14 @@ pub async fn run_virtio_bench_matrix() {
 }
 pub async fn run_virtio_bench_matrix_print() {
     let flags_list: [u32; 1] = [BENCH_FLAG_IRQ | BENCH_FLAG_POLL];
-    let total_bytes_list: [u64; 1] = [32 * 1024 * 1024];
+    let total_bytes_list: [u64; 1] = [10 * 1024 * 1024];
 
     let request_size_list: [u32; _] = [
+        1 * 1024,
         //4 * 1024,
         // 8 * 1024,
         // 16 * 1024,
-        64 * 1024,
+        //64 * 1024,
         // 256 * 1024,
         // 1024 * 1024,
         //4 * 1024 * 1024,

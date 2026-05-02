@@ -1,10 +1,8 @@
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
-use core::sync::atomic::compiler_fence;
 use core::task::{Context, Poll, Waker};
 use crossbeam_queue::SegQueue;
 use kernel_types::device::{DevNode, DeviceObject};
@@ -70,7 +68,7 @@ macro_rules! println {
 /// This is the main entry point for request routing.
 pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
     {
-        let mut guard = handle.write();
+        let guard = handle.write();
         guard.status = DriverStatus::ContinueStep;
         guard.completed = false;
     }
@@ -80,13 +78,7 @@ pub async fn send_request(target: IoTarget, handle: &mut RequestHandle<'_, '_>) 
         (guard.kind, guard.traversal_policy)
     };
 
-    let dev = target.clone();
-    let result = call_device_handler(dev, handle, kind, policy).await;
-
-    match result {
-        DriverStep::Complete { status } => status,
-        DriverStep::Continue => handle.read().status.clone(),
-    }
+    call_device_handler(target.clone(), handle, kind, policy).await
 }
 
 /// Forward a request to the next lower device in the stack.
@@ -167,7 +159,6 @@ pub fn complete_request(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
         guard.status = DriverStatus::Success;
     }
     guard.completion_context = 0;
-    guard.completion_routine = None;
     guard.completed = true;
     guard.status.clone()
 }
@@ -177,14 +168,19 @@ async fn call_device_handler(
     handle: &mut RequestHandle<'_, '_>,
     kind: RequestType,
     policy: TraversalPolicy,
-) -> DriverStep {
-    loop {
-        if matches!(kind, RequestType::Dummy) {
-            handle.write().status = DriverStatus::Success;
-            return DriverStep::complete(complete_request(handle));
+) -> DriverStatus {
+    if matches!(kind, RequestType::Dummy) {
+        handle.write().status = DriverStatus::Success;
+        return complete_request(handle);
+    }
+
+    if matches!(kind, RequestType::Pnp) {
+        if policy != TraversalPolicy::ForwardLower {
+            handle.write().status = DriverStatus::InvalidParameter;
+            return complete_request(handle);
         }
 
-        if matches!(kind, RequestType::Pnp) {
+        loop {
             let step = {
                 let h: &mut RequestHandle<'_, '_> = handle;
                 pnp_minor_dispatch(&dev, h).await
@@ -192,31 +188,27 @@ async fn call_device_handler(
             match step {
                 DriverStep::Complete { status } => {
                     handle.write().status = status;
-                    return DriverStep::complete(complete_request(handle));
+                    return complete_request(handle);
                 }
-                DriverStep::Continue => {
-                    if policy != TraversalPolicy::ForwardLower {
-                        handle.write().status = DriverStatus::InvalidParameter;
-                        return DriverStep::complete(complete_request(handle));
+                DriverStep::Continue => match dev.lower_device.get() {
+                    Some(n) => {
+                        dev = n.clone();
+                        continue;
                     }
-
-                    match dev.lower_device.get() {
-                        Some(n) => {
-                            dev = n.clone();
-                            continue;
-                        }
-                        None => {
-                            handle.write().status = DriverStatus::Success;
-                            return DriverStep::complete(complete_request(handle));
-                        }
+                    None => {
+                        handle.write().status = DriverStatus::Success;
+                        return complete_request(handle);
                     }
-                }
+                },
             }
         }
+    }
+
+    loop {
         match invoke_io_handler(&dev, handle, &kind).await {
             Some(DriverStep::Complete { status }) => {
                 handle.write().status = status;
-                return DriverStep::complete(complete_request(handle));
+                return complete_request(handle);
             }
             Some(DriverStep::Continue) | None => {
                 let next = match policy {
@@ -240,7 +232,7 @@ async fn call_device_handler(
                     }
                     Err(_) => {
                         handle.write().status = DriverStatus::NotImplemented;
-                        return DriverStep::complete(complete_request(handle));
+                        return complete_request(handle);
                     }
                 }
             }
@@ -273,6 +265,10 @@ async fn invoke_io_handler(
         return None;
     };
 
+    if h.depth == 0 {
+        return Some(h.handler.invoke(dev, handle).await);
+    }
+
     let guard = acquire_slot(h).await;
     let result = h.handler.invoke(dev, handle).await;
     drop(guard);
@@ -283,18 +279,14 @@ async fn pnp_minor_dispatch(
     device: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, '_>,
 ) -> DriverStep {
-    let (minor_opt, policy) = {
+    let minor_opt = {
         let r = handle.read();
-        (r.pnp.as_ref().map(|p| p.minor_function), r.traversal_policy)
+        r.pnp.as_ref().map(|p| p.minor_function)
     };
 
     let Some(minor) = minor_opt else {
         return DriverStep::complete(DriverStatus::InvalidParameter);
     };
-
-    if policy != TraversalPolicy::ForwardLower {
-        return DriverStep::complete(DriverStatus::InvalidParameter);
-    }
 
     if let Some(cb) = device
         .dev_init
@@ -339,10 +331,6 @@ impl Future for SlotAcquireFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let h = self.handler;
 
-        if h.depth == 0 {
-            return Poll::Ready(());
-        }
-
         loop {
             let cur = h.running_request.load(Ordering::Acquire);
             if cur < h.depth as u64 {
@@ -364,25 +352,16 @@ impl Future for SlotAcquireFuture<'_> {
 
 struct SlotGuard<'a> {
     handler: &'a IoHandler,
-    tracked: bool,
 }
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
-        if !self.tracked {
-            return;
-        }
         self.handler.running_request.fetch_sub(1, Ordering::Release);
         wake_one(&self.handler.waiters);
     }
 }
 
 async fn acquire_slot(handler: &IoHandler) -> SlotGuard<'_> {
-    let tracked = handler.depth != 0;
-
-    if tracked {
-        SlotAcquireFuture { handler }.await;
-    }
-
-    SlotGuard { handler, tracked }
+    SlotAcquireFuture { handler }.await;
+    SlotGuard { handler }
 }

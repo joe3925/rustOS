@@ -681,9 +681,6 @@ pub fn irq_signal_exactly(handle: &IrqHandle, meta: IrqMeta) {
 }
 
 pub fn irq_signal_n(handle: &IrqHandle, meta: IrqMeta, n: u32) {
-    if n == 0 {
-        return;
-    }
     handle.signal_n(meta, n as usize);
 }
 

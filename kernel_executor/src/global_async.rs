@@ -144,11 +144,7 @@ impl GlobalAsyncExecutor {
         }
 
         let shard_count = self.queues.shard_count();
-        let mut cursor = if shard_count == 0 {
-            0
-        } else {
-            start_hint % shard_count
-        };
+        let mut cursor = start_hint % shard_count;
 
         loop {
             let item = match self.queues.pop_round_robin(cursor) {

@@ -149,9 +149,6 @@ impl BlockDev {
         );
         self.send_write_immut(self.pos, &src[..len]).await?;
         self.pos += len as u64;
-        if (len == 0) {
-            println!("len is zero cap is {}", self.capacity_bytes())
-        }
         Ok(len)
     }
 }

@@ -225,10 +225,6 @@ impl Virtqueue {
     /// Push a single indirect descriptor table into the virtqueue.
     /// Returns the head descriptor index.
     pub fn push_indirect(&mut self, table_phys: PhysAddr, table_len: u32) -> Option<u16> {
-        if self.num_free == 0 {
-            return None;
-        }
-
         let head = self.alloc_desc()?;
         let desc = self.desc_ptr(head);
         unsafe {

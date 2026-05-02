@@ -744,10 +744,6 @@ impl Path {
     }
 
     fn push_in_place(&mut self, comp: &str) {
-        if self.components.len() >= 64 {
-            panic!("Path has more than 64 components");
-        }
-
         if !self.components.is_empty() {
             self.raw.push('/');
         }

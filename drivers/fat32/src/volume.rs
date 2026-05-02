@@ -5,8 +5,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
-    Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase, LossyOemCpConverter,
-    NullTimeProvider, Read, SeekFrom, Write,
+    CachedFileState, Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase,
+    LossyOemCpConverter, NullTimeProvider, Read, SeekFrom, Write,
 };
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::println;
@@ -67,6 +67,7 @@ pub struct FileCtx {
     is_dir: bool,
     pos: u64,
     size: u64,
+    cached: Option<CachedFileState>,
 }
 
 fn map_fatfs_err(e: &FsError) -> FileStatus {
@@ -114,13 +115,6 @@ async fn list_names(fs: &mut Fs, path: &Path) -> Result<Vec<String>, FsError> {
     Ok(out)
 }
 
-async fn get_file_len(fs: &mut Fs, path: &Path) -> Result<u64, FsError> {
-    let mut file = fs.root_dir().open_file(path.as_str()).await?;
-    let res = file.seek(SeekFrom::End(0)).await;
-    file.flush().await?;
-    res
-}
-
 async fn resize_file(file: &mut FatFile<'_>, new_size: u64) -> Result<(), FsError> {
     let old_size = file.seek(SeekFrom::End(0)).await?;
     // The resize will fail
@@ -150,6 +144,22 @@ fn next_file_id(vdx: &VolCtrlDevExt) -> u64 {
             return id;
         }
     }
+}
+
+fn take_file_ctx(vdx: &VolCtrlDevExt, fs_file_id: u64) -> Result<FileCtx, FileStatus> {
+    vdx.table
+        .write()
+        .remove(&fs_file_id)
+        .ok_or(FileStatus::PathNotFound)
+}
+
+fn restore_file_ctx(vdx: &VolCtrlDevExt, fs_file_id: u64, ctx: FileCtx) {
+    vdx.table.write().insert(fs_file_id, ctx);
+}
+
+fn missing_cached_file_state(fs_file_id: u64) -> FileStatus {
+    println!("Missing cached file state for fs_file_id {}", fs_file_id);
+    FileStatus::UnknownFail
 }
 
 fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_, '_>) -> Result<u64, DriverStatus> {
@@ -248,25 +258,24 @@ async fn execute_fs_work(
                 let root = fs.root_dir();
                 let open_res = match root.open_file(path_str).await {
                     Ok(mut f) => {
-                        let res = match f.seek(SeekFrom::End(0)).await {
-                            Ok(end) => Ok((false, end)),
-                            Err(e) => Err(e),
-                        };
-                        match f.flush().await {
-                            Ok(_) => res,
-                            Err(e) => Err(e),
+                        async {
+                            let end = f.seek(SeekFrom::End(0)).await?;
+                            f.seek(SeekFrom::Start(0)).await?;
+                            f.flush().await?;
+                            Ok((false, end, Some(f.into_cached_state())))
                         }
+                        .await
                     }
                     Err(FatError::NotFound) | Err(FatError::InvalidInput) => {
                         match root.open_dir(path_str).await {
-                            Ok(_d) => Ok((true, 0)),
+                            Ok(_d) => Ok((true, 0, None)),
                             Err(e) => Err(e),
                         }
                     }
                     Err(e) => Err(e),
                 };
                 match open_res {
-                    Ok((is_dir, size)) => {
+                    Ok((is_dir, size, cached)) => {
                         let id = next_file_id(&vdx);
                         {
                             let mut tbl = vdx.table.write();
@@ -277,6 +286,7 @@ async fn execute_fs_work(
                                     is_dir,
                                     pos: 0,
                                     size,
+                                    cached,
                                 },
                             );
                         }
@@ -309,10 +319,17 @@ async fn execute_fs_work(
                 };
                 p.fs_file_id
             };
-            let err = if vdx.table.write().remove(&fs_file_id).is_some() {
-                None
-            } else {
-                Some(FileStatus::PathNotFound)
+            let removed_ctx = { vdx.table.write().remove(&fs_file_id) };
+            let err = match removed_ctx {
+                None => Some(FileStatus::PathNotFound),
+                Some(ctx) if ctx.is_dir => None,
+                Some(mut ctx) => match ctx.cached.take() {
+                    Some(state) => {
+                        let mut file = state.into_file(&*fs);
+                        file.flush().await.err().map(|e| map_fatfs_err(&e))
+                    }
+                    None => Some(missing_cached_file_state(fs_file_id)),
+                },
             };
             req.write().set_data_t(FsCloseResult { error: err });
             DriverStatus::Success
@@ -338,17 +355,20 @@ async fn execute_fs_work(
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len) };
 
             let result: Result<usize, FileStatus> = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Err(FileStatus::PathNotFound),
-                    Some((_, true)) => Err(FileStatus::AccessDenied),
-                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
-                        Ok(mut file) => {
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Err(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        Err(FileStatus::AccessDenied)
+                    }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Err(err)
+                        }
+                        Some(state) => {
+                            let mut file = state.into_file(&*fs);
                             let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
                             } else {
@@ -357,12 +377,14 @@ async fn execute_fs_work(
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
                             };
-                            match file.flush().await {
+                            let res = match file.flush().await {
                                 Ok(_) => res,
                                 Err(e) => Err(map_fatfs_err(&e)),
-                            }
+                            };
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            res
                         }
-                        Err(e) => Err(map_fatfs_err(&e)),
                     },
                 }
             };
@@ -407,17 +429,20 @@ async fn execute_fs_work(
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
             let write_res: Result<usize, FileStatus> = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Err(FileStatus::PathNotFound),
-                    Some((_, true)) => Err(FileStatus::AccessDenied),
-                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
-                        Ok(mut file) => {
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Err(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        Err(FileStatus::AccessDenied)
+                    }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Err(err)
+                        }
+                        Some(state) => {
+                            let mut file = state.into_file(&*fs);
                             let n = data.len();
                             let res = if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
                                 Err(map_fatfs_err(&e))
@@ -432,12 +457,14 @@ async fn execute_fs_work(
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 }
                             };
-                            match file.flush().await {
+                            let res = match file.flush().await {
                                 Ok(_) => res,
                                 Err(e) => Err(map_fatfs_err(&e)),
-                            }
+                            };
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            res
                         }
-                        Err(e) => Err(map_fatfs_err(&e)),
                     },
                 }
             };
@@ -477,18 +504,25 @@ async fn execute_fs_work(
                 p.fs_file_id
             };
             let err = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Some(FileStatus::PathNotFound),
-                    Some((_, true)) => None,
-                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
-                        Ok(mut f) => f.flush().await.err().map(|e| map_fatfs_err(&e)),
-                        Err(e) => Some(map_fatfs_err(&e)),
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Some(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        None
+                    }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Some(err)
+                        }
+                        Some(state) => {
+                            let mut file = state.into_file(&*fs);
+                            let err = file.flush().await.err().map(|e| map_fatfs_err(&e));
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            err
+                        }
                     },
                 }
             };
@@ -604,21 +638,28 @@ async fn execute_fs_work(
                 (p.fs_file_id, p.new_size)
             };
             let err = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Some(FileStatus::PathNotFound),
-                    Some((_, true)) => Some(FileStatus::AccessDenied),
-                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
-                        Ok(mut file) => resize_file(&mut file, new_size)
-                            .await
-                            .err()
-                            .map(|e| map_fatfs_err(&e)),
-                        Err(e) => Some(map_fatfs_err(&e)),
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Some(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        Some(FileStatus::AccessDenied)
+                    }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Some(err)
+                        }
+                        Some(state) => {
+                            let mut file = state.into_file(&*fs);
+                            let err = resize_file(&mut file, new_size)
+                                .await
+                                .err()
+                                .map(|e| map_fatfs_err(&e));
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            err
+                        }
                     },
                 }
             };
@@ -652,42 +693,45 @@ async fn execute_fs_work(
             let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
 
             let result: Result<(usize, u64), FileStatus> = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.size, ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Err(FileStatus::PathNotFound),
-                    Some((_, _, true)) => Err(FileStatus::AccessDenied),
-                    Some((path, size, false)) => {
-                        match fs.root_dir().open_file(path.as_str()).await {
-                            Ok(mut file) => {
-                                let start_off = size;
-                                let res = match file.seek(SeekFrom::Start(start_off)).await {
-                                    Ok(_) => {
-                                        let n = data.len();
-                                        match file.write_all(data).await {
-                                            Ok(()) => {
-                                                if write_through {
-                                                    flush_owner_blocking(&vdx, fs_file_id);
-                                                }
-                                                Ok((n, start_off + n as u64))
-                                            }
-                                            Err(e) => Err(map_fatfs_err(&e)),
-                                        }
-                                    }
-                                    Err(e) => Err(map_fatfs_err(&e)),
-                                };
-                                match file.flush().await {
-                                    Ok(_) => res,
-                                    Err(e) => Err(map_fatfs_err(&e)),
-                                }
-                            }
-                            Err(e) => Err(map_fatfs_err(&e)),
-                        }
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Err(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        Err(FileStatus::AccessDenied)
                     }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Err(err)
+                        }
+                        Some(state) => {
+                            let start_off = ctx.size;
+                            let mut file = state.into_file(&*fs);
+                            let res = match file.seek(SeekFrom::Start(start_off)).await {
+                                Ok(_) => {
+                                    let n = data.len();
+                                    match file.write_all(data).await {
+                                        Ok(()) => {
+                                            if write_through {
+                                                flush_owner_blocking(&vdx, fs_file_id);
+                                            }
+                                            Ok((n, start_off + n as u64))
+                                        }
+                                        Err(e) => Err(map_fatfs_err(&e)),
+                                    }
+                                }
+                                Err(e) => Err(map_fatfs_err(&e)),
+                            };
+                            let res = match file.flush().await {
+                                Ok(_) => res,
+                                Err(e) => Err(map_fatfs_err(&e)),
+                            };
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            res
+                        }
+                    },
                 }
             };
 
@@ -725,17 +769,20 @@ async fn execute_fs_work(
                 (p.fs_file_id, p.offset, p.len)
             };
             let err = {
-                let ctx_opt = {
-                    vdx.table
-                        .read()
-                        .get(&fs_file_id)
-                        .map(|ctx| (ctx.path.clone(), ctx.is_dir))
-                };
-                match ctx_opt {
-                    None => Some(FileStatus::PathNotFound),
-                    Some((_, true)) => Some(FileStatus::AccessDenied),
-                    Some((path, false)) => match fs.root_dir().open_file(path.as_str()).await {
-                        Ok(mut file) => {
+                match take_file_ctx(&vdx, fs_file_id) {
+                    Err(e) => Some(e),
+                    Ok(ctx) if ctx.is_dir => {
+                        restore_file_ctx(&vdx, fs_file_id, ctx);
+                        Some(FileStatus::AccessDenied)
+                    }
+                    Ok(mut ctx) => match ctx.cached.take() {
+                        None => {
+                            let err = missing_cached_file_state(fs_file_id);
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            Some(err)
+                        }
+                        Some(state) => {
+                            let mut file = state.into_file(&*fs);
                             let file_len = file.seek(SeekFrom::End(0)).await.unwrap_or(0);
                             let end = offset.saturating_add(len);
                             let res = if offset > file_len {
@@ -761,12 +808,14 @@ async fn execute_fs_work(
                                     }
                                 }
                             };
-                            match file.flush().await {
+                            let res = match file.flush().await {
                                 Ok(_) => res,
                                 Err(e) => Some(map_fatfs_err(&e)),
-                            }
+                            };
+                            ctx.cached = Some(file.into_cached_state());
+                            restore_file_ctx(&vdx, fs_file_id, ctx);
+                            res
                         }
-                        Err(e) => Some(map_fatfs_err(&e)),
                     },
                 }
             };

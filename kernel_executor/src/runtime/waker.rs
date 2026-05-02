@@ -2,15 +2,14 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::{forget, transmute_copy, ManuallyDrop};
-use core::ptr;
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::JobFn;
 
 use super::slab::{
     decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,
-    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, is_joinable_slab_ptr,
-    is_slab_ptr, joinable_slab_poll_trampoline, slab_poll_trampoline,
+    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, joinable_slab_poll_trampoline,
+    slab_poll_trampoline,
 };
 use super::task::TaskPoll;
 
@@ -146,36 +145,26 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     let drop_guard = unsafe { Waker::from_raw(raw) };
 
     // Slab-based waker (detached)
-    if is_slab_ptr(data) {
+    if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(data) {
         // Keep slot alive while the continuation is stored
-        if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(data) {
-            get_task_slab().increment_ref(shard_idx, local_idx, generation);
-            drop(drop_guard);
-            return Some(Continuation {
-                tramp: slab_inline_poll,
-                ctx: data,
-                drop_fn: drop_slab_ctx,
-            });
-        } else {
-            drop(drop_guard);
-            return None;
-        }
+        get_task_slab().increment_ref(shard_idx, local_idx, generation);
+        drop(drop_guard);
+        return Some(Continuation {
+            tramp: slab_inline_poll,
+            ctx: data,
+            drop_fn: drop_slab_ctx,
+        });
     }
 
     // Joinable slab-based waker
-    if is_joinable_slab_ptr(data) {
-        if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(data) {
-            get_task_slab().increment_joinable_ref(shard_idx, local_idx, generation);
-            drop(drop_guard);
-            return Some(Continuation {
-                tramp: joinable_slab_inline_poll,
-                ctx: data,
-                drop_fn: drop_joinable_slab_ctx,
-            });
-        } else {
-            drop(drop_guard);
-            return None;
-        }
+    if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(data) {
+        get_task_slab().increment_joinable_ref(shard_idx, local_idx, generation);
+        drop(drop_guard);
+        return Some(Continuation {
+            tramp: joinable_slab_inline_poll,
+            ctx: data,
+            drop_fn: drop_joinable_slab_ctx,
+        });
     }
 
     // Arc-based waker with TaskWakerVtable layout
