@@ -1,9 +1,8 @@
 use crate::platform::{platform, Job};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use crossbeam_queue::SegQueue;
+use kernel_types::io::TreiberStack;
 use spin::Once;
-use x86_64::instructions::interrupts::without_interrupts;
 pub type Trampoline = extern "win64" fn(usize);
 
 #[derive(Clone, Copy)]
@@ -18,7 +17,7 @@ const MAX_SHARDS: usize = 8;
 struct CacheAligned(AtomicUsize);
 
 struct ShardedQueues {
-    queues: Vec<SegQueue<WorkItem>>,
+    queues: Vec<TreiberStack<WorkItem>>,
     active: CacheAligned,
     enqueue_hint: CacheAligned,
     pump_hint: CacheAligned,
@@ -30,7 +29,7 @@ impl ShardedQueues {
         let shard_count = if shards == 0 { 1 } else { shards };
         let mut queues = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
-            queues.push(SegQueue::new());
+            queues.push(TreiberStack::new());
         }
 
         Self {
@@ -54,9 +53,7 @@ impl ShardedQueues {
     fn push(&self, item: WorkItem) {
         let shards = self.shard_count();
         let idx = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
-        without_interrupts(|| {
-            self.queues[idx].push(item);
-        });
+        self.queues[idx].push(item);
         self.work_count.0.fetch_add(1, Ordering::Release);
     }
 
@@ -64,7 +61,7 @@ impl ShardedQueues {
         let shards = self.shard_count();
         for offset in 0..shards {
             let idx = (start_idx + offset) % shards;
-            if let Some(item) = without_interrupts(|| self.queues[idx].pop()) {
+            if let Some(item) = self.queues[idx].pop() {
                 self.work_count.0.fetch_sub(1, Ordering::Release);
                 return Some((item, idx));
             }

@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
-use x86_64::instructions::interrupts::without_interrupts;
+use kernel_types::io::TreiberStack;
 
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
@@ -25,8 +25,12 @@ pub enum TryRecvError {
 }
 
 struct MpmcInner<T> {
-    /// Lock-free queue for message storage.
+    /// Wait-free inbox for push operations (LIFO)
+    inbox: TreiberStack<T>,
+    /// Lock-free queue for FIFO message storage and retrieval.
     queue: SegQueue<T>,
+    /// Ensures only one thread drains the inbox into the queue at a time.
+    draining: AtomicBool,
     /// Wait queue for blocked receivers.
     receivers_waiting: WaitQueue,
     /// Number of active senders.
@@ -63,7 +67,9 @@ pub struct Receiver<T> {
 /// and multiple consumers.
 pub fn mpmc_channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(MpmcInner {
+        inbox: TreiberStack::new(),
         queue: SegQueue::new(),
+        draining: AtomicBool::new(false),
         receivers_waiting: WaitQueue::new(),
         sender_count: AtomicUsize::new(1),
         receiver_count: AtomicUsize::new(1),
@@ -78,6 +84,46 @@ pub fn mpmc_channel<T>() -> (Sender<T>, Receiver<T>) {
     (sender, receiver)
 }
 
+impl<T> MpmcInner<T> {
+    /// Drains the wait-free LIFO inbox into the FIFO SegQueue.
+    /// Because the inbox is LIFO, draining must reverse the items to preserve FIFO push order.
+    fn drain_inbox(&self) {
+        if self
+            .draining
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return; // Another thread is already draining
+        }
+
+        loop {
+            // Unload the LIFO stack into a temporary local vector to reverse it
+            let mut rev = alloc::vec::Vec::new();
+            while let Some(item) = self.inbox.pop() {
+                rev.push(item);
+            }
+
+            for item in rev.into_iter().rev() {
+                self.queue.push(item);
+            }
+
+            self.draining.store(false, Ordering::Release);
+
+            // Double-check pattern: if an interrupt pushed to the inbox right as we released the lock, try again.
+            if !self.inbox.is_empty() {
+                if self
+                    .draining
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+}
+
 impl<T> Sender<T> {
     /// Sends a value on this channel.
     ///
@@ -87,11 +133,11 @@ impl<T> Sender<T> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(SendError(value));
         }
-        without_interrupts(|| {
-            self.inner.queue.push(value);
-        });
 
-        if let Some(task) = without_interrupts(|| self.inner.receivers_waiting.dequeue_one()) {
+        self.inner.inbox.push(value);
+        self.inner.drain_inbox();
+
+        if let Some(task) = self.inner.receivers_waiting.dequeue_one() {
             SCHEDULER.unpark(&task);
         }
 
@@ -117,7 +163,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.inner.sender_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
-            for task in without_interrupts(|| self.inner.receivers_waiting.dequeue_all()) {
+            for task in self.inner.receivers_waiting.dequeue_all() {
                 SCHEDULER.unpark(&task);
             }
         }
@@ -131,29 +177,33 @@ impl<T> Receiver<T> {
     /// this returns `Err(RecvError)`.
     pub fn recv(&self) -> Result<T, RecvError> {
         loop {
-            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+            self.inner.drain_inbox();
+            if let Some(value) = self.inner.queue.pop() {
                 return Ok(value);
             }
 
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-                if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+                self.inner.drain_inbox();
+                if let Some(value) = self.inner.queue.pop() {
                     return Ok(value);
                 }
                 return Err(RecvError);
             }
 
-            if !without_interrupts(|| self.inner.receivers_waiting.enqueue_current()) {
+            if !self.inner.receivers_waiting.enqueue_current() {
                 continue;
             }
 
-            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+            self.inner.drain_inbox();
+            if let Some(value) = self.inner.queue.pop() {
                 self.inner.receivers_waiting.clear_current_if_queued();
                 return Ok(value);
             }
 
             if self.inner.sender_count.load(Ordering::Acquire) == 0 {
                 self.inner.receivers_waiting.clear_current_if_queued();
-                if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+                self.inner.drain_inbox();
+                if let Some(value) = self.inner.queue.pop() {
                     return Ok(value);
                 }
                 return Err(RecvError);
@@ -174,10 +224,12 @@ impl<T> Receiver<T> {
     /// `Err(TryRecvError::Empty)` if no message but channel is open,
     /// `Err(TryRecvError::Disconnected)` if all senders dropped and queue empty.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+        self.inner.drain_inbox();
+        if let Some(value) = self.inner.queue.pop() {
             Ok(value)
         } else if self.inner.sender_count.load(Ordering::Acquire) == 0 {
-            if let Some(value) = without_interrupts(|| self.inner.queue.pop()) {
+            self.inner.drain_inbox();
+            if let Some(value) = self.inner.queue.pop() {
                 Ok(value)
             } else {
                 Err(TryRecvError::Disconnected)
