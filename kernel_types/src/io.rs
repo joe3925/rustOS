@@ -16,6 +16,7 @@ struct Node<T> {
 
 pub struct TreiberStack<T> {
     head: AtomicUsize,
+    len: AtomicUsize,
     _marker: PhantomData<T>,
 }
 
@@ -23,8 +24,17 @@ impl<T> TreiberStack<T> {
     pub const fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
             _marker: PhantomData,
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len.load(Ordering::Acquire)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
     #[inline]
     fn unpack(val: usize) -> (*mut Node<T>, u16) {
@@ -61,7 +71,10 @@ impl<T> TreiberStack<T> {
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => break,
+                Ok(_) => {
+                    self.len.fetch_add(1, Ordering::Release);
+                    break;
+                }
                 Err(new_head_val) => head = new_head_val,
             }
         }
@@ -84,6 +97,7 @@ impl<T> TreiberStack<T> {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.len.fetch_sub(1, Ordering::Release);
                     let boxed = unsafe { Box::from_raw(head_ptr) };
                     return Some(boxed.data);
                 }

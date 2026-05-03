@@ -21,6 +21,7 @@ use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
+use kernel_types::io::TreiberStack;
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -149,7 +150,7 @@ impl Drop for KernelFpuGuard {
 pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     run_queue: ArrayQueue<TaskHandle>,
-    ipi_queue: ArrayQueue<TaskHandle>,
+    ipi_queue: TreiberStack<TaskHandle>,
     idle_task: TaskHandle,
     current_ptr: AtomicPtr<TaskRef>,
     lapic_id: u8,
@@ -209,7 +210,7 @@ impl Scheduler {
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             run_queue: ArrayQueue::new(RUNQ_CAP),
-            ipi_queue: ArrayQueue::new(IPIQ_CAP),
+            ipi_queue: TreiberStack::new(),
             idle_task: idle,
             current_ptr: AtomicPtr::new(idle_ptr),
             lapic_id,
@@ -288,10 +289,7 @@ impl Scheduler {
             panic!("enqueue_to_core_ipi: cpu {} not initialized", cpu);
         };
         Self::reserve_queue_load_or_panic(cpu, &core.load, "ipi queue");
-        if core.ipi_queue.push(task).err().is_some() {
-            core.load.fetch_sub(1, Ordering::Release);
-            panic!("ipi queue overflow on cpu {cpu}");
-        }
+        core.ipi_queue.push(task);
     }
 
     #[inline(always)]
@@ -433,26 +431,26 @@ impl Scheduler {
                     };
                     task.set_target_cpu(best_cpu);
 
-                    without_interrupts(|| {
-                        if best_cpu != current_cpu_id() {
-                            self.enqueue_to_core_ipi(best_cpu, task.clone());
+                    if best_cpu != current_cpu_id() {
+                        self.enqueue_to_core_ipi(best_cpu, task.clone());
 
-                            if let Some(best_core) = self.core(best_cpu) {
-                                unsafe {
-                                    if let Some(a) = APIC.lock().as_ref() {
-                                        a.lapic.send_ipi(
-                                            IpiDest::ApicId(best_core.lapic_id),
-                                            IpiKind::Fixed {
-                                                vector: SCHED_IPI_VECTOR,
-                                            },
-                                        )
-                                    }
+                        if let Some(best_core) = self.core(best_cpu) {
+                            unsafe {
+                                if let Some(a) = APIC.lock().as_ref() {
+                                    a.lapic.send_ipi(
+                                        IpiDest::ApicId(best_core.lapic_id),
+                                        IpiKind::Fixed {
+                                            vector: SCHED_IPI_VECTOR,
+                                        },
+                                    )
                                 }
                             }
-                        } else {
-                            self.enqueue_to_core(best_cpu, task.clone());
                         }
-                    });
+                    } else {
+                        without_interrupts(|| {
+                            self.enqueue_to_core(best_cpu, task.clone());
+                        });
+                    }
 
                     return;
                 }
@@ -1111,7 +1109,7 @@ pub fn dump_scheduler() -> SchedulerDump {
     for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
         dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
         dump.run_queues[i] = drain_array_queue(&core.run_queue);
-        dump.ipi_queues[i] = drain_array_queue(&core.ipi_queue);
+        dump.ipi_queues[i] = drain_stack(&core.ipi_queue);
         dump.core_loads[i] = core.load.load(Ordering::Acquire);
         dump.lapic_ids[i] = core.lapic_id;
     }
@@ -1171,6 +1169,26 @@ pub unsafe fn task_name_panic(task: &TaskRef) -> &str {
 
 /// Drain up to `MAX_DUMP_QUEUE` tasks from a lock-free `ArrayQueue`.
 fn drain_array_queue(queue: &ArrayQueue<TaskHandle>) -> QueueSnapshot {
+    let total_before_drain = queue.len();
+    let mut snap = QueueSnapshot {
+        captured: 0,
+        total_before_drain,
+        tasks: [const { None }; MAX_DUMP_QUEUE],
+    };
+    while snap.captured < MAX_DUMP_QUEUE {
+        match queue.pop() {
+            Some(task) => {
+                snap.tasks[snap.captured] = Some(task);
+                snap.captured += 1;
+            }
+            None => break,
+        }
+    }
+    snap
+}
+
+/// Drain up to `MAX_DUMP_QUEUE` tasks from a lock-free `TreiberStack`.
+fn drain_stack(queue: &TreiberStack<TaskHandle>) -> QueueSnapshot {
     let total_before_drain = queue.len();
     let mut snap = QueueSnapshot {
         captured: 0,
