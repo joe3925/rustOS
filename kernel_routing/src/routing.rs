@@ -4,7 +4,6 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
-use crossbeam_queue::SegQueue;
 use kernel_types::device::{DevNode, DeviceObject};
 use kernel_types::io::{IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
@@ -315,7 +314,7 @@ async fn pnp_minor_dispatch(
 // Synchronization helpers
 // =============================================================================
 
-fn wake_one(list: &SegQueue<Waker>) {
+fn wake_one(list: &kernel_types::io::TreiberStack<Waker>) {
     if let Some(w) = list.pop() {
         w.wake();
     }

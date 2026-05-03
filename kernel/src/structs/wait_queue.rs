@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
-use crossbeam_queue::SegQueue;
+use kernel_types::io::TreiberStack;
 
 use crate::drivers::interrupt_index::current_cpu_id;
 use crate::scheduling::scheduler::SCHEDULER;
@@ -15,7 +15,7 @@ fn alloc_wait_queue_id() -> u64 {
 
 pub struct WaitQueue {
     id: u64,
-    q: SegQueue<TaskHandle>,
+    q: TreiberStack<TaskHandle>,
     len: AtomicUsize,
 }
 
@@ -23,7 +23,7 @@ impl WaitQueue {
     pub fn new() -> Self {
         Self {
             id: alloc_wait_queue_id(),
-            q: SegQueue::new(),
+            q: TreiberStack::new(),
             len: AtomicUsize::new(0),
         }
     }
