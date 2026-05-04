@@ -54,6 +54,9 @@ pub struct TaskRef {
     /// Used for mutex, condvar, channel wait queues
     pub wait_next: AtomicU64,
 
+    /// Intrusive wait queue link for IPI scheduling
+    pub inbound_next: AtomicU64,
+
     /// The inner task data (context, stack, etc.) - requires lock for access
     pub inner: RwLock<Task>,
 
@@ -268,6 +271,7 @@ impl Task {
             permit: AtomicU8::new(0),
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
+            inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(false),
             stack_start: AtomicU64::new(stack_top),
@@ -333,6 +337,7 @@ impl Task {
             permit: AtomicU8::new(0),
             block_reason: AtomicU32::new(BlockReason::None as u32),
             wait_next: AtomicU64::new(WAIT_QUEUE_NONE),
+            inbound_next: AtomicU64::new(0),
             inner: RwLock::new(inner_task),
             is_kernel_mode: AtomicBool::new(true),
             stack_start: AtomicU64::new(stack_top_u64),

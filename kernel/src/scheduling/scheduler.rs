@@ -21,7 +21,6 @@ use core::arch::naked_asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
-use kernel_types::io::TreiberStack;
 use kernel_types::irq::IrqSafeRwLock;
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -32,7 +31,6 @@ use x86_64::registers::control::Cr3;
 
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
-const IPIQ_CAP: usize = 64;
 
 const MAX_TASKS: usize = 65_536;
 
@@ -150,7 +148,7 @@ impl Drop for KernelFpuGuard {
 pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
     run_queue: ArrayQueue<TaskHandle>,
-    ipi_queue: TreiberStack<TaskHandle>,
+    inbound_queue: AtomicU64,
     idle_task: TaskHandle,
     current_ptr: AtomicPtr<TaskRef>,
     lapic_id: u8,
@@ -210,7 +208,7 @@ impl Scheduler {
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
             run_queue: ArrayQueue::new(RUNQ_CAP),
-            ipi_queue: TreiberStack::new(),
+            inbound_queue: AtomicU64::new(0),
             idle_task: idle,
             current_ptr: AtomicPtr::new(idle_ptr),
             lapic_id,
@@ -256,9 +254,7 @@ impl Scheduler {
         let id = self.register_task(task.clone());
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
-        without_interrupts(|| {
-            self.enqueue_to_core(best_cpu, task);
-        });
+        self.enqueue_inbound(best_cpu, task);
         id
     }
 
@@ -271,25 +267,30 @@ impl Scheduler {
         let id = self.register_task(task.clone());
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
-        without_interrupts(|| {
-            self.enqueue_to_core(best_cpu, task);
-        });
+        self.enqueue_inbound(best_cpu, task);
         id
     }
 
-    fn enqueue_to_core(&self, cpu: usize, task: TaskHandle) {
+    fn enqueue_inbound(&self, cpu: usize, task: TaskHandle) {
         let Some(core) = self.core(cpu) else {
-            panic!("enqueue_to_core: cpu {} not initialized", cpu);
+            panic!("enqueue_inbound: cpu {} not initialized", cpu);
         };
-        Self::push_runqueue_or_panic(cpu, &core.run_queue, &core.load, task);
-    }
+        Self::reserve_queue_load_or_panic(cpu, &core.load, "inbound queue");
 
-    fn enqueue_to_core_ipi(&self, cpu: usize, task: TaskHandle) {
-        let Some(core) = self.core(cpu) else {
-            panic!("enqueue_to_core_ipi: cpu {} not initialized", cpu);
-        };
-        Self::reserve_queue_load_or_panic(cpu, &core.load, "ipi queue");
-        core.ipi_queue.push(task);
+        let task_id = task.task_id();
+        let mut current_head = core.inbound_queue.load(Ordering::Relaxed);
+        loop {
+            task.inbound_next.store(current_head, Ordering::Relaxed);
+            match core.inbound_queue.compare_exchange_weak(
+                current_head,
+                task_id,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(new_head) => current_head = new_head,
+            }
+        }
     }
 
     #[inline(always)]
@@ -339,20 +340,6 @@ impl Scheduler {
         }
 
         best
-    }
-
-    fn core_load_unlocked(&self, i: usize) -> Option<usize> {
-        let core = self.core(i)?;
-        let guard = core.sched_lock.try_read()?;
-
-        let rq_len = core.run_queue.len();
-        let ipi_len = core.ipi_queue.len();
-        let running = match guard.current.as_ref() {
-            Some(t) if !Arc::ptr_eq(t, &core.idle_task) => 1,
-            _ => 0,
-        };
-
-        Some(rq_len + ipi_len + running)
     }
 
     fn core_effective_load(&self, i: usize) -> Option<usize> {
@@ -432,7 +419,7 @@ impl Scheduler {
                     task.set_target_cpu(best_cpu);
 
                     if best_cpu != current_cpu_id() {
-                        self.enqueue_to_core_ipi(best_cpu, task.clone());
+                        self.enqueue_inbound(best_cpu, task.clone());
 
                         if let Some(best_core) = self.core(best_cpu) {
                             unsafe {
@@ -447,9 +434,7 @@ impl Scheduler {
                             }
                         }
                     } else {
-                        without_interrupts(|| {
-                            self.enqueue_to_core(best_cpu, task.clone());
-                        });
+                        self.enqueue_inbound(best_cpu, task.clone());
                     }
 
                     return;
@@ -694,12 +679,23 @@ impl Scheduler {
             }
         }
 
+        // Drain the lock-free IPI queue into the main run queue
+        let mut curr = core.inbound_queue.swap(0, Ordering::Acquire);
+        while curr != 0 {
+            let task = self
+                .get_task_by_id(curr)
+                .expect("task in inbound_queue not found");
+            let next = task.inbound_next.load(Ordering::Relaxed);
+
+            // We bypass push_runqueue_or_panic because the load was already incremented
+            if core.run_queue.push(task).err().is_some() {
+                panic!("run queue overflow on cpu {}", cpu_id);
+            }
+            curr = next;
+        }
+
         loop {
             let cand = if let Some(c) = core.run_queue.pop() {
-                core.load.fetch_sub(1, Ordering::Release);
-                c
-            } else if let Some(c) = core.ipi_queue.pop() {
-                // Treat pending IPI enqueues the same as run queue entries.
                 core.load.fetch_sub(1, Ordering::Release);
                 c
             } else {
@@ -824,13 +820,7 @@ impl Scheduler {
                     max_core.load.fetch_sub(1, Ordering::Release);
                     Some(t)
                 }
-                None => match max_core.ipi_queue.pop() {
-                    Some(t) => {
-                        max_core.load.fetch_sub(1, Ordering::Release);
-                        Some(t)
-                    }
-                    None => None,
-                },
+                None => None,
             };
 
             let Some(task) = task else {
@@ -877,48 +867,11 @@ impl Scheduler {
             guard.save_fpu_state();
         }
 
-        let mut ipi_cand: Option<TaskHandle> = None;
-        loop {
-            let Some(cand) = core.ipi_queue.pop() else {
-                break;
-            };
-            core.load.fetch_sub(1, Ordering::Release);
-
-            match cand.sched_state() {
-                SchedState::Terminated => continue,
-                SchedState::Parking => continue,
-                SchedState::Blocked => continue,
-                SchedState::Runnable | SchedState::Running => {
-                    ipi_cand = Some(cand);
-                    break;
-                }
-            }
-        }
-
-        let next = if let Some(cand) = ipi_cand {
-            cand.set_sched_state(SchedState::Running);
-
-            {
-                let mut guard = cand.inner.write();
-                guard.restore_fpu_state();
-                guard.mark_scheduled_in(cpu_id, now_cycles);
-            }
-
-            {
-                let mut sched_state = core.sched_lock.write();
-                sched_state.current = Some(cand.clone());
-                core.current_ptr
-                    .store(Arc::as_ptr(&cand) as *mut TaskRef, Ordering::Release);
-            }
-
-            cand
-        } else {
-            match self.schedule_next(cpu_id, &core, now_cycles) {
-                Some(t) => t,
-                None => {
-                    send_eoi(SCHED_IPI_VECTOR);
-                    return;
-                }
+        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
+            Some(t) => t,
+            None => {
+                send_eoi(SCHED_IPI_VECTOR);
+                return;
             }
         };
 
@@ -1076,7 +1029,7 @@ pub struct SchedulerDump {
     /// `None` if the CPU is not initialized or is running its idle task.
     pub current_tasks: [Option<TaskHandle>; MAX_DUMP_CPUS],
     pub run_queues: [QueueSnapshot; MAX_DUMP_CPUS],
-    pub ipi_queues: [QueueSnapshot; MAX_DUMP_CPUS],
+    pub inbound_queues: [QueueSnapshot; MAX_DUMP_CPUS],
     pub core_loads: [usize; MAX_DUMP_CPUS],
     pub lapic_ids: [u8; MAX_DUMP_CPUS],
 }
@@ -1095,7 +1048,7 @@ pub fn dump_scheduler() -> SchedulerDump {
         last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
         current_tasks: [const { None }; MAX_DUMP_CPUS],
         run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
-        ipi_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+        inbound_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
         core_loads: [0usize; MAX_DUMP_CPUS],
         lapic_ids: [0u8; MAX_DUMP_CPUS],
     };
@@ -1109,7 +1062,7 @@ pub fn dump_scheduler() -> SchedulerDump {
     for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
         dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
         dump.run_queues[i] = drain_array_queue(&core.run_queue);
-        dump.ipi_queues[i] = drain_stack(&core.ipi_queue);
+        dump.inbound_queues[i] = drain_inbound_queue(&core.inbound_queue);
         dump.core_loads[i] = core.load.load(Ordering::Acquire);
         dump.lapic_ids[i] = core.lapic_id;
     }
@@ -1187,21 +1140,24 @@ fn drain_array_queue(queue: &ArrayQueue<TaskHandle>) -> QueueSnapshot {
     snap
 }
 
-/// Drain up to `MAX_DUMP_QUEUE` tasks from a lock-free `TreiberStack`.
-fn drain_stack(queue: &TreiberStack<TaskHandle>) -> QueueSnapshot {
-    let total_before_drain = queue.len();
+/// Drain up to `MAX_DUMP_QUEUE` tasks from the lock-free intrusive `inbound_queue`.
+fn drain_inbound_queue(head: &AtomicU64) -> QueueSnapshot {
     let mut snap = QueueSnapshot {
         captured: 0,
-        total_before_drain,
+        total_before_drain: 0,
         tasks: [const { None }; MAX_DUMP_QUEUE],
     };
-    while snap.captured < MAX_DUMP_QUEUE {
-        match queue.pop() {
-            Some(task) => {
+    let mut curr = head.swap(0, Ordering::Acquire);
+    while curr != 0 {
+        snap.total_before_drain += 1;
+        if let Some(task) = SCHEDULER.get_task_by_id(curr) {
+            curr = task.inbound_next.load(Ordering::Relaxed);
+            if snap.captured < MAX_DUMP_QUEUE {
                 snap.tasks[snap.captured] = Some(task);
                 snap.captured += 1;
             }
-            None => break,
+        } else {
+            break;
         }
     }
     snap
