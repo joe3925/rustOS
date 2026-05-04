@@ -12,11 +12,15 @@ mod pci;
 mod temp_benchmark;
 mod virtqueue;
 
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::vec;
+use alloc::{sync::Arc, vec::Vec};
 use core::arch::asm;
 use core::cell::UnsafeCell;
+use core::future::poll_fn;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::task::Poll;
+use core::time::Duration;
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
 };
@@ -37,6 +41,7 @@ use kernel_api::pnp::{
     pnp_forward_request_to_next_lower,
 };
 use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
+use kernel_api::runtime::KernelStopwatch;
 use kernel_api::runtime::spawn_detached;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::panic_common;
@@ -58,7 +63,36 @@ use virtqueue::Virtqueue;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
+const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
 
+async fn wait_completion_hybrid<F>(qs: &QueueState, completion: F, spin_for: Duration) -> F::Output
+where
+    F: Future,
+{
+    let mut completion = core::pin::pin!(completion);
+    let timer = KernelStopwatch::start();
+
+    loop {
+        drain_queue_completions(qs);
+
+        if let Some(result) = poll_fn(|cx| match completion.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(Some(result)),
+            Poll::Pending => Poll::Ready(None),
+        })
+        .await
+        {
+            return result;
+        }
+
+        if timer.elapsed() >= spin_for {
+            break;
+        }
+
+        core::hint::spin_loop();
+    }
+
+    completion.await
+}
 // legacy helpers
 #[inline(always)]
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
@@ -1035,7 +1069,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         .await;
     };
 
-    let status = match completion.await {
+    let status = match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
         Ok(device_status) => blk_status_to_driver_status("read", device_status),
         Err(_) => {
             virtio_device_error("virtio-blk: read failed: completion canceled before device status")
@@ -1162,7 +1196,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
         .await;
     };
 
-    let status = match completion.await {
+    let status = match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
         Ok(device_status) => blk_status_to_driver_status("write", device_status),
         Err(_) => virtio_device_error(
             "virtio-blk: write failed: completion canceled before device status",

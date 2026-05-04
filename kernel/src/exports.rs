@@ -22,6 +22,8 @@ export! {
     function,
     print,
     wait_duration,
+    elapsed,
+    stopwatch_new,
     create_kernel_task,
     kill_kernel_task_by_id,
     park_self_and_yield,

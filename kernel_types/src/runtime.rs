@@ -41,3 +41,8 @@ impl BlockOnThreadState {
         self.ready.store(true, Ordering::Release);
     }
 }
+#[repr(C)]
+pub struct Stopwatch {
+    start_cycles: u64,
+    tsc_hz: u64,
+}

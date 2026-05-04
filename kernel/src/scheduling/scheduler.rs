@@ -572,30 +572,36 @@ impl Scheduler {
     }
 
     #[inline(always)]
-    pub fn on_timer_tick(&self, state: *mut State, cpu_id: usize) {
+    pub fn on_timer_tick(&self, state: *mut State, cpu_id: usize) -> Option<TaskHandle> {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-            return;
+            return None;
         }
         let Some(core) = self.core(cpu_id) else {
-            return;
+            return None;
         };
 
         let now_cycles = cpu::get_cycles();
         self.maybe_balance();
 
+        let mut prev_task = None;
+
         {
             let sched_state = core.sched_lock.read();
             if let Some(ref cur) = sched_state.current {
                 let Some(mut guard) = cur.inner.try_write() else {
-                    return;
+                    return None;
                 };
                 guard.update_from_context(state);
+
+                if !Arc::ptr_eq(cur, &core.idle_task) {
+                    prev_task = Some(cur.clone());
+                }
             }
         }
 
         let next = match self.schedule_next(cpu_id, &core, now_cycles) {
             Some(task) => task,
-            None => return,
+            None => return prev_task,
         };
 
         self.restore_page_table(&next);
@@ -603,6 +609,8 @@ impl Scheduler {
 
         let ctx_guard = next.inner.read();
         unsafe { ctx_guard.context.restore(state) };
+
+        prev_task
     }
 
     fn schedule_next(

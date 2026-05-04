@@ -69,9 +69,9 @@ lazy_static! {
     pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
         name: "drive",
         folder: "C:\\system\\logs",
-        log_samples: false,
-        log_spans: true,
-        log_mem_on_persist: true,
+        log_samples: true,
+        log_spans: false,
+        log_mem_on_persist: false,
         end_on_drop: false,
         timeout_ms: None,
         auto_persist_secs: None,

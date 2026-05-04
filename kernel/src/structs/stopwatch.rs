@@ -1,15 +1,8 @@
 use core::sync::atomic::Ordering;
+use core::time::Duration;
 
 use crate::{cpu, drivers::interrupt_index::TSC_HZ};
-
-/// Simple cycle‑counter stop‑watch.
-///
-/// # Example
-/// ```rust
-/// let sw = Stopwatch::start();
-/// some_slow_work();
-/// println!("elapsed = {} µs", sw.elapsed_micros());
-/// ```
+#[repr(C)]
 pub struct Stopwatch {
     start_cycles: u64,
     tsc_hz: u64,
@@ -26,7 +19,15 @@ impl Stopwatch {
             tsc_hz: freq,
         }
     }
+    #[inline(always)]
+    pub fn elapsed(&self) -> Duration {
+        let cycles = self.elapsed_cycles();
+        let secs = cycles / self.tsc_hz;
+        let rem_cycles = cycles % self.tsc_hz;
+        let nanos = ((rem_cycles as u128 * 1_000_000_000) / self.tsc_hz as u128) as u32;
 
+        Duration::new(secs, nanos)
+    }
     #[inline(always)]
     pub fn elapsed_cycles(&self) -> u64 {
         cpu::get_cycles() - self.start_cycles

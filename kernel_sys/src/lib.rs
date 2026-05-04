@@ -20,7 +20,7 @@ use kernel_types::dma::{
 };
 use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
-use kernel_types::runtime::BlockOnThreadState;
+use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
 use x86_64::addr::{PhysAddr, VirtAddr};
 use x86_64::structures::paging::PageTableFlags;
@@ -46,6 +46,8 @@ unsafe extern "win64" {
     pub fn get_rsdp() -> u64;
     pub unsafe fn get_current_cpu_id() -> usize;
     pub unsafe fn get_current_lapic_id() -> usize;
+    pub fn stopwatch_new() -> Stopwatch;
+    pub fn elapsed(s: &Stopwatch) -> Duration;
     // Tasking
     pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
@@ -240,6 +242,7 @@ unsafe extern "win64" {
     pub fn routing_get_stack_top_from_weak(
         dev_node_weak: &Weak<DevNode>,
     ) -> Option<Arc<DeviceObject>>;
+
 }
 
 #[repr(C)]

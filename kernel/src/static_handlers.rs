@@ -71,6 +71,7 @@ use crate::{
         scheduler::{TaskError, SCHEDULER},
         task::Task,
     },
+    structs::stopwatch::Stopwatch,
     util::boot_info,
 };
 
@@ -204,7 +205,14 @@ pub fn routing_print_impl(s: &str) {
 pub extern "win64" fn wait_duration(time: Duration) {
     interrupt_index::wait_duration(time);
 }
-
+#[unsafe(no_mangle)]
+pub extern "win64" fn stopwatch_new() -> Stopwatch {
+    Stopwatch::start()
+}
+#[unsafe(no_mangle)]
+pub extern "win64" fn elapsed(s: &Stopwatch) -> Duration {
+    s.elapsed()
+}
 #[no_mangle]
 pub extern "win64" fn file_open(
     path: &Path,

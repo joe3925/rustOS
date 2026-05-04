@@ -1,5 +1,6 @@
 extern crate alloc;
 
+use crate::kernel_types::runtime::Stopwatch;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -7,12 +8,14 @@ use core::future::Future;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, Poll, Waker};
+use core::time::Duration;
+use kernel_sys::elapsed;
+use kernel_sys::stopwatch_new;
 use spin::Mutex;
 
 use kernel_sys::{
     kernel_block_on_thread_state, kernel_spawn_blocking_raw, kernel_spawn_detached_ffi,
-    kernel_spawn_joinable_ffi,
-    try_steal_blocking_one as sys_try_steal_blocking_one,
+    kernel_spawn_joinable_ffi, try_steal_blocking_one as sys_try_steal_blocking_one,
 };
 use kernel_types::async_ffi::{FfiFuture, FfiWaker, FfiWakerVTable, FutureExt};
 use kernel_types::runtime::BlockOnThreadState;
@@ -201,4 +204,21 @@ where
 /// Best-effort steal of one blocking task from the kernel blocking pool.
 pub fn try_steal_blocking_one() -> bool {
     unsafe { sys_try_steal_blocking_one() }
+}
+pub struct KernelStopwatch {
+    inner: Stopwatch,
+}
+
+impl KernelStopwatch {
+    #[inline(always)]
+    pub fn start() -> Self {
+        Self {
+            inner: unsafe { stopwatch_new() },
+        }
+    }
+
+    #[inline(always)]
+    pub fn elapsed(&self) -> Duration {
+        unsafe { elapsed(&self.inner) }
+    }
 }
