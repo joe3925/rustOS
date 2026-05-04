@@ -23,6 +23,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use core::{mem, ptr};
+use kernel_types::irq::IrqSafeMutex;
 use pic8259::ChainedPics;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -37,7 +38,7 @@ pub(crate) const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 0x8;
 
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
-pub static APIC: Mutex<Option<ApicImpl>> = Mutex::new(None);
+pub static APIC: IrqSafeMutex<Option<ApicImpl>> = IrqSafeMutex::new(None);
 pub static USE_APIC: AtomicBool = AtomicBool::new(false);
 /// Counts APs that have made it into Rust code (past the SIPI trampoline).
 static AP_BOOTED: AtomicUsize = AtomicUsize::new(0);

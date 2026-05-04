@@ -174,16 +174,30 @@ impl TaskRef {
         if !self.is_kernel_mode.load(Ordering::Relaxed) {
             return Ok(false);
         }
+
         let gp = self.guard_page.load(Ordering::Acquire);
         if gp == 0 {
             return Ok(false);
         }
+
         let next_guard = match gp.checked_sub(PAGE_SIZE) {
             Some(v) => v,
             None => return Ok(false),
         };
-        unsafe { map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags) }?;
+
+        unsafe {
+            map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags)?;
+        }
+
+        let stack_top = self.stack_start.load(Ordering::Acquire);
+        if stack_top != 0 && gp < stack_top {
+            self.stack_size.store(stack_top - gp, Ordering::Release);
+        } else {
+            self.stack_size.fetch_add(PAGE_SIZE, Ordering::AcqRel);
+        }
+
         self.guard_page.store(next_guard, Ordering::Release);
+
         Ok(true)
     }
 

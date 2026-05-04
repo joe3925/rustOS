@@ -1628,9 +1628,9 @@ pub fn used_memory() -> usize {
 }
 
 const DEPTH: usize = 1_000;
-const ITERS: usize = 50_000;
+const ITERS: usize = 500_000;
 
-const BLOCK_TASKS: usize = 50_000;
+const BLOCK_TASKS: usize = 500_000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -1767,7 +1767,7 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     black_box(warm_async);
 
     let mut warm_blk = 0u64;
-    for _ in 0..2_000 {
+    for _ in 0..200_000 {
         warm_blk = blocking_chain(warm_blk).await;
     }
     black_box(warm_blk);

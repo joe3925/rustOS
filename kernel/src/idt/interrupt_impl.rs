@@ -548,7 +548,6 @@ impl IrqManager {
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
         let cpu = current_cpu_id() as u32;
-
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();
 
@@ -561,7 +560,6 @@ impl IrqManager {
         send_eoi(vector);
     }
 }
-
 static IRQ_MANAGER: Once<IrqManager> = Once::new();
 
 fn irq_manager() -> &'static IrqManager {

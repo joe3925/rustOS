@@ -20,6 +20,25 @@ impl Stopwatch {
         }
     }
     #[inline(always)]
+    pub fn from_cycles(cycles: u64) -> Duration {
+        let freq = TSC_HZ.load(Ordering::SeqCst);
+        assert!(freq != 0, "TSC not calibrated");
+
+        let secs = cycles / freq;
+        let rem_cycles = cycles % freq;
+        let nanos = ((rem_cycles as u128 * 1_000_000_000) / freq as u128) as u32;
+
+        Duration::new(secs, nanos)
+    }
+    #[inline(always)]
+    pub fn reset(&mut self) {
+        let freq = TSC_HZ.load(Ordering::SeqCst);
+        assert!(freq != 0, "TSC not calibrated");
+
+        self.start_cycles = cpu::get_cycles();
+        self.tsc_hz = freq;
+    }
+    #[inline(always)]
     pub fn elapsed(&self) -> Duration {
         let cycles = self.elapsed_cycles();
         let secs = cycles / self.tsc_hz;

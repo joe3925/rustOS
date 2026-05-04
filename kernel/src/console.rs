@@ -1,19 +1,30 @@
 use crate::util::boot_info;
+use alloc::string::String;
 use alloc::vec::Vec;
 use bootloader_api::info::PixelFormat;
-use core::fmt::{self, Write};
+use core::fmt;
+use core::fmt::Write;
+use crossbeam_queue::SegQueue;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
-use embedded_graphics::prelude::{DrawTarget, OriginDimensions, Point, RgbColor, Size};
-use kernel_types::irq::IrqSafeMutex;
-
-use embedded_graphics::text::{Baseline, Text, TextStyle, TextStyleBuilder};
+use embedded_graphics::prelude::DrawTarget;
+use embedded_graphics::prelude::OriginDimensions;
+use embedded_graphics::prelude::Point;
+use embedded_graphics::prelude::RgbColor;
+use embedded_graphics::prelude::Size;
+use embedded_graphics::text::Baseline;
+use embedded_graphics::text::Text;
+use embedded_graphics::text::TextStyle;
+use embedded_graphics::text::TextStyleBuilder;
 use embedded_graphics::Drawable;
+use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
+
 const FONT_HEIGHT: usize = 18;
 const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;
+const PRINT_FLUSH_TRIES: usize = 256;
 
 pub(crate) struct Cursor {
     pub x: usize,
@@ -218,6 +229,7 @@ impl DrawTarget for Screen {
             if coord.x < 0 || coord.y < 0 {
                 continue;
             }
+
             let x = coord.x as usize;
             let y = coord.y as usize;
 
@@ -262,8 +274,17 @@ impl Console {
     }
 
     pub(crate) fn print(&mut self, bytes: &[u8]) {
+        self.flush_queued_prints();
         self.push_bytes(bytes);
         self.flush_pending();
+        self.flush_queued_prints();
+    }
+
+    fn flush_queued_prints(&mut self) {
+        while let Some(bytes) = PRINT_QUEUE.pop() {
+            self.push_bytes(&bytes);
+            self.flush_pending();
+        }
     }
 
     #[inline(always)]
@@ -329,6 +350,7 @@ impl Console {
                     let max_cols = self.screen.width / FONT_WIDTH;
                     let col = self.cursor_pose.x / FONT_WIDTH;
                     let avail = max_cols.saturating_sub(col);
+
                     if avail == 0 {
                         self.flush_pending();
                         self.newline();
@@ -341,6 +363,7 @@ impl Console {
                     let max_cols = self.screen.width / FONT_WIDTH;
                     let col = self.cursor_pose.x / FONT_WIDTH;
                     let avail = max_cols.saturating_sub(col);
+
                     if avail == 0 {
                         self.flush_pending();
                         self.newline();
@@ -400,6 +423,7 @@ impl fmt::Write for Console {
 
 lazy_static! {
     pub static ref CONSOLE: IrqSafeMutex<Console> = IrqSafeMutex::new(Console::new());
+    static ref PRINT_QUEUE: SegQueue<Vec<u8>> = SegQueue::new();
 }
 
 #[macro_export]
@@ -419,14 +443,38 @@ macro_rules! println {
     };
 }
 
-pub(crate) fn _print(args: core::fmt::Arguments) {
+fn queue_print(args: fmt::Arguments) {
+    let mut s = String::new();
+    let _ = s.write_fmt(args);
+    PRINT_QUEUE.push(s.into_bytes());
+}
+
+fn try_flush_print_queue() -> bool {
+    if let Some(mut c) = CONSOLE.try_lock() {
+        c.flush_queued_prints();
+        return true;
+    }
+
+    false
+}
+
+pub(crate) fn _print(args: fmt::Arguments) {
+    if let Some(mut c) = CONSOLE.try_lock() {
+        c.flush_queued_prints();
+        let _ = c.write_fmt(args);
+        c.flush_pending();
+        c.flush_queued_prints();
+        return;
+    }
+
+    queue_print(args);
+
     let mut tries = 0usize;
-    while tries < 256 {
-        if let Some(mut c) = CONSOLE.try_lock() {
-            let _ = c.write_fmt(args);
-            c.flush_pending();
+    while tries < PRINT_FLUSH_TRIES {
+        if try_flush_print_queue() {
             return;
         }
+
         core::hint::spin_loop();
         tries += 1;
     }

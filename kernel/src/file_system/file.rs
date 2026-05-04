@@ -414,13 +414,11 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
             // loop {
             //
             // }
-            // bench_async_vs_sync_call_latency_async().await;
+            //bench_async_vs_sync_call_latency_async().await;
             //DRIVE_WINDOW.start();
-            //bench_c_drive_io_async().await;
-
-            //loop {
-            bench_c_drive_io_async().await;
-            //}
+            loop {
+                bench_c_drive_io_async().await;
+            }
             //DRIVE_WINDOW.stop_and_persist().await;
             //run_virtio_bench_matrix_print().await;
 
