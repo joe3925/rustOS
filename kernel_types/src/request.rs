@@ -1032,11 +1032,12 @@ pub enum RequestType {
     Read {
         offset: u64,
         len: usize,
+        no_buffer: bool,
     },
     Write {
         offset: u64,
         len: usize,
-        flush_write_through: bool,
+        no_buffer: bool,
         /// File-level owner tag. 0 = unowned (included in all targeted flushes).
         owner: u64,
     },

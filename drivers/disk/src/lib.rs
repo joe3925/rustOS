@@ -103,7 +103,7 @@ pub async fn disk_read<'a, 'b>(
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
     let (off, total) = match req.read().kind {
-        RequestType::Read { offset, len } => (offset, len),
+        RequestType::Read { offset, len, .. } => (offset, len),
         _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
@@ -151,7 +151,7 @@ pub async fn disk_write<'a, 'b>(
         RequestType::Write {
             offset,
             len,
-            flush_write_through: _,
+            no_buffer: _,
             owner: _,
         } => (offset, len),
         _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),

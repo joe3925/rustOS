@@ -76,6 +76,7 @@ impl BlockDev {
             RequestType::Read {
                 offset,
                 len: dst.len(),
+                no_buffer: false,
             },
             RequestData::empty(),
         );
@@ -106,7 +107,7 @@ impl BlockDev {
             RequestType::Write {
                 offset,
                 len: src.len(),
-                flush_write_through: false,
+                no_buffer: false,
                 owner: self.current_owner.load(Ordering::Acquire),
             },
             RequestData::empty(),

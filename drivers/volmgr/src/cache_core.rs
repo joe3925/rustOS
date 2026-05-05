@@ -953,7 +953,7 @@ where
                 RequestType::Write {
                     offset: lba * BLOCK_SIZE as u64,
                     len: BLOCK_SIZE,
-                    flush_write_through: false,
+                    no_buffer: false,
                     owner: 0,
                 },
                 io_buf,
@@ -1008,7 +1008,7 @@ where
                 RequestType::Write {
                     offset: lba * BLOCK_SIZE as u64,
                     len: BLOCK_SIZE,
-                    flush_write_through: false,
+                    no_buffer: false,
                     owner: 0,
                 },
                 io_buf,

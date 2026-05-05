@@ -125,7 +125,11 @@ pub async fn partition_pdo_read<'a, 'b>(
     let off_res = {
         let r = request.read();
         match r.kind {
-            RequestType::Read { offset, len } => {
+            RequestType::Read {
+                offset,
+                len,
+                no_buffer,
+            } => {
                 if buf_len != len {
                     Err(DriverStatus::InvalidParameter)
                 } else {
@@ -137,14 +141,14 @@ pub async fn partition_pdo_read<'a, 'b>(
                     {
                         Err(DriverStatus::InvalidParameter)
                     } else {
-                        Ok(offset)
+                        Ok((offset, no_buffer))
                     }
                 }
             }
             _ => Err(DriverStatus::InvalidParameter),
         }
     };
-    let off = match off_res {
+    let (off, no_buffer) = match off_res {
         Ok(v) => v,
         Err(st) => return DriverStep::complete(st),
     };
@@ -154,6 +158,7 @@ pub async fn partition_pdo_read<'a, 'b>(
     request.write().kind = RequestType::Read {
         offset: phys_off,
         len: buf_len,
+        no_buffer,
     };
 
     let status = send_req_parent(dx.parent.get().unwrap(), request).await;
@@ -181,7 +186,7 @@ pub async fn partition_pdo_write<'a, 'b>(
             RequestType::Write {
                 offset,
                 len,
-                flush_write_through,
+                no_buffer,
                 owner,
             } => {
                 if buf_len != len {
@@ -195,14 +200,14 @@ pub async fn partition_pdo_write<'a, 'b>(
                     {
                         Err(DriverStatus::InvalidParameter)
                     } else {
-                        Ok((offset, flush_write_through, owner))
+                        Ok((offset, no_buffer, owner))
                     }
                 }
             }
             _ => Err(DriverStatus::InvalidParameter),
         }
     };
-    let (off, flush_write_through, owner) = match off_res {
+    let (off, no_buffer, owner) = match off_res {
         Ok(v) => v,
         Err(st) => return DriverStep::complete(st),
     };
@@ -214,7 +219,7 @@ pub async fn partition_pdo_write<'a, 'b>(
     request.write().kind = RequestType::Write {
         offset: phys_off,
         len: buf_len,
-        flush_write_through,
+        no_buffer,
         owner,
     };
 
@@ -255,7 +260,14 @@ async fn read_from_lower_async(
 ) -> Result<Box<[u8]>, DriverStatus> {
     let mut data = vec![0u8; len];
     let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
-    let mut child_req = RequestHandle::new_t(RequestType::Read { offset, len }, io_buf);
+    let mut child_req = RequestHandle::new_t(
+        RequestType::Read {
+            offset,
+            len,
+            no_buffer: false,
+        },
+        io_buf,
+    );
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let status = pnp_forward_request_to_next_lower(dev.clone(), &mut child_req).await;

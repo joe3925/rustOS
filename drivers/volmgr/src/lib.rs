@@ -18,7 +18,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -127,6 +127,7 @@ impl VolumeCacheBackend for CacheBackend {
                 RequestType::Read {
                     offset,
                     len: total_len,
+                    no_buffer: false,
                 },
                 buffer,
             );
@@ -161,7 +162,7 @@ impl VolumeCacheBackend for CacheBackend {
                 if let RequestType::Write {
                     offset,
                     len,
-                    flush_write_through,
+                    no_buffer,
                     owner,
                 } = w.kind
                 {
@@ -188,7 +189,7 @@ impl VolumeCacheBackend for CacheBackend {
                         w.kind = RequestType::Write {
                             offset,
                             len: clamped,
-                            flush_write_through,
+                            no_buffer,
                             owner,
                         };
                     }
@@ -247,7 +248,7 @@ impl VolumeCacheBackend for CacheBackend {
                 RequestType::Write {
                     offset,
                     len: total_len,
-                    flush_write_through: false,
+                    no_buffer: false,
                     owner: 0,
                 },
                 buffer,
@@ -380,6 +381,42 @@ fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverSta
             }
         }
     }
+}
+
+async fn forward_no_buffer_read(target: IoTarget, offset: u64, dst: &mut [u8]) -> DriverStatus {
+    let len = dst.len();
+    let io_buf = IoBuffer::<Described, FromDevice>::new(dst).into_phys_framed();
+    let mut req = RequestHandle::new_t(
+        RequestType::Read {
+            offset,
+            len,
+            no_buffer: true,
+        },
+        io_buf,
+    );
+    req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    pnp_send_request(target, &mut req).await
+}
+
+async fn forward_no_buffer_write(
+    target: IoTarget,
+    offset: u64,
+    src: &[u8],
+    owner: u64,
+) -> DriverStatus {
+    let len = src.len();
+    let io_buf = IoBuffer::<Described, ToDevice>::new(src).into_phys_framed();
+    let mut req = RequestHandle::new_t(
+        RequestType::Write {
+            offset,
+            len,
+            no_buffer: true,
+            owner,
+        },
+        io_buf,
+    );
+    req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    pnp_send_request(target, &mut req).await
 }
 
 #[unsafe(no_mangle)]
@@ -572,20 +609,19 @@ pub async fn vol_pdo_read<'a, 'b>(
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(dev);
 
-    let cache = match dx.cache.get() {
-        Some(c) => c,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
-
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let (offset, len_req) = {
+    let (offset, len_req, no_buffer) = {
         let r = req.read();
         match r.kind {
-            RequestType::Read { offset, len } => (offset, len),
+            RequestType::Read {
+                offset,
+                len,
+                no_buffer,
+            } => (offset, len, no_buffer),
             _ => return DriverStep::complete(DriverStatus::InvalidParameter),
         }
     };
@@ -616,6 +652,29 @@ pub async fn vol_pdo_read<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
+    if no_buffer {
+        let target = match dx.backing.get() {
+            Some(t) => t.clone(),
+            None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        };
+        let mut data = match req.data() {
+            RequestDataView::Writable(data) => data,
+            RequestDataView::ReadOnly(_) => {
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+        let dst = data
+            .view_mut::<[u8]>()
+            .expect("read response missing buffer");
+        let status = forward_no_buffer_read(target, offset, &mut dst[..len]).await;
+        return DriverStep::complete(status);
+    }
+
+    let cache = match dx.cache.get() {
+        Some(c) => c,
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+    };
+
     let mut data = match req.data() {
         RequestDataView::Writable(data) => data,
         RequestDataView::ReadOnly(_) => {
@@ -640,23 +699,18 @@ pub async fn vol_pdo_write<'a, 'b>(
 ) -> DriverStep {
     let dx = ext::<VolPdoExt>(&dev);
 
-    let cache = match dx.cache.get() {
-        Some(c) => c,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
-    };
-
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let (offset, len_req, flush_write_through, owner) = match req.read().kind {
+    let (offset, len_req, no_buffer, owner) = match req.read().kind {
         RequestType::Write {
             offset,
             len,
-            flush_write_through,
+            no_buffer,
             owner,
-        } => (offset, len, flush_write_through, owner),
+        } => (offset, len, no_buffer, owner),
         _ => return DriverStep::complete(DriverStatus::InvalidParameter),
     };
 
@@ -687,6 +741,22 @@ pub async fn vol_pdo_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
+    if no_buffer {
+        let target = match dx.backing.get() {
+            Some(t) => t.clone(),
+            None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        };
+        let data = req.data().read_only();
+        let src = data.view::<[u8]>().expect("write req missing buffer");
+        let status = forward_no_buffer_write(target, offset, &src[..len], owner).await;
+        return DriverStep::complete(status);
+    }
+
+    let cache = match dx.cache.get() {
+        Some(c) => c,
+        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+    };
+
     let data = match req.data() {
         RequestDataView::ReadOnly(data) => data,
         RequestDataView::Writable(_) => {
@@ -695,11 +765,9 @@ pub async fn vol_pdo_write<'a, 'b>(
     };
     let data = data.view::<[u8]>().expect("write req missing buffer");
 
-    let result = match (flush_write_through, owner) {
-        (true, o) if o != 0 => cache.write_through_at_owned(offset, &data[..len], o).await,
-        (true, _) => cache.write_through_at(offset, &data[..len]).await,
-        (false, o) if o != 0 => cache.write_at_owned(offset, &data[..len], o).await,
-        (false, _) => cache.write_at(offset, &data[..len]).await,
+    let result = match owner {
+        o if o != 0 => cache.write_at_owned(offset, &data[..len], o).await,
+        _ => cache.write_at(offset, &data[..len]).await,
     };
 
     match result {
