@@ -30,7 +30,7 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
             RequestType::Write {
                 offset: 0,
                 len: BLOCK_SIZE,
-                flush_write_through: false,
+                no_buffer: false,
                 owner: 0,
             },
             RequestData::empty(),

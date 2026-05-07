@@ -969,7 +969,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
     let (offset, len) = match {
         let r = req.read();
         match r.kind {
-            RequestType::Read { offset, len } => Some((offset, len)),
+            RequestType::Read { offset, len, .. } => Some((offset, len)),
             _ => None,
         }
     } {

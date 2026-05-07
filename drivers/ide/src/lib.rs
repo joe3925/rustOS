@@ -461,7 +461,7 @@ pub async fn ide_pdo_read<'a, 'b>(
         r.kind
     };
     let (offset, len) = match kind {
-        RequestType::Read { offset, len } => (offset, len),
+        RequestType::Read { offset, len, .. } => (offset, len),
         _ => return complete_req(req, DriverStatus::InvalidParameter),
     };
 
