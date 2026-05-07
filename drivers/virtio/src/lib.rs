@@ -22,7 +22,8 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
 use kernel_api::benchmark::{
-    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BenchSweepBothResult, BenchSweepParams, BenchSweepResult,
+    BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
+    BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
@@ -50,7 +51,7 @@ use kernel_api::{IOCTL_PCI_SETUP_MSIX, println, request_handler};
 use spin::{Mutex, RwLock};
 use temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
-    bench_sweep, bench_sweep_params, sanitize_bench_params,
+    bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
 };
 
 use blk::{
@@ -1275,6 +1276,14 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                     .unwrap_or_default()
             };
             let params_used = sanitize_bench_params(&inner, params_in);
+            let request = if (params_used.flags & BENCH_FLAG_REQUEST) != 0 {
+                match bench_sweep_params_request(pdo, &inner, &params_used).await {
+                    Ok(r) => r,
+                    Err(e) => return complete_req(req, e),
+                }
+            } else {
+                BenchSweepResult::default()
+            };
 
             let irq = if (params_used.flags & BENCH_FLAG_IRQ) != 0 {
                 match bench_sweep_params(&parent, &inner, &params_used, true).await {
@@ -1303,6 +1312,7 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
                 params_used,
                 irq,
                 poll,
+                request,
                 queue_count: inner.queue_count as u16,
                 queue0_size: qsz,
                 indirect_enabled: if inner.indirect_desc_enabled { 1 } else { 0 },

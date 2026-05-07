@@ -18,9 +18,12 @@ use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
     unmap_range,
 };
-use kernel_api::println;
+use kernel_api::pnp::pnp_send_request;
+use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::runtime::spawn;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
+use spin::Mutex;
 pub const IOCTL_BLOCK_BENCH_SWEEP: u32 = 0xB000_8002;
 pub const IOCTL_BLOCK_BENCH_SWEEP_POLLING: u32 = 0xB000_8003;
 
@@ -164,6 +167,11 @@ struct BenchInflight<'a> {
     start_tsc: u64,
     completion: CompletionToken<'a>,
     _buffer: BenchDmaBuffer,
+}
+
+struct BenchRequestCompletion {
+    status: DriverStatus,
+    cycles: u64,
 }
 
 fn benchmark_device_error(message: &'static str) -> DriverStatus {
@@ -488,6 +496,148 @@ async fn bench_reads_direct(
     Ok(result)
 }
 
+async fn bench_read_via_request(
+    target: Arc<DeviceObject>,
+    offset: u64,
+    len: usize,
+    completion: Arc<Mutex<Option<BenchRequestCompletion>>>,
+) {
+    let mut data = Vec::new();
+    let status = if data.try_reserve_exact(len).is_err() {
+        DriverStatus::InsufficientResources
+    } else {
+        data.resize(len, 0);
+        let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
+        let mut req = RequestHandle::new_t(RequestType::Read { offset, len }, io_buf);
+        req.set_traversal_policy(TraversalPolicy::ForwardLower);
+
+        let start_tsc = rdtsc();
+        let status = pnp_send_request(target, &mut req).await;
+        let end_tsc = rdtsc();
+        let cycles = end_tsc.saturating_sub(start_tsc);
+        drop(req);
+
+        *completion.lock() = Some(BenchRequestCompletion { status, cycles });
+        return;
+    };
+
+    *completion.lock() = Some(BenchRequestCompletion { status, cycles: 0 });
+}
+
+async fn bench_reads_request(
+    target: &Arc<DeviceObject>,
+    start_sector: u64,
+    inflight: usize,
+    bench_cfg: &BenchConfig,
+) -> Result<BenchLevelResult, DriverStatus> {
+    let mut result = BenchLevelResult::default();
+    result.inflight = inflight as u32;
+
+    let total_requests = bench_cfg.requests_per_run;
+    let mut lat_samples: Vec<u64> = Vec::with_capacity(total_requests as usize);
+    let mut current_sector = start_sector;
+    let mut completed = 0u32;
+    let run_start_tsc = rdtsc();
+
+    while completed < total_requests {
+        let batch_target = (total_requests - completed).min(inflight as u32) as usize;
+        let mut joins = Vec::with_capacity(batch_target);
+        let mut completions = Vec::with_capacity(batch_target);
+        let mut submitted = 0usize;
+
+        while submitted < batch_target {
+            let completion = Arc::new(Mutex::new(None));
+            let offset = current_sector << 9;
+            let len = bench_cfg.request_size as usize;
+
+            completions.push(completion.clone());
+            joins.push(spawn(bench_read_via_request(
+                target.clone(),
+                offset,
+                len,
+                completion,
+            )));
+
+            current_sector = current_sector.saturating_add((bench_cfg.request_size as u64) >> 9);
+            submitted += 1;
+        }
+
+        while let Some(join) = joins.pop() {
+            join.await;
+        }
+
+        let mut first_error: Option<DriverStatus> = None;
+        for completion in completions {
+            let completed_request = completion.lock().take().ok_or_else(|| {
+                benchmark_device_error("virtio-blk: request benchmark completion missing")
+            })?;
+
+            if completed_request.status == DriverStatus::Success {
+                lat_samples.push(completed_request.cycles);
+            } else if first_error.is_none() {
+                first_error = Some(completed_request.status);
+            }
+
+            completed = completed.saturating_add(1);
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+    }
+
+    let run_end_tsc = rdtsc();
+
+    result.request_count = lat_samples.len() as u32;
+    result.total_time_cycles = run_end_tsc.saturating_sub(run_start_tsc);
+    result.idle_pct = 0.0;
+
+    if !lat_samples.is_empty() {
+        let sum_lat = lat_samples
+            .iter()
+            .copied()
+            .fold(0u64, |acc, sample| acc.saturating_add(sample));
+        lat_samples.sort_unstable();
+
+        result.total_cycles = sum_lat;
+        result.max_cycles = *lat_samples.last().unwrap_or(&0);
+        result.min_cycles = *lat_samples.first().unwrap_or(&0);
+        result.avg_cycles = sum_lat / lat_samples.len() as u64;
+
+        let p50i = percentile_index_permille(lat_samples.len(), 500);
+        let p99i = percentile_index_permille(lat_samples.len(), 990);
+        let p999i = percentile_index_permille(lat_samples.len(), 999);
+
+        result.p50_cycles = lat_samples[p50i];
+        result.p99_cycles = lat_samples[p99i];
+        result.p999_cycles = lat_samples[p999i];
+    } else {
+        result.min_cycles = 0;
+    }
+
+    Ok(result)
+}
+
+fn bench_inflight_levels(max_inflight: usize) -> Vec<usize> {
+    let mut levels: Vec<usize> = Vec::new();
+    let mut lvl = 1usize;
+
+    let max_levels = BenchSweepResult::default().levels.len();
+    while lvl < max_inflight && levels.len() + 1 < max_levels {
+        levels.push(lvl);
+        let next = lvl.saturating_mul(2);
+        if next == lvl {
+            break;
+        }
+        lvl = next;
+    }
+    if levels.len() < max_levels && *levels.last().unwrap_or(&0) != max_inflight {
+        levels.push(max_inflight);
+    }
+
+    levels
+}
+
 pub async fn bench_sweep_params(
     parent: &Arc<DeviceObject>,
     inner: &DevExtInner,
@@ -506,21 +656,7 @@ pub async fn bench_sweep_params(
         .min(bench_cfg.max_queue_inflight as usize)
         .max(1);
 
-    let mut levels: Vec<usize> = Vec::new();
-    let mut lvl = 1usize;
-
-    let max_levels = BenchSweepResult::default().levels.len();
-    while lvl < max_inflight && levels.len() + 1 < max_levels {
-        levels.push(lvl);
-        let next = lvl.saturating_mul(2);
-        if next == lvl {
-            break;
-        }
-        lvl = next;
-    }
-    if levels.len() < max_levels && *levels.last().unwrap_or(&0) != max_inflight {
-        levels.push(max_inflight);
-    }
+    let levels = bench_inflight_levels(max_inflight);
 
     let mut result = BenchSweepResult::default();
     let current_sector: u64 = params.start_sector;
@@ -539,6 +675,45 @@ pub async fn bench_sweep_params(
             use_interrupts,
         )
         .await?;
+
+        result.levels[result.used as usize] = level_result;
+        result.used += 1;
+
+        if level >= max_inflight {
+            break;
+        }
+    }
+
+    Ok(result)
+}
+
+pub async fn bench_sweep_params_request(
+    target: &Arc<DeviceObject>,
+    inner: &DevExtInner,
+    params: &BenchSweepParams,
+) -> Result<BenchSweepResult, DriverStatus> {
+    let bench_cfg = BenchConfig::from_inner_params(inner, params)?;
+
+    let requested_inflight = if params.max_inflight == 0 {
+        bench_cfg.max_queue_inflight as usize
+    } else {
+        params.max_inflight as usize
+    };
+    let max_inflight = requested_inflight
+        .max(1)
+        .min(bench_cfg.max_queue_inflight as usize)
+        .max(1);
+
+    let levels = bench_inflight_levels(max_inflight);
+
+    let mut result = BenchSweepResult::default();
+    let current_sector: u64 = params.start_sector;
+    for level in levels {
+        if (result.used as usize) >= result.levels.len() {
+            break;
+        }
+
+        let level_result = bench_reads_request(target, current_sector, level, &bench_cfg).await?;
 
         result.levels[result.used as usize] = level_result;
         result.used += 1;

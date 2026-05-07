@@ -49,7 +49,9 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
         }
     }
 
-    unsafe { bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), 0) };
+    unsafe {
+        bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), stack_len)
+    };
 
     let dt = sw.elapsed_nanos() as usize;
     TIMER_TIME_SCHED.get().fetch_add(dt, Ordering::Relaxed);

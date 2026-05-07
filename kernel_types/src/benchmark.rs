@@ -94,7 +94,7 @@ impl Default for BenchSweepParams {
     fn default() -> Self {
         Self {
             version: BENCH_PARAMS_VERSION_1,
-            flags: BENCH_FLAG_IRQ | BENCH_FLAG_POLL,
+            flags: BENCH_FLAG_IRQ | BENCH_FLAG_POLL | BENCH_FLAG_REQUEST,
             total_bytes: 1024 * 1024 * 1024,
             request_size: 64 * 1024,
             start_sector: 0,
@@ -111,6 +111,7 @@ pub struct BenchSweepBothResult {
     pub params_used: BenchSweepParams,
     pub irq: BenchSweepResult,
     pub poll: BenchSweepResult,
+    pub request: BenchSweepResult,
     pub queue_count: u16,
     pub queue0_size: u16,
     pub indirect_enabled: u8,
@@ -121,6 +122,7 @@ pub const BENCH_PARAMS_VERSION_1: u32 = 1;
 
 pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
 pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
+pub const BENCH_FLAG_REQUEST: u32 = 1 << 2; // route through pnp_send_request + PDO read
 
 /// Configuration for a benchmark window.
 #[repr(C)]
