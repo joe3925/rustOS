@@ -1,9 +1,5 @@
 use core::time::Duration;
 
-/// Max stack frames recorded per RIP sample.
-/// Match the kernel implementation.
-pub const MAX_STACK_DEPTH: usize = 8;
-
 /// Logical CPU identifier used by the bench API.
 ///
 /// Keep this stable for ABI/serialization. The kernel can map

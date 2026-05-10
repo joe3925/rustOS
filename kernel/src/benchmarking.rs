@@ -37,18 +37,20 @@ use kernel_types::status::{DriverStatus, FileStatus};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = true;
+const BENCH_ENABLED: bool = false;
 
-const MAX_STACK_DEPTH: usize = 64;
-const BENCH_RING_CAPACITY: usize = 8192;
+const BENCH_SAMPLE_STACK_CAPACITY: usize = 512;
+const BENCH_RING_CAPACITY: usize = 1024;
+const BENCH_SAMPLE_FRAME_CAPACITY: usize = BENCH_RING_CAPACITY * BENCH_SAMPLE_STACK_CAPACITY;
 
 // ===== Global event stream =====
 
 #[derive(Clone, Copy, Debug)]
 struct BenchSampleEvent {
     rip: u64,
-    depth: u8,
-    stack: [u64; MAX_STACK_DEPTH],
+    depth: usize,
+    captured_depth: usize,
+    stack_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -116,6 +118,7 @@ impl BenchEvent {
 struct BenchRing {
     next_seq: u64,
     buffer: Vec<BenchEvent>,
+    sample_stack: Vec<u64>,
 }
 
 impl BenchRing {
@@ -123,13 +126,44 @@ impl BenchRing {
         BenchRing {
             next_seq: 1,
             buffer: Vec::with_capacity(initial_capacity),
+            sample_stack: Vec::with_capacity(BENCH_SAMPLE_FRAME_CAPACITY),
         }
     }
 
-    fn log(&mut self, mut event: BenchEvent) {
+    fn push_event(&mut self, mut event: BenchEvent) {
         event.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         self.buffer.push(event);
+    }
+
+    fn log(&mut self, event: BenchEvent) {
+        self.push_event(event);
+    }
+
+    fn log_sample(&mut self, rip: u64, depth: usize, stack: &[u64], ts: u64, core_id: u16) {
+        let stack_offset = self.sample_stack.len();
+        let requested_depth = stack.len().min(BENCH_SAMPLE_STACK_CAPACITY);
+        self.sample_stack
+            .extend_from_slice(&stack[..requested_depth]);
+
+        let event = BenchEvent {
+            seq: 0,
+            timestamp_ns: ts,
+            core_id,
+            kind: BenchEventKind::Sample,
+            data: BenchEventData::Sample(BenchSampleEvent {
+                rip,
+                depth,
+                captured_depth: requested_depth,
+                stack_offset,
+            }),
+        };
+        self.push_event(event);
+    }
+
+    fn drain_events(&mut self) -> Vec<BenchEvent> {
+        let capacity = self.buffer.capacity().max(BENCH_RING_CAPACITY);
+        core::mem::replace(&mut self.buffer, Vec::with_capacity(capacity))
     }
 }
 
@@ -167,6 +201,8 @@ impl BenchState {
 static BENCH_STATE: Once<BenchState> = Once::new();
 static BENCH_READY: AtomicBool = AtomicBool::new(false);
 
+static SAMPLE_REFCOUNT: AtomicU32 = AtomicU32::new(0);
+static SPAN_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 static METRICS_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 
 fn bench_state() -> Option<&'static BenchState> {
@@ -207,6 +243,14 @@ fn bench_log_event_for_core(core_id: usize, event: BenchEvent) {
 
 fn bench_metrics_enabled() -> bool {
     METRICS_REFCOUNT.load(Ordering::Relaxed) != 0
+}
+
+fn bench_samples_enabled() -> bool {
+    SAMPLE_REFCOUNT.load(Ordering::Relaxed) != 0
+}
+
+fn bench_spans_enabled() -> bool {
+    SPAN_REFCOUNT.load(Ordering::Relaxed) != 0
 }
 
 fn bench_capture_metrics(core_id: usize, ts: u64) {
@@ -253,33 +297,12 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
 // ===== Global submission API =====
 
 pub fn bench_submit_rip_sample(core_id: usize, rip: u64, stack: &[u64]) {
-    if !BENCH_ENABLED {
+    if !BENCH_ENABLED || !bench_samples_enabled() {
         return;
     }
-    return;
     let ts = bench_now_ns();
 
-    let mut sample = BenchSampleEvent {
-        rip,
-        depth: 0,
-        stack: [0; MAX_STACK_DEPTH],
-    };
-
-    let depth = stack.len().min(MAX_STACK_DEPTH);
-    sample.depth = depth as u8;
-    for i in 0..depth {
-        sample.stack[i] = stack[i];
-    }
-
-    let event = BenchEvent {
-        seq: 0,
-        timestamp_ns: ts,
-        core_id: core_id as u16,
-        kind: BenchEventKind::Sample,
-        data: BenchEventData::Sample(sample),
-    };
-
-    bench_log_event_for_core(core_id, event);
+    bench_log_sample_for_core(core_id, rip, stack.len(), stack, ts);
     bench_capture_metrics(core_id, ts);
 }
 
@@ -296,6 +319,34 @@ fn bench_log_event_for_core_try(core_id: usize, event: BenchEvent) {
         return;
     };
     g.log(event);
+}
+
+#[inline]
+fn bench_log_sample_for_core(core_id: usize, rip: u64, depth: usize, stack: &[u64], ts: u64) {
+    let Some(state) = bench_state() else {
+        return;
+    };
+    let Some(ring) = state.ring_for_core(core_id) else {
+        return;
+    };
+
+    let mut g = ring.lock();
+    g.log_sample(rip, depth, stack, ts, core_id as u16);
+}
+
+#[inline]
+fn bench_log_sample_for_core_try(core_id: usize, rip: u64, depth: usize, stack: &[u64], ts: u64) {
+    let Some(state) = bench_state_get() else {
+        return;
+    };
+    let Some(ring) = state.ring_for_core(core_id) else {
+        return;
+    };
+
+    let Some(mut g) = ring.try_lock() else {
+        return;
+    };
+    g.log_sample(rip, depth, stack, ts, core_id as u16);
 }
 
 #[inline]
@@ -340,44 +391,18 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
     bench_log_event_for_core_try(core_id, event);
 }
 
-pub fn bench_submit_rip_sample_current_core(rip: u64, stack_ptr: *const u64, stack_len: usize) {
-    if !BENCH_ENABLED {
+pub fn bench_submit_rip_sample_current_core(rip: u64) {
+    if !BENCH_ENABLED || !bench_samples_enabled() {
         return;
     }
     if !BENCH_READY.load(Ordering::Acquire) {
         return;
     }
 
-    let stack = if stack_ptr.is_null() || stack_len == 0 || !stack_ptr.is_aligned_to(8) {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(stack_ptr, stack_len) }
-    };
-
     let core_id = interrupt_index::current_cpu_id();
     let ts = bench_now_ns();
 
-    let mut sample = BenchSampleEvent {
-        rip,
-        depth: 0,
-        stack: [0; MAX_STACK_DEPTH],
-    };
-
-    let depth = stack.len().min(MAX_STACK_DEPTH);
-    sample.depth = depth as u8;
-    for i in 0..depth {
-        sample.stack[i] = stack[i];
-    }
-
-    let event = BenchEvent {
-        seq: 0,
-        timestamp_ns: ts,
-        core_id: core_id as u16,
-        kind: BenchEventKind::Sample,
-        data: BenchEventData::Sample(sample),
-    };
-
-    bench_log_event_for_core_try(core_id, event);
+    bench_log_sample_for_core_try(core_id, rip, 0, &[], ts);
     bench_capture_metrics_try(core_id, ts);
 }
 
@@ -388,7 +413,7 @@ fn bench_alloc_span_id() -> Option<u32> {
 }
 
 fn bench_log_span_begin(span_id: u32, tag: &'static str, object_id: u64) {
-    if !BENCH_ENABLED {
+    if !BENCH_ENABLED || !bench_spans_enabled() {
         return;
     }
 
@@ -412,7 +437,7 @@ fn bench_log_span_begin(span_id: u32, tag: &'static str, object_id: u64) {
 }
 
 pub fn bench_log_span_end(span_id: u32, tag: &'static str, object_id: u64) {
-    if !BENCH_ENABLED {
+    if !BENCH_ENABLED || !bench_spans_enabled() {
         return;
     }
 
@@ -445,7 +470,7 @@ pub struct BenchSpanGuard {
 
 impl BenchSpanGuard {
     pub fn new(tag: &'static str, object_id: u64) -> Self {
-        if !BENCH_ENABLED {
+        if !BENCH_ENABLED || !bench_spans_enabled() {
             return BenchSpanGuard {
                 span_id: 0,
                 tag,
@@ -687,6 +712,7 @@ struct ExportBundle {
     spans_rows: Vec<String>,
     mem_rows: Vec<String>,  // includes heap+mem+sched counters per event
     max_seq_seen: Vec<u64>, // per core
+    samples_depth: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -714,6 +740,7 @@ fn make_empty_bundle(ncores: usize) -> ExportBundle {
         spans_rows,
         mem_rows,
         max_seq_seen: vec![0u64; ncores],
+        samples_depth: vec![0usize; ncores + 1],
     }
 }
 
@@ -752,8 +779,9 @@ fn write_sample_row(
     ts: u64,
     core_id: u16,
     rip: u64,
-    depth: u16,
-    stack: &[u64; MAX_STACK_DEPTH],
+    depth: usize,
+    stack: &[u64],
+    output_depth: usize,
 ) {
     let _ = core::write!(
         row,
@@ -765,16 +793,22 @@ fn write_sample_row(
         depth
     );
 
-    let depth = depth as usize;
-    for di in 0..MAX_STACK_DEPTH {
-        if di < depth {
-            let v = stack[di];
+    for di in 0..output_depth {
+        if let Some(v) = stack.get(di) {
             let _ = core::write!(row, ",0x{:016x}", v);
         } else {
             row.push(',');
         }
     }
 
+    row.push('\n');
+}
+
+fn write_sample_header(row: &mut String, stack_depth: usize) {
+    row.push_str("run_id,timestamp_ns,core,rip,depth");
+    for di in 0..stack_depth {
+        let _ = core::write!(row, ",frame{di}");
+    }
     row.push('\n');
 }
 
@@ -815,6 +849,7 @@ pub async fn build_exports_for_window(
     start_ns: u64,
     to_ns: u64,
     last_export_seq: &[u64],
+    samples_header_depth: &[usize],
     ncores: usize,
     open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
 ) -> Vec<ExportBundle> {
@@ -834,6 +869,7 @@ pub async fn build_exports_for_window(
 
     struct CoreIterator {
         events: Vec<BenchEvent>,
+        sample_stack: Vec<u64>,
         index: usize,
         core: usize,
     }
@@ -847,7 +883,7 @@ pub async fn build_exports_for_window(
             if self.index < self.events.len() {
                 let idx = self.index;
                 self.index += 1;
-                Some(self.events[idx])
+                Some(core::mem::take(&mut self.events[idx]))
             } else {
                 None
             }
@@ -860,6 +896,13 @@ pub async fn build_exports_for_window(
                 self.events.shrink_to_fit();
             }
         }
+
+        fn sample_frames(&self, sample: &BenchSampleEvent) -> &[u64] {
+            let start = sample.stack_offset;
+            let len = sample.captured_depth;
+            let end = start.saturating_add(len);
+            self.sample_stack.get(start..end).unwrap_or(&[])
+        }
     }
 
     let mut gather_joins = Vec::with_capacity(ncores);
@@ -868,16 +911,28 @@ pub async fn build_exports_for_window(
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
         gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
-            move || -> Vec<BenchEvent> {
+            move || -> (Vec<BenchEvent>, Vec<u64>) {
                 let ring_m = match st.ring_for_core(core) {
                     Some(r) => r,
-                    None => return Vec::new(),
+                    None => return (Vec::new(), Vec::new()),
                 };
 
-                let mut ring = ring_m.lock();
-                let mut out = Vec::new();
+                let (events, sample_stack) = {
+                    let mut ring = ring_m.lock();
+                    let events = ring.drain_events();
+                    let stack_capacity = ring
+                        .sample_stack
+                        .capacity()
+                        .max(BENCH_SAMPLE_FRAME_CAPACITY);
+                    let sample_stack = core::mem::replace(
+                        &mut ring.sample_stack,
+                        Vec::with_capacity(stack_capacity),
+                    );
+                    (events, sample_stack)
+                };
 
-                for ev in ring.buffer.iter() {
+                let mut out = Vec::new();
+                for ev in events {
                     if ev.is_empty() {
                         continue;
                     }
@@ -890,10 +945,8 @@ pub async fn build_exports_for_window(
                         continue;
                     }
 
-                    out.push(*ev);
+                    out.push(ev);
                 }
-
-                ring.buffer.clear();
 
                 out.sort_unstable_by(|a, b| {
                     a.timestamp_ns
@@ -902,7 +955,7 @@ pub async fn build_exports_for_window(
                         .then(a.seq.cmp(&b.seq))
                 });
 
-                out
+                (out, sample_stack)
             },
         ));
     }
@@ -911,11 +964,12 @@ pub async fn build_exports_for_window(
     let mut total_events = 0usize;
 
     for (core, j) in gather_joins.into_iter().enumerate() {
-        let events = j.await;
+        let (events, sample_stack) = j.await;
         total_events += events.len();
         if !events.is_empty() {
             iterators.push(CoreIterator {
                 events,
+                sample_stack,
                 index: 0,
                 core,
             });
@@ -926,6 +980,31 @@ pub async fn build_exports_for_window(
         return vec![make_empty_bundle(ncores)];
     }
 
+    let avg = ncores;
+    let mut samples_depth = vec![0usize; ncores + 1];
+    if log_samples {
+        for target in 0..(ncores + 1) {
+            samples_depth[target] = *samples_header_depth.get(target).unwrap_or(&0);
+        }
+
+        for iter in &iterators {
+            for ev in &iter.events {
+                if let BenchEventData::Sample(s) = &ev.data {
+                    let captured_depth = s.captured_depth;
+                    if per_core_enabled
+                        && iter.core < ncores
+                        && captured_depth > samples_depth[iter.core]
+                    {
+                        samples_depth[iter.core] = captured_depth;
+                    }
+                    if captured_depth > samples_depth[avg] {
+                        samples_depth[avg] = captured_depth;
+                    }
+                }
+            }
+        }
+    }
+
     let desired_chunks = ncores.max(4);
     let min_chunk_size = 256usize;
     let chunks = core::cmp::min(desired_chunks, total_events.div_ceil(min_chunk_size)).max(1);
@@ -933,7 +1012,9 @@ pub async fn build_exports_for_window(
 
     let mut out = Vec::with_capacity(chunks);
     for _ in 0..chunks {
-        out.push(make_empty_bundle(ncores));
+        let mut bundle = make_empty_bundle(ncores);
+        bundle.samples_depth.clone_from(&samples_depth);
+        out.push(bundle);
     }
 
     let k = iterators.len();
@@ -946,7 +1027,6 @@ pub async fn build_exports_for_window(
     }
     heap_build(&mut heap);
 
-    let avg = ncores;
     let mut global_idx = 0usize;
     let shrink_interval = 2048usize;
 
@@ -971,6 +1051,7 @@ pub async fn build_exports_for_window(
         match ev.kind {
             BenchEventKind::Sample if log_samples => {
                 if let BenchEventData::Sample(s) = ev.data {
+                    let frames = iterators[iter_idx].sample_frames(&s);
                     if per_core_enabled && scan_core < ncores {
                         write_sample_row(
                             &mut bundle.samples_rows[scan_core],
@@ -978,8 +1059,9 @@ pub async fn build_exports_for_window(
                             ev.timestamp_ns,
                             ev.core_id,
                             s.rip,
-                            s.depth.into(),
-                            &s.stack,
+                            s.depth,
+                            frames,
+                            samples_depth[scan_core],
                         );
                     }
                     write_sample_row(
@@ -988,8 +1070,9 @@ pub async fn build_exports_for_window(
                         ev.timestamp_ns,
                         ev.core_id,
                         s.rip,
-                        s.depth.into(),
-                        &s.stack,
+                        s.depth,
+                        frames,
+                        samples_depth[avg],
                     );
                 }
             }
@@ -1094,6 +1177,7 @@ struct BenchWindowInner {
     last_export_seq: Vec<u64>,
 
     samples_header_written: Vec<bool>,
+    samples_header_depth: Vec<usize>,
     spans_header_written: Vec<bool>,
     mem_header_written: Vec<bool>,
 
@@ -1114,6 +1198,7 @@ impl BenchWindowInner {
             current_run_id: 0,
             last_export_seq: vec![0; ncores],
             samples_header_written: vec![false; ncores + 1],
+            samples_header_depth: vec![0usize; ncores + 1],
             spans_header_written: vec![false; ncores + 1],
             mem_header_written: vec![false; ncores + 1],
             open_spans: BTreeMap::new(),
@@ -1125,6 +1210,7 @@ impl BenchWindowInner {
         for v in &mut self.samples_header_written {
             *v = false;
         }
+        self.samples_header_depth.fill(0);
         for v in &mut self.spans_header_written {
             *v = false;
         }
@@ -1237,6 +1323,12 @@ impl BenchWindow {
 
             inner.reset_run_state();
 
+            if inner.cfg.log_samples {
+                SAMPLE_REFCOUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            if inner.cfg.log_spans {
+                SPAN_REFCOUNT.fetch_add(1, Ordering::Relaxed);
+            }
             auto_persist_secs_opt = inner.cfg.auto_persist_secs;
             timeout_ms_opt = inner.cfg.timeout_ms;
         }
@@ -1286,12 +1378,23 @@ impl BenchWindow {
         if !BENCH_ENABLED {
             return;
         }
-        let mut inner = self.inner.lock();
-        if !inner.running {
-            return;
+
+        let (log_samples, log_spans) = {
+            let mut inner = self.inner.lock();
+            if !inner.running {
+                return;
+            }
+            inner.running = false;
+            inner.stop_ns = Some(bench_now_ns());
+            (inner.cfg.log_samples, inner.cfg.log_spans)
+        };
+
+        if log_samples {
+            SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
-        inner.running = false;
-        inner.stop_ns = Some(bench_now_ns());
+        if log_spans {
+            SPAN_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     pub fn span_guard(&self, tag: &'static str, object_id: u64) -> BenchSpanGuard {
@@ -1319,6 +1422,7 @@ impl BenchWindow {
 
         let last_export_seq: Vec<u64>;
         let mut samples_header_written: Vec<bool>;
+        let mut samples_header_depth: Vec<usize>;
         let mut spans_header_written: Vec<bool>;
         let mut mem_header_written: Vec<bool>;
 
@@ -1345,6 +1449,7 @@ impl BenchWindow {
 
             last_export_seq = inner.last_export_seq.clone();
             samples_header_written = inner.samples_header_written.clone();
+            samples_header_depth = inner.samples_header_depth.clone();
             spans_header_written = inner.spans_header_written.clone();
             mem_header_written = inner.mem_header_written.clone();
 
@@ -1361,6 +1466,7 @@ impl BenchWindow {
             start_ns,
             to_ns,
             &last_export_seq,
+            &samples_header_depth,
             ncores,
             &mut open_spans,
         )
@@ -1372,11 +1478,16 @@ impl BenchWindow {
 
         let exports = Arc::new(exports_vec);
 
+        #[derive(Clone, Copy)]
+        enum PersistStream {
+            Samples,
+            Spans,
+            Memory,
+        }
+
         let mut joins = Vec::new();
 
         if cfg.log_samples {
-            let header: &'static str = "run_id,timestamp_ns,core,rip,depth,frame0,frame1,frame2,frame3,frame4,frame5,frame6,frame7\n";
-
             for target in 0..(ncores + 1) {
                 if cfg.disable_per_core && target != ncores {
                     continue;
@@ -1386,10 +1497,37 @@ impl BenchWindow {
                 let session_dir = session_dir.clone();
                 let window_dir = window_dir.clone();
                 let mut header_written = samples_header_written[target];
+                let old_header_depth = samples_header_depth[target];
+                let header_depth = ex
+                    .iter()
+                    .map(|b| b.samples_depth[target])
+                    .max()
+                    .unwrap_or(old_header_depth)
+                    .max(old_header_depth);
 
                 joins.push(crate::scheduling::runtime::runtime::spawn(async move {
                     let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
                     let file_name = format!("run_{run_id}_samples.csv");
+
+                    if header_written && header_depth > old_header_depth {
+                        if rewrite_sample_csv_header(
+                            &path,
+                            &file_name,
+                            old_header_depth,
+                            header_depth,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return (
+                                false,
+                                PersistStream::Samples,
+                                target,
+                                header_written,
+                                old_header_depth,
+                            );
+                        }
+                    }
 
                     for b in ex.iter() {
                         let rows = &b.samples_rows[target];
@@ -1399,24 +1537,42 @@ impl BenchWindow {
 
                         if !header_written {
                             let mut csv = String::new();
-                            csv.push_str(header);
+                            write_sample_header(&mut csv, header_depth);
                             csv.push_str(rows);
                             if append_named_file(&path, &file_name, csv.as_bytes())
                                 .await
                                 .is_err()
                             {
-                                return (false, target, header_written);
+                                return (
+                                    false,
+                                    PersistStream::Samples,
+                                    target,
+                                    header_written,
+                                    old_header_depth,
+                                );
                             }
                             header_written = true;
                         } else if append_named_file(&path, &file_name, rows.as_bytes())
                             .await
                             .is_err()
                         {
-                            return (false, target, header_written);
+                            return (
+                                false,
+                                PersistStream::Samples,
+                                target,
+                                header_written,
+                                old_header_depth,
+                            );
                         }
                     }
 
-                    (true, target, header_written)
+                    (
+                        true,
+                        PersistStream::Samples,
+                        target,
+                        header_written,
+                        header_depth,
+                    )
                 }));
             }
         }
@@ -1452,18 +1608,18 @@ impl BenchWindow {
                                 .await
                                 .is_err()
                             {
-                                return (false, target, header_written);
+                                return (false, PersistStream::Spans, target, header_written, 0);
                             }
                             header_written = true;
                         } else if append_named_file(&path, &file_name, rows.as_bytes())
                             .await
                             .is_err()
                         {
-                            return (false, target, header_written);
+                            return (false, PersistStream::Spans, target, header_written, 0);
                         }
                     }
 
-                    (true, target, header_written)
+                    (true, PersistStream::Spans, target, header_written, 0)
                 }));
             }
         }
@@ -1499,18 +1655,18 @@ impl BenchWindow {
                                 .await
                                 .is_err()
                             {
-                                return (false, target, header_written);
+                                return (false, PersistStream::Memory, target, header_written, 0);
                             }
                             header_written = true;
                         } else if append_named_file(&path, &file_name, rows.as_bytes())
                             .await
                             .is_err()
                         {
-                            return (false, target, header_written);
+                            return (false, PersistStream::Memory, target, header_written, 0);
                         }
                     }
 
-                    (true, target, header_written)
+                    (true, PersistStream::Memory, target, header_written, 0)
                 }));
             }
         }
@@ -1518,20 +1674,23 @@ impl BenchWindow {
         let mut ok = true;
         let results = JoinAll::new(joins).await;
 
-        for (this_ok, target, header_written) in results {
+        for (this_ok, stream, target, header_written, header_depth) in results {
             if !this_ok {
                 ok = false;
                 continue;
             }
 
-            if cfg.log_samples {
-                samples_header_written[target] = header_written;
-            }
-            if cfg.log_spans {
-                spans_header_written[target] = header_written;
-            }
-            if cfg.log_mem_on_persist {
-                mem_header_written[target] = header_written;
+            match stream {
+                PersistStream::Samples => {
+                    samples_header_written[target] = header_written;
+                    samples_header_depth[target] = header_depth;
+                }
+                PersistStream::Spans => {
+                    spans_header_written[target] = header_written;
+                }
+                PersistStream::Memory => {
+                    mem_header_written[target] = header_written;
+                }
             }
         }
 
@@ -1551,6 +1710,7 @@ impl BenchWindow {
 
         let mut inner = self.inner.lock();
         inner.samples_header_written = samples_header_written;
+        inner.samples_header_depth = samples_header_depth;
         inner.spans_header_written = spans_header_written;
         inner.mem_header_written = mem_header_written;
 
@@ -1572,14 +1732,18 @@ impl Drop for BenchWindow {
         }
 
         let mut do_flush = false;
+        let mut dec_samples = false;
+        let mut dec_spans = false;
         let mut dec_metrics = false;
 
         {
             let mut inner = self.inner.lock();
-            if inner.running && inner.cfg.end_on_drop {
+            if inner.running {
                 inner.running = false;
                 inner.stop_ns = Some(bench_now_ns());
-                do_flush = true;
+                dec_samples = inner.cfg.log_samples;
+                dec_spans = inner.cfg.log_spans;
+                do_flush = inner.cfg.end_on_drop;
             }
             if inner.cfg.log_mem_on_persist {
                 dec_metrics = true;
@@ -1591,6 +1755,14 @@ impl Drop for BenchWindow {
             spawn_blocking(move || {
                 block_on(this.persist());
             });
+        }
+
+        if dec_samples {
+            SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        if dec_spans {
+            SPAN_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
 
         if dec_metrics {
@@ -1620,6 +1792,71 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
     }
 
     file.append(data).await.map_err(|_| ())?;
+    let _ = file.close().await;
+    Ok(())
+}
+
+fn push_padded_existing_sample_rows(out: &mut String, body: &[u8], extra_depth: usize) {
+    let Ok(text) = core::str::from_utf8(body) else {
+        return;
+    };
+
+    for line in text.split_inclusive('\n') {
+        let has_newline = line.ends_with('\n');
+        let row = if has_newline {
+            &line[..line.len().saturating_sub(1)]
+        } else {
+            line
+        };
+
+        if !row.is_empty() {
+            out.push_str(row);
+            for _ in 0..extra_depth {
+                out.push(',');
+            }
+        }
+
+        if has_newline {
+            out.push('\n');
+        }
+    }
+}
+
+async fn rewrite_sample_csv_header(
+    path: &str,
+    file_name: &str,
+    old_depth: usize,
+    new_depth: usize,
+) -> Result<(), ()> {
+    if new_depth <= old_depth {
+        return Ok(());
+    }
+
+    let file_path = Path::from_string(&format!("{path}\\{file_name}"));
+    let mut file = File::open(
+        &file_path,
+        &[
+            OpenFlags::Open,
+            OpenFlags::ReadWrite,
+            OpenFlags::WriteThrough,
+        ],
+    )
+    .await
+    .map_err(|_| ())?;
+
+    let old = file.read().await.map_err(|_| ())?;
+    let body_start = old
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(old.len());
+
+    let mut csv = String::new();
+    write_sample_header(&mut csv, new_depth);
+    push_padded_existing_sample_rows(&mut csv, &old[body_start..], new_depth - old_depth);
+
+    file.set_len(0).await.map_err(|_| ())?;
+    file.write(csv.as_bytes()).await.map_err(|_| ())?;
     let _ = file.close().await;
     Ok(())
 }
@@ -2097,7 +2334,7 @@ const DISK_BENCH_SIZES: &[usize] = &[
     // 512 * 1024,
     // 1024 * 1024,
     // 2 * 1024 * 1024,
-    // 4 * 1024 * 1024,
+    //4 * 1024 * 1024,
     //64 * 1024 * 1024,
 ];
 

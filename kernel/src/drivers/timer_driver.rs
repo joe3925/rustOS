@@ -37,22 +37,12 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let _fpu_guard = KernelFpuGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
+    let sample_rip = unsafe { (*state).rip };
+
+    bench_submit_rip_sample_current_core(sample_rip);
+
     let sw = Stopwatch::start();
-
-    let prev_task = SCHEDULER.on_timer_tick(state, cpu_id);
-    let mut stack_len = 0;
-    if let Some(task) = prev_task {
-        let rsp = unsafe { (*state).rsp };
-        let stack_start = task.stack_start.load(Ordering::Relaxed);
-        if rsp < stack_start {
-            stack_len = ((stack_start - rsp) / 8) as usize;
-        }
-    }
-
-    unsafe {
-        bench_submit_rip_sample_current_core((*state).rip, ((*state).rsp as *const u64), stack_len)
-    };
-
+    SCHEDULER.on_timer_tick(state, cpu_id);
     let dt = sw.elapsed_nanos() as usize;
     TIMER_TIME_SCHED.get().fetch_add(dt, Ordering::Relaxed);
 }

@@ -59,7 +59,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 250_000;
+pub const APIC_START_PERIOD: u64 = 25_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -118,7 +118,7 @@ pub unsafe fn init() {
 
         PER_CPU_GDT.lock().init_gdt();
         PICS.lock().initialize();
-        x86_64::instructions::interrupts::enable();
+        x86_64::instructions::interrupts::disable();
         syscall_init();
         init_dma_manager();
         init_iommu();
@@ -132,7 +132,6 @@ pub unsafe fn init() {
         let apic_time = Stopwatch::start();
         match ApicImpl::init_apic_full() {
             Ok(_) => {
-                x86_64::instructions::interrupts::disable();
                 APIC.lock().as_ref().unwrap().start_aps();
                 println!(
                     "APIC init and AP start successful in {} s!",
