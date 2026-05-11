@@ -558,9 +558,8 @@ impl PELoader {
             let dll_name = imp.dll.to_ascii_lowercase();
             let symbol_name = &imp.name;
 
-            let abs_addr = program
-                .find_import(dll_name.as_str(), symbol_name.to_string().as_str())
-                .ok_or(LoadError::NoSuchSymbol)?;
+            let abs_addr =
+                program.find_import(dll_name.as_str(), symbol_name.to_string().as_str())?;
 
             let slot_va = self.current_base.as_u64() + imp.offset as u64;
             unsafe { (slot_va as *mut u64).write(abs_addr.as_u64()) };

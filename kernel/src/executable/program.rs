@@ -1,12 +1,12 @@
-use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::object_manager::ObjectTag;
-
 use alloc::{
     collections::{btree_map::BTreeMap, vec_deque::VecDeque},
     string::{String, ToString},
     sync::Arc,
     vec::Vec,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
+use kernel_types::object_manager::ObjectTag;
+use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
@@ -393,31 +393,31 @@ impl Program {
         Ok(())
     }
 
-    pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Option<VirtAddr> {
-        let want = strip_dll_ext(dll_name);
+    pub fn find_import(&self, dll_name: &str, symbol_name: &str) -> Result<VirtAddr, LoadError> {
+        let want = strip_ext(dll_name);
         let modules = self.modules.read();
 
         for module in modules.iter() {
             let m = module.read();
-            let have = strip_dll_ext(&m.title);
+            let have = strip_ext(&m.title);
 
             if have.eq_ignore_ascii_case(want) {
                 if let Some((_, rva)) = m.symbols.iter().find(|(name, _)| name == symbol_name) {
-                    return Some(m.image_base + *rva as u64);
+                    return Ok(m.image_base + *rva as u64);
                 }
             }
         }
 
-        None
+        Err(NoSuchSymbol(symbol_name.to_string()))
     }
 
     pub fn has_module(&self, name_lc: &str) -> bool {
-        let want = strip_dll_ext(name_lc);
+        let want = strip_ext(name_lc);
 
         self.modules
             .read()
             .iter()
-            .any(|m| strip_dll_ext(&m.read().title).eq_ignore_ascii_case(want))
+            .any(|m| strip_ext(&m.read().title).eq_ignore_ascii_case(want))
     }
 
     pub fn resolve_handle(&self, handle: UserHandle) -> Option<ObjectRef> {
@@ -590,16 +590,13 @@ impl ProgramManager {
 fn basename(s: &str) -> &str {
     s.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(s)
 }
-
-fn strip_dll_ext(s: &str) -> &str {
+fn strip_ext(s: &str) -> &str {
     let s = basename(s);
-    if s.len() >= 4 {
-        let (head, tail) = s.split_at(s.len() - 4);
-        if tail.eq_ignore_ascii_case(".dll") {
-            return head;
-        }
+
+    match s.rfind('.') {
+        Some(0) | None => s,
+        Some(dot) => &s[..dot],
     }
-    s
 }
 lazy_static! {
     pub static ref PROGRAM_MANAGER: ProgramManager = ProgramManager::new();

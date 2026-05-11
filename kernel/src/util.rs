@@ -172,7 +172,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(
-        "KRNL".to_string(),
+        "kernel".to_string(),
         Path::from_string(""),
         VirtAddr::new(0xFFFF_8500_0000_0000),
         kernel_cr3(),
@@ -182,7 +182,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
-        title: "KRNL.DLL".into(),
+        title: "kernel.efi".into(),
         image_path: Path::from_string(""),
         parent_pid: 0,
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),

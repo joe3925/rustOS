@@ -167,7 +167,7 @@ pub enum LoadError {
     NotDLL,
     NoFile,
     NoMainThread,
-    NoSuchSymbol,
+    NoSuchSymbol(String),
     PageError(PageMapError),
 }
 

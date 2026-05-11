@@ -17,7 +17,7 @@ fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(
     let export_body = &contents[start + 1..end];
 
     let mut lines = Vec::new();
-    lines.push("LIBRARY KRNL".to_string());
+    lines.push("LIBRARY kernel".to_string());
     lines.push("EXPORTS".to_string());
 
     for line in export_body.lines() {
@@ -59,7 +59,7 @@ fn main() {
     let exports_path = manifest_dir.join("src").join("exports.rs");
     println!("cargo:rerun-if-changed={}", exports_path.display());
 
-    let def_path = out_dir.join("KRNL.def");
+    let def_path = out_dir.join("kernel.def");
     generate_def_file(&exports_path, &def_path).expect("Failed to generate .def file");
 
     let def_text = fs::read_to_string(&def_path).expect("Failed to read generated .def");
@@ -67,10 +67,10 @@ fn main() {
     let machine = machine_from_target(&target);
     let flavor = flavor_from_target(&target);
 
-    let lib_out = out_dir.join("KRNL.lib");
+    let lib_out = out_dir.join("kernel.lib");
     let lib = ImportLibrary::new(&def_text, machine, flavor).expect("implib failed");
-    let mut f = fs::File::create(&lib_out).expect("Failed to create KRNL.lib");
-    lib.write_to(&mut f).expect("Failed to write KRNL.lib");
+    let mut f = fs::File::create(&lib_out).expect("Failed to create kernel.lib");
+    lib.write_to(&mut f).expect("Failed to write kernel.lib");
 
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -82,8 +82,8 @@ fn main() {
                 .to_path_buf()
         });
 
-    let shared_lib = target_dir.join("KRNL.lib");
-    fs::copy(&lib_out, &shared_lib).expect("Failed to copy KRNL.lib to target/");
+    let shared_lib = target_dir.join("kernel.lib");
+    fs::copy(&lib_out, &shared_lib).expect("Failed to copy kernel.lib to target/");
 
     println!("cargo:rerun-if-changed=build.rs");
 }
