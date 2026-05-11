@@ -34,7 +34,7 @@ use kernel_types::status::{
 };
 use kernel_types::{ClassAddCallback, DpcFn, EvtDriverDeviceAdd, EvtDriverUnload};
 
-#[link(name = "KRNL")]
+#[link(name = "kernel")]
 unsafe extern "win64" {
     // Memory / Core
     pub fn kernel_alloc(layout: Layout) -> *mut u8;

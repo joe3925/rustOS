@@ -16,7 +16,9 @@ use goblin::pe::PE;
 use goblin::Object;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
-use kernel_types::memory::Module;
+use kernel_types::memory::{
+    Module, PeExportInfo, PeImportInfo, PeInfo, PePdbFormat, PePdbInfo, PeSectionInfo,
+};
 use kernel_types::status::{LoadError, PageMapError};
 use spin::rwlock::RwLock;
 use x86_64::instructions::interrupts;
@@ -152,22 +154,25 @@ impl PELoader {
             self.load_sections()?;
         }
 
-        let title = self.path.file_name().unwrap_or("unknown").to_string();
         let base = self.current_base.as_u64();
+        let relocated = base != preferred_base;
+        let pe_info = self.collect_pe_info(relocated)?;
+        let title = self.path.file_name().unwrap_or("unknown").to_string();
         println!(
-            "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x})",
+            "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x}) PDB at: {}",
             title,
             base,
             base + image_size,
-            image_size
+            image_size,
+            pe_info.pdb.as_ref().unwrap().path
         );
-
         let module = Module {
             title,
             image_path: self.path.clone(),
             parent_pid: program.pid,
             image_base: self.current_base,
             symbols: exports.clone(),
+            pe_info: Some(pe_info),
         };
         let handle = Arc::new(RwLock::new(module));
         program.modules.write().push(handle.clone());
@@ -233,10 +238,11 @@ impl PELoader {
             return Err(LoadError::MissingSections);
         }
         let range_tracker = Arc::new(RangeTracker::new(0x1000u64, 0x00007FFFFFFFFFFFu64));
+        let preferred_image_base = opt_hdr.windows_fields.image_base;
         self.current_base = if (self.needs_relocation()) {
             self.allocate_relocation_base(&range_tracker)?
         } else {
-            VirtAddr::new(opt_hdr.windows_fields.image_base)
+            VirtAddr::new(preferred_image_base)
         };
 
         let (table_phys, table_virt) = new_user_mode_page_table().unwrap();
@@ -264,6 +270,8 @@ impl PELoader {
             new_frame,
             range_tracker,
         );
+        program.pe_info =
+            Some(self.collect_pe_info(self.current_base.as_u64() != preferred_image_base)?);
 
         // Allocates the image + a guard page + the stack + the heap
         match unsafe {
@@ -438,6 +446,113 @@ impl PELoader {
         }
         out
     }
+    fn collect_pe_info(&self, relocated: bool) -> Result<PeInfo, LoadError> {
+        let opt_hdr = self
+            .pe
+            .header
+            .optional_header
+            .as_ref()
+            .ok_or(LoadError::MissingSections)?;
+        let coff = &self.pe.header.coff_header;
+        let standard = &opt_hdr.standard_fields;
+        let windows = &opt_hdr.windows_fields;
+        Ok(PeInfo {
+            is_64: self.pe.is_64,
+            is_dll: self.pe.is_lib,
+            machine: coff.machine,
+            characteristics: coff.characteristics,
+            time_date_stamp: coff.time_date_stamp,
+            optional_magic: standard.magic,
+            subsystem: windows.subsystem,
+            dll_characteristics: windows.dll_characteristics,
+            preferred_image_base: windows.image_base,
+            loaded_image_base: self.current_base,
+            entry_rva: self.pe.entry,
+            size_of_image: windows.size_of_image,
+            size_of_headers: windows.size_of_headers,
+            section_alignment: windows.section_alignment,
+            file_alignment: windows.file_alignment,
+            size_of_code: standard.size_of_code,
+            size_of_initialized_data: standard.size_of_initialized_data,
+            size_of_uninitialized_data: standard.size_of_uninitialized_data,
+            stack_reserve: windows.size_of_stack_reserve,
+            stack_commit: windows.size_of_stack_commit,
+            heap_reserve: windows.size_of_heap_reserve,
+            heap_commit: windows.size_of_heap_commit,
+            aslr: self.is_aslr(),
+            relocated,
+            sections: self.collect_section_info(),
+            imports: self.collect_import_info(),
+            exports: self.collect_export_info(),
+            pdb: self.collect_pdb_info(),
+        })
+    }
+
+    fn collect_section_info(&self) -> Vec<PeSectionInfo> {
+        self.pe
+            .sections
+            .iter()
+            .map(|section| PeSectionInfo {
+                name: section.name().unwrap_or("unknown").to_string(),
+                virtual_address: section.virtual_address,
+                virtual_size: section.virtual_size,
+                raw_offset: section.pointer_to_raw_data,
+                raw_size: section.size_of_raw_data,
+                characteristics: section.characteristics,
+            })
+            .collect()
+    }
+
+    fn collect_import_info(&self) -> Vec<PeImportInfo> {
+        self.pe
+            .imports
+            .iter()
+            .map(|import| PeImportInfo {
+                dll: import.dll.to_string(),
+                name: import.name.to_string(),
+                ordinal: import.ordinal,
+                import_address_table_rva: import.offset as u64,
+                hint_name_table_rva: import.rva as u64,
+                thunk_size: import.size,
+            })
+            .collect()
+    }
+
+    fn collect_export_info(&self) -> Vec<PeExportInfo> {
+        self.pe
+            .exports
+            .iter()
+            .map(|export| PeExportInfo {
+                name: export.name.map(|name| name.to_string()),
+                rva: export.rva as u64,
+            })
+            .collect()
+    }
+
+    fn collect_pdb_info(&self) -> Option<PePdbInfo> {
+        let debug = self.pe.debug_data.as_ref()?;
+        if let Some(pdb) = debug.codeview_pdb70_debug_info {
+            return Some(PePdbInfo {
+                format: PePdbFormat::Pdb70,
+                path: pdb_path_to_string(pdb.filename),
+                age: pdb.age,
+                guid: Some(pdb.signature),
+                signature: None,
+                codeview_offset: None,
+            });
+        }
+        if let Some(pdb) = debug.codeview_pdb20_debug_info {
+            return Some(PePdbInfo {
+                format: PePdbFormat::Pdb20,
+                path: pdb_path_to_string(pdb.filename),
+                age: pdb.age,
+                guid: None,
+                signature: Some(pdb.signature),
+                codeview_offset: Some(pdb.codeview_offset),
+            });
+        }
+        None
+    }
     pub fn patch_imports(&mut self, program: &mut Program) -> Result<(), LoadError> {
         for imp in &self.pe.imports {
             let dll_name = imp.dll.to_ascii_lowercase();
@@ -453,6 +568,14 @@ impl PELoader {
         Ok(())
     }
 }
+
+fn pdb_path_to_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end])
+        .unwrap_or("")
+        .to_string()
+}
+
 pub struct RelocationEntry {
     pub relocation_type: BaseRelocType,
     pub virtual_address: u32,

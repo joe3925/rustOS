@@ -508,7 +508,14 @@ async fn bench_read_via_request(
     } else {
         data.resize(len, 0);
         let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
-        let mut req = RequestHandle::new_t(RequestType::Read { offset, len }, io_buf);
+        let mut req = RequestHandle::new_t(
+            RequestType::Read {
+                offset,
+                len,
+                no_buffer: false,
+            },
+            io_buf,
+        );
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let start_tsc = rdtsc();

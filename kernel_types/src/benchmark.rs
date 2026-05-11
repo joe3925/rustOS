@@ -136,6 +136,7 @@ pub struct BenchWindowConfig {
     // heap/memory and scheduler counters. Sampling is driven by span/sample
     // events (not persist).
     pub log_mem_on_persist: bool,
+    pub export_debug_metadata: bool,
 
     pub end_on_drop: bool,
     pub timeout_ms: Option<Duration>,
@@ -154,6 +155,7 @@ impl Default for BenchWindowConfig {
             log_spans: true,
             disable_per_core: false,
             log_mem_on_persist: false,
+            export_debug_metadata: false,
             end_on_drop: true,
             timeout_ms: None,
             auto_persist_secs: None,

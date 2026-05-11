@@ -2,6 +2,7 @@ use crate::alloc::format;
 use crate::drivers::interrupt_index::{self, TSC_HZ};
 use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
+use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::allocator::ALLOCATOR;
 use crate::memory::{
@@ -12,6 +13,7 @@ use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
+use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
 use crate::util::{boot_info, TOTAL_TIME};
 use crate::{cpu, println, vec};
@@ -26,18 +28,21 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
+use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
     BenchLevelResult, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
     BENCH_FLAG_REQUEST,
 };
 use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
+use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{RequestData, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
+use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const BENCH_SAMPLE_STACK_CAPACITY: usize = 512;
 const BENCH_RING_CAPACITY: usize = 1024;
@@ -513,7 +518,8 @@ pub fn bench_span_guard(tag: &'static str, object_id: u64) -> BenchSpanGuard {
 
 #[derive(Clone)]
 struct BenchSessionInfo {
-    session_dir: String,
+    archive_path: String,
+    archive: Arc<BenchArchive>,
     ncores: usize,
 }
 
@@ -554,10 +560,13 @@ fn parse_session_suffix(entry: &str) -> Option<u32> {
     if !name.starts_with("session_") {
         return None;
     }
-    name[8..].parse::<u32>().ok()
+    let suffix = name[8..]
+        .strip_suffix(BENCH_ARCHIVE_EXTENSION)
+        .unwrap_or(&name[8..]);
+    suffix.parse::<u32>().ok()
 }
 
-async fn ensure_session_async(root: &str, per_core_enabled: bool) -> BenchSessionInfo {
+async fn ensure_session_async(root: &str) -> BenchSessionInfo {
     {
         let reg = session_registry().lock();
         if let Some(info) = reg.get(root) {
@@ -581,27 +590,14 @@ async fn ensure_session_async(root: &str, per_core_enabled: bool) -> BenchSessio
     }
 
     let new_id = max_id.saturating_add(1);
-    let session_dir = join_path2(root, &format!("session_{new_id}"));
-
-    let _ = File::make_dir(&Path::from_string(&session_dir)).await;
-    let cores_dir = join_path2(&session_dir, "cores");
-    let avg_dir = join_path2(&session_dir, "avg");
-    let avg_windows_dir = join_path2(&avg_dir, "windows");
-    let _ = File::make_dir(&Path::from_string(&cores_dir)).await;
-    let _ = File::make_dir(&Path::from_string(&avg_dir)).await;
-    let _ = File::make_dir(&Path::from_string(&avg_windows_dir)).await;
+    let archive_path = join_path2(root, &format!("session_{new_id}{BENCH_ARCHIVE_EXTENSION}"));
+    let archive = Arc::new(bench_archive_for_path(archive_path.clone()));
 
     let ncores = bench_ncores();
-    if per_core_enabled {
-        for i in 0..ncores {
-            let core_dir = join_path2(&cores_dir, &format!("core-{i}"));
-            let _ = File::make_dir(&Path::from_string(&core_dir)).await;
-            let _ = File::make_dir(&Path::from_string(&join_path2(&core_dir, "windows"))).await;
-        }
-    }
 
     let info = BenchSessionInfo {
-        session_dir,
+        archive_path,
+        archive,
         ncores,
     };
 
@@ -610,78 +606,40 @@ async fn ensure_session_async(root: &str, per_core_enabled: bool) -> BenchSessio
     info
 }
 
-async fn compute_next_window_suffix_async(windows_root_avg: &str, name: &str) -> u32 {
-    let entries = File::list_dir(&Path::from_string(windows_root_avg))
-        .await
-        .unwrap_or_else(|_| Vec::new());
-    let mut has_base = false;
-    let mut max_suffix: u32 = 0;
-
-    for entry in entries {
-        let e = basename(&entry);
-
-        if e == name {
-            has_base = true;
-            continue;
-        }
-        if let Some(rest) = e.strip_prefix(name) {
-            if let Some(suffix) = rest.strip_prefix('-') {
-                if let Ok(n) = suffix.parse::<u32>() {
-                    if n > max_suffix {
-                        max_suffix = n;
-                    }
-                }
-            }
-        }
-    }
-
-    if !has_base {
-        0
-    } else {
-        max_suffix.saturating_add(1).max(1)
-    }
+async fn compute_next_window_suffix_async(session_dir: &str, name: &str) -> u32 {
+    let _ = session_dir;
+    let _ = name;
+    0
 }
-async fn allocate_window_name_async(
-    session_dir: &str,
-    name: &str,
-    ncores: usize,
-    per_core_enabled: bool,
-) -> String {
-    let windows_avg = join_path2(&join_path2(session_dir, "avg"), "windows");
-
-    let mut reg = window_dir_registry().lock();
+async fn allocate_window_name_async(session_dir: &str, name: &str) -> String {
     let mut key = String::new();
     key.push_str(session_dir);
     key.push('|');
     key.push_str(name);
 
-    let suffix = match reg.get(&key).copied() {
-        Some(v) => v,
-        None => compute_next_window_suffix_async(&windows_avg, name).await,
+    let suffix_opt = {
+        let reg = window_dir_registry().lock();
+        reg.get(&key).copied()
     };
+
+    let mut suffix = match suffix_opt {
+        Some(v) => v,
+        None => compute_next_window_suffix_async(session_dir, name).await,
+    };
+
+    {
+        let mut reg = window_dir_registry().lock();
+        if let Some(registered_suffix) = reg.get(&key).copied() {
+            suffix = registered_suffix;
+        }
+        reg.insert(key, suffix.saturating_add(1));
+    }
 
     let window_dir = if suffix == 0 {
         name.to_string()
     } else {
         format!("{name}-{suffix}")
     };
-
-    reg.insert(key, suffix.saturating_add(1));
-    drop(reg);
-
-    let avg_win = join_path2(&windows_avg, &window_dir);
-    let _ = File::make_dir(&Path::from_string(&avg_win)).await;
-
-    if per_core_enabled {
-        for i in 0..ncores {
-            let core_windows = join_path2(
-                &join_path2(&join_path2(session_dir, "cores"), &format!("core-{i}")),
-                "windows",
-            );
-            let core_win = join_path2(&core_windows, &window_dir);
-            let _ = File::make_dir(&Path::from_string(&core_win)).await;
-        }
-    }
 
     window_dir
 }
@@ -691,18 +649,97 @@ fn window_path_for_target(
     target: usize,
     ncores: usize,
 ) -> String {
+    let window_root = join_path2(session_dir, window_dir);
     if target == ncores {
-        join_path2(
-            &join_path2(&join_path2(session_dir, "avg"), "windows"),
-            window_dir,
-        )
+        join_path2(&window_root, "avg")
     } else {
-        let base = join_path2(
-            &join_path2(&join_path2(session_dir, "cores"), &format!("core-{target}")),
-            "windows",
-        );
-        join_path2(&base, window_dir)
+        join_path2(&window_root, "core")
     }
+}
+
+fn window_file_name_for_target(run_id: u32, stream: &str, target: usize, ncores: usize) -> String {
+    if target == ncores {
+        format!("run_{run_id}_{stream}.csv")
+    } else {
+        format!("core-{target}_run_{run_id}_{stream}.csv")
+    }
+}
+
+fn archive_component(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+fn archive_target_component(target: usize, ncores: usize) -> String {
+    if target == ncores {
+        "avg".to_string()
+    } else {
+        format!("core/{target:03}")
+    }
+}
+
+fn archive_stream_entry_path(
+    window_dir: &str,
+    run_id: u32,
+    persist_id: u64,
+    chunk_idx: usize,
+    target: usize,
+    ncores: usize,
+    stream: &str,
+) -> String {
+    format!(
+        "windows/{}/runs/run_{:06}/persists/persist_{:06}/chunks/chunk_{:06}/{}/{}.csv",
+        archive_component(window_dir),
+        run_id,
+        persist_id,
+        chunk_idx,
+        archive_target_component(target, ncores),
+        stream
+    )
+}
+
+fn archive_manifest_entry_path(
+    window_dir: &str,
+    run_id: u32,
+    persist_id: u64,
+    name: &str,
+) -> String {
+    format!(
+        "windows/{}/runs/run_{:06}/persists/persist_{:06}/{}",
+        archive_component(window_dir),
+        run_id,
+        persist_id,
+        name
+    )
+}
+
+fn push_csv_archive_record(
+    records: &mut Vec<BenchArchiveRecord>,
+    path: String,
+    mut csv: String,
+    rows: String,
+    timestamp_ns: u64,
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    csv.push_str(&rows);
+    records.push(BenchArchiveRecord::data(
+        path,
+        csv.into_bytes(),
+        timestamp_ns,
+    ));
 }
 
 // ===== Export build (cursor-based; persist "clears" by advancing last_export_seq) =====
@@ -843,6 +880,109 @@ fn write_span_row(
         run_id, tag, object_id, start_core, start_ts, dur
     );
 }
+
+fn pdb_format_name(format: PePdbFormat) -> &'static str {
+    match format {
+        PePdbFormat::Pdb70 => "RSDS",
+        PePdbFormat::Pdb20 => "NB10",
+    }
+}
+
+fn pdb_guid_string(guid: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        guid[3],
+        guid[2],
+        guid[1],
+        guid[0],
+        guid[5],
+        guid[4],
+        guid[7],
+        guid[6],
+        guid[8],
+        guid[9],
+        guid[10],
+        guid[11],
+        guid[12],
+        guid[13],
+        guid[14],
+        guid[15]
+    )
+}
+
+fn pdb_info_json(pdb: Option<&PePdbInfo>) -> Value {
+    match pdb {
+        Some(pdb) => {
+            let guid = pdb.guid.map(|guid| pdb_guid_string(&guid));
+            let guid_bytes = pdb.guid.map(|guid| guid.to_vec());
+            json!({
+                "format": pdb_format_name(pdb.format),
+                "path": pdb.path.as_str(),
+                "age": pdb.age,
+                "guid": guid,
+                "guid_bytes": guid_bytes,
+                "signature": pdb.signature,
+                "codeview_offset": pdb.codeview_offset,
+            })
+        }
+        None => Value::Null,
+    }
+}
+
+fn build_krnl_debug_metadata_json(run_id: u32, start_ns: u64, to_ns: u64) -> Option<String> {
+    let program = PROGRAM_MANAGER.get(0)?;
+    let (program_title, program_path, modules) = {
+        let program = program.read();
+        let modules = program.modules.read().clone();
+        (
+            program.title.clone(),
+            program.image_path.to_string(),
+            modules,
+        )
+    };
+
+    let mut modules_json = Vec::with_capacity(modules.len());
+    for module in modules {
+        let module = module.read();
+        let pdb = module
+            .pe_info
+            .as_ref()
+            .and_then(|pe_info| pe_info.pdb.as_ref());
+        let pe = module.pe_info.as_ref();
+
+        modules_json.push(json!({
+            "name": module.title.as_str(),
+            "image_path": module.image_path.to_string(),
+            "image_base": format!("0x{:016x}", module.image_base.as_u64()),
+            "debug": pdb_info_json(pdb),
+            "pe": pe.map(|pe_info| json!({
+                "is_64": pe_info.is_64,
+                "is_dll": pe_info.is_dll,
+                "preferred_image_base": format!("0x{:016x}", pe_info.preferred_image_base),
+                "loaded_image_base": format!("0x{:016x}", pe_info.loaded_image_base.as_u64()),
+                "entry_rva": format!("0x{:x}", pe_info.entry_rva),
+                "size_of_image": pe_info.size_of_image,
+                "aslr": pe_info.aslr,
+                "relocated": pe_info.relocated,
+            })),
+        }));
+    }
+
+    let root = json!({
+        "run_id": run_id,
+        "start_ns": start_ns,
+        "to_ns": to_ns,
+        "program": {
+            "pid": 0u64,
+            "name": program_title,
+            "image_path": program_path,
+        },
+        "modules": modules_json,
+    });
+
+    serde_json::to_string_pretty(&root).ok()
+}
+
 pub async fn build_exports_for_window(
     cfg: &BenchWindowConfig,
     run_id: u32,
@@ -1163,7 +1303,8 @@ pub async fn build_exports_for_window(
 struct BenchWindowInner {
     cfg: BenchWindowConfig,
 
-    session_dir: String,
+    session_archive_path: String,
+    session_archive: Option<Arc<BenchArchive>>,
     window_dir: String,
     ncores: usize,
 
@@ -1185,10 +1326,17 @@ struct BenchWindowInner {
 }
 
 impl BenchWindowInner {
-    fn new(cfg: BenchWindowConfig, session_dir: String, window_dir: String, ncores: usize) -> Self {
+    fn new(
+        cfg: BenchWindowConfig,
+        session_archive_path: String,
+        session_archive: Option<Arc<BenchArchive>>,
+        window_dir: String,
+        ncores: usize,
+    ) -> Self {
         BenchWindowInner {
             cfg,
-            session_dir,
+            session_archive_path,
+            session_archive,
             window_dir,
             ncores,
             running: false,
@@ -1232,7 +1380,7 @@ pub struct BenchWindow {
 impl BenchWindow {
     pub fn new(cfg: BenchWindowConfig) -> Self {
         if !BENCH_ENABLED {
-            let inner = BenchWindowInner::new(cfg, String::new(), String::new(), 1);
+            let inner = BenchWindowInner::new(cfg, String::new(), None, String::new(), 1);
             return BenchWindow {
                 inner: Arc::new(Mutex::new(inner)),
                 init_state: Arc::new(AtomicU32::new(INIT_READY)),
@@ -1244,7 +1392,7 @@ impl BenchWindow {
         }
 
         let ncores = bench_ncores();
-        let inner = BenchWindowInner::new(cfg, String::new(), String::new(), ncores);
+        let inner = BenchWindowInner::new(cfg, String::new(), None, String::new(), ncores);
 
         BenchWindow {
             inner: Arc::new(Mutex::new(inner)),
@@ -1269,29 +1417,19 @@ impl BenchWindow {
             return false;
         }
 
-        let (folder, name, ncores, per_core_enabled) = {
+        let (folder, name) = {
             let inner = self.inner.lock();
-            (
-                inner.cfg.folder,
-                inner.cfg.name,
-                inner.ncores,
-                !inner.cfg.disable_per_core,
-            )
+            (inner.cfg.folder, inner.cfg.name)
         };
 
-        let session = ensure_session_async(folder, per_core_enabled).await;
-        let window_dir = allocate_window_name_async(
-            &session.session_dir,
-            name,
-            session.ncores,
-            per_core_enabled,
-        )
-        .await;
+        let session = ensure_session_async(folder).await;
+        let window_dir = allocate_window_name_async(&session.archive_path, name).await;
 
         {
             let mut inner = self.inner.lock();
-            if inner.session_dir.is_empty() {
-                inner.session_dir = session.session_dir;
+            if inner.session_archive_path.is_empty() {
+                inner.session_archive_path = session.archive_path;
+                inner.session_archive = Some(session.archive);
                 inner.window_dir = window_dir;
                 inner.ncores = session.ncores;
             }
@@ -1402,8 +1540,6 @@ impl BenchWindow {
     }
 
     pub async fn persist(&self) {
-        use alloc::sync::Arc;
-
         if !BENCH_ENABLED {
             return;
         }
@@ -1411,20 +1547,27 @@ impl BenchWindow {
             return;
         }
 
+        let session_archive = {
+            let inner = self.inner.lock();
+            match inner.session_archive.clone() {
+                Some(archive) => archive,
+                None => return,
+            }
+        };
+
+        let mut archive_persist = session_archive.begin_persist().await;
+        let persist_id = archive_persist.persist_id();
+
         let cfg: BenchWindowConfig;
         let run_id: u32;
         let start_ns: u64;
         let to_ns: u64;
 
-        let session_dir: String;
         let window_dir: String;
         let ncores: usize;
 
         let last_export_seq: Vec<u64>;
-        let mut samples_header_written: Vec<bool>;
         let mut samples_header_depth: Vec<usize>;
-        let mut spans_header_written: Vec<bool>;
-        let mut mem_header_written: Vec<bool>;
 
         let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>;
 
@@ -1443,15 +1586,11 @@ impl BenchWindow {
                 None => bench_now_ns(),
             };
 
-            session_dir = inner.session_dir.clone();
             window_dir = inner.window_dir.clone();
             ncores = inner.ncores;
 
             last_export_seq = inner.last_export_seq.clone();
-            samples_header_written = inner.samples_header_written.clone();
             samples_header_depth = inner.samples_header_depth.clone();
-            spans_header_written = inner.spans_header_written.clone();
-            mem_header_written = inner.mem_header_written.clone();
 
             open_spans = inner.open_spans.clone();
         }
@@ -1476,243 +1615,135 @@ impl BenchWindow {
             return;
         }
 
-        let exports = Arc::new(exports_vec);
-
-        #[derive(Clone, Copy)]
-        enum PersistStream {
-            Samples,
-            Spans,
-            Memory,
-        }
-
-        let mut joins = Vec::new();
-
-        if cfg.log_samples {
-            for target in 0..(ncores + 1) {
-                if cfg.disable_per_core && target != ncores {
-                    continue;
-                }
-
-                let ex = exports.clone();
-                let session_dir = session_dir.clone();
-                let window_dir = window_dir.clone();
-                let mut header_written = samples_header_written[target];
-                let old_header_depth = samples_header_depth[target];
-                let header_depth = ex
-                    .iter()
-                    .map(|b| b.samples_depth[target])
-                    .max()
-                    .unwrap_or(old_header_depth)
-                    .max(old_header_depth);
-
-                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
-                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                    let file_name = format!("run_{run_id}_samples.csv");
-
-                    if header_written && header_depth > old_header_depth {
-                        if rewrite_sample_csv_header(
-                            &path,
-                            &file_name,
-                            old_header_depth,
-                            header_depth,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            return (
-                                false,
-                                PersistStream::Samples,
-                                target,
-                                header_written,
-                                old_header_depth,
-                            );
-                        }
-                    }
-
-                    for b in ex.iter() {
-                        let rows = &b.samples_rows[target];
-                        if rows.is_empty() {
-                            continue;
-                        }
-
-                        if !header_written {
-                            let mut csv = String::new();
-                            write_sample_header(&mut csv, header_depth);
-                            csv.push_str(rows);
-                            if append_named_file(&path, &file_name, csv.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (
-                                    false,
-                                    PersistStream::Samples,
-                                    target,
-                                    header_written,
-                                    old_header_depth,
-                                );
-                            }
-                            header_written = true;
-                        } else if append_named_file(&path, &file_name, rows.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return (
-                                false,
-                                PersistStream::Samples,
-                                target,
-                                header_written,
-                                old_header_depth,
-                            );
-                        }
-                    }
-
-                    (
-                        true,
-                        PersistStream::Samples,
-                        target,
-                        header_written,
-                        header_depth,
-                    )
-                }));
-            }
-        }
-
-        if cfg.log_spans {
-            let header: &'static str = "run_id,tag,object_id,core,start_ns,duration_ns\n";
-
-            for target in 0..(ncores + 1) {
-                if cfg.disable_per_core && target != ncores {
-                    continue;
-                }
-
-                let ex = exports.clone();
-                let session_dir = session_dir.clone();
-                let window_dir = window_dir.clone();
-                let mut header_written = spans_header_written[target];
-
-                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
-                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                    let file_name = format!("run_{run_id}_spans.csv");
-
-                    for b in ex.iter() {
-                        let rows = &b.spans_rows[target];
-                        if rows.is_empty() {
-                            continue;
-                        }
-
-                        if !header_written {
-                            let mut csv = String::new();
-                            csv.push_str(header);
-                            csv.push_str(rows);
-                            if append_named_file(&path, &file_name, csv.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (false, PersistStream::Spans, target, header_written, 0);
-                            }
-                            header_written = true;
-                        } else if append_named_file(&path, &file_name, rows.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return (false, PersistStream::Spans, target, header_written, 0);
-                        }
-                    }
-
-                    (true, PersistStream::Spans, target, header_written, 0)
-                }));
-            }
-        }
-
-        if cfg.log_mem_on_persist {
-            let header: &'static str = "run_id,timestamp_ns,core,used_bytes,total_bytes,heap_used_bytes,heap_total_bytes,core_sched_ns,core_switches\n";
-
-            for target in 0..(ncores + 1) {
-                if cfg.disable_per_core && target != ncores {
-                    continue;
-                }
-
-                let ex = exports.clone();
-                let session_dir = session_dir.clone();
-                let window_dir = window_dir.clone();
-                let mut header_written = mem_header_written[target];
-
-                joins.push(crate::scheduling::runtime::runtime::spawn(async move {
-                    let path = window_path_for_target(&session_dir, &window_dir, target, ncores);
-                    let file_name = format!("run_{run_id}_memory.csv");
-
-                    for b in ex.iter() {
-                        let rows = &b.mem_rows[target];
-                        if rows.is_empty() {
-                            continue;
-                        }
-
-                        if !header_written {
-                            let mut csv = String::new();
-                            csv.push_str(header);
-                            csv.push_str(rows);
-                            if append_named_file(&path, &file_name, csv.as_bytes())
-                                .await
-                                .is_err()
-                            {
-                                return (false, PersistStream::Memory, target, header_written, 0);
-                            }
-                            header_written = true;
-                        } else if append_named_file(&path, &file_name, rows.as_bytes())
-                            .await
-                            .is_err()
-                        {
-                            return (false, PersistStream::Memory, target, header_written, 0);
-                        }
-                    }
-
-                    (true, PersistStream::Memory, target, header_written, 0)
-                }));
-            }
-        }
-
-        let mut ok = true;
-        let results = JoinAll::new(joins).await;
-
-        for (this_ok, stream, target, header_written, header_depth) in results {
-            if !this_ok {
-                ok = false;
-                continue;
-            }
-
-            match stream {
-                PersistStream::Samples => {
-                    samples_header_written[target] = header_written;
-                    samples_header_depth[target] = header_depth;
-                }
-                PersistStream::Spans => {
-                    spans_header_written[target] = header_written;
-                }
-                PersistStream::Memory => {
-                    mem_header_written[target] = header_written;
-                }
-            }
-        }
-
-        if !ok {
-            return;
-        }
-
+        let mut records: Vec<BenchArchiveRecord> = Vec::new();
         let mut merged_max_seq = vec![0u64; ncores];
-        for b in exports.iter() {
+
+        if cfg.export_debug_metadata {
+            if let Some(json) = build_krnl_debug_metadata_json(run_id, start_ns, to_ns) {
+                let path = archive_manifest_entry_path(
+                    &window_dir,
+                    run_id,
+                    persist_id,
+                    "debug_metadata.json",
+                );
+                records.push(BenchArchiveRecord::manifest(
+                    path,
+                    json.into_bytes(),
+                    bench_now_ns(),
+                ));
+            }
+        }
+
+        for (chunk_idx, mut b) in exports_vec.into_iter().enumerate() {
             for i in 0..ncores {
                 let s = b.max_seq_seen[i];
                 if s > merged_max_seq[i] {
                     merged_max_seq[i] = s;
                 }
             }
+
+            for target in 0..(ncores + 1) {
+                if cfg.disable_per_core && target != ncores {
+                    continue;
+                }
+
+                if cfg.log_samples {
+                    samples_header_depth[target] =
+                        samples_header_depth[target].max(b.samples_depth[target]);
+
+                    let rows = core::mem::take(&mut b.samples_rows[target]);
+                    if !rows.is_empty() {
+                        let path = archive_stream_entry_path(
+                            &window_dir,
+                            run_id,
+                            persist_id,
+                            chunk_idx,
+                            target,
+                            ncores,
+                            "samples",
+                        );
+                        let mut csv = String::new();
+                        write_sample_header(&mut csv, b.samples_depth[target]);
+                        push_csv_archive_record(&mut records, path, csv, rows, bench_now_ns());
+                    }
+                }
+
+                if cfg.log_spans {
+                    let rows = core::mem::take(&mut b.spans_rows[target]);
+                    if !rows.is_empty() {
+                        let path = archive_stream_entry_path(
+                            &window_dir,
+                            run_id,
+                            persist_id,
+                            chunk_idx,
+                            target,
+                            ncores,
+                            "spans",
+                        );
+                        let csv = "run_id,tag,object_id,core,start_ns,duration_ns\n".to_string();
+                        push_csv_archive_record(&mut records, path, csv, rows, bench_now_ns());
+                    }
+                }
+
+                if cfg.log_mem_on_persist {
+                    let rows = core::mem::take(&mut b.mem_rows[target]);
+                    if !rows.is_empty() {
+                        let path = archive_stream_entry_path(
+                            &window_dir,
+                            run_id,
+                            persist_id,
+                            chunk_idx,
+                            target,
+                            ncores,
+                            "memory",
+                        );
+                        let csv = "run_id,timestamp_ns,core,used_bytes,total_bytes,heap_used_bytes,heap_total_bytes,core_sched_ns,core_switches\n".to_string();
+                        push_csv_archive_record(&mut records, path, csv, rows, bench_now_ns());
+                    }
+                }
+            }
+        }
+
+        if records.is_empty() {
+            let mut inner = self.inner.lock();
+            inner.samples_header_depth = samples_header_depth;
+            inner.open_spans = open_spans;
+            for i in 0..ncores {
+                let max_seq = merged_max_seq[i];
+                if max_seq != 0 && max_seq > inner.last_export_seq[i] {
+                    inner.last_export_seq[i] = max_seq;
+                }
+            }
+            return;
+        }
+
+        let data_record_count = records.len();
+        let commit = json!({
+            "schema": "rustos.benchpack.persist.v1",
+            "persist_id": persist_id,
+            "window": window_dir.as_str(),
+            "run_id": run_id,
+            "start_ns": start_ns,
+            "to_ns": to_ns,
+            "ncores": ncores,
+            "disable_per_core": cfg.disable_per_core,
+            "log_samples": cfg.log_samples,
+            "log_spans": cfg.log_spans,
+            "log_mem_on_persist": cfg.log_mem_on_persist,
+            "data_record_count": data_record_count,
+        });
+        records.push(BenchArchiveRecord::persist_commit(
+            archive_manifest_entry_path(&window_dir, run_id, persist_id, "persist_commit.json"),
+            commit.to_string().into_bytes(),
+            bench_now_ns(),
+        ));
+
+        if archive_persist.append_records(&records).await.is_err() {
+            return;
         }
 
         let mut inner = self.inner.lock();
-        inner.samples_header_written = samples_header_written;
         inner.samples_header_depth = samples_header_depth;
-        inner.spans_header_written = spans_header_written;
-        inner.mem_header_written = mem_header_written;
 
         inner.open_spans = open_spans;
 
@@ -1792,6 +1823,26 @@ pub async fn append_named_file(path: &str, file_name: &str, data: &[u8]) -> Resu
     }
 
     file.append(data).await.map_err(|_| ())?;
+    let _ = file.close().await;
+    Ok(())
+}
+
+pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Result<(), ()> {
+    let dir_path = Path::from_string(path);
+    let _ = File::make_dir(&dir_path).await;
+
+    let file_path = Path::from_string(&format!("{path}\\{file_name}"));
+
+    let mut file = match File::open(&file_path, &[OpenFlags::Create, OpenFlags::WriteThrough]).await
+    {
+        Ok(f) => f,
+        Err(_) => File::open(&file_path, &[OpenFlags::Open, OpenFlags::WriteThrough])
+            .await
+            .map_err(|_| ())?,
+    };
+
+    file.set_len(0).await.map_err(|_| ())?;
+    file.write(data).await.map_err(|_| ())?;
     let _ = file.close().await;
     Ok(())
 }
@@ -2330,7 +2381,7 @@ const DISK_BENCH_FILE: &str = "io_bench.bin";
 const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
-    // 64 * 1024,
+    //64 * 1024,
     // 512 * 1024,
     // 1024 * 1024,
     // 2 * 1024 * 1024,

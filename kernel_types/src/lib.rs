@@ -13,6 +13,7 @@ extern crate self as kernel_types;
 
 pub mod async_ffi;
 pub mod async_types;
+pub mod bench_archive;
 pub mod benchmark;
 pub mod device;
 pub mod dma;

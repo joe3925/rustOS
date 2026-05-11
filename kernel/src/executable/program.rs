@@ -7,7 +7,7 @@ use alloc::{
     sync::Arc,
     vec::Vec,
 };
-use kernel_types::{device::ModuleHandle, fs::Path, status::PageMapError};
+use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
 use lazy_static::lazy_static;
 use spin::{Mutex, RwLock};
 use x86_64::{
@@ -150,6 +150,7 @@ pub struct Program {
     pub image_path: Path,
     pub pid: u64,
     pub image_base: VirtAddr,
+    pub pe_info: Option<PeInfo>,
     pub main_thread: Option<TaskHandle>,
     pub managed_threads: Mutex<Vec<TaskHandle>>,
     pub modules: RwLock<Vec<ModuleHandle>>,
@@ -179,6 +180,7 @@ impl Program {
             image_path,
             pid: 0,
             image_base,
+            pe_info: None,
             main_thread: None,
             managed_threads: Mutex::new(Vec::new()),
             modules: RwLock::new(Vec::new()),

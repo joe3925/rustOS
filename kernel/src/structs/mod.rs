@@ -1,4 +1,5 @@
 pub(crate) mod aligned_buffer;
+pub mod bench_archive;
 pub mod channel;
 pub mod condvar;
 pub(crate) mod linked_list;

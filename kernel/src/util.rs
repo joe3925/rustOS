@@ -72,6 +72,7 @@ lazy_static! {
         log_samples: true,
         log_spans: false,
         log_mem_on_persist: false,
+        export_debug_metadata: true,
         end_on_drop: false,
         timeout_ms: None,
         auto_persist_secs: None,
@@ -186,6 +187,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
         parent_pid: 0,
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
         symbols: EXPORTS.to_vec(),
+        pe_info: None,
     }))]);
     let _pid = PROGRAM_MANAGER.add_program(program);
 
