@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 use kernel_types::device::DeviceObject;
 pub use kernel_types::dma;
 use kernel_types::dma::{
-    DmaMapError, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferDirection, IoBufferInner,
-    MappableIoBufferState,
+    BorrowedDmaMapping, DmaMapError, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferDirection,
+    IoBufferInner, MappableIoBufferState,
 };
 use kernel_types::status::DriverStatus;
 
@@ -44,4 +44,12 @@ pub fn unmap_buffer<'a, S: MappableIoBufferState, D: IoBufferDirection>(
     IoBuffer::<'a, S, D>::from_inner(unsafe {
         kernel_sys::kernel_dma_unmap_buffer(raw_buffer)
     })
+}
+
+pub fn map_buffer_ref<'map, 'buffer, S: MappableIoBufferState, D: IoBufferDirection>(
+    device: &Arc<DeviceObject>,
+    buffer: &'map IoBuffer<'buffer, S, D>,
+    strategy: DmaMappingStrategy,
+) -> Result<BorrowedDmaMapping<'map>, DmaMapError> {
+    unsafe { kernel_sys::kernel_dma_map_buffer_ref(device, buffer.as_inner(), strategy) }
 }

@@ -67,18 +67,10 @@ const ATA_SR_ERR: u8 = 1 << 0;
 const TIMEOUT_MS: u64 = 10000;
 
 fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
-    {
-        let mut w = req.write();
-        w.status = status.clone();
-    }
     DriverStep::complete(status)
 }
 
 fn continue_req(req: &mut RequestHandle) -> DriverStep {
-    {
-        let mut w = req.write();
-        w.status = DriverStatus::ContinueStep;
-    }
     DriverStep::Continue
 }
 

@@ -189,6 +189,15 @@ pub extern "win64" fn kernel_dma_unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> 
     dma::unmap_buffer(buffer)
 }
 
+#[unsafe(no_mangle)]
+pub extern "win64" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
+    device: &Arc<DeviceObject>,
+    buffer: &'map IoBufferInner<'buffer>,
+    strategy: DmaMappingStrategy,
+) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError> {
+    dma::map_buffer_ref(device, buffer, strategy)
+}
+
 #[no_mangle]
 pub extern "win64" fn kernel_apic_cpu_ids() -> Vec<u8> {
     interrupt_index::apic_logical_ids()

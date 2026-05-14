@@ -95,6 +95,11 @@ unsafe extern "win64" {
         strategy: DmaMappingStrategy,
     ) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)>;
     pub fn kernel_dma_unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a>;
+    pub fn kernel_dma_map_buffer_ref<'map, 'buffer>(
+        device: &Arc<DeviceObject>,
+        buffer: &'map IoBufferInner<'buffer>,
+        strategy: DmaMappingStrategy,
+    ) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError>;
 
     // Paging / VMM
     pub fn allocate_auto_kernel_range_mapped(
