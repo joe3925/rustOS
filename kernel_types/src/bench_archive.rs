@@ -58,13 +58,13 @@
 //! If a session creates more than one window with the same name, later windows
 //! may receive a numeric suffix such as `drive-1`.
 //!
-//! Per-persist CSV chunks are written as data records:
+//! Per-persist stream chunks are written as data records:
 //!
 //! ```text
-//! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/avg/samples.csv
+//! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/avg/samples.pb
 //! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/avg/spans.csv
 //! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/avg/memory.csv
-//! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/core/000/samples.csv
+//! windows/<window>/runs/run_000001/persists/persist_000001/chunks/chunk_000000/core/000/samples.pb
 //! ```
 //!
 //! Debug metadata, when enabled, is written as a manifest record:
@@ -82,18 +82,14 @@
 //! A reader should treat data and manifest records as usable only after the
 //! matching persist-commit record has been seen and validated.
 //!
-//! # CSV Payloads
+//! # Stream Payloads
 //!
-//! `samples.csv` records contain:
+//! `samples.pb` records contain a `BenchSampleChunkProto` protobuf message from
+//! `kernel_types::benchmark`. The message contains sampled RIPs, stack unwind
+//! frames, frame-kind tags, CPU/core IDs, timestamps, task IDs, unwind status
+//! bits, stack bounds, and per-core dropped sample counters.
 //!
-//! ```text
-//! run_id,timestamp_ns,core,rip,depth,frame0,frame1,...
-//! ```
-//!
-//! The number of `frameN` columns may differ across chunks. Parse each chunk by
-//! its own header before combining samples.
-//!
-//! `spans.csv` records contain:
+//! CSV records are still used for spans and memory:
 //!
 //! ```text
 //! run_id,tag,object_id,core,start_ns,duration_ns
@@ -128,10 +124,10 @@
 //! To list windows, collect the `<window>` component from committed records whose
 //! paths start with `windows/`.
 //!
-//! To export the CSVs for one window, filter committed records with the
-//! `windows/<window>/` prefix, then collect `samples.csv`, `spans.csv`, and
+//! To export streams for one window, filter committed records with the
+//! `windows/<window>/` prefix, then collect `samples.pb`, `spans.csv`, and
 //! `memory.csv` records. Sort by run id, persist id, chunk id, and record
-//! sequence before concatenating or loading into a table.
+//! sequence before decoding or loading into a table.
 //!
 //! To read debug metadata for one window, filter committed manifest records with
 //! the `windows/<window>/` prefix whose path ends in `/debug_metadata.json`.

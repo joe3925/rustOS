@@ -4,6 +4,7 @@ use core::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use crate::file_system::file::File;
 use crate::memory::paging::tables::new_user_mode_page_table;
 use crate::println;
+use crate::profiling::unwind::register_pe_unwind_module;
 use crate::scheduling::task::Task;
 use crate::structs::range_tracker::RangeTracker;
 use crate::structs::stopwatch::Stopwatch;
@@ -157,6 +158,7 @@ impl PELoader {
         let base = self.current_base.as_u64();
         let relocated = base != preferred_base;
         let pe_info = self.collect_pe_info(relocated)?;
+        register_pe_unwind_module(base, image_size, &pe_info.sections);
         let title = self.path.file_name().unwrap_or("unknown").to_string();
         println!(
             "DBG: Loaded DLL '{}' at VMM Range: {:#x} - {:#x} (Size: {:#x}) PDB at: {}",

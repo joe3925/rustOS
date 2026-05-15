@@ -1,4 +1,4 @@
-use crate::benchmarking::bench_submit_rip_sample_current_core;
+use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
 
 use crate::drivers::interrupt_index::{current_cpu_id, send_eoi_timer};
@@ -37,9 +37,7 @@ pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
     let _fpu_guard = KernelFpuGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();
-    let sample_rip = unsafe { (*state).rip };
-
-    bench_submit_rip_sample_current_core(sample_rip);
+    bench_submit_interrupt_sample_current_core(unsafe { &*state });
 
     let sw = Stopwatch::start();
     SCHEDULER.on_timer_tick(state, cpu_id);

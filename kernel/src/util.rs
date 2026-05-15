@@ -78,6 +78,10 @@ lazy_static! {
         auto_persist_secs: None,
         sample_reserve: 256,
         span_reserve: 256,
+        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::PauseFlushCompactTime),
+        sample_capacity: None,
+        sample_chunk_capacity: None,
+        max_unwind_depth: None,
         disable_per_core: true
     });
 }

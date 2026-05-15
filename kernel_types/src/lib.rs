@@ -11,6 +11,8 @@
 extern crate alloc;
 extern crate self as kernel_types;
 
+pub use prost::Message as ProstMessage;
+
 pub mod async_ffi;
 pub mod async_types;
 pub mod bench_archive;
