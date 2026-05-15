@@ -46,3 +46,15 @@ pub struct Stopwatch {
     start_cycles: u64,
     tsc_hz: u64,
 }
+
+impl Stopwatch {
+    #[inline(always)]
+    pub fn start_cycles(&self) -> u64 {
+        self.start_cycles
+    }
+
+    #[inline(always)]
+    pub fn tsc_hz(&self) -> u64 {
+        self.tsc_hz
+    }
+}
