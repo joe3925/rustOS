@@ -119,7 +119,12 @@ pub struct RequestPayloadRawParts {
 
 pub unsafe trait RequestPayload<'data>: Send + 'data {
     /// Stable runtime tag for matching this payload type. Either impl or use type_tag::<T>()
-    extern "win64" fn runtime_tag() -> u64;
+    const RUNTIME_TAG: u64;
+
+    #[inline]
+    extern "win64" fn runtime_tag() -> u64 {
+        Self::RUNTIME_TAG
+    }
 
     /// Static byte size for nominal sized payloads.
     #[inline]
@@ -271,10 +276,7 @@ unsafe extern "win64" fn no_payload_can_into(
 macro_rules! impl_nominal_request_payload {
     ($ty:path) => {
         unsafe impl<'data> RequestPayload<'data> for $ty {
-            #[inline]
-            extern "win64" fn runtime_tag() -> u64 {
-                type_tag::<Self>()
-            }
+            const RUNTIME_TAG: u64 = type_tag::<Self>();
 
             #[inline]
             extern "win64" fn static_size() -> Option<usize> {
@@ -317,10 +319,7 @@ macro_rules! impl_nominal_request_payload {
 }
 
 unsafe impl<'data> RequestPayload<'data> for [u8] {
-    #[inline]
-    extern "win64" fn runtime_tag() -> u64 {
-        type_tag::<[u8]>()
-    }
+    const RUNTIME_TAG: u64 = type_tag::<[u8]>();
 
     #[inline]
     extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
@@ -352,10 +351,7 @@ unsafe impl<'data> RequestPayload<'data> for [u8] {
 }
 
 unsafe impl<'data> RequestPayload<'data> for str {
-    #[inline]
-    extern "win64" fn runtime_tag() -> u64 {
-        type_tag::<str>()
-    }
+    const RUNTIME_TAG: u64 = type_tag::<str>();
 
     #[inline]
     extern "win64" fn shared_raw_parts(payload: &Self) -> RequestPayloadRawParts {
@@ -688,7 +684,7 @@ impl<'data> RequestData<'data> {
             data_ptr: parts.data,
             metadata: parts.metadata,
             heap_layout: Layout::new::<()>(),
-            tag: Some(T::runtime_tag()),
+            tag: Some(T::RUNTIME_TAG),
             shared_viewer: T::shared_view_raw_parts,
             mut_viewer: T::mut_view_raw_parts,
             can_into_converter: T::can_into_request_data,
@@ -716,7 +712,7 @@ impl<'data> RequestData<'data> {
                 data_ptr: null_mut(),
                 metadata: 0,
                 heap_layout: Layout::new::<()>(),
-                tag: Some(T::runtime_tag()),
+                tag: Some(T::RUNTIME_TAG),
                 shared_viewer: T::shared_view_raw_parts,
                 mut_viewer: T::mut_view_raw_parts,
                 can_into_converter: T::can_into_request_data,
@@ -751,7 +747,7 @@ impl<'data> RequestData<'data> {
                 data_ptr: ptr,
                 metadata: 0,
                 heap_layout: layout,
-                tag: Some(T::runtime_tag()),
+                tag: Some(T::RUNTIME_TAG),
                 shared_viewer: T::shared_view_raw_parts,
                 mut_viewer: T::mut_view_raw_parts,
                 can_into_converter: T::can_into_request_data,
@@ -784,7 +780,7 @@ impl<'data> RequestData<'data> {
     }
 
     fn matches<T: RequestPayload<'data> + ?Sized>(&self) -> bool {
-        if self.tag != Some(T::runtime_tag()) {
+        if self.tag != Some(T::RUNTIME_TAG) {
             return false;
         }
 
@@ -812,7 +808,7 @@ impl<'data> RequestData<'data> {
             return Some(unsafe { T::shared_from_raw_parts(parts) });
         }
 
-        let target_parts = unsafe { (self.shared_viewer)(T::runtime_tag(), parts) }?;
+        let target_parts = unsafe { (self.shared_viewer)(T::RUNTIME_TAG, parts) }?;
         if target_parts.data.is_null() || !Self::matches_static_size::<T>(target_parts.bytes) {
             return None;
         }
@@ -839,7 +835,7 @@ impl<'data> RequestData<'data> {
             return Some(unsafe { T::mut_from_raw_parts(parts) });
         }
 
-        let target_parts = unsafe { (self.mut_viewer)(T::runtime_tag(), parts) }?;
+        let target_parts = unsafe { (self.mut_viewer)(T::RUNTIME_TAG, parts) }?;
         if target_parts.data.is_null() || !Self::matches_static_size::<T>(target_parts.bytes) {
             return None;
         }
@@ -905,14 +901,14 @@ impl<'data> RequestData<'data> {
     fn convert_then_take<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {
         let parts = self.raw_parts();
 
-        if unsafe { !(self.can_into_converter)(T::runtime_tag(), parts) } {
+        if unsafe { !(self.can_into_converter)(T::RUNTIME_TAG, parts) } {
             return Err(RequestDataError::ConversionUnavailable);
         }
 
         let mut converted = MaybeUninit::<RequestData<'data>>::uninit();
 
         let did_convert =
-            unsafe { (self.into_converter)(T::runtime_tag(), parts, converted.as_mut_ptr()) };
+            unsafe { (self.into_converter)(T::RUNTIME_TAG, parts, converted.as_mut_ptr()) };
 
         if !did_convert {
             return Err(RequestDataError::ConversionFailed);
@@ -960,7 +956,7 @@ impl<'data> RequestData<'data> {
             return false;
         }
 
-        unsafe { (self.can_into_converter)(T::runtime_tag(), parts) }
+        unsafe { (self.can_into_converter)(T::RUNTIME_TAG, parts) }
     }
 
     pub fn require<T: RequestPayload<'data>>(&mut self) -> Result<T, RequestDataError> {

@@ -417,8 +417,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
             //bench_async_vs_sync_call_latency_async().await;
             DRIVE_WINDOW.start();
             //loop {
-                bench_c_drive_io_async().await;
-                //}
+            bench_c_drive_io_async().await;
+            //wait_duration(Duration::from_secs(10));
+            //}
             DRIVE_WINDOW.stop_and_persist().await;
             //run_virtio_bench_matrix_print().await;
 

@@ -221,4 +221,14 @@ impl KernelStopwatch {
     pub fn elapsed(&self) -> Duration {
         unsafe { elapsed(&self.inner) }
     }
+
+    #[inline(always)]
+    pub fn start_cycles(&self) -> u64 {
+        self.inner.start_cycles()
+    }
+
+    #[inline(always)]
+    pub fn tsc_hz(&self) -> u64 {
+        self.inner.tsc_hz()
+    }
 }

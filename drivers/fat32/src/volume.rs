@@ -544,6 +544,7 @@ async fn execute_fs_work(
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
             };
+            flush_owner_blocking(&vdx, owner);
             req.write().set_data_t(FsCreateResult { error: err });
             DriverStatus::Success
         }

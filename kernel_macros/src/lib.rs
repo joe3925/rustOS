@@ -348,7 +348,7 @@ fn request_view_case_items(
                 parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> ::core::option::Option<::kernel_types::request::RequestPayloadRawParts> {
                 if target_tag
-                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
+                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::RUNTIME_TAG
                 {
                     return ::core::option::Option::None;
                 }
@@ -456,7 +456,7 @@ fn request_into_case_items(
                 target_tag: u64,
                 _parts: ::kernel_types::request::RequestPayloadRawParts,
             ) -> bool {
-                target_tag == <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
+                target_tag == <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::RUNTIME_TAG
             }
 
             #[inline]
@@ -466,7 +466,7 @@ fn request_into_case_items(
                 out: *mut ::kernel_types::request::RequestData<'__request_payload_data>,
             ) -> bool {
                 if target_tag
-                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::runtime_tag()
+                    != <#target as ::kernel_types::request::RequestPayload<'__request_payload_data>>::RUNTIME_TAG
                 {
                     return false;
                 }
@@ -721,10 +721,7 @@ pub fn derive_request_payload(input: TokenStream) -> TokenStream {
         unsafe impl #impl_generics_with_data ::kernel_types::request::RequestPayload<'__request_payload_data>
             for #ident #ty_generics #where_clause_with_data
         {
-            #[inline]
-            extern "win64" fn runtime_tag() -> u64 {
-                ::kernel_types::request::type_tag::<Self>()
-            }
+            const RUNTIME_TAG: u64 = ::kernel_types::request::type_tag::<Self>();
 
             #[inline]
             extern "win64" fn static_size() -> ::core::option::Option<usize> {

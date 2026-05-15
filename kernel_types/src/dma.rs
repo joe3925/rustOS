@@ -270,6 +270,60 @@ struct DmaDropContext {
     cookie: usize,
 }
 
+#[repr(C)]
+pub struct BorrowedDmaMapping<'a> {
+    segments: [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
+    segments_len: usize,
+    dma_drop: Option<DmaDropContext>,
+    _borrow: PhantomData<&'a ()>,
+}
+
+impl<'a> BorrowedDmaMapping<'a> {
+    pub fn new(
+        segments: &[IoBufferDmaSegment],
+        mapped_by: Arc<DeviceObject>,
+        unmap: DmaUnmapFn,
+        cookie: usize,
+    ) -> Result<Self, IoBufferError> {
+        if segments.len() > IOBUFFER_INLINE_SEGMENT_CAPACITY {
+            return Err(IoBufferError::SegmentCapacityExceeded {
+                required: segments.len(),
+                capacity: IOBUFFER_INLINE_SEGMENT_CAPACITY,
+            });
+        }
+
+        let mut inline = [EMPTY_DMA_SEGMENT; IOBUFFER_INLINE_SEGMENT_CAPACITY];
+        inline[..segments.len()].copy_from_slice(segments);
+
+        Ok(Self {
+            segments: inline,
+            segments_len: segments.len(),
+            dma_drop: Some(DmaDropContext {
+                mapped_by,
+                unmap,
+                cookie,
+            }),
+            _borrow: PhantomData,
+        })
+    }
+
+    pub fn segments(&self) -> &[IoBufferDmaSegment] {
+        &self.segments[..self.segments_len]
+    }
+
+    pub fn dma_segments(&self) -> core::iter::Copied<core::slice::Iter<'_, IoBufferDmaSegment>> {
+        self.segments().iter().copied()
+    }
+}
+
+impl Drop for BorrowedDmaMapping<'_> {
+    fn drop(&mut self) {
+        if let Some(drop_ctx) = self.dma_drop.take() {
+            (drop_ctx.unmap)(&drop_ctx.mapped_by, drop_ctx.cookie);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct VirtualFrameTranslation {
     phys_addr: u64,
@@ -1391,6 +1445,10 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
     pub fn into_inner(self) -> IoBufferInner<'a> {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
+    }
+
+    pub fn as_inner(&self) -> &IoBufferInner<'a> {
+        &self.inner
     }
 
     fn cast_state<NextState: IoBufferState>(self) -> IoBuffer<'a, NextState, Direction> {
