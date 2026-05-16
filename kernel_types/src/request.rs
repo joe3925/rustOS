@@ -1078,6 +1078,8 @@ pub struct Request<'data> {
     pub pnp: Option<PnpRequest<'data>>,
     pub completion_routine: Option<CompletionRoutine<'data>>,
     pub completion_context: usize,
+    completion_is_chain: bool,
+    completion_chain: Option<Vec<CompletionEntry<'data>>>,
 }
 
 impl<'data> Request<'data> {
@@ -1096,6 +1098,8 @@ impl<'data> Request<'data> {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+            completion_is_chain: false,
+            completion_chain: None,
         }
     }
 
@@ -1111,6 +1115,8 @@ impl<'data> Request<'data> {
             pnp: Some(pnp_request),
             completion_routine: None,
             completion_context: 0,
+            completion_is_chain: false,
+            completion_chain: None,
         }
     }
 
@@ -1188,6 +1194,8 @@ impl<'data> Request<'data> {
             pnp: None,
             completion_routine: None,
             completion_context: 0,
+            completion_is_chain: false,
+            completion_chain: None,
         }
     }
 
@@ -1196,48 +1204,60 @@ impl<'data> Request<'data> {
             None => {
                 self.completion_routine = Some(func);
                 self.completion_context = ctx;
+                self.completion_is_chain = false;
             }
             Some(prev) => {
                 let prev_ctx = self.completion_context;
-                let chain_ctx = store_prev_and_new(prev, prev_ctx, func, ctx);
+                let mut chain = Vec::with_capacity(
+                    self.completion_chain
+                        .as_ref()
+                        .map_or(2, |existing| existing.len() + 1),
+                );
+                chain.push((func, ctx)); // newest first
+
+                if self.completion_is_chain {
+                    if let Some(previous) = self.completion_chain.take() {
+                        chain.extend(previous.iter().copied());
+                    } else {
+                        chain.push((prev, prev_ctx));
+                    }
+                } else {
+                    chain.push((prev, prev_ctx));
+                }
+
                 self.completion_routine = Some(chained_completion);
-                self.completion_context = chain_ctx;
+                self.completion_context = 0;
+                self.completion_is_chain = true;
+                self.completion_chain = Some(chain);
             }
         }
     }
+
+    pub fn complete(&mut self) -> DriverStatus {
+        if self.completed {
+            return self.status.clone();
+        }
+
+        if let Some(fp) = self.completion_routine.take() {
+            let context = self.completion_context;
+            self.status = fp(&mut *self, context);
+        }
+
+        if self.status == DriverStatus::ContinueStep {
+            self.status = DriverStatus::Success;
+        }
+
+        self.completed = true;
+        self.completion_context = 0;
+        self.completion_is_chain = false;
+        self.completion_chain = None;
+
+        self.status.clone()
+    }
+
     #[inline]
     fn complete_for_drop(&mut self) {
-        let should_drop_chain_ctx = {
-            if self.completed {
-                return;
-            }
-
-            let mut drop_chain = false;
-
-            if let Some(fp) = self.completion_routine.take() {
-                drop_chain =
-                    fp as usize == chained_completion as usize && self.completion_context != 0;
-                let f: CompletionRoutine<'data> = unsafe { core::mem::transmute(fp) };
-                let context = self.completion_context;
-                self.status = f(&mut *self, context);
-            }
-
-            if self.status == DriverStatus::ContinueStep {
-                self.status = DriverStatus::Success;
-            }
-
-            self.completed = true;
-            drop_chain.then_some(self.completion_context)
-        };
-
-        if let Some(ctx) = should_drop_chain_ctx {
-            unsafe {
-                drop(alloc::sync::Arc::from_raw(
-                    ctx as *const alloc::vec::Vec<CompletionEntry<'data>>,
-                ));
-            }
-            self.completion_context = 0;
-        }
+        let _ = self.complete();
     }
 }
 impl<'data> Drop for Request<'data> {
@@ -1247,35 +1267,14 @@ impl<'data> Drop for Request<'data> {
 }
 type CompletionEntry<'data> = (CompletionRoutine<'data>, usize);
 
-fn store_prev_and_new<'data>(
-    prev: CompletionRoutine<'data>,
-    prev_ctx: usize,
-    next: CompletionRoutine<'data>,
-    next_ctx: usize,
-) -> usize {
-    let mut entries: alloc::vec::Vec<CompletionEntry<'data>> = alloc::vec::Vec::with_capacity(2);
-    entries.push((next, next_ctx)); // newest first
-    entries.push((prev, prev_ctx));
-    let arc: alloc::sync::Arc<alloc::vec::Vec<CompletionEntry<'data>>> =
-        alloc::sync::Arc::new(entries);
-    alloc::sync::Arc::into_raw(arc) as usize
-}
-
-extern "win64" fn chained_completion(req: &mut Request<'_>, ctx: usize) -> DriverStatus {
-    if ctx == 0 {
+extern "win64" fn chained_completion(req: &mut Request<'_>, _ctx: usize) -> DriverStatus {
+    let Some(entries) = req.completion_chain.take() else {
         return DriverStatus::Success;
-    }
-
-    // Temporarily borrow the chain without consuming the original Arc so
-    // repeated invocations stay safe.
-    let arc =
-        unsafe { alloc::sync::Arc::from_raw(ctx as *const alloc::vec::Vec<CompletionEntry<'_>>) };
-    let keep_alive = arc.clone();
-    let _ = alloc::sync::Arc::into_raw(arc);
+    };
 
     let mut status = DriverStatus::Success;
-    for (func, c) in keep_alive.iter() {
-        status = func(req, *c);
+    for (func, c) in entries {
+        status = func(req, c);
     }
 
     status
@@ -1410,8 +1409,8 @@ pub struct RequestHandleResult<'req, 'data> {
 /// `'req`  — lifetime of our exclusive borrow of the RequestHandle
 /// `'h`    — inner lifetime of the RequestHandle (e.g. lifetime of a Stack borrow)
 enum BorrowedStorage<'data, T: ?Sized> {
-    ReadOnly(&'data T),
-    Writable(&'data mut T),
+    ReadOnly(PhantomData<&'data T>),
+    Writable(PhantomData<&'data mut T>),
 }
 
 pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> {
@@ -1435,16 +1434,17 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> BorrowedHandle<'d
             handle,
             T::shared_raw_parts(data),
             StorageMode::BorrowedReadOnly,
-            BorrowedStorage::ReadOnly(data),
+            BorrowedStorage::ReadOnly(PhantomData),
         )
     }
 
     pub fn writable(handle: &'req mut RequestHandle<'h, 'data>, data: &'data mut T) -> Self {
+        let parts = T::mut_raw_parts(data);
         Self::install(
             handle,
-            T::mut_raw_parts(data),
+            parts,
             StorageMode::BorrowedWritable,
-            BorrowedStorage::Writable(data),
+            BorrowedStorage::Writable(PhantomData),
         )
     }
 

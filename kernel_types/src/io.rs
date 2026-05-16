@@ -5,17 +5,18 @@ use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use core::task::Waker;
 use spin::Once;
-
 struct Node<T> {
     data: T,
     next: *mut Node<T>,
 }
 
 pub struct TreiberStack<T> {
-    head: AtomicUsize,
+    head: AtomicPtr<Node<T>>,
     len: AtomicUsize,
     _marker: PhantomData<T>,
 }
@@ -23,7 +24,7 @@ pub struct TreiberStack<T> {
 impl<T> TreiberStack<T> {
     pub const fn new() -> Self {
         Self {
-            head: AtomicUsize::new(0),
+            head: AtomicPtr::new(ptr::null_mut()),
             len: AtomicUsize::new(0),
             _marker: PhantomData,
         }
@@ -36,72 +37,60 @@ impl<T> TreiberStack<T> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    #[inline]
-    fn unpack(val: usize) -> (*mut Node<T>, u16) {
-        let tag = (val >> 48) as u16;
-        let mut ptr = val & 0x0000_FFFF_FFFF_FFFF;
-        if ptr & 0x0000_8000_0000_0000 != 0 {
-            ptr |= 0xFFFF_0000_0000_0000;
-        }
-        (ptr as *mut Node<T>, tag)
-    }
-
-    #[inline]
-    fn pack(ptr: *mut Node<T>, tag: u16) -> usize {
-        ((ptr as usize) & 0x0000_FFFF_FFFF_FFFF) | ((tag as usize) << 48)
-    }
 
     pub fn push(&self, data: T) {
         let new_node = Box::into_raw(Box::new(Node {
             data,
-            next: core::ptr::null_mut(),
+            next: ptr::null_mut(),
         }));
 
         let mut head = self.head.load(Ordering::Relaxed);
+
         loop {
-            let (head_ptr, tag) = Self::unpack(head);
             unsafe {
-                (*new_node).next = head_ptr;
+                (*new_node).next = head;
             }
-            let new_head = Self::pack(new_node, tag.wrapping_add(1));
 
             match self.head.compare_exchange_weak(
                 head,
-                new_head,
+                new_node,
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
                     self.len.fetch_add(1, Ordering::Release);
-                    break;
+                    return;
                 }
-                Err(new_head_val) => head = new_head_val,
+                Err(new_head) => {
+                    head = new_head;
+                }
             }
         }
     }
 
     pub fn pop(&self) -> Option<T> {
         let mut head = self.head.load(Ordering::Acquire);
+
         loop {
-            let (head_ptr, tag) = Self::unpack(head);
-            if head_ptr.is_null() {
+            if head.is_null() {
                 return None;
             }
-            let next_ptr = unsafe { (*head_ptr).next };
-            let new_head = Self::pack(next_ptr, tag.wrapping_add(1));
 
-            match self.head.compare_exchange_weak(
-                head,
-                new_head,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            let next = unsafe { (*head).next };
+
+            match self
+                .head
+                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
                     self.len.fetch_sub(1, Ordering::Release);
-                    let boxed = unsafe { Box::from_raw(head_ptr) };
+
+                    let boxed = unsafe { Box::from_raw(head) };
                     return Some(boxed.data);
                 }
-                Err(new_head_val) => head = new_head_val,
+                Err(new_head) => {
+                    head = new_head;
+                }
             }
         }
     }
@@ -115,7 +104,6 @@ impl<T> Drop for TreiberStack<T> {
 
 unsafe impl<T: Send> Send for TreiberStack<T> {}
 unsafe impl<T: Send> Sync for TreiberStack<T> {}
-
 pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]

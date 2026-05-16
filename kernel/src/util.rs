@@ -59,7 +59,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 25_000;
+pub const APIC_START_PERIOD: u64 = 2_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -116,6 +116,7 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
+        crate::profiling::unwind::init_kernel_elf_unwind();
         Screen::clear_framebuffer();
         load_idt();
 
