@@ -6,6 +6,9 @@ pub mod global_async;
 pub mod platform;
 pub mod runtime;
 
+#[cfg(test)]
+mod test;
+
 #[macro_export]
 macro_rules! println {
     () => {

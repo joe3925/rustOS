@@ -425,13 +425,26 @@ impl JoinableStorage {
     }
 }
 
+type JoinablePollFn = for<'cx> unsafe fn(&JoinableSlot, &mut Context<'cx>) -> bool;
+type JoinableDropFn = unsafe fn(*mut u8);
+
 #[inline]
-fn read_cell_usize(c: &UnsafeCell<usize>) -> usize {
+fn read_poll_fn(c: &UnsafeCell<Option<JoinablePollFn>>) -> Option<JoinablePollFn> {
     unsafe { *c.get() }
 }
 
 #[inline]
-fn write_cell_usize(c: &UnsafeCell<usize>, v: usize) {
+fn write_poll_fn(c: &UnsafeCell<Option<JoinablePollFn>>, v: Option<JoinablePollFn>) {
+    unsafe { *c.get() = v }
+}
+
+#[inline]
+fn read_drop_fn(c: &UnsafeCell<Option<JoinableDropFn>>) -> Option<JoinableDropFn> {
+    unsafe { *c.get() }
+}
+
+#[inline]
+fn write_drop_fn(c: &UnsafeCell<Option<JoinableDropFn>>, v: Option<JoinableDropFn>) {
     unsafe { *c.get() = v }
 }
 
@@ -442,9 +455,9 @@ pub struct JoinableSlot {
     waker_state: AtomicU8,
     cached_waker_state: AtomicU8,
     _pad: u8,
-    poll_fn: UnsafeCell<usize>,
-    drop_fn: UnsafeCell<usize>,
-    result_drop_fn: UnsafeCell<usize>,
+    poll_fn: UnsafeCell<Option<JoinablePollFn>>,
+    drop_fn: UnsafeCell<Option<JoinableDropFn>>,
+    result_drop_fn: UnsafeCell<Option<JoinableDropFn>>,
     join_waker: UnsafeCell<MaybeUninit<Waker>>,
     cached_waker: UnsafeCell<MaybeUninit<Waker>>,
     buffer: UnsafeCell<JoinableStorage>,
@@ -460,9 +473,9 @@ impl JoinableSlot {
             waker_state: AtomicU8::new(WAKER_NONE),
             cached_waker_state: AtomicU8::new(CW_NONE),
             _pad: 0,
-            poll_fn: UnsafeCell::new(0),
-            drop_fn: UnsafeCell::new(0),
-            result_drop_fn: UnsafeCell::new(0),
+            poll_fn: UnsafeCell::new(None),
+            drop_fn: UnsafeCell::new(None),
+            result_drop_fn: UnsafeCell::new(None),
             join_waker: UnsafeCell::new(MaybeUninit::uninit()),
             cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
             buffer: UnsafeCell::new(JoinableStorage::new()),
@@ -498,23 +511,17 @@ impl JoinableSlot {
         if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {
             let ptr = buf_ptr as *mut F;
             core::ptr::write(ptr, future);
-            write_cell_usize(
-                &self.poll_fn,
-                poll_and_store_inline::<F, T> as *const () as usize,
-            );
-            write_cell_usize(&self.drop_fn, drop_inline::<F> as *const () as usize);
+            write_poll_fn(&self.poll_fn, Some(poll_and_store_inline::<F, T>));
+            write_drop_fn(&self.drop_fn, Some(drop_inline::<F>));
         } else {
             let boxed: Pin<Box<dyn Future<Output = T> + Send + 'static>> = Box::pin(future);
             let ptr = buf_ptr as *mut Option<Pin<Box<dyn Future<Output = T> + Send + 'static>>>;
             core::ptr::write(ptr, Some(boxed));
-            write_cell_usize(
-                &self.poll_fn,
-                poll_and_store_boxed::<T> as *const () as usize,
-            );
-            write_cell_usize(&self.drop_fn, drop_boxed_future::<T> as *const () as usize);
+            write_poll_fn(&self.poll_fn, Some(poll_and_store_boxed::<T>));
+            write_drop_fn(&self.drop_fn, Some(drop_boxed_future::<T>));
         }
 
-        write_cell_usize(&self.result_drop_fn, drop_inline::<T> as *const () as usize);
+        write_drop_fn(&self.result_drop_fn, Some(drop_inline::<T>));
 
         self.waker_state.store(WAKER_NONE, Ordering::Release);
         self.cached_waker_state.store(CW_NONE, Ordering::Release);
@@ -542,18 +549,15 @@ impl JoinableSlot {
 
         let mut cx = Context::from_waker(waker);
 
-        let poll_fn = read_cell_usize(&self.poll_fn);
-        if poll_fn == 0 {
+        let Some(poll_fn) = read_poll_fn(&self.poll_fn) else {
             self.state.store(STATE_COMPLETED, Ordering::Release);
             return true;
-        }
+        };
 
-        let poll_fn: unsafe fn(&JoinableSlot, &mut Context<'_>) -> bool =
-            unsafe { core::mem::transmute(poll_fn) };
         let is_ready = unsafe { poll_fn(self, &mut cx) };
 
         if is_ready {
-            write_cell_usize(&self.poll_fn, 0);
+            write_poll_fn(&self.poll_fn, None);
             self.state.store(STATE_COMPLETED, Ordering::Release);
             self.wake_join_handle();
             true
@@ -584,7 +588,7 @@ impl JoinableSlot {
         let ptr = (*self.buffer.get()).as_mut_ptr() as *mut T;
         let result = core::ptr::read(ptr);
 
-        write_cell_usize(&self.drop_fn, 0);
+        write_drop_fn(&self.drop_fn, None);
         result
     }
 
@@ -764,8 +768,8 @@ where
             let result_ptr = buffer_ptr as *mut T;
             core::ptr::write(result_ptr, result);
 
-            let result_drop = read_cell_usize(&slot.result_drop_fn);
-            write_cell_usize(&slot.drop_fn, result_drop);
+            let result_drop = read_drop_fn(&slot.result_drop_fn);
+            write_drop_fn(&slot.drop_fn, result_drop);
 
             true
         }
@@ -793,8 +797,8 @@ where
             let result_ptr = buffer_ptr as *mut T;
             core::ptr::write(result_ptr, result);
 
-            let result_drop = read_cell_usize(&slot.result_drop_fn);
-            write_cell_usize(&slot.drop_fn, result_drop);
+            let result_drop = read_drop_fn(&slot.result_drop_fn);
+            write_drop_fn(&slot.drop_fn, result_drop);
 
             true
         }
@@ -1245,9 +1249,9 @@ impl TaskSlab {
                 slot.state.store(STATE_IDLE, Ordering::Relaxed);
                 slot.waker_state.store(WAKER_NONE, Ordering::Relaxed);
                 slot.reset_cached_waker();
-                write_cell_usize(&slot.poll_fn, 0);
-                write_cell_usize(&slot.drop_fn, 0);
-                write_cell_usize(&slot.result_drop_fn, 0);
+                write_poll_fn(&slot.poll_fn, None);
+                write_drop_fn(&slot.drop_fn, None);
+                write_drop_fn(&slot.result_drop_fn, None);
 
                 let old = slot.gen_ref.load(Ordering::Acquire);
                 let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
@@ -1357,14 +1361,10 @@ impl TaskSlab {
             {
                 Ok(_) => {
                     if rc == 1 {
-                        let drop_fn = read_cell_usize(&slot.drop_fn);
-                        if drop_fn != 0 {
-                            unsafe {
-                                let f: unsafe fn(*mut u8) = core::mem::transmute(drop_fn);
-                                f((*slot.buffer.get()).as_mut_ptr());
-                            }
+                        if let Some(drop_fn) = read_drop_fn(&slot.drop_fn) {
+                            unsafe { drop_fn((*slot.buffer.get()).as_mut_ptr()) };
                         }
-                        write_cell_usize(&slot.drop_fn, 0);
+                        write_drop_fn(&slot.drop_fn, None);
 
                         slot.drop_cached_waker_if_set();
 
@@ -1376,8 +1376,8 @@ impl TaskSlab {
                         }
                         slot.waker_state.store(WAKER_NONE, Ordering::Release);
 
-                        write_cell_usize(&slot.poll_fn, 0);
-                        write_cell_usize(&slot.result_drop_fn, 0);
+                        write_poll_fn(&slot.poll_fn, None);
+                        write_drop_fn(&slot.result_drop_fn, None);
                         slot.state.store(STATE_IDLE, Ordering::Release);
 
                         shard.deallocate(local_idx);
@@ -1662,7 +1662,7 @@ pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation
 
 pub fn init_task_slab(config: SlabConfig) {
     TASK_SLAB_PTR.call_once(|| unsafe {
-        let p = TASK_SLAB_STORAGE.as_mut_ptr();
+        let p = core::ptr::addr_of_mut!(TASK_SLAB_STORAGE).cast::<TaskSlab>();
         TaskSlab::init_in_place(p, config);
         &*p
     });
@@ -1678,7 +1678,7 @@ where
 
 pub fn get_task_slab() -> &'static TaskSlab {
     TASK_SLAB_PTR.call_once(|| unsafe {
-        let p = TASK_SLAB_STORAGE.as_mut_ptr();
+        let p = core::ptr::addr_of_mut!(TASK_SLAB_STORAGE).cast::<TaskSlab>();
         TaskSlab::init_in_place(p, SlabConfig::default());
         &*p
     })

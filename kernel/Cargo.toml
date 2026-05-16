@@ -35,6 +35,7 @@ goblin = { version = "0.10.0", features = [
     "archive",
     "te",
 ], default-features = false }
+gimli = { version = "0.32.3", default-features = false, features = ["read"] }
 hashbrown = "0.15.4"
 bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",

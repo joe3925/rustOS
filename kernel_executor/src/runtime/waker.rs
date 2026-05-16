@@ -24,12 +24,24 @@ fn is_tagged(ptr: usize) -> bool {
 
 #[inline]
 fn tag_arc_ptr<T>(arc: Arc<T>) -> *const () {
-    ((Arc::into_raw(arc) as usize) | TASK_WAKER_TAG) as *const ()
+    Arc::into_raw(arc)
+        .cast::<()>()
+        .map_addr(|addr| addr | TASK_WAKER_TAG)
 }
 
 #[inline]
 unsafe fn untag_ptr<T>(ptr: *const ()) -> *const T {
-    ((ptr as usize) & TASK_WAKER_MASK) as *const T
+    ptr.map_addr(|addr| addr & TASK_WAKER_MASK).cast::<T>()
+}
+
+#[inline]
+fn encoded_to_waker_ptr(encoded: usize) -> *const () {
+    core::ptr::without_provenance(encoded)
+}
+
+#[inline]
+fn waker_ptr_to_encoded(ptr: *const ()) -> usize {
+    ptr.addr()
 }
 
 /// Creates a waker from an Arc<T: TaskPoll>, transferring the Arc's refcount.
@@ -141,7 +153,7 @@ pub fn continuation_from_waker(w: &Waker) -> Option<Continuation> {
     forget(cloned);
     let data_ptr = w.data();
     let vtable_ptr = w.vtable();
-    let data = data_ptr as usize;
+    let data = waker_ptr_to_encoded(data_ptr);
     let drop_guard = unsafe { Waker::from_raw(raw) };
 
     // Slab-based waker (detached)
@@ -201,7 +213,12 @@ pub fn create_slab_waker(shard_idx: usize, local_idx: usize, generation: u32) ->
     // No refcount increment — the slot is kept alive by structural anchor refs
     // (init_and_enqueue, enqueue_slab_task, poll_once NOTIFIED re-enqueue, etc.).
     // Waker clone/drop/wake are all refcount-free.
-    unsafe { Waker::from_raw(RawWaker::new(encoded as *const (), &SLAB_WAKER_VTABLE)) }
+    unsafe {
+        Waker::from_raw(RawWaker::new(
+            encoded_to_waker_ptr(encoded),
+            &SLAB_WAKER_VTABLE,
+        ))
+    }
 }
 
 unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
@@ -210,7 +227,7 @@ unsafe fn slab_clone_waker(ptr: *const ()) -> RawWaker {
 }
 
 unsafe fn slab_wake(ptr: *const ()) {
-    let encoded = ptr as usize;
+    let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
         enqueue_slab_task(shard_idx, local_idx, generation);
         // No refcount decrement — enqueue_slab_task manages its own anchor ref.
@@ -218,7 +235,7 @@ unsafe fn slab_wake(ptr: *const ()) {
 }
 
 unsafe fn slab_wake_by_ref(ptr: *const ()) {
-    let encoded = ptr as usize;
+    let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(encoded) {
         enqueue_slab_task(shard_idx, local_idx, generation);
         // Don't decrement ref count - wake_by_ref doesn't consume the waker
@@ -282,7 +299,7 @@ pub fn create_joinable_slab_waker(shard_idx: usize, local_idx: usize, generation
     let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
     unsafe {
         Waker::from_raw(RawWaker::new(
-            encoded as *const (),
+            encoded_to_waker_ptr(encoded),
             &JOINABLE_SLAB_WAKER_VTABLE,
         ))
     }
@@ -294,14 +311,14 @@ unsafe fn joinable_slab_clone_waker(ptr: *const ()) -> RawWaker {
 }
 
 unsafe fn joinable_slab_wake(ptr: *const ()) {
-    let encoded = ptr as usize;
+    let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
         enqueue_joinable_slab_task(shard_idx, local_idx, generation);
     }
 }
 
 unsafe fn joinable_slab_wake_by_ref(ptr: *const ()) {
-    let encoded = ptr as usize;
+    let encoded = waker_ptr_to_encoded(ptr);
     if let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(encoded) {
         enqueue_joinable_slab_task(shard_idx, local_idx, generation);
     }

@@ -9,9 +9,14 @@ use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
+use crate::profiling::unwind::{
+    capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
+};
 use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::state::State;
 use crate::static_handlers::{pnp_get_device_target, wait_duration};
 use crate::structs::bench_archive::{bench_archive_for_path, BenchArchive, BenchArchiveRecord};
 use crate::structs::stopwatch::Stopwatch;
@@ -25,37 +30,81 @@ use core::fmt::Write;
 use core::future::Future;
 use core::hint::black_box;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
 use kernel_types::benchmark::{
-    BenchLevelResult, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
-    BENCH_FLAG_REQUEST,
+    BenchDroppedSampleCounterProto, BenchLevelResult, BenchOverflowPolicy, BenchSampleChunkProto,
+    BenchSampleProto, BenchSweepParams, BenchSweepResult, BenchWindowConfig, BENCH_FLAG_IRQ,
+    BENCH_FLAG_REQUEST, BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
 };
 use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
 use kernel_types::request::{RequestData, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
+use kernel_types::ProstMessage;
 use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
 const BENCH_ENABLED: bool = true;
 
-const BENCH_SAMPLE_STACK_CAPACITY: usize = 512;
-const BENCH_RING_CAPACITY: usize = 1024;
-const BENCH_SAMPLE_FRAME_CAPACITY: usize = BENCH_RING_CAPACITY * BENCH_SAMPLE_STACK_CAPACITY;
+const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
+const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedBenchWindowConfig {
+    overflow_policy: BenchOverflowPolicy,
+    sample_capacity: usize,
+    span_capacity: usize,
+    event_capacity: usize,
+    sample_chunk_capacity: usize,
+    max_unwind_depth: usize,
+}
+
+impl ResolvedBenchWindowConfig {
+    fn from_window_config(cfg: &BenchWindowConfig) -> Self {
+        let fallback_capacity = if cfg.sample_reserve == 0 {
+            DEFAULT_SAMPLE_CAPACITY
+        } else {
+            cfg.sample_reserve
+        };
+
+        let sample_capacity = cfg.sample_capacity.unwrap_or(fallback_capacity).max(1);
+        let span_capacity = if cfg.log_spans { cfg.span_reserve } else { 0 };
+        let event_capacity = sample_capacity.saturating_add(span_capacity).max(1);
+
+        Self {
+            overflow_policy: cfg.overflow_policy.unwrap_or_default(),
+            sample_capacity,
+            span_capacity,
+            event_capacity,
+            sample_chunk_capacity: cfg
+                .sample_chunk_capacity
+                .unwrap_or(DEFAULT_SAMPLE_CHUNK_CAPACITY)
+                .max(1),
+            max_unwind_depth: cfg
+                .max_unwind_depth
+                .unwrap_or(MAX_CALLCHAIN_DEPTH)
+                .clamp(1, MAX_CALLCHAIN_DEPTH),
+        }
+    }
+}
 
 // ===== Global event stream =====
 
 #[derive(Clone, Copy, Debug)]
 struct BenchSampleEvent {
     rip: u64,
-    depth: usize,
-    captured_depth: usize,
-    stack_offset: usize,
+    task_id: u64,
+    unwind_status: u32,
+    depth: u8,
+    stack_low: u64,
+    stack_high: u64,
+    frames: [u64; MAX_CALLCHAIN_DEPTH],
+    frame_kinds: [u32; MAX_CALLCHAIN_DEPTH],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -120,10 +169,19 @@ impl BenchEvent {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchPushOutcome {
+    Stored,
+    StoredNearFull,
+    DroppedFull,
+    OverwroteOldest,
+}
+
 struct BenchRing {
     next_seq: u64,
     buffer: Vec<BenchEvent>,
-    sample_stack: Vec<u64>,
+    write_idx: usize,
+    wrapped: bool,
 }
 
 impl BenchRing {
@@ -131,26 +189,85 @@ impl BenchRing {
         BenchRing {
             next_seq: 1,
             buffer: Vec::with_capacity(initial_capacity),
-            sample_stack: Vec::with_capacity(BENCH_SAMPLE_FRAME_CAPACITY),
+            write_idx: 0,
+            wrapped: false,
         }
     }
 
-    fn push_event(&mut self, mut event: BenchEvent) {
-        event.seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.buffer.push(event);
+    fn reset_for_start(&mut self, capacity: usize) {
+        self.next_seq = 1;
+        self.write_idx = 0;
+        self.wrapped = false;
+
+        if self.buffer.capacity() != capacity {
+            self.buffer = Vec::with_capacity(capacity);
+        } else {
+            self.buffer.clear();
+        }
     }
 
-    fn log(&mut self, event: BenchEvent) {
-        self.push_event(event);
+    fn near_full(&self) -> bool {
+        let capacity = self.buffer.capacity();
+        capacity != 0 && self.buffer.len().saturating_mul(8) >= capacity.saturating_mul(7)
     }
 
-    fn log_sample(&mut self, rip: u64, depth: usize, stack: &[u64], ts: u64, core_id: u16) {
-        let stack_offset = self.sample_stack.len();
-        let requested_depth = stack.len().min(BENCH_SAMPLE_STACK_CAPACITY);
-        self.sample_stack
-            .extend_from_slice(&stack[..requested_depth]);
+    fn push_event(
+        &mut self,
+        mut event: BenchEvent,
+        policy: BenchOverflowPolicy,
+    ) -> BenchPushOutcome {
+        let capacity = self.buffer.capacity();
+        if capacity == 0 {
+            return BenchPushOutcome::DroppedFull;
+        }
 
+        if self.buffer.len() < capacity {
+            event.seq = self.next_seq;
+            self.next_seq = self.next_seq.wrapping_add(1);
+            self.buffer.push(event);
+            return if self.near_full() {
+                BenchPushOutcome::StoredNearFull
+            } else {
+                BenchPushOutcome::Stored
+            };
+        }
+
+        match policy {
+            BenchOverflowPolicy::OverwriteOldest => {
+                event.seq = self.next_seq;
+                self.next_seq = self.next_seq.wrapping_add(1);
+                self.buffer[self.write_idx] = event;
+                self.write_idx = (self.write_idx + 1) % capacity;
+                self.wrapped = true;
+                BenchPushOutcome::OverwroteOldest
+            }
+            BenchOverflowPolicy::Panic
+            | BenchOverflowPolicy::DropAndCount
+            | BenchOverflowPolicy::StopSampling
+            | BenchOverflowPolicy::QueueDrainWorker
+            | BenchOverflowPolicy::PauseFlushCompactTime
+            | BenchOverflowPolicy::PauseFlushWallTime => BenchPushOutcome::DroppedFull,
+        }
+    }
+
+    fn log(&mut self, event: BenchEvent) -> BenchPushOutcome {
+        self.push_event(event, BenchOverflowPolicy::DropAndCount)
+    }
+
+    fn log_sample(
+        &mut self,
+        rip: u64,
+        task_id: u64,
+        mut callchain: CapturedCallchain,
+        ts: u64,
+        core_id: u16,
+        max_unwind_depth: usize,
+        overflow_policy: BenchOverflowPolicy,
+    ) -> BenchPushOutcome {
+        if callchain.depth as usize > max_unwind_depth {
+            callchain.depth = max_unwind_depth as u8;
+            callchain.status |= kernel_types::benchmark::BENCH_UNWIND_STATUS_TRUNCATED;
+        }
         let event = BenchEvent {
             seq: 0,
             timestamp_ns: ts,
@@ -158,22 +275,97 @@ impl BenchRing {
             kind: BenchEventKind::Sample,
             data: BenchEventData::Sample(BenchSampleEvent {
                 rip,
-                depth,
-                captured_depth: requested_depth,
-                stack_offset,
+                task_id,
+                unwind_status: callchain.status,
+                depth: callchain.depth,
+                stack_low: callchain.stack_low,
+                stack_high: callchain.stack_high,
+                frames: callchain.frames,
+                frame_kinds: callchain.frame_kinds,
             }),
         };
-        self.push_event(event);
+        self.push_event(event, overflow_policy)
     }
 
     fn drain_events(&mut self) -> Vec<BenchEvent> {
-        let capacity = self.buffer.capacity().max(BENCH_RING_CAPACITY);
-        core::mem::replace(&mut self.buffer, Vec::with_capacity(capacity))
+        let len = self.buffer.len();
+        if len == 0 {
+            return Vec::new();
+        }
+
+        let mut out = Vec::with_capacity(len);
+        if self.wrapped && self.write_idx < len {
+            out.extend_from_slice(&self.buffer[self.write_idx..]);
+            out.extend_from_slice(&self.buffer[..self.write_idx]);
+            self.buffer.clear();
+        } else {
+            out.append(&mut self.buffer);
+        }
+        self.write_idx = 0;
+        self.wrapped = false;
+        out
+    }
+}
+
+struct BenchSampleDropCounters {
+    ring_full: AtomicU64,
+    ring_lock_busy: AtomicU64,
+    bad_context: AtomicU64,
+    unwind_failures: AtomicU64,
+    samples_dropped: AtomicU64,
+    samples_overwritten: AtomicU64,
+    sampling_stopped: AtomicU64,
+    flush_count: AtomicU64,
+    pause_flush_ns: AtomicU64,
+}
+
+impl BenchSampleDropCounters {
+    fn new() -> Self {
+        Self {
+            ring_full: AtomicU64::new(0),
+            ring_lock_busy: AtomicU64::new(0),
+            bad_context: AtomicU64::new(0),
+            unwind_failures: AtomicU64::new(0),
+            samples_dropped: AtomicU64::new(0),
+            samples_overwritten: AtomicU64::new(0),
+            sampling_stopped: AtomicU64::new(0),
+            flush_count: AtomicU64::new(0),
+            pause_flush_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self, core_id: usize) -> BenchDroppedSampleCounterProto {
+        BenchDroppedSampleCounterProto {
+            core_id: core_id as u32,
+            ring_full: self.ring_full.load(Ordering::Relaxed),
+            ring_lock_busy: self.ring_lock_busy.load(Ordering::Relaxed),
+            bad_context: self.bad_context.load(Ordering::Relaxed),
+            unwind_failures: self.unwind_failures.load(Ordering::Relaxed),
+            samples_dropped: self.samples_dropped.load(Ordering::Relaxed),
+            samples_overwritten: self.samples_overwritten.load(Ordering::Relaxed),
+            sampling_stopped: self.sampling_stopped.load(Ordering::Relaxed),
+            flush_count: self.flush_count.load(Ordering::Relaxed),
+            pause_flush_ns: self.pause_flush_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.ring_full.store(0, Ordering::Relaxed);
+        self.ring_lock_busy.store(0, Ordering::Relaxed);
+        self.bad_context.store(0, Ordering::Relaxed);
+        self.unwind_failures.store(0, Ordering::Relaxed);
+        self.samples_dropped.store(0, Ordering::Relaxed);
+        self.samples_overwritten.store(0, Ordering::Relaxed);
+        self.sampling_stopped.store(0, Ordering::Relaxed);
+        self.flush_count.store(0, Ordering::Relaxed);
+        self.pause_flush_ns.store(0, Ordering::Relaxed);
     }
 }
 
 struct BenchState {
     rings: Vec<Mutex<BenchRing>>,
+    drained_events: Vec<Mutex<Vec<BenchEvent>>>,
+    sample_drops: Vec<BenchSampleDropCounters>,
     next_span_id: AtomicU32,
 }
 
@@ -181,17 +373,27 @@ impl BenchState {
     fn new() -> Self {
         let cores = unsafe { TIMER_TIME_SCHED.iter() }.count().max(1);
         let mut rings = Vec::with_capacity(cores);
+        let mut drained_events = Vec::with_capacity(cores);
+        let mut sample_drops = Vec::with_capacity(cores);
         for _ in 0..cores {
-            rings.push(Mutex::new(BenchRing::new(BENCH_RING_CAPACITY)));
+            rings.push(Mutex::new(BenchRing::new(DEFAULT_SAMPLE_CAPACITY)));
+            drained_events.push(Mutex::new(Vec::with_capacity(DEFAULT_SAMPLE_CAPACITY)));
+            sample_drops.push(BenchSampleDropCounters::new());
         }
         BenchState {
             rings,
+            drained_events,
+            sample_drops,
             next_span_id: AtomicU32::new(1),
         }
     }
 
     fn ring_for_core(&self, core: usize) -> Option<&Mutex<BenchRing>> {
         self.rings.get(core)
+    }
+
+    fn drops_for_core(&self, core: usize) -> Option<&BenchSampleDropCounters> {
+        self.sample_drops.get(core)
     }
 
     fn alloc_span_id(&self) -> u32 {
@@ -201,6 +403,75 @@ impl BenchState {
     fn ncores(&self) -> usize {
         self.rings.len().max(1)
     }
+
+    fn reset_sample_drop_counters(&self) {
+        for drops in &self.sample_drops {
+            drops.reset();
+        }
+    }
+
+    fn prepare_for_start(&self, capacity: usize) {
+        for core in 0..self.rings.len() {
+            if let Some(ring) = self.rings.get(core) {
+                ring.lock().reset_for_start(capacity);
+            }
+            if let Some(drained) = self.drained_events.get(core) {
+                let mut drained = drained.lock();
+                if drained.capacity() < capacity {
+                    *drained = Vec::with_capacity(capacity);
+                } else {
+                    drained.clear();
+                }
+            }
+        }
+        self.reset_sample_drop_counters();
+        self.next_span_id.store(1, Ordering::Relaxed);
+    }
+
+    fn drain_core_to_spill(&self, core: usize) {
+        let Some(ring) = self.rings.get(core) else {
+            return;
+        };
+        let Some(spill) = self.drained_events.get(core) else {
+            return;
+        };
+
+        let mut events = ring.lock().drain_events();
+        if events.is_empty() {
+            return;
+        }
+
+        let mut spill = spill.lock();
+        spill.append(&mut events);
+        if let Some(drops) = self.drops_for_core(core) {
+            drops.flush_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn drain_all_to_spill(&self) {
+        for core in 0..self.rings.len() {
+            self.drain_core_to_spill(core);
+        }
+    }
+
+    fn drain_core_events(&self, core: usize) -> Vec<BenchEvent> {
+        let mut out = if let Some(spill) = self.drained_events.get(core) {
+            let mut spill = spill.lock();
+            let capacity = spill.capacity();
+            core::mem::replace(&mut *spill, Vec::with_capacity(capacity))
+        } else {
+            Vec::new()
+        };
+
+        if let Some(ring) = self.rings.get(core) {
+            let mut active = ring.lock().drain_events();
+            if !active.is_empty() {
+                out.append(&mut active);
+            }
+        }
+
+        out
+    }
 }
 
 static BENCH_STATE: Once<BenchState> = Once::new();
@@ -209,6 +480,53 @@ static BENCH_READY: AtomicBool = AtomicBool::new(false);
 static SAMPLE_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 static SPAN_REFCOUNT: AtomicU32 = AtomicU32::new(0);
 static METRICS_REFCOUNT: AtomicU32 = AtomicU32::new(0);
+static ACTIVE_OVERFLOW_POLICY: AtomicU32 = AtomicU32::new(BenchOverflowPolicy::DropAndCount as u32);
+static ACTIVE_MAX_UNWIND_DEPTH: AtomicUsize = AtomicUsize::new(MAX_CALLCHAIN_DEPTH);
+static ACTIVE_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_PAUSE_POLICY: AtomicU32 =
+    AtomicU32::new(BenchOverflowPolicy::PauseFlushWallTime as u32);
+static ACTIVE_SAMPLING_STOPPED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_PERTURBED_BY_WORKER: AtomicBool = AtomicBool::new(false);
+static ACTIVE_OVERFLOW_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn bench_policy_from_raw(raw: u32) -> BenchOverflowPolicy {
+    match raw {
+        0 => BenchOverflowPolicy::Panic,
+        1 => BenchOverflowPolicy::DropAndCount,
+        2 => BenchOverflowPolicy::StopSampling,
+        3 => BenchOverflowPolicy::QueueDrainWorker,
+        4 => BenchOverflowPolicy::PauseFlushCompactTime,
+        5 => BenchOverflowPolicy::PauseFlushWallTime,
+        6 => BenchOverflowPolicy::OverwriteOldest,
+        _ => BenchOverflowPolicy::DropAndCount,
+    }
+}
+
+fn bench_overflow_policy_name(policy: BenchOverflowPolicy) -> &'static str {
+    match policy {
+        BenchOverflowPolicy::Panic => "panic",
+        BenchOverflowPolicy::DropAndCount => "drop_and_count",
+        BenchOverflowPolicy::StopSampling => "stop_sampling",
+        BenchOverflowPolicy::QueueDrainWorker => "queue_drain_worker",
+        BenchOverflowPolicy::PauseFlushCompactTime => "pause_flush_compact_time",
+        BenchOverflowPolicy::PauseFlushWallTime => "pause_flush_wall_time",
+        BenchOverflowPolicy::OverwriteOldest => "overwrite_oldest",
+    }
+}
+
+fn active_overflow_policy() -> BenchOverflowPolicy {
+    bench_policy_from_raw(ACTIVE_OVERFLOW_POLICY.load(Ordering::Relaxed))
+}
+
+fn activate_bench_sampling_config(cfg: ResolvedBenchWindowConfig) {
+    ACTIVE_OVERFLOW_POLICY.store(cfg.overflow_policy as u32, Ordering::Release);
+    ACTIVE_MAX_UNWIND_DEPTH.store(cfg.max_unwind_depth, Ordering::Release);
+    ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
+    ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+    ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+    ACTIVE_PERTURBED_BY_WORKER.store(false, Ordering::Release);
+}
 
 fn bench_state() -> Option<&'static BenchState> {
     if !BENCH_ENABLED {
@@ -251,7 +569,7 @@ fn bench_metrics_enabled() -> bool {
 }
 
 fn bench_samples_enabled() -> bool {
-    SAMPLE_REFCOUNT.load(Ordering::Relaxed) != 0
+    SAMPLE_REFCOUNT.load(Ordering::Relaxed) != 0 && !ACTIVE_SAMPLING_STOPPED.load(Ordering::Acquire)
 }
 
 fn bench_spans_enabled() -> bool {
@@ -306,9 +624,125 @@ pub fn bench_submit_rip_sample(core_id: usize, rip: u64, stack: &[u64]) {
         return;
     }
     let ts = bench_now_ns();
+    let callchain = callchain_from_external_stack(rip, stack);
 
-    bench_log_sample_for_core(core_id, rip, stack.len(), stack, ts);
+    bench_log_sample_for_core(core_id, rip, 0, callchain, ts);
     bench_capture_metrics(core_id, ts);
+}
+
+fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> CapturedCallchain {
+    let mut out = CapturedCallchain::default();
+    let max_depth = ACTIVE_MAX_UNWIND_DEPTH
+        .load(Ordering::Relaxed)
+        .clamp(1, MAX_CALLCHAIN_DEPTH);
+    if stack.is_empty() {
+        out.frames[0] = rip;
+        out.depth = 1;
+        return out;
+    }
+
+    let limit = core::cmp::min(stack.len(), max_depth);
+    let mut i = 0usize;
+    while i < limit {
+        out.frames[i] = stack[i];
+        i += 1;
+    }
+    out.depth = limit as u8;
+    if stack.len() > max_depth {
+        out.status |= kernel_types::benchmark::BENCH_UNWIND_STATUS_TRUNCATED;
+    }
+    out
+}
+
+#[inline]
+fn bench_request_drain_worker() {
+    ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
+    let _ = ACTIVE_DRAIN_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[inline]
+fn bench_request_pause_flush(policy: BenchOverflowPolicy) {
+    ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
+    ACTIVE_PAUSE_POLICY.store(policy as u32, Ordering::Release);
+    ACTIVE_SAMPLING_STOPPED.store(true, Ordering::Release);
+    let _ = ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+}
+
+#[inline]
+fn bench_note_sample_push_outcome(
+    state: &BenchState,
+    core_id: usize,
+    outcome: BenchPushOutcome,
+    policy: BenchOverflowPolicy,
+) {
+    let drops = state.drops_for_core(core_id);
+
+    match outcome {
+        BenchPushOutcome::Stored => {}
+        BenchPushOutcome::StoredNearFull => match policy {
+            BenchOverflowPolicy::QueueDrainWorker => bench_request_drain_worker(),
+            BenchOverflowPolicy::Panic
+            | BenchOverflowPolicy::DropAndCount
+            | BenchOverflowPolicy::StopSampling
+            | BenchOverflowPolicy::PauseFlushCompactTime
+            | BenchOverflowPolicy::PauseFlushWallTime
+            | BenchOverflowPolicy::OverwriteOldest => {}
+        },
+        BenchPushOutcome::OverwroteOldest => {
+            if let Some(drops) = drops {
+                drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                drops.samples_overwritten.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        BenchPushOutcome::DroppedFull => match policy {
+            BenchOverflowPolicy::Panic => {
+                panic!("benchmark sample buffer full on core {}", core_id);
+            }
+            BenchOverflowPolicy::DropAndCount => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            BenchOverflowPolicy::StopSampling => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
+                }
+                ACTIVE_SAMPLING_STOPPED.store(true, Ordering::Release);
+            }
+            BenchOverflowPolicy::QueueDrainWorker => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                bench_request_drain_worker();
+            }
+            BenchOverflowPolicy::PauseFlushCompactTime => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
+                }
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushCompactTime);
+            }
+            BenchOverflowPolicy::PauseFlushWallTime => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
+                }
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushWallTime);
+            }
+            BenchOverflowPolicy::OverwriteOldest => {
+                if let Some(drops) = drops {
+                    drops.ring_full.fetch_add(1, Ordering::Relaxed);
+                    drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        },
+    }
 }
 
 #[inline]
@@ -323,11 +757,17 @@ fn bench_log_event_for_core_try(core_id: usize, event: BenchEvent) {
     let Some(mut g) = ring.try_lock() else {
         return;
     };
-    g.log(event);
+    let _ = g.log(event);
 }
 
 #[inline]
-fn bench_log_sample_for_core(core_id: usize, rip: u64, depth: usize, stack: &[u64], ts: u64) {
+fn bench_log_sample_for_core(
+    core_id: usize,
+    rip: u64,
+    task_id: u64,
+    callchain: CapturedCallchain,
+    ts: u64,
+) {
     let Some(state) = bench_state() else {
         return;
     };
@@ -335,12 +775,29 @@ fn bench_log_sample_for_core(core_id: usize, rip: u64, depth: usize, stack: &[u6
         return;
     };
 
+    let policy = active_overflow_policy();
+    let max_unwind_depth = ACTIVE_MAX_UNWIND_DEPTH.load(Ordering::Relaxed);
     let mut g = ring.lock();
-    g.log_sample(rip, depth, stack, ts, core_id as u16);
+    let outcome = g.log_sample(
+        rip,
+        task_id,
+        callchain,
+        ts,
+        core_id as u16,
+        max_unwind_depth,
+        policy,
+    );
+    bench_note_sample_push_outcome(state, core_id, outcome, policy);
 }
 
 #[inline]
-fn bench_log_sample_for_core_try(core_id: usize, rip: u64, depth: usize, stack: &[u64], ts: u64) {
+fn bench_log_sample_for_core_try(
+    core_id: usize,
+    rip: u64,
+    task_id: u64,
+    callchain: CapturedCallchain,
+    ts: u64,
+) {
     let Some(state) = bench_state_get() else {
         return;
     };
@@ -349,9 +806,24 @@ fn bench_log_sample_for_core_try(core_id: usize, rip: u64, depth: usize, stack: 
     };
 
     let Some(mut g) = ring.try_lock() else {
+        if let Some(drops) = state.drops_for_core(core_id) {
+            drops.ring_lock_busy.fetch_add(1, Ordering::Relaxed);
+            drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     };
-    g.log_sample(rip, depth, stack, ts, core_id as u16);
+    let policy = active_overflow_policy();
+    let max_unwind_depth = ACTIVE_MAX_UNWIND_DEPTH.load(Ordering::Relaxed);
+    let outcome = g.log_sample(
+        rip,
+        task_id,
+        callchain,
+        ts,
+        core_id as u16,
+        max_unwind_depth,
+        policy,
+    );
+    bench_note_sample_push_outcome(state, core_id, outcome, policy);
 }
 
 #[inline]
@@ -406,8 +878,48 @@ pub fn bench_submit_rip_sample_current_core(rip: u64) {
 
     let core_id = interrupt_index::current_cpu_id();
     let ts = bench_now_ns();
+    let callchain = callchain_from_external_stack(rip, &[]);
 
-    bench_log_sample_for_core_try(core_id, rip, 0, &[], ts);
+    bench_log_sample_for_core_try(core_id, rip, 0, callchain, ts);
+    bench_capture_metrics_try(core_id, ts);
+}
+
+pub fn bench_submit_interrupt_sample_current_core(state: &State) {
+    if !BENCH_ENABLED || !bench_samples_enabled() {
+        return;
+    }
+    if !BENCH_READY.load(Ordering::Acquire) {
+        return;
+    }
+
+    let core_id = interrupt_index::current_cpu_id();
+    let task = SCHEDULER.get_current_task(core_id);
+    if task.is_none() {
+        if let Some(state) = bench_state_get() {
+            if let Some(drops) = state.drops_for_core(core_id) {
+                drops.bad_context.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let task_id = task.as_ref().map(|t| t.task_id()).unwrap_or(0);
+    let max_unwind_depth = ACTIVE_MAX_UNWIND_DEPTH.load(Ordering::Relaxed);
+    let callchain = capture_callchain_from_state_limited(state, task.as_deref(), max_unwind_depth);
+    if callchain.status
+        & (kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_STACK_READ
+            | kernel_types::benchmark::BENCH_UNWIND_STATUS_BAD_UNWIND_INFO
+            | kernel_types::benchmark::BENCH_UNWIND_STATUS_UNSUPPORTED_OPCODE)
+        != 0
+    {
+        if let Some(state) = bench_state_get() {
+            if let Some(drops) = state.drops_for_core(core_id) {
+                drops.unwind_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let rip = state.rip;
+    let ts = bench_now_ns();
+
+    bench_log_sample_for_core_try(core_id, rip, task_id, callchain, ts);
     bench_capture_metrics_try(core_id, ts);
 }
 
@@ -708,6 +1220,26 @@ fn archive_stream_entry_path(
     )
 }
 
+fn archive_stream_file_entry_path(
+    window_dir: &str,
+    run_id: u32,
+    persist_id: u64,
+    chunk_idx: usize,
+    target: usize,
+    ncores: usize,
+    file_name: &str,
+) -> String {
+    format!(
+        "windows/{}/runs/run_{:06}/persists/persist_{:06}/chunks/chunk_{:06}/{}/{}",
+        archive_component(window_dir),
+        run_id,
+        persist_id,
+        chunk_idx,
+        archive_target_component(target, ncores),
+        file_name
+    )
+}
+
 fn archive_manifest_entry_path(
     window_dir: &str,
     run_id: u32,
@@ -742,14 +1274,53 @@ fn push_csv_archive_record(
     ));
 }
 
+fn encode_sample_chunk_proto(
+    run_id: u32,
+    chunk_idx: usize,
+    target: usize,
+    ncores: usize,
+    start_ns: u64,
+    to_ns: u64,
+    frame_limit: usize,
+    max_seq_by_core: &[u64],
+    sample_drops: &[BenchDroppedSampleCounterProto],
+    samples: Vec<BenchSampleProto>,
+) -> Option<Vec<u8>> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let chunk = BenchSampleChunkProto {
+        schema_version: BENCH_SAMPLE_PROTO_SCHEMA_VERSION,
+        run_id,
+        chunk_index: chunk_idx as u32,
+        target_core_id: if target == ncores {
+            u32::MAX
+        } else {
+            target as u32
+        },
+        aggregate: target == ncores,
+        start_ns,
+        end_ns: to_ns,
+        frame_limit: frame_limit as u32,
+        samples,
+        dropped: sample_drops.to_vec(),
+        max_seq_by_core: max_seq_by_core.to_vec(),
+    };
+
+    let mut bytes = Vec::with_capacity(chunk.encoded_len());
+    chunk.encode(&mut bytes).ok()?;
+    Some(bytes)
+}
+
 // ===== Export build (cursor-based; persist "clears" by advancing last_export_seq) =====
 
 struct ExportBundle {
-    samples_rows: Vec<String>,
+    samples: Vec<Vec<BenchSampleProto>>,
     spans_rows: Vec<String>,
     mem_rows: Vec<String>,  // includes heap+mem+sched counters per event
     max_seq_seen: Vec<u64>, // per core
-    samples_depth: Vec<usize>,
+    sample_drops: Vec<BenchDroppedSampleCounterProto>,
 }
 
 #[derive(Clone, Copy)]
@@ -761,23 +1332,33 @@ struct SpanRowRec {
     dur: u64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BenchPauseInterval {
+    pause_start_ns: u64,
+    pause_end_ns: u64,
+    duration_ns: u64,
+    policy: BenchOverflowPolicy,
+    logical_time_shifted: bool,
+    reason: &'static str,
+}
+
 fn make_empty_bundle(ncores: usize) -> ExportBundle {
-    let mut samples_rows = Vec::with_capacity(ncores + 1);
+    let mut samples = Vec::with_capacity(ncores + 1);
     let mut spans_rows = Vec::with_capacity(ncores + 1);
     let mut mem_rows = Vec::with_capacity(ncores + 1);
 
     for _ in 0..(ncores + 1) {
-        samples_rows.push(String::new());
+        samples.push(Vec::new());
         spans_rows.push(String::new());
         mem_rows.push(String::new());
     }
 
     ExportBundle {
-        samples_rows,
+        samples,
         spans_rows,
         mem_rows,
         max_seq_seen: vec![0u64; ncores],
-        samples_depth: vec![0usize; ncores + 1],
+        sample_drops: Vec::new(),
     }
 }
 
@@ -810,43 +1391,21 @@ fn heap_build(heap: &mut [(u64, u16, u64, usize)]) {
     }
 }
 
-fn write_sample_row(
-    row: &mut String,
-    run_id: u32,
-    ts: u64,
-    core_id: u16,
-    rip: u64,
-    depth: usize,
-    stack: &[u64],
-    output_depth: usize,
-) {
-    let _ = core::write!(
-        row,
-        "{},{},{},0x{:016x},{}",
-        run_id,
-        ts,
-        core_id,
-        rip,
-        depth
-    );
-
-    for di in 0..output_depth {
-        if let Some(v) = stack.get(di) {
-            let _ = core::write!(row, ",0x{:016x}", v);
-        } else {
-            row.push(',');
-        }
+fn sample_proto_from_event(ev: &BenchEvent, sample: BenchSampleEvent) -> BenchSampleProto {
+    let depth = core::cmp::min(sample.depth as usize, MAX_CALLCHAIN_DEPTH);
+    BenchSampleProto {
+        seq: ev.seq,
+        timestamp_ns: ev.timestamp_ns,
+        core_id: ev.core_id as u32,
+        task_id: sample.task_id,
+        sampled_rip: sample.rip,
+        unwind_status: sample.unwind_status,
+        frames: sample.frames[..depth].to_vec(),
+        frame_kinds: sample.frame_kinds[..depth].to_vec(),
+        stack_low: sample.stack_low,
+        stack_high: sample.stack_high,
+        adjusted_timestamp_ns: None,
     }
-
-    row.push('\n');
-}
-
-fn write_sample_header(row: &mut String, stack_depth: usize) {
-    row.push_str("run_id,timestamp_ns,core,rip,depth");
-    for di in 0..stack_depth {
-        let _ = core::write!(row, ",frame{di}");
-    }
-    row.push('\n');
 }
 
 fn write_metrics_row(row: &mut String, run_id: u32, ts: u64, core_id: u16, m: &BenchMetricsEvent) {
@@ -983,13 +1542,13 @@ fn build_krnl_debug_metadata_json(run_id: u32, start_ns: u64, to_ns: u64) -> Opt
     serde_json::to_string_pretty(&root).ok()
 }
 
-pub async fn build_exports_for_window(
+async fn build_exports_for_window(
     cfg: &BenchWindowConfig,
+    resolved_cfg: ResolvedBenchWindowConfig,
     run_id: u32,
     start_ns: u64,
     to_ns: u64,
     last_export_seq: &[u64],
-    samples_header_depth: &[usize],
     ncores: usize,
     open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
 ) -> Vec<ExportBundle> {
@@ -1009,7 +1568,6 @@ pub async fn build_exports_for_window(
 
     struct CoreIterator {
         events: Vec<BenchEvent>,
-        sample_stack: Vec<u64>,
         index: usize,
         core: usize,
     }
@@ -1036,13 +1594,6 @@ pub async fn build_exports_for_window(
                 self.events.shrink_to_fit();
             }
         }
-
-        fn sample_frames(&self, sample: &BenchSampleEvent) -> &[u64] {
-            let start = sample.stack_offset;
-            let len = sample.captured_depth;
-            let end = start.saturating_add(len);
-            self.sample_stack.get(start..end).unwrap_or(&[])
-        }
     }
 
     let mut gather_joins = Vec::with_capacity(ncores);
@@ -1051,25 +1602,8 @@ pub async fn build_exports_for_window(
         let last_seq = *last_export_seq.get(core).unwrap_or(&0);
 
         gather_joins.push(crate::scheduling::runtime::runtime::spawn_blocking(
-            move || -> (Vec<BenchEvent>, Vec<u64>) {
-                let ring_m = match st.ring_for_core(core) {
-                    Some(r) => r,
-                    None => return (Vec::new(), Vec::new()),
-                };
-
-                let (events, sample_stack) = {
-                    let mut ring = ring_m.lock();
-                    let events = ring.drain_events();
-                    let stack_capacity = ring
-                        .sample_stack
-                        .capacity()
-                        .max(BENCH_SAMPLE_FRAME_CAPACITY);
-                    let sample_stack = core::mem::replace(
-                        &mut ring.sample_stack,
-                        Vec::with_capacity(stack_capacity),
-                    );
-                    (events, sample_stack)
-                };
+            move || -> Vec<BenchEvent> {
+                let events = st.drain_core_events(core);
 
                 let mut out = Vec::new();
                 for ev in events {
@@ -1095,7 +1629,7 @@ pub async fn build_exports_for_window(
                         .then(a.seq.cmp(&b.seq))
                 });
 
-                (out, sample_stack)
+                out
             },
         ));
     }
@@ -1104,12 +1638,11 @@ pub async fn build_exports_for_window(
     let mut total_events = 0usize;
 
     for (core, j) in gather_joins.into_iter().enumerate() {
-        let (events, sample_stack) = j.await;
+        let events = j.await;
         total_events += events.len();
         if !events.is_empty() {
             iterators.push(CoreIterator {
                 events,
-                sample_stack,
                 index: 0,
                 core,
             });
@@ -1121,39 +1654,21 @@ pub async fn build_exports_for_window(
     }
 
     let avg = ncores;
-    let mut samples_depth = vec![0usize; ncores + 1];
-    if log_samples {
-        for target in 0..(ncores + 1) {
-            samples_depth[target] = *samples_header_depth.get(target).unwrap_or(&0);
-        }
+    let sample_drops: Vec<BenchDroppedSampleCounterProto> = if log_samples {
+        (0..ncores)
+            .filter_map(|core| state.drops_for_core(core).map(|d| d.snapshot(core)))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-        for iter in &iterators {
-            for ev in &iter.events {
-                if let BenchEventData::Sample(s) = &ev.data {
-                    let captured_depth = s.captured_depth;
-                    if per_core_enabled
-                        && iter.core < ncores
-                        && captured_depth > samples_depth[iter.core]
-                    {
-                        samples_depth[iter.core] = captured_depth;
-                    }
-                    if captured_depth > samples_depth[avg] {
-                        samples_depth[avg] = captured_depth;
-                    }
-                }
-            }
-        }
-    }
-
-    let desired_chunks = ncores.max(4);
-    let min_chunk_size = 256usize;
-    let chunks = core::cmp::min(desired_chunks, total_events.div_ceil(min_chunk_size)).max(1);
-    let chunk_size = total_events.div_ceil(chunks);
+    let chunk_size = resolved_cfg.sample_chunk_capacity.max(1);
+    let chunks = total_events.div_ceil(chunk_size).max(1);
 
     let mut out = Vec::with_capacity(chunks);
     for _ in 0..chunks {
         let mut bundle = make_empty_bundle(ncores);
-        bundle.samples_depth.clone_from(&samples_depth);
+        bundle.sample_drops = sample_drops.clone();
         out.push(bundle);
     }
 
@@ -1191,29 +1706,11 @@ pub async fn build_exports_for_window(
         match ev.kind {
             BenchEventKind::Sample if log_samples => {
                 if let BenchEventData::Sample(s) = ev.data {
-                    let frames = iterators[iter_idx].sample_frames(&s);
+                    let sample = sample_proto_from_event(&ev, s);
                     if per_core_enabled && scan_core < ncores {
-                        write_sample_row(
-                            &mut bundle.samples_rows[scan_core],
-                            run_id,
-                            ev.timestamp_ns,
-                            ev.core_id,
-                            s.rip,
-                            s.depth,
-                            frames,
-                            samples_depth[scan_core],
-                        );
+                        bundle.samples[scan_core].push(sample.clone());
                     }
-                    write_sample_row(
-                        &mut bundle.samples_rows[avg],
-                        run_id,
-                        ev.timestamp_ns,
-                        ev.core_id,
-                        s.rip,
-                        s.depth,
-                        frames,
-                        samples_depth[avg],
-                    );
+                    bundle.samples[avg].push(sample);
                 }
             }
             BenchEventKind::Metrics if want_mem_stream => {
@@ -1302,6 +1799,7 @@ pub async fn build_exports_for_window(
 
 struct BenchWindowInner {
     cfg: BenchWindowConfig,
+    resolved_cfg: ResolvedBenchWindowConfig,
 
     session_archive_path: String,
     session_archive: Option<Arc<BenchArchive>>,
@@ -1316,9 +1814,12 @@ struct BenchWindowInner {
     current_run_id: u32,
 
     last_export_seq: Vec<u64>,
+    sampling_truncated: bool,
+    pause_flush_ns: u64,
+    logical_time_compacted: bool,
+    perturbed_by_worker: bool,
+    pause_intervals: Vec<BenchPauseInterval>,
 
-    samples_header_written: Vec<bool>,
-    samples_header_depth: Vec<usize>,
     spans_header_written: Vec<bool>,
     mem_header_written: Vec<bool>,
 
@@ -1328,6 +1829,7 @@ struct BenchWindowInner {
 impl BenchWindowInner {
     fn new(
         cfg: BenchWindowConfig,
+        resolved_cfg: ResolvedBenchWindowConfig,
         session_archive_path: String,
         session_archive: Option<Arc<BenchArchive>>,
         window_dir: String,
@@ -1335,6 +1837,7 @@ impl BenchWindowInner {
     ) -> Self {
         BenchWindowInner {
             cfg,
+            resolved_cfg,
             session_archive_path,
             session_archive,
             window_dir,
@@ -1345,8 +1848,11 @@ impl BenchWindowInner {
             run_id_counter: 1,
             current_run_id: 0,
             last_export_seq: vec![0; ncores],
-            samples_header_written: vec![false; ncores + 1],
-            samples_header_depth: vec![0usize; ncores + 1],
+            sampling_truncated: false,
+            pause_flush_ns: 0,
+            logical_time_compacted: false,
+            perturbed_by_worker: false,
+            pause_intervals: Vec::new(),
             spans_header_written: vec![false; ncores + 1],
             mem_header_written: vec![false; ncores + 1],
             open_spans: BTreeMap::new(),
@@ -1355,10 +1861,11 @@ impl BenchWindowInner {
 
     fn reset_run_state(&mut self) {
         self.last_export_seq.fill(0);
-        for v in &mut self.samples_header_written {
-            *v = false;
-        }
-        self.samples_header_depth.fill(0);
+        self.sampling_truncated = false;
+        self.pause_flush_ns = 0;
+        self.logical_time_compacted = false;
+        self.perturbed_by_worker = false;
+        self.pause_intervals.clear();
         for v in &mut self.spans_header_written {
             *v = false;
         }
@@ -1379,8 +1886,10 @@ pub struct BenchWindow {
 
 impl BenchWindow {
     pub fn new(cfg: BenchWindowConfig) -> Self {
+        let resolved_cfg = ResolvedBenchWindowConfig::from_window_config(&cfg);
         if !BENCH_ENABLED {
-            let inner = BenchWindowInner::new(cfg, String::new(), None, String::new(), 1);
+            let inner =
+                BenchWindowInner::new(cfg, resolved_cfg, String::new(), None, String::new(), 1);
             return BenchWindow {
                 inner: Arc::new(Mutex::new(inner)),
                 init_state: Arc::new(AtomicU32::new(INIT_READY)),
@@ -1392,7 +1901,14 @@ impl BenchWindow {
         }
 
         let ncores = bench_ncores();
-        let inner = BenchWindowInner::new(cfg, String::new(), None, String::new(), ncores);
+        let inner = BenchWindowInner::new(
+            cfg,
+            resolved_cfg,
+            String::new(),
+            None,
+            String::new(),
+            ncores,
+        );
 
         BenchWindow {
             inner: Arc::new(Mutex::new(inner)),
@@ -1438,6 +1954,106 @@ impl BenchWindow {
         self.init_state.store(INIT_READY, Ordering::Release);
         true
     }
+
+    fn mark_worker_perturbed(&self) {
+        let mut inner = self.inner.lock();
+        inner.perturbed_by_worker = true;
+    }
+
+    fn handle_pause_flush(&self, policy: BenchOverflowPolicy) {
+        let logical_time_shifted = match policy {
+            BenchOverflowPolicy::PauseFlushCompactTime => true,
+            BenchOverflowPolicy::PauseFlushWallTime => false,
+            BenchOverflowPolicy::Panic
+            | BenchOverflowPolicy::DropAndCount
+            | BenchOverflowPolicy::StopSampling
+            | BenchOverflowPolicy::QueueDrainWorker
+            | BenchOverflowPolicy::OverwriteOldest => return,
+        };
+
+        let pause_start_ns = bench_now_ns();
+        if let Some(state) = bench_state_get() {
+            state.drain_all_to_spill();
+        }
+        let pause_end_ns = bench_now_ns();
+        let duration_ns = pause_end_ns.saturating_sub(pause_start_ns);
+
+        if let Some(state) = bench_state_get() {
+            for core in 0..state.ncores() {
+                if let Some(drops) = state.drops_for_core(core) {
+                    drops
+                        .pause_flush_ns
+                        .fetch_add(duration_ns, Ordering::Relaxed);
+                }
+            }
+        }
+
+        {
+            let mut inner = self.inner.lock();
+            inner.pause_flush_ns = inner.pause_flush_ns.saturating_add(duration_ns);
+            inner.logical_time_compacted |= logical_time_shifted;
+            inner.perturbed_by_worker = true;
+            inner.pause_intervals.push(BenchPauseInterval {
+                pause_start_ns,
+                pause_end_ns,
+                duration_ns,
+                policy,
+                logical_time_shifted,
+                reason: "buffer_full",
+            });
+        }
+
+        ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+    }
+
+    fn spawn_overflow_worker_if_needed(&self, policy: BenchOverflowPolicy) {
+        match policy {
+            BenchOverflowPolicy::QueueDrainWorker
+            | BenchOverflowPolicy::PauseFlushCompactTime
+            | BenchOverflowPolicy::PauseFlushWallTime => {}
+            BenchOverflowPolicy::Panic
+            | BenchOverflowPolicy::DropAndCount
+            | BenchOverflowPolicy::StopSampling
+            | BenchOverflowPolicy::OverwriteOldest => return,
+        }
+
+        if ACTIVE_OVERFLOW_WORKER_RUNNING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let this = self.clone();
+        spawn_blocking(move || {
+            let interval = Duration::from_millis(1);
+            loop {
+                interrupt_index::wait_duration(interval);
+
+                if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
+                    if let Some(state) = bench_state_get() {
+                        state.drain_all_to_spill();
+                    }
+                    this.mark_worker_perturbed();
+                }
+
+                if ACTIVE_PAUSE_PENDING.swap(false, Ordering::AcqRel) {
+                    let policy = bench_policy_from_raw(ACTIVE_PAUSE_POLICY.load(Ordering::Acquire));
+                    this.handle_pause_flush(policy);
+                }
+
+                let running = {
+                    let inner = this.inner.lock();
+                    inner.running
+                };
+                if !running {
+                    break;
+                }
+            }
+            ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
+        });
+    }
+
     pub fn start(&self) {
         if !BENCH_ENABLED {
             return;
@@ -1445,12 +2061,17 @@ impl BenchWindow {
 
         let auto_persist_secs_opt;
         let timeout_ms_opt;
+        let resolved_cfg;
+        let log_samples_for_worker;
 
         {
             let mut inner = self.inner.lock();
             if inner.running {
                 return;
             }
+
+            resolved_cfg = inner.resolved_cfg;
+            log_samples_for_worker = inner.cfg.log_samples;
 
             inner.running = true;
             inner.start_ns = bench_now_ns();
@@ -1461,7 +2082,12 @@ impl BenchWindow {
 
             inner.reset_run_state();
 
+            if let Some(state) = bench_state() {
+                state.prepare_for_start(resolved_cfg.event_capacity);
+            }
+
             if inner.cfg.log_samples {
+                activate_bench_sampling_config(resolved_cfg);
                 SAMPLE_REFCOUNT.fetch_add(1, Ordering::Relaxed);
             }
             if inner.cfg.log_spans {
@@ -1469,6 +2095,10 @@ impl BenchWindow {
             }
             auto_persist_secs_opt = inner.cfg.auto_persist_secs;
             timeout_ms_opt = inner.cfg.timeout_ms;
+        }
+
+        if log_samples_for_worker {
+            self.spawn_overflow_worker_if_needed(resolved_cfg.overflow_policy);
         }
 
         if let Some(timeout_ms) = timeout_ms_opt {
@@ -1524,6 +2154,8 @@ impl BenchWindow {
             }
             inner.running = false;
             inner.stop_ns = Some(bench_now_ns());
+            inner.sampling_truncated |= ACTIVE_SAMPLING_STOPPED.load(Ordering::Acquire);
+            inner.perturbed_by_worker |= ACTIVE_PERTURBED_BY_WORKER.load(Ordering::Acquire);
             (inner.cfg.log_samples, inner.cfg.log_spans)
         };
 
@@ -1559,6 +2191,7 @@ impl BenchWindow {
         let persist_id = archive_persist.persist_id();
 
         let cfg: BenchWindowConfig;
+        let resolved_cfg: ResolvedBenchWindowConfig;
         let run_id: u32;
         let start_ns: u64;
         let to_ns: u64;
@@ -1567,7 +2200,6 @@ impl BenchWindow {
         let ncores: usize;
 
         let last_export_seq: Vec<u64>;
-        let mut samples_header_depth: Vec<usize>;
 
         let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>;
 
@@ -1578,6 +2210,7 @@ impl BenchWindow {
             }
 
             cfg = inner.cfg.clone();
+            resolved_cfg = inner.resolved_cfg;
             run_id = inner.current_run_id;
 
             start_ns = inner.start_ns;
@@ -1590,7 +2223,6 @@ impl BenchWindow {
             ncores = inner.ncores;
 
             last_export_seq = inner.last_export_seq.clone();
-            samples_header_depth = inner.samples_header_depth.clone();
 
             open_spans = inner.open_spans.clone();
         }
@@ -1601,11 +2233,11 @@ impl BenchWindow {
 
         let exports_vec = build_exports_for_window(
             &cfg,
+            resolved_cfg,
             run_id,
             start_ns,
             to_ns,
             &last_export_seq,
-            &samples_header_depth,
             ncores,
             &mut open_spans,
         )
@@ -1648,23 +2280,29 @@ impl BenchWindow {
                 }
 
                 if cfg.log_samples {
-                    samples_header_depth[target] =
-                        samples_header_depth[target].max(b.samples_depth[target]);
-
-                    let rows = core::mem::take(&mut b.samples_rows[target]);
-                    if !rows.is_empty() {
-                        let path = archive_stream_entry_path(
+                    let samples = core::mem::take(&mut b.samples[target]);
+                    if let Some(bytes) = encode_sample_chunk_proto(
+                        run_id,
+                        chunk_idx,
+                        target,
+                        ncores,
+                        start_ns,
+                        to_ns,
+                        resolved_cfg.max_unwind_depth,
+                        &b.max_seq_seen,
+                        &b.sample_drops,
+                        samples,
+                    ) {
+                        let path = archive_stream_file_entry_path(
                             &window_dir,
                             run_id,
                             persist_id,
                             chunk_idx,
                             target,
                             ncores,
-                            "samples",
+                            "samples.pb",
                         );
-                        let mut csv = String::new();
-                        write_sample_header(&mut csv, b.samples_depth[target]);
-                        push_csv_archive_record(&mut records, path, csv, rows, bench_now_ns());
+                        records.push(BenchArchiveRecord::data(path, bytes, bench_now_ns()));
                     }
                 }
 
@@ -1704,22 +2342,68 @@ impl BenchWindow {
             }
         }
 
-        if records.is_empty() {
-            let mut inner = self.inner.lock();
-            inner.samples_header_depth = samples_header_depth;
-            inner.open_spans = open_spans;
-            for i in 0..ncores {
-                let max_seq = merged_max_seq[i];
-                if max_seq != 0 && max_seq > inner.last_export_seq[i] {
-                    inner.last_export_seq[i] = max_seq;
-                }
-            }
-            return;
-        }
-
         let data_record_count = records.len();
+        let sample_counter_snapshot: Vec<BenchDroppedSampleCounterProto> = if cfg.log_samples {
+            bench_state()
+                .map(|state| {
+                    (0..ncores)
+                        .filter_map(|core| state.drops_for_core(core).map(|d| d.snapshot(core)))
+                        .collect()
+                })
+                .unwrap_or_else(Vec::new)
+        } else {
+            Vec::new()
+        };
+        let samples_dropped: u64 = sample_counter_snapshot
+            .iter()
+            .map(|c| c.samples_dropped)
+            .sum();
+        let samples_overwritten: u64 = sample_counter_snapshot
+            .iter()
+            .map(|c| c.samples_overwritten)
+            .sum();
+        let sampling_stopped: u64 = sample_counter_snapshot
+            .iter()
+            .map(|c| c.sampling_stopped)
+            .sum();
+
+        let (
+            inner_sampling_truncated,
+            inner_pause_flush_ns,
+            inner_logical_time_compacted,
+            inner_perturbed_by_worker,
+            pause_intervals,
+        ) = {
+            let inner = self.inner.lock();
+            (
+                inner.sampling_truncated,
+                inner.pause_flush_ns,
+                inner.logical_time_compacted,
+                inner.perturbed_by_worker,
+                inner.pause_intervals.clone(),
+            )
+        };
+        let sampling_truncated = inner_sampling_truncated
+            || sampling_stopped != 0
+            || ACTIVE_SAMPLING_STOPPED.load(Ordering::Acquire);
+        let perturbed_by_worker =
+            inner_perturbed_by_worker || ACTIVE_PERTURBED_BY_WORKER.load(Ordering::Acquire);
+        let pause_intervals_json: Vec<Value> = pause_intervals
+            .iter()
+            .map(|p| {
+                json!({
+                    "pause_start_ns": p.pause_start_ns,
+                    "pause_end_ns": p.pause_end_ns,
+                    "duration_ns": p.duration_ns,
+                    "policy": bench_overflow_policy_name(p.policy),
+                    "logical_time_shifted": p.logical_time_shifted,
+                    "reason": p.reason,
+                })
+            })
+            .collect();
+
         let commit = json!({
-            "schema": "rustos.benchpack.persist.v1",
+            "schema": "rustos.benchpack.persist.v2",
             "persist_id": persist_id,
             "window": window_dir.as_str(),
             "run_id": run_id,
@@ -1728,6 +2412,22 @@ impl BenchWindow {
             "ncores": ncores,
             "disable_per_core": cfg.disable_per_core,
             "log_samples": cfg.log_samples,
+            "sample_format": if cfg.log_samples { "protobuf:BenchSampleChunkProto" } else { "" },
+            "overflow_policy": bench_overflow_policy_name(resolved_cfg.overflow_policy),
+            "overflow_policy_raw": resolved_cfg.overflow_policy as u32,
+            "sample_capacity": resolved_cfg.sample_capacity,
+            "span_capacity": resolved_cfg.span_capacity,
+            "event_capacity": resolved_cfg.event_capacity,
+            "sample_chunk_capacity": resolved_cfg.sample_chunk_capacity,
+            "max_unwind_depth": resolved_cfg.max_unwind_depth,
+            "sampling_truncated": sampling_truncated,
+            "samples_dropped": samples_dropped,
+            "samples_overwritten": samples_overwritten,
+            "pause_count": pause_intervals_json.len(),
+            "pause_flush_ns": inner_pause_flush_ns,
+            "logical_time_compacted": inner_logical_time_compacted,
+            "perturbed_by_worker": perturbed_by_worker,
+            "pause_intervals": pause_intervals_json,
             "log_spans": cfg.log_spans,
             "log_mem_on_persist": cfg.log_mem_on_persist,
             "data_record_count": data_record_count,
@@ -1743,9 +2443,10 @@ impl BenchWindow {
         }
 
         let mut inner = self.inner.lock();
-        inner.samples_header_depth = samples_header_depth;
 
         inner.open_spans = open_spans;
+        inner.sampling_truncated = sampling_truncated;
+        inner.perturbed_by_worker = perturbed_by_worker;
 
         for i in 0..ncores {
             let max_seq = merged_max_seq[i];
@@ -1772,6 +2473,8 @@ impl Drop for BenchWindow {
             if inner.running {
                 inner.running = false;
                 inner.stop_ns = Some(bench_now_ns());
+                inner.sampling_truncated |= ACTIVE_SAMPLING_STOPPED.load(Ordering::Acquire);
+                inner.perturbed_by_worker |= ACTIVE_PERTURBED_BY_WORKER.load(Ordering::Acquire);
                 dec_samples = inner.cfg.log_samples;
                 dec_spans = inner.cfg.log_spans;
                 do_flush = inner.cfg.end_on_drop;
@@ -1843,71 +2546,6 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 
     file.set_len(0).await.map_err(|_| ())?;
     file.write(data).await.map_err(|_| ())?;
-    let _ = file.close().await;
-    Ok(())
-}
-
-fn push_padded_existing_sample_rows(out: &mut String, body: &[u8], extra_depth: usize) {
-    let Ok(text) = core::str::from_utf8(body) else {
-        return;
-    };
-
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let row = if has_newline {
-            &line[..line.len().saturating_sub(1)]
-        } else {
-            line
-        };
-
-        if !row.is_empty() {
-            out.push_str(row);
-            for _ in 0..extra_depth {
-                out.push(',');
-            }
-        }
-
-        if has_newline {
-            out.push('\n');
-        }
-    }
-}
-
-async fn rewrite_sample_csv_header(
-    path: &str,
-    file_name: &str,
-    old_depth: usize,
-    new_depth: usize,
-) -> Result<(), ()> {
-    if new_depth <= old_depth {
-        return Ok(());
-    }
-
-    let file_path = Path::from_string(&format!("{path}\\{file_name}"));
-    let mut file = File::open(
-        &file_path,
-        &[
-            OpenFlags::Open,
-            OpenFlags::ReadWrite,
-            OpenFlags::WriteThrough,
-        ],
-    )
-    .await
-    .map_err(|_| ())?;
-
-    let old = file.read().await.map_err(|_| ())?;
-    let body_start = old
-        .iter()
-        .position(|b| *b == b'\n')
-        .map(|idx| idx + 1)
-        .unwrap_or(old.len());
-
-    let mut csv = String::new();
-    write_sample_header(&mut csv, new_depth);
-    push_padded_existing_sample_rows(&mut csv, &old[body_start..], new_depth - old_depth);
-
-    file.set_len(0).await.map_err(|_| ())?;
-    file.write(csv.as_bytes()).await.map_err(|_| ())?;
     let _ = file.close().await;
     Ok(())
 }
