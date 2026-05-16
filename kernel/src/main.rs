@@ -38,6 +38,7 @@ mod exports;
 mod file_system;
 mod memory;
 mod object_manager;
+mod profiling;
 mod registry;
 mod scheduling;
 mod static_handlers;

@@ -91,6 +91,47 @@ unsafe impl<F: Send, R: Send> Sync for SharedTask<F, R> {}
 unsafe impl<R: Send> Send for SharedTaskHeader<R> {}
 unsafe impl<R: Send> Sync for SharedTaskHeader<R> {}
 
+#[cfg(miri)]
+#[derive(Clone, Copy)]
+struct ErasedBlockingTaskPtr(*const ());
+
+#[cfg(miri)]
+unsafe impl Send for ErasedBlockingTaskPtr {}
+
+#[cfg(miri)]
+static MIRI_BLOCKING_TASKS: Mutex<Vec<Option<ErasedBlockingTaskPtr>>> = Mutex::new(Vec::new());
+
+#[cfg(miri)]
+fn register_blocking_task<F, R>(task: Arc<SharedTask<F, R>>) -> usize {
+    let ptr = Arc::into_raw(task).cast::<()>();
+    let mut tasks = MIRI_BLOCKING_TASKS.lock();
+
+    for (idx, slot) in tasks.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(ErasedBlockingTaskPtr(ptr));
+            return idx + 1;
+        }
+    }
+
+    tasks.push(Some(ErasedBlockingTaskPtr(ptr)));
+    tasks.len()
+}
+
+#[cfg(miri)]
+unsafe fn take_blocking_task<F, R>(ctx: usize) -> Arc<SharedTask<F, R>> {
+    let Some(idx) = ctx.checked_sub(1) else {
+        panic!("blocking ctx passed is null handle");
+    };
+
+    let ptr = MIRI_BLOCKING_TASKS
+        .lock()
+        .get_mut(idx)
+        .and_then(Option::take)
+        .expect("blocking ctx handle missing");
+
+    Arc::from_raw(ptr.0.cast::<SharedTask<F, R>>())
+}
+
 impl<R> Drop for SharedTaskHeader<R> {
     fn drop(&mut self) {
         if self.state.load(Ordering::Acquire) == STATE_COMPLETE {
@@ -160,10 +201,20 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    #[cfg(miri)]
+    if ctx == 0 {
+        panic!("blocking ctx passed is null handle");
+    }
+
+    #[cfg(not(miri))]
     if ctx < 0x1000 {
         panic!("blocking ctx passed is null ptr");
     }
 
+    #[cfg(miri)]
+    let task = unsafe { take_blocking_task::<F, R>(ctx) };
+
+    #[cfg(not(miri))]
     let task = unsafe { Arc::from_raw(ctx as *const SharedTask<F, R>) };
     let header = &task.header;
 
@@ -200,6 +251,11 @@ where
 {
     let task = Arc::new(SharedTask::<F, R>::new(func));
     let join_ptr = Arc::into_raw(task.clone()) as *const SharedTaskHeader<R>;
+
+    #[cfg(miri)]
+    let ptr = register_blocking_task(task);
+
+    #[cfg(not(miri))]
     let ptr = Arc::into_raw(task) as usize;
 
     submit_blocking(blocking_trampoline::<F, R>, ptr);
@@ -222,6 +278,11 @@ where
     for func in funcs {
         let task = Arc::new(SharedTask::<F, R>::new(func));
         let join_ptr = Arc::into_raw(task.clone()) as *const SharedTaskHeader<R>;
+
+        #[cfg(miri)]
+        let ptr = register_blocking_task(task);
+
+        #[cfg(not(miri))]
         let ptr = Arc::into_raw(task) as usize;
 
         jobs.push(Job {

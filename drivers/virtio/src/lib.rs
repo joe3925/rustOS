@@ -108,8 +108,6 @@ where
         if spin_cycles == 0 || rdtsc().wrapping_sub(start_cycles) >= spin_cycles {
             break;
         }
-
-        core::hint::spin_loop();
     }
 
     completion.await

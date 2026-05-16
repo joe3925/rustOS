@@ -1,8 +1,14 @@
 **/target/
 *.vhdx
 *.lib
+<<<<<<< HEAD
 *.pb 
 .kbs/*
 *.exe
 *.pdb
 kernel-bench-studio.json
+=======
+.kbs/*
+Cargo.lock
+
+>>>>>>> ab0aa7a46ac1eeb1321fec72d83506b86bc052ef

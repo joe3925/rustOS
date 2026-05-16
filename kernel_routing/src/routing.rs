@@ -142,24 +142,8 @@ pub async fn send_request_to_stack_top(
 
 /// Complete a request.
 pub fn complete_request(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
-    let mut guard = handle.write();
-
-    if guard.completed {
-        return guard.status.clone();
-    }
-
-    if let Some(fp) = guard.completion_routine.take() {
-        let f: CompletionRoutine = unsafe { core::mem::transmute(fp) };
-        let context = guard.completion_context;
-        guard.status = f(&mut guard, context);
-    }
-
-    if guard.status == DriverStatus::ContinueStep {
-        guard.status = DriverStatus::Success;
-    }
-    guard.completion_context = 0;
-    guard.completed = true;
-    guard.status.clone()
+    let guard = handle.write();
+    guard.complete()
 }
 
 async fn call_device_handler(

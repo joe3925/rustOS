@@ -848,8 +848,7 @@ impl<'a> Iterator for IoBufferDmaSegmentIter<'a> {
 
                 let start_in_page = if self.index == 0 { page_offset } else { 0 };
                 let bytes = self.remaining.min(IOBUFFER_PAGE_SIZE - start_in_page);
-                let dma_addr =
-                    iova_base + (self.index * IOBUFFER_PAGE_SIZE + start_in_page) as u64;
+                let dma_addr = iova_base + (self.index * IOBUFFER_PAGE_SIZE + start_in_page) as u64;
                 self.remaining -= bytes;
                 self.index += 1;
                 Some(IoBufferDmaSegment {
@@ -898,7 +897,9 @@ fn page_chunk_segment_count(page_offset: usize, byte_len: usize) -> usize {
     if byte_len == 0 {
         0
     } else {
-        page_offset.saturating_add(byte_len).div_ceil(IOBUFFER_PAGE_SIZE)
+        page_offset
+            .saturating_add(byte_len)
+            .div_ceil(IOBUFFER_PAGE_SIZE)
     }
 }
 
@@ -911,8 +912,13 @@ fn identity_segment_count(
     let mut current_offset = frame_offset;
     let mut remaining = byte_len;
     let mut count = 0;
-    while next_identity_segment(page_frames, &mut frame_index, &mut current_offset, &mut remaining)
-        .is_some()
+    while next_identity_segment(
+        page_frames,
+        &mut frame_index,
+        &mut current_offset,
+        &mut remaining,
+    )
+    .is_some()
     {
         count += 1;
     }

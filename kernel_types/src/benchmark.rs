@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::time::Duration;
 
 /// Logical CPU identifier used by the bench API.
@@ -120,6 +121,125 @@ pub const BENCH_FLAG_IRQ: u32 = 1 << 0; // allow irq waits
 pub const BENCH_FLAG_POLL: u32 = 1 << 1; // pure polling (no waits)
 pub const BENCH_FLAG_REQUEST: u32 = 1 << 2; // route through pnp_send_request + PDO read
 
+pub const BENCH_SAMPLE_PROTO_SCHEMA_VERSION: u32 = 2;
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchOverflowPolicy {
+    /// Panic immediately when a per-core sample buffer fills; intended for profiler debugging.
+    Panic = 0,
+    /// Drop the new sample, increment overflow/drop counters, and leave the workload unperturbed.
+    DropAndCount = 1,
+    /// Stop accepting new samples after the first full buffer, but allow the workload to continue.
+    StopSampling = 2,
+    /// Queue one background drain worker when buffers are full or near full; marks the run perturbed.
+    QueueDrainWorker = 3,
+    /// Pause measured workload time, flush buffers, shift logical time forward, then resume sampling.
+    PauseFlushCompactTime = 4,
+    /// Pause measured workload time, flush buffers without shifting timestamps, then resume sampling.
+    PauseFlushWallTime = 5,
+    /// Reuse the per-core buffer as a circular buffer, keeping newest samples and counting overwrites.
+    OverwriteOldest = 6,
+}
+
+impl Default for BenchOverflowPolicy {
+    fn default() -> Self {
+        BenchOverflowPolicy::DropAndCount
+    }
+}
+
+pub const BENCH_FRAME_KIND_UNKNOWN: u32 = 0;
+pub const BENCH_FRAME_KIND_KERNEL_ELF: u32 = 1;
+pub const BENCH_FRAME_KIND_PE_X64: u32 = 2;
+
+pub const BENCH_UNWIND_STATUS_OK: u32 = 0;
+pub const BENCH_UNWIND_STATUS_TRUNCATED: u32 = 1 << 0;
+pub const BENCH_UNWIND_STATUS_NO_UNWIND_INFO: u32 = 1 << 1;
+pub const BENCH_UNWIND_STATUS_BAD_STACK_READ: u32 = 1 << 2;
+pub const BENCH_UNWIND_STATUS_BAD_UNWIND_INFO: u32 = 1 << 3;
+pub const BENCH_UNWIND_STATUS_UNSUPPORTED_OPCODE: u32 = 1 << 4;
+pub const BENCH_UNWIND_STATUS_LEAF_FALLBACK: u32 = 1 << 5;
+pub const BENCH_UNWIND_STATUS_PE_UNWIND: u32 = 1 << 6;
+pub const BENCH_UNWIND_STATUS_KERNEL_ELF_FRAME: u32 = 1 << 7;
+pub const BENCH_UNWIND_STATUS_UNKNOWN_FRAME: u32 = 1 << 8;
+pub const BENCH_UNWIND_STATUS_STACK_BOUNDS_MISSING: u32 = 1 << 9;
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BenchSampleChunkProto {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(uint32, tag = "2")]
+    pub run_id: u32,
+    #[prost(uint32, tag = "3")]
+    pub chunk_index: u32,
+    #[prost(uint32, tag = "4")]
+    pub target_core_id: u32,
+    #[prost(bool, tag = "5")]
+    pub aggregate: bool,
+    #[prost(uint64, tag = "6")]
+    pub start_ns: u64,
+    #[prost(uint64, tag = "7")]
+    pub end_ns: u64,
+    #[prost(uint32, tag = "8")]
+    pub frame_limit: u32,
+    #[prost(message, repeated, tag = "9")]
+    pub samples: Vec<BenchSampleProto>,
+    #[prost(message, repeated, tag = "10")]
+    pub dropped: Vec<BenchDroppedSampleCounterProto>,
+    #[prost(uint64, repeated, packed = "true", tag = "11")]
+    pub max_seq_by_core: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BenchSampleProto {
+    #[prost(uint64, tag = "1")]
+    pub seq: u64,
+    #[prost(uint64, tag = "2")]
+    pub timestamp_ns: u64,
+    #[prost(uint32, tag = "3")]
+    pub core_id: u32,
+    #[prost(uint64, tag = "4")]
+    pub task_id: u64,
+    #[prost(uint64, tag = "5")]
+    pub sampled_rip: u64,
+    #[prost(uint32, tag = "6")]
+    pub unwind_status: u32,
+    #[prost(uint64, repeated, packed = "true", tag = "7")]
+    pub frames: Vec<u64>,
+    #[prost(uint32, repeated, packed = "true", tag = "8")]
+    pub frame_kinds: Vec<u32>,
+    #[prost(uint64, tag = "9")]
+    pub stack_low: u64,
+    #[prost(uint64, tag = "10")]
+    pub stack_high: u64,
+    #[prost(uint64, optional, tag = "11")]
+    pub adjusted_timestamp_ns: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct BenchDroppedSampleCounterProto {
+    #[prost(uint32, tag = "1")]
+    pub core_id: u32,
+    #[prost(uint64, tag = "2")]
+    pub ring_full: u64,
+    #[prost(uint64, tag = "3")]
+    pub ring_lock_busy: u64,
+    #[prost(uint64, tag = "4")]
+    pub bad_context: u64,
+    #[prost(uint64, tag = "5")]
+    pub unwind_failures: u64,
+    #[prost(uint64, tag = "6")]
+    pub samples_dropped: u64,
+    #[prost(uint64, tag = "7")]
+    pub samples_overwritten: u64,
+    #[prost(uint64, tag = "8")]
+    pub sampling_stopped: u64,
+    #[prost(uint64, tag = "9")]
+    pub flush_count: u64,
+    #[prost(uint64, tag = "10")]
+    pub pause_flush_ns: u64,
+}
+
 /// Configuration for a benchmark window.
 #[repr(C)]
 #[derive(Clone, Debug)]
@@ -144,6 +264,10 @@ pub struct BenchWindowConfig {
 
     pub sample_reserve: usize,
     pub span_reserve: usize,
+    pub overflow_policy: Option<BenchOverflowPolicy>,
+    pub sample_capacity: Option<usize>,
+    pub sample_chunk_capacity: Option<usize>,
+    pub max_unwind_depth: Option<usize>,
 }
 
 impl Default for BenchWindowConfig {
@@ -161,6 +285,10 @@ impl Default for BenchWindowConfig {
             auto_persist_secs: None,
             sample_reserve: 8192,
             span_reserve: 1024,
+            overflow_policy: None,
+            sample_capacity: None,
+            sample_chunk_capacity: None,
+            max_unwind_depth: None,
         }
     }
 }
