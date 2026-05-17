@@ -7,6 +7,12 @@ use x86_64::VirtAddr;
 
 pub const HEAP_START: usize = 0xFFFF_8600_0000_0000;
 pub const HEAP_SIZE: u64 = Size1GiB::SIZE * 4;
+pub const BOOTSTRAP_HEAP_SIZE: u64 = Size1GiB::SIZE;
+pub const MIMALLOC_HEAP_START: usize = HEAP_START + BOOTSTRAP_HEAP_SIZE as usize;
+pub const MIMALLOC_HEAP_SIZE: u64 = HEAP_SIZE - BOOTSTRAP_HEAP_SIZE;
+pub const MIMALLOC_META_HEAP_SIZE: u64 = 64 * 1024 * 1024;
+pub const MIMALLOC_ARENA_START: usize = MIMALLOC_HEAP_START + MIMALLOC_META_HEAP_SIZE as usize;
+pub const MIMALLOC_ARENA_SIZE: u64 = MIMALLOC_HEAP_SIZE - MIMALLOC_META_HEAP_SIZE;
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
     let heap_size = align_up_4k(HEAP_SIZE);

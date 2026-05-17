@@ -1,4 +1,6 @@
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
+use crate::benchmarking::used_memory;
+use crate::memory::heap::HEAP_SIZE;
 use crate::util::trigger_triple_fault;
 use crate::util::DRIVE_WINDOW;
 use alloc::{
@@ -395,15 +397,18 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     ensure_dir(&vfs_toml).await;
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
-    let secs = boot_ms / 1000;
+    let secs = boot_ms as f64 / 1000 as f64;
     let frac = boot_ms % 1000;
 
     let used_bytes = USED_MEMORY.load(core::sync::atomic::Ordering::Acquire);
-    let used_mib = used_bytes / (1024 * 1024);
-    let used_mib_frac = (used_bytes % (1024 * 1024)) * 1000 / (1024 * 1024);
+    let used_mib = used_bytes as f64 / (1024 * 1024) as f64;
     println!(
-        "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
-        secs, frac, used_mib, used_mib_frac
+        "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB, Used actual: {:.2} MiB",
+        secs,
+        used_mib,
+        used_memory() as f64 / (1024.0 * 1024.0),
+        (used_mib - HEAP_SIZE as f64 / (1024.0 * 1024.0))
+            + (used_memory() as f64 / (1024.0 * 1024.0)) // for now the heap is allocated upfront so this value is the actual amount of memory used total
     );
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
@@ -415,12 +420,13 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
             //
             // }
             //bench_async_vs_sync_call_latency_async().await;
-            DRIVE_WINDOW.start();
+            //DRIVE_WINDOW.start();
             //loop {
             bench_c_drive_io_async().await;
+            //run_virtio_bench_matrix_print().await;
             //wait_duration(Duration::from_secs(10));
             //}
-            DRIVE_WINDOW.stop_and_persist().await;
+            //DRIVE_WINDOW.stop_and_persist().await;
             //run_virtio_bench_matrix_print().await;
 
             //trigger_triple_fault();

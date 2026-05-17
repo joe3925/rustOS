@@ -76,9 +76,9 @@ lazy_static! {
         end_on_drop: false,
         timeout_ms: None,
         auto_persist_secs: None,
-        sample_reserve: 256,
-        span_reserve: 256,
-        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::PauseFlushCompactTime),
+        sample_reserve: 400000,
+        span_reserve: 0,
+        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
         sample_capacity: None,
         sample_chunk_capacity: None,
         max_unwind_depth: None,
@@ -172,6 +172,8 @@ pub unsafe fn init() {
     }
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
+    crate::memory::allocator::enable_mimalloc();
+
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);

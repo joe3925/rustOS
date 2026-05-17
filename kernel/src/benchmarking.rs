@@ -49,7 +49,7 @@ use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = true;
+const BENCH_ENABLED: bool = false;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -2026,10 +2026,7 @@ impl BenchWindow {
 
         let this = self.clone();
         spawn_blocking(move || {
-            let interval = Duration::from_millis(1);
             loop {
-                interrupt_index::wait_duration(interval);
-
                 if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
                     if let Some(state) = bench_state_get() {
                         state.drain_all_to_spill();

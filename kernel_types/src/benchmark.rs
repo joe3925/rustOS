@@ -244,29 +244,45 @@ pub struct BenchDroppedSampleCounterProto {
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct BenchWindowConfig {
+    /// Human-readable window name used when allocating the benchmark output directory.
     pub name: &'static str,
+    /// Root folder path where benchmark session archives are written.
     pub folder: &'static str,
 
+    /// When true, capture and export sampled callchain events.
     pub log_samples: bool,
+    /// When true, capture and export span events.
     pub log_spans: bool,
-    /// When true, skip per-core exports to avoid the overhead of per-core processing.
+    /// When true, skip per-core exports and write only aggregate exports.
     pub disable_per_core: bool,
 
-    // When true, export a per-event "memory.csv" stream that includes BOTH
-    // heap/memory and scheduler counters. Sampling is driven by span/sample
-    // events (not persist).
+    /// When true, export a per-event `memory.csv` stream containing memory, heap, and scheduler counters.
+    /// Rows are driven by span/sample events rather than by persist calls.
     pub log_mem_on_persist: bool,
+    /// When true, include debug metadata such as kernel symbol information in each persist.
     pub export_debug_metadata: bool,
 
+    /// When true, stop and asynchronously persist the window when the handle is dropped.
     pub end_on_drop: bool,
+    /// Optional timeout duration after `start` before the window automatically stops and persists.
     pub timeout_ms: Option<Duration>,
+    /// Optional interval duration between automatic persists while the window is running.
     pub auto_persist_secs: Option<Duration>,
 
+    /// Default per-core sample event capacity, in events; zero falls back to the kernel default.
     pub sample_reserve: usize,
+    /// Per-core span event capacity, in events, added only when span logging is enabled.
     pub span_reserve: usize,
+    /// Optional policy applied when a sample cannot be inserted into the per-core event buffer.
     pub overflow_policy: Option<BenchOverflowPolicy>,
+    /// Optional override for the per-core sample event budget, in events.
+    /// When absent, `sample_reserve` is used, or the kernel default if `sample_reserve` is zero.
+    /// This contributes to the shared per-core event buffer size, not a separate sample-only buffer.
     pub sample_capacity: Option<usize>,
+    /// Optional maximum number of drained events per persisted export chunk, in events.
+    /// This controls output chunking during persist and does not change in-memory buffer capacity.
     pub sample_chunk_capacity: Option<usize>,
+    /// Optional maximum captured unwind depth, in frames.
     pub max_unwind_depth: Option<usize>,
 }
 
