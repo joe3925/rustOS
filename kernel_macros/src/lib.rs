@@ -1002,3 +1002,258 @@ fn type_is_arc(ty: &Type) -> bool {
         _ => false,
     }
 }
+
+#[proc_macro_attribute]
+pub fn exception_handler(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return syn::Error::new(
+            Span::call_site(),
+            "#[exception_handler] does not accept arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let mut func = parse_macro_input!(input as ItemFn);
+
+    if let Err(e) = validate_exception_handler(&func) {
+        return e.to_compile_error().into();
+    }
+
+    transform_exception_handler(&mut func).into()
+}
+
+fn validate_exception_handler(func: &ItemFn) -> syn::Result<()> {
+    let sig = &func.sig;
+
+    if sig.constness.is_some() {
+        return Err(syn::Error::new_spanned(
+            sig.constness,
+            "#[exception_handler] does not support const functions",
+        ));
+    }
+
+    if sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            sig.asyncness,
+            "#[exception_handler] does not support async functions",
+        ));
+    }
+
+    if !sig.generics.params.is_empty() || sig.generics.where_clause.is_some() {
+        return Err(syn::Error::new_spanned(
+            &sig.generics,
+            "#[exception_handler] does not support generic functions",
+        ));
+    }
+
+    if let Some(variadic) = &sig.variadic {
+        return Err(syn::Error::new_spanned(
+            variadic,
+            "#[exception_handler] does not support variadic parameters",
+        ));
+    }
+
+    let param_count = sig.inputs.len();
+    if param_count != 1 && param_count != 2 {
+        return Err(syn::Error::new_spanned(
+            &sig.inputs,
+            "#[exception_handler] expects either (InterruptStackFrame) or (InterruptStackFrame, error_code)",
+        ));
+    }
+
+    for input in &sig.inputs {
+        if let FnArg::Receiver(rec) = input {
+            return Err(syn::Error::new_spanned(
+                rec,
+                "#[exception_handler] only supports free functions (no self receiver)",
+            ));
+        }
+    }
+
+    let Some(FnArg::Typed(frame_arg)) = sig.inputs.first() else {
+        return Err(syn::Error::new_spanned(
+            &sig.inputs,
+            "#[exception_handler] expects an InterruptStackFrame parameter",
+        ));
+    };
+
+    if !matches!(*frame_arg.pat, Pat::Ident(_)) {
+        return Err(syn::Error::new_spanned(
+            &frame_arg.pat,
+            "#[exception_handler] parameters must be simple identifiers",
+        ));
+    }
+
+    if !type_is_interrupt_stack_frame(&frame_arg.ty) {
+        return Err(syn::Error::new_spanned(
+            &frame_arg.ty,
+            "#[exception_handler] first parameter must be InterruptStackFrame, &InterruptStackFrame, or &mut InterruptStackFrame",
+        ));
+    }
+
+    if param_count == 2 {
+        let Some(FnArg::Typed(error_arg)) = sig.inputs.iter().nth(1) else {
+            return Err(syn::Error::new_spanned(
+                &sig.inputs,
+                "#[exception_handler] error-code parameter must be a typed argument",
+            ));
+        };
+
+        if !matches!(*error_arg.pat, Pat::Ident(_)) {
+            return Err(syn::Error::new_spanned(
+                &error_arg.pat,
+                "#[exception_handler] parameters must be simple identifiers",
+            ));
+        }
+
+        if !type_is_exception_error_code(&error_arg.ty) {
+            return Err(syn::Error::new_spanned(
+                &error_arg.ty,
+                "#[exception_handler] second parameter must be u64 or PageFaultErrorCode",
+            ));
+        }
+    }
+
+    match &sig.output {
+        ReturnType::Default => {}
+        ReturnType::Type(_, ty) if matches!(&**ty, Type::Never(_)) => {}
+        ReturnType::Type(_, ty) => {
+            return Err(syn::Error::new_spanned(
+                ty,
+                "#[exception_handler] functions must return () or !",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
+    let attrs = func.attrs.clone();
+    let wrapper_attrs: Vec<_> = attrs
+        .iter()
+        .filter(|attr| {
+            attr.path().is_ident("cfg")
+                || attr.path().is_ident("cfg_attr")
+                || attr.path().is_ident("doc")
+                || attr.path().is_ident("allow")
+        })
+        .cloned()
+        .collect();
+    let vis = &func.vis;
+    let wrapper_ident = func.sig.ident.clone();
+    let inner_ident = format_ident!("__exception_handler_impl_{}", wrapper_ident);
+    let has_error_code = func.sig.inputs.len() == 2;
+
+    normalize_exception_frame_param(&mut func.sig);
+    func.sig.ident = inner_ident.clone();
+    func.sig.abi = Some(syn::parse_quote!(extern "win64"));
+
+    let inner_sig = &func.sig;
+    let body = &func.block;
+    let wrapper = if has_error_code {
+        quote! {
+            #[unsafe(naked)]
+            #vis extern "win64" fn #wrapper_ident() {
+                ::core::arch::naked_asm!(
+                    "cli",
+                    "push r15", "push r14", "push r13", "push r12",
+                    "push r11", "push r10", "push r9", "push r8",
+                    "push rdi", "push rsi", "push rbp", "push rbx",
+                    "push rdx", "push rcx", "push rax",
+                    "lea  rcx, [rsp + {frame_offset}]",
+                    "mov  rdx, [rsp + {error_code_offset}]",
+                    "cld",
+                    "sub  rsp, 32",
+                    "call {handler}",
+                    "add  rsp, 32",
+                    "pop  rax", "pop  rcx", "pop  rdx", "pop  rbx",
+                    "pop  rbp", "pop  rsi", "pop  rdi", "pop  r8",
+                    "pop  r9", "pop  r10", "pop  r11", "pop  r12",
+                    "pop  r13", "pop  r14", "pop  r15",
+                    "add  rsp, 8",
+                    "iretq",
+                    frame_offset = const 128,
+                    error_code_offset = const 120,
+                    handler = sym #inner_ident,
+                );
+            }
+        }
+    } else {
+        quote! {
+            #[unsafe(naked)]
+            #vis extern "win64" fn #wrapper_ident() {
+                ::core::arch::naked_asm!(
+                    "cli",
+                    "push r15", "push r14", "push r13", "push r12",
+                    "push r11", "push r10", "push r9", "push r8",
+                    "push rdi", "push rsi", "push rbp", "push rbx",
+                    "push rdx", "push rcx", "push rax",
+                    "lea  rcx, [rsp + {frame_offset}]",
+                    "cld",
+                    "sub  rsp, 32",
+                    "call {handler}",
+                    "add  rsp, 32",
+                    "pop  rax", "pop  rcx", "pop  rdx", "pop  rbx",
+                    "pop  rbp", "pop  rsi", "pop  rdi", "pop  r8",
+                    "pop  r9", "pop  r10", "pop  r11", "pop  r12",
+                    "pop  r13", "pop  r14", "pop  r15",
+                    "iretq",
+                    frame_offset = const 120,
+                    handler = sym #inner_ident,
+                );
+            }
+        }
+    };
+
+    quote! {
+        #(#attrs)*
+        #inner_sig #body
+
+        #(#wrapper_attrs)*
+        #wrapper
+    }
+}
+
+fn normalize_exception_frame_param(sig: &mut syn::Signature) {
+    let Some(FnArg::Typed(frame_arg)) = sig.inputs.iter_mut().next() else {
+        return;
+    };
+
+    if matches!(&*frame_arg.ty, Type::Reference(_)) {
+        return;
+    }
+
+    let frame_ty = frame_arg.ty.clone();
+    frame_arg.ty = Box::new(syn::parse_quote!(&mut #frame_ty));
+}
+
+fn type_is_interrupt_stack_frame(ty: &Type) -> bool {
+    match ty {
+        Type::Reference(r) => type_is_interrupt_stack_frame(&r.elem),
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "InterruptStackFrame")
+            .unwrap_or(false),
+        Type::Paren(p) => type_is_interrupt_stack_frame(&p.elem),
+        Type::Group(g) => type_is_interrupt_stack_frame(&g.elem),
+        _ => false,
+    }
+}
+
+fn type_is_exception_error_code(ty: &Type) -> bool {
+    match ty {
+        Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident == "u64" || s.ident == "PageFaultErrorCode")
+            .unwrap_or(false),
+        Type::Paren(p) => type_is_exception_error_code(&p.elem),
+        Type::Group(g) => type_is_exception_error_code(&g.elem),
+        _ => false,
+    }
+}

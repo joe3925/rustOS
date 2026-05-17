@@ -1,5 +1,4 @@
 #![feature(trusted_random_access)]
-#![feature(abi_x86_interrupt)]
 #![feature(ascii_char)]
 #![no_std]
 #![no_main]
