@@ -8,12 +8,14 @@ use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
 
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
+
+pub static MIMALLOC_ARENA_COMMITTED: AtomicUsize = AtomicUsize::new(0);
 
 unsafe extern "C" {
     fn mi_process_init();
@@ -416,6 +418,29 @@ unsafe impl GlobalAlloc for BuddyLocked {
             )
         })
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
+    let start_addr = x86_64::VirtAddr::new(addr as u64);
+    let addr_usize = addr as usize;
+    if addr_usize < MIMALLOC_ARENA_START
+        || addr_usize + size > MIMALLOC_ARENA_START + (MIMALLOC_ARENA_SIZE as usize)
+    {
+        return false;
+    }
+
+    let flags = x86_64::structures::paging::PageTableFlags::PRESENT
+        | x86_64::structures::paging::PageTableFlags::WRITABLE;
+
+    without_interrupts(|| {
+        let res =
+            crate::memory::paging::paging::map_kernel_range(start_addr, size as u64, flags).is_ok();
+        if res {
+            MIMALLOC_ARENA_COMMITTED.fetch_add(size, Ordering::Relaxed);
+        }
+        res
+    })
 }
 
 #[no_mangle]

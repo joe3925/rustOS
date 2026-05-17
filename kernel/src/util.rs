@@ -173,7 +173,8 @@ pub unsafe fn init() {
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::allocator::enable_mimalloc();
-
+    test_full_heap_parallel();
+    test_full_heap_slow_path();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
@@ -358,6 +359,170 @@ pub fn test_full_heap() {
     println!(
         "Heap test passed: allocated and verified {} elements in the heap",
         element_count
+    );
+}
+
+struct ParallelCtx {
+    gate: Arc<AtomicBool>,
+    element_count_per_thread: usize,
+    finished: Arc<AtomicUsize>,
+}
+
+extern "win64" fn parallel_worker(ctx: usize) {
+    let ctx = unsafe { alloc::boxed::Box::from_raw(ctx as *mut ParallelCtx) };
+    while !ctx.gate.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let mut vec: Vec<u64> = Vec::with_capacity(1);
+    for i in 0..ctx.element_count_per_thread {
+        vec.push(i as u64);
+    }
+    for i in 0..ctx.element_count_per_thread {
+        if i != vec[i] as usize {
+            println!("Heap data verification failed at index {}", i);
+        }
+    }
+
+    ctx.finished.fetch_add(1, Ordering::Release);
+}
+
+pub fn test_full_heap_parallel() {
+    let threads_to_test = [1, 2, 4, 16];
+
+    for &num_threads in &threads_to_test {
+        let element_count_per_thread = ((HEAP_SIZE as usize / 4) / size_of::<u64>()) / num_threads;
+
+        let gate = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicUsize::new(0));
+
+        for i in 0..num_threads {
+            let ctx = alloc::boxed::Box::new(ParallelCtx {
+                gate: gate.clone(),
+                element_count_per_thread,
+                finished: finished.clone(),
+            });
+
+            let name = alloc::format!("heap_test_worker_{}", i);
+            let task = Task::new_kernel_mode(
+                parallel_worker,
+                alloc::boxed::Box::into_raw(ctx) as usize,
+                StackSize::Large,
+                name,
+                0,
+            );
+            SCHEDULER.add_task(task);
+        }
+
+        let sw = Stopwatch::start();
+        gate.store(true, Ordering::Release);
+
+        while finished.load(Ordering::Acquire) < num_threads {
+            core::hint::spin_loop();
+        }
+
+        let elapsed = sw.elapsed().as_millis();
+        println!(
+            "Heap test parallel ({} threads) passed: took {} ms",
+            num_threads, elapsed
+        );
+    }
+}
+
+struct SlowPathAllocCtx {
+    element_count: usize,
+    vec_ptr: Arc<AtomicUsize>,
+    vec_cap: Arc<AtomicUsize>,
+    alloc_finished: Arc<AtomicBool>,
+}
+
+extern "win64" fn slow_path_alloc_worker(ctx: usize) {
+    let ctx = unsafe { alloc::boxed::Box::from_raw(ctx as *mut SlowPathAllocCtx) };
+    let mut vec: Vec<u64> = Vec::with_capacity(1);
+    for i in 0..ctx.element_count {
+        vec.push(i as u64);
+    }
+    for i in 0..ctx.element_count {
+        if i != vec[i] as usize {
+            println!("Heap data verification failed at index {}", i);
+        }
+    }
+    let mut vec = core::mem::ManuallyDrop::new(vec);
+    ctx.vec_ptr
+        .store(vec.as_mut_ptr() as usize, Ordering::Release);
+    ctx.vec_cap.store(vec.capacity(), Ordering::Release);
+    ctx.alloc_finished.store(true, Ordering::Release);
+}
+
+struct SlowPathFreeCtx {
+    vec_ptr: usize,
+    vec_len: usize,
+    vec_cap: usize,
+    free_finished: Arc<AtomicBool>,
+}
+
+extern "win64" fn slow_path_free_worker(ctx: usize) {
+    let ctx = unsafe { alloc::boxed::Box::from_raw(ctx as *mut SlowPathFreeCtx) };
+    let vec = unsafe { Vec::from_raw_parts(ctx.vec_ptr as *mut u64, ctx.vec_len, ctx.vec_cap) };
+    drop(vec);
+    ctx.free_finished.store(true, Ordering::Release);
+}
+
+pub fn test_full_heap_slow_path() {
+    let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
+
+    let sw = Stopwatch::start();
+
+    let vec_ptr = Arc::new(AtomicUsize::new(0));
+    let vec_cap = Arc::new(AtomicUsize::new(0));
+    let alloc_finished = Arc::new(AtomicBool::new(false));
+
+    let alloc_ctx = alloc::boxed::Box::new(SlowPathAllocCtx {
+        element_count,
+        vec_ptr: vec_ptr.clone(),
+        vec_cap: vec_cap.clone(),
+        alloc_finished: alloc_finished.clone(),
+    });
+
+    let alloc_task = Task::new_kernel_mode(
+        slow_path_alloc_worker,
+        alloc::boxed::Box::into_raw(alloc_ctx) as usize,
+        StackSize::Large,
+        alloc::string::String::from("heap_alloc_worker"),
+        0,
+    );
+    SCHEDULER.add_task(alloc_task);
+
+    while !alloc_finished.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let free_finished = Arc::new(AtomicBool::new(false));
+
+    let free_ctx = alloc::boxed::Box::new(SlowPathFreeCtx {
+        vec_ptr: vec_ptr.load(Ordering::Acquire),
+        vec_len: element_count,
+        vec_cap: vec_cap.load(Ordering::Acquire),
+        free_finished: free_finished.clone(),
+    });
+
+    let free_task = Task::new_kernel_mode(
+        slow_path_free_worker,
+        alloc::boxed::Box::into_raw(free_ctx) as usize,
+        StackSize::Large,
+        alloc::string::String::from("heap_free_worker"),
+        0,
+    );
+    SCHEDULER.add_task(free_task);
+
+    while !free_finished.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let elapsed = sw.elapsed().as_millis();
+    println!(
+        "Heap test slow path (alloc/free cross-thread) passed: took {} ms",
+        elapsed
     );
 }
 

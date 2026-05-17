@@ -402,13 +402,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     let used_bytes = USED_MEMORY.load(core::sync::atomic::Ordering::Acquire);
     let used_mib = used_bytes as f64 / (1024 * 1024) as f64;
+    let heap_mib = used_memory() as f64 / (1024.0 * 1024.0);
     println!(
-        "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB, Used actual: {:.2} MiB",
-        secs,
-        used_mib,
-        used_memory() as f64 / (1024.0 * 1024.0),
-        (used_mib - HEAP_SIZE as f64 / (1024.0 * 1024.0))
-            + (used_memory() as f64 / (1024.0 * 1024.0)) // for now the heap is allocated upfront so this value is the actual amount of memory used total
+        "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB",
+        secs, used_mib, heap_mib
     );
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
