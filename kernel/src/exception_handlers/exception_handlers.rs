@@ -113,7 +113,14 @@ pub(crate) fn page_fault(stack_frame: InterruptStackFrame, error_code: PageFault
                         {
                             match task.grow_stack(flags) {
                                 Ok(true) => {}
-                                _ => break,
+                                Ok(false) => {
+                                    println!("false");
+                                    break;
+                                }
+                                Err(e) => {
+                                    println!("grow stack error: {:#?}", e);
+                                    break;
+                                }
                             }
                         }
                         if fault

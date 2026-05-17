@@ -1,13 +1,65 @@
-use std::{env, fs, path::PathBuf};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
 
 fn main() {
     let kernel_pe = artifact_path("KERNEL");
     validate_kernel_pe(&kernel_pe);
+    publish_stable_kernel_artifacts(&kernel_pe);
 
     println!("cargo:rerun-if-changed={}", kernel_pe.display());
     println!("cargo:rustc-env=KERNEL_PE_PATH={}", kernel_pe.display());
+}
+
+fn publish_stable_kernel_artifacts(kernel_pe: &Path) {
+    let stable_kernel_pe = stable_target_path("kernel.exe");
+    copy_artifact(kernel_pe, &stable_kernel_pe, "kernel PE");
+
+    let kernel_pdb = kernel_pe.with_extension("pdb");
+    if kernel_pdb.is_file() {
+        copy_artifact(
+            &kernel_pdb,
+            &stable_kernel_pe.with_extension("pdb"),
+            "kernel PDB",
+        );
+        println!("cargo:rerun-if-changed={}", kernel_pdb.display());
+    }
+}
+
+fn stable_target_path(file_name: &str) -> PathBuf {
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("kernel_stub should live under workspace root");
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+
+    workspace_root.join("target").join(profile).join(file_name)
+}
+
+fn copy_artifact(source: &Path, destination: &Path, what: &str) {
+    let destination_dir = destination.parent().unwrap_or_else(|| {
+        panic!(
+            "stable {what} path has no parent: {}",
+            destination.display()
+        )
+    });
+
+    fs::create_dir_all(destination_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to create stable {what} directory {}: {err}",
+            destination_dir.display()
+        )
+    });
+    fs::copy(source, destination).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy {what} from {} to {}: {err}",
+            source.display(),
+            destination.display()
+        )
+    });
 }
 
 fn artifact_path(dep_name: &str) -> PathBuf {

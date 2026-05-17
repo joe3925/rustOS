@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -24,6 +25,7 @@ fn main() {
         .join(profile)
         .join("kernel.exe");
     assert_exists(&kernel_pe, "PE kernel image");
+    publish_stable_kernel_artifacts(&root, profile, &kernel_pe);
 
     let mut stub = cargo(&root);
     stub.args([
@@ -76,6 +78,43 @@ fn build_std_args() -> [&'static str; 4] {
         "-Zunstable-options",
         "-Zjson-target-spec",
     ]
+}
+
+fn publish_stable_kernel_artifacts(root: &Path, profile: &str, kernel_pe: &Path) {
+    let stable_kernel_pe = root.join("target").join(profile).join("kernel.exe");
+    copy_artifact(kernel_pe, &stable_kernel_pe, "kernel PE");
+
+    let kernel_pdb = kernel_pe.with_extension("pdb");
+    if kernel_pdb.is_file() {
+        copy_artifact(
+            &kernel_pdb,
+            &stable_kernel_pe.with_extension("pdb"),
+            "kernel PDB",
+        );
+    }
+}
+
+fn copy_artifact(source: &Path, destination: &Path, what: &str) {
+    let destination_dir = destination.parent().unwrap_or_else(|| {
+        panic!(
+            "stable {what} path has no parent: {}",
+            destination.display()
+        )
+    });
+
+    fs::create_dir_all(destination_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to create stable {what} directory {}: {err}",
+            destination_dir.display()
+        )
+    });
+    fs::copy(source, destination).unwrap_or_else(|err| {
+        panic!(
+            "failed to copy {what} from {} to {}: {err}",
+            source.display(),
+            destination.display()
+        )
+    });
 }
 
 fn run(mut command: Command, step: &str) {

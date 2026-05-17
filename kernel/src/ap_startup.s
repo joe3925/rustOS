@@ -81,7 +81,7 @@ startup_ap:
 
     fninit
 
-    lgdt [GDTR_ABS]
+    lgdt [TRAMPOLINE_GDTR_LIMIT_ABS]
 
     mov ecx, 0xC0000080
     rdmsr
@@ -98,7 +98,7 @@ startup_ap:
 
 .code64
 long_mode_entry:
-    mov ax, GDT_KERNEL_DATA
+    mov ax, offset GDT_KERNEL_DATA
     mov ds, ax
     mov es, ax
     mov fs, ax
@@ -106,6 +106,8 @@ long_mode_entry:
     mov ss, ax
 
     mov rsp, qword ptr [TRAMPOLINE_START_STACK_ABS]
+    and rsp, -16
+    sub rsp, 40
 
     lgdt [TRAMPOLINE_LONGMODE_LIMIT_ABS]
 

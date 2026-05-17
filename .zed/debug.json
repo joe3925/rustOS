@@ -17,7 +17,7 @@
     "postRunCommands": [
       "target modules load --file \"kernel.efi\" .text 0xFFFF8800007270F0",
 
-      "target modules add \"target/debug/deps/artifact/kernel-36e8c2e1a15aa592/bin/kernel.exe\"",
+      "target modules add \"target/debug/kernel.exe\"",
       "target modules load --file \"kernel.exe\" .text 0xFFFF850000001000",
 
       // "target modules add \"drivers/target/x86_64-rustos-driver/debug/deps/acpi.dll\"",

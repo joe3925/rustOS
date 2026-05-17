@@ -62,13 +62,13 @@ pub unsafe extern "C" fn syscall_entry() -> ! {
         "push r14",
         "push r15",
 
-        "mov  rax, rsp",
+        "mov  rbx, rsp",
         "and  rsp, -16",
-        "sub  rsp, 8",
-        "mov  [rsp], rax",
-        "mov  rdi, rax",
+        "sub  rsp, 32",
+        "mov  rcx, rbx",
+        "cld",
         "call {handler}",
-        "mov  rsp, [rsp]",
+        "mov  rsp, rbx",
 
         "pop  r15",
         "pop  r14",
@@ -161,7 +161,7 @@ const SYSCALL_TABLE: &[Handler] = &[
 ];
 
 #[no_mangle]
-pub extern "C" fn syscall_handler(frame: &mut SyscallFrame) {
+pub extern "win64" fn syscall_handler(frame: &mut SyscallFrame) {
     let _fpu_guard = KernelFpuGuard::new();
     let num = frame.rax as usize;
     // stack args start immediately after the pushed register block

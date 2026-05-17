@@ -32,7 +32,7 @@ pub struct TimerDebug {
     pub did_sched: bool,
 }
 #[no_mangle]
-pub extern "C" fn timer_interrupt_handler_c(state: *mut State) {
+pub extern "win64" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -66,21 +66,24 @@ pub extern "win64" fn timer_interrupt_entry() {
         "push rdi","push rsi","push rbp","push rbx",
         "push rdx","push rcx","push rax",
 
-        "mov  rdi, rsp",
+        "mov  rcx, rsp",
+        "mov  rbx, rsp",
         "cld",
+        "and  rsp, -16",
         "sub  rsp, 32",
         "call {handler}",
-        "add  rsp, 32",
+        "mov  rsp, rbx",
 
+        "mov  rbx, rsp",
+        "and  rsp, -16",
         "sub  rsp, 32",
         "call {eoi}",
-        "add  rsp, 32",
+        "mov  rsp, rbx",
 
         "pop  rax","pop  rcx","pop  rdx","pop  rbx",
         "pop  rbp","pop  rsi","pop  rdi","pop  r8",
         "pop  r9","pop  r10","pop  r11","pop  r12",
         "pop  r13","pop  r14","pop  r15",
-        "sti",
         "iretq",
         handler = sym timer_interrupt_handler_c,
         eoi     = sym send_eoi_timer,
