@@ -60,7 +60,14 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {
-        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+        map_range_with_huge_pages(
+            &mut mapper,
+            addr,
+            align_size,
+            &mut frame_allocator,
+            flags,
+            false,
+        )
     }?;
     Ok(addr)
 }
@@ -128,7 +135,14 @@ pub extern "win64" fn allocate_kernel_range_mapped(
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {
-        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+        map_range_with_huge_pages(
+            &mut mapper,
+            addr,
+            align_size,
+            &mut frame_allocator,
+            flags,
+            false,
+        )
     }?;
     Ok(addr)
 }
@@ -188,7 +202,14 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     unsafe {
-        map_range_with_huge_pages(&mut mapper, addr, align_size, &mut frame_allocator, flags)
+        map_range_with_huge_pages(
+            &mut mapper,
+            addr,
+            align_size,
+            &mut frame_allocator,
+            flags,
+            false,
+        )
     }?;
     Ok(addr)
 }

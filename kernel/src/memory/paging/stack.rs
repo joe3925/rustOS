@@ -74,7 +74,7 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
     //   [stack_top-map_bytes .. stack_top)             mapped initial stack
     let map_start = stack_top - map_bytes;
 
-    unsafe { map_kernel_range(map_start, map_bytes, flags) }?;
+    unsafe { map_kernel_range(map_start, map_bytes, flags, false) }?;
     Ok(stack_top)
 }
 

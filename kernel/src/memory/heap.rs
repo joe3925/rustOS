@@ -32,6 +32,7 @@ pub(crate) fn init_heap() {
             heap_size,
             &mut frame_allocator,
             flags,
+            false,
         )
         .expect("Heap creation failed, can't recover")
     };
