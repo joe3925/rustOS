@@ -19,9 +19,11 @@ use goblin::pe::optional_header::MAGIC_64;
 use goblin::pe::section_table::{SectionTable, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 use goblin::pe::PE;
 use kernel_abi::{
-    BootInfo, FrameBuffer, FrameBufferInfo, KernelSection, KernelSections, MemoryRegion,
-    MemoryRegionKind, MemoryRegions, Optional, PixelFormat, KERNEL_PE_BASE,
-    MAX_BOOT_MEMORY_REGIONS, MAX_KERNEL_SECTIONS, PHYSICAL_MEMORY_OFFSET, RUSTOS_BOOT_INFO_MAGIC,
+    BootInfo, FrameBuffer, FrameBufferInfo, KernelSection, KernelSections, KernelSymbol,
+    KernelSymbolString, KernelSymbols, KernelTextSection, MemoryRegion, MemoryRegionKind,
+    MemoryRegions, Optional, PeTlsDirectory, PixelFormat, KERNEL_PE_BASE, MAX_BOOT_MEMORY_REGIONS,
+    MAX_KERNEL_EXPORT_SYMBOLS, MAX_KERNEL_IMPORT_SYMBOLS, MAX_KERNEL_SECTIONS,
+    MAX_KERNEL_SYMBOL_STRING_BYTES, PHYSICAL_MEMORY_OFFSET, RUSTOS_BOOT_INFO_MAGIC,
     RUSTOS_BOOT_INFO_VERSION, STUB_DYNAMIC_RANGE_END, STUB_DYNAMIC_RANGE_START, STUB_IMAGE_BASE,
 };
 use x86_64::instructions::{hlt, port::Port};
@@ -110,6 +112,13 @@ static mut ABI_MEMORY_REGIONS: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] =
     [MemoryRegion::empty(); MAX_BOOT_MEMORY_REGIONS];
 static mut ABI_KERNEL_SECTIONS: [KernelSection; MAX_KERNEL_SECTIONS] =
     [KernelSection::empty(); MAX_KERNEL_SECTIONS];
+static mut ABI_KERNEL_IMPORT_SYMBOLS: [KernelSymbol; MAX_KERNEL_IMPORT_SYMBOLS] =
+    [KernelSymbol::empty(); MAX_KERNEL_IMPORT_SYMBOLS];
+static mut ABI_KERNEL_EXPORT_SYMBOLS: [KernelSymbol; MAX_KERNEL_EXPORT_SYMBOLS] =
+    [KernelSymbol::empty(); MAX_KERNEL_EXPORT_SYMBOLS];
+static mut ABI_KERNEL_SYMBOL_STRING_BYTES: [u8; MAX_KERNEL_SYMBOL_STRING_BYTES] =
+    [0; MAX_KERNEL_SYMBOL_STRING_BYTES];
+static mut ABI_KERNEL_SYMBOL_STRING_LEN: usize = 0;
 static mut ABI_BOOT_INFO: BootInfo = BootInfo::empty();
 static mut ALLOCATED_RANGES: [PhysRange; MAX_ALLOCATED_RANGES] =
     [PhysRange::empty(); MAX_ALLOCATED_RANGES];
@@ -185,6 +194,7 @@ fn load_kernel_pe(
         copy_section(image_base, image_size, section)?;
     }
 
+    prepare_kernel_pe_tls(image_base, image_size, &pe)?;
     apply_section_permissions(mapper, image_base, image_size, &pe.sections)?;
 
     let entry = image_base
@@ -218,22 +228,37 @@ fn validate_kernel_pe(pe: &PE<'_>) -> Result<(), &'static str> {
     if pe.entry == 0 {
         return Err("kernel_stub: kernel PE has no entry point");
     }
-    if !pe.imports.is_empty() || directory_present(opt.data_directories.get_import_table()) {
-        return Err("kernel_stub: kernel PE imports are not supported");
-    }
     if pe.relocation_data.is_some()
         || directory_present(opt.data_directories.get_base_relocation_table())
     {
         return Err("kernel_stub: kernel PE relocations are not supported");
-    }
-    if pe.tls_data.is_some() || directory_present(opt.data_directories.get_tls_table()) {
-        return Err("kernel_stub: kernel PE TLS is not supported");
     }
     if directory_present(opt.data_directories.get_delay_import_descriptor()) {
         return Err("kernel_stub: kernel PE delay imports are not supported");
     }
     if pe.sections.len() > MAX_KERNEL_SECTIONS {
         return Err("kernel_stub: kernel PE has too many sections");
+    }
+
+    Ok(())
+}
+
+fn prepare_kernel_pe_tls(
+    image_base: u64,
+    image_size: u64,
+    pe: &PE<'_>,
+) -> Result<(), &'static str> {
+    let Some(tls) = pe.tls_data.as_ref() else {
+        return Ok(());
+    };
+
+    let directory = pe_tls_directory_from_goblin(tls.image_tls_directory);
+    validate_pe_tls_directory(image_base, image_size, &directory)?;
+
+    if directory.address_of_index != 0 {
+        unsafe {
+            (directory.address_of_index as *mut u32).write(0);
+        }
     }
 
     Ok(())
@@ -376,6 +401,9 @@ fn build_handoff(
 ) -> Result<&'static mut BootInfo, &'static str> {
     let memory_region_count = translate_memory_regions(&boot_info.memory_regions)?;
     let section_count = translate_kernel_sections(loaded.image_base, loaded.section_count)?;
+    let kernel_text = translate_kernel_text_section(loaded.image_base)?;
+    let pe_tls_directory = translate_kernel_tls_directory(loaded.image_base, loaded.image_size)?;
+    let (kernel_import_count, kernel_export_count) = translate_kernel_symbols()?;
 
     let framebuffer = match boot_info.framebuffer.as_mut() {
         Some(fb) => {
@@ -412,6 +440,15 @@ fn build_handoff(
             recursive_index: translate_optional(boot_info.recursive_index),
             rsdp_addr: translate_optional(boot_info.rsdp_addr),
             tls_template: Optional::None,
+            pe_tls_directory,
+            kernel_imports: KernelSymbols {
+                ptr: addr_of_mut!(ABI_KERNEL_IMPORT_SYMBOLS).cast::<KernelSymbol>(),
+                len: kernel_import_count,
+            },
+            kernel_exports: KernelSymbols {
+                ptr: addr_of_mut!(ABI_KERNEL_EXPORT_SYMBOLS).cast::<KernelSymbol>(),
+                len: kernel_export_count,
+            },
             ramdisk_addr: translate_optional(boot_info.ramdisk_addr),
             ramdisk_len: boot_info.ramdisk_len,
             kernel_addr: 0,
@@ -420,6 +457,7 @@ fn build_handoff(
             kernel_image_base: loaded.image_base,
             kernel_image_size: loaded.image_size,
             kernel_entry: loaded.entry,
+            kernel_text,
             kernel_sections: KernelSections {
                 ptr: addr_of_mut!(ABI_KERNEL_SECTIONS).cast::<KernelSection>(),
                 len: section_count,
@@ -530,6 +568,156 @@ fn translate_kernel_sections(image_base: u64, section_count: usize) -> Result<us
     }
 
     Ok(section_count)
+}
+
+fn translate_kernel_text_section(
+    image_base: u64,
+) -> Result<Optional<KernelTextSection>, &'static str> {
+    let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: failed to reparse PE .text")?;
+
+    for section in &pe.sections {
+        if section.name == *b".text\0\0\0" {
+            let size = core::cmp::max(section.virtual_size, section.size_of_raw_data) as u64;
+            return Ok(Optional::Some(KernelTextSection {
+                base: image_base + section.virtual_address as u64,
+                size,
+            }));
+        }
+    }
+
+    Ok(Optional::None)
+}
+
+fn translate_kernel_tls_directory(
+    image_base: u64,
+    image_size: u64,
+) -> Result<Optional<PeTlsDirectory>, &'static str> {
+    let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: failed to reparse PE TLS")?;
+    let Some(tls) = pe.tls_data.as_ref() else {
+        return Ok(Optional::None);
+    };
+
+    let directory = pe_tls_directory_from_goblin(tls.image_tls_directory);
+    validate_pe_tls_directory(image_base, image_size, &directory)?;
+    Ok(Optional::Some(directory))
+}
+
+fn pe_tls_directory_from_goblin(directory: goblin::pe::tls::ImageTlsDirectory) -> PeTlsDirectory {
+    PeTlsDirectory {
+        start_address_of_raw_data: directory.start_address_of_raw_data,
+        end_address_of_raw_data: directory.end_address_of_raw_data,
+        address_of_index: directory.address_of_index,
+        address_of_callbacks: directory.address_of_callbacks,
+        size_of_zero_fill: directory.size_of_zero_fill,
+        characteristics: directory.characteristics,
+    }
+}
+
+fn validate_pe_tls_directory(
+    image_base: u64,
+    image_size: u64,
+    directory: &PeTlsDirectory,
+) -> Result<(), &'static str> {
+    let image_end = image_base
+        .checked_add(image_size)
+        .ok_or("kernel_stub: PE image range overflow")?;
+
+    if directory.start_address_of_raw_data != 0 || directory.end_address_of_raw_data != 0 {
+        if directory.start_address_of_raw_data > directory.end_address_of_raw_data {
+            return Err("kernel_stub: PE TLS raw data range is backwards");
+        }
+        if directory.start_address_of_raw_data < image_base
+            || directory.end_address_of_raw_data > image_end
+        {
+            return Err("kernel_stub: PE TLS raw data is outside the kernel image");
+        }
+    }
+
+    if directory.address_of_index != 0 {
+        let index_end = directory
+            .address_of_index
+            .checked_add(core::mem::size_of::<u32>() as u64)
+            .ok_or("kernel_stub: PE TLS index address overflow")?;
+        if directory.address_of_index < image_base || index_end > image_end {
+            return Err("kernel_stub: PE TLS index is outside the kernel image");
+        }
+    }
+
+    if directory.address_of_callbacks != 0
+        && (directory.address_of_callbacks < image_base
+            || directory.address_of_callbacks >= image_end)
+    {
+        return Err("kernel_stub: PE TLS callbacks pointer is outside the kernel image");
+    }
+
+    Ok(())
+}
+
+fn translate_kernel_symbols() -> Result<(usize, usize), &'static str> {
+    let pe = PE::parse(KERNEL_PE).map_err(|_| "kernel_stub: failed to reparse PE symbols")?;
+
+    unsafe {
+        ABI_KERNEL_SYMBOL_STRING_LEN = 0;
+    }
+
+    let mut import_count = 0usize;
+    for import in &pe.imports {
+        if import_count >= MAX_KERNEL_IMPORT_SYMBOLS {
+            return Err("kernel_stub: kernel PE has too many imported symbols");
+        }
+
+        let name = store_kernel_symbol_string(import.name.as_ref())?;
+        let module = store_kernel_symbol_string(import.dll)?;
+        unsafe {
+            ABI_KERNEL_IMPORT_SYMBOLS[import_count] = KernelSymbol { name, module };
+        }
+        import_count += 1;
+    }
+
+    let export_module = pe.name.unwrap_or("kernel");
+    let mut export_count = 0usize;
+    for export in &pe.exports {
+        if export_count >= MAX_KERNEL_EXPORT_SYMBOLS {
+            return Err("kernel_stub: kernel PE has too many exported symbols");
+        }
+
+        let name = store_kernel_symbol_string(export.name.unwrap_or(""))?;
+        let module = store_kernel_symbol_string(export_module)?;
+        unsafe {
+            ABI_KERNEL_EXPORT_SYMBOLS[export_count] = KernelSymbol { name, module };
+        }
+        export_count += 1;
+    }
+
+    Ok((import_count, export_count))
+}
+
+fn store_kernel_symbol_string(value: &str) -> Result<KernelSymbolString, &'static str> {
+    if value.is_empty() {
+        return Ok(KernelSymbolString::empty());
+    }
+
+    let bytes = value.as_bytes();
+    unsafe {
+        let start = ABI_KERNEL_SYMBOL_STRING_LEN;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or("kernel_stub: kernel symbol string storage overflow")?;
+        if end > MAX_KERNEL_SYMBOL_STRING_BYTES {
+            return Err("kernel_stub: kernel symbol strings exceed handoff storage");
+        }
+
+        let dst = addr_of_mut!(ABI_KERNEL_SYMBOL_STRING_BYTES)
+            .cast::<u8>()
+            .add(start);
+        copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        ABI_KERNEL_SYMBOL_STRING_LEN = end;
+
+        Ok(KernelSymbolString {
+            ptr: dst.cast_const(),
+            len: bytes.len(),
+        })
+    }
 }
 
 fn translate_memory_kind(kind: BootMemoryRegionKind) -> MemoryRegionKind {

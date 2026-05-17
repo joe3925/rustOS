@@ -20,16 +20,22 @@ fn artifact_path(dep_name: &str) -> PathBuf {
         .collect::<Vec<_>>();
 
     matches.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut paths = matches
+        .iter()
+        .map(|(_, path)| PathBuf::from(path))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
 
-    match matches.as_slice() {
-        [(_, path)] => PathBuf::from(path),
+    match paths.as_slice() {
+        [path] => path.clone(),
         [] => panic!(
             "Cargo did not provide a {dep_name} binary artifact; check kernel_stub/Cargo.toml build-dependencies"
         ),
         many => panic!(
-            "Cargo provided multiple {dep_name} binary artifacts: {}",
+            "Cargo provided multiple distinct {dep_name} binary artifacts: {}",
             many.iter()
-                .map(|(key, _)| key.as_str())
+                .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),

@@ -22,18 +22,18 @@ use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
-#[cfg(not(target_env = "msvc"))]
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
 use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
-use crate::{cpu, println, BOOT_INFO};
+use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -41,7 +41,6 @@ use core::arch::asm;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::panic::PanicInfo;
-#[cfg(not(target_env = "msvc"))]
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use kernel_abi::BootInfo;
@@ -91,38 +90,25 @@ const TLS_SELF_TEST_PENDING: u8 = 0;
 const TLS_SELF_TEST_PASS: u8 = 1;
 const TLS_SELF_TEST_FAIL: u8 = 2;
 
-#[cfg(not(target_env = "msvc"))]
 static TLS_SELF_TEST_BUSY: AtomicBool = AtomicBool::new(false);
-#[cfg(not(target_env = "msvc"))]
 static TLS_SELF_TEST_RESULT: AtomicU8 = AtomicU8::new(TLS_SELF_TEST_PENDING);
+static KERNEL_STUB_RECLAIMED: AtomicBool = AtomicBool::new(false);
 
-#[cfg(not(target_env = "msvc"))]
 const TLS_TEMPLATE_U64: u64 = 0x1122_3344_5566_7788;
-#[cfg(not(target_env = "msvc"))]
 const TLS_MAIN_U64: u64 = 0xA1A2_A3A4_A5A6_A7A8;
-#[cfg(not(target_env = "msvc"))]
 const TLS_WORKER_U64: u64 = 0xB1B2_B3B4_B5B6_B7B8;
-#[cfg(not(target_env = "msvc"))]
 const TLS_TEMPLATE_BYTES: [u8; 16] = *b"KERNEL_TLS_CHECK";
-#[cfg(not(target_env = "msvc"))]
 const TLS_MAIN_BYTES: [u8; 16] = *b"KERNEL_TLS_MAIN!";
-#[cfg(not(target_env = "msvc"))]
 const TLS_WORKER_BYTES: [u8; 16] = *b"KERNEL_TLS_WORK!";
-#[cfg(not(target_env = "msvc"))]
 const TLS_MAIN_ZERO_BYTES: [u8; 16] = [0x4Du8; 16];
-#[cfg(not(target_env = "msvc"))]
 const TLS_WORKER_ZERO_BYTES: [u8; 16] = [0x57u8; 16];
 
-#[cfg(not(target_env = "msvc"))]
 #[thread_local]
 static mut TLS_TEST_INIT_U64: u64 = TLS_TEMPLATE_U64;
-#[cfg(not(target_env = "msvc"))]
 #[thread_local]
 static mut TLS_TEST_INIT_BYTES: [u8; 16] = TLS_TEMPLATE_BYTES;
-#[cfg(not(target_env = "msvc"))]
 #[thread_local]
 static mut TLS_TEST_ZERO_U64: u64 = 0;
-#[cfg(not(target_env = "msvc"))]
 #[thread_local]
 static mut TLS_TEST_ZERO_BYTES: [u8; 16] = [0; 16];
 pub unsafe fn init() {
@@ -132,8 +118,7 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
-        #[cfg(not(target_env = "msvc"))]
-        crate::profiling::unwind::init_kernel_elf_unwind();
+        reclaim_kernel_stub();
         Screen::clear_framebuffer();
         load_idt();
 
@@ -192,7 +177,6 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
-    #[cfg(not(target_env = "msvc"))]
     test_kernel_tls_runtime();
     let mut program = Program::new(
         "kernel".to_string(),
@@ -383,7 +367,26 @@ pub extern "win64" fn random_number() -> u64 {
 }
 
 pub fn boot_info() -> &'static mut BootInfo {
-    unsafe { BOOT_INFO.as_mut().expect("BOOT_INFO not initialized") }
+    if !BOOT_INFO_INITIALIZED.load(Ordering::Acquire) {
+        panic!("BOOT_INFO not initialized");
+    }
+
+    unsafe { &mut BOOT_INFO }
+}
+
+fn reclaim_kernel_stub() {
+    if KERNEL_STUB_RECLAIMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let boot = boot_info();
+    if boot.stub_base == 0 || boot.stub_size == 0 {
+        return;
+    }
+
+    unsafe {
+        unmap_reserved_range_unchecked(VirtAddr::new(boot.stub_base), boot.stub_size);
+    }
 }
 
 pub fn generate_guid() -> [u8; 16] {
@@ -474,7 +477,6 @@ macro_rules! boot_packages {
         ] as &[ $crate::util::BootPkg ]
     }};
 }
-#[cfg(not(target_env = "msvc"))]
 unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
     (
         TLS_TEST_INIT_U64,
@@ -484,7 +486,6 @@ unsafe fn tls_test_snapshot() -> (u64, [u8; 16], u64, [u8; 16]) {
     )
 }
 
-#[cfg(not(target_env = "msvc"))]
 unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zero_bytes: [u8; 16]) {
     TLS_TEST_INIT_U64 = init_u64;
     TLS_TEST_INIT_BYTES = init_bytes;
@@ -492,7 +493,6 @@ unsafe fn tls_test_write(init_u64: u64, init_bytes: [u8; 16], zero_u64: u64, zer
     TLS_TEST_ZERO_BYTES = zero_bytes;
 }
 
-#[cfg(not(target_env = "msvc"))]
 extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
     let expected = unsafe { tls_test_snapshot() };
     if expected != (TLS_TEMPLATE_U64, TLS_TEMPLATE_BYTES, 0, [0; 16]) {
@@ -528,7 +528,6 @@ extern "win64" fn kernel_tls_self_test_worker(_ctx: usize) {
     );
 }
 
-#[cfg(not(target_env = "msvc"))]
 pub fn test_kernel_tls_runtime() {
     let current = SCHEDULER
         .get_current_task(current_cpu_id())

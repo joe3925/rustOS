@@ -1,3 +1,5 @@
+use kernel_routing::println;
+
 use crate::benchmarking::bench_submit_interrupt_sample_current_core;
 use crate::drivers::interrupt_index::APIC_TICKS_PER_NS;
 

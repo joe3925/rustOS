@@ -33,7 +33,6 @@ fn main() {
         "--target",
         "x86_64-unknown-none",
     ])
-    .args(build_std_args())
     .env("KERNEL_PE_PATH", &kernel_pe);
     if release {
         stub.arg("--release");

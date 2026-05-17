@@ -123,6 +123,8 @@ pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
     }
     let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
         cpu_id: lapic_id as u64,
+        reserved0: [0; 0x50],
+        tls_array_pointer: 0,
     }));
     v[idx] = Some(p);
     p
@@ -130,9 +132,12 @@ pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
 #[repr(C, align(64))]
 pub struct PerCpu {
     pub cpu_id: u64,
+    reserved0: [u8; 0x50],
+    pub tls_array_pointer: u64,
 }
 
-pub const PERCPU_CPU_ID_OFF: u64 = 0;
+pub const PERCPU_CPU_ID_OFF: usize = 0;
+pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = 0x58;
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -716,6 +721,7 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
     let ptr = p as *const PerCpu;
     unsafe {
         (*(ptr as *mut PerCpu)).cpu_id = lapic_id as u64;
+        (*(ptr as *mut PerCpu)).tls_array_pointer = 0;
     }
     set_gs_bases(ptr);
     p
