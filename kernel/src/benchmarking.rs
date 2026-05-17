@@ -2548,7 +2548,12 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    HEAP_SIZE as usize - ALLOCATOR.free_memory()
+    let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
+        + crate::memory::heap::MIMALLOC_META_HEAP_SIZE as usize;
+    let used_meta = capacity - ALLOCATOR.free_memory();
+    let used_arena = crate::memory::allocator::MIMALLOC_ARENA_COMMITTED
+        .load(core::sync::atomic::Ordering::Relaxed);
+    used_meta + used_arena
 }
 
 const DEPTH: usize = 1_000;

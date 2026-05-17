@@ -17,6 +17,7 @@
 
 extern void* rustos_mi_os_alloc(size_t size, size_t alignment);
 extern void rustos_mi_os_free(void* addr, size_t size);
+extern bool rustos_mi_os_commit(void* addr, size_t size);
 extern size_t rustos_mi_physical_memory_kib(void);
 extern uint64_t rustos_mi_clock_now(void);
 extern bool rustos_mi_random_buf(void* buf, size_t len);
@@ -24,7 +25,7 @@ extern void rustos_mi_out_stderr(const char* msg);
 extern void rustos_mi_thread_yield(void);
 
 bool rustos_mi_manage_arena(void* start, size_t size) {
-  return mi_manage_os_memory(start, size, true, false, false, -1);
+  return mi_manage_os_memory(start, size, false, false, false, -1);
 }
 
 static size_t rustos_max_size(size_t a, size_t b) {
@@ -64,8 +65,9 @@ int _mi_prim_free(void* addr, size_t size) {
 }
 
 int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
-  (void)addr;
-  (void)size;
+  if (!rustos_mi_os_commit(addr, size)) {
+    return RUSTOS_ENOMEM;
+  }
   if (is_zero != NULL) *is_zero = false;
   return 0;
 }
