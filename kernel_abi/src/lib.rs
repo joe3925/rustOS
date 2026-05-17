@@ -8,8 +8,13 @@ pub const RUSTOS_BOOT_INFO_VERSION: u32 = 1;
 pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 pub const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
 pub const STUB_IMAGE_BASE: u64 = 0xFFFF_8800_0000_0000;
-pub const STUB_DYNAMIC_RANGE_START: u64 = 0xFFFF_8801_0000_0000;
-pub const STUB_DYNAMIC_RANGE_END: u64 = 0xFFFF_8900_0000_0000;
+
+// Keep the bootloader's dynamic mappings out of the fixed stub image P4 slot.
+// The bootloader reserves dynamic virtual space in whole P4 entries, so this
+// band deliberately spans several entries for the stack, boot info, framebuffer,
+// and any other early mappings it creates before the stub runs.
+pub const STUB_DYNAMIC_RANGE_START: u64 = 0xFFFF_8900_0000_0000;
+pub const STUB_DYNAMIC_RANGE_END: u64 = 0xFFFF_9000_0000_0000;
 
 pub const MAX_BOOT_MEMORY_REGIONS: usize = 256;
 pub const MAX_KERNEL_SECTIONS: usize = 96;

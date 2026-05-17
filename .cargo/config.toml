@@ -1,12 +1,19 @@
 [unstable]
 bindeps = true
+json-target-spec = true
 
 [target.x86_64-unknown-none]
 rustflags = ["-C", "code-model=large"]
+
 [profile.dev.package.kernel]
+rustflags = ["-C", "panic=abort"]
+
+[profile.dev.package.kernel_stub]
 rustflags = [
     "-C",
-    "link-args=--image-base=0xFFFF850000000000",
+    "link-args=--image-base=0xFFFF880000000000",
+    "-C",
+    "link-arg=-no-pie",
     "-C",
     "relocation-model=static",
     "-C",
@@ -14,9 +21,14 @@ rustflags = [
 ]
 
 [profile.release.package.kernel]
+rustflags = ["-C", "panic=abort"]
+
+[profile.release.package.kernel_stub]
 rustflags = [
     "-C",
-    "link-args=--image-base=0xFFFF850000000000",
+    "link-args=--image-base=0xFFFF880000000000",
+    "-C",
+    "link-arg=-no-pie",
     "-C",
     "relocation-model=static",
     "-C",
