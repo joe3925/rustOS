@@ -28,6 +28,7 @@ pub unsafe fn map_range_with_huge_pages<M>(
     size: u64,
     fa: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
+    ignore_already_mapped: bool,
 ) -> Result<(), PageMapError>
 where
     M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
@@ -51,6 +52,11 @@ where
                     continue;
                 }
                 Err(MapToError::FrameAllocationFailed) => {}
+                Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {
+                    cur += gib;
+                    remaining -= gib;
+                    continue;
+                }
                 Err(e) => {
                     return Err(PageMapError::Page1GiB(e));
                 }
@@ -65,6 +71,11 @@ where
                     continue;
                 }
                 Err(MapToError::FrameAllocationFailed) => {}
+                Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {
+                    cur += mib2;
+                    remaining -= mib2;
+                    continue;
+                }
                 Err(e) => {
                     return Err(PageMapError::Page2MiB(e));
                 }
@@ -72,7 +83,11 @@ where
         }
 
         let page4k = Page::<Size4KiB>::containing_address(cur);
-        unsafe { map_page(mapper, page4k, fa, flags) }?;
+        match unsafe { map_page(mapper, page4k, fa, flags) } {
+            Ok(_) => {}
+            Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {}
+            Err(e) => return Err(PageMapError::Page4KiB(e)),
+        }
         cur += 0x1000;
         remaining -= 0x1000;
     }
@@ -304,11 +319,19 @@ pub unsafe fn map_kernel_range(
     addr: VirtAddr,
     size: u64,
     flags: PageTableFlags,
+    ignore_already_mapped: bool,
 ) -> Result<(), PageMapError> {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    map_range_with_huge_pages(&mut mapper, addr, size, &mut frame_allocator, flags)
+    map_range_with_huge_pages(
+        &mut mapper,
+        addr,
+        size,
+        &mut frame_allocator,
+        flags,
+        ignore_already_mapped,
+    )
 }

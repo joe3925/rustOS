@@ -100,10 +100,10 @@ int _mi_prim_protect(void* addr, size_t size, bool protect) {
 
 int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bool* is_zero, void** addr) {
   (void)hint_addr;
-  (void)size;
   (void)numa_node;
   if (is_zero != NULL) *is_zero = false;
   if (addr != NULL) *addr = NULL;
+  rustos_mi_out_stderr("MIMALLOC ALLOC_HUGE FAILED: reason=Not supported in rustOS platform\n");
   return RUSTOS_ENOMEM;
 }
 

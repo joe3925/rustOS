@@ -186,7 +186,7 @@ impl TaskRef {
         };
 
         unsafe {
-            map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags)?;
+            map_kernel_range(VirtAddr::new(gp), PAGE_SIZE, flags, false)?;
         }
 
         let stack_top = self.stack_start.load(Ordering::Acquire);

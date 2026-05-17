@@ -67,6 +67,7 @@ impl KernelAllocator {
         if !self.mimalloc_enabled.load(Ordering::Acquire) {
             unsafe {
                 mi_process_init();
+                init_mimalloc_diagnostics();
                 if !rustos_mi_manage_arena(
                     MIMALLOC_ARENA_START as *mut c_void,
                     MIMALLOC_ARENA_SIZE as usize,
@@ -420,6 +421,51 @@ unsafe impl GlobalAlloc for BuddyLocked {
     }
 }
 
+unsafe extern "C" {
+    fn mi_register_output(
+        cb: extern "C" fn(msg: *const core::ffi::c_char, arg: *mut c_void),
+        arg: *mut c_void,
+    );
+    fn mi_register_error(cb: extern "C" fn(err: i32, arg: *mut c_void), arg: *mut c_void);
+}
+
+extern "C" fn mimalloc_output_cb(msg: *const core::ffi::c_char, _arg: *mut c_void) {
+    if msg.is_null() {
+        return;
+    }
+    let mut len = 0;
+    while unsafe { *msg.add(len) } != 0 {
+        len += 1;
+    }
+    let s = unsafe {
+        core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg as *const u8, len))
+    };
+    crate::println!("MIMALLOC: {}", s.trim_end());
+}
+
+extern "C" fn mimalloc_error_cb(err: i32, _arg: *mut c_void) {
+    match err {
+        11 => crate::println!("MIMALLOC ERROR: EAGAIN (double free)"),
+        12 => crate::println!("MIMALLOC ERROR: ENOMEM (out of memory)"),
+        14 => crate::println!("MIMALLOC ERROR: EFAULT (corrupted free list/metadata)"),
+        22 => crate::println!("MIMALLOC ERROR: EINVAL (invalid pointer)"),
+        75 => crate::println!("MIMALLOC ERROR: EOVERFLOW (allocation size overflow)"),
+        _ => crate::println!("MIMALLOC ERROR: {}", err),
+    }
+}
+
+static MIMALLOC_DIAGNOSTICS_INIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn init_mimalloc_diagnostics() {
+    if !MIMALLOC_DIAGNOSTICS_INIT.swap(true, core::sync::atomic::Ordering::SeqCst) {
+        unsafe {
+            mi_register_output(mimalloc_output_cb, null_mut());
+            mi_register_error(mimalloc_error_cb, null_mut());
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
     let start_addr = x86_64::VirtAddr::new(addr as u64);
@@ -427,34 +473,57 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
     if addr_usize < MIMALLOC_ARENA_START
         || addr_usize + size > MIMALLOC_ARENA_START + (MIMALLOC_ARENA_SIZE as usize)
     {
+        crate::println!(
+            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address out of arena bounds",
+            addr,
+            size
+        );
         return false;
     }
 
     let flags = x86_64::structures::paging::PageTableFlags::PRESENT
         | x86_64::structures::paging::PageTableFlags::WRITABLE;
 
-    without_interrupts(|| {
-        let res =
-            crate::memory::paging::paging::map_kernel_range(start_addr, size as u64, flags).is_ok();
-        if res {
+    let res = without_interrupts(|| {
+        crate::memory::paging::paging::map_kernel_range(start_addr, size as u64, flags, true)
+    });
+
+    match res {
+        Ok(_) => {
             MIMALLOC_ARENA_COMMITTED.fetch_add(size, Ordering::Relaxed);
+            true
         }
-        res
-    })
+        Err(e) => {
+            crate::println!("MIMALLOC COMMIT FAILED: address={:p}, size={}, flags={:?}, reason=Page mapping failed ({:?})", addr, size, flags, e);
+            false
+        }
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
-    without_interrupts(|| {
+    let ptr = without_interrupts(|| {
         MIMALLOC_OS_ALLOCATOR
             .lock()
             .alloc(size, alignment)
             .cast::<c_void>()
-    })
+    });
+
+    if ptr.is_null() {
+        crate::println!(
+            "MIMALLOC ALLOC FAILED: size={}, alignment={}, reason=Out of OS allocator memory",
+            size,
+            alignment
+        );
+    }
+    ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
+    if addr.is_null() {
+        return;
+    }
     without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
 }
 
