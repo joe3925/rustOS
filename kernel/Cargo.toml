@@ -50,6 +50,7 @@ kernel_types = { path = "../kernel_types", default-features = false, features = 
     "async-ffi-slab-slots-512",
     "async-ffi-slab-slot-bytes-64k",
 ] }
+kernel_abi = { path = "../kernel_abi" }
 kernel_routing = { path = "../kernel_routing", default-features = false, features = [
     "kernel_link",
 ] }
@@ -60,8 +61,6 @@ kernel_executor = { path = "../kernel_executor" }
 [dependencies.lazy_static]
 version = "1.0"
 features = ["spin_no_std"]
-[build-dependencies]
-implib = "0.4"
 [profile.dev]
 opt-level = 3
 lto = true

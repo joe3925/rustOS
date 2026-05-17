@@ -1,0 +1,96 @@
+use std::{env, fs, path::PathBuf};
+
+const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
+
+fn main() {
+    let kernel_pe = artifact_path("KERNEL");
+    validate_kernel_pe(&kernel_pe);
+
+    println!("cargo:rerun-if-changed={}", kernel_pe.display());
+    println!("cargo:rustc-env=KERNEL_PE_PATH={}", kernel_pe.display());
+}
+
+fn artifact_path(dep_name: &str) -> PathBuf {
+    let prefix = format!("CARGO_BIN_FILE_{dep_name}");
+    let mut matches = env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            key.starts_with(&prefix).then_some((key, value))
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort_by(|left, right| left.0.cmp(&right.0));
+
+    match matches.as_slice() {
+        [(_, path)] => PathBuf::from(path),
+        [] => panic!(
+            "Cargo did not provide a {dep_name} binary artifact; check kernel_stub/Cargo.toml build-dependencies"
+        ),
+        many => panic!(
+            "Cargo provided multiple {dep_name} binary artifacts: {}",
+            many.iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn validate_kernel_pe(path: &PathBuf) {
+    let bytes = fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read kernel PE artifact {}: {err}",
+            path.display()
+        )
+    });
+
+    let pe_offset = read_u32(&bytes, 0x3c) as usize;
+    if read_u16(&bytes, 0) != 0x5A4D {
+        panic!("kernel artifact is not an MZ/PE image: {}", path.display());
+    }
+    if read_u32(&bytes, pe_offset) != 0x0000_4550 {
+        panic!(
+            "kernel artifact has an invalid PE signature: {}",
+            path.display()
+        );
+    }
+
+    let coff = pe_offset + 4;
+    let optional = coff + 20;
+    let machine = read_u16(&bytes, coff);
+    let magic = read_u16(&bytes, optional);
+    let image_base = read_u64(&bytes, optional + 24);
+
+    if machine != 0x8664 {
+        panic!("kernel PE machine is not x86_64: 0x{machine:x}");
+    }
+    if magic != 0x20B {
+        panic!("kernel PE is not PE32+: 0x{magic:x}");
+    }
+    if image_base != KERNEL_PE_BASE {
+        panic!(
+            "kernel PE image base is 0x{image_base:x}, expected 0x{KERNEL_PE_BASE:x}; build it through the kernel_stub artifact dependency"
+        );
+    }
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    let data = bytes
+        .get(offset..offset + 2)
+        .unwrap_or_else(|| panic!("kernel PE is truncated at offset 0x{offset:x}"));
+    u16::from_le_bytes(data.try_into().unwrap())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    let data = bytes
+        .get(offset..offset + 4)
+        .unwrap_or_else(|| panic!("kernel PE is truncated at offset 0x{offset:x}"));
+    u32::from_le_bytes(data.try_into().unwrap())
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    let data = bytes
+        .get(offset..offset + 8)
+        .unwrap_or_else(|| panic!("kernel PE is truncated at offset 0x{offset:x}"));
+    u64::from_le_bytes(data.try_into().unwrap())
+}

@@ -1,8 +1,8 @@
 [build]
-target = "x86_64-unknown-none"
+target = "../x86_64-rustos-kernel.json"
 
 [unstable]
 build-std = ["core", "alloc", "panic_abort"]
 
-[target.x86_64-unknown-none]
+[target.x86_64-rustos-kernel.json]
 rustflags = ["-C", "code-model=large"]

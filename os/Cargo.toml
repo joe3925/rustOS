@@ -6,8 +6,9 @@ build = "build.rs"
 
 
 [build-dependencies]
-kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
 bootloader = { version = "0.11", default-features = false, features = ["uefi"] }
+kernel_stub = { path = "../kernel_stub", artifact = "bin", target = "x86_64-unknown-none" }
+
 [dependencies]
 
 [profile.dev]

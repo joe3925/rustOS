@@ -1,7 +1,6 @@
 use crate::util::boot_info;
 use alloc::string::String;
 use alloc::vec::Vec;
-use bootloader_api::info::PixelFormat;
 use core::fmt;
 use core::fmt::Write;
 use crossbeam_queue::SegQueue;
@@ -18,6 +17,7 @@ use embedded_graphics::text::Text;
 use embedded_graphics::text::TextStyle;
 use embedded_graphics::text::TextStyleBuilder;
 use embedded_graphics::Drawable;
+use kernel_abi::PixelFormat;
 use kernel_types::irq::IrqSafeMutex;
 use lazy_static::lazy_static;
 
@@ -89,7 +89,6 @@ impl Screen {
                 green_offset = green_position as usize;
                 blue_offset = blue_position as usize;
             }
-            _ => {}
         }
 
         let width = info.width as usize;

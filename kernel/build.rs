@@ -2,8 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
-
-use implib::{Flavor, ImportLibrary, MachineType};
+use std::process::Command;
 
 fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(), Box<dyn Error>> {
     let contents = fs::read_to_string(exports_path)?;
@@ -31,24 +30,46 @@ fn generate_def_file(exports_path: &PathBuf, def_out_path: &PathBuf) -> Result<(
     Ok(())
 }
 
-fn machine_from_target(target: &str) -> MachineType {
+fn machine_from_target(target: &str) -> &'static str {
     if target.contains("aarch64") {
-        MachineType::ARM64
+        "ARM64"
     } else if target.contains("arm") {
-        MachineType::ARMNT
+        "ARM"
     } else if target.contains("i686") || (target.contains("x86") && !target.contains("x86_64")) {
-        MachineType::I386
+        "X86"
     } else {
-        MachineType::AMD64
+        "X64"
     }
 }
 
-fn flavor_from_target(target: &str) -> Flavor {
-    if target.contains("gnu") {
-        Flavor::Gnu
+fn generate_import_library(
+    target: &str,
+    def_path: &PathBuf,
+    lib_out: &PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    let status = if target.contains("gnu") {
+        Command::new("llvm-dlltool")
+            .arg("-d")
+            .arg(def_path)
+            .arg("-l")
+            .arg(lib_out)
+            .arg("-m")
+            .arg("i386:x86-64")
+            .status()
     } else {
-        Flavor::Msvc
+        Command::new("llvm-lib")
+            .arg("/NOLOGO")
+            .arg(format!("/DEF:{}", def_path.display()))
+            .arg(format!("/MACHINE:{}", machine_from_target(target)))
+            .arg(format!("/OUT:{}", lib_out.display()))
+            .status()
+    }?;
+
+    if !status.success() {
+        return Err(format!("failed to generate kernel import library: {status}").into());
     }
+
+    Ok(())
 }
 
 fn main() {
@@ -56,21 +77,16 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
 
+    emit_kernel_pe_link_args(&target);
+
     let exports_path = manifest_dir.join("src").join("exports.rs");
     println!("cargo:rerun-if-changed={}", exports_path.display());
 
     let def_path = out_dir.join("kernel.def");
     generate_def_file(&exports_path, &def_path).expect("Failed to generate .def file");
 
-    let def_text = fs::read_to_string(&def_path).expect("Failed to read generated .def");
-
-    let machine = machine_from_target(&target);
-    let flavor = flavor_from_target(&target);
-
     let lib_out = out_dir.join("kernel.lib");
-    let lib = ImportLibrary::new(&def_text, machine, flavor).expect("implib failed");
-    let mut f = fs::File::create(&lib_out).expect("Failed to create kernel.lib");
-    lib.write_to(&mut f).expect("Failed to write kernel.lib");
+    generate_import_library(&target, &def_path, &lib_out).expect("Failed to generate kernel.lib");
 
     let target_dir = env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
@@ -86,4 +102,23 @@ fn main() {
     fs::copy(&lib_out, &shared_lib).expect("Failed to copy kernel.lib to target/");
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn emit_kernel_pe_link_args(target: &str) {
+    if !target.ends_with("windows-msvc") {
+        return;
+    }
+
+    for arg in [
+        "/NOLOGO",
+        "/NODEFAULTLIB",
+        "/SUBSYSTEM:NATIVE",
+        "/ENTRY:kernel_pe_entry",
+        "/FIXED",
+        "/DYNAMICBASE:NO",
+        "/BASE:0xFFFF850000000000",
+        "/EXPORT:kernel_pe_entry",
+    ] {
+        println!("cargo:rustc-link-arg-bin=kernel={arg}");
+    }
 }
