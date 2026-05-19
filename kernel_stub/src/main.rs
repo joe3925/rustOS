@@ -10,6 +10,7 @@ use bootloader_api::info::{
     MemoryRegion as BootMemoryRegion, MemoryRegionKind as BootMemoryRegionKind,
 };
 use bootloader_api::{entry_point, BootInfo as BootloaderBootInfo, BootloaderConfig};
+use core::arch::asm;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 use core::ptr::{addr_of_mut, copy_nonoverlapping};
@@ -144,6 +145,21 @@ struct LoadedKernel {
     section_count: usize,
 }
 
+unsafe fn enter_kernel_pe(entry: u64, boot_info: *const BootInfo) -> ! {
+    unsafe {
+        asm!(
+            "cld",
+            "and rsp, -16",
+            "sub rsp, 40",
+            "mov qword ptr [rsp], 0",
+            "jmp rax",
+            in("rax") entry,
+            in("rcx") boot_info,
+            options(noreturn)
+        )
+    }
+}
+
 fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
     init_serial();
     serial_println("kernel_stub: loading embedded PE kernel");
@@ -161,9 +177,7 @@ fn stub_start(boot_info: &'static mut BootloaderBootInfo) -> ! {
 
     serial_println("kernel_stub: jumping to PE kernel");
 
-    let entry: extern "win64" fn(*const BootInfo) -> ! =
-        unsafe { core::mem::transmute(loaded.entry as usize) };
-    entry(handoff as *const BootInfo)
+    unsafe { enter_kernel_pe(loaded.entry, handoff as *const BootInfo) }
 }
 
 fn load_kernel_pe(

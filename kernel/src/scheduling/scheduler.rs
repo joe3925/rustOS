@@ -1003,7 +1003,18 @@ pub extern "win64" fn yield_interrupt_entry() {
     );
 }
 
-pub fn kernel_task_end() -> ! {
+#[unsafe(naked)]
+pub extern "win64" fn task_return_trampoline() -> ! {
+    naked_asm!(
+        "cld",
+        "sub rsp, 8",
+        "mov qword ptr [rsp], 0",
+        "jmp {task_end}",
+        task_end = sym kernel_task_end,
+    );
+}
+
+pub extern "win64" fn kernel_task_end() -> ! {
     interrupts::without_interrupts(|| {
         crate::memory::allocator::mimalloc_thread_done();
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();

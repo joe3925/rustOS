@@ -3,7 +3,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
 use crate::memory::paging::virt_tracker::unmap_range;
-use crate::scheduling::scheduler::kernel_task_end;
+use crate::scheduling::scheduler::task_return_trampoline;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
 use alloc::string::String;
@@ -17,6 +17,9 @@ use x86_64::VirtAddr;
 pub type TaskEntry = extern "win64" fn(usize);
 
 const PAGE_SIZE: u64 = 4096;
+const WIN64_SHADOW_SPACE_BYTES: u64 = 32;
+const RETURN_ADDRESS_BYTES: u64 = 8;
+const WIN64_ENTRY_FRAME_BYTES: u64 = RETURN_ADDRESS_BYTES + WIN64_SHADOW_SPACE_BYTES;
 
 pub const IDLE_UUID_UPPER: u64 = 0x1c82f35548bcbe24;
 pub const IDLE_MAGIC_LOWER: u64 = 0x890189d70ecaca7f;
@@ -252,11 +255,11 @@ impl Task {
         let mut state = State::new(0);
         state.rip = entry_point as u64;
         state.rcx = context as u64;
-        state.rsp = stack_top - 8;
+        state.rsp = initial_win64_entry_rsp(stack_top);
         state.rflags = 0x0000_0202;
 
         unsafe {
-            *(state.rsp as *mut u64) = kernel_task_end as *const () as u64;
+            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
         let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
@@ -315,11 +318,11 @@ impl Task {
         let mut state = State::new(0);
         state.rip = entry_point as u64;
         state.rcx = context as u64;
-        state.rsp = stack_top_u64 - 8;
+        state.rsp = initial_win64_entry_rsp(stack_top_u64);
         state.rflags = 0x0000_0202;
 
         unsafe {
-            *(state.rsp as *mut u64) = kernel_task_end as *const () as u64;
+            *(state.rsp as *mut u64) = task_return_trampoline as *const () as u64;
         }
 
         let selectors = gdt.selectors_per_cpu.get_by_id(cpu_id as usize);
@@ -412,6 +415,13 @@ fn initial_guard_page(stack_top: u64, stack_size: u64) -> u64 {
         None => 0,
     }
 }
+
+fn initial_win64_entry_rsp(stack_top: u64) -> u64 {
+    // IRET enters a fresh task as if a Win64 call just reached it:
+    // [rsp] return address, [rsp+8..rsp+40) caller-allocated shadow space.
+    (stack_top & !0xf).saturating_sub(WIN64_ENTRY_FRAME_BYTES)
+}
+
 #[unsafe(naked)]
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
     naked_asm!("3:", "hlt", "jmp 3b",);
