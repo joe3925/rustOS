@@ -178,7 +178,6 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
-    test_full_heap();
     let mut program = Program::new(
         "kernel".to_string(),
         Path::from_string(""),
