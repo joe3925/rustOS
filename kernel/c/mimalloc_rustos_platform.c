@@ -1,10 +1,3 @@
-/*
- * Freestanding mimalloc primitive layer for rustOS.
- *
- * The Rust side owns virtual range allocation and exposes a small, allocation
- * free ABI to this C layer. Mimalloc sees memory as always committed because
- * the kernel heap is mapped before mimalloc is enabled.
- */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -29,11 +22,14 @@ bool rustos_mi_manage_arena(void* start, size_t size) {
 }
 
 static size_t rustos_max_size(size_t a, size_t b) {
-  return (a > b ? a : b);
+  return a > b ? a : b;
 }
 
 void _mi_prim_mem_init(mi_os_mem_config_t* config) {
-  if (config == NULL) return;
+  if (config == NULL) {
+    return;
+  }
+
   config->page_size = RUSTOS_PAGE_SIZE;
   config->large_page_size = 0;
   config->alloc_granularity = RUSTOS_PAGE_SIZE;
@@ -44,19 +40,38 @@ void _mi_prim_mem_init(mi_os_mem_config_t* config) {
   config->has_virtual_reserve = false;
 }
 
-int _mi_prim_alloc(void* hint_addr, size_t size, size_t try_alignment, bool commit, bool allow_large, bool* is_large, bool* is_zero, void** addr) {
+int _mi_prim_alloc(
+  void* hint_addr,
+  size_t size,
+  size_t try_alignment,
+  bool commit,
+  bool allow_large,
+  bool* is_large,
+  bool* is_zero,
+  void** addr
+) {
   (void)hint_addr;
   (void)commit;
   (void)allow_large;
 
-  if (is_large != NULL) *is_large = false;
-  if (is_zero != NULL) *is_zero = true;
-  if (addr == NULL) return RUSTOS_ENOMEM;
+  if (is_large != NULL) {
+    *is_large = false;
+  }
+
+  if (is_zero != NULL) {
+    *is_zero = true;
+  }
+
+  if (addr == NULL) {
+    return RUSTOS_ENOMEM;
+  }
 
   const size_t alignment = rustos_max_size(try_alignment, RUSTOS_PAGE_SIZE);
   void* p = rustos_mi_os_alloc(size, alignment);
+
   *addr = p;
-  return (p == NULL ? RUSTOS_ENOMEM : 0);
+
+  return p == NULL ? RUSTOS_ENOMEM : 0;
 }
 
 int _mi_prim_free(void* addr, size_t size) {
@@ -68,14 +83,22 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
   if (!rustos_mi_os_commit(addr, size)) {
     return RUSTOS_ENOMEM;
   }
-  if (is_zero != NULL) *is_zero = false;
+
+  if (is_zero != NULL) {
+    *is_zero = false;
+  }
+
   return 0;
 }
 
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
   (void)addr;
   (void)size;
-  if (needs_recommit != NULL) *needs_recommit = false;
+
+  if (needs_recommit != NULL) {
+    *needs_recommit = false;
+  }
+
   return 0;
 }
 
@@ -98,12 +121,27 @@ int _mi_prim_protect(void* addr, size_t size, bool protect) {
   return 0;
 }
 
-int _mi_prim_alloc_huge_os_pages(void* hint_addr, size_t size, int numa_node, bool* is_zero, void** addr) {
+int _mi_prim_alloc_huge_os_pages(
+  void* hint_addr,
+  size_t size,
+  int numa_node,
+  bool* is_zero,
+  void** addr
+) {
   (void)hint_addr;
+  (void)size;
   (void)numa_node;
-  if (is_zero != NULL) *is_zero = false;
-  if (addr != NULL) *addr = NULL;
+
+  if (is_zero != NULL) {
+    *is_zero = false;
+  }
+
+  if (addr != NULL) {
+    *addr = NULL;
+  }
+
   rustos_mi_out_stderr("MIMALLOC ALLOC_HUGE FAILED: reason=Not supported in rustOS platform\n");
+
   return RUSTOS_ENOMEM;
 }
 
@@ -120,7 +158,10 @@ mi_msecs_t _mi_prim_clock_now(void) {
 }
 
 void _mi_prim_process_info(mi_process_info_t* pinfo) {
-  if (pinfo == NULL) return;
+  if (pinfo == NULL) {
+    return;
+  }
+
   pinfo->elapsed = rustos_mi_clock_now();
   pinfo->utime = 0;
   pinfo->stime = 0;
@@ -137,9 +178,11 @@ void _mi_prim_out_stderr(const char* msg) {
 
 bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
   (void)name;
+
   if (result != NULL && result_size != 0) {
     result[0] = 0;
   }
+
   return false;
 }
 
@@ -164,7 +207,10 @@ bool _mi_is_redirected(void) {
 }
 
 bool _mi_allocator_init(const char** message) {
-  if (message != NULL) *message = NULL;
+  if (message != NULL) {
+    *message = NULL;
+  }
+
   return true;
 }
 

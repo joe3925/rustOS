@@ -3,9 +3,11 @@
 
 #include <stddef.h>
 
+#ifndef NULL
 #define NULL ((void*)0)
+#endif
 
-void abort(void) __attribute__((noreturn));
+_Noreturn void abort(void);
 long strtol(const char* nptr, char** endptr, int base);
 char* getenv(const char* name);
 

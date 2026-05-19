@@ -7,7 +7,7 @@ extern int errno;
 #define ENOMEM 12
 #define EFAULT 14
 #define EINVAL 22
-#define ENOTSUP 95
 #define EOVERFLOW 75
+#define ENOTSUP 95
 
 #endif

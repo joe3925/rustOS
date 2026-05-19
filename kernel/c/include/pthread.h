@@ -10,6 +10,7 @@ typedef struct {
 
 #define PTHREAD_MUTEX_INITIALIZER { ATOMIC_VAR_INIT(0) }
 
+int pthread_mutex_init(pthread_mutex_t* mutex, const void* attr);
 int pthread_mutex_trylock(pthread_mutex_t* mutex);
 int pthread_mutex_lock(pthread_mutex_t* mutex);
 int pthread_mutex_unlock(pthread_mutex_t* mutex);

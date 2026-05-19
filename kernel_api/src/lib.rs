@@ -48,3 +48,21 @@ macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", $crate::alloc::format!($($arg)*)));
 }
+#[unsafe(no_mangle)]
+pub extern "C" fn fmodf(x: f32, y: f32) -> f32 {
+    libm::fmodf(x, y)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fmod(x: f64, y: f64) -> f64 {
+    libm::fmod(x, y)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fma(x: f64, y: f64, z: f64) -> f64 {
+    libm::fma(x, y, z)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fmaf(x: f32, y: f32, z: f32) -> f32 {
+    libm::fmaf(x, y, z)
+}

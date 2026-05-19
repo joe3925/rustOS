@@ -9,9 +9,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
-
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
 
@@ -532,7 +532,7 @@ pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
     let bytes = boot_info()
         .memory_regions
         .iter()
-        .filter(|region| region.kind == bootloader_api::info::MemoryRegionKind::Usable)
+        .filter(|region| region.kind == MemoryRegionKind::Usable)
         .fold(0u128, |sum, region| {
             sum + (region.end - region.start) as u128
         });
