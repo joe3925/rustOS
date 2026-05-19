@@ -2026,10 +2026,7 @@ impl BenchWindow {
 
         let this = self.clone();
         spawn_blocking(move || {
-            let interval = Duration::from_millis(1);
             loop {
-                interrupt_index::wait_duration(interval);
-
                 if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
                     if let Some(state) = bench_state_get() {
                         state.drain_all_to_spill();

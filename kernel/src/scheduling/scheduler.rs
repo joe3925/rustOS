@@ -12,8 +12,8 @@ use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_U
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 
+use crate::println;
 pub use crate::scheduling::task::TaskHandle;
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1005,6 +1005,7 @@ pub extern "win64" fn yield_interrupt_entry() {
 
 pub fn kernel_task_end() -> ! {
     interrupts::without_interrupts(|| {
+        crate::memory::allocator::mimalloc_thread_done();
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
     });

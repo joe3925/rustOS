@@ -1,114 +1,168 @@
+use crate::memory::heap::{
+    BOOTSTRAP_HEAP_SIZE, HEAP_START, MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE,
+    MIMALLOC_HEAP_START, MIMALLOC_META_HEAP_SIZE,
+};
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
-use crate::{
-    memory::{
-        heap::{HEAP_SIZE, HEAP_START},
-        paging::{
-            frame_alloc::BootInfoFrameAllocator, paging::unmap_range_impl, tables::init_mapper,
-        },
-    },
-    scheduling::runtime::runtime::yield_now,
-};
-use baby_mimalloc::Mimalloc;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::c_void;
 use core::ptr::{null_mut, NonNull};
 use core::sync::atomic::{AtomicBool, Ordering};
-use x86_64::structures::paging::{mapper::MapToError, Mapper, Page, PageTableFlags, Size4KiB};
-use x86_64::{align_up, VirtAddr};
-use x86_64::{
-    instructions::interrupts::{self, without_interrupts},
-    structures::paging::FrameAllocator,
-};
+use x86_64::align_up;
+use x86_64::instructions::interrupts::without_interrupts;
 
-// NOTE: When changing the allocator, floating point can not be used unless the fpu guard in interrupts is changed to manually dropped instead of relying on the drop impl.
-// Rust will order the drop of the guard how ever it feels like this can mean the guard is dropped then some allocation is dropped, the free uses floating point, and floating point is corrupted.
+const PAGE_SIZE: usize = 4096;
+const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
 
-// #[global_allocator]
-// pub static mut ALLOCATOR: Locked<Allocator> = Locked::new(Allocator::new());
-#[global_allocator]
-pub static ALLOCATOR: BuddyLocked = BuddyLocked::new();
-// #[global_allocator]
-// pub static ALLOCATOR: YieldingMimalloc = YieldingMimalloc::new();
-
-/// Global allocator wrapper that yields if another CPU is holding the lock
-/// instead of spinning with interrupts off.
-pub struct YieldingMimalloc {
-    inner: spin::Mutex<Mimalloc<KernelSegAlloc>>,
+unsafe extern "C" {
+    fn mi_process_init();
+    fn mi_thread_done();
+    fn mi_malloc_aligned(size: usize, alignment: usize) -> *mut c_void;
+    fn mi_zalloc_aligned(size: usize, alignment: usize) -> *mut c_void;
+    fn mi_realloc_aligned(ptr: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
+    fn mi_free(ptr: *mut c_void);
+    fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
 
-impl YieldingMimalloc {
+#[global_allocator]
+pub static ALLOCATOR: KernelAllocator = KernelAllocator::new();
+
+static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(
+    MIMALLOC_HEAP_START,
+    MIMALLOC_META_HEAP_SIZE as usize,
+));
+
+pub fn enable_mimalloc() {
+    ALLOCATOR.enable_mimalloc();
+}
+
+pub fn mimalloc_thread_done() {
+    ALLOCATOR.mimalloc_thread_done();
+}
+
+pub struct KernelAllocator {
+    bootstrap: BuddyLocked,
+    mimalloc_enabled: AtomicBool,
+    enable_lock: spin::Mutex<()>,
+}
+
+impl KernelAllocator {
     pub const fn new() -> Self {
         Self {
-            inner: spin::Mutex::new(Mimalloc::with_os_allocator(KernelSegAlloc)),
+            bootstrap: BuddyLocked::new(),
+            mimalloc_enabled: AtomicBool::new(false),
+            enable_lock: spin::Mutex::new(()),
+        }
+    }
+
+    pub fn enable_mimalloc(&self) {
+        if self.mimalloc_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let _guard = self.enable_lock.lock();
+        if !self.mimalloc_enabled.load(Ordering::Acquire) {
+            unsafe {
+                mi_process_init();
+                if !rustos_mi_manage_arena(
+                    MIMALLOC_ARENA_START as *mut c_void,
+                    MIMALLOC_ARENA_SIZE as usize,
+                ) {
+                    panic!("failed to register rustOS mimalloc arena");
+                }
+            }
+            self.mimalloc_enabled.store(true, Ordering::Release);
         }
     }
 
     #[inline(always)]
-    fn lock(&self) -> spin::MutexGuard<'_, Mimalloc<KernelSegAlloc>> {
-        loop {
-            if let Some(g) = self.inner.try_lock() {
-                return g;
-            }
+    pub fn mimalloc_enabled(&self) -> bool {
+        self.mimalloc_enabled.load(Ordering::Acquire)
+    }
 
-            if interrupts::are_enabled() {
-                yield_now();
-            } else {
-                core::hint::spin_loop();
+    pub fn mimalloc_thread_done(&self) {
+        if self.mimalloc_enabled() {
+            unsafe {
+                mi_thread_done();
             }
         }
     }
-    #[inline(always)]
+
     pub fn free_memory(&self) -> usize {
-        0
+        self.bootstrap.free_memory() + MIMALLOC_OS_ALLOCATOR.lock().free_memory()
+    }
+
+    #[inline(always)]
+    fn ptr_is_mimalloc(ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        addr >= MIMALLOC_HEAP_START && addr < MIMALLOC_HEAP_END
     }
 }
 
-unsafe impl GlobalAlloc for YieldingMimalloc {
+unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.lock().alloc(layout)
+        if self.mimalloc_enabled() {
+            mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8
+        } else {
+            self.bootstrap.alloc(layout)
+        }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if self.mimalloc_enabled() {
+            mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8
+        } else {
+            let ptr = self.bootstrap.alloc(layout);
+            if !ptr.is_null() {
+                core::ptr::write_bytes(ptr, 0, layout.size());
+            }
+            ptr
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.lock().dealloc(ptr, layout)
-    }
-}
-
-pub struct KernelSegAlloc;
-
-const PAGE_SIZE: usize = 4096;
-
-// Simple VA range allocator that backs allocations with freshly mapped frames.
-// All metadata lives inside the heap VA itself so no heap allocations occur.
-static SEG_ALLOC: Locked<SegAllocator> = Locked::new(SegAllocator::new());
-unsafe impl GlobalAlloc for KernelSegAlloc {
-    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
-        let size = x86_64::align_up(layout.size() as u64, PAGE_SIZE as u64) as usize;
-        if size == 0 {
-            return core::ptr::null_mut();
-        }
-        let align = layout.align().max(PAGE_SIZE);
-        vm_alloc_aligned(size, align)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
         if ptr.is_null() {
             return;
         }
-        let size = x86_64::align_up(layout.size() as u64, PAGE_SIZE as u64) as usize;
-        if size == 0 {
-            return;
+
+        if Self::ptr_is_mimalloc(ptr) {
+            mi_free(ptr.cast::<c_void>());
+        } else {
+            self.bootstrap.dealloc(ptr, layout);
         }
-        vm_free(ptr, size);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if ptr.is_null() {
+            return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
+        }
+
+        if Self::ptr_is_mimalloc(ptr) {
+            mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8
+        } else {
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let new_ptr = self.alloc(new_layout);
+            if !new_ptr.is_null() {
+                core::ptr::copy_nonoverlapping(
+                    ptr,
+                    new_ptr,
+                    core::cmp::min(layout.size(), new_size),
+                );
+                self.bootstrap.dealloc(ptr, layout);
+            }
+            new_ptr
+        }
     }
 }
+
 pub struct Locked<A> {
     inner: spin::Mutex<A>,
 }
 
 impl<A> Locked<A> {
     pub const fn new(inner: A) -> Self {
-        Locked {
+        Self {
             inner: spin::Mutex::new(inner),
         }
     }
@@ -118,16 +172,22 @@ impl<A> Locked<A> {
     }
 }
 
-struct SegAllocator {
+struct RangeAllocator {
     free_list: LinkedList,
     initialized: bool,
+    start: usize,
+    size: usize,
+    free_bytes: usize,
 }
 
-impl SegAllocator {
-    pub const fn new() -> Self {
+impl RangeAllocator {
+    pub const fn new(start: usize, size: usize) -> Self {
         Self {
             free_list: LinkedList::new(),
             initialized: false,
+            start,
+            size,
+            free_bytes: 0,
         }
     }
 
@@ -137,23 +197,67 @@ impl SegAllocator {
         }
 
         unsafe {
-            if !ensure_header_mapped(HEAP_START) {
-                return;
-            }
-
-            let heap_node_ptr = HEAP_START as *mut ListNode;
-            heap_node_ptr.write(ListNode::new(HEAP_SIZE as usize));
-            self.free_list.head.next = heap_node_ptr.as_mut();
-            self.initialized = true;
+            let node_ptr = self.start as *mut ListNode;
+            node_ptr.write(ListNode::new(self.size));
+            self.free_list.head.next = node_ptr.as_mut();
         }
+
+        self.free_bytes = self.size;
+        self.initialized = true;
+    }
+
+    fn free_memory(&self) -> usize {
+        self.free_bytes
+    }
+
+    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        self.ensure_init();
+
+        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        if size == 0 {
+            return null_mut();
+        }
+        let align = align.max(PAGE_SIZE);
+
+        let Some((region, alloc_start)) = self.find_region(size, align) else {
+            return null_mut();
+        };
+
+        let region_start = region.start_addr();
+        let region_end = region.end_addr();
+        let alloc_end = alloc_start + size;
+
+        if alloc_start > region_start {
+            self.add_free_region(region_start, alloc_start - region_start);
+        }
+        if alloc_end < region_end {
+            self.add_free_region(alloc_end, region_end - alloc_end);
+        }
+
+        self.free_bytes = self.free_bytes.saturating_sub(size);
+        core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
+        alloc_start as *mut u8
+    }
+
+    unsafe fn free(&mut self, ptr: *mut u8, size: usize) {
+        if ptr.is_null() || size == 0 {
+            return;
+        }
+
+        self.ensure_init();
+
+        let addr = ptr as usize;
+        if addr < self.start || addr >= self.start + self.size {
+            return;
+        }
+
+        let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
+        self.add_free_region(addr, size);
+        self.free_bytes = self.free_bytes.saturating_add(size).min(self.size);
     }
 
     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
         if size < core::mem::size_of::<ListNode>() || size < PAGE_SIZE {
-            return;
-        }
-
-        if !ensure_header_mapped(addr) {
             return;
         }
 
@@ -197,6 +301,7 @@ impl SegAllocator {
             }
         }
     }
+
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
         let mut best_fit_size = usize::MAX;
         let mut best_fit_prev: *mut ListNode = core::ptr::null_mut();
@@ -237,7 +342,7 @@ impl SegAllocator {
         let region_start = region.start_addr();
         let region_end = region.end_addr();
 
-        let alloc_start = x86_64::align_up(region_start as u64, align as u64) as usize;
+        let alloc_start = align_up(region_start as u64, align as u64) as usize;
         let alloc_end = alloc_start.checked_add(size).ok_or(())?;
 
         if alloc_end > region_end {
@@ -245,7 +350,6 @@ impl SegAllocator {
         }
 
         let min = core::mem::size_of::<ListNode>();
-
         let lead = alloc_start - region_start;
         if lead > 0 && lead < min {
             return Err(());
@@ -260,321 +364,6 @@ impl SegAllocator {
     }
 }
 
-unsafe fn ensure_header_mapped(addr: usize) -> bool {
-    let boot = boot_info();
-    let phys_off = VirtAddr::new(
-        boot.physical_memory_offset
-            .into_option()
-            .expect("missing phys mem offset"),
-    );
-
-    let mut mapper = init_mapper(phys_off);
-    let mut fa = BootInfoFrameAllocator::init(&boot.memory_regions);
-
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr as u64));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
-    let new_frame = match fa.allocate_frame() {
-        Some(f) => f,
-        None => return false,
-    };
-
-    match mapper.map_to(page, new_frame, flags, &mut fa) {
-        Ok(flush) => {
-            flush.flush();
-            true
-        }
-        Err(MapToError::PageAlreadyMapped(_)) => {
-            fa.deallocate_frame(new_frame);
-            true
-        }
-        Err(_) => {
-            fa.deallocate_frame(new_frame);
-            false
-        }
-    }
-}
-
-unsafe fn map_range_4k_rollback(start: VirtAddr, size: usize) -> Result<(), ()> {
-    let boot = boot_info();
-    let phys_off = VirtAddr::new(
-        boot.physical_memory_offset
-            .into_option()
-            .expect("missing phys mem offset"),
-    );
-
-    let mut mapper = init_mapper(phys_off);
-    let mut fa = BootInfoFrameAllocator::init(&boot.memory_regions);
-
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-
-    let mut cur = start;
-    let mut remaining = align_up(size as u64, PAGE_SIZE as u64) as usize;
-
-    while remaining > 0 {
-        let page = Page::<Size4KiB>::containing_address(cur);
-
-        let new_frame = match fa.allocate_frame() {
-            Some(f) => f,
-            None => {
-                unmap_range_impl(start, (cur.as_u64() - start.as_u64()));
-                return Err(());
-            }
-        };
-
-        match mapper.map_to(page, new_frame, flags, &mut fa) {
-            Ok(flush) => {
-                flush.flush();
-            }
-            Err(MapToError::PageAlreadyMapped(_)) => {
-                fa.deallocate_frame(new_frame);
-            }
-            Err(_) => {
-                fa.deallocate_frame(new_frame);
-                unmap_range_impl(start, (cur.as_u64() - start.as_u64()));
-                return Err(());
-            }
-        }
-
-        cur += PAGE_SIZE as u64;
-        remaining -= PAGE_SIZE;
-    }
-
-    Ok(())
-}
-
-/// Allocate a VA range from the heap window, back it with frames, and map it RW.
-unsafe fn vm_alloc_aligned(size: usize, align: usize) -> *mut u8 {
-    let request_size = align_up(size as u64, PAGE_SIZE as u64) as usize;
-    if request_size == 0 {
-        return null_mut();
-    }
-    let align = align.max(PAGE_SIZE);
-
-    let (alloc_start, alloc_size) = match without_interrupts(|| {
-        let mut alloc = SEG_ALLOC.lock();
-        alloc.ensure_init();
-        if !alloc.initialized {
-            return None;
-        }
-
-        alloc
-            .find_region(request_size, align)
-            .map(|(region, alloc_start)| {
-                let region_start = region.start_addr();
-                let region_end = region.end_addr();
-                let alloc_end = alloc_start + request_size;
-
-                if alloc_start > region_start {
-                    unsafe { alloc.add_free_region(region_start, alloc_start - region_start) };
-                }
-                if alloc_end < region_end {
-                    unsafe { alloc.add_free_region(alloc_end, region_end - alloc_end) };
-                }
-
-                (alloc_start, request_size)
-            })
-    }) {
-        Some(v) => v,
-        None => return null_mut(),
-    };
-
-    if map_range_4k_rollback(VirtAddr::new(alloc_start as u64), alloc_size).is_err() {
-        without_interrupts(|| {
-            let mut alloc = SEG_ALLOC.lock();
-            alloc.ensure_init();
-            if alloc.initialized {
-                unsafe { alloc.add_free_region(alloc_start, alloc_size) };
-            }
-        });
-        return null_mut();
-    }
-
-    core::ptr::write_bytes(alloc_start as *mut u8, 0, alloc_size);
-    alloc_start as *mut u8
-}
-
-/// Unmap and free the VA range previously returned by `vm_alloc_aligned`.
-unsafe fn vm_free(ptr: *mut u8, size: usize) {
-    if ptr.is_null() || size == 0 {
-        return;
-    }
-
-    let size = align_up(size as u64, PAGE_SIZE as u64) as usize;
-
-    unmap_range_impl(VirtAddr::new(ptr as u64), size as u64);
-
-    if !ensure_header_mapped(ptr as usize) {
-        return;
-    }
-
-    without_interrupts(|| {
-        let mut alloc = SEG_ALLOC.lock();
-        alloc.ensure_init();
-        if alloc.initialized {
-            unsafe { alloc.add_free_region(ptr as usize, size) };
-        }
-    });
-}
-// pub struct Allocator {
-//     pub(crate) free_list: LinkedList,
-//     pub(crate) allocations_made: u128,
-// }
-// impl Allocator {
-//     pub const fn new() -> Self {
-//         Allocator {
-//             free_list: LinkedList::new(),
-//             allocations_made: 0,
-//         }
-//     }
-//     unsafe fn add_free_region(&mut self, addr: usize, size: usize) {
-//         assert!(size >= size_of::<ListNode>());
-
-//         // create a new list node and append it at the start of the list
-//         let mut node = ListNode::new(size);
-//         node.next = self.free_list.head.next.take();
-//         let node_ptr = addr as *mut ListNode;
-//         node_ptr.write(node);
-//         self.free_list.head.next = Some(&mut *node_ptr);
-//     }
-
-//     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
-//         let mut best_fit_size = usize::MAX;
-//         let mut best_fit_prev: *mut ListNode = ptr::null_mut();
-//         let mut best_fit_alloc_start = 0usize;
-
-//         let mut current = &mut self.free_list.head as *mut ListNode;
-
-//         unsafe {
-//             // Traverse the free list
-//             while let Some(ref mut region) = (*current).next {
-//                 if let Ok(alloc_start) = Self::alloc_from_region(region, size, align) {
-//                     let region_size = region.size;
-//                     if region_size < best_fit_size {
-//                         best_fit_size = region_size;
-//                         best_fit_prev = current;
-//                         best_fit_alloc_start = alloc_start;
-//                     }
-//                 }
-//                 // Move to the next region
-//                 current = &mut **region as *mut ListNode;
-//             }
-
-//             if !best_fit_prev.is_null() {
-//                 let best_fit_prev_ref = &mut *best_fit_prev;
-//                 let best_fit_region = best_fit_prev_ref.next.take().unwrap();
-//                 let next = best_fit_region.next.take();
-//                 best_fit_prev_ref.next = next;
-
-//                 return Some((best_fit_region, best_fit_alloc_start));
-//             }
-//         }
-
-//         None
-//     }
-//     fn alloc_from_region(region: &mut ListNode, size: usize, align: usize) -> Result<usize, ()> {
-//         let alloc_start = align_up(region.start_addr() as u64, align as u64);
-//         let alloc_end = alloc_start.checked_add(size as u64).ok_or(())?;
-
-//         if alloc_end > region.end_addr() as u64 {
-//             return Err(());
-//         }
-
-//         let excess_size = region.end_addr() as u64 - alloc_end;
-//         if excess_size > 0 && excess_size < size_of::<ListNode>() as u64 {
-//             // rest of region too small to hold a ListNode (required because the
-//             // allocation splits the region in a used and a free part)
-//             return Err(());
-//         }
-
-//         Ok(alloc_start as usize)
-//     }
-//     fn size_align(layout: Layout) -> (usize, usize) {
-//         let layout = layout
-//             .align_to(align_of::<ListNode>())
-//             .expect("adjusting alignment failed")
-//             .pad_to_align();
-//         let size = layout.size().max(size_of::<ListNode>());
-//         (size, layout.align())
-//     }
-//     pub(crate) fn free_memory(&self) -> usize {
-//         let mut current = &self.free_list.head;
-//         let mut total_free = 0;
-
-//         while let Some(ref region) = current.next {
-//             total_free += region.size;
-//             current = region;
-//         }
-
-//         total_free
-//     }
-
-//     pub fn merge_free_list(&mut self) {
-//         unsafe {
-//             let mut current = self.free_list.head.start_addr() as *mut ListNode;
-
-//             while !current.is_null() {
-//                 let current_node = &mut *current;
-
-//                 if let Some(ref mut next_ref) = current_node.next {
-//                     let next_ptr = &mut **next_ref as *mut ListNode;
-//                     let next_node = &mut *next_ptr;
-
-//                     if current_node.end_addr() == next_node.start_addr() {
-//                         current_node.size += next_node.size;
-
-//                         current_node.next = next_node.next.take();
-//                     } else {
-//                         current = next_ptr;
-//                     }
-//                 } else {
-//                     break;
-//                 }
-//             }
-//         }
-//     }
-// }
-//TODO: make this atomic or mutex lock
-// static mut INIT: bool = false;
-// unsafe impl GlobalAlloc for Locked<Allocator> {
-//     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-//         // perform layout adjustments
-//         x86_64::instructions::interrupts::without_interrupts(|| {
-//             let (size, align) = Allocator::size_align(layout);
-//             let mut allocator = self.lock();
-
-//             if (INIT == false) {
-//                 let heap_start = VirtAddr::new(HEAP_START as u64);
-//                 let heap_node_ptr = heap_start.as_mut_ptr() as *mut ListNode;
-
-//                 allocator.free_list.head.next = heap_node_ptr.as_mut();
-//                 INIT = true;
-//             }
-//             if let Some((region, alloc_start)) = allocator.find_region(size, align) {
-//                 let alloc_end = alloc_start.checked_add(size).expect("overflow");
-//                 let excess_size = region.end_addr() - alloc_end;
-//                 if excess_size > 0 {
-//                     allocator.add_free_region(alloc_end, excess_size);
-//                 }
-//                 allocator.allocations_made += 1;
-//                 alloc_start as *mut u8
-//             } else {
-//                 ptr::null_mut()
-//             }
-//         })
-//     }
-
-//     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-//         // perform layout adjustments
-//         x86_64::instructions::interrupts::without_interrupts(|| {
-//             let mut allocator = self.lock();
-//             let (size, _) = Allocator::size_align(layout);
-//             allocator.allocations_made -= 1;
-//             allocator.add_free_region(ptr as usize, size);
-//             allocator.merge_free_list();
-//         });
-//     }
-// }
 pub struct BuddyLocked {
     inner: LockedHeap<32>,
     init: AtomicBool,
@@ -587,19 +376,21 @@ impl BuddyLocked {
             init: AtomicBool::new(false),
         }
     }
+
     #[inline(always)]
     unsafe fn ensure_init(&self) {
         if !self.init.load(Ordering::Acquire) {
             without_interrupts(|| {
                 if !self.init.load(Ordering::Acquire) {
-                    let heap_start = HEAP_START;
-                    let heap_size = HEAP_SIZE as usize;
-                    self.inner.lock().init(heap_start, heap_size);
+                    self.inner
+                        .lock()
+                        .init(HEAP_START, BOOTSTRAP_HEAP_SIZE as usize);
                     self.init.store(true, Ordering::Release);
                 }
             });
         }
     }
+
     pub fn free_memory(&self) -> usize {
         without_interrupts(|| {
             let inner = self.inner.lock();
@@ -612,7 +403,7 @@ unsafe impl GlobalAlloc for BuddyLocked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         self.ensure_init();
         without_interrupts(|| self.inner.lock().alloc(layout))
-            .expect("kernel heap overflow")
+            .expect("kernel bootstrap heap overflow")
             .as_ptr()
     }
 
@@ -620,9 +411,81 @@ unsafe impl GlobalAlloc for BuddyLocked {
         self.ensure_init();
         without_interrupts(|| {
             self.inner.lock().dealloc(
-                NonNull::new(ptr).expect("Null ptr passed to kernel heap dealloc"),
+                NonNull::new(ptr).expect("null ptr passed to kernel heap dealloc"),
                 layout,
             )
         })
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *mut c_void {
+    without_interrupts(|| {
+        MIMALLOC_OS_ALLOCATOR
+            .lock()
+            .alloc(size, alignment)
+            .cast::<c_void>()
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
+    without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
+}
+
+#[no_mangle]
+pub extern "C" fn rustos_mi_physical_memory_kib() -> usize {
+    let bytes = boot_info()
+        .memory_regions
+        .iter()
+        .filter(|region| region.kind == bootloader_api::info::MemoryRegionKind::Usable)
+        .fold(0u128, |sum, region| {
+            sum + (region.end - region.start) as u128
+        });
+
+    (bytes / 1024).min(usize::MAX as u128) as usize
+}
+
+#[no_mangle]
+pub extern "C" fn rustos_mi_clock_now() -> u64 {
+    let cycles = crate::cpu::get_cycles();
+    let hz = crate::drivers::interrupt_index::TSC_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        cycles
+    } else {
+        ((cycles as u128 * 1000) / hz as u128) as u64
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rustos_mi_random_buf(buf: *mut c_void, len: usize) -> bool {
+    if buf.is_null() {
+        return false;
+    }
+
+    let mut state = crate::cpu::get_cycles()
+        ^ (buf as u64).rotate_left(17)
+        ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let bytes = core::slice::from_raw_parts_mut(buf.cast::<u8>(), len);
+    for byte in bytes {
+        state = splitmix64(state);
+        *byte = (state >> 56) as u8;
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
+
+#[no_mangle]
+pub extern "C" fn rustos_mi_thread_yield() {
+    core::hint::spin_loop();
+}
+
+#[inline(always)]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
