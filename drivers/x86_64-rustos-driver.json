@@ -13,11 +13,9 @@
   "data-layout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
   "target-pointer-width": 64,
   "target-endian": "little",
-  "target-family": [
-    "windows"
-  ],
+  "target-family": ["windows"],
   "features": "+cmpxchg16b,+sse3,+lahfsahf",
-  "has-thread-local": true,
+  "has-thread-local": false,
   "max-atomic-width": 128,
   "dynamic-linking": true,
   "dll-prefix": "",
@@ -28,9 +26,7 @@
   "debuginfo-kind": "pdb",
   "emit-debug-gdb-scripts": false,
   "split-debuginfo": "off",
-  "supported-split-debuginfo": [
-    "off"
-  ],
+  "supported-split-debuginfo": ["off"],
   "panic-strategy": "abort",
   "relocation-model": "pic",
   "code-model": "large",
@@ -59,9 +55,7 @@
   "requires-uwtable": true,
   "crt-static-respected": true,
   "crt-static-allows-dylibs": true,
-  "supported-sanitizers": [
-    "address"
-  ],
+  "supported-sanitizers": ["address"],
   "plt-by-default": false,
   "staticlib-prefix": "",
   "staticlib-suffix": ".lib"

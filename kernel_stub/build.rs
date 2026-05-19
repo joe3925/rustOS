@@ -6,12 +6,28 @@ use std::{
 const KERNEL_PE_BASE: u64 = 0xFFFF_8500_0000_0000;
 
 fn main() {
-    let kernel_pe = artifact_path("KERNEL");
+    let kernel_pe = kernel_pe_path();
     validate_kernel_pe(&kernel_pe);
     publish_stable_kernel_artifacts(&kernel_pe);
 
     println!("cargo:rerun-if-changed={}", kernel_pe.display());
     println!("cargo:rustc-env=KERNEL_PE_PATH={}", kernel_pe.display());
+}
+
+fn kernel_pe_path() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=KERNEL_PE_PATH");
+    if let Some(path) = env::var_os("KERNEL_PE_PATH").map(PathBuf::from) {
+        if !path.is_file() {
+            panic!(
+                "KERNEL_PE_PATH points to a missing or non-file path: {}",
+                path.display()
+            );
+        }
+
+        return path;
+    }
+
+    panic!("KERNEL_PE_PATH is not set; build through `cargo run -p xtask` so the PE kernel is built first")
 }
 
 fn publish_stable_kernel_artifacts(kernel_pe: &Path) {
@@ -60,38 +76,6 @@ fn copy_artifact(source: &Path, destination: &Path, what: &str) {
             destination.display()
         )
     });
-}
-
-fn artifact_path(dep_name: &str) -> PathBuf {
-    let prefix = format!("CARGO_BIN_FILE_{dep_name}");
-    let mut matches = env::vars_os()
-        .filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            key.starts_with(&prefix).then_some((key, value))
-        })
-        .collect::<Vec<_>>();
-
-    matches.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut paths = matches
-        .iter()
-        .map(|(_, path)| PathBuf::from(path))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-
-    match paths.as_slice() {
-        [path] => path.clone(),
-        [] => panic!(
-            "Cargo did not provide a {dep_name} binary artifact; check kernel_stub/Cargo.toml build-dependencies"
-        ),
-        many => panic!(
-            "Cargo provided multiple distinct {dep_name} binary artifacts: {}",
-            many.iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 fn validate_kernel_pe(path: &PathBuf) {

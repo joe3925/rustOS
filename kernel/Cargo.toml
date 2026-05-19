@@ -1,3 +1,5 @@
+
+cargo-features = ["profile-rustflags"]
 [package]
 name = "kernel"
 version = "0.1.0"
@@ -41,10 +43,13 @@ bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",
     "derive",
 ] }
-serde_json = { version = "1.0.140", default-features = false, features = ["alloc"] }
+serde_json = { version = "1.0.140", default-features = false, features = [
+    "alloc",
+] }
 buddy_system_allocator = "0.11.0"
 baby-mimalloc = { version = "*", features = ["spin_mutex", "deferred_free"] }
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
+libm = { version = "0.2", default-features = false }
 kernel_types = { path = "../kernel_types", default-features = false, features = [
     "async-ffi-slab",
     "async-ffi-slab-slots-512",
@@ -59,6 +64,8 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
 ] }
 kernel_executor = { path = "../kernel_executor" }
 kernel_macros = { path = "../kernel_macros" }
+
+
 [dependencies.lazy_static]
 version = "1.0"
 features = ["spin_no_std"]

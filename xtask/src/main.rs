@@ -6,17 +6,21 @@ use std::process::{Command, ExitStatus};
 fn main() {
     let release = env::args().any(|arg| arg == "--release");
     let root = workspace_root();
+    let kernel_dir = root.join("kernel");
     let profile = if release { "release" } else { "debug" };
     let target_json = root.join("x86_64-rustos-kernel.json");
 
-    let mut kernel = cargo(&root);
+    let mut kernel = cargo(&kernel_dir);
     kernel
-        .args(["build", "-p", "kernel", "--target"])
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .args(["build", "--target"])
         .arg(&target_json)
         .args(build_std_args());
+
     if release {
         kernel.arg("--release");
     }
+
     run(kernel, "building PE kernel");
 
     let kernel_pe = root
@@ -24,6 +28,7 @@ fn main() {
         .join("x86_64-rustos-kernel")
         .join(profile)
         .join("kernel.exe");
+
     assert_exists(&kernel_pe, "PE kernel image");
     publish_stable_kernel_artifacts(&root, profile, &kernel_pe);
 
@@ -36,9 +41,11 @@ fn main() {
         "x86_64-unknown-none",
     ])
     .env("KERNEL_PE_PATH", &kernel_pe);
+
     if release {
         stub.arg("--release");
     }
+
     run(stub, "building bootloader-visible kernel stub");
 
     let stub_image = root
@@ -46,14 +53,17 @@ fn main() {
         .join("x86_64-unknown-none")
         .join(profile)
         .join("kernel_stub");
+
     assert_exists(&stub_image, "kernel stub ELF");
 
     let mut os = cargo(&root);
     os.args(["build", "-p", "OS"])
         .env("KERNEL_STUB_PATH", &stub_image);
+
     if release {
         os.arg("--release");
     }
+
     run(os, "building boot image");
 }
 
@@ -64,10 +74,10 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn cargo(root: &Path) -> Command {
+fn cargo(dir: &Path) -> Command {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command.current_dir(root);
+    command.current_dir(dir);
     command
 }
 
@@ -85,6 +95,7 @@ fn publish_stable_kernel_artifacts(root: &Path, profile: &str, kernel_pe: &Path)
     copy_artifact(kernel_pe, &stable_kernel_pe, "kernel PE");
 
     let kernel_pdb = kernel_pe.with_extension("pdb");
+
     if kernel_pdb.is_file() {
         copy_artifact(
             &kernel_pdb,
@@ -108,6 +119,7 @@ fn copy_artifact(source: &Path, destination: &Path, what: &str) {
             destination_dir.display()
         )
     });
+
     fs::copy(source, destination).unwrap_or_else(|err| {
         panic!(
             "failed to copy {what} from {} to {}: {err}",
@@ -121,6 +133,7 @@ fn run(mut command: Command, step: &str) {
     let status = command
         .status()
         .unwrap_or_else(|err| panic!("failed to start {step}: {err}"));
+
     check_status(status, step);
 }
 

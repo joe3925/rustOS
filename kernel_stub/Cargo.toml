@@ -18,6 +18,3 @@ kernel_abi = { path = "../kernel_abi" }
 x86_64 = { version = "=0.15.2", default-features = false, features = [
     "instructions",
 ] }
-
-[build-dependencies]
-kernel = { path = "../kernel", artifact = "bin", target = "x86_64-pc-windows-msvc" }

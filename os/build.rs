@@ -29,44 +29,16 @@ fn main() {
 }
 
 fn kernel_stub_path() -> PathBuf {
-    let path = artifact_path("KERNEL_STUB");
+    println!("cargo:rerun-if-env-changed=KERNEL_STUB_PATH");
+    let path = env::var_os("KERNEL_STUB_PATH")
+        .map(PathBuf::from)
+        .expect("KERNEL_STUB_PATH is not set; build through `cargo run -p xtask` so the kernel stub is built first");
+
     assert!(
         path.is_file(),
-        "kernel_stub artifact points to a missing or non-file path: {}",
+        "KERNEL_STUB_PATH points to a missing or non-file path: {}",
         path.display()
     );
     println!("cargo:rerun-if-changed={}", path.display());
     path
-}
-
-fn artifact_path(dep_name: &str) -> PathBuf {
-    let prefix = format!("CARGO_BIN_FILE_{dep_name}");
-    let mut matches = env::vars_os()
-        .filter_map(|(key, value)| {
-            let key = key.into_string().ok()?;
-            key.starts_with(&prefix).then_some((key, value))
-        })
-        .collect::<Vec<_>>();
-
-    matches.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut paths = matches
-        .iter()
-        .map(|(_, path)| PathBuf::from(path))
-        .collect::<Vec<_>>();
-    paths.sort();
-    paths.dedup();
-
-    match paths.as_slice() {
-        [path] => path.clone(),
-        [] => panic!(
-            "Cargo did not provide a {dep_name} binary artifact; check os/Cargo.toml build-dependencies"
-        ),
-        many => panic!(
-            "Cargo provided multiple distinct {dep_name} binary artifacts: {}",
-            many.iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
