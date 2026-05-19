@@ -22,6 +22,7 @@ use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
 use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
@@ -32,17 +33,17 @@ use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
-use crate::{cpu, println, BOOT_INFO};
+use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
-use bootloader_api::BootInfo;
 use core::arch::asm;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use kernel_abi::BootInfo;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
@@ -59,7 +60,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 2_000;
+pub const APIC_START_PERIOD: u64 = 250_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -91,6 +92,7 @@ const TLS_SELF_TEST_FAIL: u8 = 2;
 
 static TLS_SELF_TEST_BUSY: AtomicBool = AtomicBool::new(false);
 static TLS_SELF_TEST_RESULT: AtomicU8 = AtomicU8::new(TLS_SELF_TEST_PENDING);
+static KERNEL_STUB_RECLAIMED: AtomicBool = AtomicBool::new(false);
 
 const TLS_TEMPLATE_U64: u64 = 0x1122_3344_5566_7788;
 const TLS_MAIN_U64: u64 = 0xA1A2_A3A4_A5A6_A7A8;
@@ -116,7 +118,7 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
-        crate::profiling::unwind::init_kernel_elf_unwind();
+        reclaim_kernel_stub();
         Screen::clear_framebuffer();
         load_idt();
 
@@ -365,7 +367,26 @@ pub extern "win64" fn random_number() -> u64 {
 }
 
 pub fn boot_info() -> &'static mut BootInfo {
-    unsafe { BOOT_INFO.as_mut().expect("BOOT_INFO not initialized") }
+    if !BOOT_INFO_INITIALIZED.load(Ordering::Acquire) {
+        panic!("BOOT_INFO not initialized");
+    }
+
+    unsafe { &mut BOOT_INFO }
+}
+
+fn reclaim_kernel_stub() {
+    if KERNEL_STUB_RECLAIMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let boot = boot_info();
+    if boot.stub_base == 0 || boot.stub_size == 0 {
+        return;
+    }
+
+    unsafe {
+        unmap_reserved_range_unchecked(VirtAddr::new(boot.stub_base), boot.stub_size);
+    }
 }
 
 pub fn generate_guid() -> [u8; 16] {

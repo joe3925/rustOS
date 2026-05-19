@@ -86,6 +86,20 @@ pub unsafe fn unmap_range_unchecked(virtual_addr: VirtAddr, size: u64) {
     unmap_range_impl(virtual_addr, size)
 }
 pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
+    unmap_range_with_frame_mode(virtual_addr, size, UnmapFrameMode::Accounted)
+}
+
+pub(crate) unsafe fn unmap_reserved_range_unchecked(virtual_addr: VirtAddr, size: u64) {
+    unmap_range_with_frame_mode(virtual_addr, size, UnmapFrameMode::Reserved)
+}
+
+#[derive(Clone, Copy)]
+enum UnmapFrameMode {
+    Accounted,
+    Reserved,
+}
+
+unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: UnmapFrameMode) {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(
         boot_info
@@ -109,7 +123,7 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
         // Try 1 GiB page
         if remaining >= GI_B
             && (cur.as_u64() & (GI_B - 1)) == 0
-            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur)
+            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur, mode)
         {
             cur += GI_B;
             remaining -= GI_B;
@@ -119,7 +133,7 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
         // Try 2 MiB page
         if remaining >= MI_B2
             && (cur.as_u64() & (MI_B2 - 1)) == 0
-            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur)
+            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur, mode)
         {
             cur += MI_B2;
             remaining -= MI_B2;
@@ -127,7 +141,7 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
         }
 
         // Fall back to 4 KiB page
-        if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur) {
+        if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur, mode) {
             // nothing else to do
         }
         cur += KI_B4;
@@ -141,13 +155,17 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
     mapper: &mut impl Mapper<S>,
     frame_allocator: &mut BootInfoFrameAllocator,
     addr: VirtAddr,
+    mode: UnmapFrameMode,
 ) -> bool {
     let page = Page::<S>::containing_address(addr);
     match mapper.unmap(page) {
         Ok((frame, flush)) => {
             flush.flush();
             // SAFETY: the frame is no longer mapped
-            frame_allocator.deallocate_frame(frame);
+            match mode {
+                UnmapFrameMode::Accounted => frame_allocator.deallocate_frame(frame),
+                UnmapFrameMode::Reserved => frame_allocator.release_reserved_frame(frame),
+            }
             true
         }
         Err(_) => false,

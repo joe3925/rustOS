@@ -1,10 +1,7 @@
 use bootloader::{BootConfig, UefiBoot};
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, fs, path::PathBuf};
 
 fn main() {
-    let kernel_path =
-        env::var("CARGO_BIN_FILE_KERNEL_kernel").expect("Could not find kernel binary");
-    let kernel_path = PathBuf::from(kernel_path);
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let target_dir = out_dir
@@ -14,7 +11,7 @@ fn main() {
         .unwrap()
         .parent()
         .unwrap();
-    let root_dir = target_dir.parent().unwrap().parent().unwrap();
+    let kernel_path = kernel_stub_path();
     let image_path = target_dir.join("boot.img");
     let efi_path = target_dir.join("kernel.efi");
 
@@ -29,4 +26,19 @@ fn main() {
 
     println!("cargo:rustc-env=BOOTLOADER_IMAGE={}", image_path.display());
     println!("cargo:rustc-env=KERNEL_EFI={}", efi_path.display());
+}
+
+fn kernel_stub_path() -> PathBuf {
+    println!("cargo:rerun-if-env-changed=KERNEL_STUB_PATH");
+    let path = env::var_os("KERNEL_STUB_PATH")
+        .map(PathBuf::from)
+        .expect("KERNEL_STUB_PATH is not set; build through `cargo run -p xtask` so the kernel stub is built first");
+
+    assert!(
+        path.is_file(),
+        "KERNEL_STUB_PATH points to a missing or non-file path: {}",
+        path.display()
+    );
+    println!("cargo:rerun-if-changed={}", path.display());
+    path
 }

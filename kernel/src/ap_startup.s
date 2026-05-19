@@ -18,12 +18,11 @@
 
 .set TRAMPOLINE_BASE, 0x8000
 
-.section .text.trampoline, "ax", @progbits
-.global trampoline
-.global trampoline_end
-.type trampoline, @function
+.section .text$trampoline, "x"
+.globl trampoline
+.globl trampoline_end
 
-/* Absolute addresses inside the copied blob (no relocations at runtime). */
+/* Absolute addresses inside the copied blob. */
 .set TRAMPOLINE_PAGEMAP_ABS,         TRAMPOLINE_BASE + (trampoline.pagemap        - trampoline)
 .set TRAMPOLINE_GDTR_LIMIT_ABS,      TRAMPOLINE_BASE + (trampoline.gdtr_limit     - trampoline)
 .set TRAMPOLINE_GDTR_BASE_ABS,       TRAMPOLINE_BASE + (trampoline.gdtr_base      - trampoline)
@@ -36,7 +35,7 @@
 .set GDTR_ABS, TRAMPOLINE_BASE + (gdtr - trampoline)
 .set GDT_ABS,  TRAMPOLINE_BASE + (gdt  - trampoline)
 
-/* Selectors are offsets in the GDT (TI=0, RPL=0). */
+/* Selectors are offsets in the GDT: TI=0, RPL=0. */
 .set GDT_KERNEL_CODE, (gdt.kernel_code - gdt)
 .set GDT_KERNEL_DATA, (gdt.kernel_data - gdt)
 
@@ -45,7 +44,8 @@
 .code16
 trampoline:
     jmp short startup_ap
-    /* Ensure the next byte is exactly offset 0x08 from 'trampoline'. */
+
+    /* Ensure the next byte is exactly offset 0x08 from trampoline. */
     .fill 8 - (. - trampoline), 1, 0x90
 
     /* Data block: MUST match NASM field order and packing exactly. */
@@ -60,6 +60,7 @@ trampoline.longmode_base:   .quad 0          /* +0x30 */
 
 startup_ap:
     cli
+
     xor ax, ax
     mov ds, ax
     mov es, ax
@@ -80,7 +81,7 @@ startup_ap:
 
     fninit
 
-    lgdt [GDTR_ABS]
+    lgdt [TRAMPOLINE_GDTR_LIMIT_ABS]
 
     mov ecx, 0xC0000080
     rdmsr
@@ -97,7 +98,7 @@ startup_ap:
 
 .code64
 long_mode_entry:
-    mov ax, 0x10
+    mov ax, offset GDT_KERNEL_DATA
     mov ds, ax
     mov es, ax
     mov fs, ax
@@ -105,6 +106,8 @@ long_mode_entry:
     mov ss, ax
 
     mov rsp, qword ptr [TRAMPOLINE_START_STACK_ABS]
+    and rsp, -16
+    sub rsp, 40
 
     lgdt [TRAMPOLINE_LONGMODE_LIMIT_ABS]
 
@@ -112,7 +115,7 @@ long_mode_entry:
     jmp rax
 
 gdtr:
-    .word (gdt_end - gdt + 1)
+    .word (gdt_end - gdt - 1)
     .quad GDT_ABS
 
 gdt:
@@ -120,14 +123,11 @@ gdt.null:
     .quad 0x0000000000000000
 
 gdt.kernel_code:
-    /* access=0x98, flags(L)=0x20 => 00 00 00 00 00 98 20 00 */
     .quad 0x0020980000000000
 
 gdt.kernel_data:
-    /* access=0x92, flags=0x00 => 00 00 00 00 00 92 00 00 */
     .quad 0x0000920000000000
 
 gdt_end:
 
 trampoline_end:
-.size trampoline, trampoline_end - trampoline

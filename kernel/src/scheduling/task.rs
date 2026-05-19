@@ -74,7 +74,7 @@ pub struct TaskRef {
     /// Total reserved stack bytes (write-once, read lock-free)
     pub stack_size: AtomicU64,
 
-    /// x86-64 ELF thread pointer for this task's kernel TLS block.
+    /// Scheduler-restored kernel TLS pointer for this task.
     pub tls_thread_pointer: AtomicU64,
 }
 

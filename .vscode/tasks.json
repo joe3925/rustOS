@@ -4,13 +4,13 @@
         {
             "label": "dbg full build",
             "type": "shell",
-            "command": "Set-Location '${workspaceFolder}\\drivers'; cargo build; Set-Location '${workspaceFolder}\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "command": "Set-Location '${workspaceFolder}\\drivers'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location '${workspaceFolder}'; cargo run -p xtask; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "problemMatcher": []
         },
         {
             "label": "dbg kernel build",
             "type": "shell",
-            "command": "Set-Location '${workspaceFolder}\\os'; cargo build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+            "command": "Set-Location '${workspaceFolder}'; cargo run -p xtask; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
             "problemMatcher": []
         },
         {

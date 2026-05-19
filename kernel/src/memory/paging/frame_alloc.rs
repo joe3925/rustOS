@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
+use kernel_abi::{MemoryRegion, MemoryRegionKind};
 use kernel_types::irq::IrqSafeMutex;
 use x86_64::{
     structures::paging::{FrameAllocator, PageSize, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
@@ -19,20 +19,25 @@ use crate::{
 
 pub static MEMORY_BITMAP: IrqSafeMutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
     IrqSafeMutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
+static RECLAIMED_MEMORY_BITMAP: IrqSafeMutex<[u64; num_frames_4k(BOOT_MEMORY_SIZE) / 64]> =
+    IrqSafeMutex::new([0; num_frames_4k(BOOT_MEMORY_SIZE) / 64]);
 
 pub static USED_MEMORY: AtomicUsize = AtomicUsize::new(0);
+static RECLAIMED_MEMORY_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 static NEXT_WORD_4K: AtomicUsize = AtomicUsize::new(0);
 static NEXT_WORD_2M: AtomicUsize = AtomicUsize::new(0);
 static NEXT_WORD_1G: AtomicUsize = AtomicUsize::new(0);
 
 pub fn total_usable_bytes() -> u64 {
-    boot_info()
+    let boot_usable: u64 = boot_info()
         .memory_regions
         .iter()
         .filter(|r| r.kind == MemoryRegionKind::Usable)
         .map(|r| r.end - r.start)
-        .sum()
+        .sum();
+
+    boot_usable + RECLAIMED_MEMORY_BYTES.load(Ordering::Acquire) as u64
 }
 
 #[derive(Clone)]
@@ -69,6 +74,12 @@ impl BootInfoFrameAllocator {
         NEXT_WORD_4K.store(0, Ordering::Release);
         NEXT_WORD_2M.store(0, Ordering::Release);
         NEXT_WORD_1G.store(0, Ordering::Release);
+        RECLAIMED_MEMORY_BYTES.store(0, Ordering::Release);
+
+        let mut reclaimed = RECLAIMED_MEMORY_BITMAP.lock();
+        for w in reclaimed.iter_mut() {
+            *w = 0;
+        }
     }
 
     pub fn init(_memory_regions: &'static [MemoryRegion]) -> Self {
@@ -162,6 +173,32 @@ impl BootInfoFrameAllocator {
         clear_range(bm.as_mut_slice(), base_idx, len);
 
         USED_MEMORY.fetch_sub(bytes_u64 as usize, Ordering::SeqCst);
+    }
+
+    pub fn release_reserved_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
+        let base_idx = (frame.start_address().as_u64() >> 12) as usize;
+        let len = match S::SIZE {
+            Size4KiB::SIZE => 1usize,
+            Size2MiB::SIZE => FRAMES_PER_2M,
+            Size1GiB::SIZE => FRAMES_PER_1G,
+            _ => return,
+        };
+
+        if base_idx < LOW_FRAMES {
+            return;
+        }
+
+        let mut bm = MEMORY_BITMAP.lock();
+
+        if !frame_range_is_boot_info_usable(base_idx, len) {
+            let mut reclaimed = RECLAIMED_MEMORY_BITMAP.lock();
+            let newly_reclaimed = set_range_count_new(reclaimed.as_mut_slice(), base_idx, len);
+            if newly_reclaimed != 0 {
+                RECLAIMED_MEMORY_BYTES.fetch_add(newly_reclaimed * 0x1000, Ordering::SeqCst);
+            }
+        }
+
+        clear_range(bm.as_mut_slice(), base_idx, len);
     }
 }
 
@@ -328,6 +365,15 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
 }
 
 fn frame_range_is_usable(base_idx: usize, len: usize) -> bool {
+    if frame_range_is_boot_info_usable(base_idx, len) {
+        return true;
+    }
+
+    let reclaimed = RECLAIMED_MEMORY_BITMAP.lock();
+    range_all_set(&*reclaimed, base_idx, len)
+}
+
+fn frame_range_is_boot_info_usable(base_idx: usize, len: usize) -> bool {
     let base = (base_idx as u64) << 12;
     let end_excl = ((base_idx.saturating_add(len) as u64) << 12);
 
@@ -420,6 +466,55 @@ fn clear_range(bitmap: &mut [u64], start: usize, len: usize) {
     }
 
     bitmap[last_word] &= !(!0u64 >> (63 - (end_incl & 63)));
+}
+
+fn set_range_count_new(bitmap: &mut [u64], start: usize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+
+    let total_bits = bitmap.len() * 64;
+    if start >= total_bits {
+        return 0;
+    }
+
+    let end = start.saturating_add(len).min(total_bits);
+    let mut new_bits = 0usize;
+
+    for idx in start..end {
+        let w = idx / 64;
+        let b = idx & 63;
+        let mask = 1u64 << b;
+        if bitmap[w] & mask == 0 {
+            bitmap[w] |= mask;
+            new_bits += 1;
+        }
+    }
+
+    new_bits
+}
+
+fn range_all_set(bitmap: &[u64], start: usize, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+
+    let Some(end) = start.checked_add(len) else {
+        return false;
+    };
+    if end > bitmap.len() * 64 {
+        return false;
+    }
+
+    for idx in start..end {
+        let w = idx / 64;
+        let b = idx & 63;
+        if bitmap[w] & (1u64 << b) == 0 {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Return the index of the first set bit in `[start, end)`, or `None` if all clear.

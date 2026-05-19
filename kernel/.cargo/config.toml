@@ -1,8 +1,12 @@
 [build]
-target = "x86_64-unknown-none"
+target = "../x86_64-rustos-kernel.json"
+
+[profile.release]
+rustflags = ["-C", "panic=abort"]
+[profile.dev]
+rustflags = ["-C", "panic=abort"]
 
 [unstable]
-build-std = ["core", "alloc", "panic_abort"]
-
-[target.x86_64-unknown-none]
-rustflags = ["-C", "code-model=large"]
+build-std = ["core", "alloc", "compiler_builtins", "panic_abort"]
+build-std-features = ["compiler-builtins-mem"]
+json-target-spec = true
