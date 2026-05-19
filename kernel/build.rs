@@ -121,6 +121,55 @@ fn compile_mimalloc(manifest_dir: &std::path::Path, target: &str) {
     build.compile("rustos_mimalloc");
 }
 
+fn compile_mimalloc(manifest_dir: &std::path::Path, target: &str) {
+    let mimalloc_dir = manifest_dir.join("vendor").join("mimalloc-v2");
+    let shim_include_dir = manifest_dir.join("c").join("include");
+    let include_dir = mimalloc_dir.join("include");
+    let src_dir = mimalloc_dir.join("src");
+
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("c").display()
+    );
+    println!("cargo:rerun-if-changed={}", include_dir.display());
+    println!("cargo:rerun-if-changed={}", src_dir.display());
+
+    let mut build = cc::Build::new();
+    build
+        .compiler("clang")
+        .archiver("llvm-ar")
+        .include(&shim_include_dir)
+        .include(&include_dir)
+        .include(&src_dir)
+        .file(manifest_dir.join("c").join("mimalloc_static.c"))
+        .file(manifest_dir.join("c").join("mimalloc_rustos_platform.c"))
+        .file(manifest_dir.join("c").join("rustos_libc.c"))
+        .flag("--target=x86_64-unknown-none")
+        .flag("-std=c11")
+        .flag("-ffreestanding")
+        .flag("-fno-builtin")
+        .flag("-fno-stack-protector")
+        .flag("-fno-pic")
+        .flag("-mno-red-zone")
+        .flag("-mcmodel=large")
+        .flag("-Wno-unused-parameter")
+        .flag("-Wno-unused-function")
+        .flag("-Wno-unused-macros")
+        .flag("-Wno-missing-braces")
+        .define("MI_DEBUG", "0")
+        .define("MI_SECURE", "0")
+        .define("MI_STAT", "0")
+        .define("MI_NO_GETENV", "1")
+        .define("MI_RUSTOS_HIGH_HALF", "1")
+        .define("NDEBUG", "1");
+
+    if !target.contains("x86_64") {
+        panic!("rustOS mimalloc platform is currently implemented for x86_64 only");
+    }
+
+    build.compile("rustos_mimalloc");
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
