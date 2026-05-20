@@ -17,6 +17,10 @@ extern bool rustos_mi_random_buf(void* buf, size_t len);
 extern void rustos_mi_out_stderr(const char* msg);
 extern void rustos_mi_thread_yield(void);
 
+void rustos_mi_configure_options(void) {
+  mi_option_set(mi_option_eager_commit_delay, 0);
+}
+
 bool rustos_mi_manage_arena(void* start, size_t size) {
   return mi_manage_os_memory(start, size, false, false, false, -1);
 }

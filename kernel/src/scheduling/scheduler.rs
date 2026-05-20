@@ -101,7 +101,8 @@ impl TaskTable {
 }
 
 /// Saves the current task's FPU/SIMD state for the duration of a kernel handler.
-/// Restores it only if we return to the same task (i.e., no context switch happened).
+/// Restores the task selected at handler exit so post-schedule handler code
+/// cannot clobber the FPU/SIMD state that will be resumed by `iretq`.
 pub struct KernelFpuGuard {
     saved_task: Option<TaskHandle>,
 }
@@ -129,18 +130,15 @@ impl KernelFpuGuard {
 
 impl Drop for KernelFpuGuard {
     fn drop(&mut self) {
-        let Some(task) = self.saved_task.take() else {
-            return;
-        };
+        self.saved_task.take();
 
         let cpu_id = current_cpu_id();
         if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
-            if Arc::ptr_eq(&task, &current) {
-                let mut guard = current.inner.try_write().expect(
-                    "Failed to acquire task lock for restoring FPU state in interrupt handler",
-                );
-                guard.restore_fpu_state();
-            }
+            let mut guard = current
+                .inner
+                .try_write()
+                .expect("Failed to acquire task lock for restoring FPU state in interrupt handler");
+            guard.restore_fpu_state();
         }
     }
 }
@@ -599,7 +597,7 @@ impl Scheduler {
             }
         }
 
-        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(task) => task,
             None => return prev_task,
         };
@@ -618,6 +616,7 @@ impl Scheduler {
         cpu_id: usize,
         core: &Arc<CoreScheduler>,
         now_cycles: u64,
+        prev_fpu_already_saved: bool,
     ) -> Option<TaskHandle> {
         let mut sched_state = core.sched_lock.write();
 
@@ -628,7 +627,9 @@ impl Scheduler {
 
             let mut lock_failed = false;
             if let Some(mut guard) = prev.inner.try_write() {
-                guard.save_fpu_state();
+                if !prev_fpu_already_saved {
+                    guard.save_fpu_state();
+                }
                 if !prev_is_idle {
                     guard.account_switched_out(now_cycles);
                 }
@@ -871,11 +872,7 @@ impl Scheduler {
         }
 
         let now_cycles = cpu::get_cycles();
-        if let Some(mut guard) = core.idle_task.inner.try_write() {
-            guard.save_fpu_state();
-        }
-
-        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
                 send_eoi(SCHED_IPI_VECTOR);
@@ -1015,8 +1012,9 @@ pub extern "win64" fn task_return_trampoline() -> ! {
 }
 
 pub extern "win64" fn kernel_task_end() -> ! {
+    crate::memory::allocator::mimalloc_thread_done();
+
     interrupts::without_interrupts(|| {
-        crate::memory::allocator::mimalloc_thread_done();
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
     });

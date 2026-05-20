@@ -57,6 +57,11 @@ where
                     remaining -= gib;
                     continue;
                 }
+                Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {
+                    cur += gib;
+                    remaining -= gib;
+                    continue;
+                }
                 Err(e) => {
                     return Err(PageMapError::Page1GiB(e));
                 }
@@ -76,6 +81,11 @@ where
                     remaining -= mib2;
                     continue;
                 }
+                Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {
+                    cur += mib2;
+                    remaining -= mib2;
+                    continue;
+                }
                 Err(e) => {
                     return Err(PageMapError::Page2MiB(e));
                 }
@@ -86,6 +96,7 @@ where
         match unsafe { map_page(mapper, page4k, fa, flags) } {
             Ok(_) => {}
             Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {}
+            Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {}
             Err(e) => return Err(PageMapError::Page4KiB(e)),
         }
         cur += 0x1000;
@@ -240,14 +251,18 @@ pub unsafe extern "win64" fn identity_map_page(
 pub unsafe fn map_page(
     mapper: &mut impl Mapper<Size4KiB>,
     page: Page<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    frame_allocator: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
     let frame = frame_allocator
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
-    unsafe {
-        mapper.map_to(page, frame, flags, frame_allocator)?.flush();
+    match unsafe { mapper.map_to(page, frame, flags, frame_allocator) } {
+        Ok(flush) => flush.flush(),
+        Err(err) => {
+            frame_allocator.deallocate_frame(frame);
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -255,15 +270,14 @@ pub unsafe fn map_page(
 /// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
 /// The best way to do this is to reserve the range you want to map manually.
 #[inline(always)]
-unsafe fn map_1gib_page<M, FA>(
+unsafe fn map_1gib_page<M>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
-    fa: &mut FA,
+    fa: &mut BootInfoFrameAllocator,
 ) -> Result<(), MapToError<Size1GiB>>
 where
     M: Mapper<Size1GiB>,
-    FA: FrameAllocator<Size1GiB> + FrameAllocator<Size4KiB>,
 {
     let page = Page::<Size1GiB>::containing_address(addr);
     let frame = fa
@@ -276,8 +290,12 @@ where
         flags | PageTableFlags::HUGE_PAGE
     };
 
-    unsafe {
-        mapper.map_to(page, frame, effective_flags, fa)?.flush();
+    match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
+        Ok(flush) => flush.flush(),
+        Err(err) => {
+            fa.deallocate_frame(frame);
+            return Err(err);
+        }
     }
     Ok(())
 }
@@ -285,15 +303,14 @@ where
 /// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
 /// The best way to do this is to reserve the range you want to map manually.
 #[inline(always)]
-unsafe fn map_2mib_page<M, FA>(
+unsafe fn map_2mib_page<M>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
-    fa: &mut FA,
+    fa: &mut BootInfoFrameAllocator,
 ) -> Result<(), MapToError<Size2MiB>>
 where
     M: Mapper<Size2MiB>,
-    FA: FrameAllocator<Size2MiB> + FrameAllocator<Size4KiB>,
 {
     let page = Page::<Size2MiB>::containing_address(addr);
     let frame = fa
@@ -307,8 +324,12 @@ where
         flags | PageTableFlags::HUGE_PAGE
     };
 
-    unsafe {
-        mapper.map_to(page, frame, effective_flags, fa)?.flush();
+    match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
+        Ok(flush) => flush.flush(),
+        Err(err) => {
+            fa.deallocate_frame(frame);
+            return Err(err);
+        }
     }
     Ok(())
 }

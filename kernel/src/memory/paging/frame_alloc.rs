@@ -294,7 +294,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
                 *w = u64::MAX;
             }
 
-            NEXT_WORD_2M.store(word_idx, Ordering::Relaxed);
+            NEXT_WORD_2M.store(start_w + WORDS_PER_2M, Ordering::Relaxed);
 
             USED_MEMORY.fetch_add(0x20_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;
@@ -354,7 +354,7 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
                 *w = u64::MAX;
             }
 
-            NEXT_WORD_1G.store(word_idx, Ordering::Relaxed);
+            NEXT_WORD_1G.store(start_w + WORDS_PER_1G, Ordering::Relaxed);
 
             USED_MEMORY.fetch_add(0x4000_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;

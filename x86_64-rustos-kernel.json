@@ -4,6 +4,7 @@
   "os": "windows",
   "env": "msvc",
   "vendor": "pc",
+  "linker": "lld-link",
   "linker-flavor": "msvc",
   "linker-is-gnu": false,
   "lld-flavor": "link",
@@ -23,7 +24,7 @@
   "exe-suffix": ".exe",
   "binary-format": "coff",
   "archive-format": "coff",
-  "debuginfo-kind": "pdb",
+  "debuginfo-kind": "dwarf",
   "emit-debug-gdb-scripts": false,
   "split-debuginfo": "off",
   "supported-split-debuginfo": ["off"],
@@ -42,7 +43,7 @@
       "/DYNAMICBASE:NO",
       "/BASE:0xFFFF850000000000",
       "/EXPORT:kernel_pe_entry",
-      "/DEBUG:FULL"
+      "/DEBUG:SYMTAB"
     ],
     "msvc-lld": [
       "/NOLOGO",
@@ -53,7 +54,7 @@
       "/DYNAMICBASE:NO",
       "/BASE:0xFFFF850000000000",
       "/EXPORT:kernel_pe_entry",
-      "/DEBUG:FULL"
+      "/DEBUG:SYMTAB"
     ]
   },
   "requires-uwtable": true,

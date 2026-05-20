@@ -118,4 +118,52 @@ impl RangeTracker {
 
         None
     }
+
+    pub fn alloc_auto_aligned(&self, size: u64, alignment: u64) -> Option<VirtAddr> {
+        let aligned_size = (size + 0xFFF) & !0xFFF;
+        if aligned_size == 0 || alignment < 0x1000 || (alignment & (alignment - 1)) != 0 {
+            return None;
+        }
+
+        let mut lock = self.allocations.lock();
+        lock.sort_unstable_by_key(|&(base, _)| base);
+
+        let mut current = align_up(self.start, alignment)?;
+
+        for &(alloc_base, alloc_size) in lock.iter() {
+            if current
+                .checked_add(aligned_size)
+                .is_some_and(|end| end <= alloc_base)
+            {
+                lock.push((current, aligned_size));
+                return Some(VirtAddr::new(current));
+            }
+
+            let alloc_end = alloc_base.checked_add(alloc_size)?;
+            if alloc_end > current {
+                current = align_up(alloc_end, alignment)?;
+            }
+            if current > self.end {
+                return None;
+            }
+        }
+
+        if current
+            .checked_add(aligned_size)
+            .is_some_and(|end| end <= self.end)
+        {
+            lock.push((current, aligned_size));
+            return Some(VirtAddr::new(current));
+        }
+
+        None
+    }
+}
+
+#[inline]
+fn align_up(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment.is_power_of_two());
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
 }

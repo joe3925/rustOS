@@ -8,14 +8,42 @@ use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
 use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
 const PAGE_SIZE: usize = 4096;
+const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
+const MIMALLOC_COMMIT_TRACK_START: usize =
+    align_down_const(MIMALLOC_ARENA_START, MIMALLOC_COMMIT_GRANULARITY);
+const MIMALLOC_COMMIT_TRACK_END: usize = align_up_const(
+    MIMALLOC_ARENA_START + MIMALLOC_ARENA_SIZE as usize,
+    MIMALLOC_COMMIT_GRANULARITY,
+);
+const MIMALLOC_COMMIT_CHUNKS: usize =
+    (MIMALLOC_COMMIT_TRACK_END - MIMALLOC_COMMIT_TRACK_START) / MIMALLOC_COMMIT_GRANULARITY;
+const MIMALLOC_COMMIT_BITMAP_BITS: usize = usize::BITS as usize;
+const MIMALLOC_COMMIT_BITMAP_WORDS: usize =
+    (MIMALLOC_COMMIT_CHUNKS + MIMALLOC_COMMIT_BITMAP_BITS - 1) / MIMALLOC_COMMIT_BITMAP_BITS;
 
 pub static MIMALLOC_ARENA_COMMITTED: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_COMMIT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static MIMALLOC_COMMIT_BITMAP: [AtomicUsize; MIMALLOC_COMMIT_BITMAP_WORDS] =
+    [const { AtomicUsize::new(0) }; MIMALLOC_COMMIT_BITMAP_WORDS];
+static MIMALLOC_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_COMMIT_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_COMMIT_REQUESTED: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_COMMIT_MAPPED: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_COMMIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+pub struct MimallocCommitStats {
+    pub calls: usize,
+    pub map_calls: usize,
+    pub requested: usize,
+    pub mapped: usize,
+    pub cycles: u64,
+}
 
 unsafe extern "C" {
     fn mi_process_init();
@@ -24,6 +52,7 @@ unsafe extern "C" {
     fn mi_zalloc_aligned(size: usize, alignment: usize) -> *mut c_void;
     fn mi_realloc_aligned(ptr: *mut c_void, new_size: usize, alignment: usize) -> *mut c_void;
     fn mi_free(ptr: *mut c_void);
+    fn rustos_mi_configure_options();
     fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
 
@@ -41,6 +70,24 @@ pub fn enable_mimalloc() {
 
 pub fn mimalloc_thread_done() {
     ALLOCATOR.mimalloc_thread_done();
+}
+
+pub fn mimalloc_commit_stats_reset() {
+    MIMALLOC_COMMIT_CALLS.store(0, Ordering::Relaxed);
+    MIMALLOC_COMMIT_MAP_CALLS.store(0, Ordering::Relaxed);
+    MIMALLOC_COMMIT_REQUESTED.store(0, Ordering::Relaxed);
+    MIMALLOC_COMMIT_MAPPED.store(0, Ordering::Relaxed);
+    MIMALLOC_COMMIT_CYCLES.store(0, Ordering::Relaxed);
+}
+
+pub fn mimalloc_commit_stats() -> MimallocCommitStats {
+    MimallocCommitStats {
+        calls: MIMALLOC_COMMIT_CALLS.load(Ordering::Relaxed),
+        map_calls: MIMALLOC_COMMIT_MAP_CALLS.load(Ordering::Relaxed),
+        requested: MIMALLOC_COMMIT_REQUESTED.load(Ordering::Relaxed),
+        mapped: MIMALLOC_COMMIT_MAPPED.load(Ordering::Relaxed),
+        cycles: MIMALLOC_COMMIT_CYCLES.load(Ordering::Relaxed),
+    }
 }
 
 pub struct KernelAllocator {
@@ -67,6 +114,7 @@ impl KernelAllocator {
         if !self.mimalloc_enabled.load(Ordering::Acquire) {
             unsafe {
                 mi_process_init();
+                rustos_mi_configure_options();
                 init_mimalloc_diagnostics();
                 if !rustos_mi_manage_arena(
                     MIMALLOC_ARENA_START as *mut c_void,
@@ -468,15 +516,35 @@ pub fn init_mimalloc_diagnostics() {
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
-    let start_addr = x86_64::VirtAddr::new(addr as u64);
+    let start_cycles = crate::cpu::get_cycles();
+    MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
+
     let addr_usize = addr as usize;
+    let Some(end_usize) = addr_usize.checked_add(size) else {
+        crate::println!(
+            "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address overflow",
+            addr,
+            size
+        );
+        MIMALLOC_COMMIT_CYCLES.fetch_add(
+            crate::cpu::get_cycles().wrapping_sub(start_cycles),
+            Ordering::Relaxed,
+        );
+        return false;
+    };
+
     if addr_usize < MIMALLOC_ARENA_START
-        || addr_usize + size > MIMALLOC_ARENA_START + (MIMALLOC_ARENA_SIZE as usize)
+        || end_usize > MIMALLOC_ARENA_START + (MIMALLOC_ARENA_SIZE as usize)
     {
         crate::println!(
             "MIMALLOC COMMIT FAILED: address={:p}, size={}, reason=Address out of arena bounds",
             addr,
             size
+        );
+        MIMALLOC_COMMIT_CYCLES.fetch_add(
+            crate::cpu::get_cycles().wrapping_sub(start_cycles),
+            Ordering::Relaxed,
         );
         return false;
     }
@@ -484,20 +552,61 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
     let flags = x86_64::structures::paging::PageTableFlags::PRESENT
         | x86_64::structures::paging::PageTableFlags::WRITABLE;
 
-    let res = without_interrupts(|| {
-        crate::memory::paging::paging::map_kernel_range(start_addr, size as u64, flags, true)
-    });
+    let commit_start = align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY)
+        .max(MIMALLOC_COMMIT_TRACK_START);
+    let commit_end = align_up_const(end_usize, MIMALLOC_COMMIT_GRANULARITY)
+        .min(MIMALLOC_COMMIT_TRACK_END);
 
-    match res {
-        Ok(_) => {
-            MIMALLOC_ARENA_COMMITTED.fetch_add(size, Ordering::Relaxed);
-            true
+    let first_chunk = (commit_start - MIMALLOC_COMMIT_TRACK_START) / MIMALLOC_COMMIT_GRANULARITY;
+    let last_chunk = (commit_end - MIMALLOC_COMMIT_TRACK_START) / MIMALLOC_COMMIT_GRANULARITY;
+
+    let _commit_guard = MIMALLOC_COMMIT_LOCK.lock();
+    let mut chunk = first_chunk;
+    while chunk < last_chunk {
+        if mimalloc_commit_chunk_is_set(chunk) {
+            chunk += 1;
+            continue;
         }
-        Err(e) => {
-            crate::println!("MIMALLOC COMMIT FAILED: address={:p}, size={}, flags={:?}, reason=Page mapping failed ({:?})", addr, size, flags, e);
-            false
+
+        let run_start = chunk;
+        chunk += 1;
+        while chunk < last_chunk && !mimalloc_commit_chunk_is_set(chunk) {
+            chunk += 1;
         }
+
+        let run_addr = MIMALLOC_COMMIT_TRACK_START + run_start * MIMALLOC_COMMIT_GRANULARITY;
+        let run_size = (chunk - run_start) * MIMALLOC_COMMIT_GRANULARITY;
+        let start_addr = x86_64::VirtAddr::new(run_addr as u64);
+
+        let res = without_interrupts(|| {
+            crate::memory::paging::paging::map_kernel_range(
+                start_addr,
+                run_size as u64,
+                flags,
+                true,
+            )
+        });
+
+        if let Err(e) = res {
+            crate::println!("MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})", addr, size, run_addr, run_size, flags, e);
+            MIMALLOC_COMMIT_CYCLES.fetch_add(
+                crate::cpu::get_cycles().wrapping_sub(start_cycles),
+                Ordering::Relaxed,
+            );
+            return false;
+        }
+
+        mimalloc_commit_mark_range(run_start, chunk);
+        MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+        MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
+        MIMALLOC_ARENA_COMMITTED.fetch_add(run_size, Ordering::Relaxed);
     }
+
+    MIMALLOC_COMMIT_CYCLES.fetch_add(
+        crate::cpu::get_cycles().wrapping_sub(start_cycles),
+        Ordering::Relaxed,
+    );
+    true
 }
 
 #[no_mangle]
@@ -582,4 +691,28 @@ fn splitmix64(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+const fn align_down_const(value: usize, align: usize) -> usize {
+    value & !(align - 1)
+}
+
+const fn align_up_const(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
+
+#[inline(always)]
+fn mimalloc_commit_chunk_is_set(chunk: usize) -> bool {
+    let word = chunk / MIMALLOC_COMMIT_BITMAP_BITS;
+    let bit = chunk % MIMALLOC_COMMIT_BITMAP_BITS;
+    (MIMALLOC_COMMIT_BITMAP[word].load(Ordering::Relaxed) & (1usize << bit)) != 0
+}
+
+#[inline(always)]
+fn mimalloc_commit_mark_range(start: usize, end: usize) {
+    for chunk in start..end {
+        let word = chunk / MIMALLOC_COMMIT_BITMAP_BITS;
+        let bit = chunk % MIMALLOC_COMMIT_BITMAP_BITS;
+        MIMALLOC_COMMIT_BITMAP[word].fetch_or(1usize << bit, Ordering::Relaxed);
+    }
 }

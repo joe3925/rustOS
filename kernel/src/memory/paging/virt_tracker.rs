@@ -160,29 +160,10 @@ pub fn allocate_auto_kernel_range_aligned(size: u64, alignment: u64) -> Option<V
         return None;
     }
 
-    if alignment > 0x1000 {
-        let extra = alignment - 0x1000;
-        let total_request = aligned_size + extra;
-
-        let addr = KERNEL_RANGE_TRACKER.alloc_auto(total_request)?;
-
-        let aligned_addr = (addr.as_u64() + alignment - 1) & !(alignment - 1);
-
-        let wasted_before = aligned_addr - addr.as_u64();
-        if wasted_before > 0 {
-            KERNEL_RANGE_TRACKER.dealloc(addr.as_u64(), wasted_before);
-        }
-
-        let wasted_after = extra - wasted_before;
-        if wasted_after > 0 {
-            let suffix_start = aligned_addr + aligned_size;
-            KERNEL_RANGE_TRACKER.dealloc(suffix_start, wasted_after);
-        }
-
-        Some(VirtAddr::new(aligned_addr))
+    if alignment == 0x1000 {
+        KERNEL_RANGE_TRACKER.alloc_auto(aligned_size)
     } else {
-        let addr = KERNEL_RANGE_TRACKER.alloc_auto(aligned_size)?;
-        Some(addr)
+        KERNEL_RANGE_TRACKER.alloc_auto_aligned(aligned_size, alignment)
     }
 }
 pub fn allocate_auto_kernel_range_mapped_aligned(
