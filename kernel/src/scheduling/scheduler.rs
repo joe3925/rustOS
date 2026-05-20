@@ -1012,7 +1012,7 @@ pub extern "win64" fn task_return_trampoline() -> ! {
 }
 
 pub extern "win64" fn kernel_task_end() -> ! {
-    crate::memory::allocator::mimalloc_thread_done();
+    crate::memory::heap::mimalloc_thread_done();
 
     interrupts::without_interrupts(|| {
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();

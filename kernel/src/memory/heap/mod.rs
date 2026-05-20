@@ -1,3 +1,26 @@
+pub mod allocator;
+pub mod buddylocked;
+#[cfg(feature = "allocator-mimalloc")]
+pub mod mimalloc;
+
+#[global_allocator]
+pub static ALLOCATOR: KernelAllocator = KernelAllocator::new();
+
+pub fn enable_mimalloc() {
+    ALLOCATOR.enable_mimalloc();
+    #[cfg(feature = "allocator-mimalloc")]
+    {
+        use alloc::vec::Vec;
+        let chunk = Vec::<u8>::with_capacity(2 * 1024 * 1024 * 1024);
+        core::hint::black_box(chunk.as_ptr());
+    }
+}
+
+pub fn mimalloc_thread_done() {
+    ALLOCATOR.mimalloc_thread_done();
+}
+
+use crate::memory::heap::allocator::KernelAllocator;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::{align_up_4k, map_range_with_huge_pages};
 use crate::memory::paging::tables::init_mapper;
@@ -21,9 +44,16 @@ pub const MIMALLOC_ARENA_SIZE: u64 =
 const fn align_up_usize(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
+
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
+
+    #[cfg(feature = "allocator-mimalloc")]
     let heap_size = align_up_4k(BOOTSTRAP_HEAP_SIZE + MIMALLOC_META_HEAP_SIZE);
+
+    #[cfg(feature = "allocator-buddy")]
+    let heap_size = align_up_4k(HEAP_SIZE);
+
     let heap_end = heap_start + heap_size;
 
     let boot_info = boot_info();

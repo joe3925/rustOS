@@ -4,7 +4,7 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
-use crate::memory::allocator::ALLOCATOR;
+use crate::memory::heap::ALLOCATOR;
 use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
@@ -2548,12 +2548,19 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-        + crate::memory::heap::MIMALLOC_META_HEAP_SIZE as usize;
-    let used_meta = capacity - ALLOCATOR.free_memory();
-    let used_arena = crate::memory::allocator::MIMALLOC_ARENA_COMMITTED
-        .load(core::sync::atomic::Ordering::Relaxed);
-    used_meta + used_arena
+    #[cfg(feature = "allocator-mimalloc")]
+    {
+        let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
+            + crate::memory::heap::MIMALLOC_META_HEAP_SIZE as usize;
+        let used_meta = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+        let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
+            .load(core::sync::atomic::Ordering::Relaxed);
+        used_meta + used_arena
+    }
+    #[cfg(feature = "allocator-buddy")]
+    {
+        crate::memory::heap::HEAP_SIZE as usize - crate::memory::heap::ALLOCATOR.free_memory()
+    }
 }
 
 const DEPTH: usize = 1_000;

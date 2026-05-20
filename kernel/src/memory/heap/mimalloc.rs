@@ -1,19 +1,19 @@
 use crate::cpu;
 use crate::memory::heap::{
-    BOOTSTRAP_HEAP_SIZE, HEAP_START, MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE,
-    MIMALLOC_HEAP_START, MIMALLOC_META_HEAP_SIZE,
+    MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE, MIMALLOC_HEAP_START,
+    MIMALLOC_META_HEAP_SIZE,
 };
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use alloc::vec::Vec;
-use buddy_system_allocator::LockedHeap;
-use core::alloc::{GlobalAlloc, Layout};
+use core::alloc::Layout;
 use core::ffi::c_void;
-use core::ptr::{null_mut, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
+
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 1024 * 1024 * 1024;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
@@ -81,24 +81,25 @@ unsafe extern "C" {
     fn rustos_mi_manage_arena(start: *mut c_void, size: usize) -> bool;
 }
 
-#[global_allocator]
-pub static ALLOCATOR: KernelAllocator = KernelAllocator::new();
-
 static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(
     MIMALLOC_HEAP_START,
     MIMALLOC_META_HEAP_SIZE as usize,
 ));
 
-pub fn enable_mimalloc() {
-    ALLOCATOR.enable_mimalloc();
-    {
-        let chunk = Vec::<u8>::with_capacity(2 * 1024 * 1024 * 1024);
-        core::hint::black_box(chunk.as_ptr());
+pub unsafe fn enable_mimalloc_impl() {
+    mi_process_init();
+    rustos_mi_configure_options();
+    init_mimalloc_diagnostics();
+    if !rustos_mi_manage_arena(
+        MIMALLOC_ARENA_START as *mut c_void,
+        MIMALLOC_ARENA_SIZE as usize,
+    ) {
+        panic!("failed to register rustOS mimalloc arena");
     }
 }
 
-pub fn mimalloc_thread_done() {
-    ALLOCATOR.mimalloc_thread_done();
+pub unsafe fn mimalloc_thread_done_impl() {
+    mi_thread_done();
 }
 
 pub fn mimalloc_commit_stats_reset() {
@@ -147,146 +148,55 @@ pub fn mimalloc_alloc_stats() -> MimallocAllocStats {
     }
 }
 
-pub struct KernelAllocator {
-    bootstrap: BuddyLocked,
-    mimalloc_enabled: AtomicBool,
-    enable_lock: spin::Mutex<()>,
+#[inline(always)]
+pub fn ptr_is_mimalloc(ptr: *mut u8) -> bool {
+    let addr = ptr as usize;
+    addr >= MIMALLOC_HEAP_START && addr < MIMALLOC_HEAP_END
 }
 
-impl KernelAllocator {
-    pub const fn new() -> Self {
-        Self {
-            bootstrap: BuddyLocked::new(),
-            mimalloc_enabled: AtomicBool::new(false),
-            enable_lock: spin::Mutex::new(()),
-        }
-    }
-
-    pub fn enable_mimalloc(&self) {
-        if self.mimalloc_enabled.load(Ordering::Acquire) {
-            return;
-        }
-
-        let _guard = self.enable_lock.lock();
-        if !self.mimalloc_enabled.load(Ordering::Acquire) {
-            unsafe {
-                mi_process_init();
-                rustos_mi_configure_options();
-                init_mimalloc_diagnostics();
-                if !rustos_mi_manage_arena(
-                    MIMALLOC_ARENA_START as *mut c_void,
-                    MIMALLOC_ARENA_SIZE as usize,
-                ) {
-                    panic!("failed to register rustOS mimalloc arena");
-                }
-            }
-            self.mimalloc_enabled.store(true, Ordering::Release);
-        }
-    }
-
-    #[inline(always)]
-    pub fn mimalloc_enabled(&self) -> bool {
-        self.mimalloc_enabled.load(Ordering::Acquire)
-    }
-
-    pub fn mimalloc_thread_done(&self) {
-        if self.mimalloc_enabled() {
-            unsafe {
-                mi_thread_done();
-            }
-        }
-    }
-
-    pub fn free_memory(&self) -> usize {
-        self.bootstrap.free_memory() + MIMALLOC_OS_ALLOCATOR.lock().free_memory()
-    }
-
-    #[inline(always)]
-    fn ptr_is_mimalloc(ptr: *mut u8) -> bool {
-        let addr = ptr as usize;
-        addr >= MIMALLOC_HEAP_START && addr < MIMALLOC_HEAP_END
-    }
+pub fn get_mimalloc_free_memory() -> usize {
+    MIMALLOC_OS_ALLOCATOR.lock().free_memory()
 }
 
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if self.mimalloc_enabled() {
-            let start = cpu::get_cycles();
-            let ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
-            let elapsed = cpu::get_cycles().wrapping_sub(start);
-            MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-            ptr
-        } else {
-            self.bootstrap.alloc(layout)
-        }
-    }
+pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
+    let start = cpu::get_cycles();
+    let ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+    MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+    ptr
+}
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if self.mimalloc_enabled() {
-            let start = cpu::get_cycles();
-            let ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
-            let elapsed = cpu::get_cycles().wrapping_sub(start);
-            MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-            ptr
-        } else {
-            let ptr = self.bootstrap.alloc(layout);
-            if !ptr.is_null() {
-                core::ptr::write_bytes(ptr, 0, layout.size());
-            }
-            ptr
-        }
-    }
+pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
+    let start = cpu::get_cycles();
+    let ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+    MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+    ptr
+}
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ptr.is_null() {
-            return;
-        }
+pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
+    let start = cpu::get_cycles();
+    mi_free(ptr.cast::<c_void>());
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+    MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+}
 
-        if Self::ptr_is_mimalloc(ptr) {
-            let start = cpu::get_cycles();
-            mi_free(ptr.cast::<c_void>());
-            let elapsed = cpu::get_cycles().wrapping_sub(start);
-            MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-        } else {
-            self.bootstrap.dealloc(ptr, layout);
-        }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if ptr.is_null() {
-            return self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
-        }
-
-        if Self::ptr_is_mimalloc(ptr) {
-            let start = cpu::get_cycles();
-            let new_ptr = mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align())
-                as *mut u8;
-            let elapsed = cpu::get_cycles().wrapping_sub(start);
-            MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_REALLOC_OLD_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
-            MIMALLOC_REALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-            new_ptr
-        } else {
-            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-            let new_ptr = self.alloc(new_layout);
-            if !new_ptr.is_null() {
-                core::ptr::copy_nonoverlapping(
-                    ptr,
-                    new_ptr,
-                    core::cmp::min(layout.size(), new_size),
-                );
-                self.bootstrap.dealloc(ptr, layout);
-            }
-            new_ptr
-        }
-    }
+pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    let start = cpu::get_cycles();
+    let new_ptr =
+        mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8;
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_REALLOC_OLD_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+    MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
+    MIMALLOC_REALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+    new_ptr
 }
 
 pub struct Locked<A> {
@@ -494,60 +404,6 @@ impl RangeAllocator {
         }
 
         Ok(alloc_start)
-    }
-}
-
-pub struct BuddyLocked {
-    inner: LockedHeap<32>,
-    init: AtomicBool,
-}
-
-impl BuddyLocked {
-    pub const fn new() -> Self {
-        Self {
-            inner: LockedHeap::<32>::empty(),
-            init: AtomicBool::new(false),
-        }
-    }
-
-    #[inline(always)]
-    unsafe fn ensure_init(&self) {
-        if !self.init.load(Ordering::Acquire) {
-            without_interrupts(|| {
-                if !self.init.load(Ordering::Acquire) {
-                    self.inner
-                        .lock()
-                        .init(HEAP_START, BOOTSTRAP_HEAP_SIZE as usize);
-                    self.init.store(true, Ordering::Release);
-                }
-            });
-        }
-    }
-
-    pub fn free_memory(&self) -> usize {
-        without_interrupts(|| {
-            let inner = self.inner.lock();
-            inner.stats_total_bytes() - inner.stats_alloc_actual()
-        })
-    }
-}
-
-unsafe impl GlobalAlloc for BuddyLocked {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.ensure_init();
-        without_interrupts(|| self.inner.lock().alloc(layout))
-            .expect("kernel bootstrap heap overflow")
-            .as_ptr()
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.ensure_init();
-        without_interrupts(|| {
-            self.inner.lock().dealloc(
-                NonNull::new(ptr).expect("null ptr passed to kernel heap dealloc"),
-                layout,
-            )
-        })
     }
 }
 
