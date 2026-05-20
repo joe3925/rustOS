@@ -60,7 +60,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 250_000;
+pub const APIC_START_PERIOD: u64 = 10_000_000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -175,7 +175,6 @@ pub unsafe fn init() {
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::allocator::enable_mimalloc();
-    test_full_heap_parallel();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
@@ -441,6 +440,7 @@ pub fn test_full_heap_parallel() {
         }
 
         crate::memory::allocator::mimalloc_commit_stats_reset();
+        crate::memory::allocator::mimalloc_alloc_stats_reset();
         let sw = Stopwatch::start();
         gate.store(true, Ordering::Release);
 
@@ -454,9 +454,13 @@ pub fn test_full_heap_parallel() {
 
         let elapsed = sw.elapsed().as_millis();
         let commit_stats = crate::memory::allocator::mimalloc_commit_stats();
+        let alloc_stats = crate::memory::allocator::mimalloc_alloc_stats();
         let commit_ms = Stopwatch::from_cycles(commit_stats.cycles).as_millis();
+        let alloc_ms = Stopwatch::from_cycles(alloc_stats.alloc_cycles).as_millis();
+        let realloc_ms = Stopwatch::from_cycles(alloc_stats.realloc_cycles).as_millis();
+        let dealloc_ms = Stopwatch::from_cycles(alloc_stats.dealloc_cycles).as_millis();
         println!(
-            "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify max/sum {} / {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms)",
+            "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify max/sum {} / {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
             num_threads,
             elapsed,
             push_max_ms.load(Ordering::Relaxed),
@@ -467,7 +471,16 @@ pub fn test_full_heap_parallel() {
             commit_stats.map_calls,
             commit_stats.requested / (1024 * 1024),
             commit_stats.mapped / (1024 * 1024),
-            commit_ms
+            commit_ms,
+            alloc_stats.alloc_calls,
+            alloc_stats.realloc_calls,
+            alloc_stats.dealloc_calls,
+            alloc_stats.alloc_bytes / (1024 * 1024),
+            alloc_stats.realloc_new_bytes / (1024 * 1024),
+            alloc_stats.dealloc_bytes / (1024 * 1024),
+            alloc_ms,
+            realloc_ms,
+            dealloc_ms
         );
     }
 }
@@ -684,13 +697,10 @@ pub fn test_kernel_tls_runtime() {
     ));
 
     let mut completed = false;
-    for _ in 0..4096 {
-        if TLS_SELF_TEST_RESULT.load(Ordering::Acquire) != TLS_SELF_TEST_PENDING {
-            completed = true;
-            break;
-        }
+    while TLS_SELF_TEST_RESULT.load(Ordering::Acquire) == TLS_SELF_TEST_PENDING {
         yield_now();
     }
+    completed = true;
 
     let current_snapshot = unsafe { tls_test_snapshot() };
     unsafe {

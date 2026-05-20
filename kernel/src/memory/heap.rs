@@ -11,8 +11,16 @@ pub const BOOTSTRAP_HEAP_SIZE: u64 = Size2MiB::SIZE * 5;
 pub const MIMALLOC_HEAP_START: usize = HEAP_START + BOOTSTRAP_HEAP_SIZE as usize;
 pub const MIMALLOC_HEAP_SIZE: u64 = HEAP_SIZE - BOOTSTRAP_HEAP_SIZE;
 pub const MIMALLOC_META_HEAP_SIZE: u64 = 64 * 1024 * 1024;
-pub const MIMALLOC_ARENA_START: usize = MIMALLOC_HEAP_START + MIMALLOC_META_HEAP_SIZE as usize;
-pub const MIMALLOC_ARENA_SIZE: u64 = MIMALLOC_HEAP_SIZE - MIMALLOC_META_HEAP_SIZE;
+pub const MIMALLOC_ARENA_START: usize = align_up_usize(
+    MIMALLOC_HEAP_START + MIMALLOC_META_HEAP_SIZE as usize,
+    Size1GiB::SIZE as usize,
+);
+pub const MIMALLOC_ARENA_SIZE: u64 =
+    (HEAP_START + HEAP_SIZE as usize - MIMALLOC_ARENA_START) as u64;
+
+const fn align_up_usize(value: usize, align: usize) -> usize {
+    (value + align - 1) & !(align - 1)
+}
 pub(crate) fn init_heap() {
     let heap_start = VirtAddr::new(align_up_4k(HEAP_START as u64));
     let heap_size = align_up_4k(BOOTSTRAP_HEAP_SIZE + MIMALLOC_META_HEAP_SIZE);

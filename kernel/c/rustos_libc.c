@@ -7,17 +7,80 @@
 int errno;
 
 void* memcpy(void* restrict dst, const void* restrict src, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  void* ret = dst;
+  size_t qwords = n / sizeof(uint64_t);
+  size_t tail = n & (sizeof(uint64_t) - 1);
+  __asm__ volatile(
+    "rep movsq"
+    : "+D"(dst), "+S"(src), "+c"(qwords)
+    :
+    : "memory"
+  );
+  __asm__ volatile(
+    "rep movsb"
+    : "+D"(dst), "+S"(src), "+c"(tail)
+    :
+    : "memory"
+  );
+  return ret;
+#else
   unsigned char* d = (unsigned char*)dst;
   const unsigned char* s = (const unsigned char*)src;
-
   for (size_t i = 0; i < n; i++) {
     d[i] = s[i];
   }
-
   return dst;
+#endif
 }
 
 void* memmove(void* dst, const void* src, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  void* ret = dst;
+  if (dst == src || n == 0) {
+    return ret;
+  }
+
+  if ((uintptr_t)dst < (uintptr_t)src || (uintptr_t)dst >= ((uintptr_t)src + n)) {
+    size_t qwords = n / sizeof(uint64_t);
+    size_t tail = n & (sizeof(uint64_t) - 1);
+    __asm__ volatile(
+      "rep movsq"
+      : "+D"(dst), "+S"(src), "+c"(qwords)
+      :
+      : "memory"
+    );
+    __asm__ volatile(
+      "rep movsb"
+      : "+D"(dst), "+S"(src), "+c"(tail)
+      :
+      : "memory"
+    );
+  } else {
+    unsigned char* d = (unsigned char*)dst;
+    const unsigned char* s = (const unsigned char*)src;
+    size_t tail = n & (sizeof(uint64_t) - 1);
+    for (size_t i = 0; i < tail; i++) {
+      d[n - 1 - i] = s[n - 1 - i];
+    }
+
+    size_t qwords = n / sizeof(uint64_t);
+    if (qwords != 0) {
+      uint64_t* dq = (uint64_t*)(d + ((qwords - 1) * sizeof(uint64_t)));
+      const uint64_t* sq = (const uint64_t*)(s + ((qwords - 1) * sizeof(uint64_t)));
+      __asm__ volatile(
+        "std\n\t"
+        "rep movsq\n\t"
+        "cld"
+        : "+D"(dq), "+S"(sq), "+c"(qwords)
+        :
+        : "memory", "cc"
+      );
+    }
+  }
+
+  return ret;
+#else
   unsigned char* d = (unsigned char*)dst;
   const unsigned char* s = (const unsigned char*)src;
 
@@ -36,9 +99,30 @@ void* memmove(void* dst, const void* src, size_t n) {
   }
 
   return dst;
+#endif
 }
 
 void* memset(void* dst, int c, size_t n) {
+#if defined(__x86_64__) || defined(_M_X64)
+  void* ret = dst;
+  unsigned char value = (unsigned char)c;
+  uint64_t pattern = 0x0101010101010101ULL * (uint64_t)value;
+  size_t qwords = n / sizeof(uint64_t);
+  size_t tail = n & (sizeof(uint64_t) - 1);
+  __asm__ volatile(
+    "rep stosq"
+    : "+D"(dst), "+c"(qwords)
+    : "a"(pattern)
+    : "memory"
+  );
+  __asm__ volatile(
+    "rep stosb"
+    : "+D"(dst), "+c"(tail)
+    : "a"(value)
+    : "memory"
+  );
+  return ret;
+#else
   unsigned char* d = (unsigned char*)dst;
 
   for (size_t i = 0; i < n; i++) {
@@ -46,6 +130,7 @@ void* memset(void* dst, int c, size_t n) {
   }
 
   return dst;
+#endif
 }
 
 int memcmp(const void* lhs, const void* rhs, size_t n) {

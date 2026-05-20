@@ -1,9 +1,11 @@
+use crate::cpu;
 use crate::memory::heap::{
     BOOTSTRAP_HEAP_SIZE, HEAP_START, MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE,
     MIMALLOC_HEAP_START, MIMALLOC_META_HEAP_SIZE,
 };
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
+use alloc::vec::Vec;
 use buddy_system_allocator::LockedHeap;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_void;
@@ -13,7 +15,7 @@ use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
 const PAGE_SIZE: usize = 4096;
-const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
+const MIMALLOC_COMMIT_GRANULARITY: usize = 1024 * 1024 * 1024;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
 const MIMALLOC_COMMIT_TRACK_START: usize =
     align_down_const(MIMALLOC_ARENA_START, MIMALLOC_COMMIT_GRANULARITY);
@@ -36,6 +38,16 @@ static MIMALLOC_COMMIT_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MIMALLOC_COMMIT_REQUESTED: AtomicUsize = AtomicUsize::new(0);
 static MIMALLOC_COMMIT_MAPPED: AtomicUsize = AtomicUsize::new(0);
 static MIMALLOC_COMMIT_CYCLES: AtomicU64 = AtomicU64::new(0);
+static MIMALLOC_ALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_ALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
+static MIMALLOC_REALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_REALLOC_OLD_BYTES: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_REALLOC_NEW_BYTES: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_REALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
+static MIMALLOC_DEALLOC_CALLS: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_DEALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
+static MIMALLOC_DEALLOC_CYCLES: AtomicU64 = AtomicU64::new(0);
 
 pub struct MimallocCommitStats {
     pub calls: usize,
@@ -43,6 +55,19 @@ pub struct MimallocCommitStats {
     pub requested: usize,
     pub mapped: usize,
     pub cycles: u64,
+}
+
+pub struct MimallocAllocStats {
+    pub alloc_calls: usize,
+    pub alloc_bytes: usize,
+    pub alloc_cycles: u64,
+    pub realloc_calls: usize,
+    pub realloc_old_bytes: usize,
+    pub realloc_new_bytes: usize,
+    pub realloc_cycles: u64,
+    pub dealloc_calls: usize,
+    pub dealloc_bytes: usize,
+    pub dealloc_cycles: u64,
 }
 
 unsafe extern "C" {
@@ -66,6 +91,10 @@ static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocato
 
 pub fn enable_mimalloc() {
     ALLOCATOR.enable_mimalloc();
+    {
+        let chunk = Vec::<u8>::with_capacity(2 * 1024 * 1024 * 1024);
+        core::hint::black_box(chunk.as_ptr());
+    }
 }
 
 pub fn mimalloc_thread_done() {
@@ -80,6 +109,19 @@ pub fn mimalloc_commit_stats_reset() {
     MIMALLOC_COMMIT_CYCLES.store(0, Ordering::Relaxed);
 }
 
+pub fn mimalloc_alloc_stats_reset() {
+    MIMALLOC_ALLOC_CALLS.store(0, Ordering::Relaxed);
+    MIMALLOC_ALLOC_BYTES.store(0, Ordering::Relaxed);
+    MIMALLOC_ALLOC_CYCLES.store(0, Ordering::Relaxed);
+    MIMALLOC_REALLOC_CALLS.store(0, Ordering::Relaxed);
+    MIMALLOC_REALLOC_OLD_BYTES.store(0, Ordering::Relaxed);
+    MIMALLOC_REALLOC_NEW_BYTES.store(0, Ordering::Relaxed);
+    MIMALLOC_REALLOC_CYCLES.store(0, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_CALLS.store(0, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_BYTES.store(0, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_CYCLES.store(0, Ordering::Relaxed);
+}
+
 pub fn mimalloc_commit_stats() -> MimallocCommitStats {
     MimallocCommitStats {
         calls: MIMALLOC_COMMIT_CALLS.load(Ordering::Relaxed),
@@ -87,6 +129,21 @@ pub fn mimalloc_commit_stats() -> MimallocCommitStats {
         requested: MIMALLOC_COMMIT_REQUESTED.load(Ordering::Relaxed),
         mapped: MIMALLOC_COMMIT_MAPPED.load(Ordering::Relaxed),
         cycles: MIMALLOC_COMMIT_CYCLES.load(Ordering::Relaxed),
+    }
+}
+
+pub fn mimalloc_alloc_stats() -> MimallocAllocStats {
+    MimallocAllocStats {
+        alloc_calls: MIMALLOC_ALLOC_CALLS.load(Ordering::Relaxed),
+        alloc_bytes: MIMALLOC_ALLOC_BYTES.load(Ordering::Relaxed),
+        alloc_cycles: MIMALLOC_ALLOC_CYCLES.load(Ordering::Relaxed),
+        realloc_calls: MIMALLOC_REALLOC_CALLS.load(Ordering::Relaxed),
+        realloc_old_bytes: MIMALLOC_REALLOC_OLD_BYTES.load(Ordering::Relaxed),
+        realloc_new_bytes: MIMALLOC_REALLOC_NEW_BYTES.load(Ordering::Relaxed),
+        realloc_cycles: MIMALLOC_REALLOC_CYCLES.load(Ordering::Relaxed),
+        dealloc_calls: MIMALLOC_DEALLOC_CALLS.load(Ordering::Relaxed),
+        dealloc_bytes: MIMALLOC_DEALLOC_BYTES.load(Ordering::Relaxed),
+        dealloc_cycles: MIMALLOC_DEALLOC_CYCLES.load(Ordering::Relaxed),
     }
 }
 
@@ -154,7 +211,13 @@ impl KernelAllocator {
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if self.mimalloc_enabled() {
-            mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8
+            let start = cpu::get_cycles();
+            let ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+            let elapsed = cpu::get_cycles().wrapping_sub(start);
+            MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+            ptr
         } else {
             self.bootstrap.alloc(layout)
         }
@@ -162,7 +225,13 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         if self.mimalloc_enabled() {
-            mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8
+            let start = cpu::get_cycles();
+            let ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+            let elapsed = cpu::get_cycles().wrapping_sub(start);
+            MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+            ptr
         } else {
             let ptr = self.bootstrap.alloc(layout);
             if !ptr.is_null() {
@@ -178,7 +247,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         if Self::ptr_is_mimalloc(ptr) {
+            let start = cpu::get_cycles();
             mi_free(ptr.cast::<c_void>());
+            let elapsed = cpu::get_cycles().wrapping_sub(start);
+            MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
         } else {
             self.bootstrap.dealloc(ptr, layout);
         }
@@ -190,7 +264,15 @@ unsafe impl GlobalAlloc for KernelAllocator {
         }
 
         if Self::ptr_is_mimalloc(ptr) {
-            mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8
+            let start = cpu::get_cycles();
+            let new_ptr = mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align())
+                as *mut u8;
+            let elapsed = cpu::get_cycles().wrapping_sub(start);
+            MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_REALLOC_OLD_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
+            MIMALLOC_REALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+            new_ptr
         } else {
             let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
             let new_ptr = self.alloc(new_layout);
@@ -552,10 +634,10 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
     let flags = x86_64::structures::paging::PageTableFlags::PRESENT
         | x86_64::structures::paging::PageTableFlags::WRITABLE;
 
-    let commit_start = align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY)
-        .max(MIMALLOC_COMMIT_TRACK_START);
-    let commit_end = align_up_const(end_usize, MIMALLOC_COMMIT_GRANULARITY)
-        .min(MIMALLOC_COMMIT_TRACK_END);
+    let commit_start =
+        align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(MIMALLOC_COMMIT_TRACK_START);
+    let commit_end =
+        align_up_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(MIMALLOC_COMMIT_TRACK_END);
 
     let first_chunk = (commit_start - MIMALLOC_COMMIT_TRACK_START) / MIMALLOC_COMMIT_GRANULARITY;
     let last_chunk = (commit_end - MIMALLOC_COMMIT_TRACK_START) / MIMALLOC_COMMIT_GRANULARITY;
