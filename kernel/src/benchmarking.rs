@@ -4,7 +4,6 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
-use crate::memory::heap::ALLOCATOR;
 use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
@@ -486,9 +485,11 @@ static ACTIVE_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PAUSE_POLICY: AtomicU32 =
     AtomicU32::new(BenchOverflowPolicy::PauseFlushWallTime as u32);
+static ACTIVE_PAUSE_START_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLING_STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PERTURBED_BY_WORKER: AtomicBool = AtomicBool::new(false);
 static ACTIVE_OVERFLOW_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_OVERFLOW_WINDOW: Once<Mutex<Option<BenchWindow>>> = Once::new();
 
 fn bench_policy_from_raw(raw: u32) -> BenchOverflowPolicy {
     match raw {
@@ -524,8 +525,28 @@ fn activate_bench_sampling_config(cfg: ResolvedBenchWindowConfig) {
     ACTIVE_MAX_UNWIND_DEPTH.store(cfg.max_unwind_depth, Ordering::Release);
     ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
     ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+    ACTIVE_PAUSE_START_NS.store(0, Ordering::Release);
     ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
     ACTIVE_PERTURBED_BY_WORKER.store(false, Ordering::Release);
+}
+
+fn active_overflow_window() -> &'static Mutex<Option<BenchWindow>> {
+    ACTIVE_OVERFLOW_WINDOW.call_once(|| Mutex::new(None))
+}
+
+fn set_active_overflow_window(window: BenchWindow) {
+    *active_overflow_window().lock() = Some(window);
+}
+
+fn clear_active_overflow_window(window: &BenchWindow) {
+    let mut active = active_overflow_window().lock();
+    if active
+        .as_ref()
+        .map(|w| Arc::ptr_eq(&w.inner, &window.inner))
+        .unwrap_or(false)
+    {
+        *active = None;
+    }
 }
 
 fn bench_state() -> Option<&'static BenchState> {
@@ -658,14 +679,75 @@ fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> CapturedCallchain {
 fn bench_request_drain_worker() {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
     let _ = ACTIVE_DRAIN_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    bench_spawn_overflow_worker_if_needed();
 }
 
 #[inline]
 fn bench_request_pause_flush(policy: BenchOverflowPolicy) {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
-    ACTIVE_PAUSE_POLICY.store(policy as u32, Ordering::Release);
     ACTIVE_SAMPLING_STOPPED.store(true, Ordering::Release);
-    let _ = ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    if !ACTIVE_PAUSE_PENDING.load(Ordering::Acquire) {
+        ACTIVE_PAUSE_POLICY.store(policy as u32, Ordering::Release);
+        ACTIVE_PAUSE_START_NS.store(bench_now_ns(), Ordering::Release);
+        let _ =
+            ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    }
+    bench_spawn_overflow_worker_if_needed();
+}
+
+fn bench_spawn_overflow_worker_if_needed() {
+    if ACTIVE_OVERFLOW_WORKER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let window = {
+        let active = active_overflow_window().lock();
+        active.clone()
+    };
+
+    let Some(window) = window else {
+        ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
+        ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+        ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
+        return;
+    };
+
+    spawn_blocking(move || {
+        loop {
+            let mut did_work = false;
+
+            if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
+                if let Some(state) = bench_state_get() {
+                    state.drain_all_to_spill();
+                }
+                window.mark_worker_perturbed();
+                did_work = true;
+            }
+
+            if ACTIVE_PAUSE_PENDING.swap(false, Ordering::AcqRel) {
+                let policy = bench_policy_from_raw(ACTIVE_PAUSE_POLICY.load(Ordering::Acquire));
+                let pause_start_ns = ACTIVE_PAUSE_START_NS.swap(0, Ordering::AcqRel);
+                window.handle_pause_flush(policy, pause_start_ns);
+                did_work = true;
+            }
+
+            if !did_work {
+                break;
+            }
+        }
+
+        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
+
+        if ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
+            || ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
+        {
+            bench_spawn_overflow_worker_if_needed();
+        }
+    });
 }
 
 #[inline]
@@ -681,11 +763,15 @@ fn bench_note_sample_push_outcome(
         BenchPushOutcome::Stored => {}
         BenchPushOutcome::StoredNearFull => match policy {
             BenchOverflowPolicy::QueueDrainWorker => bench_request_drain_worker(),
+            BenchOverflowPolicy::PauseFlushCompactTime => {
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushCompactTime)
+            }
+            BenchOverflowPolicy::PauseFlushWallTime => {
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushWallTime)
+            }
             BenchOverflowPolicy::Panic
             | BenchOverflowPolicy::DropAndCount
             | BenchOverflowPolicy::StopSampling
-            | BenchOverflowPolicy::PauseFlushCompactTime
-            | BenchOverflowPolicy::PauseFlushWallTime
             | BenchOverflowPolicy::OverwriteOldest => {}
         },
         BenchPushOutcome::OverwroteOldest => {
@@ -723,7 +809,6 @@ fn bench_note_sample_push_outcome(
                 if let Some(drops) = drops {
                     drops.ring_full.fetch_add(1, Ordering::Relaxed);
                     drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
-                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
                 }
                 bench_request_pause_flush(BenchOverflowPolicy::PauseFlushCompactTime);
             }
@@ -731,7 +816,6 @@ fn bench_note_sample_push_outcome(
                 if let Some(drops) = drops {
                     drops.ring_full.fetch_add(1, Ordering::Relaxed);
                     drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
-                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
                 }
                 bench_request_pause_flush(BenchOverflowPolicy::PauseFlushWallTime);
             }
@@ -1342,6 +1426,39 @@ struct BenchPauseInterval {
     reason: &'static str,
 }
 
+fn logical_time_adjustment_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> u64 {
+    let mut adjustment = 0u64;
+    for interval in pause_intervals {
+        if !interval.logical_time_shifted {
+            continue;
+        }
+
+        let interval_adjustment = if ts >= interval.pause_end_ns {
+            interval.duration_ns
+        } else if ts > interval.pause_start_ns {
+            ts.saturating_sub(interval.pause_start_ns)
+        } else {
+            0
+        };
+
+        adjustment = adjustment.saturating_add(interval_adjustment);
+    }
+    adjustment
+}
+
+fn adjusted_event_timestamp_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> Option<u64> {
+    let adjustment = logical_time_adjustment_ns(ts, pause_intervals);
+    if adjustment == 0 {
+        None
+    } else {
+        Some(ts.saturating_sub(adjustment))
+    }
+}
+
+fn logical_event_timestamp_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> u64 {
+    adjusted_event_timestamp_ns(ts, pause_intervals).unwrap_or(ts)
+}
+
 fn make_empty_bundle(ncores: usize) -> ExportBundle {
     let mut samples = Vec::with_capacity(ncores + 1);
     let mut spans_rows = Vec::with_capacity(ncores + 1);
@@ -1391,7 +1508,11 @@ fn heap_build(heap: &mut [(u64, u16, u64, usize)]) {
     }
 }
 
-fn sample_proto_from_event(ev: &BenchEvent, sample: BenchSampleEvent) -> BenchSampleProto {
+fn sample_proto_from_event(
+    ev: &BenchEvent,
+    sample: BenchSampleEvent,
+    pause_intervals: &[BenchPauseInterval],
+) -> BenchSampleProto {
     let depth = core::cmp::min(sample.depth as usize, MAX_CALLCHAIN_DEPTH);
     BenchSampleProto {
         seq: ev.seq,
@@ -1404,7 +1525,7 @@ fn sample_proto_from_event(ev: &BenchEvent, sample: BenchSampleEvent) -> BenchSa
         frame_kinds: sample.frame_kinds[..depth].to_vec(),
         stack_low: sample.stack_low,
         stack_high: sample.stack_high,
-        adjusted_timestamp_ns: None,
+        adjusted_timestamp_ns: adjusted_event_timestamp_ns(ev.timestamp_ns, pause_intervals),
     }
 }
 
@@ -1551,6 +1672,7 @@ async fn build_exports_for_window(
     last_export_seq: &[u64],
     ncores: usize,
     open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
+    pause_intervals: &[BenchPauseInterval],
 ) -> Vec<ExportBundle> {
     if !BENCH_ENABLED {
         return vec![make_empty_bundle(ncores)];
@@ -1706,7 +1828,7 @@ async fn build_exports_for_window(
         match ev.kind {
             BenchEventKind::Sample if log_samples => {
                 if let BenchEventData::Sample(s) = ev.data {
-                    let sample = sample_proto_from_event(&ev, s);
+                    let sample = sample_proto_from_event(&ev, s, pause_intervals);
                     if per_core_enabled && scan_core < ncores {
                         bundle.samples[scan_core].push(sample.clone());
                     }
@@ -1715,22 +1837,17 @@ async fn build_exports_for_window(
             }
             BenchEventKind::Metrics if want_mem_stream => {
                 if let BenchEventData::Metrics(m) = ev.data {
+                    let ts = logical_event_timestamp_ns(ev.timestamp_ns, pause_intervals);
                     if per_core_enabled && scan_core < ncores {
                         write_metrics_row(
                             &mut bundle.mem_rows[scan_core],
                             run_id,
-                            ev.timestamp_ns,
+                            ts,
                             ev.core_id,
                             &m,
                         );
                     }
-                    write_metrics_row(
-                        &mut bundle.mem_rows[avg],
-                        run_id,
-                        ev.timestamp_ns,
-                        ev.core_id,
-                        &m,
-                    );
+                    write_metrics_row(&mut bundle.mem_rows[avg], run_id, ts, ev.core_id, &m);
                 }
             }
             BenchEventKind::SpanBegin if log_spans => {
@@ -1743,7 +1860,11 @@ async fn build_exports_for_window(
                     if let Some((start_span, start_ts, start_core)) =
                         open_spans.remove(&span.span_id)
                     {
-                        let dur = ev.timestamp_ns.saturating_sub(start_ts);
+                        let logical_start_ts =
+                            logical_event_timestamp_ns(start_ts, pause_intervals);
+                        let logical_end_ts =
+                            logical_event_timestamp_ns(ev.timestamp_ns, pause_intervals);
+                        let dur = logical_end_ts.saturating_sub(logical_start_ts);
 
                         write_span_row(
                             &mut bundle.spans_rows[avg],
@@ -1751,7 +1872,7 @@ async fn build_exports_for_window(
                             start_span.tag,
                             start_span.object_id,
                             start_core,
-                            start_ts,
+                            logical_start_ts,
                             dur,
                         );
 
@@ -1763,7 +1884,7 @@ async fn build_exports_for_window(
                                 start_span.tag,
                                 start_span.object_id,
                                 start_core,
-                                start_ts,
+                                logical_start_ts,
                                 dur,
                             );
                         }
@@ -1960,7 +2081,7 @@ impl BenchWindow {
         inner.perturbed_by_worker = true;
     }
 
-    fn handle_pause_flush(&self, policy: BenchOverflowPolicy) {
+    fn handle_pause_flush(&self, policy: BenchOverflowPolicy, pause_start_ns: u64) {
         let logical_time_shifted = match policy {
             BenchOverflowPolicy::PauseFlushCompactTime => true,
             BenchOverflowPolicy::PauseFlushWallTime => false,
@@ -1971,7 +2092,11 @@ impl BenchWindow {
             | BenchOverflowPolicy::OverwriteOldest => return,
         };
 
-        let pause_start_ns = bench_now_ns();
+        let pause_start_ns = if pause_start_ns == 0 {
+            bench_now_ns()
+        } else {
+            pause_start_ns
+        };
         if let Some(state) = bench_state_get() {
             state.drain_all_to_spill();
         }
@@ -2005,52 +2130,6 @@ impl BenchWindow {
 
         ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
     }
-
-    fn spawn_overflow_worker_if_needed(&self, policy: BenchOverflowPolicy) {
-        match policy {
-            BenchOverflowPolicy::QueueDrainWorker
-            | BenchOverflowPolicy::PauseFlushCompactTime
-            | BenchOverflowPolicy::PauseFlushWallTime => {}
-            BenchOverflowPolicy::Panic
-            | BenchOverflowPolicy::DropAndCount
-            | BenchOverflowPolicy::StopSampling
-            | BenchOverflowPolicy::OverwriteOldest => return,
-        }
-
-        if ACTIVE_OVERFLOW_WORKER_RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let this = self.clone();
-        spawn_blocking(move || {
-            loop {
-                if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
-                    if let Some(state) = bench_state_get() {
-                        state.drain_all_to_spill();
-                    }
-                    this.mark_worker_perturbed();
-                }
-
-                if ACTIVE_PAUSE_PENDING.swap(false, Ordering::AcqRel) {
-                    let policy = bench_policy_from_raw(ACTIVE_PAUSE_POLICY.load(Ordering::Acquire));
-                    this.handle_pause_flush(policy);
-                }
-
-                let running = {
-                    let inner = this.inner.lock();
-                    inner.running
-                };
-                if !running {
-                    break;
-                }
-            }
-            ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-        });
-    }
-
     pub fn start(&self) {
         if !BENCH_ENABLED {
             return;
@@ -2059,7 +2138,6 @@ impl BenchWindow {
         let auto_persist_secs_opt;
         let timeout_ms_opt;
         let resolved_cfg;
-        let log_samples_for_worker;
 
         {
             let mut inner = self.inner.lock();
@@ -2068,7 +2146,6 @@ impl BenchWindow {
             }
 
             resolved_cfg = inner.resolved_cfg;
-            log_samples_for_worker = inner.cfg.log_samples;
 
             inner.running = true;
             inner.start_ns = bench_now_ns();
@@ -2084,6 +2161,7 @@ impl BenchWindow {
             }
 
             if inner.cfg.log_samples {
+                set_active_overflow_window(self.clone());
                 activate_bench_sampling_config(resolved_cfg);
                 SAMPLE_REFCOUNT.fetch_add(1, Ordering::Relaxed);
             }
@@ -2092,10 +2170,6 @@ impl BenchWindow {
             }
             auto_persist_secs_opt = inner.cfg.auto_persist_secs;
             timeout_ms_opt = inner.cfg.timeout_ms;
-        }
-
-        if log_samples_for_worker {
-            self.spawn_overflow_worker_if_needed(resolved_cfg.overflow_policy);
         }
 
         if let Some(timeout_ms) = timeout_ms_opt {
@@ -2157,6 +2231,7 @@ impl BenchWindow {
         };
 
         if log_samples {
+            clear_active_overflow_window(self);
             SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
         if log_spans {
@@ -2197,6 +2272,7 @@ impl BenchWindow {
         let ncores: usize;
 
         let last_export_seq: Vec<u64>;
+        let pause_intervals: Vec<BenchPauseInterval>;
 
         let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>;
 
@@ -2220,6 +2296,7 @@ impl BenchWindow {
             ncores = inner.ncores;
 
             last_export_seq = inner.last_export_seq.clone();
+            pause_intervals = inner.pause_intervals.clone();
 
             open_spans = inner.open_spans.clone();
         }
@@ -2237,6 +2314,7 @@ impl BenchWindow {
             &last_export_seq,
             ncores,
             &mut open_spans,
+            &pause_intervals,
         )
         .await;
 
@@ -2369,7 +2447,6 @@ impl BenchWindow {
             inner_pause_flush_ns,
             inner_logical_time_compacted,
             inner_perturbed_by_worker,
-            pause_intervals,
         ) = {
             let inner = self.inner.lock();
             (
@@ -2377,7 +2454,6 @@ impl BenchWindow {
                 inner.pause_flush_ns,
                 inner.logical_time_compacted,
                 inner.perturbed_by_worker,
-                inner.pause_intervals.clone(),
             )
         };
         let sampling_truncated = inner_sampling_truncated
@@ -2489,6 +2565,7 @@ impl Drop for BenchWindow {
         }
 
         if dec_samples {
+            clear_active_overflow_window(self);
             SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
 
