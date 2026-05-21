@@ -8,4 +8,5 @@
 *.lock
 Cargo.lock
 kernel-bench-studio.json
+qemu/
 

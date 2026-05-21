@@ -115,6 +115,8 @@ pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
+    let apic_time;
+    let mut start_aps = false;
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
@@ -137,21 +139,27 @@ pub unsafe fn init() {
         let tsc_end = cpu::get_cycles();
         calibrate_tsc(tsc_start, tsc_end, 50);
         TOTAL_TIME.call_once(Stopwatch::start);
-        let apic_time = Stopwatch::start();
+        apic_time = Stopwatch::start();
         match ApicImpl::init_apic_full() {
             Ok(_) => {
-                APIC.lock().as_ref().unwrap().start_aps();
-                println!(
-                    "APIC init and AP start successful in {} s!",
-                    apic_time.elapsed_sec()
-                );
+                start_aps = true;
             }
             Err(err) => {
                 println!("APIC transition failed {}!", err.to_str());
             }
         }
     }
-    while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
+    if start_aps {
+        APIC.lock().as_ref().unwrap().start_aps();
+        println!(
+            "APIC init and AP start successful in {} s!",
+            apic_time.elapsed_sec()
+        );
+    }
+
+    while CORE_LOCK.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
 

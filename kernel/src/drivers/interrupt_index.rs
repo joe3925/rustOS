@@ -405,6 +405,40 @@ pub fn wait_using_pit_50ms() {
     }
 }
 
+fn duration_to_tsc_cycles(d: Duration) -> u128 {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    d.as_nanos()
+        .saturating_mul(tsc_hz as u128)
+        .saturating_add(999_999_999)
+        / 1_000_000_000
+}
+
+fn wait_for_ap_booted(expected: usize, timeout: Duration) -> bool {
+    if AP_BOOTED.load(Ordering::Acquire) >= expected {
+        return true;
+    }
+
+    let target_delta = duration_to_tsc_cycles(timeout);
+    let start = cpu::get_cycles() as u128;
+
+    loop {
+        if AP_BOOTED.load(Ordering::Acquire) >= expected {
+            return true;
+        }
+
+        let elapsed = (cpu::get_cycles() as u128).saturating_sub(start);
+        if elapsed >= target_delta {
+            return false;
+        }
+
+        core::hint::spin_loop();
+    }
+}
+
 #[inline]
 fn lapic() -> *mut u32 {
     LAPIC_BASE_VA.load(Ordering::SeqCst) as *mut u32
@@ -532,6 +566,13 @@ impl Lapic {
 
     fn ptr(&self) -> *mut u32 {
         self.base_addr.as_mut_ptr()
+    }
+
+    unsafe fn wait_for_delivery(&self) {
+        let icr1 = self.ptr().add(APICOffset::Icr1 as usize / 4);
+        while (icr1.read_volatile() & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -858,21 +899,13 @@ impl ApicImpl {
 
             unsafe {
                 let dst = IpiDest::ApicId(apic.local_apic_id as u8);
+                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
 
                 self.lapic.send_ipi(dst, IpiKind::InitAssert);
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
                 self.lapic.send_ipi(dst, IpiKind::InitDeassert);
-                wait_duration(Duration::from_millis(10));
-
-                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
-                self.lapic.send_ipi(
-                    dst,
-                    IpiKind::Startup {
-                        vector_phys_addr: tramp_phys,
-                    },
-                );
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
                 self.lapic.send_ipi(
                     dst,
@@ -880,23 +913,24 @@ impl ApicImpl {
                         vector_phys_addr: tramp_phys,
                     },
                 );
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
-                // Wait until the AP has executed ap_startup (past the trampoline) before reusing it.
-                for _ in 0..500 {
-                    if AP_BOOTED.load(Ordering::SeqCst) >= expected {
-                        break;
-                    }
-                    wait_duration(Duration::from_millis(1));
+                if !wait_for_ap_booted(expected, Duration::from_millis(1)) {
+                    self.lapic.send_ipi(
+                        dst,
+                        IpiKind::Startup {
+                            vector_phys_addr: tramp_phys,
+                        },
+                    );
+                    self.lapic.wait_for_delivery();
                 }
-            }
-        }
 
-        for _ in 0..200 {
-            if CORE_LOCK.load(Ordering::SeqCst) == 0 {
-                break;
+                assert!(
+                    wait_for_ap_booted(expected, Duration::from_millis(100)),
+                    "AP with local APIC id {} did not reach ap_startup",
+                    apic.local_apic_id
+                );
             }
-            wait_duration(Duration::from_millis(1));
         }
 
         unmap_range(VirtAddr::new(map_start), map_len as u64);
