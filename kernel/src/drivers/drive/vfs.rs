@@ -147,7 +147,7 @@ impl Vfs {
         if let Some(t) = self.blocking_read(&self.target_cache).get(symlink).cloned() {
             return Some(t);
         }
-        let tgt = PNP_MANAGER.resolve_targetio_from_symlink(symlink.to_string())?;
+        let tgt = PNP_MANAGER.resolve_targetio_from_symlink_ref(symlink)?;
         self.blocking_write(&self.target_cache)
             .insert(symlink.to_string(), tgt.clone());
         Some(tgt)
