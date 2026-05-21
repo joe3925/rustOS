@@ -48,7 +48,7 @@ use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+const BENCH_ENABLED: bool = true;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -2056,11 +2056,11 @@ impl BenchWindow {
 
         let (folder, name) = {
             let inner = self.inner.lock();
-            (inner.cfg.folder, inner.cfg.name)
+            (inner.cfg.folder.clone(), inner.cfg.name.clone())
         };
 
-        let session = ensure_session_async(folder).await;
-        let window_dir = allocate_window_name_async(&session.archive_path, name).await;
+        let session = ensure_session_async(&folder).await;
+        let window_dir = allocate_window_name_async(&session.archive_path, &name).await;
 
         {
             let mut inner = self.inner.lock();
@@ -3197,6 +3197,7 @@ pub async fn bench_c_drive_io_async() {
                 "[disk-bench] failed to size benchmark file to {} bytes: {:?}",
                 bench_len, e
             );
+            let _ = file.close().await;
             return;
         }
         if let Err(e) = file.flush().await {
@@ -3204,6 +3205,7 @@ pub async fn bench_c_drive_io_async() {
                 "[disk-bench] failed to flush benchmark file sizing: {:?}",
                 e
             );
+            let _ = file.close().await;
             return;
         }
     }
@@ -3263,10 +3265,24 @@ pub async fn bench_c_drive_io_async() {
         let mut total_read = 0u64;
         let mut offset = 0u64;
         for op in 0..ops {
-            match file.read_at(offset, chunk_sz).await {
-                Ok(buf) => {
-                    total_read = total_read.saturating_add(buf.len() as u64);
-                    offset = offset.saturating_add(chunk_sz as u64);
+            match file.read_at_into(offset, &mut chunk).await {
+                Ok(n) => {
+                    if n == 0 {
+                        println!(
+                            "[disk-bench] short read at op {} (size {}): 0 of {}",
+                            op, chunk_sz, chunk_sz
+                        );
+                        break;
+                    }
+                    total_read = total_read.saturating_add(n as u64);
+                    offset = offset.saturating_add(n as u64);
+                    if n != chunk_sz {
+                        println!(
+                            "[disk-bench] short read at op {} (size {}): {} of {}",
+                            op, chunk_sz, n, chunk_sz
+                        );
+                        break;
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -3376,6 +3392,10 @@ pub async fn bench_c_drive_io_async() {
             ops_5,
             ops_10
         );
+    }
+
+    if let Err(e) = file.close().await {
+        println!("[disk-bench] close failed: {:?}", e);
     }
 }
 

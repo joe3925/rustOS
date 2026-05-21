@@ -14,6 +14,7 @@ pub const VIRTIO_STATUS_FAILED: u8 = 128;
 
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;
+pub const VIRTIO_BLK_T_FLUSH: u32 = 4;
 
 #[repr(C)]
 pub struct VirtioBlkReqHeader {
@@ -29,6 +30,7 @@ pub const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 pub const VIRTIO_BLK_F_SIZE_MAX: u64 = 1 << 1;
 pub const VIRTIO_BLK_F_SEG_MAX: u64 = 1 << 2;
 pub const VIRTIO_BLK_F_BLK_SIZE: u64 = 1 << 6;
+pub const VIRTIO_BLK_F_FLUSH: u64 = 1 << 9;
 /// Mandatory for modern virtio-pci devices.
 pub const VIRTIO_F_VERSION_1: u64 = 1u64 << 32;
 
@@ -54,6 +56,8 @@ pub struct DeviceInitResult {
     pub mq_negotiated: bool,
     /// Whether indirect descriptors were successfully negotiated.
     pub indirect_desc_supported: bool,
+    /// Whether device cache flush requests were successfully negotiated.
+    pub flush_supported: bool,
 }
 
 /// Negotiate features and read device configuration.
@@ -98,6 +102,7 @@ pub fn init_device(
     // Check for feature support
     let mq_supported = (dev_features & VIRTIO_BLK_F_MQ) != 0;
     let indirect_supported = (dev_features & VIRTIO_F_INDIRECT_DESC) != 0;
+    let flush_supported = (dev_features & VIRTIO_BLK_F_FLUSH) != 0;
     let access_platform_supported = (dev_features & VIRTIO_F_ACCESS_PLATFORM) != 0;
 
     if !access_platform_supported {
@@ -114,6 +119,9 @@ pub fn init_device(
     }
     if indirect_supported {
         supported_features |= VIRTIO_F_INDIRECT_DESC;
+    }
+    if flush_supported {
+        supported_features |= VIRTIO_BLK_F_FLUSH;
     }
     let driver_features = dev_features & supported_features;
 
@@ -153,6 +161,7 @@ pub fn init_device(
     // Check if features were actually negotiated
     let mq_negotiated = mq_supported && (driver_features & VIRTIO_BLK_F_MQ) != 0;
     let indirect_negotiated = indirect_supported && (driver_features & VIRTIO_F_INDIRECT_DESC) != 0;
+    let flush_negotiated = flush_supported && (driver_features & VIRTIO_BLK_F_FLUSH) != 0;
 
     let capacity = unsafe {
         core::ptr::read_volatile(
@@ -177,6 +186,7 @@ pub fn init_device(
         num_queues,
         mq_negotiated,
         indirect_desc_supported: indirect_negotiated,
+        flush_supported: flush_negotiated,
     })
 }
 

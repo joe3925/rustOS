@@ -66,26 +66,26 @@ pub static BOOTSET: &[BootPkg] = boot_packages![
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-lazy_static! {
-    pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
-        name: "drive",
-        folder: "C:\\system\\logs",
-        log_samples: true,
-        log_spans: false,
-        log_mem_on_persist: false,
-        export_debug_metadata: true,
-        end_on_drop: false,
-        timeout_ms: None,
-        auto_persist_secs: None,
-        sample_reserve: 400000,
-        span_reserve: 0,
-        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
-        sample_capacity: None,
-        sample_chunk_capacity: None,
-        max_unwind_depth: None,
-        disable_per_core: true
-    });
-}
+// lazy_static! {
+//     pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
+//         name: "drive",
+//         folder: "C:\\system\\logs",
+//         log_samples: true,
+//         log_spans: false,
+//         log_mem_on_persist: false,
+//         export_debug_metadata: true,
+//         end_on_drop: false,
+//         timeout_ms: None,
+//         auto_persist_secs: None,
+//         sample_reserve: 400000,
+//         span_reserve: 0,
+//         overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+//         sample_capacity: None,
+//         sample_chunk_capacity: None,
+//         max_unwind_depth: None,
+//         disable_per_core: true
+//     });
+// }
 const TLS_SELF_TEST_PENDING: u8 = 0;
 const TLS_SELF_TEST_PASS: u8 = 1;
 const TLS_SELF_TEST_FAIL: u8 = 2;

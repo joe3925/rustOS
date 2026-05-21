@@ -342,7 +342,6 @@ pub fn current_cpu_id() -> usize {
     }
     id as usize
 }
-
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8

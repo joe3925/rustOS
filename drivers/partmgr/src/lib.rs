@@ -227,6 +227,24 @@ pub async fn partition_pdo_write<'a, 'b>(
 
     DriverStep::complete(status)
 }
+
+#[request_handler]
+pub async fn partition_pdo_flush<'a, 'b>(
+    device: &Arc<DeviceObject>,
+    request: &'b mut RequestHandle<'a, '_>,
+) -> DriverStep {
+    match request.read().kind {
+        RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
+        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+    }
+
+    let dx = ext::<PartDevExt>(&device);
+    request.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status = send_req_parent(dx.parent.get().unwrap(), request).await;
+
+    DriverStep::complete(status)
+}
+
 #[request_handler]
 pub async fn partmgr_start<'a, 'b>(
     dev: &Arc<DeviceObject>,
@@ -390,6 +408,7 @@ pub async fn partmgr_pnp_query_devrels<'a, 'b>(
         let mut io_vt = IoVtable::new();
         io_vt.set(IoType::Read(partition_pdo_read), 0);
         io_vt.set(IoType::Write(partition_pdo_write), 0);
+        io_vt.set(IoType::Flush(partition_pdo_flush), 0);
 
         let mut child_init = DeviceInit::new(io_vt, None);
 

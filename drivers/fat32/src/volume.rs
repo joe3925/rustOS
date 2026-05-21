@@ -331,6 +331,9 @@ async fn execute_fs_work(
                     None => Some(missing_cached_file_state(fs_file_id)),
                 },
             };
+            if err.is_none() {
+                flush_owner_blocking(&vdx, fs_file_id);
+            }
             req.write().set_data_t(FsCloseResult { error: err });
             DriverStatus::Success
         }

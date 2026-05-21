@@ -1,14 +1,16 @@
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
 use crate::benchmarking::used_memory;
+use crate::benchmarking::BenchWindow;
 use crate::memory::heap::HEAP_SIZE;
 use crate::util::trigger_triple_fault;
-use crate::util::DRIVE_WINDOW;
+use alloc::format;
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
+use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
@@ -204,18 +206,21 @@ impl File {
 
     pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FileStatus> {
         let mut buf = alloc::vec![0u8; len];
+        let n = self.read_at_into(offset, &mut buf).await?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    pub async fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileStatus> {
         let (res, st) = file_provider::provider()
-            .read_at(self.fs_file_id, offset, &mut buf)
+            .read_at(self.fs_file_id, offset, buf)
             .await;
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match res.error {
-            None => {
-                buf.truncate(res.bytes_read);
-                Ok(buf)
-            }
+            None => Ok(res.bytes_read),
             Some(e) => Err(e),
         }
     }
@@ -282,10 +287,13 @@ impl File {
         }
     }
 
-    pub async fn close(self) -> Result<(), FileStatus> {
-        let (res, st) = file_provider::provider()
-            .close_handle(self.fs_file_id)
-            .await;
+    pub async fn close(mut self) -> Result<(), FileStatus> {
+        let id = core::mem::take(&mut self.fs_file_id);
+        if id == 0 {
+            return Ok(());
+        }
+
+        let (res, st) = file_provider::provider().close_handle(id).await;
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -418,8 +426,30 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
             // }
             //bench_async_vs_sync_call_latency_async().await;
             //DRIVE_WINDOW.start();
+            let mut i = 0;
             loop {
+                let drive_window = BenchWindow::new(BenchWindowConfig {
+                    name: format!("iter{}", i),
+                    folder: "C:\\system\\logs".to_string(),
+                    log_samples: true,
+                    log_spans: false,
+                    log_mem_on_persist: false,
+                    export_debug_metadata: true,
+                    end_on_drop: false,
+                    timeout_ms: None,
+                    auto_persist_secs: None,
+                    sample_reserve: 400000,
+                    span_reserve: 0,
+                    overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+                    sample_capacity: None,
+                    sample_chunk_capacity: None,
+                    max_unwind_depth: None,
+                    disable_per_core: true,
+                });
+                drive_window.start();
                 bench_c_drive_io_async().await;
+                drive_window.stop_and_persist().await;
+                i += 1;
                 //run_virtio_bench_matrix_print().await;
                 //wait_duration(Duration::from_secs(10));
             }

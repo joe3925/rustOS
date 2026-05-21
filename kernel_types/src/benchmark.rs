@@ -1,3 +1,4 @@
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -245,9 +246,9 @@ pub struct BenchDroppedSampleCounterProto {
 #[derive(Clone, Debug)]
 pub struct BenchWindowConfig {
     /// Human-readable window name used when allocating the benchmark output directory.
-    pub name: &'static str,
+    pub name: String,
     /// Root folder path where benchmark session archives are written.
-    pub folder: &'static str,
+    pub folder: String,
 
     /// When true, capture and export sampled callchain events.
     pub log_samples: bool,
@@ -289,8 +290,8 @@ pub struct BenchWindowConfig {
 impl Default for BenchWindowConfig {
     fn default() -> Self {
         BenchWindowConfig {
-            name: "default",
-            folder: "C:\\system\\logs",
+            name: "default".to_string(),
+            folder: "C:\\system\\logs".to_string(),
             log_samples: true,
             log_spans: true,
             disable_per_core: false,
