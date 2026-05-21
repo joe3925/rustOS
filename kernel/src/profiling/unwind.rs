@@ -1,16 +1,10 @@
 use alloc::vec::Vec;
 use core::{slice, sync::atomic::Ordering};
 
-use gimli::{
-    BaseAddresses, CfaRule, CieOrFde, DebugFrame, DebugFrameOffset, EhFrame, EhFrameOffset,
-    EndianSlice, LittleEndian, Register, RegisterRule as GimliRegisterRule,
-    UnwindContext as GimliUnwindContext, UnwindContextStorage, UnwindSection, UnwindTableRow,
-};
-use goblin::elf::{program_header::PT_LOAD, section_header::SHF_ALLOC, Elf};
+use kernel_abi::KernelSection;
 use kernel_types::benchmark::{
-    BENCH_FRAME_KIND_KERNEL_ELF, BENCH_FRAME_KIND_PE_X64, BENCH_FRAME_KIND_UNKNOWN,
-    BENCH_UNWIND_STATUS_BAD_STACK_READ, BENCH_UNWIND_STATUS_BAD_UNWIND_INFO,
-    BENCH_UNWIND_STATUS_KERNEL_ELF_FRAME, BENCH_UNWIND_STATUS_LEAF_FALLBACK,
+    BENCH_FRAME_KIND_PE_X64, BENCH_FRAME_KIND_UNKNOWN, BENCH_UNWIND_STATUS_BAD_STACK_READ,
+    BENCH_UNWIND_STATUS_BAD_UNWIND_INFO, BENCH_UNWIND_STATUS_LEAF_FALLBACK,
     BENCH_UNWIND_STATUS_NO_UNWIND_INFO, BENCH_UNWIND_STATUS_PE_UNWIND,
     BENCH_UNWIND_STATUS_STACK_BOUNDS_MISSING, BENCH_UNWIND_STATUS_TRUNCATED,
     BENCH_UNWIND_STATUS_UNKNOWN_FRAME, BENCH_UNWIND_STATUS_UNSUPPORTED_OPCODE,
@@ -20,25 +14,8 @@ use spin::RwLock;
 
 use crate::scheduling::state::State;
 use crate::scheduling::task::TaskRef;
-use crate::util::boot_info;
 
 pub const MAX_CALLCHAIN_DEPTH: usize = 32;
-
-const KERNEL_ELF_PREFIX_MASK: u64 = 0xffff_ff00_0000_0000;
-const KERNEL_ELF_PREFIX: u64 = 0xffff_8500_0000_0000;
-const PE_PREFIX_MASK: u64 = 0xffff_f000_0000_0000;
-const PE_PREFIX: u64 = 0xffff_9000_0000_0000;
-
-const X86_64_DWARF_REG_RBX: u16 = 3;
-const X86_64_DWARF_REG_RSI: u16 = 4;
-const X86_64_DWARF_REG_RDI: u16 = 5;
-const X86_64_DWARF_REG_RBP: u16 = 6;
-const X86_64_DWARF_REG_RSP: u16 = 7;
-const X86_64_DWARF_REG_R12: u16 = 12;
-const X86_64_DWARF_REG_R13: u16 = 13;
-const X86_64_DWARF_REG_R14: u16 = 14;
-const X86_64_DWARF_REG_R15: u16 = 15;
-const X86_64_DWARF_REG_RIP: u16 = 16;
 
 const UNW_FLAG_CHAININFO: u8 = 0x4;
 
@@ -51,15 +28,6 @@ const UWOP_SAVE_NONVOL_FAR: u8 = 5;
 const UWOP_SAVE_XMM128: u8 = 8;
 const UWOP_SAVE_XMM128_FAR: u8 = 9;
 const UWOP_PUSH_MACHFRAME: u8 = 10;
-
-type GimliReader = EndianSlice<'static, LittleEndian>;
-
-struct GimliUnwindStorage;
-
-impl UnwindContextStorage<usize> for GimliUnwindStorage {
-    type Rules = [(Register, GimliRegisterRule<usize>); 64];
-    type Stack = [UnwindTableRow<usize, Self>; 8];
-}
 
 #[derive(Clone, Copy)]
 pub struct StackBounds {
@@ -103,61 +71,56 @@ struct PeUnwindModule {
     functions: Vec<RuntimeFunction>,
 }
 
-#[derive(Clone, Copy)]
-enum KernelElfCfiKind {
-    EhFrame,
-    DebugFrame,
-}
-
-#[derive(Clone, Copy)]
-struct KernelElfCfiSection {
-    data: &'static [u8],
-    kind: KernelElfCfiKind,
-}
-
-#[derive(Clone, Copy)]
-struct ElfUnwindEntry {
-    initial_location: u64,
-    end: u64,
-    fde_offset: usize,
-    section: KernelElfCfiSection,
-}
-
-#[derive(Clone, Copy)]
-struct ElfSectionData {
-    data: &'static [u8],
-    addr: u64,
-    flags: u64,
-}
-
-struct KernelElfUnwindModule {
-    image_base: u64,
-    image_end: u64,
-    bases: BaseAddresses,
-    functions: Vec<ElfUnwindEntry>,
-}
-
-enum ElfUnwindError {
-    NoInfo,
-    BadStackRead,
-    BadUnwindInfo,
-    UnsupportedOpcode,
-}
-
 static PE_UNWIND_MODULES: RwLock<Vec<PeUnwindModule>> = RwLock::new(Vec::new());
-static KERNEL_ELF_UNWIND_MODULE: RwLock<Option<KernelElfUnwindModule>> = RwLock::new(None);
 
 pub fn register_pe_unwind_module(image_base: u64, image_size: u64, sections: &[PeSectionInfo]) {
     let Some(pdata) = sections.iter().find(|s| s.name == ".pdata") else {
         return;
     };
 
-    let bytes = core::cmp::min(pdata.virtual_size, pdata.raw_size) as usize;
+    register_pe_unwind_module_from_pdata(
+        image_base,
+        image_size,
+        pdata.virtual_address,
+        pdata.virtual_size,
+        pdata.raw_size,
+    );
+}
+
+pub fn register_kernel_pe_unwind_module(
+    image_base: u64,
+    image_size: u64,
+    sections: &[KernelSection],
+) {
+    let Some(pdata) = sections
+        .iter()
+        .find(|section| pe_section_name_eq(&section.name, b".pdata"))
+    else {
+        return;
+    };
+
+    register_pe_unwind_module_from_pdata(
+        image_base,
+        image_size,
+        pdata.virtual_address,
+        pdata.virtual_size,
+        pdata.raw_size,
+    );
+}
+
+fn register_pe_unwind_module_from_pdata(
+    image_base: u64,
+    image_size: u64,
+    pdata_virtual_address: u32,
+    pdata_virtual_size: u32,
+    pdata_raw_size: u32,
+) {
+    let bytes = core::cmp::min(pdata_virtual_size, pdata_raw_size) as usize;
     if bytes < 12 {
         return;
     }
 
-    let base = image_base.saturating_add(pdata.virtual_address as u64);
+    let base = image_base.saturating_add(pdata_virtual_address as u64);
     let entry_count = bytes / 12;
     let mut functions = Vec::with_capacity(entry_count);
 
@@ -195,16 +158,11 @@ pub fn register_pe_unwind_module(image_base: u64, image_size: u64, sections: &[P
     }
 }
 
-pub fn init_kernel_elf_unwind() {
-    if KERNEL_ELF_UNWIND_MODULE.read().is_some() {
-        return;
+fn pe_section_name_eq(name: &[u8; 8], target: &[u8]) -> bool {
+    if target.len() > name.len() || &name[..target.len()] != target {
+        return false;
     }
-
-    let module = build_kernel_elf_unwind_module();
-    let mut slot = KERNEL_ELF_UNWIND_MODULE.write();
-    if slot.is_none() {
-        *slot = module;
-    }
+    name[target.len()..].iter().all(|b| *b == 0)
 }
 
 pub fn capture_callchain_from_state(state: &State, task: Option<&TaskRef>) -> CapturedCallchain {
@@ -283,429 +241,33 @@ fn push_frame(out: &mut CapturedCallchain, pc: u64) {
 }
 
 fn classify_pc(pc: u64) -> u32 {
-    if (pc & KERNEL_ELF_PREFIX_MASK) == KERNEL_ELF_PREFIX {
-        BENCH_FRAME_KIND_KERNEL_ELF
-    } else if (pc & PE_PREFIX_MASK) == PE_PREFIX {
-        BENCH_FRAME_KIND_PE_X64
-    } else {
-        BENCH_FRAME_KIND_UNKNOWN
+    if is_registered_pe_pc(pc) {
+        return BENCH_FRAME_KIND_PE_X64;
     }
+
+    BENCH_FRAME_KIND_UNKNOWN
 }
 
 fn unwind_one(ctx: &mut UnwindContext, bounds: StackBounds) -> u32 {
     let control_pc = ctx.control_pc();
-    match classify_pc(control_pc) {
-        BENCH_FRAME_KIND_PE_X64 => unwind_pe_x64(ctx, bounds, control_pc),
-        BENCH_FRAME_KIND_KERNEL_ELF => unwind_kernel_elf(ctx, bounds, control_pc),
-        _ => {
-            let status = BENCH_UNWIND_STATUS_UNKNOWN_FRAME
-                | BENCH_UNWIND_STATUS_NO_UNWIND_INFO
-                | BENCH_UNWIND_STATUS_LEAF_FALLBACK;
-            leaf_unwind(ctx, bounds).map_or(status | BENCH_UNWIND_STATUS_BAD_STACK_READ, |_| status)
-        }
-    }
-}
-
-fn unwind_kernel_elf(ctx: &mut UnwindContext, bounds: StackBounds, control_pc: u64) -> u32 {
-    let status = BENCH_UNWIND_STATUS_KERNEL_ELF_FRAME;
-    let Some(module_guard) = KERNEL_ELF_UNWIND_MODULE.try_read() else {
-        return elf_leaf_fallback(ctx, bounds, status);
-    };
-    let Some(module) = module_guard.as_ref() else {
-        return elf_leaf_fallback(ctx, bounds, status);
-    };
-
-    if control_pc < module.image_base || control_pc >= module.image_end {
-        return elf_leaf_fallback(ctx, bounds, status);
+    if is_registered_pe_pc(control_pc) {
+        return unwind_pe_x64(ctx, bounds, control_pc);
     }
 
-    let Some(entry) = lookup_elf_function(module, control_pc) else {
-        return elf_leaf_fallback(ctx, bounds, status);
-    };
-
-    match unwind_elf_cfi(ctx, bounds, module, entry, control_pc) {
-        Ok(()) => status,
-        Err(ElfUnwindError::NoInfo) => elf_leaf_fallback(ctx, bounds, status),
-        Err(ElfUnwindError::BadStackRead) => status | BENCH_UNWIND_STATUS_BAD_STACK_READ,
-        Err(ElfUnwindError::BadUnwindInfo) => status | BENCH_UNWIND_STATUS_BAD_UNWIND_INFO,
-        Err(ElfUnwindError::UnsupportedOpcode) => status | BENCH_UNWIND_STATUS_UNSUPPORTED_OPCODE,
-    }
-}
-
-fn elf_leaf_fallback(ctx: &mut UnwindContext, bounds: StackBounds, status: u32) -> u32 {
-    let status = status | BENCH_UNWIND_STATUS_NO_UNWIND_INFO | BENCH_UNWIND_STATUS_LEAF_FALLBACK;
+    let status = BENCH_UNWIND_STATUS_UNKNOWN_FRAME
+        | BENCH_UNWIND_STATUS_NO_UNWIND_INFO
+        | BENCH_UNWIND_STATUS_LEAF_FALLBACK;
     leaf_unwind(ctx, bounds).map_or(status | BENCH_UNWIND_STATUS_BAD_STACK_READ, |_| status)
 }
 
-fn lookup_elf_function(module: &KernelElfUnwindModule, pc: u64) -> Option<ElfUnwindEntry> {
-    let mut lo = 0usize;
-    let mut hi = module.functions.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let f = module.functions[mid];
-        if pc < f.initial_location {
-            hi = mid;
-        } else if pc >= f.end {
-            lo = mid + 1;
-        } else {
-            return Some(f);
-        }
-    }
-    None
-}
-
-fn build_kernel_elf_unwind_module() -> Option<KernelElfUnwindModule> {
-    let kernel_elf = kernel_elf_file_bytes()?;
-    let elf = Elf::parse(kernel_elf).ok()?;
-    if !elf.is_64 || !elf.little_endian {
-        return None;
-    }
-
-    let (image_base, image_end) = kernel_elf_image_bounds(&elf)?;
-    let text_base = find_elf_section(&elf, kernel_elf, ".text")
-        .map(|s| s.addr)
-        .unwrap_or(image_base);
-    let eh_frame = find_elf_section(&elf, kernel_elf, ".eh_frame")
-        .filter(|s| s.flags & SHF_ALLOC as u64 != 0 && s.addr != 0 && !s.data.is_empty());
-    let eh_frame_hdr = find_elf_section(&elf, kernel_elf, ".eh_frame_hdr")
-        .filter(|s| s.flags & SHF_ALLOC as u64 != 0 && s.addr != 0 && !s.data.is_empty());
-    let debug_frame =
-        find_elf_section(&elf, kernel_elf, ".debug_frame").filter(|s| !s.data.is_empty());
-
-    let mut bases = BaseAddresses::default().set_text(text_base);
-    if let Some(eh_frame) = eh_frame {
-        bases = bases.set_eh_frame(eh_frame.addr);
-    }
-    if let Some(eh_frame_hdr) = eh_frame_hdr {
-        bases = bases.set_eh_frame_hdr(eh_frame_hdr.addr);
-    }
-
-    let mut eh_functions = Vec::new();
-    if let Some(eh_frame) = eh_frame {
-        collect_eh_frame_entries(
-            KernelElfCfiSection {
-                data: eh_frame.data,
-                kind: KernelElfCfiKind::EhFrame,
-            },
-            &bases,
-            &mut eh_functions,
-        );
-    }
-
-    let mut functions = if eh_functions.len() > 16 {
-        eh_functions
-    } else {
-        let mut debug_functions = Vec::new();
-        if let Some(debug_frame) = debug_frame {
-            collect_debug_frame_entries(
-                KernelElfCfiSection {
-                    data: debug_frame.data,
-                    kind: KernelElfCfiKind::DebugFrame,
-                },
-                &bases,
-                &mut debug_functions,
-            );
-        }
-
-        if debug_functions.is_empty() {
-            eh_functions
-        } else {
-            debug_functions
-        }
+fn is_registered_pe_pc(pc: u64) -> bool {
+    let Some(modules) = PE_UNWIND_MODULES.try_read() else {
+        return false;
     };
 
-    if functions.is_empty() {
-        return None;
-    }
-
-    functions.sort_unstable_by(|a, b| {
-        a.initial_location
-            .cmp(&b.initial_location)
-            .then(a.end.cmp(&b.end))
-            .then(a.fde_offset.cmp(&b.fde_offset))
-    });
-    functions.dedup_by(|a, b| {
-        a.initial_location == b.initial_location && a.end == b.end && a.fde_offset == b.fde_offset
-    });
-
-    Some(KernelElfUnwindModule {
-        image_base,
-        image_end,
-        bases,
-        functions,
-    })
-}
-
-fn kernel_elf_file_bytes() -> Option<&'static [u8]> {
-    let boot = boot_info();
-    let kernel_addr = 0xFFFF_8500_0000_0000 + boot.kernel_image_offset;
-    Some(unsafe { slice::from_raw_parts(kernel_addr as *const u8, boot.kernel_len as usize) })
-}
-
-fn kernel_elf_image_bounds(elf: &Elf<'_>) -> Option<(u64, u64)> {
-    let mut image_base = u64::MAX;
-    let mut image_end = 0u64;
-
-    for header in &elf.program_headers {
-        if header.p_type != PT_LOAD || header.p_memsz == 0 {
-            continue;
-        }
-        image_base = image_base.min(header.p_vaddr);
-        image_end = image_end.max(header.p_vaddr.checked_add(header.p_memsz)?);
-    }
-
-    if image_base == u64::MAX || image_end <= image_base {
-        return None;
-    }
-
-    Some((image_base, image_end))
-}
-
-fn find_elf_section(elf: &Elf<'_>, bytes: &'static [u8], target: &str) -> Option<ElfSectionData> {
-    for header in &elf.section_headers {
-        let name = elf.shdr_strtab.get_at(header.sh_name)?;
-        if name != target {
-            continue;
-        }
-
-        let offset = usize::try_from(header.sh_offset).ok()?;
-        let size = usize::try_from(header.sh_size).ok()?;
-        let end = offset.checked_add(size)?;
-        let data = bytes.get(offset..end)?;
-        return Some(ElfSectionData {
-            data,
-            addr: header.sh_addr,
-            flags: header.sh_flags,
-        });
-    }
-
-    None
-}
-
-fn make_eh_frame(data: &'static [u8]) -> EhFrame<GimliReader> {
-    let mut frame = EhFrame::new(data, LittleEndian);
-    frame.set_address_size(8);
-    frame
-}
-
-fn make_debug_frame(data: &'static [u8]) -> DebugFrame<GimliReader> {
-    let mut frame = DebugFrame::new(data, LittleEndian);
-    frame.set_address_size(8);
-    frame
-}
-
-fn collect_eh_frame_entries(
-    section: KernelElfCfiSection,
-    bases: &BaseAddresses,
-    out: &mut Vec<ElfUnwindEntry>,
-) {
-    let frame = make_eh_frame(section.data);
-    let mut entries = frame.entries(bases);
-    while let Ok(Some(entry)) = entries.next() {
-        let CieOrFde::Fde(partial) = entry else {
-            continue;
-        };
-
-        let fde_offset = partial.offset();
-        let Ok(fde) = partial.parse(EhFrame::cie_from_offset) else {
-            continue;
-        };
-        push_gimli_fde(
-            section,
-            fde_offset,
-            fde.initial_address(),
-            fde.end_address(),
-            out,
-        );
-    }
-}
-
-fn collect_debug_frame_entries(
-    section: KernelElfCfiSection,
-    bases: &BaseAddresses,
-    out: &mut Vec<ElfUnwindEntry>,
-) {
-    let frame = make_debug_frame(section.data);
-    let mut entries = frame.entries(bases);
-    while let Ok(Some(entry)) = entries.next() {
-        let CieOrFde::Fde(partial) = entry else {
-            continue;
-        };
-
-        let fde_offset = partial.offset();
-        let Ok(fde) = partial.parse(DebugFrame::cie_from_offset) else {
-            continue;
-        };
-        push_gimli_fde(
-            section,
-            fde_offset,
-            fde.initial_address(),
-            fde.end_address(),
-            out,
-        );
-    }
-}
-
-fn push_gimli_fde(
-    section: KernelElfCfiSection,
-    fde_offset: usize,
-    initial_location: u64,
-    end: u64,
-    out: &mut Vec<ElfUnwindEntry>,
-) {
-    if initial_location == 0 || end <= initial_location {
-        return;
-    }
-
-    out.push(ElfUnwindEntry {
-        initial_location,
-        end,
-        fde_offset,
-        section,
-    });
-}
-
-fn unwind_elf_cfi(
-    ctx: &mut UnwindContext,
-    bounds: StackBounds,
-    module: &KernelElfUnwindModule,
-    entry: ElfUnwindEntry,
-    control_pc: u64,
-) -> Result<(), ElfUnwindError> {
-    if control_pc < entry.initial_location || control_pc >= entry.end {
-        return Err(ElfUnwindError::NoInfo);
-    }
-
-    match entry.section.kind {
-        KernelElfCfiKind::EhFrame => unwind_eh_frame_cfi(ctx, bounds, module, entry, control_pc),
-        KernelElfCfiKind::DebugFrame => {
-            unwind_debug_frame_cfi(ctx, bounds, module, entry, control_pc)
-        }
-    }
-}
-
-fn unwind_eh_frame_cfi(
-    ctx: &mut UnwindContext,
-    bounds: StackBounds,
-    module: &KernelElfUnwindModule,
-    entry: ElfUnwindEntry,
-    control_pc: u64,
-) -> Result<(), ElfUnwindError> {
-    let frame = make_eh_frame(entry.section.data);
-    let fde = frame
-        .fde_from_offset(
-            &module.bases,
-            EhFrameOffset(entry.fde_offset),
-            EhFrame::cie_from_offset,
-        )
-        .map_err(map_gimli_error)?;
-    let return_reg = fde.cie().return_address_register();
-    let mut gimli_ctx = GimliUnwindContext::<usize, GimliUnwindStorage>::new_in();
-    let row = fde
-        .unwind_info_for_address(&frame, &module.bases, &mut gimli_ctx, control_pc)
-        .map_err(map_gimli_error)?;
-    apply_gimli_row(ctx, bounds, row, return_reg)
-}
-
-fn unwind_debug_frame_cfi(
-    ctx: &mut UnwindContext,
-    bounds: StackBounds,
-    module: &KernelElfUnwindModule,
-    entry: ElfUnwindEntry,
-    control_pc: u64,
-) -> Result<(), ElfUnwindError> {
-    let frame = make_debug_frame(entry.section.data);
-    let fde = frame
-        .fde_from_offset(
-            &module.bases,
-            DebugFrameOffset(entry.fde_offset),
-            DebugFrame::cie_from_offset,
-        )
-        .map_err(map_gimli_error)?;
-    let return_reg = fde.cie().return_address_register();
-    let mut gimli_ctx = GimliUnwindContext::<usize, GimliUnwindStorage>::new_in();
-    let row = fde
-        .unwind_info_for_address(&frame, &module.bases, &mut gimli_ctx, control_pc)
-        .map_err(map_gimli_error)?;
-    apply_gimli_row(ctx, bounds, row, return_reg)
-}
-
-fn map_gimli_error(error: gimli::Error) -> ElfUnwindError {
-    match error {
-        gimli::Error::NoUnwindInfoForAddress => ElfUnwindError::NoInfo,
-        _ => ElfUnwindError::BadUnwindInfo,
-    }
-}
-
-fn apply_gimli_row(
-    ctx: &mut UnwindContext,
-    bounds: StackBounds,
-    row: &UnwindTableRow<usize, GimliUnwindStorage>,
-    return_reg: Register,
-) -> Result<(), ElfUnwindError> {
-    let cfa = match row.cfa() {
-        CfaRule::RegisterAndOffset { register, offset } => {
-            let cfa_base = ctx
-                .get_dwarf_reg(register.0)
-                .ok_or(ElfUnwindError::BadUnwindInfo)?;
-            add_signed(cfa_base, *offset).ok_or(ElfUnwindError::BadUnwindInfo)?
-        }
-        CfaRule::Expression(_) => return Err(ElfUnwindError::UnsupportedOpcode),
-    };
-
-    let mut next = *ctx;
-    let return_address = gimli_rule_value(ctx, bounds, cfa, row.register(return_reg))?
-        .ok_or(ElfUnwindError::BadUnwindInfo)?;
-
-    for reg in [
-        X86_64_DWARF_REG_RBX,
-        X86_64_DWARF_REG_RBP,
-        X86_64_DWARF_REG_RSI,
-        X86_64_DWARF_REG_RDI,
-        X86_64_DWARF_REG_R12,
-        X86_64_DWARF_REG_R13,
-        X86_64_DWARF_REG_R14,
-        X86_64_DWARF_REG_R15,
-    ] {
-        if let Some(value) = gimli_rule_value(ctx, bounds, cfa, row.register(Register(reg)))? {
-            next.set_dwarf_reg(reg, value);
-        }
-    }
-
-    next.rip = return_address;
-    next.rsp = cfa;
-    next.rip_is_return_address = true;
-    *ctx = next;
-    Ok(())
-}
-
-fn gimli_rule_value(
-    ctx: &UnwindContext,
-    bounds: StackBounds,
-    cfa: u64,
-    rule: GimliRegisterRule<usize>,
-) -> Result<Option<u64>, ElfUnwindError> {
-    match rule {
-        GimliRegisterRule::Undefined | GimliRegisterRule::SameValue => Ok(None),
-        GimliRegisterRule::Offset(offset) => {
-            let addr = add_signed(cfa, offset).ok_or(ElfUnwindError::BadUnwindInfo)?;
-            read_stack_u64(bounds, addr)
-                .map(Some)
-                .ok_or(ElfUnwindError::BadStackRead)
-        }
-        GimliRegisterRule::ValOffset(offset) => add_signed(cfa, offset)
-            .map(Some)
-            .ok_or(ElfUnwindError::BadUnwindInfo),
-        GimliRegisterRule::Register(reg) => ctx
-            .get_dwarf_reg(reg.0)
-            .map(Some)
-            .ok_or(ElfUnwindError::BadUnwindInfo),
-        GimliRegisterRule::Constant(value) => Ok(Some(value)),
-        GimliRegisterRule::Expression(_)
-        | GimliRegisterRule::ValExpression(_)
-        | GimliRegisterRule::Architectural => Err(ElfUnwindError::UnsupportedOpcode),
-        _ => Err(ElfUnwindError::UnsupportedOpcode),
-    }
+    modules
+        .iter()
+        .any(|module| pc >= module.image_base && pc < module.image_end)
 }
 
 fn unwind_pe_x64(ctx: &mut UnwindContext, bounds: StackBounds, control_pc: u64) -> u32 {
@@ -981,14 +543,6 @@ fn is_canonical(addr: u64) -> bool {
     (sign == 0 && high == 0) || (sign == 1 && high == 0xffff)
 }
 
-fn add_signed(value: u64, offset: i64) -> Option<u64> {
-    if offset >= 0 {
-        value.checked_add(offset as u64)
-    } else {
-        value.checked_sub(offset.unsigned_abs())
-    }
-}
-
 #[derive(Clone, Copy)]
 struct UnwindContext {
     rip: u64,
@@ -1043,22 +597,6 @@ impl UnwindContext {
         }
     }
 
-    fn get_dwarf_reg(&self, reg: u16) -> Option<u64> {
-        match reg {
-            X86_64_DWARF_REG_RBX => Some(self.rbx),
-            X86_64_DWARF_REG_RSI => Some(self.rsi),
-            X86_64_DWARF_REG_RDI => Some(self.rdi),
-            X86_64_DWARF_REG_RBP => Some(self.rbp),
-            X86_64_DWARF_REG_RSP => Some(self.rsp),
-            X86_64_DWARF_REG_R12 => Some(self.r12),
-            X86_64_DWARF_REG_R13 => Some(self.r13),
-            X86_64_DWARF_REG_R14 => Some(self.r14),
-            X86_64_DWARF_REG_R15 => Some(self.r15),
-            X86_64_DWARF_REG_RIP => Some(self.rip),
-            _ => None,
-        }
-    }
-
     fn set_reg(&mut self, reg: u8, value: u64) {
         match reg {
             3 => self.rbx = value,
@@ -1069,22 +607,6 @@ impl UnwindContext {
             13 => self.r13 = value,
             14 => self.r14 = value,
             15 => self.r15 = value,
-            _ => {}
-        }
-    }
-
-    fn set_dwarf_reg(&mut self, reg: u16, value: u64) {
-        match reg {
-            X86_64_DWARF_REG_RBX => self.rbx = value,
-            X86_64_DWARF_REG_RSI => self.rsi = value,
-            X86_64_DWARF_REG_RDI => self.rdi = value,
-            X86_64_DWARF_REG_RBP => self.rbp = value,
-            X86_64_DWARF_REG_RSP => self.rsp = value,
-            X86_64_DWARF_REG_R12 => self.r12 = value,
-            X86_64_DWARF_REG_R13 => self.r13 = value,
-            X86_64_DWARF_REG_R14 => self.r14 = value,
-            X86_64_DWARF_REG_R15 => self.r15 = value,
-            X86_64_DWARF_REG_RIP => self.rip = value,
             _ => {}
         }
     }

@@ -10,7 +10,7 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
-default = ["allocator-mimalloc"]
+default = ["allocator-buddy"]
 allocator-mimalloc = []
 allocator-buddy = []
 
@@ -32,8 +32,6 @@ raw-cpuid = "11.5.0"
 acpi = "5.2.0"
 goblin = { version = "0.10.0", features = [
     "endian_fd",
-    "elf64",
-    "elf32",
     "pe64",
     "pe32",
     "mach64",
@@ -41,7 +39,6 @@ goblin = { version = "0.10.0", features = [
     "archive",
     "te",
 ], default-features = false }
-gimli = { version = "0.32.3", default-features = false, features = ["read"] }
 hashbrown = "0.15.4"
 bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",

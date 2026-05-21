@@ -14,7 +14,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use goblin::pe::dll_characteristic::IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE;
 use goblin::pe::PE;
-use goblin::Object;
 use kernel_types::device::ModuleHandle;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::memory::{
@@ -48,10 +47,7 @@ impl PELoader {
 
         let slice: &[u8] = &boxed;
 
-        let pe = match Object::parse(slice).ok()? {
-            Object::PE(pe) => pe,
-            _ => return None,
-        };
+        let pe = PE::parse(slice).ok()?;
 
         let pe_static: PE<'static> = unsafe { transmute::<PE<'_>, PE<'static>>(pe) };
         let base = VirtAddr::new(pe_static.image_base as u64);

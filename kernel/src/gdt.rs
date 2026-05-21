@@ -1,3 +1,4 @@
+use crate::benchmarking::BENCH_ENABLED;
 use core::{mem, ptr};
 
 use lazy_static::lazy_static;
@@ -56,7 +57,18 @@ impl GDTTracker {
         ptr::write(tss_ptr, TaskStateSegment::new());
         let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
         // Stacks
-        let timer_stack =
+
+        // This needs to be done because interrupt stacks aren't allowed to grow and the bench submit puts a bunch on the stack to prevent alloc in interrupts.
+        // TODO: consider allowing interrupt stacks to grow or reducing bench submits footprint.
+        let timer_stack = if (BENCH_ENABLED) {
+            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc timer stack")
+        } else {
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack")
+        };
+        let yield_stack =
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
+
+        let sched_ipi_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
 
         let privilege_stack =
@@ -68,10 +80,6 @@ impl GDTTracker {
         let page_stack =
             allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack ");
 
-        let yield_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack ");
-        let sched_ipi_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc sched ipi stack ");
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack;
         tss_static.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = page_stack;
@@ -88,7 +96,6 @@ impl GDTTracker {
 
         let kernel_code_selector = (*gdt_ptr_base).append(Descriptor::kernel_code_segment());
         let kernel_data_selector = (*gdt_ptr_base).append(Descriptor::kernel_data_segment());
-        // Swap this append order if it causes issues
         let user_data_selector = (*gdt_ptr_base).append(Descriptor::user_data_segment());
         let user_code_selector = (*gdt_ptr_base).append(Descriptor::user_code_segment());
 

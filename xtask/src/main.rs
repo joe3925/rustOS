@@ -54,7 +54,7 @@ fn main() {
         .join(profile)
         .join("kernel_stub");
 
-    assert_exists(&stub_image, "kernel stub ELF");
+    assert_exists(&stub_image, "kernel stub image");
 
     let mut os = cargo(&root);
     os.args(["build", "-p", "OS"])

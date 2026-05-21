@@ -120,6 +120,14 @@ pub unsafe fn init() {
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
+        {
+            let boot = boot_info();
+            crate::profiling::unwind::register_kernel_pe_unwind_module(
+                boot.kernel_image_base,
+                boot.kernel_image_size,
+                boot.kernel_sections.as_slice(),
+            );
+        }
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
         load_idt();
