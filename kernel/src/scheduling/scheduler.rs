@@ -1,9 +1,11 @@
 use crate::cpu;
+use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
 use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
+use crate::idt::InterruptGuard;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::runtime::runtime::yield_now;
@@ -895,6 +897,7 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_ipi(state, cpu_id);
@@ -905,6 +908,7 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_timer_tick(state, cpu_id);

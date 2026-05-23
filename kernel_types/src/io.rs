@@ -1,32 +1,41 @@
 use crate::device::DeviceObject;
+use crate::irq::IrqSafeMutex;
 use crate::pnp::DriverStep;
 use crate::request::{RequestHandle, RequestType};
 use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::marker::PhantomData;
-use core::ptr;
 use core::sync::atomic::AtomicU64;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
 use core::task::Waker;
+use spin::Mutex;
 use spin::Once;
+
+// This is here as a temp fix, needs to spin as the drivers can't use tls
+
+#[repr(C)]
 struct Node<T> {
     data: T,
-    next: *mut Node<T>,
+    next: Option<Box<Node<T>>>,
 }
 
+#[repr(C)]
+struct Inner<T> {
+    head: Option<Box<Node<T>>>,
+}
+
+#[repr(C)]
 pub struct TreiberStack<T> {
-    head: AtomicPtr<Node<T>>,
+    inner: IrqSafeMutex<Inner<T>>,
     len: AtomicUsize,
-    _marker: PhantomData<T>,
 }
 
 impl<T> TreiberStack<T> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            head: AtomicPtr::new(ptr::null_mut()),
+            inner: IrqSafeMutex::new(Inner { head: None }),
             len: AtomicUsize::new(0),
-            _marker: PhantomData,
         }
     }
 
@@ -39,59 +48,56 @@ impl<T> TreiberStack<T> {
     }
 
     pub fn push(&self, data: T) {
-        let new_node = Box::into_raw(Box::new(Node {
+        let mut inner = self.inner.lock();
+
+        let node = Box::new(Node {
             data,
-            next: ptr::null_mut(),
-        }));
+            next: inner.head.take(),
+        });
 
-        let mut head = self.head.load(Ordering::Relaxed);
-
-        loop {
-            unsafe {
-                (*new_node).next = head;
-            }
-
-            match self.head.compare_exchange_weak(
-                head,
-                new_node,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.len.fetch_add(1, Ordering::Release);
-                    return;
-                }
-                Err(new_head) => {
-                    head = new_head;
-                }
-            }
-        }
+        inner.head = Some(node);
+        self.len.fetch_add(1, Ordering::Release);
     }
 
     pub fn pop(&self) -> Option<T> {
-        let mut head = self.head.load(Ordering::Acquire);
+        let mut inner = self.inner.lock();
 
-        loop {
-            if head.is_null() {
-                return None;
+        let node = inner.head.take()?;
+        let Node { data, next } = *node;
+
+        inner.head = next;
+        self.len.fetch_sub(1, Ordering::AcqRel);
+
+        Some(data)
+    }
+
+    pub fn drain_fifo<F>(&self, mut f: F)
+    where
+        F: FnMut(T),
+    {
+        let mut head = {
+            let mut inner = self.inner.lock();
+            let head = inner.head.take();
+
+            if head.is_some() {
+                self.len.store(0, Ordering::Release);
             }
 
-            let next = unsafe { (*head).next };
+            head
+        };
 
-            match self
-                .head
-                .compare_exchange_weak(head, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    self.len.fetch_sub(1, Ordering::Release);
+        let mut reversed = None;
 
-                    let boxed = unsafe { Box::from_raw(head) };
-                    return Some(boxed.data);
-                }
-                Err(new_head) => {
-                    head = new_head;
-                }
-            }
+        while let Some(mut node) = head {
+            head = node.next.take();
+            node.next = reversed;
+            reversed = Some(node);
+        }
+
+        while let Some(node) = reversed {
+            let Node { data, next } = *node;
+            f(data);
+            reversed = next;
         }
     }
 }
@@ -102,8 +108,11 @@ impl<T> Drop for TreiberStack<T> {
     }
 }
 
-unsafe impl<T: Send> Send for TreiberStack<T> {}
-unsafe impl<T: Send> Sync for TreiberStack<T> {}
+impl<T> Default for TreiberStack<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 pub type IoTarget = Arc<DeviceObject>;
 
 #[repr(C)]

@@ -160,6 +160,13 @@ impl BootInfoFrameAllocator {
         Self::allocate_contiguous_frames_aligned(num_frames, 1)
     }
 
+    pub fn allocate_contiguous_2mib_frames(num_frames: usize) -> Option<PhysAddr> {
+        let frames_4k = num_frames.checked_mul(FRAMES_PER_2M)?;
+        let phys = Self::allocate_contiguous_frames_aligned(frames_4k, FRAMES_PER_2M)?;
+        USED_MEMORY.fetch_add(num_frames * Size2MiB::SIZE as usize, Ordering::SeqCst);
+        Some(phys)
+    }
+
     pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
         let base_idx = (frame.start_address().as_u64() >> 12) as usize;
         let (len, bytes_u64) = match S::SIZE {

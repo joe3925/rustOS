@@ -10,7 +10,7 @@ name = "kernel"
 path = "src/main.rs"
 
 [features]
-default = ["allocator-buddy"]
+default = ["allocator-mimalloc"]
 allocator-mimalloc = []
 allocator-buddy = []
 
@@ -64,6 +64,9 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
 ] }
 kernel_executor = { path = "../kernel_executor" }
 kernel_macros = { path = "../kernel_macros" }
+crossbeam-epoch = { version = "0.9", default-features = false, features = [
+    "alloc",
+] }
 cfg-if = "1.0.4"
 
 
@@ -74,7 +77,7 @@ features = ["spin_no_std"]
 cc = "1.2"
 implib = "0.4"
 [profile.dev]
-opt-level = 0
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

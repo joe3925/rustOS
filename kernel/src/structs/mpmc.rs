@@ -1,11 +1,10 @@
+use crate::scheduling::scheduler::SCHEDULER;
+use crate::scheduling::state::BlockReason;
+use crate::structs::treiber_stack::TreiberStack;
+use crate::structs::wait_queue::WaitQueue;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
-use kernel_types::io::TreiberStack;
-
-use crate::scheduling::scheduler::SCHEDULER;
-use crate::scheduling::state::BlockReason;
-use crate::structs::wait_queue::WaitQueue;
 
 /// Error returned when sending on a disconnected channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,40 +85,33 @@ pub fn mpmc_channel<T>() -> (Sender<T>, Receiver<T>) {
 
 impl<T> MpmcInner<T> {
     /// Drains the wait-free LIFO inbox into the FIFO SegQueue.
-    /// Because the inbox is LIFO, draining must reverse the items to preserve FIFO push order.
     fn drain_inbox(&self) {
         if self
             .draining
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return; // Another thread is already draining
+            return;
         }
 
         loop {
-            // Unload the LIFO stack into a temporary local vector to reverse it
-            let mut rev = alloc::vec::Vec::new();
-            while let Some(item) = self.inbox.pop() {
-                rev.push(item);
-            }
-
-            for item in rev.into_iter().rev() {
+            self.inbox.drain_fifo(|item| {
                 self.queue.push(item);
-            }
+            });
 
             self.draining.store(false, Ordering::Release);
 
-            // Double-check pattern: if an interrupt pushed to the inbox right as we released the lock, try again.
-            if !self.inbox.is_empty() {
-                if self
-                    .draining
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    continue;
-                }
+            if self.inbox.is_empty() {
+                break;
             }
-            break;
+
+            if self
+                .draining
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                break;
+            }
         }
     }
 }

@@ -265,34 +265,54 @@ pub fn get_current_logical_id() -> u8 {
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
+
 static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
 
 pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
     let idx = lapic_id as usize;
+
     let mut v = PERCPU_SLOTS.lock();
+
     if v.len() <= idx {
         v.resize_with(idx + 1, || None);
     }
+
     if let Some(p) = v[idx] {
         return p;
     }
+
     let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
+        is_in_interrupt: AtomicBool::new(false),
+        reserved_interrupt_pad: [0; 0x7],
         cpu_id: lapic_id as u64,
-        reserved0: [0; 0x50],
+        reserved0: [0; 0x48],
         tls_array_pointer: 0,
     }));
+
     v[idx] = Some(p);
     p
 }
+
 #[repr(C, align(64))]
 pub struct PerCpu {
-    pub cpu_id: u64,
-    reserved0: [u8; 0x50],
-    pub tls_array_pointer: u64,
+    pub is_in_interrupt: AtomicBool, // 0x00
+    reserved_interrupt_pad: [u8; 0x7],
+    pub cpu_id: u64, // 0x08
+    reserved0: [u8; 0x48],
+    pub tls_array_pointer: u64, // 0x58
 }
 
-pub const PERCPU_CPU_ID_OFF: usize = 0;
+pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = 0x00;
+pub const PERCPU_CPU_ID_OFF: usize = 0x08;
 pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = 0x58;
+
+const _: () = {
+    assert!(core::mem::align_of::<PerCpu>() == 0x40);
+    assert!(core::mem::size_of::<PerCpu>() == 0x80);
+    assert!(core::mem::offset_of!(PerCpu, is_in_interrupt) == PERCPU_IS_IN_INTERRUPT_OFF);
+    assert!(core::mem::offset_of!(PerCpu, cpu_id) == PERCPU_CPU_ID_OFF);
+    assert!(core::mem::offset_of!(PerCpu, tls_array_pointer) == PERCPU_TLS_ARRAY_POINTER_OFF);
+};
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -303,7 +323,7 @@ fn wrmsr(msr: u32, val: u64) {
         asm!(
             "wrmsr",
             in("ecx") msr,
-            in("eax") (val as u32),
+            in("eax") val as u32,
             in("edx") (val >> 32) as u32,
             options(nostack, preserves_flags)
         );
@@ -311,19 +331,59 @@ fn wrmsr(msr: u32, val: u64) {
 }
 
 #[inline(always)]
+fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    ((hi as u64) << 32) | lo as u64
+}
+
+#[inline(always)]
 pub fn set_gs_bases(percpu: *const PerCpu) {
     let p = percpu as u64;
+
     wrmsr(IA32_GS_BASE, p);
     wrmsr(IA32_KERNEL_GS_BASE, p);
 }
 
 #[inline(always)]
+pub fn current_percpu() -> &'static PerCpu {
+    let ptr = rdmsr(IA32_GS_BASE) as *const PerCpu;
+
+    debug_assert!(!ptr.is_null());
+
+    unsafe { &*ptr }
+}
+
+#[inline(always)]
+pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
+    &current_percpu().is_in_interrupt
+}
+
+#[inline(always)]
+pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
+    &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
+}
+
+#[inline(always)]
 pub fn set_current_cpu_id(id: u32) {
+    let id = id as u64;
+
     unsafe {
         asm!(
-            "mov dword ptr gs:[{off}], {id:e}",
+            "mov qword ptr gs:[{off}], {id:r}",
             off = const PERCPU_CPU_ID_OFF,
-            id  = in(reg) id,
+            id = in(reg) id,
             options(nostack, preserves_flags)
         );
     }
@@ -331,15 +391,17 @@ pub fn set_current_cpu_id(id: u32) {
 
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
-    let id: u32;
+    let id: u64;
+
     unsafe {
         asm!(
-            "mov {out:e}, dword ptr gs:[{off}]",
+            "mov {out:r}, qword ptr gs:[{off}]",
             out = out(reg) id,
             off = const PERCPU_CPU_ID_OFF,
             options(nomem, nostack, preserves_flags)
         );
     }
+
     id as usize
 }
 impl InterruptIndex {

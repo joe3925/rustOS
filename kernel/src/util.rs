@@ -19,6 +19,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
+use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
@@ -191,7 +192,6 @@ pub unsafe fn init() {
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
-    //test_full_heap();
     init_executor_platform();
     GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
     install_file_provider(ProviderKind::Bootstrap);
@@ -379,139 +379,6 @@ pub fn test_full_heap() {
         time.elapsed_millis(),
         element_count
     );
-}
-
-// struct ParallelCtx {
-//     gate: Arc<AtomicBool>,
-//     element_count_per_thread: usize,
-//     finished: Arc<AtomicUsize>,
-//     push_total_ms: Arc<AtomicUsize>,
-//     push_max_ms: Arc<AtomicUsize>,
-//     verify_total_ms: Arc<AtomicUsize>,
-//     verify_max_ms: Arc<AtomicUsize>,
-// }
-
-// extern "win64" fn parallel_worker(ctx: usize) {
-//     let ctx = unsafe { alloc::boxed::Box::from_raw(ctx as *mut ParallelCtx) };
-//     while !ctx.gate.load(Ordering::Acquire) {
-//         yield_now();
-//     }
-
-//     {
-//         let mut vec: Vec<u64> = Vec::with_capacity(1);
-//         let push_sw = Stopwatch::start();
-//         for i in 0..ctx.element_count_per_thread {
-//             vec.push(i as u64);
-//         }
-//         let push_ms = push_sw.elapsed_millis() as usize;
-//         ctx.push_total_ms.fetch_add(push_ms, Ordering::Relaxed);
-//         atomic_max(&ctx.push_max_ms, push_ms);
-
-//         let verify_sw = Stopwatch::start();
-//         for i in 0..ctx.element_count_per_thread {
-//             if i != vec[i] as usize {
-//                 println!("Heap data verification failed at index {}", i);
-//             }
-//         }
-//         let verify_ms = verify_sw.elapsed_millis() as usize;
-//         ctx.verify_total_ms.fetch_add(verify_ms, Ordering::Relaxed);
-//         atomic_max(&ctx.verify_max_ms, verify_ms);
-//     }
-
-//     ctx.finished.fetch_add(1, Ordering::Release);
-// }
-
-// pub fn test_full_heap_parallel() {
-//     let threads_to_test = [2, 4, 16];
-
-//     for &num_threads in &threads_to_test {
-//         let element_count_per_thread = ((HEAP_SIZE as usize / 4) / size_of::<u64>()) / num_threads;
-
-//         let gate = Arc::new(AtomicBool::new(false));
-//         let finished = Arc::new(AtomicUsize::new(0));
-//         let push_total_ms = Arc::new(AtomicUsize::new(0));
-//         let push_max_ms = Arc::new(AtomicUsize::new(0));
-//         let verify_total_ms = Arc::new(AtomicUsize::new(0));
-//         let verify_max_ms = Arc::new(AtomicUsize::new(0));
-//         let mut tasks = Vec::with_capacity(num_threads);
-
-//         for i in 0..num_threads {
-//             let ctx = alloc::boxed::Box::new(ParallelCtx {
-//                 gate: gate.clone(),
-//                 element_count_per_thread,
-//                 finished: finished.clone(),
-//                 push_total_ms: push_total_ms.clone(),
-//                 push_max_ms: push_max_ms.clone(),
-//                 verify_total_ms: verify_total_ms.clone(),
-//                 verify_max_ms: verify_max_ms.clone(),
-//             });
-
-//             let name = alloc::format!("heap_test_worker_{}", i);
-//             let task = Task::new_kernel_mode(
-//                 parallel_worker,
-//                 alloc::boxed::Box::into_raw(ctx) as usize,
-//                 StackSize::Large,
-//                 name,
-//                 0,
-//             );
-//             tasks.push(task.clone());
-//             SCHEDULER.add_task(task);
-//         }
-
-//         crate::memory::allocator::mimalloc_commit_stats_reset();
-//         crate::memory::heap::mimalloc_alloc_stats_reset();
-//         let sw = Stopwatch::start();
-//         gate.store(true, Ordering::Release);
-
-//         while finished.load(Ordering::Acquire) < num_threads {
-//             yield_now();
-//         }
-
-//         while tasks.iter().any(|task| !task.is_terminated()) {
-//             yield_now();
-//         }
-
-//         let elapsed = sw.elapsed().as_millis();
-//         let commit_stats = crate::memory::allocator::mimalloc_commit_stats();
-//         let alloc_stats = crate::memory::allocator::mimalloc_alloc_stats();
-//         let commit_ms = Stopwatch::from_cycles(commit_stats.cycles).as_millis();
-//         let alloc_ms = Stopwatch::from_cycles(alloc_stats.alloc_cycles).as_millis();
-//         let realloc_ms = Stopwatch::from_cycles(alloc_stats.realloc_cycles).as_millis();
-//         let dealloc_ms = Stopwatch::from_cycles(alloc_stats.dealloc_cycles).as_millis();
-//         println!(
-//             "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify max/sum {} / {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
-//             num_threads,
-//             elapsed,
-//             push_max_ms.load(Ordering::Relaxed),
-//             push_total_ms.load(Ordering::Relaxed),
-//             verify_max_ms.load(Ordering::Relaxed),
-//             verify_total_ms.load(Ordering::Relaxed),
-//             commit_stats.calls,
-//             commit_stats.map_calls,
-//             commit_stats.requested / (1024 * 1024),
-//             commit_stats.mapped / (1024 * 1024),
-//             commit_ms,
-//             alloc_stats.alloc_calls,
-//             alloc_stats.realloc_calls,
-//             alloc_stats.dealloc_calls,
-//             alloc_stats.alloc_bytes / (1024 * 1024),
-//             alloc_stats.realloc_new_bytes / (1024 * 1024),
-//             alloc_stats.dealloc_bytes / (1024 * 1024),
-//             alloc_ms,
-//             realloc_ms,
-//             dealloc_ms
-//         );
-//     }
-// }
-
-fn atomic_max(target: &AtomicUsize, value: usize) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(next) => current = next,
-        }
-    }
 }
 
 pub extern "win64" fn random_number() -> u64 {

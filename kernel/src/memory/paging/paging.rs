@@ -33,6 +33,38 @@ pub unsafe fn map_range_with_huge_pages<M>(
 where
     M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
 {
+    map_range_with_huge_pages_impl(mapper, addr, size, fa, flags, ignore_already_mapped, true)
+}
+
+/// SAFETY: Same as `map_range_with_huge_pages`. The caller must only use this
+/// for fresh virtual ranges that have not been accessed since they became
+/// unmapped, so there cannot be a stale present TLB entry.
+pub unsafe fn map_fresh_range_with_huge_pages_no_flush<M>(
+    mapper: &mut M,
+    addr: VirtAddr,
+    size: u64,
+    fa: &mut BootInfoFrameAllocator,
+    flags: PageTableFlags,
+    ignore_already_mapped: bool,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    map_range_with_huge_pages_impl(mapper, addr, size, fa, flags, ignore_already_mapped, false)
+}
+
+unsafe fn map_range_with_huge_pages_impl<M>(
+    mapper: &mut M,
+    addr: VirtAddr,
+    size: u64,
+    fa: &mut BootInfoFrameAllocator,
+    flags: PageTableFlags,
+    ignore_already_mapped: bool,
+    flush_each: bool,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
     let mut cur = addr;
     debug_assert_eq!(cur.as_u64() & 0xFFF, 0);
     let mut remaining = align_up_4k(size);
@@ -45,7 +77,7 @@ where
 
     while remaining > 0 {
         if supports_1g && remaining >= gib && (cur.as_u64() & (gib - 1)) == 0 {
-            match unsafe { map_1gib_page(mapper, cur, flags, fa) } {
+            match unsafe { map_1gib_page_inner(mapper, cur, flags, fa, flush_each) } {
                 Ok(_) => {
                     cur += gib;
                     remaining -= gib;
@@ -69,7 +101,7 @@ where
         }
 
         if remaining >= mib2 && (cur.as_u64() & (mib2 - 1)) == 0 {
-            match unsafe { map_2mib_page(mapper, cur, flags, fa) } {
+            match unsafe { map_2mib_page_inner(mapper, cur, flags, fa, flush_each) } {
                 Ok(_) => {
                     cur += mib2;
                     remaining -= mib2;
@@ -93,7 +125,7 @@ where
         }
 
         let page4k = Page::<Size4KiB>::containing_address(cur);
-        match unsafe { map_page(mapper, page4k, fa, flags) } {
+        match unsafe { map_page_inner(mapper, page4k, fa, flags, flush_each) } {
             Ok(_) => {}
             Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {}
             Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {}
@@ -115,6 +147,10 @@ pub(crate) unsafe fn unmap_range_impl(virtual_addr: VirtAddr, size: u64) {
     unmap_range_with_frame_mode(virtual_addr, size, UnmapFrameMode::Accounted)
 }
 
+pub(crate) unsafe fn unmap_range_keep_frames_unchecked(virtual_addr: VirtAddr, size: u64) {
+    unmap_range_with_frame_mode(virtual_addr, size, UnmapFrameMode::KeepFrames)
+}
+
 pub(crate) unsafe fn unmap_reserved_range_unchecked(virtual_addr: VirtAddr, size: u64) {
     unmap_range_with_frame_mode(virtual_addr, size, UnmapFrameMode::Reserved)
 }
@@ -123,6 +159,7 @@ pub(crate) unsafe fn unmap_reserved_range_unchecked(virtual_addr: VirtAddr, size
 enum UnmapFrameMode {
     Accounted,
     Reserved,
+    KeepFrames,
 }
 
 unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: UnmapFrameMode) {
@@ -191,6 +228,7 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
             match mode {
                 UnmapFrameMode::Accounted => frame_allocator.deallocate_frame(frame),
                 UnmapFrameMode::Reserved => frame_allocator.release_reserved_frame(frame),
+                UnmapFrameMode::KeepFrames => {}
             }
             true
         }
@@ -254,11 +292,25 @@ pub unsafe fn map_page(
     frame_allocator: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
 ) -> Result<(), MapToError<Size4KiB>> {
+    map_page_inner(mapper, page, frame_allocator, flags, true)
+}
+
+unsafe fn map_page_inner(
+    mapper: &mut impl Mapper<Size4KiB>,
+    page: Page<Size4KiB>,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    flags: PageTableFlags,
+    flush: bool,
+) -> Result<(), MapToError<Size4KiB>> {
     let frame = frame_allocator
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
     match unsafe { mapper.map_to(page, frame, flags, frame_allocator) } {
-        Ok(flush) => flush.flush(),
+        Ok(map_flush) => {
+            if flush {
+                map_flush.flush();
+            }
+        }
         Err(err) => {
             frame_allocator.deallocate_frame(frame);
             return Err(err);
@@ -279,6 +331,19 @@ unsafe fn map_1gib_page<M>(
 where
     M: Mapper<Size1GiB>,
 {
+    map_1gib_page_inner(mapper, addr, flags, fa, true)
+}
+
+unsafe fn map_1gib_page_inner<M>(
+    mapper: &mut M,
+    addr: VirtAddr,
+    flags: PageTableFlags,
+    fa: &mut BootInfoFrameAllocator,
+    flush: bool,
+) -> Result<(), MapToError<Size1GiB>>
+where
+    M: Mapper<Size1GiB>,
+{
     let page = Page::<Size1GiB>::containing_address(addr);
     let frame = fa
         .allocate_frame()
@@ -291,7 +356,11 @@ where
     };
 
     match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
-        Ok(flush) => flush.flush(),
+        Ok(map_flush) => {
+            if flush {
+                map_flush.flush();
+            }
+        }
         Err(err) => {
             fa.deallocate_frame(frame);
             return Err(err);
@@ -312,6 +381,19 @@ unsafe fn map_2mib_page<M>(
 where
     M: Mapper<Size2MiB>,
 {
+    map_2mib_page_inner(mapper, addr, flags, fa, true)
+}
+
+unsafe fn map_2mib_page_inner<M>(
+    mapper: &mut M,
+    addr: VirtAddr,
+    flags: PageTableFlags,
+    fa: &mut BootInfoFrameAllocator,
+    flush: bool,
+) -> Result<(), MapToError<Size2MiB>>
+where
+    M: Mapper<Size2MiB>,
+{
     let page = Page::<Size2MiB>::containing_address(addr);
     let frame = fa
         .allocate_frame()
@@ -325,7 +407,11 @@ where
     };
 
     match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
-        Ok(flush) => flush.flush(),
+        Ok(map_flush) => {
+            if flush {
+                map_flush.flush();
+            }
+        }
         Err(err) => {
             fa.deallocate_frame(frame);
             return Err(err);
@@ -348,6 +434,59 @@ pub unsafe fn map_kernel_range(
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
     map_range_with_huge_pages(
+        &mut mapper,
+        addr,
+        size,
+        &mut frame_allocator,
+        flags,
+        ignore_already_mapped,
+    )
+}
+
+pub(crate) unsafe fn map_kernel_2mib_frame(
+    addr: VirtAddr,
+    phys_addr: PhysAddr,
+    flags: PageTableFlags,
+    flush: bool,
+) -> Result<(), MapToError<Size2MiB>> {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+    let page = Page::<Size2MiB>::containing_address(addr);
+    let frame = PhysFrame::<Size2MiB>::containing_address(phys_addr);
+    let effective_flags = if flags.contains(PageTableFlags::HUGE_PAGE) {
+        flags
+    } else {
+        flags | PageTableFlags::HUGE_PAGE
+    };
+
+    match unsafe { mapper.map_to(page, frame, effective_flags, &mut frame_allocator) } {
+        Ok(map_flush) => {
+            if flush {
+                map_flush.flush();
+            }
+        }
+        Err(err) => return Err(err),
+    }
+
+    Ok(())
+}
+
+/// SAFETY: Same as `map_kernel_range`. This skips TLB invalidation and is only
+/// valid for fresh virtual ranges that have not been accessed while unmapped.
+pub unsafe fn map_fresh_kernel_range_no_flush(
+    addr: VirtAddr,
+    size: u64,
+    flags: PageTableFlags,
+    ignore_already_mapped: bool,
+) -> Result<(), PageMapError> {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    map_fresh_range_with_huge_pages_no_flush(
         &mut mapper,
         addr,
         size,

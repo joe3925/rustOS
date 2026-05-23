@@ -1,6 +1,7 @@
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
 use crate::benchmarking::used_memory;
 use crate::benchmarking::BenchWindow;
+use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::HEAP_SIZE;
 use crate::util::trigger_triple_fault;
 use alloc::format;
@@ -421,13 +422,13 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
     spawn_blocking(|| {
         spawn_detached(async move {
-            // loop {
-            //
-            // }
-            //bench_async_vs_sync_call_latency_async().await;
-            //DRIVE_WINDOW.start();
-            let mut i = 0;
             loop {
+                //
+                // }
+                //bench_async_vs_sync_call_latency_async().await;
+                //DRIVE_WINDOW.start();
+                let mut i = 0;
+                //loop {
                 let drive_window = BenchWindow::new(BenchWindowConfig {
                     name: format!("iter{}", i),
                     folder: "C:\\system\\logs".to_string(),
@@ -447,8 +448,12 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
                     disable_per_core: true,
                 });
                 drive_window.start();
+                test_full_heap_parallel();
+
                 bench_c_drive_io_async().await;
                 drive_window.stop_and_persist().await;
+                // test_full_heap_parallel();
+
                 i += 1;
                 //run_virtio_bench_matrix_print().await;
                 //wait_duration(Duration::from_secs(10));

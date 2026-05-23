@@ -1,4 +1,6 @@
+use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use alloc::sync::Arc;
+
 use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
@@ -547,6 +549,7 @@ impl IrqManager {
     }
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
+        InterruptGuard::new();
         let cpu = current_cpu_id() as u32;
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();
@@ -695,3 +698,15 @@ pub fn irq_free_vector(vector: u8) -> bool {
 }
 
 pub const SCHED_IPI_VECTOR: u8 = 0xF2;
+pub struct InterruptGuard {}
+impl InterruptGuard {
+    pub fn new() -> Self {
+        current_is_in_interrupt_atomic().store(true, Ordering::Relaxed);
+        InterruptGuard {}
+    }
+}
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        current_is_in_interrupt_atomic().store(false, Ordering::Relaxed);
+    }
+}

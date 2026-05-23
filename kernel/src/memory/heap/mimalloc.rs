@@ -1,11 +1,13 @@
 use crate::cpu;
 use crate::memory::heap::{
-    MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE, MIMALLOC_HEAP_START,
-    MIMALLOC_META_HEAP_SIZE,
+    HEAP_SIZE, HEAP_START, MIMALLOC_ARENA_SIZE, MIMALLOC_ARENA_START, MIMALLOC_HEAP_SIZE,
+    MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE,
 };
+use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::paging::{map_kernel_2mib_frame, unmap_range_keep_frames_unchecked};
+use crate::memory::paging::tables::init_mapper;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
-use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ffi::c_void;
 use core::ptr::null_mut;
@@ -13,6 +15,10 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
+use x86_64::structures::paging::{
+    FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB,
+};
+use x86_64::{PhysAddr, VirtAddr};
 
 const PAGE_SIZE: usize = 4096;
 const MIMALLOC_COMMIT_GRANULARITY: usize = 1024 * 1024 * 1024;
@@ -83,7 +89,7 @@ unsafe extern "C" {
 
 static MIMALLOC_OS_ALLOCATOR: Locked<RangeAllocator> = Locked::new(RangeAllocator::new(
     MIMALLOC_HEAP_START,
-    MIMALLOC_META_HEAP_SIZE as usize,
+    MIMALLOC_OS_HEAP_SIZE as usize,
 ));
 
 pub unsafe fn enable_mimalloc_impl() {
@@ -151,7 +157,7 @@ pub fn mimalloc_alloc_stats() -> MimallocAllocStats {
 #[inline(always)]
 pub fn ptr_is_mimalloc(ptr: *mut u8) -> bool {
     let addr = ptr as usize;
-    addr >= MIMALLOC_HEAP_START && addr < MIMALLOC_HEAP_END
+    (addr >= MIMALLOC_HEAP_START && addr < MIMALLOC_HEAP_END) || ptr_is_raw_large(ptr)
 }
 
 pub fn get_mimalloc_free_memory() -> usize {
@@ -160,7 +166,15 @@ pub fn get_mimalloc_free_memory() -> usize {
 
 pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
     let start = cpu::get_cycles();
-    let ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    let mut ptr = null_mut();
+    if raw_large_alloc_enabled(layout.size(), layout.align()) {
+        ptr = RAW_LARGE_ALLOCATOR
+            .lock()
+            .alloc(layout.size(), layout.align());
+    }
+    if ptr.is_null() {
+        ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    }
     let elapsed = cpu::get_cycles().wrapping_sub(start);
     MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -170,7 +184,18 @@ pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
 
 pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
     let start = cpu::get_cycles();
-    let ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    let mut ptr = null_mut();
+    if raw_large_alloc_enabled(layout.size(), layout.align()) {
+        ptr = RAW_LARGE_ALLOCATOR
+            .lock()
+            .alloc(layout.size(), layout.align());
+        if !ptr.is_null() {
+            core::ptr::write_bytes(ptr, 0, layout.size());
+        }
+    }
+    if ptr.is_null() {
+        ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
+    }
     let elapsed = cpu::get_cycles().wrapping_sub(start);
     MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -180,6 +205,15 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
 
 pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
     let start = cpu::get_cycles();
+    if ptr_is_raw_large(ptr) {
+        if RAW_LARGE_ALLOCATOR.lock().dealloc(ptr) {
+            let elapsed = cpu::get_cycles().wrapping_sub(start);
+            MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+            MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+            return;
+        }
+    }
     mi_free(ptr.cast::<c_void>());
     let elapsed = cpu::get_cycles().wrapping_sub(start);
     MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -189,8 +223,22 @@ pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
 
 pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     let start = cpu::get_cycles();
-    let new_ptr =
-        mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8;
+    let new_ptr = if ptr_is_raw_large(ptr) {
+        RAW_LARGE_ALLOCATOR
+            .lock()
+            .realloc(ptr, layout.size(), new_size, layout.align())
+    } else if raw_large_alloc_enabled(new_size, layout.align()) {
+        let raw_ptr = RAW_LARGE_ALLOCATOR.lock().alloc(new_size, layout.align());
+        if !raw_ptr.is_null() {
+            core::ptr::copy_nonoverlapping(ptr, raw_ptr, core::cmp::min(layout.size(), new_size));
+            mi_free(ptr.cast::<c_void>());
+            raw_ptr
+        } else {
+            mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8
+        }
+    } else {
+        mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8
+    };
     let elapsed = cpu::get_cycles().wrapping_sub(start);
     MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
     MIMALLOC_REALLOC_OLD_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
@@ -407,6 +455,501 @@ impl RangeAllocator {
     }
 }
 
+const RAW_LARGE_THRESHOLD: usize = 2 * 1024 * 1024;
+const RAW_LARGE_UNIT_SIZE: usize = Size2MiB::SIZE as usize;
+const RAW_LARGE_HEAP_START: usize = HEAP_START + HEAP_SIZE as usize;
+const RAW_LARGE_HEAP_SIZE: usize = 8 * 1024 * 1024 * 1024;
+const RAW_LARGE_SLOT_SIZE: usize = 512 * 1024 * 1024;
+const RAW_LARGE_SLOT_UNITS: usize = RAW_LARGE_SLOT_SIZE / RAW_LARGE_UNIT_SIZE;
+const RAW_LARGE_FULL_SLOT_ACTIVE_COUNT: usize = 4;
+const RAW_LARGE_RESERVATION_WORKING_SET_UNITS: usize =
+    ((HEAP_SIZE as usize / 4) + RAW_LARGE_UNIT_SIZE - 1) / RAW_LARGE_UNIT_SIZE;
+const RAW_LARGE_UNITS: usize = RAW_LARGE_HEAP_SIZE / RAW_LARGE_UNIT_SIZE;
+const RAW_LARGE_BITMAP_WORD_BITS: usize = usize::BITS as usize;
+const RAW_LARGE_BITMAP_WORDS: usize =
+    (RAW_LARGE_UNITS + RAW_LARGE_BITMAP_WORD_BITS - 1) / RAW_LARGE_BITMAP_WORD_BITS;
+const RAW_LARGE_MAX_ALLOCS: usize = 256;
+
+#[derive(Clone, Copy)]
+struct RawLargeMeta {
+    base_unit: usize,
+    reserved_units: usize,
+    committed_units: usize,
+    active: bool,
+}
+
+impl RawLargeMeta {
+    const EMPTY: Self = Self {
+        base_unit: 0,
+        reserved_units: 0,
+        committed_units: 0,
+        active: false,
+    };
+}
+
+struct RawLargeAllocator {
+    used: [usize; RAW_LARGE_BITMAP_WORDS],
+    frames: [usize; RAW_LARGE_UNITS],
+    metas: [RawLargeMeta; RAW_LARGE_MAX_ALLOCS],
+}
+
+static RAW_LARGE_ALLOCATOR: spin::Mutex<RawLargeAllocator> =
+    spin::Mutex::new(RawLargeAllocator::new());
+
+impl RawLargeAllocator {
+    const fn new() -> Self {
+        Self {
+            used: [0; RAW_LARGE_BITMAP_WORDS],
+            frames: [0; RAW_LARGE_UNITS],
+            metas: [RawLargeMeta::EMPTY; RAW_LARGE_MAX_ALLOCS],
+        }
+    }
+
+    #[inline(always)]
+    fn contains_addr(addr: usize) -> bool {
+        addr >= RAW_LARGE_HEAP_START && addr < RAW_LARGE_HEAP_START + RAW_LARGE_HEAP_SIZE
+    }
+
+    #[inline(always)]
+    fn unit_addr(unit: usize) -> usize {
+        RAW_LARGE_HEAP_START + unit * RAW_LARGE_UNIT_SIZE
+    }
+
+    #[inline(always)]
+    fn units_for_size(size: usize) -> Option<usize> {
+        if size == 0 {
+            return Some(1);
+        }
+        let rounded = size.checked_add(RAW_LARGE_UNIT_SIZE - 1)? & !(RAW_LARGE_UNIT_SIZE - 1);
+        Some(rounded / RAW_LARGE_UNIT_SIZE)
+    }
+
+    #[inline(always)]
+    fn align_units(align: usize) -> usize {
+        let align = align.max(RAW_LARGE_UNIT_SIZE);
+        (align + RAW_LARGE_UNIT_SIZE - 1) / RAW_LARGE_UNIT_SIZE
+    }
+
+    #[inline(always)]
+    fn bit_is_set(&self, unit: usize) -> bool {
+        let word = unit / RAW_LARGE_BITMAP_WORD_BITS;
+        let bit = unit & (RAW_LARGE_BITMAP_WORD_BITS - 1);
+        (self.used[word] & (1usize << bit)) != 0
+    }
+
+    #[inline(always)]
+    fn set_bit(&mut self, unit: usize) {
+        let word = unit / RAW_LARGE_BITMAP_WORD_BITS;
+        let bit = unit & (RAW_LARGE_BITMAP_WORD_BITS - 1);
+        self.used[word] |= 1usize << bit;
+    }
+
+    #[inline(always)]
+    fn clear_bit(&mut self, unit: usize) {
+        let word = unit / RAW_LARGE_BITMAP_WORD_BITS;
+        let bit = unit & (RAW_LARGE_BITMAP_WORD_BITS - 1);
+        self.used[word] &= !(1usize << bit);
+    }
+
+    fn run_is_free(&self, start: usize, units: usize) -> bool {
+        if units == 0
+            || start
+                .checked_add(units)
+                .is_none_or(|end| end > RAW_LARGE_UNITS)
+        {
+            return false;
+        }
+        for unit in start..start + units {
+            if self.bit_is_set(unit) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_run(&mut self, start: usize, units: usize) {
+        for unit in start..start + units {
+            self.set_bit(unit);
+        }
+    }
+
+    fn clear_run(&mut self, start: usize, units: usize) {
+        for unit in start..start + units {
+            self.clear_bit(unit);
+        }
+    }
+
+    fn find_free_run(&self, units: usize, align_units: usize) -> Option<usize> {
+        if units == 0 || units > RAW_LARGE_UNITS {
+            return None;
+        }
+
+        let align_units = align_units.max(1);
+        let mut start = 0usize;
+        while start + units <= RAW_LARGE_UNITS {
+            let rem = start % align_units;
+            if rem != 0 {
+                start += align_units - rem;
+                continue;
+            }
+
+            if self.run_is_free(start, units) {
+                return Some(start);
+            }
+            start += 1;
+        }
+        None
+    }
+
+    fn find_meta_by_base(&self, base_unit: usize) -> Option<usize> {
+        self.metas
+            .iter()
+            .position(|meta| meta.active && meta.base_unit == base_unit)
+    }
+
+    fn find_free_meta(&self) -> Option<usize> {
+        self.metas.iter().position(|meta| !meta.active)
+    }
+
+    fn active_alloc_count(&self) -> usize {
+        self.metas.iter().filter(|meta| meta.active).count()
+    }
+
+    fn reservation_units(active_count: usize, committed_units: usize) -> usize {
+        let active_count = active_count.max(1);
+        let fair_units =
+            (RAW_LARGE_RESERVATION_WORKING_SET_UNITS + active_count - 1) / active_count;
+        committed_units.max(fair_units.min(RAW_LARGE_SLOT_UNITS))
+    }
+
+    fn shrink_active_reservations(&mut self, target_units: usize) {
+        for idx in 0..self.metas.len() {
+            let meta = self.metas[idx];
+            if !meta.active {
+                continue;
+            }
+
+            let new_reserved_units = meta.committed_units.max(target_units);
+            if meta.reserved_units <= new_reserved_units {
+                continue;
+            }
+
+            let free_start = meta.base_unit + new_reserved_units;
+            let free_units = meta.reserved_units - new_reserved_units;
+            self.clear_run(free_start, free_units);
+            self.metas[idx].reserved_units = new_reserved_units;
+        }
+    }
+
+    unsafe fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        let Some(committed_units) = Self::units_for_size(size) else {
+            return null_mut();
+        };
+
+        let active_count_after_alloc = self.active_alloc_count().saturating_add(1);
+        let reserved_units = if active_count_after_alloc <= RAW_LARGE_FULL_SLOT_ACTIVE_COUNT {
+            committed_units.max(RAW_LARGE_SLOT_UNITS)
+        } else {
+            Self::reservation_units(active_count_after_alloc, committed_units)
+        };
+        if active_count_after_alloc > RAW_LARGE_FULL_SLOT_ACTIVE_COUNT {
+            self.shrink_active_reservations(reserved_units);
+        }
+
+        let align_units = Self::align_units(align);
+        let Some(meta_idx) = self.find_free_meta() else {
+            return null_mut();
+        };
+        let Some(base_unit) = self.find_free_run(reserved_units, align_units) else {
+            return null_mut();
+        };
+
+        self.set_run(base_unit, reserved_units);
+        if !unsafe { self.ensure_units_mapped(base_unit, committed_units) } {
+            self.clear_run(base_unit, reserved_units);
+            return null_mut();
+        }
+
+        self.metas[meta_idx] = RawLargeMeta {
+            base_unit,
+            reserved_units,
+            committed_units,
+            active: true,
+        };
+
+        Self::unit_addr(base_unit) as *mut u8
+    }
+
+    unsafe fn dealloc(&mut self, ptr: *mut u8) -> bool {
+        let addr = ptr as usize;
+        if !Self::contains_addr(addr) || (addr - RAW_LARGE_HEAP_START) % RAW_LARGE_UNIT_SIZE != 0 {
+            return false;
+        }
+
+        let base_unit = (addr - RAW_LARGE_HEAP_START) / RAW_LARGE_UNIT_SIZE;
+        let Some(meta_idx) = self.find_meta_by_base(base_unit) else {
+            return false;
+        };
+
+        let meta = self.metas[meta_idx];
+        self.clear_run(meta.base_unit, meta.reserved_units);
+        self.metas[meta_idx] = RawLargeMeta::EMPTY;
+        true
+    }
+
+    unsafe fn realloc(
+        &mut self,
+        ptr: *mut u8,
+        _old_size: usize,
+        new_size: usize,
+        align: usize,
+    ) -> *mut u8 {
+        let addr = ptr as usize;
+        if !Self::contains_addr(addr) || (addr - RAW_LARGE_HEAP_START) % RAW_LARGE_UNIT_SIZE != 0 {
+            return null_mut();
+        }
+
+        let old_base_unit = (addr - RAW_LARGE_HEAP_START) / RAW_LARGE_UNIT_SIZE;
+        let Some(meta_idx) = self.find_meta_by_base(old_base_unit) else {
+            return null_mut();
+        };
+        let Some(new_units) = Self::units_for_size(new_size) else {
+            return null_mut();
+        };
+
+        let meta = self.metas[meta_idx];
+        if new_units <= meta.reserved_units {
+            if new_units > meta.committed_units
+                && !unsafe {
+                    self.ensure_units_mapped(
+                        meta.base_unit + meta.committed_units,
+                        new_units - meta.committed_units,
+                    )
+                }
+            {
+                return null_mut();
+            }
+            self.metas[meta_idx].committed_units =
+                self.metas[meta_idx].committed_units.max(new_units);
+            return ptr;
+        }
+
+        let align_units = Self::align_units(align);
+        let Some(new_base_unit) = self.find_free_run(new_units, align_units) else {
+            return null_mut();
+        };
+
+        self.set_run(new_base_unit, new_units);
+
+        for offset in 0..meta.committed_units {
+            let old_unit = meta.base_unit + offset;
+            let new_unit = new_base_unit + offset;
+            let phys = self.frames[old_unit];
+            if phys == 0
+                || !unsafe { self.replace_unit_mapping(new_unit, PhysAddr::new(phys as u64)) }
+            {
+                self.clear_run(new_base_unit, new_units);
+                return null_mut();
+            }
+        }
+
+        if !unsafe {
+            self.ensure_units_mapped(
+                new_base_unit + meta.committed_units,
+                new_units - meta.committed_units,
+            )
+        } {
+            self.clear_run(new_base_unit, new_units);
+            return null_mut();
+        }
+
+        unsafe {
+            unmap_range_keep_frames_unchecked(
+                VirtAddr::new(Self::unit_addr(meta.base_unit) as u64),
+                (meta.committed_units * RAW_LARGE_UNIT_SIZE) as u64,
+            );
+        }
+        for unit in meta.base_unit..meta.base_unit + meta.committed_units {
+            self.frames[unit] = 0;
+        }
+        self.clear_run(meta.base_unit, meta.reserved_units);
+
+        self.metas[meta_idx] = RawLargeMeta {
+            base_unit: new_base_unit,
+            reserved_units: new_units,
+            committed_units: new_units,
+            active: true,
+        };
+
+        Self::unit_addr(new_base_unit) as *mut u8
+    }
+
+    unsafe fn ensure_units_mapped(&mut self, start: usize, units: usize) -> bool {
+        if units == 0 {
+            return true;
+        }
+
+        let boot_info = boot_info();
+        let phys_mem_offset =
+            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+        let mut mapper = init_mapper(phys_mem_offset);
+        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE;
+
+        let end = start + units;
+        let mut unit = start;
+        while unit < end {
+            if self.frames[unit] != 0 {
+                unit += 1;
+                continue;
+            }
+
+            let run_start = unit;
+            while unit < end && self.frames[unit] == 0 {
+                unit += 1;
+            }
+            let run_units = unit - run_start;
+
+            match unsafe {
+                self.ensure_units_mapped_contiguous(
+                    run_start,
+                    run_units,
+                    &mut mapper,
+                    &mut frame_allocator,
+                    flags,
+                )
+            } {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(()) => return false,
+            }
+
+            for offset in 0..run_units {
+                let cur_unit = run_start + offset;
+                if !unsafe {
+                    self.ensure_unit_mapped_single(
+                        cur_unit,
+                        &mut mapper,
+                        &mut frame_allocator,
+                        flags,
+                    )
+                } {
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    unsafe fn ensure_units_mapped_contiguous(
+        &mut self,
+        start: usize,
+        units: usize,
+        mapper: &mut impl Mapper<Size2MiB>,
+        frame_allocator: &mut BootInfoFrameAllocator,
+        flags: PageTableFlags,
+    ) -> Result<bool, ()> {
+        let Some(phys_base) = BootInfoFrameAllocator::allocate_contiguous_2mib_frames(units) else {
+            return Ok(false);
+        };
+
+        for offset in 0..units {
+            let unit = start + offset;
+            let phys = PhysAddr::new(phys_base.as_u64() + (offset * RAW_LARGE_UNIT_SIZE) as u64);
+            let frame = PhysFrame::<Size2MiB>::containing_address(phys);
+            let page =
+                Page::<Size2MiB>::containing_address(VirtAddr::new(Self::unit_addr(unit) as u64));
+            let mapped = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
+
+            if mapped.is_err() {
+                for rollback_offset in offset..units {
+                    let rollback_phys = PhysAddr::new(
+                        phys_base.as_u64() + (rollback_offset * RAW_LARGE_UNIT_SIZE) as u64,
+                    );
+                    frame_allocator
+                        .deallocate_frame(PhysFrame::<Size2MiB>::containing_address(rollback_phys));
+                }
+                return Err(());
+            }
+
+            self.frames[unit] = phys.as_u64() as usize;
+        }
+
+        Ok(true)
+    }
+
+    unsafe fn ensure_unit_mapped_single(
+        &mut self,
+        unit: usize,
+        mapper: &mut impl Mapper<Size2MiB>,
+        frame_allocator: &mut BootInfoFrameAllocator,
+        flags: PageTableFlags,
+    ) -> bool {
+        let Some(frame) =
+            <BootInfoFrameAllocator as FrameAllocator<Size2MiB>>::allocate_frame(frame_allocator)
+        else {
+            return false;
+        };
+
+        let phys = frame.start_address();
+        let page =
+            Page::<Size2MiB>::containing_address(VirtAddr::new(Self::unit_addr(unit) as u64));
+        let mapped = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
+
+        if mapped.is_err() {
+            frame_allocator.deallocate_frame(frame);
+            return false;
+        }
+
+        self.frames[unit] = phys.as_u64() as usize;
+        true
+    }
+
+    unsafe fn replace_unit_mapping(&mut self, unit: usize, phys: PhysAddr) -> bool {
+        if self.frames[unit] != 0 {
+            unsafe {
+                unmap_range_keep_frames_unchecked(
+                    VirtAddr::new(Self::unit_addr(unit) as u64),
+                    RAW_LARGE_UNIT_SIZE as u64,
+                );
+            }
+
+            let boot_info = boot_info();
+            let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+            frame_allocator.deallocate_frame(PhysFrame::<Size2MiB>::containing_address(
+                PhysAddr::new(self.frames[unit] as u64),
+            ));
+            self.frames[unit] = 0;
+        }
+
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        if unsafe {
+            map_kernel_2mib_frame(
+                VirtAddr::new(Self::unit_addr(unit) as u64),
+                phys,
+                flags,
+                false,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+
+        self.frames[unit] = phys.as_u64() as usize;
+        true
+    }
+}
+
+fn raw_large_alloc_enabled(size: usize, align: usize) -> bool {
+    size >= RAW_LARGE_THRESHOLD && align <= RAW_LARGE_UNIT_SIZE
+}
+
+fn ptr_is_raw_large(ptr: *mut u8) -> bool {
+    RawLargeAllocator::contains_addr(ptr as usize)
+}
+
 unsafe extern "C" {
     fn mi_register_output(
         cb: extern "C" fn(msg: *const core::ffi::c_char, arg: *mut c_void),
@@ -517,7 +1060,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
         let start_addr = x86_64::VirtAddr::new(run_addr as u64);
 
         let res = without_interrupts(|| {
-            crate::memory::paging::paging::map_kernel_range(
+            crate::memory::paging::paging::map_fresh_kernel_range_no_flush(
                 start_addr,
                 run_size as u64,
                 flags,

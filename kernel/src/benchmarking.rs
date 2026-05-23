@@ -48,7 +48,7 @@ use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-pub const BENCH_ENABLED: bool = true;
+pub const BENCH_ENABLED: bool = false;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -2628,11 +2628,11 @@ pub fn used_memory() -> usize {
     #[cfg(feature = "allocator-mimalloc")]
     {
         let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
-            + crate::memory::heap::MIMALLOC_META_HEAP_SIZE as usize;
-        let used_meta = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+            + crate::memory::heap::MIMALLOC_OS_HEAP_SIZE as usize;
+        let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
         let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
             .load(core::sync::atomic::Ordering::Relaxed);
-        used_meta + used_arena
+        used_non_arena + used_arena
     }
     #[cfg(feature = "allocator-buddy")]
     {
