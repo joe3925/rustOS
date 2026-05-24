@@ -506,6 +506,20 @@ impl JoinableSlot {
         let size = core::mem::size_of::<F>();
         let align = core::mem::align_of::<F>();
 
+        let result_size = core::mem::size_of::<T>();
+        let result_align = core::mem::align_of::<T>();
+        // TODO: temp fix because the result is written to a fixed size buffer
+        if result_size > JOINABLE_STORAGE_SIZE || result_align > INLINE_FUTURE_ALIGN {
+            panic!(
+                "Joinable task result type {} (size {}, align {}) exceeds slab limits (max size {}, max align {})",
+                core::any::type_name::<T>(),
+                result_size,
+                result_align,
+                JOINABLE_STORAGE_SIZE,
+                INLINE_FUTURE_ALIGN
+            );
+        }
+
         let buf_ptr = (*self.buffer.get()).as_mut_ptr();
 
         if size <= JOINABLE_STORAGE_SIZE && align <= INLINE_FUTURE_ALIGN {

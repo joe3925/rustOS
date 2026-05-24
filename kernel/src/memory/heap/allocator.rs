@@ -15,6 +15,7 @@ use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use spin::Mutex;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "allocator-mimalloc")] {
@@ -183,46 +184,42 @@ cfg_if::cfg_if! {
 
 struct ParallelCtx {
     gate: Arc<AtomicBool>,
+    worker_index: usize,
     element_count_per_thread: usize,
     finished: Arc<AtomicUsize>,
     push_total_ms: Arc<AtomicUsize>,
     push_max_ms: Arc<AtomicUsize>,
-    verify_total_ms: Arc<AtomicUsize>,
-    verify_max_ms: Arc<AtomicUsize>,
+    worker_vecs: Arc<Mutex<Vec<Option<Vec<u64>>>>>,
 }
 
 extern "win64" fn parallel_worker(ctx: usize) {
     let ctx = unsafe { Box::from_raw(ctx as *mut ParallelCtx) };
+
     while !ctx.gate.load(Ordering::Acquire) {
         yield_now();
     }
 
-    {
-        let mut vec: Vec<u64> = Vec::with_capacity(1);
-        let push_sw = Stopwatch::start();
-        for i in 0..ctx.element_count_per_thread {
-            vec.push(i as u64);
-        }
-        let push_ms = push_sw.elapsed_millis() as usize;
-        ctx.push_total_ms.fetch_add(push_ms, Ordering::Relaxed);
-        atomic_max(&ctx.push_max_ms, push_ms);
+    let mut vec: Vec<u64> = Vec::with_capacity(1);
 
-        let verify_sw = Stopwatch::start();
-        for i in 0..ctx.element_count_per_thread {
-            if i != vec[i] as usize {
-                println!("Heap data verification failed at index {}", i);
-            }
-        }
-        let verify_ms = verify_sw.elapsed_millis() as usize;
-        ctx.verify_total_ms.fetch_add(verify_ms, Ordering::Relaxed);
-        atomic_max(&ctx.verify_max_ms, verify_ms);
+    let push_sw = Stopwatch::start();
+    for i in 0..ctx.element_count_per_thread {
+        vec.push(i as u64);
+    }
+
+    let push_ms = push_sw.elapsed_millis() as usize;
+    ctx.push_total_ms.fetch_add(push_ms, Ordering::Relaxed);
+    atomic_max(&ctx.push_max_ms, push_ms);
+
+    {
+        let mut worker_vecs = ctx.worker_vecs.lock();
+        worker_vecs[ctx.worker_index] = Some(vec);
     }
 
     ctx.finished.fetch_add(1, Ordering::Release);
 }
 
 pub fn test_full_heap_parallel() {
-    let threads_to_test = [2, 4, 16];
+    let threads_to_test = [1, 2, 4, 16];
 
     for &num_threads in &threads_to_test {
         let element_count_per_thread = ((HEAP_SIZE as usize / 4) / size_of::<u64>()) / num_threads;
@@ -231,19 +228,22 @@ pub fn test_full_heap_parallel() {
         let finished = Arc::new(AtomicUsize::new(0));
         let push_total_ms = Arc::new(AtomicUsize::new(0));
         let push_max_ms = Arc::new(AtomicUsize::new(0));
-        let verify_total_ms = Arc::new(AtomicUsize::new(0));
-        let verify_max_ms = Arc::new(AtomicUsize::new(0));
+
+        let mut worker_vec_slots = Vec::with_capacity(num_threads);
+        worker_vec_slots.resize_with(num_threads, || None);
+        let worker_vecs = Arc::new(Mutex::new(worker_vec_slots));
+
         let mut tasks = Vec::with_capacity(num_threads);
 
         for i in 0..num_threads {
             let ctx = Box::new(ParallelCtx {
                 gate: gate.clone(),
+                worker_index: i,
                 element_count_per_thread,
                 finished: finished.clone(),
                 push_total_ms: push_total_ms.clone(),
                 push_max_ms: push_max_ms.clone(),
-                verify_total_ms: verify_total_ms.clone(),
-                verify_max_ms: verify_max_ms.clone(),
+                worker_vecs: worker_vecs.clone(),
             });
 
             let name = format!("heap_test_worker_{}", i);
@@ -254,17 +254,59 @@ pub fn test_full_heap_parallel() {
                 name,
                 0,
             );
+
             tasks.push(task.clone());
             SCHEDULER.add_task(task);
         }
 
         reset_parallel_heap_test_stats();
+
         let sw = Stopwatch::start();
         gate.store(true, Ordering::Release);
 
         while finished.load(Ordering::Acquire) < num_threads {
             yield_now();
         }
+
+        let verify_sw = Stopwatch::start();
+
+        {
+            let mut worker_vecs = worker_vecs.lock();
+
+            for worker_index in 0..num_threads {
+                let vec = match worker_vecs[worker_index].take() {
+                    Some(vec) => vec,
+                    None => {
+                        println!(
+                            "Heap data verification missing vector for worker {}",
+                            worker_index
+                        );
+                        continue;
+                    }
+                };
+
+                if vec.len() != element_count_per_thread {
+                    println!(
+                        "Heap data verification length mismatch for worker {}: got {}, expected {}",
+                        worker_index,
+                        vec.len(),
+                        element_count_per_thread
+                    );
+                    continue;
+                }
+
+                for i in 0..element_count_per_thread {
+                    if i != vec[i] as usize {
+                        println!(
+                            "Heap data verification failed for worker {} at index {}",
+                            worker_index, i
+                        );
+                    }
+                }
+            }
+        }
+
+        let verify_ms = verify_sw.elapsed_millis() as usize;
 
         while tasks.iter().any(|task| !task.is_terminated()) {
             yield_now();
@@ -275,8 +317,7 @@ pub fn test_full_heap_parallel() {
             sw.elapsed().as_millis(),
             push_max_ms.load(Ordering::Relaxed),
             push_total_ms.load(Ordering::Relaxed),
-            verify_max_ms.load(Ordering::Relaxed),
-            verify_total_ms.load(Ordering::Relaxed),
+            verify_ms,
         );
     }
 }
@@ -293,8 +334,7 @@ cfg_if::cfg_if! {
             elapsed_ms: u128,
             push_max_ms: usize,
             push_total_ms: usize,
-            verify_max_ms: usize,
-            verify_total_ms: usize,
+            verify_ms: usize,
         ) {
             let commit_stats = crate::memory::heap::mimalloc::mimalloc_commit_stats();
             let alloc_stats = crate::memory::heap::mimalloc::mimalloc_alloc_stats();
@@ -302,14 +342,14 @@ cfg_if::cfg_if! {
             let alloc_ms = Stopwatch::from_cycles(alloc_stats.alloc_cycles).as_millis();
             let realloc_ms = Stopwatch::from_cycles(alloc_stats.realloc_cycles).as_millis();
             let dealloc_ms = Stopwatch::from_cycles(alloc_stats.dealloc_cycles).as_millis();
+
             println!(
-                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify max/sum {} / {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
+                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify main {} ms, commits calls/maps {} / {}, req/map {} / {} MiB, commit {} ms, alloc/realloc/free calls {} / {} / {}, MiB {} / {} / {}, ms {} / {} / {})",
                 num_threads,
                 elapsed_ms,
                 push_max_ms,
                 push_total_ms,
-                verify_max_ms,
-                verify_total_ms,
+                verify_ms,
                 commit_stats.calls,
                 commit_stats.map_calls,
                 commit_stats.requested / (1024 * 1024),
@@ -334,22 +374,19 @@ cfg_if::cfg_if! {
             elapsed_ms: u128,
             push_max_ms: usize,
             push_total_ms: usize,
-            verify_max_ms: usize,
-            verify_total_ms: usize,
+            verify_ms: usize,
         ) {
             println!(
-                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify max/sum {} / {} ms)",
+                "Heap test parallel ({} threads) passed: took {} ms (push max/sum {} / {} ms, verify main {} ms)",
                 num_threads,
                 elapsed_ms,
                 push_max_ms,
                 push_total_ms,
-                verify_max_ms,
-                verify_total_ms,
+                verify_ms,
             );
         }
     }
 }
-
 fn atomic_max(target: &AtomicUsize, value: usize) {
     let mut current = target.load(Ordering::Relaxed);
     while value > current {

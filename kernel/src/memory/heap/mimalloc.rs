@@ -794,7 +794,10 @@ impl RawLargeAllocator {
             VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
         let mut mapper = init_mapper(phys_mem_offset);
         let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::HUGE_PAGE
+            | PageTableFlags::NO_EXECUTE;
 
         let end = start + units;
         let mut unit = start;
@@ -923,7 +926,7 @@ impl RawLargeAllocator {
             self.frames[unit] = 0;
         }
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
         if unsafe {
             map_kernel_2mib_frame(
                 VirtAddr::new(Self::unit_addr(unit) as u64),
@@ -1031,7 +1034,8 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
     }
 
     let flags = x86_64::structures::paging::PageTableFlags::PRESENT
-        | x86_64::structures::paging::PageTableFlags::WRITABLE;
+        | x86_64::structures::paging::PageTableFlags::WRITABLE
+        | x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
 
     let commit_start =
         align_down_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(MIMALLOC_COMMIT_TRACK_START);

@@ -12,7 +12,7 @@ use core::task::Waker;
 use spin::Mutex;
 use spin::Once;
 
-// This is here as a temp fix, needs to spin as the drivers can't use tls
+// TODO: This is here as a temp fix, needs to spin as the drivers can't use tls
 
 #[repr(C)]
 struct Node<T> {

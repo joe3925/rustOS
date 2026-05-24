@@ -6,8 +6,8 @@ use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns, calibrate_tsc, current_cpu_id,
-    get_current_logical_id, init_percpu_gs, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind,
-    LocalApic,
+    current_is_in_interrupt_atomic, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
+    ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -275,6 +275,10 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
     };
     if is_owner {
         println!("=== KERNEL PANIC [{}] ===", mod_name);
+        println!(
+            "is in interrupt: {:#?}",
+            current_is_in_interrupt_atomic().load(Ordering::Relaxed)
+        );
         println!("{}", info);
 
         // let dump = dump_scheduler();

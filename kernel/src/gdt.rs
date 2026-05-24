@@ -1,4 +1,5 @@
 use crate::benchmarking::BENCH_ENABLED;
+use crate::println;
 use core::{mem, ptr};
 
 use lazy_static::lazy_static;
@@ -60,25 +61,28 @@ impl GDTTracker {
 
         // This needs to be done because interrupt stacks aren't allowed to grow and the bench submit puts a bunch on the stack to prevent alloc in interrupts.
         // TODO: consider allowing interrupt stacks to grow or reducing bench submits footprint.
-        let timer_stack = if (BENCH_ENABLED) {
-            allocate_kernel_stack(StackSize::Huge2M).expect("Failed to alloc timer stack")
+        let timer_stack_size = if BENCH_ENABLED {
+            StackSize::Huge2M
         } else {
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack")
+            StackSize::Medium
         };
+        let timer_stack =
+            allocate_kernel_stack(timer_stack_size).expect("Failed to alloc timer stack");
+
         let yield_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc yield stack");
 
         let sched_ipi_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc timer stack");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc sched ipi stack");
 
         let privilege_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack ");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc privilege stack");
 
         let double_fault_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack ");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc double fault stack");
 
         let page_stack =
-            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack ");
+            allocate_kernel_stack(StackSize::Medium).expect("Failed to alloc page fault stack");
 
         tss_static.interrupt_stack_table[TIMER_IST_INDEX as usize] = timer_stack;
         tss_static.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = double_fault_stack;
