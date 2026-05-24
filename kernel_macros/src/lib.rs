@@ -1047,6 +1047,13 @@ fn validate_exception_handler(func: &ItemFn) -> syn::Result<()> {
         ));
     }
 
+    if let Some(abi) = &sig.abi {
+        return Err(syn::Error::new_spanned(
+            abi,
+            "#[exception_handler] applies the ABI automatically; remove the explicit 'extern' declaration",
+        ));
+    }
+
     if let Some(variadic) = &sig.variadic {
         return Err(syn::Error::new_spanned(
             variadic,
@@ -1058,7 +1065,7 @@ fn validate_exception_handler(func: &ItemFn) -> syn::Result<()> {
     if param_count != 1 && param_count != 2 {
         return Err(syn::Error::new_spanned(
             &sig.inputs,
-            "#[exception_handler] expects either (InterruptStackFrame) or (InterruptStackFrame, error_code)",
+            "#[exception_handler] expects either (State) or (State, error_code)",
         ));
     }
 
@@ -1071,24 +1078,24 @@ fn validate_exception_handler(func: &ItemFn) -> syn::Result<()> {
         }
     }
 
-    let Some(FnArg::Typed(frame_arg)) = sig.inputs.first() else {
+    let Some(FnArg::Typed(state_arg)) = sig.inputs.first() else {
         return Err(syn::Error::new_spanned(
             &sig.inputs,
-            "#[exception_handler] expects an InterruptStackFrame parameter",
+            "#[exception_handler] expects a State parameter",
         ));
     };
 
-    if !matches!(*frame_arg.pat, Pat::Ident(_)) {
+    if !matches!(*state_arg.pat, Pat::Ident(_)) {
         return Err(syn::Error::new_spanned(
-            &frame_arg.pat,
+            &state_arg.pat,
             "#[exception_handler] parameters must be simple identifiers",
         ));
     }
 
-    if !type_is_interrupt_stack_frame(&frame_arg.ty) {
+    if !type_is_exception_state(&state_arg.ty) {
         return Err(syn::Error::new_spanned(
-            &frame_arg.ty,
-            "#[exception_handler] first parameter must be InterruptStackFrame, &InterruptStackFrame, or &mut InterruptStackFrame",
+            &state_arg.ty,
+            "#[exception_handler] first parameter must be State, &State, or &mut State",
         ));
     }
 
@@ -1141,43 +1148,81 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
         })
         .cloned()
         .collect();
+
     let vis = &func.vis;
     let wrapper_ident = func.sig.ident.clone();
     let inner_ident = format_ident!("__exception_handler_impl_{}", wrapper_ident);
     let has_error_code = func.sig.inputs.len() == 2;
 
-    normalize_exception_frame_param(&mut func.sig);
+    normalize_exception_state_param(&mut func.sig);
     func.sig.ident = inner_ident.clone();
     func.sig.abi = Some(syn::parse_quote!(extern "win64"));
 
     let inner_sig = &func.sig;
     let body = &func.block;
+
     let wrapper = if has_error_code {
         quote! {
             #[unsafe(naked)]
             #vis extern "win64" fn #wrapper_ident() {
                 ::core::arch::naked_asm!(
                     "cli",
-                    "push r15", "push r14", "push r13", "push r12",
-                    "push r11", "push r10", "push r9", "push r8",
-                    "push rdi", "push rsi", "push rbp", "push rbx",
-                    "push rdx", "push rcx", "push rax",
-                    "lea  rcx, [rsp + {frame_offset}]",
-                    "mov  rdx, [rsp + {error_code_offset}]",
+
+                    "push r15",
+                    "push r14",
+                    "push r13",
+                    "push r12",
+                    "push r11",
+                    "push r10",
+                    "push r9",
+                    "push r8",
+                    "push rdi",
+                    "push rsi",
+                    "push rbp",
+                    "push rbx",
+                    "push rdx",
+                    "push rcx",
+                    "push rax",
+
+                    "mov  rdx, [rsp + 120]",
+
+                    "mov  rax, [rsp + 128]",
+                    "mov  [rsp + 120], rax",
+                    "mov  rax, [rsp + 136]",
+                    "mov  [rsp + 128], rax",
+                    "mov  rax, [rsp + 144]",
+                    "mov  [rsp + 136], rax",
+                    "mov  rax, [rsp + 152]",
+                    "mov  [rsp + 144], rax",
+                    "mov  rax, [rsp + 160]",
+                    "mov  [rsp + 152], rax",
+
+                    "mov  rcx, rsp",
                     "mov  rbx, rsp",
                     "cld",
                     "and  rsp, -16",
                     "sub  rsp, 32",
                     "call {handler}",
                     "mov  rsp, rbx",
-                    "pop  rax", "pop  rcx", "pop  rdx", "pop  rbx",
-                    "pop  rbp", "pop  rsi", "pop  rdi", "pop  r8",
-                    "pop  r9", "pop  r10", "pop  r11", "pop  r12",
-                    "pop  r13", "pop  r14", "pop  r15",
-                    "add  rsp, 8",
+
+                    "pop  rax",
+                    "pop  rcx",
+                    "pop  rdx",
+                    "pop  rbx",
+                    "pop  rbp",
+                    "pop  rsi",
+                    "pop  rdi",
+                    "pop  r8",
+                    "pop  r9",
+                    "pop  r10",
+                    "pop  r11",
+                    "pop  r12",
+                    "pop  r13",
+                    "pop  r14",
+                    "pop  r15",
+
                     "iretq",
-                    frame_offset = const 128,
-                    error_code_offset = const 120,
+
                     handler = sym #inner_ident,
                 );
             }
@@ -1188,23 +1233,49 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
             #vis extern "win64" fn #wrapper_ident() {
                 ::core::arch::naked_asm!(
                     "cli",
-                    "push r15", "push r14", "push r13", "push r12",
-                    "push r11", "push r10", "push r9", "push r8",
-                    "push rdi", "push rsi", "push rbp", "push rbx",
-                    "push rdx", "push rcx", "push rax",
-                    "lea  rcx, [rsp + {frame_offset}]",
+
+                    "push r15",
+                    "push r14",
+                    "push r13",
+                    "push r12",
+                    "push r11",
+                    "push r10",
+                    "push r9",
+                    "push r8",
+                    "push rdi",
+                    "push rsi",
+                    "push rbp",
+                    "push rbx",
+                    "push rdx",
+                    "push rcx",
+                    "push rax",
+
+                    "mov  rcx, rsp",
                     "mov  rbx, rsp",
                     "cld",
                     "and  rsp, -16",
                     "sub  rsp, 32",
                     "call {handler}",
                     "mov  rsp, rbx",
-                    "pop  rax", "pop  rcx", "pop  rdx", "pop  rbx",
-                    "pop  rbp", "pop  rsi", "pop  rdi", "pop  r8",
-                    "pop  r9", "pop  r10", "pop  r11", "pop  r12",
-                    "pop  r13", "pop  r14", "pop  r15",
+
+                    "pop  rax",
+                    "pop  rcx",
+                    "pop  rdx",
+                    "pop  rbx",
+                    "pop  rbp",
+                    "pop  rsi",
+                    "pop  rdi",
+                    "pop  r8",
+                    "pop  r9",
+                    "pop  r10",
+                    "pop  r11",
+                    "pop  r12",
+                    "pop  r13",
+                    "pop  r14",
+                    "pop  r15",
+
                     "iretq",
-                    frame_offset = const 120,
+
                     handler = sym #inner_ident,
                 );
             }
@@ -1220,30 +1291,30 @@ fn transform_exception_handler(func: &mut ItemFn) -> TokenStream2 {
     }
 }
 
-fn normalize_exception_frame_param(sig: &mut syn::Signature) {
-    let Some(FnArg::Typed(frame_arg)) = sig.inputs.iter_mut().next() else {
+fn normalize_exception_state_param(sig: &mut syn::Signature) {
+    let Some(FnArg::Typed(state_arg)) = sig.inputs.iter_mut().next() else {
         return;
     };
 
-    if matches!(&*frame_arg.ty, Type::Reference(_)) {
+    if matches!(&*state_arg.ty, Type::Reference(_)) {
         return;
     }
 
-    let frame_ty = frame_arg.ty.clone();
-    frame_arg.ty = Box::new(syn::parse_quote!(&mut #frame_ty));
+    let state_ty = state_arg.ty.clone();
+    state_arg.ty = Box::new(syn::parse_quote!(&mut #state_ty));
 }
 
-fn type_is_interrupt_stack_frame(ty: &Type) -> bool {
+fn type_is_exception_state(ty: &Type) -> bool {
     match ty {
-        Type::Reference(r) => type_is_interrupt_stack_frame(&r.elem),
+        Type::Reference(r) => type_is_exception_state(&r.elem),
         Type::Path(p) => p
             .path
             .segments
             .last()
-            .map(|s| s.ident == "InterruptStackFrame")
+            .map(|s| s.ident == "State")
             .unwrap_or(false),
-        Type::Paren(p) => type_is_interrupt_stack_frame(&p.elem),
-        Type::Group(g) => type_is_interrupt_stack_frame(&g.elem),
+        Type::Paren(p) => type_is_exception_state(&p.elem),
+        Type::Group(g) => type_is_exception_state(&g.elem),
         _ => false,
     }
 }

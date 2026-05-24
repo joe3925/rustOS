@@ -1,5 +1,8 @@
 use core::arch::asm;
-
+use x86_64::registers::rflags::RFlags;
+use x86_64::structures::gdt::SegmentSelector;
+use x86_64::structures::idt::InterruptStackFrame;
+use x86_64::VirtAddr;
 /// Scheduling state for a task - stored atomically outside the Task RwLock
 /// to allow lock-free checks in the scheduler hot path.
 #[repr(u8)]
@@ -248,5 +251,14 @@ impl State {
     pub unsafe extern "C" fn restore(&self, state: *mut State) {
         core::ptr::write(state, *self);
     }
+    #[inline(always)]
+    pub fn into_interrupt_stack_frame(self) -> InterruptStackFrame {
+        InterruptStackFrame::new(
+            VirtAddr::new(self.rip),
+            SegmentSelector(self.cs as u16),
+            RFlags::from_bits_truncate(self.rflags),
+            VirtAddr::new(self.rsp),
+            SegmentSelector(self.ss as u16),
+        )
+    }
 }
-fn function() {}
