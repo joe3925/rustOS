@@ -549,7 +549,7 @@ impl IrqManager {
     }
 
     fn dispatch(&self, vector: u8, frame: &mut InterruptStackFrame) {
-        InterruptGuard::new();
+        let guard = InterruptGuard::new();
         let cpu = current_cpu_id() as u32;
         let slot = &self.vectors[vector as usize];
         let regs = slot.regs.read();

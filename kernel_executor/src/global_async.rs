@@ -6,9 +6,10 @@ use spin::Once;
 pub type Trampoline = extern "win64" fn(usize);
 
 #[derive(Clone, Copy)]
-struct WorkItem {
-    trampoline: Trampoline,
-    ctx: usize,
+#[repr(C)]
+pub struct WorkItem {
+    pub trampoline: Trampoline,
+    pub ctx: usize,
 }
 
 const MAX_SHARDS: usize = 8;
@@ -139,6 +140,15 @@ impl GlobalAsyncExecutor {
         if !self.try_enter_pump() {
             return;
         }
+        #[inline]
+        fn addr_prefix_byte(addr: usize) -> u8 {
+            ((addr >> 40) & 0xff) as u8
+        }
+
+        #[inline]
+        fn is_heap_addr(addr: usize) -> bool {
+            addr_prefix_byte(addr) == 0x86
+        }
 
         let shard_count = self.queues.shard_count();
         let mut cursor = start_hint % shard_count;
@@ -146,6 +156,9 @@ impl GlobalAsyncExecutor {
         loop {
             let item = match self.queues.pop_round_robin(cursor) {
                 Some((x, idx)) => {
+                    if is_heap_addr(x.trampoline as usize) {
+                        panic!("corrupted work item ctx: {:#X}", x.ctx);
+                    }
                     cursor = (idx + 1) % shard_count;
                     x
                 }

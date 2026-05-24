@@ -38,7 +38,7 @@ pub extern "win64" fn timer_interrupt_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    InterruptGuard::new();
+    let guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     TIMER.fetch_add(1, Ordering::Relaxed);
     let cpu_id = current_cpu_id();

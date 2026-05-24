@@ -897,7 +897,7 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    InterruptGuard::new();
+    let guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_ipi(state, cpu_id);
@@ -908,7 +908,7 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    InterruptGuard::new();
+    let guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_timer_tick(state, cpu_id);
