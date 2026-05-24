@@ -183,28 +183,32 @@ impl IrqHandleOps for IrqHandleInner {
             return 0;
         }
 
-        let waiters = {
-            let mut st = self.state.lock();
-            st.last_meta = meta;
+        let mut woken = 0;
 
-            let mut drained = Vec::with_capacity(n.min(st.waiters.len()));
-            for _ in 0..n {
-                let Some(waiter) = st.pop_waiter() else { break };
-                waiter.enqueued.store(false, Ordering::Release);
-                drained.push(waiter);
-            }
+        while woken < n {
+            let waiter_opt = {
+                let mut st = self.state.lock();
+                st.last_meta = meta;
 
-            if drained.len() < n {
-                st.pending_signals = st.pending_signals.saturating_add(n - drained.len());
-            }
+                match st.pop_waiter() {
+                    Some(waiter) => {
+                        waiter.enqueued.store(false, Ordering::Release);
+                        Some(waiter)
+                    }
+                    None => {
+                        st.pending_signals = st.pending_signals.saturating_add(n - woken);
+                        None
+                    }
+                }
+            };
 
-            drained
-        };
+            let Some(waiter) = waiter_opt else {
+                break;
+            };
 
-        let woken = waiters.len();
-        for waiter in waiters.iter() {
             waiter.store_result(IrqWaitResult::ok_n(meta, 1));
             waiter.wake();
+            woken += 1;
         }
 
         woken
