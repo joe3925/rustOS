@@ -2,7 +2,7 @@ use alloc::string::String;
 use bincode::{Decode, Encode};
 use core::convert::Infallible;
 use core::fmt;
-use core::ops::{ControlFlow, FromResidual, Try};
+use core::ops::{ControlFlow, FromResidual, Residual, Try};
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{Size1GiB, Size2MiB, Size4KiB};
 
@@ -106,6 +106,10 @@ impl Try for DriverStatus {
             ControlFlow::Break(self)
         }
     }
+}
+
+impl Residual<()> for DriverStatus {
+    type TryType = DriverStatus;
 }
 
 impl From<i32> for DriverStatus {
