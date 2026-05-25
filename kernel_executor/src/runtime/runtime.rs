@@ -265,302 +265,161 @@ where
     }
 }
 
-// enum FutureSlot<F: Future> {
-//     Running(F),
-//     Done(Option<F::Output>),
-// }
-
-// struct JoinAllShared {
-//     parent: Mutex<Option<Waker>>,
-//     ready_queue: SegQueue<usize>,
-//     ready_count: AtomicUsize,
-//     polling: AtomicBool,
-// }
-
-// impl JoinAllShared {
-//     fn new() -> Arc<Self> {
-//         Arc::new(Self {
-//             parent: Mutex::new(None),
-//             ready_queue: SegQueue::new(),
-//             ready_count: AtomicUsize::new(0),
-//             polling: AtomicBool::new(false),
-//         })
-//     }
-
-//     fn register_parent(&self, waker: &Waker) {
-//         let mut guard = self.parent.lock();
-
-//         if guard.as_ref().is_none_or(|old| !old.will_wake(waker)) {
-//             *guard = Some(waker.clone());
-//         }
-//     }
-
-//     fn wake_parent(&self) {
-//         if self.polling.load(Ordering::Acquire) {
-//             return;
-//         }
-
-//         let guard = self.parent.lock();
-
-//         if let Some(w) = guard.as_ref() {
-//             w.wake_by_ref();
-//         }
-//     }
-
-//     fn push_ready(&self, index: usize) {
-//         self.ready_queue.push(index);
-//         self.ready_count.fetch_add(1, Ordering::Release);
-//         self.wake_parent();
-//     }
-
-//     fn pop_ready(&self) -> Option<usize> {
-//         let index = self.ready_queue.pop()?;
-//         self.ready_count.fetch_sub(1, Ordering::AcqRel);
-//         Some(index)
-//     }
-
-//     fn has_ready(&self) -> bool {
-//         self.ready_count.load(Ordering::Acquire) != 0
-//     }
-// }
-
-// struct JoinAllChildWake {
-//     shared: Arc<JoinAllShared>,
-//     index: usize,
-//     queued: AtomicBool,
-// }
-
-// impl JoinAllChildWake {
-//     fn new(shared: Arc<JoinAllShared>, index: usize) -> Arc<Self> {
-//         Arc::new(Self {
-//             shared,
-//             index,
-//             queued: AtomicBool::new(false),
-//         })
-//     }
-
-//     fn queue(&self) {
-//         if !self.queued.swap(true, Ordering::AcqRel) {
-//             self.shared.push_ready(self.index);
-//         }
-//     }
-
-//     fn make_waker(self: &Arc<Self>) -> Waker {
-//         unsafe {
-//             Waker::from_raw(RawWaker::new(
-//                 Arc::into_raw(self.clone()) as *const (),
-//                 &JOIN_ALL_CHILD_WAKER_VTABLE,
-//             ))
-//         }
-//     }
-// }
-
-// unsafe fn join_all_child_waker_clone(ptr: *const ()) -> RawWaker {
-//     let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
-//     let cloned = Arc::clone(&arc);
-
-//     RawWaker::new(
-//         Arc::into_raw(cloned) as *const (),
-//         &JOIN_ALL_CHILD_WAKER_VTABLE,
-//     )
-// }
-
-// unsafe fn join_all_child_waker_wake(ptr: *const ()) {
-//     let arc = unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) };
-//     arc.queue();
-// }
-
-// unsafe fn join_all_child_waker_wake_by_ref(ptr: *const ()) {
-//     let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
-//     arc.queue();
-// }
-
-// unsafe fn join_all_child_waker_drop(ptr: *const ()) {
-//     drop(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
-// }
-
-// static JOIN_ALL_CHILD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-//     join_all_child_waker_clone,
-//     join_all_child_waker_wake,
-//     join_all_child_waker_wake_by_ref,
-//     join_all_child_waker_drop,
-// );
-
-// struct JoinAllSlot<F: Future> {
-//     state: FutureSlot<F>,
-//     wake: Arc<JoinAllChildWake>,
-// }
-
-// pub struct JoinAll<F: Future> {
-//     slots: Vec<JoinAllSlot<F>>,
-//     remaining: usize,
-//     shared: Arc<JoinAllShared>,
-// }
-
-// impl<F: Future> JoinAll<F> {
-//     pub fn new(fs: Vec<F>) -> Self {
-//         let shared = JoinAllShared::new();
-//         let remaining = fs.len();
-//         let mut slots = Vec::with_capacity(remaining);
-
-//         for (index, fut) in fs.into_iter().enumerate() {
-//             let wake = JoinAllChildWake::new(shared.clone(), index);
-
-//             wake.queued.store(true, Ordering::Release);
-//             shared.push_ready(index);
-
-//             slots.push(JoinAllSlot {
-//                 state: FutureSlot::Running(fut),
-//                 wake,
-//             });
-//         }
-
-//         Self {
-//             slots,
-//             remaining,
-//             shared,
-//         }
-//     }
-// }
-
-// impl<F: Future> Future for JoinAll<F> {
-//     type Output = Vec<F::Output>;
-
-//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-//         let this = unsafe { self.get_unchecked_mut() };
-
-//         if this.remaining == 0 {
-//             return Poll::Ready(join_all_take_output(&mut this.slots));
-//         }
-
-//         this.shared.register_parent(cx.waker());
-
-//         if this.shared.polling.swap(true, Ordering::AcqRel) {
-//             panic!("JoinAll polled concurrently");
-//         }
-
-//         let budget = this.slots.len().saturating_mul(4).max(256);
-//         let mut polls = 0usize;
-//         while polls < budget {
-//             let Some(index) = this.shared.pop_ready() else {
-//                 break;
-//             };
-
-//             if index < this.slots.len() && join_all_poll_one(this, index, true) {
-//                 polls += 1;
-//             }
-
-//             if this.remaining == 0 {
-//                 this.shared.polling.store(false, Ordering::Release);
-//                 return Poll::Ready(join_all_take_output(&mut this.slots));
-//             }
-//         }
-
-//         if this.remaining != 0 && !this.shared.has_ready() {
-//             let mut i = 0usize;
-
-//             while i < this.slots.len() && polls < budget {
-//                 if join_all_poll_one(this, i, false) {
-//                     polls += 1;
-//                 }
-
-//                 if this.remaining == 0 {
-//                     this.shared.polling.store(false, Ordering::Release);
-//                     return Poll::Ready(join_all_take_output(&mut this.slots));
-//                 }
-
-//                 i += 1;
-//             }
-//         }
-
-//         while polls < budget {
-//             let Some(index) = this.shared.pop_ready() else {
-//                 break;
-//             };
-
-//             if index < this.slots.len() && join_all_poll_one(this, index, true) {
-//                 polls += 1;
-//             }
-
-//             if this.remaining == 0 {
-//                 this.shared.polling.store(false, Ordering::Release);
-//                 return Poll::Ready(join_all_take_output(&mut this.slots));
-//             }
-//         }
-
-//         this.shared.polling.store(false, Ordering::Release);
-
-//         if this.remaining == 0 {
-//             Poll::Ready(join_all_take_output(&mut this.slots))
-//         } else {
-//             if this.shared.has_ready() || polls >= budget {
-//                 cx.waker().wake_by_ref();
-//             }
-
-//             Poll::Pending
-//         }
-//     }
-// }
-
-// fn join_all_poll_one<F: Future>(this: &mut JoinAll<F>, index: usize, require_queued: bool) -> bool {
-//     let slot = &mut this.slots[index];
-
-//     if require_queued && !slot.wake.queued.swap(false, Ordering::AcqRel) {
-//         return false;
-//     }
-
-//     if !require_queued {
-//         slot.wake.queued.store(false, Ordering::Release);
-//     }
-
-//     let FutureSlot::Running(fut) = &mut slot.state else {
-//         return false;
-//     };
-
-//     let waker = slot.wake.make_waker();
-//     let mut cx = Context::from_waker(&waker);
-//     let pinned = unsafe { Pin::new_unchecked(fut) };
-
-//     if let Poll::Ready(result) = pinned.poll(&mut cx) {
-//         slot.state = FutureSlot::Done(Some(result));
-//         this.remaining -= 1;
-//     }
-
-//     true
-// }
-
-// fn join_all_take_output<F: Future>(slots: &mut [JoinAllSlot<F>]) -> Vec<F::Output> {
-//     let mut out = Vec::with_capacity(slots.len());
-
-//     for slot in slots.iter_mut() {
-//         match &mut slot.state {
-//             FutureSlot::Done(result) => {
-//                 out.push(result.take().expect("result already taken"));
-//             }
-//             FutureSlot::Running(_) => {
-//                 panic!("JoinAll completed with running child");
-//             }
-//         }
-//     }
-
-//     out
-// }
 enum FutureSlot<F: Future> {
     Running(F),
     Done(Option<F::Output>),
 }
 
+struct JoinAllShared {
+    parent: Mutex<Option<Waker>>,
+    ready_queue: SegQueue<usize>,
+    ready_count: AtomicUsize,
+    polling: AtomicBool,
+}
+
+impl JoinAllShared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            parent: Mutex::new(None),
+            ready_queue: SegQueue::new(),
+            ready_count: AtomicUsize::new(0),
+            polling: AtomicBool::new(false),
+        })
+    }
+
+    fn register_parent(&self, waker: &Waker) {
+        let mut guard = self.parent.lock();
+
+        if guard.as_ref().is_none_or(|old| !old.will_wake(waker)) {
+            *guard = Some(waker.clone());
+        }
+    }
+
+    fn wake_parent(&self) {
+        if self.polling.load(Ordering::Acquire) {
+            return;
+        }
+
+        let guard = self.parent.lock();
+
+        if let Some(w) = guard.as_ref() {
+            w.wake_by_ref();
+        }
+    }
+
+    fn push_ready(&self, index: usize) {
+        self.ready_queue.push(index);
+        self.ready_count.fetch_add(1, Ordering::Release);
+        self.wake_parent();
+    }
+
+    fn pop_ready(&self) -> Option<usize> {
+        let index = self.ready_queue.pop()?;
+        self.ready_count.fetch_sub(1, Ordering::AcqRel);
+        Some(index)
+    }
+
+    fn has_ready(&self) -> bool {
+        self.ready_count.load(Ordering::Acquire) != 0
+    }
+}
+
+struct JoinAllChildWake {
+    shared: Arc<JoinAllShared>,
+    index: usize,
+    queued: AtomicBool,
+}
+
+impl JoinAllChildWake {
+    fn new(shared: Arc<JoinAllShared>, index: usize) -> Arc<Self> {
+        Arc::new(Self {
+            shared,
+            index,
+            queued: AtomicBool::new(false),
+        })
+    }
+
+    fn queue(&self) {
+        if !self.queued.swap(true, Ordering::AcqRel) {
+            self.shared.push_ready(self.index);
+        }
+    }
+
+    fn make_waker(self: &Arc<Self>) -> Waker {
+        unsafe {
+            Waker::from_raw(RawWaker::new(
+                Arc::into_raw(self.clone()) as *const (),
+                &JOIN_ALL_CHILD_WAKER_VTABLE,
+            ))
+        }
+    }
+}
+
+unsafe fn join_all_child_waker_clone(ptr: *const ()) -> RawWaker {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+    let cloned = Arc::clone(&arc);
+
+    RawWaker::new(
+        Arc::into_raw(cloned) as *const (),
+        &JOIN_ALL_CHILD_WAKER_VTABLE,
+    )
+}
+
+unsafe fn join_all_child_waker_wake(ptr: *const ()) {
+    let arc = unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) };
+    arc.queue();
+}
+
+unsafe fn join_all_child_waker_wake_by_ref(ptr: *const ()) {
+    let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+    arc.queue();
+}
+
+unsafe fn join_all_child_waker_drop(ptr: *const ()) {
+    drop(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+}
+
+static JOIN_ALL_CHILD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    join_all_child_waker_clone,
+    join_all_child_waker_wake,
+    join_all_child_waker_wake_by_ref,
+    join_all_child_waker_drop,
+);
+
+struct JoinAllSlot<F: Future> {
+    state: FutureSlot<F>,
+    wake: Arc<JoinAllChildWake>,
+}
+
 pub struct JoinAll<F: Future> {
-    slots: Vec<FutureSlot<F>>,
+    slots: Vec<JoinAllSlot<F>>,
     remaining: usize,
+    shared: Arc<JoinAllShared>,
 }
 
 impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
+        let shared = JoinAllShared::new();
         let remaining = fs.len();
-        let slots = fs.into_iter().map(FutureSlot::Running).collect();
+        let mut slots = Vec::with_capacity(remaining);
 
-        Self { slots, remaining }
+        for (index, fut) in fs.into_iter().enumerate() {
+            let wake = JoinAllChildWake::new(shared.clone(), index);
+
+            wake.queued.store(true, Ordering::Release);
+            shared.push_ready(index);
+
+            slots.push(JoinAllSlot {
+                state: FutureSlot::Running(fut),
+                wake,
+            });
+        }
+
+        Self {
+            slots,
+            remaining,
+            shared,
+        }
     }
 }
 
@@ -574,36 +433,107 @@ impl<F: Future> Future for JoinAll<F> {
             return Poll::Ready(join_all_take_output(&mut this.slots));
         }
 
-        let mut i = 0usize;
-        while i < this.slots.len() {
-            let slot = &mut this.slots[i];
+        this.shared.register_parent(cx.waker());
 
-            if let FutureSlot::Running(fut) = slot {
-                let pinned = unsafe { Pin::new_unchecked(fut) };
-
-                if let Poll::Ready(result) = pinned.poll(cx) {
-                    *slot = FutureSlot::Done(Some(result));
-                    this.remaining -= 1;
-
-                    if this.remaining == 0 {
-                        return Poll::Ready(join_all_take_output(&mut this.slots));
-                    }
-                }
-            }
-
-            i += 1;
+        if this.shared.polling.swap(true, Ordering::AcqRel) {
+            panic!("JoinAll polled concurrently");
         }
 
-        cx.waker().wake_by_ref();
-        Poll::Pending
+        let budget = this.slots.len().saturating_mul(4).max(256);
+        let mut polls = 0usize;
+        while polls < budget {
+            let Some(index) = this.shared.pop_ready() else {
+                break;
+            };
+
+            if index < this.slots.len() && join_all_poll_one(this, index, true) {
+                polls += 1;
+            }
+
+            if this.remaining == 0 {
+                this.shared.polling.store(false, Ordering::Release);
+                return Poll::Ready(join_all_take_output(&mut this.slots));
+            }
+        }
+
+        if this.remaining != 0 && !this.shared.has_ready() {
+            let mut i = 0usize;
+
+            while i < this.slots.len() && polls < budget {
+                if join_all_poll_one(this, i, false) {
+                    polls += 1;
+                }
+
+                if this.remaining == 0 {
+                    this.shared.polling.store(false, Ordering::Release);
+                    return Poll::Ready(join_all_take_output(&mut this.slots));
+                }
+
+                i += 1;
+            }
+        }
+
+        while polls < budget {
+            let Some(index) = this.shared.pop_ready() else {
+                break;
+            };
+
+            if index < this.slots.len() && join_all_poll_one(this, index, true) {
+                polls += 1;
+            }
+
+            if this.remaining == 0 {
+                this.shared.polling.store(false, Ordering::Release);
+                return Poll::Ready(join_all_take_output(&mut this.slots));
+            }
+        }
+
+        this.shared.polling.store(false, Ordering::Release);
+
+        if this.remaining == 0 {
+            Poll::Ready(join_all_take_output(&mut this.slots))
+        } else {
+            if this.shared.has_ready() || polls >= budget {
+                cx.waker().wake_by_ref();
+            }
+
+            Poll::Pending
+        }
     }
 }
 
-fn join_all_take_output<F: Future>(slots: &mut [FutureSlot<F>]) -> Vec<F::Output> {
+fn join_all_poll_one<F: Future>(this: &mut JoinAll<F>, index: usize, require_queued: bool) -> bool {
+    let slot = &mut this.slots[index];
+
+    if require_queued && !slot.wake.queued.swap(false, Ordering::AcqRel) {
+        return false;
+    }
+
+    if !require_queued {
+        slot.wake.queued.store(false, Ordering::Release);
+    }
+
+    let FutureSlot::Running(fut) = &mut slot.state else {
+        return false;
+    };
+
+    let waker = slot.wake.make_waker();
+    let mut cx = Context::from_waker(&waker);
+    let pinned = unsafe { Pin::new_unchecked(fut) };
+
+    if let Poll::Ready(result) = pinned.poll(&mut cx) {
+        slot.state = FutureSlot::Done(Some(result));
+        this.remaining -= 1;
+    }
+
+    true
+}
+
+fn join_all_take_output<F: Future>(slots: &mut [JoinAllSlot<F>]) -> Vec<F::Output> {
     let mut out = Vec::with_capacity(slots.len());
 
     for slot in slots.iter_mut() {
-        match slot {
+        match &mut slot.state {
             FutureSlot::Done(result) => {
                 out.push(result.take().expect("result already taken"));
             }

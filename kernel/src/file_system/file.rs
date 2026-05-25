@@ -428,10 +428,12 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
 
     spawn_detached(async move {
-        loop {
-            bench_c_drive_io_async().await;
-            test_full_heap_parallel();
-        }
+        bench_async_vs_sync_call_latency_async().await;
+        bench_runtime_executor_async().await;
+        // loop {
+        //     bench_c_drive_io_async().await;
+        //     test_full_heap_parallel();
+        // }
 
         //DRIVE_WINDOW.start();
         //loop {
