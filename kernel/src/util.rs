@@ -30,7 +30,7 @@ use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
+use crate::scheduling::scheduler::{task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;

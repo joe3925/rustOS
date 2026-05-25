@@ -10,6 +10,10 @@ use crate::platform::{ExecutorPlatform, Job};
 struct InlinePlatform;
 
 impl ExecutorPlatform for InlinePlatform {
+    fn init_runtime(&self, _max_threads: usize, _max_jobs: usize) {}
+
+    fn init_blocking(&self, _max_threads: usize) {}
+
     fn submit_runtime(&self, job: Job) {
         (job.f)(job.a);
     }

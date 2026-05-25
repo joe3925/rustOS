@@ -161,7 +161,7 @@ struct SchedulerState {
 
 pub struct Scheduler {
     all_tasks: TaskTable,
-    cores: RwLock<Vec<Arc<CoreScheduler>>>,
+    cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
     last_balance_tick: AtomicUsize,
@@ -176,7 +176,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             all_tasks: TaskTable::new(MAX_TASKS),
-            cores: RwLock::new(Vec::new()),
+            cores: IrqSafeRwLock::new(Vec::new()),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
             last_balance_tick: AtomicUsize::new(0),
@@ -1070,34 +1070,34 @@ pub struct SchedulerDump {
 /// - Interrupts must be disabled before calling (panic_common already does this).
 ///
 /// Does not allocate heap memory. Does not acquire any locks.
-pub fn dump_scheduler() -> SchedulerDump {
-    let mut dump = SchedulerDump {
-        num_cores: SCHEDULER.num_cores.load(Ordering::Acquire),
-        next_task_id: SCHEDULER.next_task_id.load(Ordering::Acquire),
-        last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
-        current_tasks: [const { None }; MAX_DUMP_CPUS],
-        run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
-        inbound_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
-        core_loads: [0usize; MAX_DUMP_CPUS],
-        lapic_ids: [0u8; MAX_DUMP_CPUS],
-    };
+// pub fn dump_scheduler() -> SchedulerDump {
+//     let mut dump = SchedulerDump {
+//         num_cores: SCHEDULER.num_cores.load(Ordering::Acquire),
+//         next_task_id: SCHEDULER.next_task_id.load(Ordering::Acquire),
+//         last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
+//         current_tasks: [const { None }; MAX_DUMP_CPUS],
+//         run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+//         inbound_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+//         core_loads: [0usize; MAX_DUMP_CPUS],
+//         lapic_ids: [0u8; MAX_DUMP_CPUS],
+//     };
 
-    // SAFETY: We bypass the RwLock on `cores` because:
-    //   1. Interrupts are disabled — no timer tick, no IPI.
-    //   2. The caller guarantees nothing else will touch the scheduler.
-    //   3. `cores` is only mutated at startup; it is effectively immutable here.
-    let cores: &Vec<Arc<CoreScheduler>> = unsafe { bypass_spin_rwlock(&SCHEDULER.cores) };
+//     // SAFETY: We bypass the RwLock on `cores` because:
+//     //   1. Interrupts are disabled — no timer tick, no IPI.
+//     //   2. The caller guarantees nothing else will touch the scheduler.
+//     //   3. `cores` is only mutated at startup; it is effectively immutable here.
+//     let cores: &Vec<Arc<CoreScheduler>> = unsafe { bypass_spin_rwlock(&SCHEDULER.cores) };
 
-    for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
-        dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
-        dump.run_queues[i] = drain_array_queue(&core.run_queue);
-        dump.inbound_queues[i] = drain_inbound_queue(&core.inbound_queue);
-        dump.core_loads[i] = core.load.load(Ordering::Acquire);
-        dump.lapic_ids[i] = core.lapic_id;
-    }
+//     for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
+//         dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
+//         dump.run_queues[i] = drain_array_queue(&core.run_queue);
+//         dump.inbound_queues[i] = drain_inbound_queue(&core.inbound_queue);
+//         dump.core_loads[i] = core.load.load(Ordering::Acquire);
+//         dump.lapic_ids[i] = core.lapic_id;
+//     }
 
-    dump
-}
+//     dump
+// }
 
 /// Bypass a `spin::RwLock<T>` without acquiring it.
 ///

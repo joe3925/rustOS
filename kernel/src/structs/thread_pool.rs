@@ -115,6 +115,7 @@ struct Shared {
     shutdown: AtomicBool,
     num_workers: AtomicUsize,
     total_workers: AtomicUsize,
+    work_amount_hint: AtomicUsize,
     block_on_enabled: bool,
 }
 
@@ -182,6 +183,7 @@ impl<Q: JobQueue> ThreadPoolImpl<Q> {
             total_workers: AtomicUsize::new(threads),
             shutdown: AtomicBool::new(false),
             num_workers: AtomicUsize::new(0),
+            work_amount_hint: AtomicUsize::new(0),
             block_on_enabled,
         });
 
@@ -220,17 +222,27 @@ impl<Q: JobQueue> ThreadPoolImpl<Q> {
             return Err(SubmitError::Shutdown);
         }
 
-        Q::send(
+        self.shared.work_amount_hint.fetch_add(1, Ordering::Relaxed);
+
+        let result = Q::send(
             &self.sender,
             Job {
                 f: function,
                 a: context,
             },
-        )
-        .map_err(|err| match err {
-            QueueSendError::Full => SubmitError::Full,
-            QueueSendError::Disconnected => SubmitError::Disconnected,
-        })
+        );
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.shared.work_amount_hint.fetch_sub(1, Ordering::Relaxed);
+
+                Err(match err {
+                    QueueSendError::Full => SubmitError::Full,
+                    QueueSendError::Disconnected => SubmitError::Disconnected,
+                })
+            }
+        }
     }
 
     pub fn submit_many(&self, jobs: &[Job]) -> usize {
@@ -242,12 +254,24 @@ impl<Q: JobQueue> ThreadPoolImpl<Q> {
             return 0;
         }
 
+        self.shared
+            .work_amount_hint
+            .fetch_add(jobs.len(), Ordering::Relaxed);
+
         let mut sent = 0usize;
 
         for &job in jobs {
             if Q::send(&self.sender, job).is_ok() {
                 sent += 1;
             }
+        }
+
+        let failed = jobs.len() - sent;
+
+        if failed != 0 {
+            self.shared
+                .work_amount_hint
+                .fetch_sub(failed, Ordering::Relaxed);
         }
 
         sent
@@ -265,6 +289,7 @@ impl<Q: JobQueue> ThreadPoolImpl<Q> {
     pub fn try_execute_one(&self) -> bool {
         match Q::try_recv(&self.receiver) {
             Ok(job) => {
+                self.shared.work_amount_hint.fetch_sub(1, Ordering::Relaxed);
                 (job.f)(job.a);
                 true
             }
@@ -286,6 +311,10 @@ impl<Q: JobQueue> ThreadPoolImpl<Q> {
 
     pub fn total_workers(&self) -> usize {
         self.shared.total_workers.load(Ordering::Acquire)
+    }
+
+    pub fn work_amount_hint(&self) -> usize {
+        self.shared.work_amount_hint.load(Ordering::Relaxed)
     }
 }
 
@@ -315,6 +344,8 @@ extern "win64" fn worker_entry<Q: JobQueue>(ctx: usize) {
             Ok(job) => job,
             Err(_) => break,
         };
+
+        shared.work_amount_hint.fetch_sub(1, Ordering::Relaxed);
 
         (job.f)(job.a);
     }
