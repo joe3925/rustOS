@@ -1,5 +1,4 @@
 use crate::runtime::task::TaskPoll;
-use alloc::boxed::Box;
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -7,7 +6,7 @@ use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crossbeam_queue::SegQueue;
@@ -104,8 +103,6 @@ where
     }
 }
 
-/// Spawns a future, preferring slab allocation before falling back to Arc.
-/// Returns a JoinHandle that can be awaited to get the result.
 pub fn spawn<F, T>(future: F) -> JoinHandle<T>
 where
     F: Future<Output = T> + Send + 'static,
@@ -134,8 +131,10 @@ where
     }
 
     slab.record_joinable_fallback();
+
     let task = Arc::new(JoinableTask::new(future));
     task.enqueue();
+
     JoinHandle {
         inner: JoinHandleInner::Arc(task),
     }
@@ -168,6 +167,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
                     Poll::Ready(result)
                 } else {
                     task.update_waker(cx.waker());
+
                     if let Some(result) = task.take_result() {
                         Poll::Ready(result)
                     } else {
@@ -187,6 +187,7 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
                 }
 
                 let slab = get_task_slab();
+
                 let Some(slot) =
                     slab.get_joinable_slot(*shard_idx as usize, *local_idx as usize, *generation)
                 else {
@@ -195,22 +196,27 @@ impl<T: Send + 'static> Future for JoinHandle<T> {
 
                 if slot.is_completed() {
                     let result = unsafe { slot.take_result::<T>() };
+
                     slab.decrement_joinable_ref(
                         *shard_idx as usize,
                         *local_idx as usize,
                         *generation,
                     );
+
                     *consumed = true;
                     Poll::Ready(result)
                 } else {
                     slot.update_join_waker(cx.waker());
+
                     if slot.is_completed() {
                         let result = unsafe { slot.take_result::<T>() };
+
                         slab.decrement_joinable_ref(
                             *shard_idx as usize,
                             *local_idx as usize,
                             *generation,
                         );
+
                         *consumed = true;
                         Poll::Ready(result)
                     } else {
@@ -243,7 +249,6 @@ impl<T: Send + 'static> Drop for JoinHandle<T> {
     }
 }
 
-/// Spawns a detached future, preferring slab allocation before falling back to Arc.
 pub fn spawn_detached<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -254,112 +259,308 @@ where
         slot_handle.init_and_enqueue(future);
     } else {
         slab.record_fallback();
+
         let task = Arc::new(FutureTask::new(future));
         task.enqueue();
     }
 }
 
+// enum FutureSlot<F: Future> {
+//     Running(F),
+//     Done(Option<F::Output>),
+// }
+
+// struct JoinAllShared {
+//     parent: Mutex<Option<Waker>>,
+//     ready_queue: SegQueue<usize>,
+//     ready_count: AtomicUsize,
+//     polling: AtomicBool,
+// }
+
+// impl JoinAllShared {
+//     fn new() -> Arc<Self> {
+//         Arc::new(Self {
+//             parent: Mutex::new(None),
+//             ready_queue: SegQueue::new(),
+//             ready_count: AtomicUsize::new(0),
+//             polling: AtomicBool::new(false),
+//         })
+//     }
+
+//     fn register_parent(&self, waker: &Waker) {
+//         let mut guard = self.parent.lock();
+
+//         if guard.as_ref().is_none_or(|old| !old.will_wake(waker)) {
+//             *guard = Some(waker.clone());
+//         }
+//     }
+
+//     fn wake_parent(&self) {
+//         if self.polling.load(Ordering::Acquire) {
+//             return;
+//         }
+
+//         let guard = self.parent.lock();
+
+//         if let Some(w) = guard.as_ref() {
+//             w.wake_by_ref();
+//         }
+//     }
+
+//     fn push_ready(&self, index: usize) {
+//         self.ready_queue.push(index);
+//         self.ready_count.fetch_add(1, Ordering::Release);
+//         self.wake_parent();
+//     }
+
+//     fn pop_ready(&self) -> Option<usize> {
+//         let index = self.ready_queue.pop()?;
+//         self.ready_count.fetch_sub(1, Ordering::AcqRel);
+//         Some(index)
+//     }
+
+//     fn has_ready(&self) -> bool {
+//         self.ready_count.load(Ordering::Acquire) != 0
+//     }
+// }
+
+// struct JoinAllChildWake {
+//     shared: Arc<JoinAllShared>,
+//     index: usize,
+//     queued: AtomicBool,
+// }
+
+// impl JoinAllChildWake {
+//     fn new(shared: Arc<JoinAllShared>, index: usize) -> Arc<Self> {
+//         Arc::new(Self {
+//             shared,
+//             index,
+//             queued: AtomicBool::new(false),
+//         })
+//     }
+
+//     fn queue(&self) {
+//         if !self.queued.swap(true, Ordering::AcqRel) {
+//             self.shared.push_ready(self.index);
+//         }
+//     }
+
+//     fn make_waker(self: &Arc<Self>) -> Waker {
+//         unsafe {
+//             Waker::from_raw(RawWaker::new(
+//                 Arc::into_raw(self.clone()) as *const (),
+//                 &JOIN_ALL_CHILD_WAKER_VTABLE,
+//             ))
+//         }
+//     }
+// }
+
+// unsafe fn join_all_child_waker_clone(ptr: *const ()) -> RawWaker {
+//     let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+//     let cloned = Arc::clone(&arc);
+
+//     RawWaker::new(
+//         Arc::into_raw(cloned) as *const (),
+//         &JOIN_ALL_CHILD_WAKER_VTABLE,
+//     )
+// }
+
+// unsafe fn join_all_child_waker_wake(ptr: *const ()) {
+//     let arc = unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) };
+//     arc.queue();
+// }
+
+// unsafe fn join_all_child_waker_wake_by_ref(ptr: *const ()) {
+//     let arc = ManuallyDrop::new(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+//     arc.queue();
+// }
+
+// unsafe fn join_all_child_waker_drop(ptr: *const ()) {
+//     drop(unsafe { Arc::from_raw(ptr as *const JoinAllChildWake) });
+// }
+
+// static JOIN_ALL_CHILD_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+//     join_all_child_waker_clone,
+//     join_all_child_waker_wake,
+//     join_all_child_waker_wake_by_ref,
+//     join_all_child_waker_drop,
+// );
+
+// struct JoinAllSlot<F: Future> {
+//     state: FutureSlot<F>,
+//     wake: Arc<JoinAllChildWake>,
+// }
+
+// pub struct JoinAll<F: Future> {
+//     slots: Vec<JoinAllSlot<F>>,
+//     remaining: usize,
+//     shared: Arc<JoinAllShared>,
+// }
+
+// impl<F: Future> JoinAll<F> {
+//     pub fn new(fs: Vec<F>) -> Self {
+//         let shared = JoinAllShared::new();
+//         let remaining = fs.len();
+//         let mut slots = Vec::with_capacity(remaining);
+
+//         for (index, fut) in fs.into_iter().enumerate() {
+//             let wake = JoinAllChildWake::new(shared.clone(), index);
+
+//             wake.queued.store(true, Ordering::Release);
+//             shared.push_ready(index);
+
+//             slots.push(JoinAllSlot {
+//                 state: FutureSlot::Running(fut),
+//                 wake,
+//             });
+//         }
+
+//         Self {
+//             slots,
+//             remaining,
+//             shared,
+//         }
+//     }
+// }
+
+// impl<F: Future> Future for JoinAll<F> {
+//     type Output = Vec<F::Output>;
+
+//     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+//         let this = unsafe { self.get_unchecked_mut() };
+
+//         if this.remaining == 0 {
+//             return Poll::Ready(join_all_take_output(&mut this.slots));
+//         }
+
+//         this.shared.register_parent(cx.waker());
+
+//         if this.shared.polling.swap(true, Ordering::AcqRel) {
+//             panic!("JoinAll polled concurrently");
+//         }
+
+//         let budget = this.slots.len().saturating_mul(4).max(256);
+//         let mut polls = 0usize;
+//         while polls < budget {
+//             let Some(index) = this.shared.pop_ready() else {
+//                 break;
+//             };
+
+//             if index < this.slots.len() && join_all_poll_one(this, index, true) {
+//                 polls += 1;
+//             }
+
+//             if this.remaining == 0 {
+//                 this.shared.polling.store(false, Ordering::Release);
+//                 return Poll::Ready(join_all_take_output(&mut this.slots));
+//             }
+//         }
+
+//         if this.remaining != 0 && !this.shared.has_ready() {
+//             let mut i = 0usize;
+
+//             while i < this.slots.len() && polls < budget {
+//                 if join_all_poll_one(this, i, false) {
+//                     polls += 1;
+//                 }
+
+//                 if this.remaining == 0 {
+//                     this.shared.polling.store(false, Ordering::Release);
+//                     return Poll::Ready(join_all_take_output(&mut this.slots));
+//                 }
+
+//                 i += 1;
+//             }
+//         }
+
+//         while polls < budget {
+//             let Some(index) = this.shared.pop_ready() else {
+//                 break;
+//             };
+
+//             if index < this.slots.len() && join_all_poll_one(this, index, true) {
+//                 polls += 1;
+//             }
+
+//             if this.remaining == 0 {
+//                 this.shared.polling.store(false, Ordering::Release);
+//                 return Poll::Ready(join_all_take_output(&mut this.slots));
+//             }
+//         }
+
+//         this.shared.polling.store(false, Ordering::Release);
+
+//         if this.remaining == 0 {
+//             Poll::Ready(join_all_take_output(&mut this.slots))
+//         } else {
+//             if this.shared.has_ready() || polls >= budget {
+//                 cx.waker().wake_by_ref();
+//             }
+
+//             Poll::Pending
+//         }
+//     }
+// }
+
+// fn join_all_poll_one<F: Future>(this: &mut JoinAll<F>, index: usize, require_queued: bool) -> bool {
+//     let slot = &mut this.slots[index];
+
+//     if require_queued && !slot.wake.queued.swap(false, Ordering::AcqRel) {
+//         return false;
+//     }
+
+//     if !require_queued {
+//         slot.wake.queued.store(false, Ordering::Release);
+//     }
+
+//     let FutureSlot::Running(fut) = &mut slot.state else {
+//         return false;
+//     };
+
+//     let waker = slot.wake.make_waker();
+//     let mut cx = Context::from_waker(&waker);
+//     let pinned = unsafe { Pin::new_unchecked(fut) };
+
+//     if let Poll::Ready(result) = pinned.poll(&mut cx) {
+//         slot.state = FutureSlot::Done(Some(result));
+//         this.remaining -= 1;
+//     }
+
+//     true
+// }
+
+// fn join_all_take_output<F: Future>(slots: &mut [JoinAllSlot<F>]) -> Vec<F::Output> {
+//     let mut out = Vec::with_capacity(slots.len());
+
+//     for slot in slots.iter_mut() {
+//         match &mut slot.state {
+//             FutureSlot::Done(result) => {
+//                 out.push(result.take().expect("result already taken"));
+//             }
+//             FutureSlot::Running(_) => {
+//                 panic!("JoinAll completed with running child");
+//             }
+//         }
+//     }
+
+//     out
+// }
 enum FutureSlot<F: Future> {
     Running(F),
     Done(Option<F::Output>),
 }
 
-struct JoinAllShared {
-    parent: Mutex<Option<Waker>>,
-    ready_queue: SegQueue<usize>,
-}
-
-struct IndexedWakerData {
-    shared: Arc<JoinAllShared>,
-    index: usize,
-}
-
-unsafe fn indexed_waker_clone(ptr: *const ()) -> RawWaker {
-    let data = unsafe { &*(ptr as *const IndexedWakerData) };
-    let cloned = Box::new(IndexedWakerData {
-        shared: data.shared.clone(),
-        index: data.index,
-    });
-    RawWaker::new(Box::into_raw(cloned) as *const (), &INDEXED_WAKER_VTABLE)
-}
-
-unsafe fn indexed_waker_wake(ptr: *const ()) {
-    let data = unsafe { Box::from_raw(ptr as *mut IndexedWakerData) };
-    data.shared.ready_queue.push(data.index);
-    let guard = data.shared.parent.lock();
-    if let Some(w) = guard.as_ref() {
-        w.wake_by_ref();
-    }
-    drop(guard);
-}
-
-unsafe fn indexed_waker_wake_by_ref(ptr: *const ()) {
-    let data = unsafe { &*(ptr as *const IndexedWakerData) };
-    data.shared.ready_queue.push(data.index);
-    let guard = data.shared.parent.lock();
-    if let Some(w) = guard.as_ref() {
-        w.wake_by_ref();
-    }
-    drop(guard);
-}
-
-unsafe fn indexed_waker_drop(ptr: *const ()) {
-    drop(unsafe { Box::from_raw(ptr as *mut IndexedWakerData) });
-}
-
-static INDEXED_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    indexed_waker_clone,
-    indexed_waker_wake,
-    indexed_waker_wake_by_ref,
-    indexed_waker_drop,
-);
-
-impl JoinAllShared {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            parent: Mutex::new(None),
-            ready_queue: SegQueue::new(),
-        })
-    }
-
-    fn update_parent(&self, waker: &Waker) {
-        let mut guard = self.parent.lock();
-        if guard.as_ref().is_none_or(|w| !w.will_wake(waker)) {
-            *guard = Some(waker.clone());
-        }
-    }
-
-    fn make_waker(self: &Arc<Self>, index: usize) -> Waker {
-        let data = Box::new(IndexedWakerData {
-            shared: self.clone(),
-            index,
-        });
-        unsafe {
-            Waker::from_raw(RawWaker::new(
-                Box::into_raw(data) as *const (),
-                &INDEXED_WAKER_VTABLE,
-            ))
-        }
-    }
-}
-
 pub struct JoinAll<F: Future> {
     slots: Vec<FutureSlot<F>>,
     remaining: usize,
-    shared: Arc<JoinAllShared>,
-    first_poll: bool,
 }
 
 impl<F: Future> JoinAll<F> {
     pub fn new(fs: Vec<F>) -> Self {
         let remaining = fs.len();
         let slots = fs.into_iter().map(FutureSlot::Running).collect();
-        Self {
-            slots,
-            remaining,
-            shared: JoinAllShared::new(),
-            first_poll: true,
-        }
+
+        Self { slots, remaining }
     }
 }
 
@@ -370,58 +571,47 @@ impl<F: Future> Future for JoinAll<F> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.remaining == 0 {
-            let mut out = Vec::with_capacity(this.slots.len());
-            for slot in this.slots.iter_mut() {
-                if let FutureSlot::Done(result) = slot {
-                    out.push(result.take().expect("result already taken"));
-                }
-            }
-            return Poll::Ready(out);
+            return Poll::Ready(join_all_take_output(&mut this.slots));
         }
 
-        this.shared.update_parent(cx.waker());
+        let mut i = 0usize;
+        while i < this.slots.len() {
+            let slot = &mut this.slots[i];
 
-        if this.first_poll {
-            this.first_poll = false;
-            for (i, slot) in this.slots.iter_mut().enumerate() {
-                if let FutureSlot::Running(fut) = slot {
-                    let waker = this.shared.make_waker(i);
-                    let mut child_cx = Context::from_waker(&waker);
-                    let pinned = unsafe { Pin::new_unchecked(fut) };
-                    if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
-                        *slot = FutureSlot::Done(Some(result));
-                        this.remaining -= 1;
+            if let FutureSlot::Running(fut) = slot {
+                let pinned = unsafe { Pin::new_unchecked(fut) };
+
+                if let Poll::Ready(result) = pinned.poll(cx) {
+                    *slot = FutureSlot::Done(Some(result));
+                    this.remaining -= 1;
+
+                    if this.remaining == 0 {
+                        return Poll::Ready(join_all_take_output(&mut this.slots));
                     }
                 }
             }
-        } else {
-            while let Some(idx) = this.shared.ready_queue.pop() {
-                if idx >= this.slots.len() {
-                    continue;
-                }
-                let slot = &mut this.slots[idx];
-                if let FutureSlot::Running(fut) = slot {
-                    let waker = this.shared.make_waker(idx);
-                    let mut child_cx = Context::from_waker(&waker);
-                    let pinned = unsafe { Pin::new_unchecked(fut) };
-                    if let Poll::Ready(result) = pinned.poll(&mut child_cx) {
-                        *slot = FutureSlot::Done(Some(result));
-                        this.remaining -= 1;
-                    }
-                }
-            }
+
+            i += 1;
         }
 
-        if this.remaining == 0 {
-            let mut out = Vec::with_capacity(this.slots.len());
-            for slot in this.slots.iter_mut() {
-                if let FutureSlot::Done(result) = slot {
-                    out.push(result.take().expect("result already taken"));
-                }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+fn join_all_take_output<F: Future>(slots: &mut [FutureSlot<F>]) -> Vec<F::Output> {
+    let mut out = Vec::with_capacity(slots.len());
+
+    for slot in slots.iter_mut() {
+        match slot {
+            FutureSlot::Done(result) => {
+                out.push(result.take().expect("result already taken"));
             }
-            Poll::Ready(out)
-        } else {
-            Poll::Pending
+            FutureSlot::Running(_) => {
+                panic!("JoinAll completed with running child");
+            }
         }
     }
+
+    out
 }

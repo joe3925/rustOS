@@ -9,6 +9,8 @@ pub struct Job {
 }
 
 pub trait ExecutorPlatform: Send + Sync {
+    fn init_runtime(&self, max_threads: usize, max_jobs: usize);
+    fn init_blocking(&self, max_threads: usize);
     fn submit_runtime(&self, job: Job);
     fn submit_blocking(&self, job: Job);
     fn submit_blocking_many(&self, jobs: &[Job]);

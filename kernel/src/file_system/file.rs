@@ -1,5 +1,9 @@
+use crate::benchmarking::async_chain;
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
+use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
+use crate::benchmarking::yield_once;
+
 use crate::benchmarking::BenchWindow;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::HEAP_SIZE;
@@ -19,6 +23,9 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
+use crate::scheduling::runtime::runtime::spawn;
+use crate::scheduling::runtime::runtime::JoinAll;
+
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     drivers::interrupt_index::wait_duration,
@@ -420,49 +427,23 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
 
-    spawn_blocking(|| {
-        spawn_detached(async move {
-            loop {
-                //
-                // }
-                //bench_async_vs_sync_call_latency_async().await;
-                //DRIVE_WINDOW.start();
-                let mut i = 0;
-                //loop {
-                let drive_window = BenchWindow::new(BenchWindowConfig {
-                    name: format!("iter{}", i),
-                    folder: "C:\\system\\logs".to_string(),
-                    log_samples: true,
-                    log_spans: false,
-                    log_mem_on_persist: false,
-                    export_debug_metadata: true,
-                    end_on_drop: false,
-                    timeout_ms: None,
-                    auto_persist_secs: None,
-                    sample_reserve: 400000,
-                    span_reserve: 0,
-                    overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
-                    sample_capacity: None,
-                    sample_chunk_capacity: None,
-                    max_unwind_depth: None,
-                    disable_per_core: true,
-                });
-                drive_window.start();
-                test_full_heap_parallel();
+    spawn_detached(async move {
+        loop {
+            bench_c_drive_io_async().await;
+            test_full_heap_parallel();
+        }
 
-                bench_c_drive_io_async().await;
-                drive_window.stop_and_persist().await;
-                // test_full_heap_parallel();
+        //DRIVE_WINDOW.start();
+        //loop {
+        // test_full_heap_parallel();
 
-                i += 1;
-                //run_virtio_bench_matrix_print().await;
-                //wait_duration(Duration::from_secs(10));
-            }
-            //DRIVE_WINDOW.stop_and_persist().await;
-            //run_virtio_bench_matrix_print().await;
+        //run_virtio_bench_matrix_print().await;
+        //wait_duration(Duration::from_secs(10));
+        //}
+        //DRIVE_WINDOW.stop_and_persist().await;
+        //run_virtio_bench_matrix_print().await;
 
-            //trigger_triple_fault();
-        });
+        //trigger_triple_fault();
     });
     Ok(())
 }

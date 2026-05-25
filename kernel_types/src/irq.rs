@@ -1,40 +1,51 @@
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use core::mem::ManuallyDrop;
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::Waker;
 
 use spin::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use x86_64::instructions::interrupts;
 
-/// IRQ handle shared across kernel/driver boundary.
-/// Safe to pass over FFI (win64); both sides must be compiled with the same Rust version.
-pub type IrqHandle = Arc<IrqHandleInner>;
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqHandle {
+    pub id: usize,
+    pub generation: usize,
+}
 
-/// ISR function signature (win64 ABI).
-/// Returns true if the interrupt was claimed/handled by this handler.
+impl IrqHandle {
+    pub const fn null() -> Self {
+        Self {
+            id: 0,
+            generation: 0,
+        }
+    }
+
+    pub const fn is_null(self) -> bool {
+        self.id == 0
+    }
+}
+
+pub type IrqBorrowedHandle = *const IrqHandleInner;
+
 pub type IrqIsrFn = extern "win64" fn(
     vector: u8,
     cpu: u32,
     frame: &mut x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool;
 
-/// Metadata passed when signaling an IRQ
-/// Carries additional information from the ISR to waiters.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IrqMeta {
-    /// Tag value for identifying signal type
     pub tag: u64,
-    /// Additional data slots
     pub data: [u64; 3],
 }
 
 impl IrqMeta {
-    /// Create a new empty metadata struct
     pub const fn new() -> Self {
         Self {
             tag: 0,
@@ -42,12 +53,10 @@ impl IrqMeta {
         }
     }
 
-    /// Create metadata with a specific tag
     pub const fn with_tag(tag: u64) -> Self {
         Self { tag, data: [0; 3] }
     }
 
-    /// Create metadata with tag and single data value
     pub const fn with_data(tag: u64, d0: u64) -> Self {
         Self {
             tag,
@@ -55,7 +64,6 @@ impl IrqMeta {
         }
     }
 
-    /// Create metadata with tag and multiple data values
     pub const fn with_data3(tag: u64, d0: u64, d1: u64, d2: u64) -> Self {
         Self {
             tag,
@@ -64,27 +72,21 @@ impl IrqMeta {
     }
 }
 
-/// Result codes for IRQ wait operations
 pub const IRQ_WAIT_OK: u32 = 0;
 pub const IRQ_WAIT_CLOSED: u32 = 1;
 pub const IRQ_WAIT_NULL: u32 = 2;
 pub const IRQ_WAIT_TIMEOUT: u32 = 3;
 pub const IRQ_RESCUE_WAKEUP: u32 = 4;
 
-/// Result of waiting on an IRQ
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct IrqWaitResult {
-    /// Result code (IRQ_WAIT_*)
     pub code: u32,
-    /// Number of signals consumed (usually 1)
     pub count: u32,
-    /// Metadata from the signal
     pub meta: IrqMeta,
 }
 
 impl IrqWaitResult {
-    /// Create a successful result with metadata
     pub const fn ok(meta: IrqMeta) -> Self {
         Self {
             code: IRQ_WAIT_OK,
@@ -93,7 +95,6 @@ impl IrqWaitResult {
         }
     }
 
-    /// Create a successful result with count
     pub const fn ok_n(meta: IrqMeta, count: u32) -> Self {
         Self {
             code: IRQ_WAIT_OK,
@@ -102,7 +103,6 @@ impl IrqWaitResult {
         }
     }
 
-    /// Create a closed result (handle was unregistered)
     pub const fn closed() -> Self {
         Self {
             code: IRQ_WAIT_CLOSED,
@@ -111,7 +111,6 @@ impl IrqWaitResult {
         }
     }
 
-    /// Create a null result (null handle passed)
     pub const fn null() -> Self {
         Self {
             code: IRQ_WAIT_NULL,
@@ -120,7 +119,6 @@ impl IrqWaitResult {
         }
     }
 
-    /// Create a timeout result
     pub const fn timeout() -> Self {
         Self {
             code: IRQ_WAIT_TIMEOUT,
@@ -128,6 +126,7 @@ impl IrqWaitResult {
             meta: IrqMeta::new(),
         }
     }
+
     pub const fn rescue() -> Self {
         Self {
             code: IRQ_RESCUE_WAKEUP,
@@ -136,22 +135,18 @@ impl IrqWaitResult {
         }
     }
 
-    /// Check if wait succeeded
     pub fn is_ok(&self) -> bool {
         self.code == IRQ_WAIT_OK
     }
 
-    /// Check if handle was closed
     pub fn is_closed(&self) -> bool {
         self.code == IRQ_WAIT_CLOSED
     }
 
-    /// Check if null handle was passed
     pub fn is_null(&self) -> bool {
         self.code == IRQ_WAIT_NULL
     }
 
-    /// Check if wait timed out
     pub fn is_timeout(&self) -> bool {
         self.code == IRQ_WAIT_TIMEOUT
     }
@@ -163,9 +158,40 @@ impl Default for IrqWaitResult {
     }
 }
 
-// =============================================================================
-// IRQ HANDLE (safe, Arc-based)
-// =============================================================================
+#[derive(Clone, Copy)]
+pub struct WaiterPtr {
+    ptr: NonNull<Waiter>,
+}
+
+impl WaiterPtr {
+    pub fn new(waiter: &Waiter) -> Self {
+        Self {
+            ptr: NonNull::from(waiter),
+        }
+    }
+
+    pub unsafe fn from_raw(ptr: *mut Waiter) -> Self {
+        Self {
+            ptr: NonNull::new_unchecked(ptr),
+        }
+    }
+
+    pub fn as_ptr(self) -> *mut Waiter {
+        self.ptr.as_ptr()
+    }
+
+    pub unsafe fn as_ref<'a>(self) -> &'a Waiter {
+        self.ptr.as_ref()
+    }
+
+    pub fn ptr_eq(self, other: WaiterPtr) -> bool {
+        self.ptr == other.ptr
+    }
+}
+
+unsafe impl Send for WaiterPtr {}
+unsafe impl Sync for WaiterPtr {}
+
 #[repr(C)]
 pub struct Waiter {
     pub waker: IrqSafeMutex<Option<Waker>>,
@@ -173,13 +199,16 @@ pub struct Waiter {
     pub enqueued: AtomicBool,
 }
 
+unsafe impl Send for Waiter {}
+unsafe impl Sync for Waiter {}
+
 impl Waiter {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
+    pub const fn new() -> Self {
+        Self {
             waker: IrqSafeMutex::new(None),
             result: IrqSafeMutex::new(None),
             enqueued: AtomicBool::new(false),
-        })
+        }
     }
 
     pub fn set_waker(&self, w: &Waker) {
@@ -188,6 +217,7 @@ impl Waiter {
             Some(existing) => !existing.will_wake(w),
             None => true,
         };
+
         if update {
             *g = Some(w.clone());
         }
@@ -201,10 +231,10 @@ impl Waiter {
         *self.result.lock() = Some(r);
     }
 
-    pub fn wake(&self) {
-        let w = self.waker.lock().take();
-        if let Some(w) = w {
-            w.wake();
+    pub fn wake_by_ref(&self) {
+        let g = self.waker.lock();
+        if let Some(w) = g.as_ref() {
+            w.wake_by_ref();
         }
     }
 
@@ -216,7 +246,7 @@ impl Waiter {
 }
 
 pub struct WaitState {
-    pub waiters: VecDeque<Arc<Waiter>>,
+    pub waiters: VecDeque<WaiterPtr>,
     pub pending_signals: usize,
     pub last_meta: IrqMeta,
 }
@@ -230,17 +260,17 @@ impl WaitState {
         }
     }
 
-    pub fn pop_waiter(&mut self) -> Option<Arc<Waiter>> {
+    pub fn pop_waiter(&mut self) -> Option<WaiterPtr> {
         self.waiters.pop_front()
     }
 
-    pub fn push_waiter(&mut self, w: Arc<Waiter>) {
-        self.waiters.push_back(w);
+    pub fn push_waiter(&mut self, waiter: WaiterPtr) {
+        self.waiters.push_back(waiter);
     }
 
-    pub fn remove_waiter(&mut self, target: &Arc<Waiter>) -> bool {
+    pub fn remove_waiter(&mut self, target: WaiterPtr) -> bool {
         let before = self.waiters.len();
-        self.waiters.retain(|w| !Arc::ptr_eq(w, target));
+        self.waiters.retain(|w| !w.ptr_eq(target));
         before != self.waiters.len()
     }
 }
@@ -253,32 +283,18 @@ pub struct IrqHandleInner {
     pub state: IrqSafeMutex<WaitState>,
 }
 
-impl Drop for IrqHandleInner {
-    fn drop(&mut self) {
-        if let Some(h) = self.drop_hook.lock().take() {
-            h.invoke();
-        }
-    }
-}
-
-/// Drop hook for automatic cleanup when handle is dropped.
-/// Called when the last reference to an IRQ handle is released.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DropHook {
-    /// Function to call on drop
     pub func: extern "win64" fn(usize),
-    /// Argument to pass to the function
     pub arg: usize,
 }
 
 impl DropHook {
-    /// Create a new drop hook
     pub const fn new(func: extern "win64" fn(usize), arg: usize) -> Self {
         Self { func, arg }
     }
 
-    /// Invoke the drop hook
     pub fn invoke(self) {
         (self.func)(self.arg);
     }
@@ -336,6 +352,7 @@ impl<T> IrqSafeMutex<T> {
     #[inline(always)]
     pub fn try_lock(&self) -> Option<IrqSafeMutexGuard<'_, T>> {
         let restore_interrupts = interrupts::are_enabled();
+
         if restore_interrupts {
             interrupts::disable();
         }
@@ -349,6 +366,7 @@ impl<T> IrqSafeMutex<T> {
                 if restore_interrupts {
                     interrupts::enable();
                 }
+
                 None
             }
         }
@@ -374,7 +392,10 @@ impl<'a, T> DerefMut for IrqSafeMutexGuard<'a, T> {
 impl<'a, T> Drop for IrqSafeMutexGuard<'a, T> {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
+
         if self.restore_interrupts {
             interrupts::enable();
         }
@@ -430,6 +451,7 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn try_read(&self) -> Option<IrqSafeRwLockReadGuard<'_, T>> {
         let restore_interrupts = interrupts::are_enabled();
+
         if restore_interrupts {
             interrupts::disable();
         }
@@ -443,6 +465,7 @@ impl<T> IrqSafeRwLock<T> {
                 if restore_interrupts {
                     interrupts::enable();
                 }
+
                 None
             }
         }
@@ -475,6 +498,7 @@ impl<T> IrqSafeRwLock<T> {
     #[inline(always)]
     pub fn try_write(&self) -> Option<IrqSafeRwLockWriteGuard<'_, T>> {
         let restore_interrupts = interrupts::are_enabled();
+
         if restore_interrupts {
             interrupts::disable();
         }
@@ -488,6 +512,7 @@ impl<T> IrqSafeRwLock<T> {
                 if restore_interrupts {
                     interrupts::enable();
                 }
+
                 None
             }
         }
@@ -506,7 +531,10 @@ impl<'a, T> Deref for IrqSafeRwLockReadGuard<'a, T> {
 impl<'a, T> Drop for IrqSafeRwLockReadGuard<'a, T> {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
+
         if self.restore_interrupts {
             interrupts::enable();
         }
@@ -532,7 +560,10 @@ impl<'a, T> DerefMut for IrqSafeRwLockWriteGuard<'a, T> {
 impl<'a, T> Drop for IrqSafeRwLockWriteGuard<'a, T> {
     #[inline(always)]
     fn drop(&mut self) {
-        unsafe { ManuallyDrop::drop(&mut self.guard) };
+        unsafe {
+            ManuallyDrop::drop(&mut self.guard);
+        }
+
         if self.restore_interrupts {
             interrupts::enable();
         }

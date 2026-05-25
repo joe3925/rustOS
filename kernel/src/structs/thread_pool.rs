@@ -1,13 +1,17 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::scheduling::tls;
-use crate::structs::mpmc::{mpmc_channel, Receiver, Sender};
+use crate::structs::bounded_mpmc::{
+    bounded_mpmc_channel, BoundedReceiver, BoundedSendError, BoundedSender,
+};
+use crate::structs::mpmc::{mpmc_channel, Receiver, RecvError, Sender, TryRecvError};
 
 pub type JobFn = extern "win64" fn(usize);
 
@@ -16,9 +20,94 @@ pub struct Job {
     pub f: JobFn,
     pub a: usize,
 }
+
 impl From<(extern "win64" fn(usize), usize)> for Job {
     fn from(job: (extern "win64" fn(usize), usize)) -> Self {
         Job { f: job.0, a: job.1 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitError {
+    Shutdown,
+    Full,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueSendError {
+    Full,
+    Disconnected,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedJobsConfig {
+    pub max_jobs: usize,
+    pub max_consumers: usize,
+}
+
+pub trait JobQueue: 'static {
+    type Sender: Clone + Send + Sync + 'static;
+    type Receiver: Clone + Send + Sync + 'static;
+    type Config: Copy;
+
+    fn channel(config: Self::Config) -> (Self::Sender, Self::Receiver);
+    fn send(sender: &Self::Sender, job: Job) -> Result<(), QueueSendError>;
+    fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError>;
+    fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError>;
+}
+
+pub enum UnboundedJobs {}
+
+impl JobQueue for UnboundedJobs {
+    type Sender = Sender<Job>;
+    type Receiver = Receiver<Job>;
+    type Config = ();
+
+    fn channel(_: Self::Config) -> (Self::Sender, Self::Receiver) {
+        mpmc_channel::<Job>()
+    }
+
+    fn send(sender: &Self::Sender, job: Job) -> Result<(), QueueSendError> {
+        sender.send(job).map_err(|_| QueueSendError::Disconnected)
+    }
+
+    fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError> {
+        receiver.recv()
+    }
+
+    fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError> {
+        receiver.try_recv()
+    }
+}
+
+pub enum BoundedJobs {}
+
+impl JobQueue for BoundedJobs {
+    type Sender = BoundedSender<Job>;
+    type Receiver = BoundedReceiver<Job>;
+    type Config = BoundedJobsConfig;
+
+    fn channel(config: Self::Config) -> (Self::Sender, Self::Receiver) {
+        assert!(config.max_jobs > 0);
+        assert!(config.max_consumers > 0);
+
+        bounded_mpmc_channel::<Job>(config.max_jobs, config.max_consumers)
+    }
+
+    fn send(sender: &Self::Sender, job: Job) -> Result<(), QueueSendError> {
+        sender.try_send(job).map_err(|err| match err {
+            BoundedSendError::Full(_) => QueueSendError::Full,
+            BoundedSendError::Disconnected(_) => QueueSendError::Disconnected,
+        })
+    }
+
+    fn recv(receiver: &Self::Receiver) -> Result<Job, RecvError> {
+        receiver.recv()
+    }
+
+    fn try_recv(receiver: &Self::Receiver) -> Result<Job, TryRecvError> {
+        receiver.try_recv()
     }
 }
 
@@ -29,31 +118,65 @@ struct Shared {
     block_on_enabled: bool,
 }
 
-struct WorkerCtx {
+struct WorkerCtx<Q: JobQueue> {
     shared: Arc<Shared>,
-    receiver: Receiver<Job>,
+    receiver: Q::Receiver,
     _idx: usize,
 }
 
-pub struct ThreadPool {
+pub struct ThreadPoolImpl<Q: JobQueue> {
     shared: Arc<Shared>,
-    sender: Sender<Job>,
-    receiver: Receiver<Job>,
+    sender: Q::Sender,
+    receiver: Q::Receiver,
+    _queue: PhantomData<Q>,
 }
 
-impl ThreadPool {
+pub type ThreadPool = ThreadPoolImpl<UnboundedJobs>;
+pub type BoundedThreadPool = ThreadPoolImpl<BoundedJobs>;
+
+impl ThreadPoolImpl<UnboundedJobs> {
     pub fn new(threads: usize) -> Self {
-        Self::new_with_block_on(threads, false)
+        Self::new_with_block_on(threads, false, ())
     }
 
     pub fn new_blocking(threads: usize) -> Self {
-        Self::new_with_block_on(threads, true)
+        Self::new_with_block_on(threads, true, ())
     }
 
-    fn new_with_block_on(threads: usize, block_on_enabled: bool) -> Self {
+    pub fn submit(&self, function: JobFn, context: usize) {
+        let _ = self.try_submit(function, context);
+    }
+}
+
+impl ThreadPoolImpl<BoundedJobs> {
+    pub fn new(threads: usize, max_jobs: usize) -> Self {
+        let config = BoundedJobsConfig {
+            max_jobs,
+            max_consumers: threads,
+        };
+
+        Self::new_with_block_on(threads, false, config)
+    }
+
+    pub fn new_blocking(threads: usize, max_jobs: usize) -> Self {
+        let config = BoundedJobsConfig {
+            max_jobs,
+            max_consumers: threads,
+        };
+
+        Self::new_with_block_on(threads, true, config)
+    }
+
+    pub fn submit(&self, function: JobFn, context: usize) -> bool {
+        self.try_submit(function, context).is_ok()
+    }
+}
+
+impl<Q: JobQueue> ThreadPoolImpl<Q> {
+    fn new_with_block_on(threads: usize, block_on_enabled: bool, config: Q::Config) -> Self {
         assert!(threads > 0);
 
-        let (sender, receiver) = mpmc_channel::<Job>();
+        let (sender, receiver) = Q::channel(config);
 
         let shared = Arc::new(Shared {
             total_workers: AtomicUsize::new(threads),
@@ -65,21 +188,22 @@ impl ThreadPool {
         for i in 0..threads {
             shared.num_workers.fetch_add(1, Ordering::Release);
 
-            // Each worker gets its own cloned receiver
-            let ctx = Box::new(WorkerCtx {
+            let ctx = Box::new(WorkerCtx::<Q> {
                 shared: shared.clone(),
                 receiver: receiver.clone(),
                 _idx: i,
             });
 
             let name: String = alloc::format!("thread_pool_worker_{i}");
+
             let th = Task::new_kernel_mode(
-                worker_entry,
+                worker_entry::<Q>,
                 Box::into_raw(ctx) as usize,
                 StackSize::Tiny,
                 name,
                 0,
             );
+
             SCHEDULER.spawn_task(th);
         }
 
@@ -87,36 +211,46 @@ impl ThreadPool {
             shared,
             sender,
             receiver,
+            _queue: PhantomData,
         }
     }
 
-    pub fn submit(&self, function: JobFn, context: usize) {
+    pub fn try_submit(&self, function: JobFn, context: usize) -> Result<(), SubmitError> {
         if self.shared.shutdown.load(Ordering::Acquire) {
-            return;
+            return Err(SubmitError::Shutdown);
         }
 
-        let job = Job {
-            f: function,
-            a: context,
-        };
-        // TODO: error handling, this shouldn't panic
-        self.sender.send(job).expect("failed to send task to mpmc");
+        Q::send(
+            &self.sender,
+            Job {
+                f: function,
+                a: context,
+            },
+        )
+        .map_err(|err| match err {
+            QueueSendError::Full => SubmitError::Full,
+            QueueSendError::Disconnected => SubmitError::Disconnected,
+        })
     }
 
-    pub fn submit_many(&self, jobs: &[Job]) {
+    pub fn submit_many(&self, jobs: &[Job]) -> usize {
         if jobs.is_empty() {
-            return;
+            return 0;
         }
+
         if self.shared.shutdown.load(Ordering::Acquire) {
-            return;
+            return 0;
         }
 
         let mut sent = 0usize;
+
         for &job in jobs {
-            if self.sender.send(job).is_ok() {
+            if Q::send(&self.sender, job).is_ok() {
                 sent += 1;
             }
         }
+
+        sent
     }
 
     pub fn submit_if_runnable(&self, f: JobFn, a: usize) {
@@ -124,11 +258,12 @@ impl ThreadPool {
             (f)(a);
             return;
         }
-        self.submit(f, a);
+
+        let _ = self.try_submit(f, a);
     }
 
     pub fn try_execute_one(&self) -> bool {
-        match self.receiver.try_recv() {
+        match Q::try_recv(&self.receiver) {
             Ok(job) => {
                 (job.f)(job.a);
                 true
@@ -139,7 +274,6 @@ impl ThreadPool {
 
     pub fn shutdown(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        // Dropping the sender will close the channel and wake all waiting receivers
     }
 
     pub fn is_shutdown(&self) -> bool {
@@ -149,19 +283,23 @@ impl ThreadPool {
     pub fn workers(&self) -> usize {
         self.shared.num_workers.load(Ordering::Acquire)
     }
-}
 
-impl Drop for ThreadPool {
-    fn drop(&mut self) {
-        self.shutdown();
-        // sender is dropped here, which closes the channel
+    pub fn total_workers(&self) -> usize {
+        self.shared.total_workers.load(Ordering::Acquire)
     }
 }
 
-extern "win64" fn worker_entry(ctx: usize) {
-    let ctx = unsafe { Box::from_raw(ctx as *mut WorkerCtx) };
+impl<Q: JobQueue> Drop for ThreadPoolImpl<Q> {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+extern "win64" fn worker_entry<Q: JobQueue>(ctx: usize) {
+    let ctx = unsafe { Box::from_raw(ctx as *mut WorkerCtx<Q>) };
     let shared = ctx.shared.clone();
     let receiver = ctx.receiver.clone();
+
     drop(ctx);
 
     if shared.block_on_enabled {
@@ -169,21 +307,15 @@ extern "win64" fn worker_entry(ctx: usize) {
     }
 
     loop {
-        // Check shutdown before blocking
         if shared.shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        // Block until a job is available or channel disconnects
-        let job = match receiver.recv() {
+        let job = match Q::recv(&receiver) {
             Ok(job) => job,
-            Err(_) => {
-                // Channel disconnected (all senders dropped)  exit
-                break;
-            }
+            Err(_) => break,
         };
 
-        // Execute the job
         (job.f)(job.a);
     }
 

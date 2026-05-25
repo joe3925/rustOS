@@ -59,9 +59,9 @@ cfg_if::cfg_if! {
 
                 if self.mimalloc_enabled() {
                     without_interrupts(||{
-                        // if current_is_in_interrupt_atomic().load(Ordering::Acquire){
-                        //     panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
-                        // }
+                        if current_is_in_interrupt_atomic().load(Ordering::Acquire){
+                            panic!("mimalloc_thread_done called from interrupt, this shouldn't happen");
+                        }
                         unsafe { mi::mimalloc_thread_done_impl(); }
                     })
                 }
@@ -77,9 +77,9 @@ cfg_if::cfg_if! {
 
                 if self.mimalloc_enabled() {
                     without_interrupts(||{
-                        // if current_is_in_interrupt_atomic().load(Ordering::Acquire){
-                        //     panic!("Cannot accses allocator from interrupt");
-                        // }
+                        if current_is_in_interrupt_atomic().load(Ordering::Acquire){
+                            panic!("Cannot accses allocator from interrupt");
+                        }
                         mi::mimalloc_alloc(layout)
                     })
                 } else {
@@ -91,9 +91,9 @@ cfg_if::cfg_if! {
 
                 if self.mimalloc_enabled() {
                     without_interrupts(||{
-                        // if current_is_in_interrupt_atomic().load(Ordering::Acquire){
-                        //     panic!("Cannot accses allocator from interrupt");
-                        // }
+                        if current_is_in_interrupt_atomic().load(Ordering::Acquire){
+                            panic!("Cannot accses allocator from interrupt");
+                        }
                         mi::mimalloc_alloc_zeroed(layout)
                     })
                 } else {
@@ -113,9 +113,9 @@ cfg_if::cfg_if! {
 
                 if mi::ptr_is_mimalloc(ptr) {
                     without_interrupts(||{
-                        // if current_is_in_interrupt_atomic().load(Ordering::Acquire){
-                        //     panic!("Cannot accses allocator from interrupt");
-                        // }
+                        if current_is_in_interrupt_atomic().load(Ordering::Acquire){
+                            panic!("Cannot accses allocator from interrupt");
+                        }
                         mi::mimalloc_dealloc(ptr, layout)
                     })
                 } else {
@@ -130,9 +130,9 @@ cfg_if::cfg_if! {
 
                 if mi::ptr_is_mimalloc(ptr) {
                     without_interrupts(||{
-                        // if current_is_in_interrupt_atomic().load(Ordering::Acquire){
-                        //     panic!("Cannot accses allocator from interrupt");
-                        // }
+                        if current_is_in_interrupt_atomic().load(Ordering::Acquire){
+                            panic!("Cannot accses allocator from interrupt");
+                        }
                         mi::mimalloc_realloc(ptr, layout, new_size)
                     })
                 } else {
@@ -309,7 +309,6 @@ pub fn test_full_heap_parallel() {
 
                 for i in 0..element_count_per_thread {
                     if i != vec[i] as usize {
-                        trigger_triple_fault();
                         println!(
                             "Heap data verification failed for worker {} at index {}",
                             worker_index, i

@@ -1,10 +1,10 @@
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::state::BlockReason;
-use crate::structs::treiber_stack::TreiberStack;
 use crate::structs::wait_queue::WaitQueue;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_queue::SegQueue;
+use kernel_types::io::TreiberStack;
 
 /// Error returned when sending on a disconnected channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,7 @@ pub struct Receiver<T> {
 ///
 /// Both [`Sender`] and [`Receiver`] can be cloned for multiple producers
 /// and multiple consumers.
+
 pub fn mpmc_channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Arc::new(MpmcInner {
         inbox: TreiberStack::new(),

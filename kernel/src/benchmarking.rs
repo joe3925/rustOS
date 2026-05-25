@@ -11,6 +11,7 @@ use crate::memory::{
 use crate::profiling::unwind::{
     capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
 };
+use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
@@ -25,11 +26,13 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cmp::min;
 use core::fmt::Write;
 use core::future::Future;
 use core::hint::black_box;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
@@ -2641,9 +2644,9 @@ pub fn used_memory() -> usize {
 }
 
 const DEPTH: usize = 1_000;
-const ITERS: usize = 500_000;
+const ITERS: usize = 50_000;
 
-const BLOCK_TASKS: usize = 500_000;
+const ASYNC_TASKS: usize = 50_000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -2651,25 +2654,11 @@ pub fn bench_async_vs_sync_call_latency() {
     });
 }
 
-#[inline(never)]
-fn sync_leaf(x: u64) -> u64 {
-    x.wrapping_add(1)
-}
-
-#[inline(never)]
-fn sync_chain(mut x: u64) -> u64 {
-    let mut i = 0usize;
-    while i < DEPTH {
-        x = sync_leaf(x);
-        i += 1;
-    }
-    x
-}
-
 struct Ready;
 
 impl Future for Ready {
     type Output = ();
+
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Ready(())
@@ -2681,6 +2670,39 @@ fn ready() -> Ready {
     Ready
 }
 
+pub struct YieldOnce {
+    yielded: bool,
+    test: bool,
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.test {
+            panic!("polled after ready");
+        }
+        if this.yielded {
+            this.test = true;
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+#[inline(always)]
+pub fn yield_once() -> YieldOnce {
+    YieldOnce {
+        yielded: false,
+        test: false,
+    }
+}
+
 #[inline(never)]
 async fn async_leaf(x: u64) -> u64 {
     ready().await;
@@ -2688,42 +2710,48 @@ async fn async_leaf(x: u64) -> u64 {
 }
 
 #[inline(never)]
-async fn async_chain(mut x: u64) -> u64 {
+pub async fn async_chain(mut x: u64) -> u64 {
     let mut i = 0usize;
+
     while i < DEPTH {
         x = async_leaf(x).await;
         i += 1;
     }
+
     x
 }
 
 #[inline(never)]
-async fn blocking_chain(x: u64) -> u64 {
-    spawn_blocking(move || {
-        // if ret % 10_000 == 0 {
-        //     println!("blocking done num: {}", ret);
-        // }
-        sync_chain(x)
+async fn async_spawn_wake_chain(x: u64) -> u64 {
+    spawn(async move {
+        yield_once().await;
+        async_chain(x).await
     })
     .await
 }
 
 #[inline(never)]
-async fn blocking_queue_stress(seed: u64) -> u64 {
-    let mut funcs = Vec::with_capacity(BLOCK_TASKS);
-    for i in 0..BLOCK_TASKS {
+async fn async_queue_stress(seed: u64) -> u64 {
+    let mut joins = Vec::with_capacity(ASYNC_TASKS);
+
+    for i in 0..ASYNC_TASKS {
         let x = seed.wrapping_add(i as u64);
-        funcs.push(move || {
-            // if ret % 10_000 == 0 {
-            //     println!("blocking done num: {}", ret);
-            // }
-            sync_chain(x)
-        });
+
+        joins.push(spawn(async move {
+            yield_once().await;
+            async_chain(x).await
+        }));
     }
 
-    let joins = spawn_blocking_many(funcs);
-    let _results = JoinAll::new(joins).await;
-    BLOCK_TASKS as u64
+    let results = JoinAll::new(joins).await;
+
+    let mut acc = 0u64;
+    for r in results {
+        acc = acc.wrapping_add(r);
+    }
+
+    black_box(acc);
+    ASYNC_TASKS as u64
 }
 
 #[inline(always)]
@@ -2745,7 +2773,7 @@ fn nanos_per_call(total_micros: u64, call_count: u64) -> f64 {
     if call_count == 0 {
         0.0
     } else {
-        (total_micros as f64 * 1000.0) / call_count as f64
+        total_micros as f64 * 1000.0 / call_count as f64
     }
 }
 
@@ -2759,6 +2787,15 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
 }
 
 #[inline(always)]
+fn safe_ratio_f64(num: f64, den: f64) -> f64 {
+    if den == 0.0 {
+        0.0
+    } else {
+        num / den
+    }
+}
+
+#[inline(always)]
 fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
     if total_micros == 0 {
         0.0
@@ -2768,30 +2805,17 @@ fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
 }
 
 pub async fn bench_async_vs_sync_call_latency_async() {
-    let mut warm = 0u64;
-    for _ in 0..10_000 {
-        warm = sync_chain(warm);
-    }
-
     let mut warm_async = 0u64;
     for _ in 0..10_000 {
         warm_async = async_chain(warm_async).await;
     }
     black_box(warm_async);
 
-    let mut warm_blk = 0u64;
-    for _ in 0..200_000 {
-        warm_blk = blocking_chain(warm_blk).await;
+    let mut warm_spawn = 0u64;
+    for _ in 0..10_000 {
+        warm_spawn = async_spawn_wake_chain(warm_spawn).await;
     }
-    black_box(warm_blk);
-
-    let mut s = 0u64;
-    let sw_sync = Stopwatch::start();
-    for _ in 0..ITERS {
-        s = sync_chain(s);
-    }
-    let sync_us = sw_sync.elapsed_micros();
-    black_box(s);
+    black_box(warm_spawn);
 
     let mut a = 0u64;
     let sw_async = Stopwatch::start();
@@ -2801,161 +2825,562 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     let async_us = sw_async.elapsed_micros();
     black_box(a);
 
-    let mut b = 0u64;
-    let sw_blk = Stopwatch::start();
+    let mut sw = 0u64;
+    let sw_spawn = Stopwatch::start();
     for _ in 0..ITERS {
-        b = blocking_chain(b).await;
+        sw = async_spawn_wake_chain(sw).await;
     }
-    let blk_us = sw_blk.elapsed_micros();
-    black_box(b);
+    let spawn_us = sw_spawn.elapsed_micros();
+    black_box(sw);
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
-    for index in 1..2u64 {
-        q = 0;
-        q = blocking_queue_stress(q).await;
-        println!("blocking num: {}", index * q);
-    }
+    q = async_queue_stress(q).await;
     let q_us = sw_q.elapsed_micros();
     black_box(q);
 
     let iters_u64 = ITERS as u64;
     let inner_calls_u64 = (ITERS as u64) * (DEPTH as u64);
+    let asyncq_inner_calls_u64 = (ASYNC_TASKS as u64) * (DEPTH as u64);
 
-    let sync_us_per_chain = avg_micros_per(sync_us, iters_u64);
     let async_us_per_chain = avg_micros_per(async_us, iters_u64);
-    let blk_us_per_chain = avg_micros_per(blk_us, iters_u64);
+    let spawn_us_per_chain = avg_micros_per(spawn_us, iters_u64);
+    let asyncq_us_per_task = avg_micros_per(q_us, ASYNC_TASKS as u64);
 
-    let sync_ns_per_inner = nanos_per_call(sync_us, inner_calls_u64);
     let async_ns_per_inner = nanos_per_call(async_us, inner_calls_u64);
+    let spawn_ns_per_inner = nanos_per_call(spawn_us, inner_calls_u64);
+    let asyncq_ns_per_inner = nanos_per_call(q_us, asyncq_inner_calls_u64);
 
-    let sync_ms = micros_to_ms(sync_us);
     let async_ms = micros_to_ms(async_us);
-    let blk_ms = micros_to_ms(blk_us);
-
+    let spawn_ms = micros_to_ms(spawn_us);
     let q_ms = micros_to_ms(q_us);
-    let q_us_per_task = avg_micros_per(q_us, BLOCK_TASKS as u64);
 
-    println!("[bench] iters={} depth={}", ITERS, DEPTH);
+    let async_ops_sec = ops_per_sec_from_micros(iters_u64, async_us);
+    let spawn_ops_sec = ops_per_sec_from_micros(iters_u64, spawn_us);
+    let asyncq_ops_sec = ops_per_sec_from_micros(ASYNC_TASKS as u64, q_us);
+
+    let spawn_vs_async = safe_ratio(spawn_us, async_us);
+    let asyncq_vs_async = safe_ratio_f64(asyncq_us_per_task, async_us_per_chain);
+    let spawn_vs_asyncq = safe_ratio_f64(spawn_us_per_chain, asyncq_us_per_task);
+
+    let spawn_overhead_us = spawn_us_per_chain - async_us_per_chain;
+    let asyncq_overhead_us = asyncq_us_per_task - async_us_per_chain;
+
     println!(
-        "[bench] sync:  total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
-        sync_ms, sync_us_per_chain, sync_ns_per_inner
-    );
-    println!(
-        "[bench] async: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
-        async_ms, async_us_per_chain, async_ns_per_inner
-    );
-    println!(
-        "[bench] blk:   total={:.3} ms  us/chain={:.3}",
-        blk_ms, blk_us_per_chain
-    );
-    println!(
-        "[bench] blkq:  tasks={} total={:.3} ms  us/task={:.3}",
-        BLOCK_TASKS, q_ms, q_us_per_task
+        "[bench] iters={} depth={} async_tasks={}",
+        ITERS, DEPTH, ASYNC_TASKS
     );
 
-    // Everything relative to sync baseline
-    let sm_vs_sync = safe_ratio(async_us, sync_us);
-    let blk_vs_sync = safe_ratio(blk_us, sync_us);
-    let blk_vs_blkq = safe_ratio(blk_us, q_us);
+    println!(
+        "[bench] async-sm:         total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
+        async_ms,
+        async_us_per_chain,
+        async_ns_per_inner,
+        async_ops_sec
+    );
 
-    // Isolate pure overhead costs (us per chain, relative to sync)
-    let sm_overhead_us = async_us_per_chain - sync_us_per_chain;
-    let blk_overhead_us = blk_us_per_chain - sync_us_per_chain;
-    // pending+wake = blk - async (the spawn/wake cost on top of state machine)
-    let pw_overhead_us = blk_us_per_chain - async_us_per_chain;
+    println!(
+        "[bench] async-spawn-wake: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
+        spawn_ms,
+        spawn_us_per_chain,
+        spawn_ns_per_inner,
+        spawn_ops_sec
+    );
 
-    println!("[bench] --- vs sync baseline ---");
     println!(
-        "[bench] state_machine/sync  = {:.3}x  (async overhead: {:.3} us/chain)",
-        sm_vs_sync, sm_overhead_us
+        "[bench] asyncq:           tasks={} total={:.3} ms  us/task={:.3}  ns/inner_call={:.3}  tasks/sec={:.3}",
+        ASYNC_TASKS,
+        q_ms,
+        asyncq_us_per_task,
+        asyncq_ns_per_inner,
+        asyncq_ops_sec
     );
+
+    println!("[bench] --- async overheads ---");
+
     println!(
-        "[bench] blk/sync            = {:.3}x  (spawn+wake+sm overhead: {:.3} us/chain)",
-        blk_vs_sync, blk_overhead_us
+        "[bench] spawn_wake/async_sm = {:.3}x  overhead={:.3} us/chain",
+        spawn_vs_async, spawn_overhead_us
     );
-    let pw_vs_sync = if async_us_per_chain == 0.0 {
-        0.0
-    } else {
-        blk_us_per_chain / async_us_per_chain
-    };
+
     println!(
-        "[bench] pending+wake/sync   = {:.3}x  (blk/async, pure spawn+wake cost)",
-        pw_vs_sync
+        "[bench] asyncq/async_sm      = {:.3}x  overhead={:.3} us/task",
+        asyncq_vs_async, asyncq_overhead_us
     );
+
     println!(
-        "[bench] blk/blkq            = {:.3}x  (sequential blocking vs bulk queue)",
-        blk_vs_blkq
+        "[bench] spawn_wake/asyncq    = {:.3}x  sequential spawn/join per-chain vs queued bulk async tasks",
+        spawn_vs_asyncq
     );
 }
 
-// =====================
-// Realistic traffic benchmark
-// =====================
+const SPAWN_DETACHED_ITERS: usize = 50_000;
+const SPAWN_JOIN_ITERS: usize = 50_000;
 
-// Simulates a driver-like workload: async setup -> blocking device work -> async postprocess
-// Runs at varying concurrency levels to find saturation point and measure scheduling overhead.
+const DRIVER_REQUESTS: usize = 32_768;
+const DRIVER_WAKE_BATCH: usize = 64;
+const DRIVER_STAGE_POLLS: usize = 3;
 
-const TRAFFIC_TOTAL_TASKS: usize = 100_000;
-const TRAFFIC_CONCURRENCY: &[usize] = &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
-const TRAFFIC_WORK_NS: u64 = 1000; // simulated device work per blocking task
-const TRAFFIC_ASYNC_DEPTH: usize = 10; // async setup + postprocess depth
-#[inline(never)]
-fn traffic_blocking_work(seed: u64) -> u64 {
-    // Simulate real device work: spin for TRAFFIC_WORK_NS then do a small compute
-    if TRAFFIC_WORK_NS > 0 {
-        crate::drivers::interrupt_index::wait_duration(Duration::from_nanos(TRAFFIC_WORK_NS));
-    }
-    let mut x = seed;
-    for _ in 0..100 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-    }
-    x
+pub async fn bench_runtime_executor_async() {
+    println!("=== runtime executor benchmark ===");
+    println!("detached spawns: {}", SPAWN_DETACHED_ITERS);
+    println!("join spawns:     {}", SPAWN_JOIN_ITERS);
+    println!("driver requests: {}", DRIVER_REQUESTS);
+    println!("wake batch:      {}", DRIVER_WAKE_BATCH);
+
+    bench_spawn_detached().await;
+    bench_spawn_join().await;
+    bench_driver_traffic().await;
+
+    println!("=== runtime executor benchmark done ===");
 }
 
-#[inline(never)]
-async fn traffic_async_work(mut x: u64, depth: usize) -> u64 {
-    for _ in 0..depth {
-        x = async_leaf(x).await;
-    }
-    x
-}
+async fn bench_spawn_detached() {
+    let done = CountDown::new(SPAWN_DETACHED_ITERS);
 
-/// One "request": async setup -> spawn_blocking device work -> async postprocess
-#[inline(never)]
-async fn traffic_one_request(seed: u64) -> u64 {
-    let prepared = traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await;
+    let t0 = rdtsc_ordered();
 
-    let device_result = spawn_blocking(move || traffic_blocking_work(prepared)).await;
-
-    let result = traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await;
-    result
-}
-
-/// One "request" using bulk queue for the blocking phase
-#[inline(never)]
-async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
-    let count = seeds.len();
-
-    let mut prepared = Vec::with_capacity(count);
-    for &seed in &seeds {
-        prepared.push(traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await);
+    let mut i = 0usize;
+    while i < SPAWN_DETACHED_ITERS {
+        spawn_detached(detached_spawn_task(done.clone(), i as u64));
+        i += 1;
     }
 
-    let funcs: Vec<_> = prepared
-        .iter()
-        .map(|&p| move || traffic_blocking_work(p))
-        .collect();
-    let joins = spawn_blocking_many(funcs);
-    let device_results = JoinAll::new(joins).await;
+    let t1 = rdtsc_ordered();
+    done.wait().await;
+    let t2 = rdtsc_ordered();
 
-    let mut results = Vec::with_capacity(count);
-    for device_result in device_results {
-        results.push(traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await);
-    }
-    results
+    println!("--- detached spawn ---");
+    print_cycles_per("enqueue", t1.wrapping_sub(t0), SPAWN_DETACHED_ITERS);
+    print_cycles_per("enqueue+run", t2.wrapping_sub(t0), SPAWN_DETACHED_ITERS);
 }
 
+async fn detached_spawn_task(done: Arc<CountDown>, value: u64) {
+    DriverStage::new(1).await;
+    black_box(value.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    done.done_one();
+}
+
+async fn bench_spawn_join() {
+    let mut handles = Vec::with_capacity(SPAWN_JOIN_ITERS);
+
+    let t0 = rdtsc_ordered();
+
+    let mut i = 0usize;
+    while i < SPAWN_JOIN_ITERS {
+        handles.push(spawn(join_spawn_task(i as u64)));
+        i += 1;
+    }
+
+    let t1 = rdtsc_ordered();
+    let results = JoinAll::new(handles).await;
+    let t2 = rdtsc_ordered();
+
+    let mut checksum = 0u64;
+    for v in results {
+        checksum = checksum.wrapping_add(v);
+    }
+
+    black_box(checksum);
+
+    println!("--- joinable spawn ---");
+    print_cycles_per("enqueue", t1.wrapping_sub(t0), SPAWN_JOIN_ITERS);
+    print_cycles_per("enqueue+join", t2.wrapping_sub(t0), SPAWN_JOIN_ITERS);
+    println!("checksum: {:#x}", checksum);
+}
+
+async fn join_spawn_task(value: u64) -> u64 {
+    DriverStage::new(1).await;
+    value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+async fn bench_driver_traffic() {
+    let shared = DriverBenchShared::new(DRIVER_REQUESTS);
+    let mut requests = Vec::with_capacity(DRIVER_REQUESTS);
+
+    let t0 = rdtsc_ordered();
+
+    let mut i = 0usize;
+    while i < DRIVER_REQUESTS {
+        let req = Arc::new(DriverRequest::new(i, shared.clone()));
+        requests.push(req.clone());
+        spawn_detached(driver_request_task(req));
+        i += 1;
+    }
+
+    let t_spawned = rdtsc_ordered();
+
+    ParkedWait::new(shared.clone()).await;
+
+    let t_parked = rdtsc_ordered();
+
+    let mut wake_call_cycles = 0u64;
+    let mut idx = 0usize;
+
+    while idx < requests.len() {
+        let end = min(idx + DRIVER_WAKE_BATCH, requests.len());
+
+        let b0 = rdtsc_ordered();
+
+        while idx < end {
+            requests[idx].signal();
+            idx += 1;
+        }
+
+        let b1 = rdtsc_ordered();
+        wake_call_cycles = wake_call_cycles.wrapping_add(b1.wrapping_sub(b0));
+
+        yield_once().await;
+    }
+
+    let t_wakes_done = rdtsc_ordered();
+
+    shared.done.wait().await;
+
+    let t_done = rdtsc_ordered();
+
+    let latency_sum = shared.wake_latency_sum.load(Ordering::Relaxed);
+    let latency_max = shared.wake_latency_max.load(Ordering::Relaxed);
+    let completed = shared.completed.load(Ordering::Relaxed);
+
+    println!("--- driver realistic traffic ---");
+    print_cycles_per(
+        "spawn request task",
+        t_spawned.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    print_cycles_per(
+        "spawn+park request",
+        t_parked.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    print_cycles_per("waker.signal call", wake_call_cycles, DRIVER_REQUESTS);
+    print_cycles_per("wake-to-task-observed", latency_sum, DRIVER_REQUESTS);
+    print_cycles_per(
+        "end-to-end request",
+        t_done.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    println!("wake-to-task max: {} cycles", latency_max);
+    println!("completed: {}", completed);
+    println!(
+        "wake pump total: {} cycles",
+        t_wakes_done.wrapping_sub(t_parked)
+    );
+}
+
+async fn driver_request_task(req: Arc<DriverRequest>) {
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+
+    DriverCompletionFuture::new(req.clone()).await;
+
+    DriverStage::new(1).await;
+
+    let now = rdtsc_ordered();
+    let wake = req.wake_tsc.load(Ordering::Acquire);
+    let latency = now.wrapping_sub(wake);
+
+    req.shared
+        .wake_latency_sum
+        .fetch_add(latency, Ordering::Relaxed);
+    atomic_max(&req.shared.wake_latency_max, latency);
+    req.shared.completed.fetch_add(1, Ordering::Relaxed);
+    req.shared.done.done_one();
+
+    black_box(req.index);
+}
+
+struct DriverStage {
+    remaining: usize,
+}
+
+impl DriverStage {
+    fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+}
+
+impl Future for DriverStage {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.remaining == 0 {
+            Poll::Ready(())
+        } else {
+            this.remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+struct DriverRequest {
+    index: usize,
+    ready: AtomicBool,
+    parked_once: AtomicBool,
+    wake_tsc: AtomicU64,
+    waker: Mutex<Option<Waker>>,
+    shared: Arc<DriverBenchShared>,
+}
+
+impl DriverRequest {
+    fn new(index: usize, shared: Arc<DriverBenchShared>) -> Self {
+        Self {
+            index,
+            ready: AtomicBool::new(false),
+            parked_once: AtomicBool::new(false),
+            wake_tsc: AtomicU64::new(0),
+            waker: Mutex::new(None),
+            shared,
+        }
+    }
+
+    fn signal(&self) {
+        let t = rdtsc_ordered();
+
+        self.wake_tsc.store(t, Ordering::Release);
+        self.ready.store(true, Ordering::Release);
+
+        let waker = {
+            let mut guard = self.waker.lock();
+            guard.take()
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    fn mark_parked(&self) {
+        if self.parked_once.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let parked = self.shared.parked.fetch_add(1, Ordering::AcqRel) + 1;
+
+        if parked == self.shared.total {
+            let guard = self.shared.parked_waker.lock();
+            if let Some(w) = guard.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+    }
+}
+
+struct DriverCompletionFuture {
+    req: Arc<DriverRequest>,
+}
+
+impl DriverCompletionFuture {
+    fn new(req: Arc<DriverRequest>) -> Self {
+        Self { req }
+    }
+}
+
+impl Future for DriverCompletionFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.req.ready.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.req.waker.lock();
+
+        if this.req.ready.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        drop(guard);
+
+        this.req.mark_parked();
+
+        if this.req.ready.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct DriverBenchShared {
+    total: usize,
+    parked: AtomicUsize,
+    parked_waker: Mutex<Option<Waker>>,
+    wake_latency_sum: AtomicU64,
+    wake_latency_max: AtomicU64,
+    completed: AtomicUsize,
+    done: Arc<CountDown>,
+}
+
+impl DriverBenchShared {
+    fn new(total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            total,
+            parked: AtomicUsize::new(0),
+            parked_waker: Mutex::new(None),
+            wake_latency_sum: AtomicU64::new(0),
+            wake_latency_max: AtomicU64::new(0),
+            completed: AtomicUsize::new(0),
+            done: CountDown::new(total),
+        })
+    }
+}
+
+struct ParkedWait {
+    shared: Arc<DriverBenchShared>,
+}
+
+impl ParkedWait {
+    fn new(shared: Arc<DriverBenchShared>) -> Self {
+        Self { shared }
+    }
+}
+
+impl Future for ParkedWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.shared.parked.load(Ordering::Acquire) >= this.shared.total {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.shared.parked_waker.lock();
+
+        if this.shared.parked.load(Ordering::Acquire) >= this.shared.total {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+struct CountDown {
+    remaining: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl CountDown {
+    fn new(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(count),
+            waker: Mutex::new(None),
+        })
+    }
+
+    fn done_one(&self) {
+        let old = self.remaining.fetch_sub(1, Ordering::AcqRel);
+
+        if old == 1 {
+            let guard = self.waker.lock();
+            if let Some(w) = guard.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+    }
+
+    fn wait(self: &Arc<Self>) -> CountDownWait {
+        CountDownWait {
+            inner: self.clone(),
+        }
+    }
+}
+
+struct CountDownWait {
+    inner: Arc<CountDown>,
+}
+
+impl Future for CountDownWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.inner.remaining.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.inner.waker.lock();
+
+        if this.inner.remaining.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+fn atomic_max(dst: &AtomicU64, value: u64) {
+    let mut cur = dst.load(Ordering::Relaxed);
+
+    while value > cur {
+        match dst.compare_exchange_weak(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+fn print_cycles_per(name: &str, total: u64, count: usize) {
+    let count = count as u64;
+
+    if count == 0 {
+        println!("{}: n/a", name);
+        return;
+    }
+
+    let whole = total / count;
+    let frac = ((total % count) * 100) / count;
+
+    println!("{}: {}.{:02} cycles/op", name, whole, frac);
+}
+
+#[inline(always)]
+fn rdtsc_ordered() -> u64 {
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    ((high as u64) << 32) | low as u64
+}
 // =====================
 // Config
 // =====================

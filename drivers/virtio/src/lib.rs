@@ -14,6 +14,10 @@ mod virtqueue;
 
 use alloc::vec;
 use alloc::{sync::Arc, vec::Vec};
+use blk::{
+    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH,
+    VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
@@ -21,14 +25,16 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
+use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
     BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
-    IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
-    irq_register_isr_gsi, irq_wait_closed,
+    IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
+    irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{
     FromDevice, IoBuffer, IoBufferDmaSegment, PhysFramed, ToDevice,
@@ -55,12 +61,6 @@ use temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
     bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
 };
-
-use blk::{
-    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_IN,
-    VIRTIO_BLK_T_FLUSH, VIRTIO_BLK_T_OUT,
-};
-use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -111,8 +111,8 @@ where
             break;
         }
     }
-
-    completion.await
+    let res = completion.await;
+    res
 }
 // legacy helpers
 #[inline(always)]
@@ -279,7 +279,7 @@ extern "win64" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
     let isr_va = ctx as *const u8;
@@ -300,13 +300,14 @@ extern "win64" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],
     });
+
     true
 }
 

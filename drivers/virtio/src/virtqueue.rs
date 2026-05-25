@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU16, Ordering};
 use kernel_api::device::DeviceObject;
+use kernel_api::println;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
 use crate::dma_region::ContiguousDmaRegion;

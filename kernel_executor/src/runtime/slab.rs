@@ -229,6 +229,13 @@ const CW_NONE: u8 = 0;
 const CW_UPDATING: u8 = 1;
 const CW_SET: u8 = 2;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NotifyResult {
+    Notified,
+    AlreadyQueued,
+    IdleRace,
+    Completed,
+}
 #[repr(C, align(64))]
 pub struct TaskSlot {
     gen_ref: AtomicU32,
@@ -375,17 +382,19 @@ impl TaskSlot {
     }
 
     #[inline]
-    pub fn try_notify(&self) -> bool {
+    pub fn try_notify_result(&self) -> NotifyResult {
         match self.state.compare_exchange(
             STATE_POLLING,
             STATE_NOTIFIED,
             Ordering::AcqRel,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
-            Ok(_) => true,
-            Err(STATE_IDLE) => false,
-            Err(STATE_QUEUED) => true,
-            Err(_) => true,
+            Ok(_) => NotifyResult::Notified,
+            Err(STATE_IDLE) => NotifyResult::IdleRace,
+            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
+            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
+            Err(STATE_COMPLETED) => NotifyResult::Completed,
+            Err(_) => NotifyResult::IdleRace,
         }
     }
 
@@ -752,17 +761,19 @@ impl JoinableSlot {
     }
 
     #[inline]
-    pub fn try_notify(&self) -> bool {
+    pub fn try_notify_result(&self) -> NotifyResult {
         match self.state.compare_exchange(
             STATE_POLLING,
             STATE_NOTIFIED,
             Ordering::AcqRel,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
-            Ok(_) => true,
-            Err(STATE_IDLE) => false,
-            Err(STATE_QUEUED) => true,
-            Err(_) => true,
+            Ok(_) => NotifyResult::Notified,
+            Err(STATE_IDLE) => NotifyResult::IdleRace,
+            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
+            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
+            Err(STATE_COMPLETED) => NotifyResult::Completed,
+            Err(_) => NotifyResult::IdleRace,
         }
     }
 }
@@ -1618,7 +1629,7 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
         return;
     };
 
-    for _ in 0..2 {
+    loop {
         if slot.try_enqueue() {
             slab.increment_ref(shard_idx, local_idx, generation);
             let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
@@ -1626,8 +1637,13 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
             return;
         }
 
-        if slot.try_notify() {
-            return;
+        match slot.try_notify_result() {
+            NotifyResult::Notified => return,
+            NotifyResult::AlreadyQueued => return,
+            NotifyResult::Completed => return,
+            NotifyResult::IdleRace => {
+                core::hint::spin_loop();
+            }
         }
     }
 }
@@ -1660,7 +1676,7 @@ pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation
         return;
     };
 
-    for _ in 0..2 {
+    loop {
         if slot.try_enqueue() {
             slab.increment_joinable_ref(shard_idx, local_idx, generation);
             let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
@@ -1668,12 +1684,16 @@ pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation
             return;
         }
 
-        if slot.try_notify() {
-            return;
+        match slot.try_notify_result() {
+            NotifyResult::Notified => return,
+            NotifyResult::AlreadyQueued => return,
+            NotifyResult::Completed => return,
+            NotifyResult::IdleRace => {
+                core::hint::spin_loop();
+            }
         }
     }
 }
-
 pub fn init_task_slab(config: SlabConfig) {
     TASK_SLAB_PTR.call_once(|| unsafe {
         let p = core::ptr::addr_of_mut!(TASK_SLAB_STORAGE).cast::<TaskSlab>();
