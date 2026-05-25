@@ -17,7 +17,7 @@ pub struct WorkItem {
     pub ctx: usize,
 }
 
-const MAX_SHARDS: usize = 8;
+const MAX_SHARDS: usize = 32;
 const QUEUE_CAP_PER_SHARD: usize = 12500;
 
 struct ShardedQueues {

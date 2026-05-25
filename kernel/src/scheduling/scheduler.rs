@@ -34,7 +34,7 @@ use x86_64::registers::control::Cr3;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 
-const MAX_TASKS: usize = 65_536;
+const MAX_TASKS: usize = 131_072;
 
 #[derive(Debug)]
 #[repr(u32)]
@@ -1029,7 +1029,7 @@ pub extern "win64" fn kernel_task_end() -> ! {
 
 // ── Panic dump ────────────────────────────────────────────────────────────────
 
-const MAX_DUMP_CPUS: usize = 16;
+const MAX_DUMP_CPUS: usize = 24;
 const MAX_DUMP_QUEUE: usize = 128;
 
 pub struct QueueSnapshot {

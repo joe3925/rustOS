@@ -39,6 +39,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::arch::asm;
+use core::cmp::max;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::panic::PanicInfo;
@@ -193,7 +194,7 @@ pub unsafe fn init() {
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
+    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)));
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(

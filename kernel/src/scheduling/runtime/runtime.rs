@@ -7,8 +7,6 @@ use spin::Once;
 use crate::static_handlers::{print, task_yield};
 use crate::structs::thread_pool::{BoundedThreadPool, ThreadPool};
 
-const DEFAULT_RUNTIME_JOBS: usize = 4096;
-
 struct KernelExecutorPlatform {
     runtime_pool: Once<Arc<BoundedThreadPool>>,
     blocking_pool: Once<Arc<ThreadPool>>,
