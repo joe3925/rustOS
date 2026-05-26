@@ -432,14 +432,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     println!("[bench-debug] scheduling detached benchmark task");
     spawn_detached(async move {
         // println!("[bench-debug] detached benchmark task started");
-        // bench_async_vs_sync_call_latency_async().await;
+        bench_async_vs_sync_call_latency_async().await;
         // println!("[bench-debug] async-vs-sync benchmark returned");
-        // bench_runtime_executor_async().await;
-        println!("starting check");
-        for i in 0..100_000 {
-            async_spawn_wake_chain(i).await;
-        }
-        println!("ending check");
+        bench_runtime_executor_async().await;
         // loop {
         //     bench_c_drive_io_async().await;
         //     test_full_heap_parallel();
@@ -457,8 +452,6 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
         //trigger_triple_fault();
     });
-    wait_duration(Duration::from_mins(1));
-    println!("hi");
     Ok(())
 }
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {

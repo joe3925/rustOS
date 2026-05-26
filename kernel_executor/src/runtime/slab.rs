@@ -11,8 +11,6 @@ use core::task::{Context, Poll, Waker};
 
 use spin::Once;
 
-use crate::println;
-
 use super::runtime::submit_global;
 use super::task::{STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED};
 
@@ -600,10 +598,7 @@ impl JoinableSlot {
                 let encoded =
                     encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
                 submit_global(joinable_slab_poll_trampoline, encoded);
-            } else {
-                println!("not requeued");
             }
-
             false
         }
     }
@@ -707,18 +702,30 @@ impl JoinableSlot {
     }
 
     fn wake_join_handle(&self) {
-        if self
-            .waker_state
-            .compare_exchange(WAKER_SET, WAKER_TAKEN, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            unsafe {
-                let waker = (*self.join_waker.get()).assume_init_read();
-                waker.wake();
+        loop {
+            match self.waker_state.compare_exchange(
+                WAKER_SET,
+                WAKER_TAKEN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    unsafe {
+                        let waker = (*self.join_waker.get()).assume_init_read();
+                        waker.wake();
+                    }
+
+                    return;
+                }
+                Err(WAKER_UPDATING) => {
+                    core::hint::spin_loop();
+                }
+                Err(_) => {
+                    return;
+                }
             }
         }
     }
-
     pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
         loop {
             let s = self.cached_waker_state.load(Ordering::Acquire);
