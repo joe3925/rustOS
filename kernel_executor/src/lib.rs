@@ -1,6 +1,8 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod global_async;
 pub mod platform;

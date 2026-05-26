@@ -17,7 +17,6 @@ pub struct WorkItem {
 }
 
 const MAX_SHARDS: usize = 32;
-const MAX_WORK_ITEMS: usize = 50_000;
 
 struct ShardedQueues {
     queues: Vec<BoundedTreiberStack<WorkItem>>,
@@ -121,15 +120,16 @@ impl GlobalAsyncExecutor {
         })
     }
 
-    pub fn init(&self, shards: usize) {
+    pub fn init(&self, shards: usize, max_work_items: usize) {
         let shards = shards.clamp(1, MAX_SHARDS);
+        let max_work_items = max_work_items.max(shards);
 
         self.queues
-            .call_once(|| ShardedQueues::new(shards, MAX_WORK_ITEMS));
+            .call_once(|| ShardedQueues::new(shards, max_work_items));
         self.max_pumps.0.store(shards, Ordering::Release);
 
         platform().init_blocking(shards);
-        platform().init_runtime(shards, MAX_SHARDS);
+        platform().init_runtime(shards, shards);
 
         if self.queues().has_pending_work() {
             self.try_schedule();

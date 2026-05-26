@@ -27,6 +27,9 @@ fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(count) as *const (), &VTABLE)) }
 }
 
+// This test exists to cover the detached task state machine without involving
+// the global executor. An inline poll of a ready future should complete exactly
+// once and prevent a second inline poll from starting.
 #[test]
 fn future_task_inline_poll_runs_ready_future_to_completion() {
     let ran = Arc::new(AtomicUsize::new(0));
@@ -43,6 +46,9 @@ fn future_task_inline_poll_runs_ready_future_to_completion() {
     assert!(!task.try_start_inline_poll());
 }
 
+// This test exists to cover the joinable task state machine directly. A ready
+// future should store its result, wake the joiner once, and allow the result to
+// be consumed exactly once.
 #[test]
 fn joinable_task_inline_poll_stores_result_and_wakes_joiner() {
     let task = Arc::new(JoinableTask::new(async { 99usize }));

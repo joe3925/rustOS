@@ -194,7 +194,7 @@ pub unsafe fn init() {
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)));
+    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(

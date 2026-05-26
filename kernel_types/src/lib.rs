@@ -88,6 +88,7 @@ pub type DpcFn = extern "win64" fn(usize);
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;
 
+#[cfg(not(any(test, feature = "hosted-tests")))]
 #[unsafe(no_mangle)]
 pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8) -> i32 {
     unimplemented!()
