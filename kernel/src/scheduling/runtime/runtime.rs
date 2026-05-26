@@ -57,7 +57,7 @@ impl ExecutorPlatform for KernelExecutorPlatform {
         let accepted = self.runtime_pool().submit(job.f, job.a);
 
         if !accepted {
-            panic!("runtime executor pool queue full");
+            panic!("runtime executor pool queue full size");
         }
     }
 

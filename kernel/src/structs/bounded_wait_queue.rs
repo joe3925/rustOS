@@ -28,6 +28,7 @@ pub enum BoundedWaitQueueError {
 
 struct WaitSlot {
     state: AtomicUsize,
+    task_id: AtomicU64,
     task: UnsafeCell<Option<TaskHandle>>,
 }
 
@@ -35,18 +36,27 @@ impl WaitSlot {
     const fn new() -> Self {
         Self {
             state: AtomicUsize::new(SLOT_EMPTY),
+            task_id: AtomicU64::new(WAIT_QUEUE_NONE),
             task: UnsafeCell::new(None),
         }
     }
 
     #[inline]
     unsafe fn write_task(&self, task: TaskHandle) {
+        self.task_id.store(task.task_id(), Ordering::Release);
         *self.task.get() = Some(task);
     }
 
     #[inline]
     unsafe fn take_task(&self) -> Option<TaskHandle> {
-        (*self.task.get()).take()
+        let task = (*self.task.get()).take();
+        self.task_id.store(WAIT_QUEUE_NONE, Ordering::Release);
+        task
+    }
+
+    #[inline]
+    fn task_id(&self) -> u64 {
+        self.task_id.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -163,38 +173,45 @@ impl BoundedWaitQueue {
 
     pub fn dequeue_one(&self) -> Option<TaskHandle> {
         let cap = self.slots.len();
-        let start = self.dequeue_hint.fetch_add(1, Ordering::Relaxed);
-        for offset in 0..cap {
-            let idx = (start + offset) % cap;
-            let slot = &self.slots[idx];
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_WAITING,
-                    SLOT_WAKING,
+        loop {
+            if self.len.load(Ordering::Acquire) == 0 {
+                return None;
+            }
+
+            let start = self.dequeue_hint.fetch_add(1, Ordering::Relaxed);
+            for offset in 0..cap {
+                let idx = (start + offset) % cap;
+                let slot = &self.slots[idx];
+                if slot
+                    .state
+                    .compare_exchange(
+                        SLOT_WAITING,
+                        SLOT_WAKING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+                let task = unsafe { slot.take_task() };
+                slot.state.store(SLOT_EMPTY, Ordering::Release);
+                self.len.fetch_sub(1, Ordering::Release);
+                let task = match task {
+                    Some(task) => task,
+                    None => continue,
+                };
+                let _ = task.wait_next.compare_exchange(
+                    self.id,
+                    WAIT_QUEUE_NONE,
                     Ordering::AcqRel,
                     Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
+                );
+                return Some(task);
             }
-            let task = unsafe { slot.take_task() };
-            slot.state.store(SLOT_EMPTY, Ordering::Release);
-            self.len.fetch_sub(1, Ordering::Release);
-            let task = match task {
-                Some(task) => task,
-                None => continue,
-            };
-            let _ = task.wait_next.compare_exchange(
-                self.id,
-                WAIT_QUEUE_NONE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            return Some(task);
+
+            core::hint::spin_loop();
         }
-        None
     }
     pub fn wake_one(&self) -> bool {
         let task = match self.dequeue_one() {
@@ -237,9 +254,14 @@ impl BoundedWaitQueue {
         if current.wait_next.load(Ordering::Acquire) != self.id {
             return false;
         }
+        let current_id = current.task_id();
         let cap = self.slots.len();
         for idx in 0..cap {
             let slot = &self.slots[idx];
+            if slot.task_id() != current_id {
+                continue;
+            }
+
             if slot
                 .state
                 .compare_exchange(

@@ -304,6 +304,27 @@ fn wake_one(list: &kernel_types::io::TreiberStack<Waker>) {
     }
 }
 
+fn remove_waiter(list: &kernel_types::io::TreiberStack<Waker>, waker: &Waker) {
+    let _ = list.remove_one_by(|w| w.will_wake(waker));
+}
+
+fn try_acquire_slot(handler: &IoHandler) -> bool {
+    loop {
+        let cur = handler.running_request.load(Ordering::Acquire);
+        if cur >= handler.depth as u64 {
+            return false;
+        }
+
+        if handler
+            .running_request
+            .compare_exchange(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
 struct SlotAcquireFuture<'a> {
     handler: &'a IoHandler,
 }
@@ -314,22 +335,19 @@ impl Future for SlotAcquireFuture<'_> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let h = self.handler;
 
-        loop {
-            let cur = h.running_request.load(Ordering::Acquire);
-            if cur < h.depth as u64 {
-                if h.running_request
-                    .compare_exchange(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    return Poll::Ready(());
-                }
-                continue;
-            }
-
-            // Unable to acquire: enqueue current waker and yield.
-            h.waiters.push(cx.waker().clone());
-            return Poll::Pending;
+        if try_acquire_slot(h) {
+            return Poll::Ready(());
         }
+
+        remove_waiter(&h.waiters, cx.waker());
+        h.waiters.push(cx.waker().clone());
+
+        if try_acquire_slot(h) {
+            remove_waiter(&h.waiters, cx.waker());
+            return Poll::Ready(());
+        }
+
+        Poll::Pending
     }
 }
 

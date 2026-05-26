@@ -1,4 +1,5 @@
 use crate::benchmarking::async_chain;
+use crate::benchmarking::async_spawn_wake_chain;
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
 use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
@@ -7,6 +8,7 @@ use crate::benchmarking::yield_once;
 use crate::benchmarking::BenchWindow;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::HEAP_SIZE;
+use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
 use alloc::format;
 use alloc::{
@@ -427,13 +429,21 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
 
+    println!("[bench-debug] scheduling detached benchmark task");
     spawn_detached(async move {
-        bench_async_vs_sync_call_latency_async().await;
-        bench_runtime_executor_async().await;
-        loop {
-            bench_c_drive_io_async().await;
-            test_full_heap_parallel();
+        // println!("[bench-debug] detached benchmark task started");
+        // bench_async_vs_sync_call_latency_async().await;
+        // println!("[bench-debug] async-vs-sync benchmark returned");
+        // bench_runtime_executor_async().await;
+        println!("starting check");
+        for i in 0..100_000 {
+            async_spawn_wake_chain(i).await;
         }
+        println!("ending check");
+        // loop {
+        //     bench_c_drive_io_async().await;
+        //     test_full_heap_parallel();
+        // }
 
         //DRIVE_WINDOW.start();
         //loop {
@@ -447,6 +457,8 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
 
         //trigger_triple_fault();
     });
+    wait_duration(Duration::from_mins(1));
+    println!("hi");
     Ok(())
 }
 pub(crate) fn file_parser(path: &str) -> Vec<&str> {

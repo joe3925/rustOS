@@ -254,6 +254,7 @@ fn halt_loop() -> ! {
 }
 #[no_mangle]
 pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> ! {
+    trigger_triple_fault();
     if PANIC_ACTIVE.swap(true, Ordering::SeqCst) {
         halt_loop()
     }

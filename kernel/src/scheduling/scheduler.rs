@@ -255,6 +255,7 @@ impl Scheduler {
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
         self.enqueue_inbound(best_cpu, task);
+        self.kick_remote_core(best_cpu);
         id
     }
 
@@ -268,6 +269,7 @@ impl Scheduler {
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
         self.enqueue_inbound(best_cpu, task);
+        self.kick_remote_core(best_cpu);
         id
     }
 
@@ -289,6 +291,25 @@ impl Scheduler {
             ) {
                 Ok(_) => break,
                 Err(new_head) => current_head = new_head,
+            }
+        }
+    }
+
+    fn kick_remote_core(&self, cpu: usize) {
+        if cpu == current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+
+        if let Some(core) = self.core(cpu) {
+            unsafe {
+                if let Some(a) = APIC.lock().as_ref() {
+                    a.lapic.send_ipi(
+                        IpiDest::ApicId(core.lapic_id),
+                        IpiKind::Fixed {
+                            vector: SCHED_IPI_VECTOR,
+                        },
+                    )
+                }
             }
         }
     }
@@ -418,24 +439,8 @@ impl Scheduler {
                     };
                     task.set_target_cpu(best_cpu);
 
-                    if best_cpu != current_cpu_id() {
-                        self.enqueue_inbound(best_cpu, task.clone());
-
-                        if let Some(best_core) = self.core(best_cpu) {
-                            unsafe {
-                                if let Some(a) = APIC.lock().as_ref() {
-                                    a.lapic.send_ipi(
-                                        IpiDest::ApicId(best_core.lapic_id),
-                                        IpiKind::Fixed {
-                                            vector: SCHED_IPI_VECTOR,
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                    } else {
-                        self.enqueue_inbound(best_cpu, task.clone());
-                    }
+                    self.enqueue_inbound(best_cpu, task.clone());
+                    self.kick_remote_core(best_cpu);
 
                     return;
                 }

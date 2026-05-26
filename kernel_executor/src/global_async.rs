@@ -1,9 +1,9 @@
 use crate::platform::{platform, Job};
-use alloc::boxed::Box;
-use core::array;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::mpmc_ring::MpmcRing;
+use kernel_types::io::{BoundedTreiberStack, TreiberStack};
 use spin::Once;
+use x86_64::instructions::interrupts::without_interrupts;
 
 pub type Trampoline = extern "win64" fn(usize);
 
@@ -18,33 +18,42 @@ pub struct WorkItem {
 }
 
 const MAX_SHARDS: usize = 32;
-const QUEUE_CAP_PER_SHARD: usize = 12500;
+const MAX_WORK_ITEMS: usize = 100_000;
 
 struct ShardedQueues {
-    queues: [&'static MpmcRing<WorkItem, QUEUE_CAP_PER_SHARD>; MAX_SHARDS],
+    queues: Vec<BoundedTreiberStack<WorkItem>>,
     active: CacheAligned,
     enqueue_hint: CacheAligned,
     pump_hint: CacheAligned,
+    work_count: CacheAligned,
 }
 
 impl ShardedQueues {
     fn new(shards: usize) -> Self {
         let shard_count = shards.clamp(1, MAX_SHARDS);
+        let base = MAX_WORK_ITEMS / shard_count;
+        let rem = MAX_WORK_ITEMS % shard_count;
+
+        let mut queues = Vec::with_capacity(shard_count);
+
+        let mut i = 0usize;
+        while i < shard_count {
+            let cap = base + usize::from(i < rem);
+            queues.push(BoundedTreiberStack::new(cap));
+            i += 1;
+        }
 
         Self {
-            queues: array::from_fn(|_| {
-                let q: &'static MpmcRing<WorkItem, QUEUE_CAP_PER_SHARD> =
-                    Box::leak(Box::new(MpmcRing::new()));
-                q
-            }),
+            queues,
             active: CacheAligned(AtomicUsize::new(shard_count)),
             enqueue_hint: CacheAligned(AtomicUsize::new(0)),
             pump_hint: CacheAligned(AtomicUsize::new(0)),
+            work_count: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
     fn set_active(&self, shards: usize) {
-        let capped = shards.clamp(1, MAX_SHARDS);
+        let capped = shards.clamp(1, self.queues.len());
         self.active.0.store(capped, Ordering::Release);
     }
 
@@ -52,50 +61,50 @@ impl ShardedQueues {
         self.active.0.load(Ordering::Acquire)
     }
 
-    fn push(&self, item: WorkItem) -> Result<(), WorkItem> {
+    fn try_push(&self, mut item: WorkItem) -> Result<(), WorkItem> {
         let shards = self.shard_count();
-        let start = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed);
+        let start = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
 
-        for offset in 0..shards {
+        let mut offset = 0usize;
+        while offset < shards {
             let idx = (start + offset) % shards;
 
             match self.queues[idx].try_push(item) {
-                Ok(()) => return Ok(()),
-                Err(x) => {
-                    if offset + 1 == shards {
-                        return Err(x);
-                    }
+                Ok(()) => {
+                    self.work_count.0.fetch_add(1, Ordering::Release);
+                    return Ok(());
+                }
+                Err(returned) => {
+                    item = returned;
                 }
             }
+
+            offset += 1;
         }
 
-        unreachable!()
+        Err(item)
     }
 
     fn pop_round_robin(&self, start_idx: usize) -> Option<(WorkItem, usize)> {
         let shards = self.shard_count();
 
-        for offset in 0..shards {
+        let mut offset = 0usize;
+        while offset < shards {
             let idx = (start_idx + offset) % shards;
 
-            if let Some(item) = self.queues[idx].try_pop() {
+            if let Some(item) = self.queues[idx].pop() {
+                self.work_count.0.fetch_sub(1, Ordering::AcqRel);
                 return Some((item, idx));
             }
+
+            offset += 1;
         }
 
         None
     }
 
-    fn is_empty(&self) -> bool {
-        let shards = self.shard_count();
-
-        for idx in 0..shards {
-            if !self.queues[idx].is_empty_approx() {
-                return false;
-            }
-        }
-
-        true
+    fn has_pending_work(&self) -> bool {
+        self.work_count.0.load(Ordering::Acquire) != 0
     }
 
     fn next_pump_hint(&self) -> usize {
@@ -130,7 +139,7 @@ impl GlobalAsyncExecutor {
         platform().init_blocking(shards);
         platform().init_runtime(shards, MAX_SHARDS);
 
-        if !self.queues.is_empty() {
+        if self.queues.has_pending_work() {
             self.try_schedule();
         }
     }
@@ -141,28 +150,23 @@ impl GlobalAsyncExecutor {
     }
 
     pub fn try_submit(&self, trampoline: Trampoline, ctx: usize) -> Result<(), WorkItem> {
-        self.queues.push(WorkItem { trampoline, ctx })?;
+        self.queues.try_push(WorkItem { trampoline, ctx })?;
         self.try_schedule();
         Ok(())
     }
 
     fn try_schedule(&self) {
-        loop {
-            let max = self.max_pumps.0.load(Ordering::Acquire);
-            let active = self.active_pumps.0.load(Ordering::Acquire);
+        let max = self.max_pumps.0.load(Ordering::Acquire);
+        let reserved = self
+            .active_pumps
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < max).then_some(active + 1)
+            })
+            .is_ok();
 
-            if active >= max {
-                return;
-            }
-
-            if self
-                .active_pumps
-                .0
-                .compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
+        if !reserved {
+            return;
         }
 
         let hint = self.queues.next_pump_hint();
@@ -174,7 +178,7 @@ impl GlobalAsyncExecutor {
     }
 
     fn exit_pump(&self) {
-        self.active_pumps.0.fetch_sub(1, Ordering::Release);
+        self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn pump(&self, start_hint: usize) {
@@ -199,7 +203,7 @@ impl GlobalAsyncExecutor {
 
         self.exit_pump();
 
-        if !self.queues.is_empty() {
+        if self.queues.has_pending_work() {
             self.try_schedule();
         }
     }

@@ -11,6 +11,8 @@ use core::task::{Context, Poll, Waker};
 
 use spin::Once;
 
+use crate::println;
+
 use super::runtime::submit_global;
 use super::task::{STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, STATE_QUEUED};
 
@@ -324,8 +326,8 @@ impl TaskSlot {
             Ordering::Acquire,
         );
 
-        if let Err(s) = prev {
-            return s == STATE_COMPLETED;
+        if prev.is_err() {
+            return false;
         }
 
         let mut cx = Context::from_waker(waker);
@@ -566,8 +568,8 @@ impl JoinableSlot {
             Ordering::Acquire,
         );
 
-        if let Err(s) = prev {
-            return s == STATE_COMPLETED;
+        if prev.is_err() {
+            return false;
         }
 
         let mut cx = Context::from_waker(waker);
@@ -591,7 +593,6 @@ impl JoinableSlot {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
-
             if let Err(STATE_NOTIFIED) = prev {
                 self.state.store(STATE_QUEUED, Ordering::Release);
                 let slab = get_task_slab();
@@ -599,6 +600,8 @@ impl JoinableSlot {
                 let encoded =
                     encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
                 submit_global(joinable_slab_poll_trampoline, encoded);
+            } else {
+                println!("not requeued");
             }
 
             false
@@ -1188,22 +1191,29 @@ impl TaskSlab {
         if shard_idx >= NUM_SHARDS {
             return false;
         }
+
         let shard = &self.shards[shard_idx];
         let Some(slot) = shard.get_slot(local_idx) else {
             return false;
         };
 
         let expected_gen = expected_gen & GEN_MASK;
+
         loop {
             let cur = slot.gen_ref.load(Ordering::Acquire);
+
             if unpack_gen(cur) != expected_gen {
                 return false;
             }
+
             let rc = unpack_ref(cur);
-            if rc >= REF_MASK {
+
+            if rc == 0 || rc >= REF_MASK {
                 return false;
             }
+
             let new = pack_gen_ref(expected_gen, rc + 1);
+
             match slot
                 .gen_ref
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
@@ -1212,7 +1222,6 @@ impl TaskSlab {
                 Err(v) if unpack_gen(v) != expected_gen => return false,
                 Err(_) => {
                     spin_loop();
-                    continue;
                 }
             }
         }
@@ -1319,7 +1328,6 @@ impl TaskSlab {
         }
         Some(slot)
     }
-
     pub fn increment_joinable_ref(
         &self,
         shard_idx: usize,
@@ -1329,22 +1337,29 @@ impl TaskSlab {
         if shard_idx >= NUM_SHARDS {
             return false;
         }
+
         let shard = &self.joinable_shards[shard_idx];
         let Some(slot) = shard.get_slot(local_idx) else {
             return false;
         };
 
         let expected_gen = expected_gen & GEN_MASK;
+
         loop {
             let cur = slot.gen_ref.load(Ordering::Acquire);
+
             if unpack_gen(cur) != expected_gen {
                 return false;
             }
+
             let rc = unpack_ref(cur);
-            if rc >= REF_MASK {
+
+            if rc == 0 || rc >= REF_MASK {
                 return false;
             }
+
             let new = pack_gen_ref(expected_gen, rc + 1);
+
             match slot
                 .gen_ref
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
@@ -1353,7 +1368,6 @@ impl TaskSlab {
                 Err(v) if unpack_gen(v) != expected_gen => return false,
                 Err(_) => {
                     spin_loop();
-                    continue;
                 }
             }
         }
@@ -1625,24 +1639,30 @@ pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
 
 pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
     let slab = get_task_slab();
+
+    if !slab.increment_ref(shard_idx, local_idx, generation) {
+        return;
+    }
+
     let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
+        slab.decrement_ref(shard_idx, local_idx, generation);
         return;
     };
 
     loop {
         if slot.try_enqueue() {
-            slab.increment_ref(shard_idx, local_idx, generation);
             let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
             submit_global(slab_poll_trampoline, encoded);
             return;
         }
 
         match slot.try_notify_result() {
-            NotifyResult::Notified => return,
-            NotifyResult::AlreadyQueued => return,
-            NotifyResult::Completed => return,
+            NotifyResult::Notified | NotifyResult::AlreadyQueued | NotifyResult::Completed => {
+                slab.decrement_ref(shard_idx, local_idx, generation);
+                return;
+            }
             NotifyResult::IdleRace => {
-                core::hint::spin_loop();
+                spin_loop();
             }
         }
     }
@@ -1672,24 +1692,30 @@ pub extern "win64" fn joinable_slab_poll_trampoline(ctx: usize) {
 
 pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
     let slab = get_task_slab();
+
+    if !slab.increment_joinable_ref(shard_idx, local_idx, generation) {
+        return;
+    }
+
     let Some(slot) = slab.get_joinable_slot(shard_idx, local_idx, generation) else {
+        slab.decrement_joinable_ref(shard_idx, local_idx, generation);
         return;
     };
 
     loop {
         if slot.try_enqueue() {
-            slab.increment_joinable_ref(shard_idx, local_idx, generation);
             let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
             submit_global(joinable_slab_poll_trampoline, encoded);
             return;
         }
 
         match slot.try_notify_result() {
-            NotifyResult::Notified => return,
-            NotifyResult::AlreadyQueued => return,
-            NotifyResult::Completed => return,
+            NotifyResult::Notified | NotifyResult::AlreadyQueued | NotifyResult::Completed => {
+                slab.decrement_joinable_ref(shard_idx, local_idx, generation);
+                return;
+            }
             NotifyResult::IdleRace => {
-                core::hint::spin_loop();
+                spin_loop();
             }
         }
     }

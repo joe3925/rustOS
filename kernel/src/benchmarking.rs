@@ -2722,7 +2722,7 @@ pub async fn async_chain(mut x: u64) -> u64 {
 }
 
 #[inline(never)]
-async fn async_spawn_wake_chain(x: u64) -> u64 {
+pub async fn async_spawn_wake_chain(x: u64) -> u64 {
     spawn(async move {
         yield_once().await;
         async_chain(x).await
@@ -2805,17 +2805,20 @@ fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
 }
 
 pub async fn bench_async_vs_sync_call_latency_async() {
+    println!("[bench-debug] async-vs-sync start");
     let mut warm_async = 0u64;
     for _ in 0..10_000 {
         warm_async = async_chain(warm_async).await;
     }
     black_box(warm_async);
+    println!("[bench-debug] warm async done");
 
     let mut warm_spawn = 0u64;
     for _ in 0..10_000 {
         warm_spawn = async_spawn_wake_chain(warm_spawn).await;
     }
     black_box(warm_spawn);
+    println!("[bench-debug] warm spawn done");
 
     let mut a = 0u64;
     let sw_async = Stopwatch::start();
@@ -2824,6 +2827,7 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     }
     let async_us = sw_async.elapsed_micros();
     black_box(a);
+    println!("[bench-debug] timed async done");
 
     let mut sw = 0u64;
     let sw_spawn = Stopwatch::start();
@@ -2832,12 +2836,14 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     }
     let spawn_us = sw_spawn.elapsed_micros();
     black_box(sw);
+    println!("[bench-debug] timed spawn done");
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
     q = async_queue_stress(q).await;
     let q_us = sw_q.elapsed_micros();
     black_box(q);
+    println!("[bench-debug] async queue stress done");
 
     let iters_u64 = ITERS as u64;
     let inner_calls_u64 = (ITERS as u64) * (DEPTH as u64);
