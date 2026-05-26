@@ -435,10 +435,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
         bench_async_vs_sync_call_latency_async().await;
         // println!("[bench-debug] async-vs-sync benchmark returned");
         bench_runtime_executor_async().await;
-        // loop {
-        //     bench_c_drive_io_async().await;
-        //     test_full_heap_parallel();
-        // }
+        loop {
+            bench_c_drive_io_async().await;
+            test_full_heap_parallel();
+        }
 
         //DRIVE_WINDOW.start();
         //loop {

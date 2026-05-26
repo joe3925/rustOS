@@ -1,16 +1,13 @@
 use crate::benchmarking::BENCH_ENABLED;
-use crate::println;
-use core::{mem, ptr};
 
+use alloc::boxed::Box;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::structures::tss::TaskStateSegment;
 
 use crate::cpu::get_cpu_info;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
-use crate::memory::paging::virt_tracker::allocate_auto_kernel_range_mapped;
 use crate::structs::per_cpu_vec::PerCpuVec;
 
 use x86_64::instructions::segmentation::{Segment, CS, SS};
@@ -27,8 +24,6 @@ lazy_static! {
 pub struct GDTTracker {
     pub gdt_array: PerCpuVec<*const GlobalDescriptorTable>,
     pub selectors_per_cpu: PerCpuVec<Selectors>,
-    pub base: *mut u8,
-    pub size: usize,
 }
 unsafe impl Send for GDTTracker {}
 impl Default for GDTTracker {
@@ -39,24 +34,14 @@ impl Default for GDTTracker {
 
 impl GDTTracker {
     pub fn new() -> Self {
-        let base = allocate_auto_kernel_range_mapped(
-            0x1000,
-            PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-        )
-        .expect("failed to alloc GDT page")
-        .as_mut_ptr::<u8>();
         GDTTracker {
             gdt_array: PerCpuVec::new(),
             selectors_per_cpu: PerCpuVec::new(),
-            base,
-            size: 0,
         }
     }
     pub unsafe fn init_gdt(&mut self) {
-        let tss_size = core::mem::size_of::<TaskStateSegment>();
-        let tss_ptr = self.base.add(self.size) as *mut TaskStateSegment;
-        ptr::write(tss_ptr, TaskStateSegment::new());
-        let tss_static: &'static mut TaskStateSegment = &mut *tss_ptr;
+        let tss_static: &'static mut TaskStateSegment =
+            Box::leak(Box::new(TaskStateSegment::new()));
         // Stacks
 
         // This needs to be done because interrupt stacks aren't allowed to grow and the bench submit puts a bunch on the stack to prevent alloc in interrupts.
@@ -91,22 +76,16 @@ impl GDTTracker {
         tss_static.interrupt_stack_table[SCHED_IPI_IST_INDEX as usize] = sched_ipi_stack;
         tss_static.privilege_stack_table[0] = privilege_stack;
 
-        let tss_size = core::mem::size_of::<TaskStateSegment>();
-        let gdt_max_entries = 12; // actually 8 but is set to 12 to account for the internal counters in the struct
-        let gdt_size_bytes = gdt_max_entries * mem::size_of::<u64>();
+        let gdt: &'static mut GlobalDescriptorTable =
+            Box::leak(Box::new(GlobalDescriptorTable::new()));
 
-        let gdt_ptr_base = self.base.add(self.size + tss_size) as *mut GlobalDescriptorTable;
-        ptr::write(gdt_ptr_base, GlobalDescriptorTable::new());
+        let kernel_code_selector = gdt.append(Descriptor::kernel_code_segment());
+        let kernel_data_selector = gdt.append(Descriptor::kernel_data_segment());
+        let user_data_selector = gdt.append(Descriptor::user_data_segment());
+        let user_code_selector = gdt.append(Descriptor::user_code_segment());
 
-        let kernel_code_selector = (*gdt_ptr_base).append(Descriptor::kernel_code_segment());
-        let kernel_data_selector = (*gdt_ptr_base).append(Descriptor::kernel_data_segment());
-        let user_data_selector = (*gdt_ptr_base).append(Descriptor::user_data_segment());
-        let user_code_selector = (*gdt_ptr_base).append(Descriptor::user_code_segment());
-
-        let tss_selector = (*gdt_ptr_base).append(Descriptor::tss_segment(tss_static));
-        (*gdt_ptr_base).load();
-
-        self.size += tss_size + gdt_size_bytes;
+        let tss_selector = gdt.append(Descriptor::tss_segment(tss_static));
+        gdt.load();
 
         CS::set_reg(kernel_code_selector);
         SS::set_reg(kernel_data_selector);
@@ -122,7 +101,8 @@ impl GDTTracker {
             .get_feature_info()
             .expect("NO CPUID")
             .initial_local_apic_id() as usize;
-        self.gdt_array.set_by_id(id, gdt_ptr_base, core::ptr::null);
+        self.gdt_array
+            .set_by_id(id, gdt as *const GlobalDescriptorTable, core::ptr::null);
         self.selectors_per_cpu
             .set_by_id(id, selectors, Selectors::default);
     }

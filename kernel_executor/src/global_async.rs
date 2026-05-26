@@ -1,9 +1,8 @@
 use crate::platform::{platform, Job};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::io::{BoundedTreiberStack, TreiberStack};
+use kernel_types::io::BoundedTreiberStack;
 use spin::Once;
-use x86_64::instructions::interrupts::without_interrupts;
 
 pub type Trampoline = extern "win64" fn(usize);
 
@@ -18,26 +17,24 @@ pub struct WorkItem {
 }
 
 const MAX_SHARDS: usize = 32;
-const MAX_WORK_ITEMS: usize = 100_000;
+const MAX_WORK_ITEMS: usize = 50_000;
 
 struct ShardedQueues {
     queues: Vec<BoundedTreiberStack<WorkItem>>,
-    active: CacheAligned,
     enqueue_hint: CacheAligned,
     pump_hint: CacheAligned,
     work_count: CacheAligned,
 }
 
 impl ShardedQueues {
-    fn new(shards: usize) -> Self {
-        let shard_count = shards.clamp(1, MAX_SHARDS);
-        let base = MAX_WORK_ITEMS / shard_count;
-        let rem = MAX_WORK_ITEMS % shard_count;
+    fn new(shards: usize, max_work_items: usize) -> Self {
+        let base = max_work_items / shards;
+        let rem = max_work_items % shards;
 
-        let mut queues = Vec::with_capacity(shard_count);
+        let mut queues = Vec::with_capacity(shards);
 
         let mut i = 0usize;
-        while i < shard_count {
+        while i < shards {
             let cap = base + usize::from(i < rem);
             queues.push(BoundedTreiberStack::new(cap));
             i += 1;
@@ -45,20 +42,14 @@ impl ShardedQueues {
 
         Self {
             queues,
-            active: CacheAligned(AtomicUsize::new(shard_count)),
             enqueue_hint: CacheAligned(AtomicUsize::new(0)),
             pump_hint: CacheAligned(AtomicUsize::new(0)),
             work_count: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
-    fn set_active(&self, shards: usize) {
-        let capped = shards.clamp(1, self.queues.len());
-        self.active.0.store(capped, Ordering::Release);
-    }
-
     fn shard_count(&self) -> usize {
-        self.active.0.load(Ordering::Acquire)
+        self.queues.len()
     }
 
     fn try_push(&self, mut item: WorkItem) -> Result<(), WorkItem> {
@@ -114,7 +105,7 @@ impl ShardedQueues {
 }
 
 pub struct GlobalAsyncExecutor {
-    queues: ShardedQueues,
+    queues: Once<ShardedQueues>,
     active_pumps: CacheAligned,
     max_pumps: CacheAligned,
 }
@@ -124,7 +115,7 @@ impl GlobalAsyncExecutor {
         static EXEC: Once<GlobalAsyncExecutor> = Once::new();
 
         EXEC.call_once(|| GlobalAsyncExecutor {
-            queues: ShardedQueues::new(MAX_SHARDS),
+            queues: Once::new(),
             active_pumps: CacheAligned(AtomicUsize::new(0)),
             max_pumps: CacheAligned(AtomicUsize::new(1)),
         })
@@ -133,15 +124,22 @@ impl GlobalAsyncExecutor {
     pub fn init(&self, shards: usize) {
         let shards = shards.clamp(1, MAX_SHARDS);
 
+        self.queues
+            .call_once(|| ShardedQueues::new(shards, MAX_WORK_ITEMS));
         self.max_pumps.0.store(shards, Ordering::Release);
-        self.queues.set_active(shards);
 
         platform().init_blocking(shards);
         platform().init_runtime(shards, MAX_SHARDS);
 
-        if self.queues.has_pending_work() {
+        if self.queues().has_pending_work() {
             self.try_schedule();
         }
+    }
+
+    fn queues(&self) -> &ShardedQueues {
+        self.queues
+            .get()
+            .expect("global async executor queues not initialized")
     }
 
     pub fn submit(&self, trampoline: Trampoline, ctx: usize) {
@@ -150,7 +148,7 @@ impl GlobalAsyncExecutor {
     }
 
     pub fn try_submit(&self, trampoline: Trampoline, ctx: usize) -> Result<(), WorkItem> {
-        self.queues.try_push(WorkItem { trampoline, ctx })?;
+        self.queues().try_push(WorkItem { trampoline, ctx })?;
         self.try_schedule();
         Ok(())
     }
@@ -169,7 +167,7 @@ impl GlobalAsyncExecutor {
             return;
         }
 
-        let hint = self.queues.next_pump_hint();
+        let hint = self.queues().next_pump_hint();
 
         platform().submit_runtime(Job {
             f: pump_trampoline,
@@ -182,16 +180,13 @@ impl GlobalAsyncExecutor {
     }
 
     fn pump(&self, start_hint: usize) {
-        let shard_count = self.queues.shard_count();
+        let queues = self.queues();
+        let shard_count = queues.shard_count();
         let mut cursor = start_hint % shard_count;
 
         loop {
-            let item = match self.queues.pop_round_robin(cursor) {
+            let item = match queues.pop_round_robin(cursor) {
                 Some((x, idx)) => {
-                    if is_heap_addr(x.trampoline as usize) {
-                        panic!("corrupted work item ctx: {:#X}", x.ctx);
-                    }
-
                     cursor = (idx + 1) % shard_count;
                     x
                 }
@@ -203,20 +198,10 @@ impl GlobalAsyncExecutor {
 
         self.exit_pump();
 
-        if self.queues.has_pending_work() {
+        if queues.has_pending_work() {
             self.try_schedule();
         }
     }
-}
-
-#[inline]
-fn addr_prefix_byte(addr: usize) -> u8 {
-    ((addr >> 40) & 0xff) as u8
-}
-
-#[inline]
-fn is_heap_addr(addr: usize) -> bool {
-    addr_prefix_byte(addr) == 0x86
 }
 
 #[inline(never)]

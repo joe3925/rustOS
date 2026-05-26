@@ -80,7 +80,6 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
-
 #[no_mangle]
 pub extern "win64" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
     if boot_info.is_null() {
@@ -91,7 +90,6 @@ pub extern "win64" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
     if boot_info.magic != RUSTOS_BOOT_INFO_MAGIC || boot_info.version != RUSTOS_BOOT_INFO_VERSION {
         panic!("kernel_pe_entry received an incompatible boot info block");
     }
-
     unsafe {
         copy_boot_info(boot_info);
         BOOT_INFO_INITIALIZED.store(true, Ordering::Release);

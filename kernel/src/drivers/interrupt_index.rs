@@ -1012,10 +1012,12 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
 
 extern "win64" fn ap_startup() -> ! {
     cpu::enable_sse();
+    CORE_LOCK.fetch_add(1, Ordering::SeqCst);
     // Signal that this AP is past the trampoline and safe to reuse it.
+    // CORE_LOCK is already raised so the BSP cannot miss this AP before it
+    // finishes serialized core initialization.
     AP_BOOTED.fetch_add(1, Ordering::SeqCst);
     {
-        CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();
 
         unsafe { PER_CPU_GDT.lock().init_gdt() };
