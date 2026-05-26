@@ -5,6 +5,7 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::process::exit;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -18,7 +19,10 @@ use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
 const DEFAULT_HTTP_STRESS_TASKS: usize = 1_000_000;
 const REQUESTS_PER_TASK: usize = 3;
-const NETWORK_CONCURRENCY_PER_SHARD: usize = 256;
+
+// Windows will run out of sockets if this number is too big
+const NETWORK_CONCURRENCY_PER_SHARD: usize = 32;
+
 const LARGE_FUTURE_PADDING: usize = JOINABLE_STORAGE_SIZE + 1;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -64,6 +68,7 @@ impl ProgressWatchdog {
     fn start(label: &'static str, progress: Arc<AtomicUsize>) -> Self {
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
         let stop_for_thread = stop.clone();
+
         let thread = std::thread::Builder::new()
             .name(format!("executor stress watchdog: {label}"))
             .spawn(move || {
@@ -72,12 +77,19 @@ impl ProgressWatchdog {
                 loop {
                     let (lock, condvar) = &*stop_for_thread;
                     let guard = lock.lock().expect("executor stress watchdog stop lock");
-                    let (guard, _) = condvar
+
+                    let (guard, timeout) = condvar
                         .wait_timeout(guard, WATCHDOG_INTERVAL)
                         .expect("executor stress watchdog stop condvar");
+
                     if *guard {
                         break;
                     }
+
+                    if !timeout.timed_out() {
+                        continue;
+                    }
+
                     drop(guard);
 
                     let current_progress = progress.load(Ordering::Acquire);
@@ -86,7 +98,7 @@ impl ProgressWatchdog {
                             "executor stress watchdog failed {label}: no progress for {:?}; progress counter stayed at {current_progress}",
                             WATCHDOG_INTERVAL
                         );
-                        //std::process::exit(1);
+                        exit(1);
                     }
 
                     last_progress = current_progress;
@@ -237,7 +249,7 @@ struct LocalHttpServer {
 }
 
 impl LocalHttpServer {
-    fn start(tokio: &Handle) -> Self {
+    fn start(tokio: &Handle, progress: Arc<AtomicUsize>) -> Self {
         let listener =
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind executor stress HTTP server");
         listener
@@ -253,7 +265,7 @@ impl LocalHttpServer {
             let _guard = tokio.enter();
             let listener =
                 TokioTcpListener::from_std(listener).expect("convert executor stress listener");
-            tokio.spawn(run_http_server(listener, stop_for_task))
+            tokio.spawn(run_http_server(listener, stop_for_task, progress))
         };
 
         Self {
@@ -276,11 +288,16 @@ impl Drop for LocalHttpServer {
     }
 }
 
-async fn run_http_server(listener: TokioTcpListener, stop: Arc<AtomicBool>) {
+async fn run_http_server(
+    listener: TokioTcpListener,
+    stop: Arc<AtomicBool>,
+    progress: Arc<AtomicUsize>,
+) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(handle_http_connection(stream));
+                progress.fetch_add(1, Ordering::AcqRel);
+                tokio::spawn(handle_http_connection(stream, progress.clone()));
             }
             Err(_) if stop.load(Ordering::Acquire) => break,
             Err(err) => panic!("executor stress HTTP accept failed: {err}"),
@@ -288,11 +305,13 @@ async fn run_http_server(listener: TokioTcpListener, stop: Arc<AtomicBool>) {
     }
 }
 
-async fn handle_http_connection(mut stream: TokioTcpStream) {
+async fn handle_http_connection(mut stream: TokioTcpStream, progress: Arc<AtomicUsize>) {
     loop {
         let Some((task_id, round)) = read_http_request(&mut stream).await else {
             return;
         };
+        progress.fetch_add(1, Ordering::AcqRel);
+
         let value = request_value(task_id, round);
         let body = value.to_string();
         let response = format!(
@@ -305,6 +324,7 @@ async fn handle_http_connection(mut stream: TokioTcpStream) {
             .write_all(response.as_bytes())
             .await
             .expect("write executor stress HTTP response");
+        progress.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -362,11 +382,14 @@ async fn http_get_value(
     round: usize,
     permits: Arc<Semaphore>,
     connections: Arc<TokioMutex<Vec<TokioTcpStream>>>,
+    progress: Arc<AtomicUsize>,
 ) -> u64 {
     let _permit = permits
         .acquire_owned()
         .await
         .expect("executor stress HTTP semaphore closed");
+    progress.fetch_add(1, Ordering::AcqRel);
+
     let mut stream = match connections.lock().await.pop() {
         Some(stream) => stream,
         None => TokioTcpStream::connect(addr)
@@ -381,8 +404,10 @@ async fn http_get_value(
         .write_all(request.as_bytes())
         .await
         .expect("write executor stress HTTP request");
+    progress.fetch_add(1, Ordering::AcqRel);
 
     let body = read_http_body(&mut stream).await;
+    progress.fetch_add(1, Ordering::AcqRel);
     connections.lock().await.push(stream);
 
     let body = core::str::from_utf8(&body).expect("executor stress HTTP response body not UTF-8");
@@ -459,7 +484,15 @@ async fn run_executor_http_task(
 
         let permits = permits.clone();
         let connections = connections.clone();
-        let request = tokio.spawn(http_get_value(addr, task_id, round, permits, connections));
+        let progress_for_request = progress.clone();
+        let request = tokio.spawn(http_get_value(
+            addr,
+            task_id,
+            round,
+            permits,
+            connections,
+            progress_for_request,
+        ));
         let value = request
             .await
             .expect("executor stress Tokio request task panicked");
@@ -565,6 +598,7 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
     super::init_threaded_runtime();
 
     let task_count = stress_task_total();
+    let progress = Arc::new(AtomicUsize::new(0));
     let tokio = Arc::new(
         Builder::new_multi_thread()
             .worker_threads(super::test_shard_count().max(2))
@@ -572,14 +606,12 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
             .build()
             .expect("build executor stress Tokio runtime"),
     );
-    let server = LocalHttpServer::start(tokio.handle());
+    let server = LocalHttpServer::start(tokio.handle(), progress.clone());
     let permits = Arc::new(Semaphore::new(stress_network_concurrency()));
     let connections = Arc::new(TokioMutex::new(Vec::with_capacity(
         stress_network_concurrency(),
     )));
     let gate = Arc::new(AsyncStartGate::new());
-    let progress = Arc::new(AtomicUsize::new(0));
-    let _watchdog = ProgressWatchdog::start(future_set.label(), progress.clone());
 
     let mut saw_inline = false;
     let mut saw_large = false;
@@ -620,8 +652,11 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
         gate.parked_count() == task_count
     });
     gate.open();
+    progress.fetch_add(1, Ordering::AcqRel);
 
+    let watchdog = ProgressWatchdog::start(future_set.label(), progress.clone());
     let results = block_on(async { JoinAll::new(handles).await });
+    drop(watchdog);
 
     assert_eq!(results.len(), task_count);
     for (task_id, value) in results.into_iter().enumerate() {
