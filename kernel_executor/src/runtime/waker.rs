@@ -1,10 +1,10 @@
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::marker::PhantomData;
 use core::mem::{forget, transmute_copy, ManuallyDrop};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
 use crate::platform::JobFn;
+use crate::sync::Arc;
 
 use super::slab::{
     decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,

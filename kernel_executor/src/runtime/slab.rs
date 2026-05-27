@@ -2,13 +2,13 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::future::Future;
-use core::hint::spin_loop;
 use core::mem::{align_of, MaybeUninit};
 use core::pin::Pin;
 use core::ptr;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
 
+use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use crate::sync::spin_loop;
 use spin::Once;
 
 use super::runtime::submit_global;
@@ -249,7 +249,7 @@ pub struct TaskSlot {
 unsafe impl Sync for TaskSlot {}
 
 impl TaskSlot {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
@@ -416,6 +416,12 @@ const WAKER_UPDATING: u8 = 1;
 const WAKER_SET: u8 = 2;
 const WAKER_TAKEN: u8 = 3;
 
+enum JoinWakeStep {
+    Wake(Waker),
+    WaitForUpdate,
+    NoWaker,
+}
+
 #[repr(C, align(8))]
 struct JoinableStorage {
     data: MaybeUninit<[u8; JOINABLE_STORAGE_SIZE]>,
@@ -475,7 +481,7 @@ pub struct JoinableSlot {
 unsafe impl Sync for JoinableSlot {}
 
 impl JoinableSlot {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             gen_ref: AtomicU32::new(0),
             state: AtomicU8::new(STATE_IDLE),
@@ -701,28 +707,31 @@ impl JoinableSlot {
         }
     }
 
+    fn take_join_waker_for_wake(&self) -> JoinWakeStep {
+        match self.waker_state.compare_exchange(
+            WAKER_SET,
+            WAKER_TAKEN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let waker = unsafe { (*self.join_waker.get()).assume_init_read() };
+                JoinWakeStep::Wake(waker)
+            }
+            Err(WAKER_UPDATING) => JoinWakeStep::WaitForUpdate,
+            Err(_) => JoinWakeStep::NoWaker,
+        }
+    }
+
     fn wake_join_handle(&self) {
         loop {
-            match self.waker_state.compare_exchange(
-                WAKER_SET,
-                WAKER_TAKEN,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    unsafe {
-                        let waker = (*self.join_waker.get()).assume_init_read();
-                        waker.wake();
-                    }
-
+            match self.take_join_waker_for_wake() {
+                JoinWakeStep::Wake(waker) => {
+                    waker.wake();
                     return;
                 }
-                Err(WAKER_UPDATING) => {
-                    core::hint::spin_loop();
-                }
-                Err(_) => {
-                    return;
-                }
+                JoinWakeStep::WaitForUpdate => spin_loop(),
+                JoinWakeStep::NoWaker => return,
             }
         }
     }
@@ -1755,93 +1764,255 @@ pub fn slab_stats() -> SlabStats {
     get_task_slab().stats()
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(loom, feature = "loom")))]
 mod tests {
     use super::*;
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use core::task::Waker;
-    use std::task::Wake;
-    use std::time::{Duration, Instant};
+    use crate::sync::exhaustive_model;
+    use core::mem::ManuallyDrop;
+    use core::task::{RawWaker, RawWakerVTable, Waker};
 
-    struct CountWake {
-        wakes: AtomicUsize,
+    struct ModelWakeCounter {
+        wakes: crate::sync::atomic::AtomicUsize,
     }
 
-    impl Wake for CountWake {
-        fn wake(self: Arc<Self>) {
-            self.wakes.fetch_add(1, Ordering::AcqRel);
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.wakes.fetch_add(1, Ordering::AcqRel);
-        }
+    unsafe fn clone_model_waker(ptr: *const ()) -> RawWaker {
+        let arc =
+            ManuallyDrop::new(unsafe { std::sync::Arc::from_raw(ptr.cast::<ModelWakeCounter>()) });
+        let cloned = std::sync::Arc::clone(&arc);
+        RawWaker::new(
+            std::sync::Arc::into_raw(cloned).cast::<()>(),
+            &MODEL_WAKER_VTABLE,
+        )
     }
 
-    fn wait_until_flag(flag: &AtomicBool, timeout: Duration) -> bool {
-        let start = Instant::now();
-        while !flag.load(Ordering::Acquire) {
-            if start.elapsed() >= timeout {
-                return false;
-            }
-            std::thread::yield_now();
-        }
-        true
+    unsafe fn wake_model_waker(ptr: *const ()) {
+        let arc = unsafe { std::sync::Arc::from_raw(ptr.cast::<ModelWakeCounter>()) };
+        arc.wakes
+            .fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
     }
 
-    // This test covers the precise lost-wakeup race in JoinableSlot. Completion
-    // can arrive while the JoinHandle is between WAKER_UPDATING and WAKER_SET;
-    // wake_join_handle must wait through that update and wake the installed waker.
-    #[test]
-    fn joinable_slot_wake_join_handle_waits_for_waker_update_to_finish() {
-        let slot = Arc::new(JoinableSlot::new());
-        let wake_counter = Arc::new(CountWake {
-            wakes: AtomicUsize::new(0),
-        });
-        let join_waker = Waker::from(wake_counter.clone());
-        let entered_wake = Arc::new(AtomicBool::new(false));
-        let returned_from_wake = Arc::new(AtomicBool::new(false));
+    unsafe fn wake_model_waker_by_ref(ptr: *const ()) {
+        let arc =
+            ManuallyDrop::new(unsafe { std::sync::Arc::from_raw(ptr.cast::<ModelWakeCounter>()) });
+        arc.wakes
+            .fetch_add(1, crate::sync::atomic::Ordering::AcqRel);
+    }
 
-        slot.waker_state.store(WAKER_UPDATING, Ordering::Release);
+    unsafe fn drop_model_waker(ptr: *const ()) {
+        drop(unsafe { std::sync::Arc::from_raw(ptr.cast::<ModelWakeCounter>()) });
+    }
 
-        let slot_for_thread = slot.clone();
-        let entered_for_thread = entered_wake.clone();
-        let returned_for_thread = returned_from_wake.clone();
-        let wake_thread = std::thread::spawn(move || {
-            entered_for_thread.store(true, Ordering::Release);
-            slot_for_thread.wake_join_handle();
-            returned_for_thread.store(true, Ordering::Release);
-        });
+    static MODEL_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_model_waker,
+        wake_model_waker,
+        wake_model_waker_by_ref,
+        drop_model_waker,
+    );
 
-        assert!(
-            wait_until_flag(&entered_wake, Duration::from_secs(1)),
-            "wake thread did not enter wake_join_handle"
+    fn model_waker(counter: std::sync::Arc<ModelWakeCounter>) -> Waker {
+        let raw = RawWaker::new(
+            std::sync::Arc::into_raw(counter).cast::<()>(),
+            &MODEL_WAKER_VTABLE,
         );
+        unsafe { Waker::from_raw(raw) }
+    }
 
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(50) {
-            if returned_from_wake.load(Ordering::Acquire) {
-                break;
+    // Models the exact JoinableSlot lost-wakeup protocol with Loom-controlled
+    // atomics. wake_join_handle must not return while another thread is between
+    // WAKER_UPDATING and WAKER_SET.
+    #[test]
+    fn loom_joinable_wake_waits_for_in_progress_waker_update() {
+        exhaustive_model(|| {
+            let slot = crate::sync::Arc::new(JoinableSlot::new());
+            let counter = std::sync::Arc::new(ModelWakeCounter {
+                wakes: crate::sync::atomic::AtomicUsize::new(0),
+            });
+            let waker = model_waker(counter.clone());
+
+            slot.waker_state
+                .store(WAKER_UPDATING, crate::sync::atomic::Ordering::Release);
+
+            let wake_slot = slot.clone();
+            let wake_thread = loom::thread::spawn(move || {
+                wake_slot.wake_join_handle();
+            });
+
+            let finish_slot = slot.clone();
+            let finish_thread = loom::thread::spawn(move || {
+                unsafe {
+                    (*finish_slot.join_waker.get()).write(waker);
+                }
+                finish_slot
+                    .waker_state
+                    .store(WAKER_SET, crate::sync::atomic::Ordering::Release);
+            });
+
+            finish_thread.join().expect("waker install thread panicked");
+            wake_thread.join().expect("wake thread panicked");
+
+            assert_eq!(
+                counter.wakes.load(crate::sync::atomic::Ordering::Acquire),
+                1
+            );
+            assert_eq!(
+                slot.waker_state
+                    .load(crate::sync::atomic::Ordering::Acquire),
+                WAKER_TAKEN
+            );
+        });
+    }
+
+    // Models the production JoinHandle poll race: the handle registers a waker
+    // while task completion stores STATE_COMPLETED and wakes the handle. If the
+    // poll path can still return Pending, exactly one completion wake is required.
+    #[test]
+    fn loom_joinable_pending_poll_gets_completion_wake() {
+        exhaustive_model(|| {
+            let slot = crate::sync::Arc::new(JoinableSlot::new());
+            let counter = std::sync::Arc::new(ModelWakeCounter {
+                wakes: crate::sync::atomic::AtomicUsize::new(0),
+            });
+            let returned_pending =
+                crate::sync::Arc::new(crate::sync::atomic::AtomicBool::new(false));
+            let waker = model_waker(counter.clone());
+
+            let waiter_slot = slot.clone();
+            let waiter_pending = returned_pending.clone();
+            let waiter = loom::thread::spawn(move || {
+                if !waiter_slot.is_completed() {
+                    loom::thread::yield_now();
+                    waiter_slot.update_join_waker(&waker);
+                    loom::thread::yield_now();
+
+                    if !waiter_slot.is_completed() {
+                        waiter_pending.store(true, crate::sync::atomic::Ordering::Release);
+                    }
+                }
+            });
+
+            let complete_slot = slot.clone();
+            let completer = loom::thread::spawn(move || {
+                loom::thread::yield_now();
+                complete_slot
+                    .state
+                    .store(STATE_COMPLETED, crate::sync::atomic::Ordering::Release);
+                loom::thread::yield_now();
+                complete_slot.wake_join_handle();
+            });
+
+            waiter.join().expect("join handle poll thread panicked");
+            completer.join().expect("completion thread panicked");
+
+            if returned_pending.load(crate::sync::atomic::Ordering::Acquire) {
+                assert_eq!(
+                    counter.wakes.load(crate::sync::atomic::Ordering::Acquire),
+                    1
+                );
+                assert_eq!(
+                    slot.waker_state
+                        .load(crate::sync::atomic::Ordering::Acquire),
+                    WAKER_TAKEN
+                );
             }
-            std::thread::yield_now();
-        }
+        });
+    }
 
-        if returned_from_wake.load(Ordering::Acquire) {
-            wake_thread
-                .join()
-                .expect("join wake thread panicked before assertion");
-            panic!("wake_join_handle returned while join waker state was WAKER_UPDATING");
-        }
+    // Models the detached slab task wake-vs-pending-poll race. The caller's
+    // IdleRace retry must convert a just-idled task into QUEUED instead of
+    // losing the wake.
+    #[test]
+    fn loom_task_slot_notify_idle_race_requeues() {
+        exhaustive_model(|| {
+            let slot = crate::sync::Arc::new(TaskSlot::new());
+            slot.state
+                .store(STATE_POLLING, crate::sync::atomic::Ordering::Release);
 
-        unsafe {
-            (*slot.join_waker.get()).write(join_waker);
-        }
-        slot.waker_state.store(WAKER_SET, Ordering::Release);
+            let poll_slot = slot.clone();
+            let poller = loom::thread::spawn(move || {
+                let prev = poll_slot.state.compare_exchange(
+                    STATE_POLLING,
+                    STATE_IDLE,
+                    crate::sync::atomic::Ordering::AcqRel,
+                    crate::sync::atomic::Ordering::Acquire,
+                );
 
-        wake_thread
-            .join()
-            .expect("join wake thread panicked after waker install");
-        assert_eq!(wake_counter.wakes.load(Ordering::Acquire), 1);
-        assert_eq!(slot.waker_state.load(Ordering::Acquire), WAKER_TAKEN);
+                if let Err(STATE_NOTIFIED) = prev {
+                    poll_slot
+                        .state
+                        .store(STATE_QUEUED, crate::sync::atomic::Ordering::Release);
+                }
+            });
+
+            let notify_slot = slot.clone();
+            let notifier = loom::thread::spawn(move || loop {
+                match notify_slot.try_notify_result() {
+                    NotifyResult::Notified
+                    | NotifyResult::AlreadyQueued
+                    | NotifyResult::Completed => return,
+                    NotifyResult::IdleRace => {
+                        if notify_slot.try_enqueue() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            poller.join().expect("poller thread panicked");
+            notifier.join().expect("notifier thread panicked");
+
+            assert_eq!(
+                slot.state.load(crate::sync::atomic::Ordering::Acquire),
+                STATE_QUEUED
+            );
+        });
+    }
+
+    // Models the same wake-vs-pending-poll race for joinable slab slots, which
+    // have their own slot type but must preserve the same no-lost-wake contract.
+    #[test]
+    fn loom_joinable_slot_notify_idle_race_requeues() {
+        exhaustive_model(|| {
+            let slot = crate::sync::Arc::new(JoinableSlot::new());
+            slot.state
+                .store(STATE_POLLING, crate::sync::atomic::Ordering::Release);
+
+            let poll_slot = slot.clone();
+            let poller = loom::thread::spawn(move || {
+                let prev = poll_slot.state.compare_exchange(
+                    STATE_POLLING,
+                    STATE_IDLE,
+                    crate::sync::atomic::Ordering::AcqRel,
+                    crate::sync::atomic::Ordering::Acquire,
+                );
+
+                if let Err(STATE_NOTIFIED) = prev {
+                    poll_slot
+                        .state
+                        .store(STATE_QUEUED, crate::sync::atomic::Ordering::Release);
+                }
+            });
+
+            let notify_slot = slot.clone();
+            let notifier = loom::thread::spawn(move || loop {
+                match notify_slot.try_notify_result() {
+                    NotifyResult::Notified
+                    | NotifyResult::AlreadyQueued
+                    | NotifyResult::Completed => return,
+                    NotifyResult::IdleRace => {
+                        if notify_slot.try_enqueue() {
+                            return;
+                        }
+                    }
+                }
+            });
+
+            poller.join().expect("poller thread panicked");
+            notifier.join().expect("notifier thread panicked");
+
+            assert_eq!(
+                slot.state.load(crate::sync::atomic::Ordering::Acquire),
+                STATE_QUEUED
+            );
+        });
     }
 }

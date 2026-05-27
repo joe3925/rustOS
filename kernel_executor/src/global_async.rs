@@ -1,6 +1,6 @@
 use crate::platform::{platform, Job};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
 use kernel_types::io::BoundedTreiberStack;
 use spin::Once;
 

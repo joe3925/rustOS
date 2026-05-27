@@ -1,12 +1,11 @@
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::{Context, Poll, Waker};
 
-use spin::Mutex;
+use crate::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::{Arc, Mutex};
 
 use super::runtime::submit_global;
 use super::waker;
@@ -24,6 +23,52 @@ pub const STATE_QUEUED: u8 = 1;
 pub const STATE_POLLING: u8 = 2;
 pub const STATE_NOTIFIED: u8 = 3;
 pub const STATE_COMPLETED: u8 = 4;
+
+fn transition_enqueue(state: &AtomicU8) -> bool {
+    // Retry loop to handle the race between POLLING+IDLE and our
+    // POLLING+NOTIFIED attempt. Without the loop, observing POLLING
+    // then racing with the poll_once POLLING+IDLE transition causes
+    // the NOTIFIED CAS to fail with IDLE, silently dropping the wake.
+    loop {
+        match state.compare_exchange_weak(
+            STATE_IDLE,
+            STATE_QUEUED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(STATE_POLLING) => {
+                match state.compare_exchange(
+                    STATE_POLLING,
+                    STATE_NOTIFIED,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return false,
+                    Err(STATE_IDLE) => continue,
+                    Err(_) => return false,
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn transition_pending_poll_complete(state: &AtomicU8) -> bool {
+    let prev = state.compare_exchange(
+        STATE_POLLING,
+        STATE_IDLE,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+
+    if let Err(STATE_NOTIFIED) = prev {
+        state.store(STATE_QUEUED, Ordering::Release);
+        return true;
+    }
+
+    false
+}
 
 pub trait TaskPoll: Send + Sync {
     fn poll_once(self: Arc<Self>);
@@ -55,36 +100,9 @@ impl FutureTask {
 
 impl TaskPoll for FutureTask {
     fn enqueue(self: &Arc<Self>) {
-        // Retry loop to handle the race between POLLING+IDLE and our
-        // POLLING+NOTIFIED attempt. Without the loop, observing POLLING
-        // then racing with the poll_once POLLING+IDLE transition causes
-        // the NOTIFIED CAS to fail with IDLE, silently dropping the wake.
-        loop {
-            match self.state.compare_exchange_weak(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let ptr = Arc::into_raw(self.clone()) as usize;
-                    submit_global(poll_trampoline::<Self>, ptr);
-                    return;
-                }
-                Err(STATE_POLLING) => {
-                    match self.state.compare_exchange(
-                        STATE_POLLING,
-                        STATE_NOTIFIED,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return,
-                        Err(STATE_IDLE) => continue,
-                        Err(_) => return,
-                    }
-                }
-                Err(_) => return,
-            }
+        if transition_enqueue(&self.state) {
+            let ptr = Arc::into_raw(self.clone()) as usize;
+            submit_global(poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -124,19 +142,8 @@ impl TaskPoll for FutureTask {
             return;
         }
 
-        // Poll returned Pending. Transition POLLING -> IDLE, unless
-        // a wake() upgraded us to NOTIFIED.
-        let prev = self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if let Err(STATE_NOTIFIED) = prev {
-            // Wake was called during poll – re-enqueue immediately.
-            // Transition NOTIFIED -> QUEUED and submit.
-            self.state.store(STATE_QUEUED, Ordering::Release);
+        // Poll returned Pending. If a wake arrived while polling, re-enqueue.
+        if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
             submit_global(poll_trampoline::<Self>, ptr);
         }
@@ -164,15 +171,7 @@ impl TaskPoll for FutureTask {
             return;
         }
 
-        let prev = self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if let Err(STATE_NOTIFIED) = prev {
-            self.state.store(STATE_QUEUED, Ordering::Release);
+        if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
             submit_global(poll_trampoline::<Self>, ptr);
         }
@@ -236,32 +235,9 @@ impl<T: Send + 'static> JoinableTask<T> {
 
 impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
     fn enqueue(self: &Arc<Self>) {
-        loop {
-            match self.state.compare_exchange_weak(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let ptr = Arc::into_raw(self.clone()) as usize;
-                    submit_global(poll_trampoline::<Self>, ptr);
-                    return;
-                }
-                Err(STATE_POLLING) => {
-                    match self.state.compare_exchange(
-                        STATE_POLLING,
-                        STATE_NOTIFIED,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => return,
-                        Err(STATE_IDLE) => continue,
-                        Err(_) => return,
-                    }
-                }
-                Err(_) => return,
-            }
+        if transition_enqueue(&self.state) {
+            let ptr = Arc::into_raw(self.clone()) as usize;
+            submit_global(poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -308,16 +284,8 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
             return;
         }
 
-        // Pending – transition POLLING -> IDLE, or handle NOTIFIED
-        let prev = self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if let Err(STATE_NOTIFIED) = prev {
-            self.state.store(STATE_QUEUED, Ordering::Release);
+        // Pending. If a wake arrived while polling, re-enqueue.
+        if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
             submit_global(poll_trampoline::<Self>, ptr);
         }
@@ -352,15 +320,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
             return;
         }
 
-        let prev = self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_IDLE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-
-        if let Err(STATE_NOTIFIED) = prev {
-            self.state.store(STATE_QUEUED, Ordering::Release);
+        if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
             submit_global(poll_trampoline::<Self>, ptr);
         }
@@ -386,4 +346,36 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
 pub extern "win64" fn poll_trampoline<T: TaskPoll>(ctx: usize) {
     let task = unsafe { Arc::from_raw(ctx as *const T) };
     task.poll_once();
+}
+
+#[cfg(all(test, any(loom, feature = "loom")))]
+mod loom_tests {
+    use super::*;
+    use crate::sync::atomic::{AtomicU8, Ordering};
+    use crate::sync::{exhaustive_model, Arc};
+
+    // Models the wake-vs-pending-poll race used by both FutureTask and
+    // JoinableTask. No interleaving may leave the task IDLE after a wake raced
+    // with the poll completion path; it must end up QUEUED for another poll.
+    #[test]
+    fn loom_arc_task_enqueue_pending_poll_race_requeues() {
+        exhaustive_model(|| {
+            let state = Arc::new(AtomicU8::new(STATE_POLLING));
+
+            let poller_state = state.clone();
+            let poller = loom::thread::spawn(move || {
+                transition_pending_poll_complete(&poller_state);
+            });
+
+            let enqueue_state = state.clone();
+            let enqueue = loom::thread::spawn(move || {
+                transition_enqueue(&enqueue_state);
+            });
+
+            poller.join().expect("poller thread panicked");
+            enqueue.join().expect("enqueue thread panicked");
+
+            assert_eq!(state.load(Ordering::Acquire), STATE_QUEUED);
+        });
+    }
 }
