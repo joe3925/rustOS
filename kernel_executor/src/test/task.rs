@@ -1,7 +1,10 @@
 use alloc::sync::Arc;
+use core::future::Future;
 use core::mem::ManuallyDrop;
+use core::pin::Pin;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::task::{RawWaker, RawWakerVTable, Waker};
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::time::Duration;
 
 use crate::runtime::task::{FutureTask, JoinableTask, TaskPoll};
 
@@ -27,6 +30,41 @@ fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(count) as *const (), &VTABLE)) }
 }
 
+struct WakeDuringPoll {
+    polls: Arc<AtomicUsize>,
+}
+
+impl Future for WakeDuringPoll {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.polls.fetch_add(1, Ordering::AcqRel) == 0 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    }
+}
+
+struct JoinableWakeDuringPoll {
+    polls: Arc<AtomicUsize>,
+    value: usize,
+}
+
+impl Future for JoinableWakeDuringPoll {
+    type Output = usize;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.polls.fetch_add(1, Ordering::AcqRel) == 0 {
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(self.value)
+        }
+    }
+}
+
 // This test exists to cover the detached task state machine without involving
 // the global executor. An inline poll of a ready future should complete exactly
 // once and prevent a second inline poll from starting.
@@ -46,6 +84,26 @@ fn future_task_inline_poll_runs_ready_future_to_completion() {
     assert!(!task.try_start_inline_poll());
 }
 
+// This test covers the detached task POLLING -> NOTIFIED -> QUEUED transition
+// directly. A wake that fires during poll must requeue the task after Pending
+// instead of being dropped when the poll returns.
+#[test]
+fn future_task_wake_during_inline_poll_requeues_and_completes() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = Arc::new(FutureTask::new(WakeDuringPoll {
+        polls: polls.clone(),
+    }));
+
+    assert!(task.try_start_inline_poll());
+    task.clone().poll_once_inline();
+
+    super::wait_until(Duration::from_secs(10), || task.is_completed());
+    assert_eq!(polls.load(Ordering::Acquire), 2);
+}
+
 // This test exists to cover the joinable task state machine directly. A ready
 // future should store its result, wake the joiner once, and allow the result to
 // be consumed exactly once.
@@ -61,5 +119,30 @@ fn joinable_task_inline_poll_stores_result_and_wakes_joiner() {
     assert!(task.is_completed());
     assert_eq!(task.take_result(), Some(99));
     assert_eq!(task.take_result(), None);
+    assert_eq!(wake_count.load(Ordering::Acquire), 1);
+}
+
+// This test covers the joinable Arc task POLLING -> NOTIFIED -> QUEUED
+// transition. The task wakes itself during its first poll, so completion depends
+// on preserving that in-flight wake and polling it again.
+#[test]
+fn joinable_task_wake_during_inline_poll_requeues_completes_and_wakes_joiner() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let polls = Arc::new(AtomicUsize::new(0));
+    let task = Arc::new(JoinableTask::new(JoinableWakeDuringPoll {
+        polls: polls.clone(),
+        value: 123,
+    }));
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    task.set_waker(counting_waker(wake_count.clone()));
+
+    assert!(task.try_start_inline_poll());
+    task.clone().poll_once_inline();
+
+    super::wait_until(Duration::from_secs(10), || task.is_completed());
+    assert_eq!(polls.load(Ordering::Acquire), 2);
+    assert_eq!(task.take_result(), Some(123));
     assert_eq!(wake_count.load(Ordering::Acquire), 1);
 }

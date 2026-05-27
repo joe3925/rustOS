@@ -4,6 +4,8 @@ use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::sync::{Condvar, Mutex};
+use std::task::Wake;
 use std::time::Duration;
 
 use crate::global_async::GlobalAsyncExecutor;
@@ -37,6 +39,70 @@ fn counting_waker(count: Arc<AtomicUsize>) -> Waker {
 fn poll_once<F: Future + Unpin>(future: &mut F, waker: &Waker) -> Poll<F::Output> {
     let mut cx = Context::from_waker(waker);
     Pin::new(future).poll(&mut cx)
+}
+
+struct WakeSignal {
+    wakes: AtomicUsize,
+    lock: Mutex<()>,
+    condvar: Condvar,
+}
+
+impl WakeSignal {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            wakes: AtomicUsize::new(0),
+            lock: Mutex::new(()),
+            condvar: Condvar::new(),
+        })
+    }
+
+    fn waker(self: &Arc<Self>) -> Waker {
+        Waker::from(self.clone())
+    }
+
+    fn wake_count(&self) -> usize {
+        self.wakes.load(Ordering::Acquire)
+    }
+
+    fn wait_for_wakes(&self, expected: usize, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut guard = self.lock.lock().expect("wake signal lock");
+
+        while self.wake_count() < expected {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let (next_guard, result) = self
+                .condvar
+                .wait_timeout(guard, remaining)
+                .expect("wake signal condvar");
+            guard = next_guard;
+
+            if result.timed_out() && self.wake_count() < expected {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn record_wake(&self) {
+        self.wakes.fetch_add(1, Ordering::AcqRel);
+        self.condvar.notify_all();
+    }
+}
+
+impl Wake for WakeSignal {
+    fn wake(self: Arc<Self>) {
+        self.record_wake();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.record_wake();
+    }
 }
 
 struct WakeOnce {
@@ -163,9 +229,106 @@ impl Future for LargeCountingJoinFuture {
 
 struct LargeResult([usize; 128]);
 
+struct DropMarker {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for DropMarker {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct ControlledFuture<T> {
+    ready: Arc<AtomicBool>,
+    child_waker: Arc<Mutex<Option<Waker>>>,
+    completed: Arc<AtomicUsize>,
+    value: Option<T>,
+}
+
+impl<T> Unpin for ControlledFuture<T> {}
+
+impl<T> ControlledFuture<T> {
+    fn new(
+        ready: Arc<AtomicBool>,
+        child_waker: Arc<Mutex<Option<Waker>>>,
+        completed: Arc<AtomicUsize>,
+        value: T,
+    ) -> Self {
+        Self {
+            ready,
+            child_waker,
+            completed,
+            value: Some(value),
+        }
+    }
+}
+
+impl<T> Future for ControlledFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.ready.load(Ordering::Acquire) {
+            this.completed.fetch_add(1, Ordering::AcqRel);
+            Poll::Ready(this.value.take().expect("controlled future polled after ready"))
+        } else {
+            *this
+                .child_waker
+                .lock()
+                .expect("controlled future waker lock") = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+struct LargeControlledFuture<T> {
+    inner: ControlledFuture<T>,
+    _padding: [u8; JOINABLE_STORAGE_SIZE + 1],
+}
+
+impl<T> Unpin for LargeControlledFuture<T> {}
+
+impl<T> Future for LargeControlledFuture<T> {
+    type Output = T;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll(cx)
+    }
+}
+
+struct RecursiveSubmitState {
+    remaining_submissions: AtomicUsize,
+    completed: AtomicUsize,
+}
+
 extern "win64" fn increment_counter(ctx: usize) {
     let counter = unsafe { &*(ctx as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::AcqRel);
+}
+
+extern "win64" fn recursive_submit_counter(ctx: usize) {
+    let state = unsafe { &*(ctx as *const RecursiveSubmitState) };
+    state.completed.fetch_add(1, Ordering::AcqRel);
+
+    let should_submit_more = state
+        .remaining_submissions
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            (remaining > 0).then(|| remaining - 1)
+        })
+        .is_ok();
+
+    if should_submit_more {
+        GlobalAsyncExecutor::global().submit(recursive_submit_counter, ctx);
+    }
+}
+
+fn take_child_waker(slot: &Arc<Mutex<Option<Waker>>>) -> Waker {
+    slot.lock()
+        .expect("controlled future waker lock")
+        .take()
+        .expect("controlled future did not register waker")
 }
 
 // This test exists to keep the zero-scheduling fast path honest: a ready future
@@ -238,6 +401,435 @@ fn spawn_joinhandle_completes_inline_and_fallback_storage_paths() {
     assert_eq!(large_result.0[0], 33);
     assert_eq!(large_result.0[127], 33);
     assert_eq!(over_aligned, 44);
+}
+
+// This test exists to make the JoinHandle wake contract explicit for slab-backed
+// tasks. After a handle returns Pending, the test waits for the registered waker
+// instead of relying on block_on or JoinAll to poll in a loop.
+#[test]
+fn slab_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut handle = spawn(ControlledFuture::new(
+        ready.clone(),
+        child_waker.clone(),
+        completed.clone(),
+        77usize,
+    ));
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    assert!(
+        join_wake.wait_for_wakes(1, Duration::from_secs(10)),
+        "slab JoinHandle was not woken after its child completed"
+    );
+    assert_eq!(completed.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Ready(77)
+    ));
+}
+
+// This test mirrors the slab wake contract on the Arc fallback path. It prevents
+// the large-future path from depending on eager repolling by block_on/JoinAll.
+#[test]
+fn arc_fallback_joinhandle_pending_poll_wakes_registered_waiter_on_completion() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let future = LargeControlledFuture {
+        inner: ControlledFuture::new(
+            ready.clone(),
+            child_waker.clone(),
+            completed.clone(),
+            88usize,
+        ),
+        _padding: [0; JOINABLE_STORAGE_SIZE + 1],
+    };
+    let mut handle = spawn(future);
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    assert!(
+        join_wake.wait_for_wakes(1, Duration::from_secs(10)),
+        "Arc fallback JoinHandle was not woken after its child completed"
+    );
+    assert_eq!(completed.load(Ordering::Acquire), 1);
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Ready(88)
+    ));
+}
+
+// This test protects waker replacement on slab-backed JoinHandles. If a pending
+// handle is polled by a new task, completion must wake the newest waiter and not
+// a stale waker left over from an earlier poll.
+#[test]
+fn slab_joinhandle_completion_uses_latest_registered_waiter() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut handle = spawn(ControlledFuture::new(
+        ready.clone(),
+        child_waker.clone(),
+        completed,
+        99usize,
+    ));
+
+    let stale_waiter = WakeSignal::new();
+    let latest_waiter = WakeSignal::new();
+
+    assert!(matches!(
+        poll_once(&mut handle, &stale_waiter.waker()),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        poll_once(&mut handle, &latest_waiter.waker()),
+        Poll::Pending
+    ));
+
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    assert!(
+        latest_waiter.wait_for_wakes(1, Duration::from_secs(10)),
+        "latest JoinHandle waiter was not woken"
+    );
+    assert_eq!(
+        stale_waiter.wake_count(),
+        0,
+        "stale JoinHandle waiter was woken after replacement"
+    );
+    assert!(matches!(
+        poll_once(&mut handle, &latest_waiter.waker()),
+        Poll::Ready(99)
+    ));
+}
+
+// This test protects waker replacement on Arc fallback JoinHandles. The fallback
+// JoinableTask path uses a different waker store than slab slots, so it needs the
+// same stale-waiter check independently.
+#[test]
+fn arc_fallback_joinhandle_completion_uses_latest_registered_waiter() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let future = LargeControlledFuture {
+        inner: ControlledFuture::new(
+            ready.clone(),
+            child_waker.clone(),
+            completed,
+            100usize,
+        ),
+        _padding: [0; JOINABLE_STORAGE_SIZE + 1],
+    };
+    let mut handle = spawn(future);
+
+    let stale_waiter = WakeSignal::new();
+    let latest_waiter = WakeSignal::new();
+
+    assert!(matches!(
+        poll_once(&mut handle, &stale_waiter.waker()),
+        Poll::Pending
+    ));
+    assert!(matches!(
+        poll_once(&mut handle, &latest_waiter.waker()),
+        Poll::Pending
+    ));
+
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    assert!(
+        latest_waiter.wait_for_wakes(1, Duration::from_secs(10)),
+        "latest Arc fallback JoinHandle waiter was not woken"
+    );
+    assert_eq!(
+        stale_waiter.wake_count(),
+        0,
+        "stale Arc fallback JoinHandle waiter was woken after replacement"
+    );
+    assert!(matches!(
+        poll_once(&mut handle, &latest_waiter.waker()),
+        Poll::Ready(100)
+    ));
+}
+
+// This test covers the slab-backed completed-but-unawaited cleanup path. A task
+// result stored in the slab must be dropped exactly once when its JoinHandle is
+// dropped without consuming the result.
+#[test]
+fn dropping_completed_slab_joinhandle_drops_unconsumed_result_once() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut handle = spawn(ControlledFuture::new(
+        ready.clone(),
+        child_waker.clone(),
+        completed.clone(),
+        DropMarker {
+            drops: drops.clone(),
+        },
+    ));
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+    assert!(
+        join_wake.wait_for_wakes(1, Duration::from_secs(10)),
+        "JoinHandle did not wake after storing an unconsumed result"
+    );
+    assert_eq!(completed.load(Ordering::Acquire), 1);
+
+    drop(handle);
+
+    super::wait_until(Duration::from_secs(10), || {
+        drops.load(Ordering::Acquire) == 1
+    });
+}
+
+// This test covers the slab-backed pending-then-dropped cleanup path. Dropping
+// the JoinHandle must not cancel the task, and the later unconsumed result must
+// still be dropped exactly once when the slot is released.
+#[test]
+fn dropping_pending_slab_joinhandle_drops_result_after_task_finishes() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut handle = spawn(ControlledFuture::new(
+        ready.clone(),
+        child_waker.clone(),
+        completed.clone(),
+        DropMarker {
+            drops: drops.clone(),
+        },
+    ));
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    drop(handle);
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    super::wait_until(Duration::from_secs(10), || {
+        completed.load(Ordering::Acquire) == 1 && drops.load(Ordering::Acquire) == 1
+    });
+}
+
+// This test covers the Arc fallback completed-but-unawaited cleanup path. Large
+// futures store their result in JoinableTask; dropping the unconsumed handle must
+// still drop that result exactly once.
+#[test]
+fn dropping_completed_arc_fallback_joinhandle_drops_unconsumed_result_once() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let future = LargeControlledFuture {
+        inner: ControlledFuture::new(
+            ready.clone(),
+            child_waker.clone(),
+            completed.clone(),
+            DropMarker {
+                drops: drops.clone(),
+            },
+        ),
+        _padding: [0; JOINABLE_STORAGE_SIZE + 1],
+    };
+    let mut handle = spawn(future);
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+    assert!(
+        join_wake.wait_for_wakes(1, Duration::from_secs(10)),
+        "Arc fallback JoinHandle did not wake after storing an unconsumed result"
+    );
+    assert_eq!(completed.load(Ordering::Acquire), 1);
+
+    drop(handle);
+
+    super::wait_until(Duration::from_secs(10), || {
+        drops.load(Ordering::Acquire) == 1
+    });
+}
+
+// This test covers the Arc fallback pending-then-dropped cleanup path. Dropping
+// the JoinHandle must not cancel a large future, and its eventual result must be
+// dropped when the task finishes with no waiter left.
+#[test]
+fn dropping_pending_arc_fallback_joinhandle_drops_result_after_task_finishes() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let ready = Arc::new(AtomicBool::new(false));
+    let child_waker = Arc::new(Mutex::new(None));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let future = LargeControlledFuture {
+        inner: ControlledFuture::new(
+            ready.clone(),
+            child_waker.clone(),
+            completed.clone(),
+            DropMarker {
+                drops: drops.clone(),
+            },
+        ),
+        _padding: [0; JOINABLE_STORAGE_SIZE + 1],
+    };
+    let mut handle = spawn(future);
+
+    let join_wake = WakeSignal::new();
+    assert!(matches!(
+        poll_once(&mut handle, &join_wake.waker()),
+        Poll::Pending
+    ));
+    super::wait_until(Duration::from_secs(10), || {
+        child_waker
+            .lock()
+            .expect("controlled future waker lock")
+            .is_some()
+    });
+
+    drop(handle);
+    ready.store(true, Ordering::Release);
+    take_child_waker(&child_waker).wake();
+
+    super::wait_until(Duration::from_secs(10), || {
+        completed.load(Ordering::Acquire) == 1 && drops.load(Ordering::Acquire) == 1
+    });
+}
+
+// This test covers the slab JoinHandle double-poll guard. Once the result has
+// been consumed, polling the same handle again is a caller bug and must panic
+// instead of reading freed slot storage.
+#[test]
+#[should_panic(expected = "JoinHandle polled after completion")]
+fn slab_joinhandle_panics_when_polled_after_completion() {
+    let guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let mut handle = spawn(async { 5usize });
+    assert_eq!(block_on(async { (&mut handle).await }), 5);
+    drop(guard);
+
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(wake_count);
+    let _ = poll_once(&mut handle, &waker);
+}
+
+// This test covers JoinAll's empty-input contract. An empty JoinAll should be
+// immediately ready and should not wake its parent just to make progress.
+#[test]
+fn join_all_empty_is_ready_without_parent_wake() {
+    let wake_count = Arc::new(AtomicUsize::new(0));
+    let waker = counting_waker(wake_count.clone());
+    let mut join_all = JoinAll::new(Vec::<WakeOnce>::new());
+
+    match poll_once(&mut join_all, &waker) {
+        Poll::Ready(values) => assert!(values.is_empty()),
+        Poll::Pending => panic!("empty JoinAll returned Pending"),
+    }
+
+    assert_eq!(wake_count.load(Ordering::Acquire), 0);
 }
 
 // This test exists to stress runtime scheduling across all configured shards.
@@ -388,5 +980,31 @@ fn raw_global_executor_jobs_drain_under_queue_pressure() {
 
     super::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == jobs
+    });
+}
+
+// This test covers the global executor handoff where work is submitted by jobs
+// that are already running on pump threads. Those recursive submissions must not
+// be stranded when the current pump drains its local view of the queues.
+#[test]
+fn global_executor_drains_work_submitted_by_running_jobs() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let initial_jobs = super::stress_task_count(32);
+    let recursive_jobs = super::stress_task_count(32);
+    let expected = initial_jobs + recursive_jobs;
+    let state = Arc::new(RecursiveSubmitState {
+        remaining_submissions: AtomicUsize::new(recursive_jobs),
+        completed: AtomicUsize::new(0),
+    });
+    let ctx = Arc::as_ptr(&state) as usize;
+
+    for _ in 0..initial_jobs {
+        GlobalAsyncExecutor::global().submit(recursive_submit_counter, ctx);
+    }
+
+    super::wait_until(Duration::from_secs(10), || {
+        state.completed.load(Ordering::Acquire) == expected
     });
 }

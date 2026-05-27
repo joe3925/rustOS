@@ -295,3 +295,43 @@ where
     submit_blocking_many(&jobs);
     joins
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    fn run_same_blocking_task_twice<F>(
+        task: Arc<SharedTask<F, usize>>,
+        header: *const SharedTaskHeader<usize>,
+    ) where
+        F: FnOnce() -> usize + Send + 'static,
+    {
+        let ctx1 = Arc::into_raw(task.clone()) as usize;
+        let ctx2 = Arc::into_raw(task) as usize;
+
+        blocking_trampoline::<F, usize>(ctx1);
+        blocking_trampoline::<F, usize>(ctx2);
+
+        let header = unsafe { &*header };
+        assert_eq!(header.take_result(), Some(321));
+    }
+
+    // This test covers the blocking trampoline's reentry guard. If a worker and
+    // a steal path both try to execute the same blocking job, the closure must run
+    // once and the second trampoline entry must return before touching the job.
+    #[test]
+    fn blocking_trampoline_runs_shared_task_at_most_once_when_reentered() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_for_task = runs.clone();
+        let task = Arc::new(SharedTask::new(move || {
+            runs_for_task.fetch_add(1, Ordering::AcqRel);
+            321usize
+        }));
+        let header = &task.header as *const SharedTaskHeader<usize>;
+
+        run_same_blocking_task_twice(task, header);
+
+        assert_eq!(runs.load(Ordering::Acquire), 1);
+    }
+}

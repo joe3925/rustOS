@@ -1,6 +1,7 @@
 use crate::runtime::slab::{
     decode_joinable_slab_ptr, decode_slab_ptr, encode_joinable_slab_ptr, encode_slab_ptr,
-    is_joinable_slab_ptr, is_slab_ptr, slab_stats, SlabConfigBuilder,
+    enqueue_joinable_slab_task, enqueue_slab_task, get_task_slab, is_joinable_slab_ptr,
+    is_slab_ptr, slab_stats, SlabConfigBuilder,
 };
 use alloc::{sync::Arc, vec::Vec};
 use core::future::Future;
@@ -66,6 +67,103 @@ fn slab_pointer_encoding_keeps_detached_and_joinable_namespaces_separate() {
         Some((7, 0x0ABC, 0xCAFE))
     );
     assert_eq!(decode_slab_ptr(joinable), None);
+}
+
+// This test covers cached waker initialization on joinable slab slots. Many
+// threads racing to fetch the cached waker must all get equivalent wakers for
+// the same slot, with no partially initialized waker visible.
+#[test]
+fn joinable_slot_cached_waker_initializes_once_under_thread_contention() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let slab = get_task_slab();
+    let handle = slab
+        .allocate_joinable()
+        .expect("expected a joinable slab slot");
+    let (shard_idx, local_idx, generation) = handle.indices();
+    let slot = slab
+        .get_joinable_slot(shard_idx, local_idx, generation)
+        .expect("allocated joinable slot missing");
+    let wakers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    std::thread::scope(|scope| {
+        for _ in 0..32 {
+            let wakers = wakers.clone();
+            scope.spawn(move || {
+                let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
+                wakers
+                    .lock()
+                    .expect("cached waker result lock")
+                    .push(waker);
+            });
+        }
+    });
+
+    let wakers = wakers.lock().expect("cached waker result lock");
+    assert_eq!(wakers.len(), 32);
+    for waker in wakers.iter().skip(1) {
+        assert!(wakers[0].will_wake(waker));
+    }
+    drop(wakers);
+
+    slab.decrement_joinable_ref(shard_idx, local_idx, generation);
+}
+
+// This test covers stale generation protection for joinable slab slots. Once a
+// slot's refcount reaches zero, an old generation must not be resurrected by a
+// stale waker or by a direct stale refcount increment.
+#[test]
+fn stale_joinable_generation_cannot_reacquire_freed_slot() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let slab = get_task_slab();
+    let handle = slab
+        .allocate_joinable()
+        .expect("expected a joinable slab slot");
+    let (shard_idx, local_idx, generation) = handle.indices();
+
+    assert!(slab.increment_joinable_ref(shard_idx, local_idx, generation));
+    slab.decrement_joinable_ref(shard_idx, local_idx, generation);
+    slab.decrement_joinable_ref(shard_idx, local_idx, generation);
+
+    assert!(
+        !slab.increment_joinable_ref(shard_idx, local_idx, generation),
+        "stale joinable generation reacquired a freed slot"
+    );
+    enqueue_joinable_slab_task(shard_idx, local_idx, generation);
+    assert!(
+        !slab.increment_joinable_ref(shard_idx, local_idx, generation),
+        "stale joinable wake resurrected a freed slot"
+    );
+}
+
+// This test covers the same stale generation/refcount contract for detached
+// slab slots. A stale detached waker must not be able to put a freed slot back
+// into the executor.
+#[test]
+fn stale_detached_generation_cannot_reacquire_freed_slot() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let slab = get_task_slab();
+    let handle = slab.allocate().expect("expected a detached slab slot");
+    let (shard_idx, local_idx, generation) = handle.indices();
+
+    assert!(slab.increment_ref(shard_idx, local_idx, generation));
+    slab.decrement_ref(shard_idx, local_idx, generation);
+    slab.decrement_ref(shard_idx, local_idx, generation);
+
+    assert!(
+        !slab.increment_ref(shard_idx, local_idx, generation),
+        "stale detached generation reacquired a freed slot"
+    );
+    enqueue_slab_task(shard_idx, local_idx, generation);
+    assert!(
+        !slab.increment_ref(shard_idx, local_idx, generation),
+        "stale detached wake resurrected a freed slot"
+    );
 }
 
 // This test exists to make sure the global slab initializes under the threaded

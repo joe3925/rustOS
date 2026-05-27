@@ -1754,3 +1754,94 @@ pub fn get_task_slab() -> &'static TaskSlab {
 pub fn slab_stats() -> SlabStats {
     get_task_slab().stats()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::task::Waker;
+    use std::task::Wake;
+    use std::time::{Duration, Instant};
+
+    struct CountWake {
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn wait_until_flag(flag: &AtomicBool, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while !flag.load(Ordering::Acquire) {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
+
+    // This test covers the precise lost-wakeup race in JoinableSlot. Completion
+    // can arrive while the JoinHandle is between WAKER_UPDATING and WAKER_SET;
+    // wake_join_handle must wait through that update and wake the installed waker.
+    #[test]
+    fn joinable_slot_wake_join_handle_waits_for_waker_update_to_finish() {
+        let slot = Arc::new(JoinableSlot::new());
+        let wake_counter = Arc::new(CountWake {
+            wakes: AtomicUsize::new(0),
+        });
+        let join_waker = Waker::from(wake_counter.clone());
+        let entered_wake = Arc::new(AtomicBool::new(false));
+        let returned_from_wake = Arc::new(AtomicBool::new(false));
+
+        slot.waker_state.store(WAKER_UPDATING, Ordering::Release);
+
+        let slot_for_thread = slot.clone();
+        let entered_for_thread = entered_wake.clone();
+        let returned_for_thread = returned_from_wake.clone();
+        let wake_thread = std::thread::spawn(move || {
+            entered_for_thread.store(true, Ordering::Release);
+            slot_for_thread.wake_join_handle();
+            returned_for_thread.store(true, Ordering::Release);
+        });
+
+        assert!(
+            wait_until_flag(&entered_wake, Duration::from_secs(1)),
+            "wake thread did not enter wake_join_handle"
+        );
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(50) {
+            if returned_from_wake.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+
+        if returned_from_wake.load(Ordering::Acquire) {
+            wake_thread
+                .join()
+                .expect("join wake thread panicked before assertion");
+            panic!("wake_join_handle returned while join waker state was WAKER_UPDATING");
+        }
+
+        unsafe {
+            (*slot.join_waker.get()).write(join_waker);
+        }
+        slot.waker_state.store(WAKER_SET, Ordering::Release);
+
+        wake_thread
+            .join()
+            .expect("join wake thread panicked after waker install");
+        assert_eq!(wake_counter.wakes.load(Ordering::Acquire), 1);
+        assert_eq!(slot.waker_state.load(Ordering::Acquire), WAKER_TAKEN);
+    }
+}
