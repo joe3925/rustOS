@@ -16,9 +16,11 @@ use super::task::{STATE_COMPLETED, STATE_IDLE, STATE_NOTIFIED, STATE_POLLING, ST
 
 const NUM_SHARDS: usize = 8;
 
+const MIN_SLOTS_PER_SHARD: usize = 64;
 const DEFAULT_SLOTS_PER_SHARD: usize = 128;
 const MAX_SLOTS_PER_SHARD: usize = 4096;
 
+const MIN_JOINABLE_SLOTS_PER_SHARD: usize = 32;
 const DEFAULT_JOINABLE_SLOTS_PER_SHARD: usize = 64;
 const MAX_JOINABLE_SLOTS_PER_SHARD: usize = 1024;
 
@@ -179,12 +181,16 @@ impl SlabConfigBuilder {
     }
 
     pub fn capacity(mut self, total: usize) -> Self {
-        self.config.slots_per_shard = total.div_ceil(NUM_SHARDS).min(MAX_SLOTS_PER_SHARD).max(64);
+        self.config.slots_per_shard = total
+            .div_ceil(NUM_SHARDS)
+            .min(MAX_SLOTS_PER_SHARD)
+            .max(MIN_SLOTS_PER_SHARD);
         self
     }
 
     pub fn slots_per_shard(mut self, slots: usize) -> Self {
-        self.config.slots_per_shard = slots.min(MAX_SLOTS_PER_SHARD).max(64);
+        self.config.slots_per_shard =
+            slots.min(MAX_SLOTS_PER_SHARD).max(MIN_SLOTS_PER_SHARD);
         self
     }
 
@@ -236,6 +242,95 @@ pub enum NotifyResult {
     IdleRace,
     Completed,
 }
+
+trait SlabSlot: Sized {
+    fn new() -> Self;
+    fn gen_ref(&self) -> &AtomicU32;
+    fn state(&self) -> &AtomicU8;
+    fn cached_waker_state(&self) -> &AtomicU8;
+    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>>;
+    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker;
+    fn prepare_for_allocation(&self);
+    fn release_last_ref(&self);
+
+    #[inline]
+    fn reset_cached_waker(&self) {
+        self.cached_waker_state().store(CW_NONE, Ordering::Relaxed);
+    }
+
+    #[inline]
+    fn drop_cached_waker_if_set(&self) {
+        let s = self.cached_waker_state().load(Ordering::Acquire);
+        if s == CW_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.cached_waker().get()).as_mut_ptr());
+            }
+        }
+        self.cached_waker_state().store(CW_NONE, Ordering::Release);
+    }
+
+    fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+        loop {
+            let s = self.cached_waker_state().load(Ordering::Acquire);
+            if s == CW_SET {
+                return unsafe { (*self.cached_waker().get()).assume_init_ref().clone() };
+            }
+            if s == CW_UPDATING {
+                spin_loop();
+                continue;
+            }
+            if self
+                .cached_waker_state()
+                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            let w = Self::create_waker(shard_idx, local_idx, generation);
+            unsafe {
+                (*self.cached_waker().get()).write(w.clone());
+            }
+            self.cached_waker_state().store(CW_SET, Ordering::Release);
+            return w;
+        }
+    }
+
+    #[inline]
+    fn is_completed(&self) -> bool {
+        self.state().load(Ordering::Acquire) == STATE_COMPLETED
+    }
+
+    #[inline]
+    fn try_enqueue(&self) -> bool {
+        self.state()
+            .compare_exchange(
+                STATE_IDLE,
+                STATE_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[inline]
+    fn try_notify_result(&self) -> NotifyResult {
+        match self.state().compare_exchange(
+            STATE_POLLING,
+            STATE_NOTIFIED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => NotifyResult::Notified,
+            Err(STATE_IDLE) => NotifyResult::IdleRace,
+            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
+            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
+            Err(STATE_COMPLETED) => NotifyResult::Completed,
+            Err(_) => NotifyResult::IdleRace,
+        }
+    }
+}
+
 #[repr(C, align(64))]
 pub struct TaskSlot {
     gen_ref: AtomicU32,
@@ -261,22 +356,6 @@ impl TaskSlot {
     }
 
     #[inline]
-    fn reset_cached_waker(&self) {
-        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn drop_cached_waker_if_set(&self) {
-        let s = self.cached_waker_state.load(Ordering::Acquire);
-        if s == CW_SET {
-            unsafe {
-                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
-            }
-        }
-        self.cached_waker_state.store(CW_NONE, Ordering::Release);
-    }
-
-    #[inline]
     pub fn init(&self, future: impl Future<Output = ()> + Send + 'static) {
         unsafe { *self.future.get() = Some(FutureStorage::new(future)) };
         self.state.store(STATE_QUEUED, Ordering::Release);
@@ -284,30 +363,7 @@ impl TaskSlot {
 
     #[inline]
     pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        loop {
-            let s = self.cached_waker_state.load(Ordering::Acquire);
-            if s == CW_SET {
-                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
-            }
-            if s == CW_UPDATING {
-                spin_loop();
-                continue;
-            }
-            if self
-                .cached_waker_state
-                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-
-            let w = super::waker::create_slab_waker(shard_idx, local_idx, generation);
-            unsafe {
-                (*self.cached_waker.get()).write(w.clone());
-            }
-            self.cached_waker_state.store(CW_SET, Ordering::Release);
-            return w;
-        }
+        <Self as SlabSlot>::get_cached_waker(self, shard_idx, local_idx, generation)
     }
 
     pub fn poll_once(
@@ -366,36 +422,17 @@ impl TaskSlot {
 
     #[inline]
     pub fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == STATE_COMPLETED
+        <Self as SlabSlot>::is_completed(self)
     }
 
     #[inline]
     pub fn try_enqueue(&self) -> bool {
-        self.state
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        <Self as SlabSlot>::try_enqueue(self)
     }
 
     #[inline]
     pub fn try_notify_result(&self) -> NotifyResult {
-        match self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_NOTIFIED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => NotifyResult::Notified,
-            Err(STATE_IDLE) => NotifyResult::IdleRace,
-            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
-            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
-            Err(STATE_COMPLETED) => NotifyResult::Completed,
-            Err(_) => NotifyResult::IdleRace,
-        }
+        <Self as SlabSlot>::try_notify_result(self)
     }
 
     #[inline]
@@ -408,6 +445,51 @@ impl TaskSlot {
                 Ordering::Acquire,
             )
             .is_ok()
+    }
+}
+
+impl SlabSlot for TaskSlot {
+    fn new() -> Self {
+        TaskSlot::new()
+    }
+
+    #[inline]
+    fn gen_ref(&self) -> &AtomicU32 {
+        &self.gen_ref
+    }
+
+    #[inline]
+    fn state(&self) -> &AtomicU8 {
+        &self.state
+    }
+
+    #[inline]
+    fn cached_waker_state(&self) -> &AtomicU8 {
+        &self.cached_waker_state
+    }
+
+    #[inline]
+    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>> {
+        &self.cached_waker
+    }
+
+    #[inline]
+    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+        super::waker::create_slab_waker(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn prepare_for_allocation(&self) {
+        self.state.store(STATE_IDLE, Ordering::Relaxed);
+        <Self as SlabSlot>::reset_cached_waker(self);
+        unsafe { *self.future.get() = None };
+    }
+
+    #[inline]
+    fn release_last_ref(&self) {
+        unsafe { *self.future.get() = None };
+        <Self as SlabSlot>::drop_cached_waker_if_set(self);
+        self.state.store(STATE_IDLE, Ordering::Release);
     }
 }
 
@@ -495,22 +577,6 @@ impl JoinableSlot {
             cached_waker: UnsafeCell::new(MaybeUninit::uninit()),
             buffer: UnsafeCell::new(JoinableStorage::new()),
         }
-    }
-
-    #[inline]
-    fn reset_cached_waker(&self) {
-        self.cached_waker_state.store(CW_NONE, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn drop_cached_waker_if_set(&self) {
-        let s = self.cached_waker_state.load(Ordering::Acquire);
-        if s == CW_SET {
-            unsafe {
-                core::ptr::drop_in_place((*self.cached_waker.get()).as_mut_ptr());
-            }
-        }
-        self.cached_waker_state.store(CW_NONE, Ordering::Release);
     }
 
     pub unsafe fn init_joinable<F, T>(&self, future: F)
@@ -736,64 +802,85 @@ impl JoinableSlot {
         }
     }
     pub fn get_cached_waker(&self, shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
-        loop {
-            let s = self.cached_waker_state.load(Ordering::Acquire);
-            if s == CW_SET {
-                return unsafe { (*self.cached_waker.get()).assume_init_ref().clone() };
-            }
-            if s == CW_UPDATING {
-                spin_loop();
-                continue;
-            }
-            if self
-                .cached_waker_state
-                .compare_exchange(CW_NONE, CW_UPDATING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-
-            let w = super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation);
-            unsafe {
-                (*self.cached_waker.get()).write(w.clone());
-            }
-            self.cached_waker_state.store(CW_SET, Ordering::Release);
-            return w;
-        }
+        <Self as SlabSlot>::get_cached_waker(self, shard_idx, local_idx, generation)
     }
 
     #[inline]
     pub fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) == STATE_COMPLETED
+        <Self as SlabSlot>::is_completed(self)
     }
 
     #[inline]
     pub fn try_enqueue(&self) -> bool {
-        self.state
-            .compare_exchange(
-                STATE_IDLE,
-                STATE_QUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        <Self as SlabSlot>::try_enqueue(self)
     }
 
     #[inline]
     pub fn try_notify_result(&self) -> NotifyResult {
-        match self.state.compare_exchange(
-            STATE_POLLING,
-            STATE_NOTIFIED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => NotifyResult::Notified,
-            Err(STATE_IDLE) => NotifyResult::IdleRace,
-            Err(STATE_QUEUED) => NotifyResult::AlreadyQueued,
-            Err(STATE_NOTIFIED) => NotifyResult::AlreadyQueued,
-            Err(STATE_COMPLETED) => NotifyResult::Completed,
-            Err(_) => NotifyResult::IdleRace,
+        <Self as SlabSlot>::try_notify_result(self)
+    }
+}
+
+impl SlabSlot for JoinableSlot {
+    fn new() -> Self {
+        JoinableSlot::new()
+    }
+
+    #[inline]
+    fn gen_ref(&self) -> &AtomicU32 {
+        &self.gen_ref
+    }
+
+    #[inline]
+    fn state(&self) -> &AtomicU8 {
+        &self.state
+    }
+
+    #[inline]
+    fn cached_waker_state(&self) -> &AtomicU8 {
+        &self.cached_waker_state
+    }
+
+    #[inline]
+    fn cached_waker(&self) -> &UnsafeCell<MaybeUninit<Waker>> {
+        &self.cached_waker
+    }
+
+    #[inline]
+    fn create_waker(shard_idx: usize, local_idx: usize, generation: u32) -> Waker {
+        super::waker::create_joinable_slab_waker(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn prepare_for_allocation(&self) {
+        self.state.store(STATE_IDLE, Ordering::Relaxed);
+        self.waker_state.store(WAKER_NONE, Ordering::Relaxed);
+        <Self as SlabSlot>::reset_cached_waker(self);
+        write_poll_fn(&self.poll_fn, None);
+        write_drop_fn(&self.drop_fn, None);
+        write_drop_fn(&self.result_drop_fn, None);
+    }
+
+    #[inline]
+    fn release_last_ref(&self) {
+        if let Some(drop_fn) = read_drop_fn(&self.drop_fn) {
+            unsafe { drop_fn((*self.buffer.get()).as_mut_ptr()) };
         }
+        write_drop_fn(&self.drop_fn, None);
+
+        <Self as SlabSlot>::drop_cached_waker_if_set(self);
+
+        let ws = self.waker_state.load(Ordering::Acquire);
+        if ws == WAKER_SET {
+            unsafe {
+                core::ptr::drop_in_place((*self.join_waker.get()).as_mut_ptr());
+            }
+        }
+        self.waker_state.store(WAKER_NONE, Ordering::Release);
+
+        write_poll_fn(&self.poll_fn, None);
+        write_drop_fn(&self.result_drop_fn, None);
+        self.state.store(STATE_IDLE, Ordering::Release);
     }
 }
 
@@ -855,17 +942,20 @@ unsafe fn drop_boxed_future<T>(ptr: *mut u8) {
     core::ptr::drop_in_place(boxed_ptr);
 }
 
-struct SlabShard {
+struct SlotShard<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize> {
     free_bitmap: Box<[AtomicU64]>,
     alloc_hint: CachePadded<AtomicUsize>,
-    slots: Box<[TaskSlot]>,
+    slots: Box<[S]>,
     active_slots: usize,
     allocated_count: CachePadded<AtomicUsize>,
 }
 
-impl SlabShard {
+impl<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize> SlotShard<S, MIN_SLOTS, MAX_SLOTS>
+where
+    S: SlabSlot,
+{
     fn new(num_slots: usize) -> Self {
-        let num_slots = num_slots.min(MAX_SLOTS_PER_SHARD).max(64);
+        let num_slots = num_slots.min(MAX_SLOTS).max(MIN_SLOTS);
         let num_words = num_slots.div_ceil(64);
 
         let mut bitmap = Vec::with_capacity(num_words);
@@ -896,7 +986,7 @@ impl SlabShard {
 
         let mut slots = Vec::with_capacity(num_slots);
         for _ in 0..num_slots {
-            slots.push(TaskSlot::new());
+            slots.push(S::new());
         }
 
         Self {
@@ -968,7 +1058,7 @@ impl SlabShard {
     }
 
     #[inline]
-    fn get_slot(&self, idx: usize) -> Option<&TaskSlot> {
+    fn get_slot(&self, idx: usize) -> Option<&S> {
         if idx >= self.active_slots {
             return None;
         }
@@ -976,126 +1066,9 @@ impl SlabShard {
     }
 }
 
-struct JoinableShard {
-    free_bitmap: Box<[AtomicU64]>,
-    alloc_hint: CachePadded<AtomicUsize>,
-    slots: Box<[JoinableSlot]>,
-    active_slots: usize,
-    allocated_count: CachePadded<AtomicUsize>,
-}
-
-impl JoinableShard {
-    fn new(num_slots: usize) -> Self {
-        let num_slots = num_slots.min(MAX_JOINABLE_SLOTS_PER_SHARD).max(32);
-        let num_words = num_slots.div_ceil(64);
-
-        let mut bitmap = Vec::with_capacity(num_words);
-        for _ in 0..num_words {
-            bitmap.push(AtomicU64::new(0));
-        }
-
-        for i in 0..num_words {
-            let slots_in_word = if i == num_words - 1 {
-                let rem = num_slots % 64;
-                if rem == 0 {
-                    64
-                } else {
-                    rem
-                }
-            } else {
-                64
-            };
-
-            let mask = if slots_in_word == 64 {
-                !0u64
-            } else {
-                (1u64 << slots_in_word) - 1
-            };
-
-            bitmap[i].store(mask, Ordering::Relaxed);
-        }
-
-        let mut slots = Vec::with_capacity(num_slots);
-        for _ in 0..num_slots {
-            slots.push(JoinableSlot::new());
-        }
-
-        Self {
-            free_bitmap: bitmap.into_boxed_slice(),
-            alloc_hint: CachePadded::new(AtomicUsize::new(0)),
-            slots: slots.into_boxed_slice(),
-            active_slots: num_slots,
-            allocated_count: CachePadded::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn try_allocate(&self) -> Option<usize> {
-        let hint = self.alloc_hint.load(Ordering::Relaxed);
-        let num_words = self.free_bitmap.len();
-
-        for offset in 0..num_words {
-            let word_idx = (hint / 64 + offset) % num_words;
-            let word = &self.free_bitmap[word_idx];
-
-            loop {
-                let bits = word.load(Ordering::Relaxed);
-                if bits == 0 {
-                    break;
-                }
-
-                let bit_idx = bits.trailing_zeros() as usize;
-                let slot_idx = word_idx * 64 + bit_idx;
-
-                if slot_idx >= self.active_slots {
-                    break;
-                }
-
-                let mask = 1u64 << bit_idx;
-
-                match word.compare_exchange_weak(
-                    bits,
-                    bits & !mask,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        self.alloc_hint.store(slot_idx + 1, Ordering::Relaxed);
-                        self.allocated_count.fetch_add(1, Ordering::Relaxed);
-                        return Some(slot_idx);
-                    }
-                    Err(_) => {
-                        spin_loop();
-                        continue;
-                    }
-                }
-            }
-        }
-
-        None
-    }
-
-    fn deallocate(&self, slot_idx: usize) {
-        if slot_idx >= self.active_slots {
-            return;
-        }
-
-        let word_idx = slot_idx / 64;
-        let bit_idx = slot_idx % 64;
-        let mask = 1u64 << bit_idx;
-
-        self.free_bitmap[word_idx].fetch_or(mask, Ordering::Relaxed);
-        self.alloc_hint.store(slot_idx, Ordering::Relaxed);
-        self.allocated_count.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    fn get_slot(&self, idx: usize) -> Option<&JoinableSlot> {
-        if idx >= self.active_slots {
-            return None;
-        }
-        Some(&self.slots[idx])
-    }
-}
+type SlabShard = SlotShard<TaskSlot, MIN_SLOTS_PER_SHARD, MAX_SLOTS_PER_SHARD>;
+type JoinableShard =
+    SlotShard<JoinableSlot, MIN_JOINABLE_SLOTS_PER_SHARD, MAX_JOINABLE_SLOTS_PER_SHARD>;
 
 pub struct TaskSlab {
     shards: [SlabShard; NUM_SHARDS],
@@ -1110,7 +1083,10 @@ pub struct TaskSlab {
 
 impl TaskSlab {
     fn init_in_place(dst: *mut TaskSlab, mut config: SlabConfig) {
-        config.slots_per_shard = config.slots_per_shard.min(MAX_SLOTS_PER_SHARD).max(64);
+        config.slots_per_shard = config
+            .slots_per_shard
+            .min(MAX_SLOTS_PER_SHARD)
+            .max(MIN_SLOTS_PER_SHARD);
 
         let joinable_slots = (config.slots_per_shard / 2)
             .max(DEFAULT_JOINABLE_SLOTS_PER_SHARD)
@@ -1148,67 +1124,73 @@ impl TaskSlab {
         }
     }
 
-    pub fn allocate(&self) -> Option<SlotHandle<'_>> {
+    fn allocate_in<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize>(
+        &self,
+        shards: &[SlotShard<S, MIN_SLOTS, MAX_SLOTS>; NUM_SHARDS],
+        allocations: &AtomicU64,
+    ) -> Option<(u8, u16, u32)>
+    where
+        S: SlabSlot,
+    {
         let start_shard = self.shard_hint();
 
         for offset in 0..NUM_SHARDS {
             let shard_idx = (start_shard + offset) % NUM_SHARDS;
-            let shard = &self.shards[shard_idx];
+            let shard = &shards[shard_idx];
 
             if let Some(local_idx) = shard.try_allocate() {
                 let slot = shard.get_slot(local_idx)?;
+                slot.prepare_for_allocation();
 
-                slot.state.store(STATE_IDLE, Ordering::Relaxed);
-                slot.reset_cached_waker();
-                unsafe { *slot.future.get() = None };
-
-                let old = slot.gen_ref.load(Ordering::Acquire);
+                let old = slot.gen_ref().load(Ordering::Acquire);
                 let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
-                slot.gen_ref
+                slot.gen_ref()
                     .store(pack_gen_ref(new_gen, 1), Ordering::Release);
 
-                self.total_allocations.fetch_add(1, Ordering::Relaxed);
+                allocations.fetch_add(1, Ordering::Relaxed);
 
-                return Some(SlotHandle {
-                    slab: self,
-                    shard_idx: shard_idx as u8,
-                    local_idx: local_idx as u16,
-                    generation: new_gen,
-                });
+                return Some((shard_idx as u8, local_idx as u16, new_gen));
             }
         }
 
         None
     }
 
-    pub fn record_fallback(&self) {
-        self.fallback_allocations.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline]
-    pub fn get_slot(
-        &self,
+    fn get_slot_in<'a, S, const MIN_SLOTS: usize, const MAX_SLOTS: usize>(
+        shards: &'a [SlotShard<S, MIN_SLOTS, MAX_SLOTS>; NUM_SHARDS],
         shard_idx: usize,
         local_idx: usize,
         expected_gen: u32,
-    ) -> Option<&TaskSlot> {
+    ) -> Option<&'a S>
+    where
+        S: SlabSlot,
+    {
         if shard_idx >= NUM_SHARDS {
             return None;
         }
-        let slot = self.shards[shard_idx].get_slot(local_idx)?;
-        let packed = slot.gen_ref.load(Ordering::Acquire);
+        let slot = shards[shard_idx].get_slot(local_idx)?;
+        let packed = slot.gen_ref().load(Ordering::Acquire);
         if unpack_gen(packed) != (expected_gen & GEN_MASK) {
             return None;
         }
         Some(slot)
     }
 
-    pub fn increment_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) -> bool {
+    fn increment_ref_in<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize>(
+        shards: &[SlotShard<S, MIN_SLOTS, MAX_SLOTS>; NUM_SHARDS],
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) -> bool
+    where
+        S: SlabSlot,
+    {
         if shard_idx >= NUM_SHARDS {
             return false;
         }
 
-        let shard = &self.shards[shard_idx];
+        let shard = &shards[shard_idx];
         let Some(slot) = shard.get_slot(local_idx) else {
             return false;
         };
@@ -1216,7 +1198,7 @@ impl TaskSlab {
         let expected_gen = expected_gen & GEN_MASK;
 
         loop {
-            let cur = slot.gen_ref.load(Ordering::Acquire);
+            let cur = slot.gen_ref().load(Ordering::Acquire);
 
             if unpack_gen(cur) != expected_gen {
                 return false;
@@ -1231,7 +1213,7 @@ impl TaskSlab {
             let new = pack_gen_ref(expected_gen, rc + 1);
 
             match slot
-                .gen_ref
+                .gen_ref()
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => return true,
@@ -1243,19 +1225,26 @@ impl TaskSlab {
         }
     }
 
-    pub fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
+    fn decrement_ref_in<S, const MIN_SLOTS: usize, const MAX_SLOTS: usize>(
+        shards: &[SlotShard<S, MIN_SLOTS, MAX_SLOTS>; NUM_SHARDS],
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) where
+        S: SlabSlot,
+    {
         if shard_idx >= NUM_SHARDS {
             return;
         }
 
-        let shard = &self.shards[shard_idx];
+        let shard = &shards[shard_idx];
         let Some(slot) = shard.get_slot(local_idx) else {
             return;
         };
 
         let expected_gen = expected_gen & GEN_MASK;
         loop {
-            let cur = slot.gen_ref.load(Ordering::Acquire);
+            let cur = slot.gen_ref().load(Ordering::Acquire);
             if unpack_gen(cur) != expected_gen {
                 return;
             }
@@ -1265,14 +1254,12 @@ impl TaskSlab {
             }
             let new = pack_gen_ref(expected_gen, rc - 1);
             match slot
-                .gen_ref
+                .gen_ref()
                 .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
                     if rc == 1 {
-                        unsafe { *slot.future.get() = None };
-                        slot.drop_cached_waker_if_set();
-                        slot.state.store(STATE_IDLE, Ordering::Release);
+                        slot.release_last_ref();
                         shard.deallocate(local_idx);
                     }
                     return;
@@ -1286,40 +1273,50 @@ impl TaskSlab {
         }
     }
 
+    pub fn allocate(&self) -> Option<SlotHandle<'_>> {
+        let (shard_idx, local_idx, generation) =
+            self.allocate_in(&self.shards, &self.total_allocations)?;
+
+        Some(SlotHandle {
+            slab: self,
+            shard_idx,
+            local_idx,
+            generation,
+        })
+    }
+
+    pub fn record_fallback(&self) {
+        self.fallback_allocations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn get_slot(
+        &self,
+        shard_idx: usize,
+        local_idx: usize,
+        expected_gen: u32,
+    ) -> Option<&TaskSlot> {
+        Self::get_slot_in(&self.shards, shard_idx, local_idx, expected_gen)
+    }
+
+    pub fn increment_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) -> bool {
+        Self::increment_ref_in(&self.shards, shard_idx, local_idx, expected_gen)
+    }
+
+    pub fn decrement_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
+        Self::decrement_ref_in(&self.shards, shard_idx, local_idx, expected_gen);
+    }
+
     pub fn allocate_joinable(&self) -> Option<JoinableSlotHandle<'_>> {
-        let start_shard = self.shard_hint();
+        let (shard_idx, local_idx, generation) =
+            self.allocate_in(&self.joinable_shards, &self.joinable_allocations)?;
 
-        for offset in 0..NUM_SHARDS {
-            let shard_idx = (start_shard + offset) % NUM_SHARDS;
-            let shard = &self.joinable_shards[shard_idx];
-
-            if let Some(local_idx) = shard.try_allocate() {
-                let slot = shard.get_slot(local_idx)?;
-
-                slot.state.store(STATE_IDLE, Ordering::Relaxed);
-                slot.waker_state.store(WAKER_NONE, Ordering::Relaxed);
-                slot.reset_cached_waker();
-                write_poll_fn(&slot.poll_fn, None);
-                write_drop_fn(&slot.drop_fn, None);
-                write_drop_fn(&slot.result_drop_fn, None);
-
-                let old = slot.gen_ref.load(Ordering::Acquire);
-                let new_gen = (unpack_gen(old).wrapping_add(1)) & GEN_MASK;
-                slot.gen_ref
-                    .store(pack_gen_ref(new_gen, 1), Ordering::Release);
-
-                self.joinable_allocations.fetch_add(1, Ordering::Relaxed);
-
-                return Some(JoinableSlotHandle {
-                    slab: self,
-                    shard_idx: shard_idx as u8,
-                    local_idx: local_idx as u16,
-                    generation: new_gen,
-                });
-            }
-        }
-
-        None
+        Some(JoinableSlotHandle {
+            slab: self,
+            shard_idx,
+            local_idx,
+            generation,
+        })
     }
 
     pub fn record_joinable_fallback(&self) {
@@ -1334,118 +1331,20 @@ impl TaskSlab {
         local_idx: usize,
         expected_gen: u32,
     ) -> Option<&JoinableSlot> {
-        if shard_idx >= NUM_SHARDS {
-            return None;
-        }
-        let slot = self.joinable_shards[shard_idx].get_slot(local_idx)?;
-        let packed = slot.gen_ref.load(Ordering::Acquire);
-        if unpack_gen(packed) != (expected_gen & GEN_MASK) {
-            return None;
-        }
-        Some(slot)
+        Self::get_slot_in(&self.joinable_shards, shard_idx, local_idx, expected_gen)
     }
+
     pub fn increment_joinable_ref(
         &self,
         shard_idx: usize,
         local_idx: usize,
         expected_gen: u32,
     ) -> bool {
-        if shard_idx >= NUM_SHARDS {
-            return false;
-        }
-
-        let shard = &self.joinable_shards[shard_idx];
-        let Some(slot) = shard.get_slot(local_idx) else {
-            return false;
-        };
-
-        let expected_gen = expected_gen & GEN_MASK;
-
-        loop {
-            let cur = slot.gen_ref.load(Ordering::Acquire);
-
-            if unpack_gen(cur) != expected_gen {
-                return false;
-            }
-
-            let rc = unpack_ref(cur);
-
-            if rc == 0 || rc >= REF_MASK {
-                return false;
-            }
-
-            let new = pack_gen_ref(expected_gen, rc + 1);
-
-            match slot
-                .gen_ref
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return true,
-                Err(v) if unpack_gen(v) != expected_gen => return false,
-                Err(_) => {
-                    spin_loop();
-                }
-            }
-        }
+        Self::increment_ref_in(&self.joinable_shards, shard_idx, local_idx, expected_gen)
     }
 
     pub fn decrement_joinable_ref(&self, shard_idx: usize, local_idx: usize, expected_gen: u32) {
-        if shard_idx >= NUM_SHARDS {
-            return;
-        }
-
-        let shard = &self.joinable_shards[shard_idx];
-        let Some(slot) = shard.get_slot(local_idx) else {
-            return;
-        };
-
-        let expected_gen = expected_gen & GEN_MASK;
-        loop {
-            let cur = slot.gen_ref.load(Ordering::Acquire);
-            if unpack_gen(cur) != expected_gen {
-                return;
-            }
-            let rc = unpack_ref(cur);
-            if rc == 0 {
-                return;
-            }
-            let new = pack_gen_ref(expected_gen, rc - 1);
-            match slot
-                .gen_ref
-                .compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    if rc == 1 {
-                        if let Some(drop_fn) = read_drop_fn(&slot.drop_fn) {
-                            unsafe { drop_fn((*slot.buffer.get()).as_mut_ptr()) };
-                        }
-                        write_drop_fn(&slot.drop_fn, None);
-
-                        slot.drop_cached_waker_if_set();
-
-                        let ws = slot.waker_state.load(Ordering::Acquire);
-                        if ws == WAKER_SET {
-                            unsafe {
-                                core::ptr::drop_in_place((*slot.join_waker.get()).as_mut_ptr());
-                            }
-                        }
-                        slot.waker_state.store(WAKER_NONE, Ordering::Release);
-
-                        write_poll_fn(&slot.poll_fn, None);
-                        write_drop_fn(&slot.result_drop_fn, None);
-                        slot.state.store(STATE_IDLE, Ordering::Release);
-
-                        shard.deallocate(local_idx);
-                    }
-                    return;
-                }
-                Err(v) if unpack_gen(v) != expected_gen => return,
-                Err(_) => {
-                    spin_loop();
-                    continue;
-                }
-            }
-        }
+        Self::decrement_ref_in(&self.joinable_shards, shard_idx, local_idx, expected_gen);
     }
 
     #[inline]
@@ -1580,43 +1479,43 @@ const PTR_LOCAL_MASK: usize = (1usize << PTR_LOCAL_BITS) - 1;
 const PTR_GEN_MASK: usize = (1usize << PTR_GEN_BITS) - 1;
 
 #[inline]
-pub fn encode_slab_ptr(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
+fn encode_slab_ptr_tag<const TAG: usize>(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
     let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
     let local_bits = ((local_idx as usize) & PTR_LOCAL_MASK) << PTR_LOCAL_SHIFT;
     let gen_bits = ((generation as usize) & PTR_GEN_MASK) << PTR_GEN_SHIFT;
-    gen_bits | local_bits | shard_bits | PTR_TAG_DETACHED
+    gen_bits | local_bits | shard_bits | TAG
+}
+
+#[inline]
+fn decode_slab_ptr_tag<const TAG: usize>(ptrv: usize) -> Option<(usize, usize, u32)> {
+    if (ptrv & 0b11) != TAG {
+        return None;
+    }
+    let shard_idx = (ptrv >> PTR_SHARD_SHIFT) & PTR_SHARD_MASK;
+    let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
+    let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
+
+    Some((shard_idx, local_idx, generation))
+}
+
+#[inline]
+pub fn encode_slab_ptr(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
+    encode_slab_ptr_tag::<PTR_TAG_DETACHED>(shard_idx, local_idx, generation)
 }
 
 #[inline]
 pub fn decode_slab_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
-    if (ptrv & 0b11) != PTR_TAG_DETACHED {
-        return None;
-    }
-    let shard_idx = (ptrv >> PTR_SHARD_SHIFT) & PTR_SHARD_MASK;
-    let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
-    let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
-
-    Some((shard_idx, local_idx, generation))
+    decode_slab_ptr_tag::<PTR_TAG_DETACHED>(ptrv)
 }
 
 #[inline]
 pub fn encode_joinable_slab_ptr(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
-    let shard_bits = ((shard_idx as usize) & PTR_SHARD_MASK) << PTR_SHARD_SHIFT;
-    let local_bits = ((local_idx as usize) & PTR_LOCAL_MASK) << PTR_LOCAL_SHIFT;
-    let gen_bits = ((generation as usize) & PTR_GEN_MASK) << PTR_GEN_SHIFT;
-    gen_bits | local_bits | shard_bits | PTR_TAG_JOINABLE
+    encode_slab_ptr_tag::<PTR_TAG_JOINABLE>(shard_idx, local_idx, generation)
 }
 
 #[inline]
 pub fn decode_joinable_slab_ptr(ptrv: usize) -> Option<(usize, usize, u32)> {
-    if (ptrv & 0b11) != PTR_TAG_JOINABLE {
-        return None;
-    }
-    let shard_idx = (ptrv >> PTR_SHARD_SHIFT) & PTR_SHARD_MASK;
-    let local_idx = (ptrv >> PTR_LOCAL_SHIFT) & PTR_LOCAL_MASK;
-    let generation = ((ptrv >> PTR_GEN_SHIFT) & PTR_GEN_MASK) as u32;
-
-    Some((shard_idx, local_idx, generation))
+    decode_slab_ptr_tag::<PTR_TAG_JOINABLE>(ptrv)
 }
 
 #[inline]
@@ -1631,50 +1530,194 @@ pub fn is_joinable_slab_ptr(ptrv: usize) -> bool {
     (ptrv & 0b11) == PTR_TAG_JOINABLE
 }
 
-#[inline(never)]
-pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
-    let Some((shard_idx, local_idx, generation)) = decode_slab_ptr(ctx) else {
+trait SlabTaskKind {
+    type Slot: SlabSlot;
+
+    const TRAMPOLINE: extern "win64" fn(usize);
+
+    fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize;
+    fn decode(ctx: usize) -> Option<(usize, usize, u32)>;
+    fn get_slot(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> Option<&Self::Slot>;
+    fn increment_ref(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool;
+    fn decrement_ref(slab: &TaskSlab, shard_idx: usize, local_idx: usize, generation: u32);
+    fn poll_once(
+        slot: &Self::Slot,
+        waker: &Waker,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool;
+}
+
+struct DetachedSlabTask;
+
+impl SlabTaskKind for DetachedSlabTask {
+    type Slot = TaskSlot;
+
+    const TRAMPOLINE: extern "win64" fn(usize) = slab_poll_trampoline;
+
+    #[inline]
+    fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
+        encode_slab_ptr(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn decode(ctx: usize) -> Option<(usize, usize, u32)> {
+        decode_slab_ptr(ctx)
+    }
+
+    #[inline]
+    fn get_slot(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> Option<&TaskSlot> {
+        slab.get_slot(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn increment_ref(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool {
+        slab.increment_ref(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn decrement_ref(slab: &TaskSlab, shard_idx: usize, local_idx: usize, generation: u32) {
+        slab.decrement_ref(shard_idx, local_idx, generation);
+    }
+
+    #[inline]
+    fn poll_once(
+        slot: &TaskSlot,
+        waker: &Waker,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool {
+        slot.poll_once(waker, shard_idx, local_idx, generation)
+    }
+}
+
+struct JoinableSlabTask;
+
+impl SlabTaskKind for JoinableSlabTask {
+    type Slot = JoinableSlot;
+
+    const TRAMPOLINE: extern "win64" fn(usize) = joinable_slab_poll_trampoline;
+
+    #[inline]
+    fn encode(shard_idx: u8, local_idx: u16, generation: u32) -> usize {
+        encode_joinable_slab_ptr(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn decode(ctx: usize) -> Option<(usize, usize, u32)> {
+        decode_joinable_slab_ptr(ctx)
+    }
+
+    #[inline]
+    fn get_slot(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> Option<&JoinableSlot> {
+        slab.get_joinable_slot(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn increment_ref(
+        slab: &TaskSlab,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool {
+        slab.increment_joinable_ref(shard_idx, local_idx, generation)
+    }
+
+    #[inline]
+    fn decrement_ref(slab: &TaskSlab, shard_idx: usize, local_idx: usize, generation: u32) {
+        slab.decrement_joinable_ref(shard_idx, local_idx, generation);
+    }
+
+    #[inline]
+    fn poll_once(
+        slot: &JoinableSlot,
+        waker: &Waker,
+        shard_idx: usize,
+        local_idx: usize,
+        generation: u32,
+    ) -> bool {
+        slot.poll_once_joinable(waker, shard_idx, local_idx, generation)
+    }
+}
+
+#[inline(always)]
+fn poll_slab_task<K>(ctx: usize)
+where
+    K: SlabTaskKind,
+{
+    let Some((shard_idx, local_idx, generation)) = K::decode(ctx) else {
         return;
     };
 
     let slab = get_task_slab();
-    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
+    let Some(slot) = K::get_slot(slab, shard_idx, local_idx, generation) else {
         return;
     };
 
     let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
 
-    let completed = slot.poll_once(&waker, shard_idx, local_idx, generation);
+    let completed = K::poll_once(slot, &waker, shard_idx, local_idx, generation);
 
-    slab.decrement_ref(shard_idx, local_idx, generation);
+    K::decrement_ref(slab, shard_idx, local_idx, generation);
 
     if completed {
-        slab.decrement_ref(shard_idx, local_idx, generation);
+        K::decrement_ref(slab, shard_idx, local_idx, generation);
     }
 }
 
-pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
+#[inline(always)]
+fn enqueue_slab_task_inner<K>(shard_idx: usize, local_idx: usize, generation: u32)
+where
+    K: SlabTaskKind,
+{
     let slab = get_task_slab();
 
-    if !slab.increment_ref(shard_idx, local_idx, generation) {
+    if !K::increment_ref(slab, shard_idx, local_idx, generation) {
         return;
     }
 
-    let Some(slot) = slab.get_slot(shard_idx, local_idx, generation) else {
-        slab.decrement_ref(shard_idx, local_idx, generation);
+    let Some(slot) = K::get_slot(slab, shard_idx, local_idx, generation) else {
+        K::decrement_ref(slab, shard_idx, local_idx, generation);
         return;
     };
 
     loop {
         if slot.try_enqueue() {
-            let encoded = encode_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-            submit_global(slab_poll_trampoline, encoded);
+            let encoded = K::encode(shard_idx as u8, local_idx as u16, generation);
+            submit_global(K::TRAMPOLINE, encoded);
             return;
         }
 
         match slot.try_notify_result() {
             NotifyResult::Notified | NotifyResult::AlreadyQueued | NotifyResult::Completed => {
-                slab.decrement_ref(shard_idx, local_idx, generation);
+                K::decrement_ref(slab, shard_idx, local_idx, generation);
                 return;
             }
             NotifyResult::IdleRace => {
@@ -1682,59 +1725,24 @@ pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
             }
         }
     }
+}
+
+#[inline(never)]
+pub extern "win64" fn slab_poll_trampoline(ctx: usize) {
+    poll_slab_task::<DetachedSlabTask>(ctx);
+}
+
+pub fn enqueue_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
+    enqueue_slab_task_inner::<DetachedSlabTask>(shard_idx, local_idx, generation);
 }
 
 #[inline(never)]
 pub extern "win64" fn joinable_slab_poll_trampoline(ctx: usize) {
-    let Some((shard_idx, local_idx, generation)) = decode_joinable_slab_ptr(ctx) else {
-        return;
-    };
-
-    let slab = get_task_slab();
-    let Some(slot) = slab.get_joinable_slot(shard_idx, local_idx, generation) else {
-        return;
-    };
-
-    let waker = slot.get_cached_waker(shard_idx, local_idx, generation);
-
-    let completed = slot.poll_once_joinable(&waker, shard_idx, local_idx, generation);
-
-    slab.decrement_joinable_ref(shard_idx, local_idx, generation);
-
-    if completed {
-        slab.decrement_joinable_ref(shard_idx, local_idx, generation);
-    }
+    poll_slab_task::<JoinableSlabTask>(ctx);
 }
 
 pub fn enqueue_joinable_slab_task(shard_idx: usize, local_idx: usize, generation: u32) {
-    let slab = get_task_slab();
-
-    if !slab.increment_joinable_ref(shard_idx, local_idx, generation) {
-        return;
-    }
-
-    let Some(slot) = slab.get_joinable_slot(shard_idx, local_idx, generation) else {
-        slab.decrement_joinable_ref(shard_idx, local_idx, generation);
-        return;
-    };
-
-    loop {
-        if slot.try_enqueue() {
-            let encoded = encode_joinable_slab_ptr(shard_idx as u8, local_idx as u16, generation);
-            submit_global(joinable_slab_poll_trampoline, encoded);
-            return;
-        }
-
-        match slot.try_notify_result() {
-            NotifyResult::Notified | NotifyResult::AlreadyQueued | NotifyResult::Completed => {
-                slab.decrement_joinable_ref(shard_idx, local_idx, generation);
-                return;
-            }
-            NotifyResult::IdleRace => {
-                spin_loop();
-            }
-        }
-    }
+    enqueue_slab_task_inner::<JoinableSlabTask>(shard_idx, local_idx, generation);
 }
 pub fn init_task_slab(config: SlabConfig) {
     TASK_SLAB_PTR.call_once(|| unsafe {
