@@ -3,7 +3,6 @@ extern crate std;
 mod blocking;
 mod executor;
 mod runtime;
-mod slab;
 mod task;
 
 use crate::platform::{ExecutorPlatform, Job};
@@ -98,13 +97,13 @@ fn stress_task_count(multiplier: usize) -> usize {
     test_shard_count() * multiplier
 }
 
-fn init_threaded_runtime() {
+pub(crate) fn init_threaded_runtime() {
     init_test_platform();
     crate::global_async::GlobalAsyncExecutor::global()
         .init(test_shard_count(), TEST_MAX_WORK_ITEMS);
 }
 
-fn wait_until<F>(timeout: Duration, mut done: F)
+pub(crate) fn wait_until<F>(timeout: Duration, mut done: F)
 where
     F: FnMut() -> bool,
 {
@@ -118,7 +117,7 @@ where
     }
 }
 
-fn global_runtime_lock() -> MutexGuard<'static, ()> {
+pub(crate) fn global_runtime_lock() -> MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().expect("kernel_executor test runtime lock")
 }

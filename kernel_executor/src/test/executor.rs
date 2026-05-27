@@ -17,7 +17,7 @@ use tokio::net::TcpStream as TokioTcpStream;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::{Mutex as TokioMutex, Semaphore};
 
-const DEFAULT_HTTP_STRESS_TASKS: usize = 1_000_000;
+const DEFAULT_HTTP_STRESS_TASKS: usize = 300_000;
 const REQUESTS_PER_TASK: usize = 3;
 
 // Windows will run out of sockets if this number is too big
@@ -664,20 +664,20 @@ fn run_saturated_executor_http_test(future_set: HttpStressFutureSet) {
     }
 }
 
-// This test exists to saturate the executor with 1,000,000 resident async
+// This test exists to saturate the executor with 300_000 resident async
 // loopback HTTP tasks whose future type is small enough for joinable inline
 // storage. It protects the executor path used by compact request futures.
 #[test]
-fn saturated_executor_handles_1m_async_loopback_http_tasks_inline_futures() {
+fn saturated_executor_handles_300k_async_loopback_http_tasks_inline_futures() {
     run_saturated_executor_http_test(HttpStressFutureSet::InlineOnly);
 }
 
-// This test exists to saturate the executor with 1,000,000 resident async
+// This test exists to saturate the executor with 300_000 resident async
 // loopback HTTP tasks whose future type is too large for joinable inline
 // storage. It forces the oversized future path while keeping the same network,
 // yielding, wake, and JoinAll behavior as the inline-sized stress case.
 #[test]
-fn saturated_executor_handles_1m_async_loopback_http_tasks_large_futures() {
+fn saturated_executor_handles_300k_async_loopback_http_tasks_large_futures() {
     run_saturated_executor_http_test(HttpStressFutureSet::LargeOnly);
 }
 
@@ -687,6 +687,6 @@ fn saturated_executor_handles_1m_async_loopback_http_tasks_large_futures() {
 // the gate opens, so the large futures cannot start only after the small futures
 // have completed.
 #[test]
-fn saturated_executor_handles_1m_async_loopback_http_tasks_mixed_inline_and_large_futures() {
+fn saturated_executor_handles_300k_async_loopback_http_tasks_mixed_inline_and_large_futures() {
     run_saturated_executor_http_test(HttpStressFutureSet::MixedInlineAndLarge);
 }

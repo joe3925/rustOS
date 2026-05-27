@@ -42,6 +42,7 @@ mod profiling;
 mod registry;
 mod scheduling;
 mod static_handlers;
+mod sync_platform;
 mod structs;
 mod syscalls;
 mod util;
