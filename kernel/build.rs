@@ -47,32 +47,81 @@ fn generate_import_library(
     def_path: &PathBuf,
     lib_out: &PathBuf,
 ) -> Result<(), Box<dyn Error>> {
-    let status = if target.contains("gnu") {
-        Command::new("llvm-dlltool")
-            .arg("-d")
-            .arg(def_path)
-            .arg("-l")
-            .arg(lib_out)
-            .arg("-m")
-            .arg("i386:x86-64")
-            .status()
+    let attempts = if target.contains("gnu") {
+        vec![ImportLibTool::LlvmDlltool]
     } else {
-        Command::new("llvm-lib")
-            .arg("/NOLOGO")
-            .arg(format!("/DEF:{}", def_path.display()))
-            .arg(format!("/MACHINE:{}", machine_from_target(target)))
-            .arg(format!("/OUT:{}", lib_out.display()))
-            .status()
-    }?;
+        vec![ImportLibTool::LlvmLib, ImportLibTool::LldLink]
+    };
+    let mut errors = Vec::new();
 
-    if !status.success() {
-        return Err(format!("failed to generate kernel import library: {status}").into());
+    for tool in attempts {
+        match tool.run(target, def_path, lib_out) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => errors.push(format!("{} exited with {status}", tool.name())),
+            Err(err) => errors.push(format!("{} failed to start: {err}", tool.name())),
+        }
     }
 
-    Ok(())
+    Err(format!(
+        "failed to generate kernel import library: {}",
+        errors.join("; ")
+    )
+    .into())
 }
 
-fn compile_mimalloc(manifest_dir: &std::path::Path, target: &str) {
+#[derive(Clone, Copy)]
+enum ImportLibTool {
+    LlvmDlltool,
+    LlvmLib,
+    LldLink,
+}
+
+impl ImportLibTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::LlvmDlltool => "llvm-dlltool",
+            Self::LlvmLib => "llvm-lib",
+            Self::LldLink => "lld-link",
+        }
+    }
+
+    fn run(
+        self,
+        target: &str,
+        def_path: &PathBuf,
+        lib_out: &PathBuf,
+    ) -> Result<std::process::ExitStatus, std::io::Error> {
+        match self {
+            Self::LlvmDlltool => Command::new(self.name())
+                .arg("-d")
+                .arg(def_path)
+                .arg("-l")
+                .arg(lib_out)
+                .arg("-m")
+                .arg("i386:x86-64")
+                .status(),
+            Self::LlvmLib => Command::new(self.name())
+                .arg("/NOLOGO")
+                .arg(format!("/DEF:{}", def_path.display()))
+                .arg(format!("/MACHINE:{}", machine_from_target(target)))
+                .arg(format!("/OUT:{}", lib_out.display()))
+                .status(),
+            Self::LldLink => Command::new(self.name())
+                .arg("/lib")
+                .arg("/NOLOGO")
+                .arg(format!("/DEF:{}", def_path.display()))
+                .arg(format!("/MACHINE:{}", machine_from_target(target)))
+                .arg(format!("/OUT:{}", lib_out.display()))
+                .status(),
+        }
+    }
+}
+
+fn compile_mimalloc(
+    manifest_dir: &std::path::Path,
+    target: &str,
+    out_dir: &PathBuf,
+) -> Result<(), Box<dyn Error>> {
     let mimalloc_dir = manifest_dir.join("vendor").join("mimalloc-v2");
     let shim_include_dir = manifest_dir.join("c").join("include");
     let include_dir = mimalloc_dir.join("include");
@@ -93,7 +142,6 @@ fn compile_mimalloc(manifest_dir: &std::path::Path, target: &str) {
 
     build
         .compiler("clang")
-        .archiver("llvm-lib")
         .include(&shim_include_dir)
         .include(&include_dir)
         .include(&src_dir)
@@ -123,15 +171,78 @@ fn compile_mimalloc(manifest_dir: &std::path::Path, target: &str) {
         .define("MI_RUSTOS_HIGH_HALF", "1")
         .define("NDEBUG", "1")
         .define("MI_USE_BUILTIN_THREAD_POINTER", "0");
-    build.compile("rustos_mimalloc");
+
+    let objects = build.compile_intermediates();
+    let lib_out = out_dir.join("rustos_mimalloc.lib");
+    archive_msvc_static_library(&objects, &lib_out)?;
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=rustos_mimalloc");
+
+    Ok(())
 }
+
+fn archive_msvc_static_library(
+    objects: &[PathBuf],
+    lib_out: &PathBuf,
+) -> Result<(), Box<dyn Error>> {
+    let attempts = [MsvcLibTool::LlvmLib, MsvcLibTool::LldLink];
+    let mut errors = Vec::new();
+
+    for tool in attempts {
+        match tool.archive(objects, lib_out) {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => errors.push(format!("{} exited with {status}", tool.name())),
+            Err(err) => errors.push(format!("{} failed to start: {err}", tool.name())),
+        }
+    }
+
+    Err(format!("failed to archive rustos_mimalloc: {}", errors.join("; ")).into())
+}
+
+#[derive(Clone, Copy)]
+enum MsvcLibTool {
+    LlvmLib,
+    LldLink,
+}
+
+impl MsvcLibTool {
+    fn name(self) -> &'static str {
+        match self {
+            Self::LlvmLib => "llvm-lib",
+            Self::LldLink => "lld-link",
+        }
+    }
+
+    fn archive(
+        self,
+        objects: &[PathBuf],
+        lib_out: &PathBuf,
+    ) -> Result<std::process::ExitStatus, std::io::Error> {
+        let mut command = Command::new(self.name());
+
+        match self {
+            Self::LlvmLib => {
+                command.arg("/NOLOGO");
+            }
+            Self::LldLink => {
+                command.arg("/lib").arg("/NOLOGO");
+            }
+        }
+
+        command.arg(format!("/OUT:{}", lib_out.display()));
+        command.args(objects);
+        command.status()
+    }
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let target = env::var("TARGET").unwrap();
 
     emit_kernel_pe_link_args(&target);
-    compile_mimalloc(&manifest_dir, &target);
+    compile_mimalloc(&manifest_dir, &target, &out_dir).expect("Failed to compile mimalloc");
 
     let exports_path = manifest_dir.join("src").join("exports.rs");
     println!("cargo:rerun-if-changed={}", exports_path.display());
