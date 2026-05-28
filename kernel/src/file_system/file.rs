@@ -395,7 +395,7 @@ async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
 }
 
 async fn ensure_dir(path: &Path) {
-    let _ = provider().make_dir_path(path);
+    let _ = provider().make_dir_path(path).await;
 }
 
 async fn file_exists(path: &Path) -> bool {
@@ -428,13 +428,9 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
-
     spawn_detached(async move {
-<<<<<<< HEAD
         // println!("[bench-debug] detached benchmark task started");
         // println!("[bench-debug] async-vs-sync benchmark returned");
-=======
->>>>>>> 5b365607823db4483e9253df369df82a4c78808d
         loop {
             bench_async_vs_sync_call_latency_async().await;
             bench_runtime_executor_async().await;

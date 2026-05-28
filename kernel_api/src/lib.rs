@@ -48,6 +48,14 @@ macro_rules! println {
     () => ($crate::print!("\n"));
     ($($arg:tt)*) => ($crate::print!("{}\n", $crate::alloc::format!($($arg)*)));
 }
+
+#[macro_export]
+macro_rules! print_no_fmt {
+    ($s:literal) => {{
+        $crate::util::print($s);
+    }};
+}
+
 #[macro_export]
 macro_rules! println_no_format {
     () => {{

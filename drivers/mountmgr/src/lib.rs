@@ -37,7 +37,6 @@ use kernel_api::{
         pnp_create_symlink, pnp_ioctl_via_symlink, pnp_load_service, pnp_remove_symlink,
         pnp_send_request_via_symlink,
     },
-    println,
     reg::{self, switch_to_vfs_async},
     request::{Request, RequestHandle, RequestType, TraversalPolicy},
     request_handler,
@@ -219,15 +218,13 @@ pub async fn volclass_ctrl_ioctl<'a, 'b>(
                         wr.push(t);
                     }
                     drop(wr);
-                    let _ = refresh_fs_registry_from_registry().await;
+                    let _registry = refresh_fs_registry_from_registry().await;
+
                     spawn_detached(rescan_all_volumes());
 
                     DriverStep::complete(DriverStatus::Success)
                 }
-                _ => {
-                    println!("tag was none");
-                    DriverStep::complete(DriverStatus::InvalidParameter)
-                }
+                _ => DriverStep::complete(DriverStatus::InvalidParameter),
             }
         }
         _ => DriverStep::complete(DriverStatus::NotImplemented),
@@ -383,7 +380,6 @@ async fn try_bind_filesystems_for_parent_fdo(
     let stable_id = match stable_id {
         Some(id) => id,
         None => {
-            println!("Volume {} has no stable_id, skipping mount", public_link);
             return false;
         }
     };
@@ -426,13 +422,17 @@ async fn try_bind_filesystems_for_parent_fdo(
             continue;
         }
 
-        let Some(id) = identify_req.write().data().read_only().view::<FsIdentify>() else {
-            continue;
+        let (can_mount, function_fdo) = {
+            let req = identify_req.write();
+            let Some(id) = req.data().read_only().view::<FsIdentify>() else {
+                continue;
+            };
+            (id.can_mount, id.mount_device.clone())
         };
-        if !id.can_mount {
+        if !can_mount {
             continue;
         }
-        let Some(function_fdo) = id.mount_device.as_ref() else {
+        let Some(function_fdo) = function_fdo else {
             continue;
         };
 
@@ -452,16 +452,22 @@ async fn try_bind_filesystems_for_parent_fdo(
         )
         .await;
 
-        if let Ok((dn, _top)) = created {
-            let primary_link = public_link.to_string();
-            let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
-            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
-            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
-            let _ = pnp_create_device_symlink_top(dn.instance_path.clone(), stable_link.clone());
+        match created {
+            Ok((dn, _top)) => {
+                let primary_link = public_link.to_string();
+                let compat_link = alloc::format!("\\GLOBAL\\Mounts\\{:04}", vid);
+                let _ =
+                    pnp_create_device_symlink_top(dn.instance_path.clone(), primary_link.clone());
+                let _ =
+                    pnp_create_device_symlink_top(dn.instance_path.clone(), compat_link.clone());
+                let _ =
+                    pnp_create_device_symlink_top(dn.instance_path.clone(), stable_link.clone());
 
-            let dx = ext::<VolFdoExt>(parent_fdo);
-            dx.fs_link.call_once(|| stable_link);
-            return true;
+                let dx = ext::<VolFdoExt>(parent_fdo);
+                dx.fs_link.call_once(|| stable_link);
+                return true;
+            }
+            Err(_e) => {}
         }
     }
 
@@ -629,7 +635,6 @@ async fn attempt_boot_bind(
 
     // Boot path: assign C: only, write registry only on first-boot/change
     if stable_id.is_empty() {
-        println!("System volume has no stable_id, cannot assign C:");
         return Err(RegError::KeyNotFound);
     }
 
@@ -638,14 +643,12 @@ async fn attempt_boot_bind(
     match unsafe { switch_to_vfs_async().await } {
         Ok(()) => {
             VFS_ACTIVE.store(true, Ordering::Release);
-            println!("System volume mounted at '{}')", fs_mount_link);
             // Now that the VFS provider is active, trigger a resync so all volumes
             // get mounted and labeled without waiting for an external RESYNC request.
             rescan_all_volumes().await;
             Ok(())
         }
         Err(e) => {
-            println!("Error: {:#?}", e);
             panic!("VFS transition failed {:#?}", e);
         }
     }

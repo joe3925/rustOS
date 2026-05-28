@@ -34,7 +34,7 @@ use x86_64::registers::control::Cr3;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 
-const MAX_TASKS: usize = 131_072;
+const MAX_TASKS: usize = 4096;
 
 #[derive(Debug)]
 #[repr(u32)]
