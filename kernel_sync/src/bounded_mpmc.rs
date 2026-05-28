@@ -55,6 +55,9 @@ struct WaitFreeBoundedQueue<T> {
     slots: Vec<QueueSlot<T>>,
     push_hint: AtomicUsize,
     pop_hint: AtomicUsize,
+    // Counts reserved capacity, not just published values. SLOT_RESERVED and
+    // SLOT_TAKING must keep their permits so interrupt-time senders never spin
+    // waiting for the interrupted context to finish a transient slot update.
     len: AtomicUsize,
 }
 
@@ -77,10 +80,26 @@ impl<T> WaitFreeBoundedQueue<T> {
 
     fn try_push(&self, value: T) -> Result<(), T> {
         let cap = self.slots.len();
-        let start = self.push_hint.fetch_add(1, Ordering::Relaxed);
 
-        for offset in 0..cap {
-            let idx = (start + offset) % cap;
+        if self
+            .len
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |len| {
+                if len < cap {
+                    Some(len + 1)
+                } else {
+                    None
+                }
+            })
+            .is_err()
+        {
+            return Err(value);
+        }
+
+        let start = self.push_hint.fetch_add(1, Ordering::Relaxed);
+        let mut offset = 0usize;
+
+        loop {
+            let idx = start.wrapping_add(offset) % cap;
             let slot = &self.slots[idx];
 
             if slot
@@ -91,21 +110,22 @@ impl<T> WaitFreeBoundedQueue<T> {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_err()
+                .is_ok()
             {
-                continue;
+                unsafe {
+                    slot.write_value(value);
+                }
+
+                slot.state.store(SLOT_FULL, Ordering::Release);
+                return Ok(());
             }
 
-            unsafe {
-                slot.write_value(value);
+            offset += 1;
+            if offset == cap {
+                offset = 0;
+                core::hint::spin_loop();
             }
-
-            self.len.fetch_add(1, Ordering::Release);
-            slot.state.store(SLOT_FULL, Ordering::Release);
-            return Ok(());
         }
-
-        Err(value)
     }
 
     fn try_pop(&self) -> Option<T> {
@@ -113,7 +133,7 @@ impl<T> WaitFreeBoundedQueue<T> {
         let start = self.pop_hint.fetch_add(1, Ordering::Relaxed);
 
         for offset in 0..cap {
-            let idx = (start + offset) % cap;
+            let idx = start.wrapping_add(offset) % cap;
             let slot = &self.slots[idx];
 
             if slot

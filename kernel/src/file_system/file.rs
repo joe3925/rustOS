@@ -432,10 +432,10 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     println!("[bench-debug] scheduling detached benchmark task");
     spawn_detached(async move {
         // println!("[bench-debug] detached benchmark task started");
-        bench_async_vs_sync_call_latency_async().await;
         // println!("[bench-debug] async-vs-sync benchmark returned");
-        bench_runtime_executor_async().await;
         loop {
+            bench_async_vs_sync_call_latency_async().await;
+            bench_runtime_executor_async().await;
             bench_c_drive_io_async().await;
             test_full_heap_parallel();
         }
