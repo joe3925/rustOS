@@ -1,14 +1,17 @@
 use crate::drivers::interrupt_index::IpiDest;
 use crate::drivers::interrupt_index::IpiKind;
 use crate::drivers::interrupt_index::LocalApic;
+use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::TLB_FLUSH_VECTOR;
 use crate::{
     cpu::get_cpu_info,
-    drivers::interrupt_index::{send_eoi, APIC},
+    drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
     memory::paging::{frame_alloc::BootInfoFrameAllocator, tables::init_mapper},
     util::boot_info,
+    KERNEL_INITIALIZED,
 };
 use core::arch::naked_asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::status::PageMapError;
 use x86_64::{
     instructions,
@@ -18,6 +21,14 @@ use x86_64::{
     },
     PhysAddr, VirtAddr,
 };
+
+const TLB_SHOOTDOWN_MAX_CPUS: usize = 256;
+
+static TLB_SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static TLB_SHOOTDOWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static TLB_SHOOTDOWN_ACKS: [AtomicU64; TLB_SHOOTDOWN_MAX_CPUS] =
+    [const { AtomicU64::new(0) }; TLB_SHOOTDOWN_MAX_CPUS];
+
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
 }
@@ -503,6 +514,11 @@ pub unsafe fn map_fresh_kernel_range_no_flush(
 
 extern "win64" fn tlb_flush_ipi() {
     instructions::tlb::flush_all();
+    let cpu = current_cpu_id();
+    if cpu < TLB_SHOOTDOWN_MAX_CPUS {
+        let sequence = TLB_SHOOTDOWN_SEQUENCE.load(Ordering::SeqCst);
+        TLB_SHOOTDOWN_ACKS[cpu].store(sequence, Ordering::SeqCst);
+    }
     send_eoi(TLB_FLUSH_VECTOR);
 }
 #[unsafe(naked)]
@@ -531,6 +547,28 @@ pub extern "win64" fn tlb_flush_entry() {
     );
 }
 pub fn trigger_tlb_shootdown() {
+    let cpu_count = NUM_CORES.load(Ordering::Acquire);
+    if cpu_count <= 1 || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+        instructions::tlb::flush_all();
+        return;
+    }
+
+    assert!(
+        cpu_count <= TLB_SHOOTDOWN_MAX_CPUS,
+        "TLB shootdown CPU count {} exceeds ack table size {}",
+        cpu_count,
+        TLB_SHOOTDOWN_MAX_CPUS
+    );
+    assert!(
+        instructions::interrupts::are_enabled(),
+        "synchronous TLB shootdown attempted with interrupts disabled"
+    );
+
+    let _guard = TLB_SHOOTDOWN_LOCK.lock();
+    let sequence = TLB_SHOOTDOWN_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+    let current_cpu = current_cpu_id();
+
+    let mut sent = false;
     unsafe {
         if let Some(a) = APIC.lock().as_ref() {
             a.lapic.send_ipi(
@@ -538,8 +576,26 @@ pub fn trigger_tlb_shootdown() {
                 IpiKind::Fixed {
                     vector: TLB_FLUSH_VECTOR,
                 },
-            )
+            );
+            sent = true;
         }
     }
     instructions::tlb::flush_all();
+    if current_cpu < TLB_SHOOTDOWN_MAX_CPUS {
+        TLB_SHOOTDOWN_ACKS[current_cpu].store(sequence, Ordering::SeqCst);
+    }
+
+    if !sent {
+        return;
+    }
+
+    for cpu in 0..cpu_count {
+        if cpu == current_cpu {
+            continue;
+        }
+
+        while TLB_SHOOTDOWN_ACKS[cpu].load(Ordering::SeqCst) < sequence {
+            core::hint::spin_loop();
+        }
+    }
 }
