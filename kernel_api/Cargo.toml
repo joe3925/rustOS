@@ -17,7 +17,7 @@ kernel_macros = { path = "../kernel_macros" }
 kernel_types = { path = "../kernel_types" }
 kernel_sys = { path = "../kernel_sys" }
 kernel_routing = { path = "../kernel_routing" }
-
+libm = { version = "0.2", default-features = false }
 [features]
 default = ["async-ffi-slab-default"]
 

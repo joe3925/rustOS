@@ -87,6 +87,8 @@ pub struct DevExtInner {
     pub msix_pba: Option<VirtAddr>,
     /// Whether indirect descriptors are enabled for this device.
     pub indirect_desc_enabled: bool,
+    /// Whether VIRTIO_BLK_T_FLUSH is available for write-through/cache flushes.
+    pub flush_supported: bool,
 }
 
 impl DevExtInner {

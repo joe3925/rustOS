@@ -1,12 +1,23 @@
+use crate::benchmarking::async_chain;
+use crate::benchmarking::async_spawn_wake_chain;
 use crate::benchmarking::bench_async_vs_sync_call_latency_async;
+use crate::benchmarking::bench_runtime_executor_async;
+use crate::benchmarking::used_memory;
+use crate::benchmarking::yield_once;
+
+use crate::benchmarking::BenchWindow;
+use crate::memory::heap::allocator::test_full_heap_parallel;
+use crate::memory::heap::HEAP_SIZE;
+use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
-use crate::util::DRIVE_WINDOW;
+use alloc::format;
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 use core::time::Duration;
 use kernel_executor::runtime::runtime::{block_on, spawn_blocking};
+use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::{
     fs::{OpenFlags, Path},
     status::{DriverStatus, FileStatus, RegError},
@@ -14,6 +25,9 @@ use kernel_types::{
 use rand_core::block;
 
 use crate::file_system::file_provider::provider;
+use crate::scheduling::runtime::runtime::spawn;
+use crate::scheduling::runtime::runtime::JoinAll;
+
 use crate::{
     benchmarking::{bench_c_drive_io_async, run_virtio_bench_matrix_print},
     drivers::interrupt_index::wait_duration,
@@ -202,18 +216,21 @@ impl File {
 
     pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FileStatus> {
         let mut buf = alloc::vec![0u8; len];
+        let n = self.read_at_into(offset, &mut buf).await?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    pub async fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileStatus> {
         let (res, st) = file_provider::provider()
-            .read_at(self.fs_file_id, offset, &mut buf)
+            .read_at(self.fs_file_id, offset, buf)
             .await;
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
         }
         match res.error {
-            None => {
-                buf.truncate(res.bytes_read);
-                Ok(buf)
-            }
+            None => Ok(res.bytes_read),
             Some(e) => Err(e),
         }
     }
@@ -280,10 +297,13 @@ impl File {
         }
     }
 
-    pub async fn close(self) -> Result<(), FileStatus> {
-        let (res, st) = file_provider::provider()
-            .close_handle(self.fs_file_id)
-            .await;
+    pub async fn close(mut self) -> Result<(), FileStatus> {
+        let id = core::mem::take(&mut self.fs_file_id);
+        if id == 0 {
+            return Ok(());
+        }
+
+        let (res, st) = file_provider::provider().close_handle(id).await;
 
         if st != DriverStatus::Success {
             return Err(FileStatus::UnknownFail);
@@ -375,7 +395,7 @@ async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
 }
 
 async fn ensure_dir(path: &Path) {
-    let _ = provider().make_dir_path(path);
+    let _ = provider().make_dir_path(path).await;
 }
 
 async fn file_exists(path: &Path) -> bool {
@@ -395,36 +415,40 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     ensure_dir(&vfs_toml).await;
 
     let boot_ms = TOTAL_TIME.get().unwrap().elapsed_millis();
-    let secs = boot_ms / 1000;
+    let secs = boot_ms as f64 / 1000 as f64;
     let frac = boot_ms % 1000;
 
     let used_bytes = USED_MEMORY.load(core::sync::atomic::Ordering::Acquire);
-    let used_mib = used_bytes / (1024 * 1024);
-    let used_mib_frac = (used_bytes % (1024 * 1024)) * 1000 / (1024 * 1024);
+    let used_mib = used_bytes as f64 / (1024 * 1024) as f64;
+    let heap_mib = used_memory() as f64 / (1024.0 * 1024.0);
     println!(
-        "boot time: {}.{:03}s, Used memory: {}.{:03} MiB",
-        secs, frac, used_mib, used_mib_frac
+        "boot time: {:.3}s, Used memory: {:.2} MiB, Used heap: {:.2} MiB",
+        secs, used_mib, heap_mib
     );
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
-
-    spawn_blocking(|| {
-        spawn_detached(async move {
-            // loop {
-            //
-            // }
-            //bench_async_vs_sync_call_latency_async().await;
-            DRIVE_WINDOW.start();
-            //loop {
+    spawn_detached(async move {
+        // println!("[bench-debug] detached benchmark task started");
+        // println!("[bench-debug] async-vs-sync benchmark returned");
+        loop {
+            bench_async_vs_sync_call_latency_async().await;
+            bench_runtime_executor_async().await;
             bench_c_drive_io_async().await;
-            //wait_duration(Duration::from_secs(10));
-            //}
-            DRIVE_WINDOW.stop_and_persist().await;
-            //run_virtio_bench_matrix_print().await;
+            test_full_heap_parallel();
+        }
 
-            //trigger_triple_fault();
-        });
+        //DRIVE_WINDOW.start();
+        //loop {
+        // test_full_heap_parallel();
+
+        //run_virtio_bench_matrix_print().await;
+        //wait_duration(Duration::from_secs(10));
+        //}
+        //DRIVE_WINDOW.stop_and_persist().await;
+        //run_virtio_bench_matrix_print().await;
+
+        //trigger_triple_fault();
     });
     Ok(())
 }

@@ -7,6 +7,44 @@ use core::{
 use kernel_types::object_manager::OmError;
 use x86_64::instructions::interrupts;
 
+use crate::memory::heap::allocator::KernelAllocator;
+use crate::{
+    benchmarking::{
+        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
+    },
+    console::CONSOLE,
+    drivers::{
+        interrupt_index::{self, current_cpu_id, get_current_logical_id},
+        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
+        ACPI::{ACPIImpl, ACPI_TABLES},
+    },
+    file_system::{
+        file::{self, File},
+        file_provider::VFS_PROVIDER,
+    },
+    idt::{
+        irq_alloc_vector, irq_borrowed_ensure_signal, irq_borrowed_signal, irq_borrowed_signal_all,
+        irq_borrowed_signal_n, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
+        irq_signal_all, irq_signal_exactly, irq_signal_n,
+    },
+    memory::{
+        dma,
+        paging::{mmio, stack::StackSize},
+    },
+    registry::reg,
+    scheduling::{
+        self,
+        global_async::GlobalAsyncExecutor,
+        runtime::runtime::{
+            block_on as kernel_block_on, spawn as kernel_spawn,
+            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
+        },
+        scheduler::{TaskError, SCHEDULER},
+        task::Task,
+    },
+    structs::stopwatch::Stopwatch,
+    util::boot_info,
+};
 use acpi::AcpiTables;
 use alloc::{
     collections::btree_map::BTreeMap,
@@ -26,7 +64,7 @@ use kernel_types::{
     },
     fs::{OpenFlags, Path},
     io::IoTarget,
-    irq::{IrqHandle, IrqIsrFn, IrqMeta},
+    irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
     request::RequestHandle,
     runtime::BlockOnThreadState,
@@ -35,45 +73,6 @@ use kernel_types::{
 };
 use spin::{Mutex, Once};
 use x86_64::VirtAddr;
-
-use crate::{
-    benchmarking::{
-        bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
-    },
-    console::CONSOLE,
-    drivers::{
-        interrupt_index::{self, current_cpu_id, get_current_logical_id},
-        pnp::{device::DevNodeExt, manager::PNP_MANAGER, request::DpcFn},
-        ACPI::{ACPIImpl, ACPI_TABLES},
-    },
-    file_system::{
-        file::{self, File},
-        file_provider::VFS_PROVIDER,
-    },
-    idt::{
-        irq_alloc_vector, irq_free_vector, irq_register, irq_register_gsi, irq_signal,
-        irq_signal_all, irq_signal_exactly, irq_signal_n,
-    },
-    memory::{
-        allocator::ALLOCATOR,
-        dma,
-        paging::{mmio, stack::StackSize},
-    },
-    registry::reg,
-    scheduling::{
-        self,
-        global_async::GlobalAsyncExecutor,
-        runtime::runtime::{
-            block_on as kernel_block_on, spawn as kernel_spawn,
-            spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
-            BLOCKING_POOL, RUNTIME_POOL,
-        },
-        scheduler::{TaskError, SCHEDULER},
-        task::Task,
-    },
-    structs::stopwatch::Stopwatch,
-    util::boot_info,
-};
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn create_kernel_task(
@@ -106,13 +105,13 @@ pub extern "win64" fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError> {
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_alloc(layout: Layout) -> *mut u8 {
-    unsafe { GlobalAlloc::alloc(&ALLOCATOR, layout) }
+    unsafe { GlobalAlloc::alloc(&crate::memory::heap::ALLOCATOR, layout) }
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_free(ptr: *mut u8, layout: Layout) {
     unsafe {
-        GlobalAlloc::dealloc(&ALLOCATOR, ptr, layout);
+        GlobalAlloc::dealloc(&crate::memory::heap::ALLOCATOR, ptr, layout);
     };
 }
 #[unsafe(no_mangle)]
@@ -126,24 +125,6 @@ pub extern "win64" fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal(handle: &IrqHandle, meta: IrqMeta) {
-    irq_signal(handle, meta)
-}
-#[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_ensure_signal(handle: &IrqHandle, meta: IrqMeta) {
-    irq_signal_exactly(handle, meta);
-}
-#[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal_n(handle: &IrqHandle, meta: IrqMeta, n: u32) {
-    irq_signal_n(handle, meta, n)
-}
-
-#[unsafe(no_mangle)]
-pub extern "win64" fn kernel_irq_signal_all(handle: &IrqHandle, meta: IrqMeta) {
-    irq_signal_all(handle, meta)
-}
-
-#[unsafe(no_mangle)]
 pub extern "win64" fn kernel_irq_alloc_vector() -> i32 {
     irq_alloc_vector().map(|v| v as i32).unwrap_or(-1)
 }
@@ -152,7 +133,43 @@ pub extern "win64" fn kernel_irq_alloc_vector() -> i32 {
 pub extern "win64" fn kernel_irq_free_vector(vector: u8) -> bool {
     irq_free_vector(vector)
 }
+#[unsafe(no_mangle)]
+pub unsafe extern "win64" fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta) {
+    unsafe {
+        irq_borrowed_signal(handle, meta);
+    }
+}
 
+#[unsafe(no_mangle)]
+pub unsafe extern "win64" fn kernel_irq_borrowed_ensure_signal(
+    handle: IrqBorrowedHandle,
+    meta: IrqMeta,
+) {
+    unsafe {
+        irq_borrowed_ensure_signal(handle, meta);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "win64" fn kernel_irq_borrowed_signal_n(
+    handle: IrqBorrowedHandle,
+    meta: IrqMeta,
+    n: u32,
+) {
+    unsafe {
+        irq_borrowed_signal_n(handle, meta, n);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "win64" fn kernel_irq_borrowed_signal_all(
+    handle: IrqBorrowedHandle,
+    meta: IrqMeta,
+) {
+    unsafe {
+        irq_borrowed_signal_all(handle, meta);
+    }
+}
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_dma_register_pci_pdo(
     pdo: &Arc<DeviceObject>,
@@ -584,23 +601,7 @@ pub extern "win64" fn pnp_create_devnode_over_pdo_with_function(
     .into_ffi()
 }
 
-#[no_mangle]
-pub unsafe extern "win64" fn submit_runtime_internal(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    RUNTIME_POOL.submit(trampoline, ctx);
-}
-
 static BLOCKING_INIT: Once = Once::new();
-
-#[no_mangle]
-pub unsafe extern "win64" fn submit_blocking_internal(
-    trampoline: extern "win64" fn(usize),
-    ctx: usize,
-) {
-    BLOCKING_POOL.submit(trampoline, ctx);
-}
 
 #[no_mangle]
 pub unsafe extern "win64" fn task_yield() {

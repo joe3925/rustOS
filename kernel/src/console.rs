@@ -1,9 +1,8 @@
 use crate::util::boot_info;
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::fmt;
 use core::fmt::Write;
-use crossbeam_queue::SegQueue;
+use core::sync::atomic::{AtomicBool, Ordering};
+use crossbeam_queue::ArrayQueue;
 use embedded_graphics::mono_font::iso_8859_5::FONT_9X18;
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb888;
@@ -26,9 +25,97 @@ const FONT_WIDTH: usize = 9;
 const TAB_SPACES: usize = 4;
 const PRINT_FLUSH_TRIES: usize = 256;
 
+const PRINT_QUEUE_SLOTS: usize = 256;
+const PRINT_SLOT_SIZE: usize = 1024;
+const PRINT_SLOT_PAYLOAD: usize = PRINT_SLOT_SIZE - 1;
+
 pub(crate) struct Cursor {
     pub x: usize,
     pub y: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PrintSlot {
+    bytes: [u8; PRINT_SLOT_SIZE],
+    len: usize,
+}
+
+impl PrintSlot {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; PRINT_SLOT_SIZE],
+            len: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.len == PRINT_SLOT_PAYLOAD
+    }
+
+    #[inline(always)]
+    fn clear(&mut self) {
+        self.len = 0;
+        self.bytes[0] = 0;
+    }
+
+    #[inline(always)]
+    fn push(&mut self, b: u8) {
+        debug_assert!(self.len < PRINT_SLOT_PAYLOAD);
+        self.bytes[self.len] = b;
+        self.len += 1;
+        self.bytes[self.len] = 0;
+    }
+
+    #[inline(always)]
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+struct QueuedPrintWriter {
+    slot: PrintSlot,
+}
+
+impl QueuedPrintWriter {
+    fn new() -> Self {
+        Self {
+            slot: PrintSlot::new(),
+        }
+    }
+
+    fn flush_slot(&mut self) {
+        if self.slot.is_empty() {
+            return;
+        }
+
+        let slot = self.slot;
+        self.slot.clear();
+        queue_slot(slot);
+    }
+
+    fn finish(mut self) {
+        self.flush_slot();
+    }
+}
+
+impl fmt::Write for QueuedPrintWriter {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            if self.slot.is_full() {
+                self.flush_slot();
+            }
+
+            self.slot.push(b);
+        }
+
+        Ok(())
+    }
 }
 
 pub struct Screen {
@@ -48,7 +135,6 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Zero the entire framebuffer if available. Safe to call before creating a `Screen`.
     pub fn clear_framebuffer() {
         let boot = boot_info();
         if let Some(fb) = boot.framebuffer.as_mut() {
@@ -162,6 +248,7 @@ impl Screen {
         if x >= self.width || y >= self.height {
             return;
         }
+
         self.write_pixel_unchecked(x, y, r, g, b);
     }
 
@@ -250,7 +337,8 @@ pub struct Console {
     style: MonoTextStyle<'static, Rgb888>,
     text_style: TextStyle,
 
-    pending: Vec<u8>,
+    pending: [u8; PRINT_SLOT_SIZE],
+    pending_len: usize,
 }
 
 impl Console {
@@ -260,15 +348,13 @@ impl Console {
         let style = MonoTextStyle::new(&FONT_9X18, Rgb888::new(52, 100, 235));
         let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
 
-        let mut pending = Vec::new();
-        pending.reserve(256);
-
         Self {
             screen,
             cursor_pose: Cursor { x: 0, y: 0 },
             style,
             text_style,
-            pending,
+            pending: [0; PRINT_SLOT_SIZE],
+            pending_len: 0,
         }
     }
 
@@ -280,8 +366,8 @@ impl Console {
     }
 
     fn flush_queued_prints(&mut self) {
-        while let Some(bytes) = PRINT_QUEUE.pop() {
-            self.push_bytes(&bytes);
+        while let Some(slot) = PRINT_QUEUE.pop() {
+            self.push_bytes(slot.as_bytes());
             self.flush_pending();
         }
     }
@@ -319,8 +405,34 @@ impl Console {
 
         let mut i = 0;
         while i < spaces {
-            self.pending.push(b' ');
+            self.pending_push(b' ');
             i += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn pending_push(&mut self, b: u8) {
+        if self.pending_len == PRINT_SLOT_PAYLOAD {
+            self.flush_pending();
+        }
+
+        self.pending[self.pending_len] = b;
+        self.pending_len += 1;
+        self.pending[self.pending_len] = 0;
+    }
+
+    fn push_printable_byte(&mut self, b: u8) {
+        self.pending_push(b);
+
+        let max_cols = self.screen.width / FONT_WIDTH;
+        let col = self.cursor_pose.x / FONT_WIDTH;
+        let avail = max_cols.saturating_sub(col);
+
+        if avail == 0 {
+            self.flush_pending();
+            self.newline();
+        } else if self.pending_len >= avail {
+            self.flush_pending();
         }
     }
 
@@ -345,47 +457,28 @@ impl Console {
                     self.flush_pending();
                 }
                 0x20..=0x7E => {
-                    self.pending.push(b);
-                    let max_cols = self.screen.width / FONT_WIDTH;
-                    let col = self.cursor_pose.x / FONT_WIDTH;
-                    let avail = max_cols.saturating_sub(col);
-
-                    if avail == 0 {
-                        self.flush_pending();
-                        self.newline();
-                    } else if self.pending.len() >= avail {
-                        self.flush_pending();
-                    }
+                    self.push_printable_byte(b);
                 }
                 _ => {
-                    self.pending.push(b'?');
-                    let max_cols = self.screen.width / FONT_WIDTH;
-                    let col = self.cursor_pose.x / FONT_WIDTH;
-                    let avail = max_cols.saturating_sub(col);
-
-                    if avail == 0 {
-                        self.flush_pending();
-                        self.newline();
-                    } else if self.pending.len() >= avail {
-                        self.flush_pending();
-                    }
+                    self.push_printable_byte(b'?');
                 }
             }
         }
     }
 
     fn flush_pending(&mut self) {
-        if self.pending.is_empty() {
+        if self.pending_len == 0 {
             return;
         }
 
         let max_cols = self.screen.width / FONT_WIDTH;
         if max_cols == 0 {
-            self.pending.clear();
+            self.pending_len = 0;
+            self.pending[0] = 0;
             return;
         }
 
-        while !self.pending.is_empty() {
+        while self.pending_len != 0 {
             let col = self.cursor_pose.x / FONT_WIDTH;
             let avail = max_cols.saturating_sub(col);
 
@@ -394,7 +487,7 @@ impl Console {
                 continue;
             }
 
-            let take = self.pending.len().min(avail);
+            let take = self.pending_len.min(avail);
             let chunk = &self.pending[..take];
 
             let s = core::str::from_utf8(chunk).unwrap_or("?");
@@ -404,7 +497,9 @@ impl Console {
 
             self.cursor_pose.x = self.cursor_pose.x.saturating_add(take * FONT_WIDTH);
 
-            self.pending.drain(..take);
+            self.pending.copy_within(take..self.pending_len, 0);
+            self.pending_len -= take;
+            self.pending[self.pending_len] = 0;
 
             if self.cursor_pose.x + FONT_WIDTH > self.screen.width {
                 self.newline();
@@ -422,8 +517,10 @@ impl fmt::Write for Console {
 
 lazy_static! {
     pub static ref CONSOLE: IrqSafeMutex<Console> = IrqSafeMutex::new(Console::new());
-    static ref PRINT_QUEUE: SegQueue<Vec<u8>> = SegQueue::new();
+    static ref PRINT_QUEUE: ArrayQueue<PrintSlot> = ArrayQueue::new(PRINT_QUEUE_SLOTS);
 }
+
+static PRINT_QUEUE_FULL_PANIC: AtomicBool = AtomicBool::new(false);
 
 #[macro_export]
 macro_rules! print {
@@ -442,10 +539,49 @@ macro_rules! println {
     };
 }
 
+fn queue_slot(slot: PrintSlot) {
+    if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
+        return;
+    }
+
+    match PRINT_QUEUE.push(slot) {
+        Ok(()) => {}
+        Err(slot) => {
+            print_queue_full_panic(slot);
+        }
+    }
+}
+
 fn queue_print(args: fmt::Arguments) {
-    let mut s = String::new();
-    let _ = s.write_fmt(args);
-    PRINT_QUEUE.push(s.into_bytes());
+    if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
+        return;
+    }
+
+    let mut writer = QueuedPrintWriter::new();
+    let _ = writer.write_fmt(args);
+    writer.finish();
+}
+
+fn print_queue_full_panic(slot: PrintSlot) -> ! {
+    if PRINT_QUEUE_FULL_PANIC.swap(true, Ordering::AcqRel) {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+
+    loop {
+        if let Some(mut c) = CONSOLE.try_lock() {
+            c.flush_queued_prints();
+            c.push_bytes(slot.as_bytes());
+            c.flush_pending();
+            c.flush_queued_prints();
+            break;
+        }
+
+        core::hint::spin_loop();
+    }
+
+    panic!("print queue full");
 }
 
 fn try_flush_print_queue() -> bool {
@@ -458,6 +594,11 @@ fn try_flush_print_queue() -> bool {
 }
 
 pub(crate) fn _print(args: fmt::Arguments) {
+    if PRINT_QUEUE_FULL_PANIC.load(Ordering::Acquire) {
+        let _ = try_flush_print_queue();
+        return;
+    }
+
     if let Some(mut c) = CONSOLE.try_lock() {
         c.flush_queued_prints();
         let _ = c.write_fmt(args);

@@ -231,6 +231,7 @@ impl Program {
                     end.as_u64() - start.as_u64(),
                     &mut frame_alloc,
                     flags,
+                    false,
                 )
             }
         })();
@@ -268,6 +269,7 @@ impl Program {
                 end.as_u64() - start.as_u64(),
                 &mut frame_alloc,
                 flags,
+                false,
             )?;
             Ok(())
         })();
@@ -306,6 +308,7 @@ impl Program {
                 end.as_u64() - start.as_u64(),
                 &mut frame_alloc,
                 flags,
+                false,
             )?;
         }
         unsafe {

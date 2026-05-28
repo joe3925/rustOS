@@ -970,16 +970,37 @@ impl PnpManager {
         OBJECT_MANAGER.unlink(&link_path)
     }
 
-    pub fn resolve_targetio_from_symlink(&self, mut p: String) -> Option<IoTarget> {
+    pub fn resolve_targetio_from_symlink(&self, p: String) -> Option<IoTarget> {
+        self.resolve_targetio_from_symlink_ref(&p)
+    }
+
+    pub fn resolve_targetio_from_symlink_ref(&self, p: &str) -> Option<IoTarget> {
+        enum ResolvePath<'a> {
+            Borrowed(&'a str),
+            Owned(String),
+            Shared(Arc<str>),
+        }
+
+        impl ResolvePath<'_> {
+            fn as_str(&self) -> &str {
+                match self {
+                    Self::Borrowed(p) => p,
+                    Self::Owned(p) => p.as_str(),
+                    Self::Shared(p) => p.as_ref(),
+                }
+            }
+        }
+
+        let mut p = ResolvePath::Borrowed(p);
         for _ in 0..32 {
-            let o = OBJECT_MANAGER.open(p.clone()).ok()?;
+            let o = OBJECT_MANAGER.open(p.as_str()).ok()?;
             match &o.payload {
                 ObjectPayload::Device(d) => return Some(d.clone()),
                 ObjectPayload::Directory(_) => {
-                    p = alloc::format!("{}\\Top", p);
+                    p = ResolvePath::Owned(alloc::format!("{}\\Top", p.as_str()));
                 }
                 ObjectPayload::Symlink(target) => {
-                    p = target.clone().target.to_string();
+                    p = ResolvePath::Shared(target.target.clone());
                 }
                 _ => return None,
             }

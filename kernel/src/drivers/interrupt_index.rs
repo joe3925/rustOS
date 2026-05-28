@@ -265,34 +265,54 @@ pub fn get_current_logical_id() -> u8 {
         .expect("cpu id not available?")
         .initial_local_apic_id()
 }
+
 static PERCPU_SLOTS: Mutex<Vec<Option<&'static PerCpu>>> = Mutex::new(Vec::new());
 
 pub fn alloc_or_get_percpu_for(lapic_id: u32) -> &'static PerCpu {
     let idx = lapic_id as usize;
+
     let mut v = PERCPU_SLOTS.lock();
+
     if v.len() <= idx {
         v.resize_with(idx + 1, || None);
     }
+
     if let Some(p) = v[idx] {
         return p;
     }
+
     let p: &'static PerCpu = Box::leak(Box::new(PerCpu {
+        is_in_interrupt: AtomicBool::new(false),
+        reserved_interrupt_pad: [0; 0x7],
         cpu_id: lapic_id as u64,
-        reserved0: [0; 0x50],
+        reserved0: [0; 0x48],
         tls_array_pointer: 0,
     }));
+
     v[idx] = Some(p);
     p
 }
+
 #[repr(C, align(64))]
 pub struct PerCpu {
-    pub cpu_id: u64,
-    reserved0: [u8; 0x50],
-    pub tls_array_pointer: u64,
+    pub is_in_interrupt: AtomicBool, // 0x00
+    reserved_interrupt_pad: [u8; 0x7],
+    pub cpu_id: u64, // 0x08
+    reserved0: [u8; 0x48],
+    pub tls_array_pointer: u64, // 0x58
 }
 
-pub const PERCPU_CPU_ID_OFF: usize = 0;
+pub const PERCPU_IS_IN_INTERRUPT_OFF: usize = 0x00;
+pub const PERCPU_CPU_ID_OFF: usize = 0x08;
 pub const PERCPU_TLS_ARRAY_POINTER_OFF: usize = 0x58;
+
+const _: () = {
+    assert!(core::mem::align_of::<PerCpu>() == 0x40);
+    assert!(core::mem::size_of::<PerCpu>() == 0x80);
+    assert!(core::mem::offset_of!(PerCpu, is_in_interrupt) == PERCPU_IS_IN_INTERRUPT_OFF);
+    assert!(core::mem::offset_of!(PerCpu, cpu_id) == PERCPU_CPU_ID_OFF);
+    assert!(core::mem::offset_of!(PerCpu, tls_array_pointer) == PERCPU_TLS_ARRAY_POINTER_OFF);
+};
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
 const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
@@ -303,7 +323,7 @@ fn wrmsr(msr: u32, val: u64) {
         asm!(
             "wrmsr",
             in("ecx") msr,
-            in("eax") (val as u32),
+            in("eax") val as u32,
             in("edx") (val >> 32) as u32,
             options(nostack, preserves_flags)
         );
@@ -311,19 +331,59 @@ fn wrmsr(msr: u32, val: u64) {
 }
 
 #[inline(always)]
+fn rdmsr(msr: u32) -> u64 {
+    let lo: u32;
+    let hi: u32;
+
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") lo,
+            out("edx") hi,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    ((hi as u64) << 32) | lo as u64
+}
+
+#[inline(always)]
 pub fn set_gs_bases(percpu: *const PerCpu) {
     let p = percpu as u64;
+
     wrmsr(IA32_GS_BASE, p);
     wrmsr(IA32_KERNEL_GS_BASE, p);
 }
 
 #[inline(always)]
+pub fn current_percpu() -> &'static PerCpu {
+    let ptr = rdmsr(IA32_GS_BASE) as *const PerCpu;
+
+    debug_assert!(!ptr.is_null());
+
+    unsafe { &*ptr }
+}
+
+#[inline(always)]
+pub fn current_is_in_interrupt_atomic() -> &'static AtomicBool {
+    &current_percpu().is_in_interrupt
+}
+
+#[inline(always)]
+pub fn is_in_interrupt_atomic_for(lapic_id: u32) -> &'static AtomicBool {
+    &alloc_or_get_percpu_for(lapic_id).is_in_interrupt
+}
+
+#[inline(always)]
 pub fn set_current_cpu_id(id: u32) {
+    let id = id as u64;
+
     unsafe {
         asm!(
-            "mov dword ptr gs:[{off}], {id:e}",
+            "mov qword ptr gs:[{off}], {id:r}",
             off = const PERCPU_CPU_ID_OFF,
-            id  = in(reg) id,
+            id = in(reg) id,
             options(nostack, preserves_flags)
         );
     }
@@ -331,18 +391,19 @@ pub fn set_current_cpu_id(id: u32) {
 
 #[inline(always)]
 pub fn current_cpu_id() -> usize {
-    let id: u32;
+    let id: u64;
+
     unsafe {
         asm!(
-            "mov {out:e}, dword ptr gs:[{off}]",
+            "mov {out:r}, qword ptr gs:[{off}]",
             out = out(reg) id,
             off = const PERCPU_CPU_ID_OFF,
             options(nomem, nostack, preserves_flags)
         );
     }
+
     id as usize
 }
-
 impl InterruptIndex {
     pub(crate) fn as_u8(self) -> u8 {
         self as u8
@@ -402,6 +463,40 @@ pub fn wait_using_pit_50ms() {
                 break;
             }
         }
+    }
+}
+
+fn duration_to_tsc_cycles(d: Duration) -> u128 {
+    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
+    if tsc_hz == 0 {
+        panic!("TSC not calibrated");
+    }
+
+    d.as_nanos()
+        .saturating_mul(tsc_hz as u128)
+        .saturating_add(999_999_999)
+        / 1_000_000_000
+}
+
+fn wait_for_ap_booted(expected: usize, timeout: Duration) -> bool {
+    if AP_BOOTED.load(Ordering::Acquire) >= expected {
+        return true;
+    }
+
+    let target_delta = duration_to_tsc_cycles(timeout);
+    let start = cpu::get_cycles() as u128;
+
+    loop {
+        if AP_BOOTED.load(Ordering::Acquire) >= expected {
+            return true;
+        }
+
+        let elapsed = (cpu::get_cycles() as u128).saturating_sub(start);
+        if elapsed >= target_delta {
+            return false;
+        }
+
+        core::hint::spin_loop();
     }
 }
 
@@ -532,6 +627,13 @@ impl Lapic {
 
     fn ptr(&self) -> *mut u32 {
         self.base_addr.as_mut_ptr()
+    }
+
+    unsafe fn wait_for_delivery(&self) {
+        let icr1 = self.ptr().add(APICOffset::Icr1 as usize / 4);
+        while (icr1.read_volatile() & (1 << 12)) != 0 {
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -858,21 +960,13 @@ impl ApicImpl {
 
             unsafe {
                 let dst = IpiDest::ApicId(apic.local_apic_id as u8);
+                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
 
                 self.lapic.send_ipi(dst, IpiKind::InitAssert);
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
                 self.lapic.send_ipi(dst, IpiKind::InitDeassert);
-                wait_duration(Duration::from_millis(10));
-
-                let expected = AP_BOOTED.load(Ordering::SeqCst) + 1;
-                self.lapic.send_ipi(
-                    dst,
-                    IpiKind::Startup {
-                        vector_phys_addr: tramp_phys,
-                    },
-                );
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
                 self.lapic.send_ipi(
                     dst,
@@ -880,23 +974,24 @@ impl ApicImpl {
                         vector_phys_addr: tramp_phys,
                     },
                 );
-                wait_duration(Duration::from_millis(10));
+                self.lapic.wait_for_delivery();
 
-                // Wait until the AP has executed ap_startup (past the trampoline) before reusing it.
-                for _ in 0..500 {
-                    if AP_BOOTED.load(Ordering::SeqCst) >= expected {
-                        break;
-                    }
-                    wait_duration(Duration::from_millis(1));
+                if !wait_for_ap_booted(expected, Duration::from_millis(1)) {
+                    self.lapic.send_ipi(
+                        dst,
+                        IpiKind::Startup {
+                            vector_phys_addr: tramp_phys,
+                        },
+                    );
+                    self.lapic.wait_for_delivery();
                 }
-            }
-        }
 
-        for _ in 0..200 {
-            if CORE_LOCK.load(Ordering::SeqCst) == 0 {
-                break;
+                assert!(
+                    wait_for_ap_booted(expected, Duration::from_millis(100)),
+                    "AP with local APIC id {} did not reach ap_startup",
+                    apic.local_apic_id
+                );
             }
-            wait_duration(Duration::from_millis(1));
         }
 
         unmap_range(VirtAddr::new(map_start), map_len as u64);
@@ -917,10 +1012,12 @@ pub fn init_percpu_gs(lapic_id: u32) -> &'static PerCpu {
 
 extern "win64" fn ap_startup() -> ! {
     cpu::enable_sse();
+    CORE_LOCK.fetch_add(1, Ordering::SeqCst);
     // Signal that this AP is past the trampoline and safe to reuse it.
+    // CORE_LOCK is already raised so the BSP cannot miss this AP before it
+    // finishes serialized core initialization.
     AP_BOOTED.fetch_add(1, Ordering::SeqCst);
     {
-        CORE_LOCK.fetch_add(1, Ordering::SeqCst);
         let _g = INIT_LOCK.lock();
 
         unsafe { PER_CPU_GDT.lock().init_gdt() };

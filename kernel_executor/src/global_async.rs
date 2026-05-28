@@ -1,76 +1,100 @@
 use crate::platform::{platform, Job};
+use crate::sync::atomic::{AtomicUsize, Ordering};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use kernel_types::io::TreiberStack;
+use kernel_types::io::BoundedTreiberStack;
 use spin::Once;
+
 pub type Trampoline = extern "win64" fn(usize);
-
-#[derive(Clone, Copy)]
-struct WorkItem {
-    trampoline: Trampoline,
-    ctx: usize,
-}
-
-const MAX_SHARDS: usize = 8;
 
 #[repr(align(64))]
 struct CacheAligned(AtomicUsize);
 
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct WorkItem {
+    pub trampoline: Trampoline,
+    pub ctx: usize,
+}
+
+const MAX_SHARDS: usize = 32;
+
 struct ShardedQueues {
-    queues: Vec<TreiberStack<WorkItem>>,
-    active: CacheAligned,
+    queues: Vec<BoundedTreiberStack<WorkItem>>,
     enqueue_hint: CacheAligned,
     pump_hint: CacheAligned,
     work_count: CacheAligned,
 }
 
 impl ShardedQueues {
-    fn new(shards: usize) -> Self {
-        let shard_count = if shards == 0 { 1 } else { shards };
-        let mut queues = Vec::with_capacity(shard_count);
-        for _ in 0..shard_count {
-            queues.push(TreiberStack::new());
+    fn new(shards: usize, max_work_items: usize) -> Self {
+        let base = max_work_items / shards;
+        let rem = max_work_items % shards;
+
+        let mut queues = Vec::with_capacity(shards);
+
+        let mut i = 0usize;
+        while i < shards {
+            let cap = base + usize::from(i < rem);
+            queues.push(BoundedTreiberStack::new(cap));
+            i += 1;
         }
 
         Self {
             queues,
-            active: CacheAligned(AtomicUsize::new(shard_count)),
             enqueue_hint: CacheAligned(AtomicUsize::new(0)),
             pump_hint: CacheAligned(AtomicUsize::new(0)),
             work_count: CacheAligned(AtomicUsize::new(0)),
         }
     }
 
-    fn set_active(&self, shards: usize) {
-        let capped = shards.clamp(1, self.queues.len());
-        self.active.0.store(capped, Ordering::Release);
-    }
-
     fn shard_count(&self) -> usize {
-        self.active.0.load(Ordering::Acquire)
+        self.queues.len()
     }
 
-    fn push(&self, item: WorkItem) {
+    fn try_push(&self, mut item: WorkItem) -> Result<(), WorkItem> {
         let shards = self.shard_count();
-        let idx = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
-        self.queues[idx].push(item);
-        self.work_count.0.fetch_add(1, Ordering::Release);
+        let start = self.enqueue_hint.0.fetch_add(1, Ordering::Relaxed) % shards;
+
+        let mut offset = 0usize;
+        while offset < shards {
+            let idx = (start + offset) % shards;
+
+            match self.queues[idx].try_push(item) {
+                Ok(()) => {
+                    self.work_count.0.fetch_add(1, Ordering::Release);
+                    return Ok(());
+                }
+                Err(returned) => {
+                    item = returned;
+                }
+            }
+
+            offset += 1;
+        }
+
+        Err(item)
     }
 
     fn pop_round_robin(&self, start_idx: usize) -> Option<(WorkItem, usize)> {
         let shards = self.shard_count();
-        for offset in 0..shards {
+
+        let mut offset = 0usize;
+        while offset < shards {
             let idx = (start_idx + offset) % shards;
+
             if let Some(item) = self.queues[idx].pop() {
-                self.work_count.0.fetch_sub(1, Ordering::Release);
+                self.work_count.0.fetch_sub(1, Ordering::AcqRel);
                 return Some((item, idx));
             }
+
+            offset += 1;
         }
+
         None
     }
 
-    fn is_empty(&self) -> bool {
-        self.work_count.0.load(Ordering::Acquire) == 0
+    fn has_pending_work(&self) -> bool {
+        self.work_count.0.load(Ordering::Acquire) != 0
     }
 
     fn next_pump_hint(&self) -> usize {
@@ -80,7 +104,7 @@ impl ShardedQueues {
 }
 
 pub struct GlobalAsyncExecutor {
-    queues: ShardedQueues,
+    queues: Once<ShardedQueues>,
     active_pumps: CacheAligned,
     max_pumps: CacheAligned,
 }
@@ -88,75 +112,93 @@ pub struct GlobalAsyncExecutor {
 impl GlobalAsyncExecutor {
     pub fn global() -> &'static GlobalAsyncExecutor {
         static EXEC: Once<GlobalAsyncExecutor> = Once::new();
+
         EXEC.call_once(|| GlobalAsyncExecutor {
-            queues: ShardedQueues::new(MAX_SHARDS),
+            queues: Once::new(),
             active_pumps: CacheAligned(AtomicUsize::new(0)),
             max_pumps: CacheAligned(AtomicUsize::new(1)),
         })
     }
 
-    pub fn init(&self, n: usize) {
-        let n = if n == 0 { 1 } else { n };
-        self.max_pumps.0.store(n, Ordering::Release);
-        self.queues.set_active(n);
-        self.try_schedule();
+    pub fn init(&self, shards: usize, max_work_items: usize) {
+        let shards = shards.clamp(1, MAX_SHARDS);
+        let max_work_items = max_work_items.max(shards);
+
+        self.queues
+            .call_once(|| ShardedQueues::new(shards, max_work_items));
+        self.max_pumps.0.store(shards, Ordering::Release);
+
+        platform().init_blocking(shards);
+        platform().init_runtime(shards, shards);
+
+        if self.queues().has_pending_work() {
+            self.try_schedule();
+        }
+    }
+
+    fn queues(&self) -> &ShardedQueues {
+        self.queues
+            .get()
+            .expect("global async executor queues not initialized")
     }
 
     pub fn submit(&self, trampoline: Trampoline, ctx: usize) {
-        self.queues.push(WorkItem { trampoline, ctx });
+        self.try_submit(trampoline, ctx)
+            .expect("failed to submit to executor pool")
+    }
+
+    pub fn try_submit(&self, trampoline: Trampoline, ctx: usize) -> Result<(), WorkItem> {
+        self.queues().try_push(WorkItem { trampoline, ctx })?;
         self.try_schedule();
+        Ok(())
     }
 
     fn try_schedule(&self) {
-        let max = self.max_pumps.0.load(Ordering::Relaxed);
-        let active = self.active_pumps.0.load(Ordering::Relaxed);
-        if active >= max {
+        let max = self.max_pumps.0.load(Ordering::Acquire);
+        let reserved = self
+            .active_pumps
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < max).then_some(active + 1)
+            })
+            .is_ok();
+
+        if !reserved {
             return;
         }
 
-        let hint = self.queues.next_pump_hint();
+        let hint = self.queues().next_pump_hint();
+
         platform().submit_runtime(Job {
             f: pump_trampoline,
             a: hint,
         });
     }
 
-    fn try_enter_pump(&self) -> bool {
-        let max = self.max_pumps.0.load(Ordering::Relaxed);
-        let prev = self.active_pumps.0.fetch_add(1, Ordering::AcqRel);
-        if prev + 1 > max {
-            self.active_pumps.0.fetch_sub(1, Ordering::Relaxed);
-            return false;
-        }
-        true
-    }
-
     fn exit_pump(&self) {
-        self.active_pumps.0.fetch_sub(1, Ordering::Release);
+        self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn pump(&self, start_hint: usize) {
-        if !self.try_enter_pump() {
-            return;
-        }
-
-        let shard_count = self.queues.shard_count();
+        let queues = self.queues();
+        let shard_count = queues.shard_count();
         let mut cursor = start_hint % shard_count;
 
         loop {
-            let item = match self.queues.pop_round_robin(cursor) {
+            let item = match queues.pop_round_robin(cursor) {
                 Some((x, idx)) => {
                     cursor = (idx + 1) % shard_count;
                     x
                 }
                 None => break,
             };
+
             (item.trampoline)(item.ctx);
         }
 
         self.exit_pump();
 
-        if !self.queues.is_empty() {
+        if queues.has_pending_work() {
             self.try_schedule();
         }
     }

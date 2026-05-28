@@ -1,11 +1,13 @@
 **/target/
 *.vhdx
 *.lib
-*.pb 
+*.pb
 .kbs/*
 *.exe
 *.pdb
 *.lock
 Cargo.lock
 kernel-bench-studio.json
-
+qemu/
+.DS_Store
+*.dmg

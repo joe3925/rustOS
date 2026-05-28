@@ -9,8 +9,12 @@ edition = "2021"
 name = "kernel"
 path = "src/main.rs"
 
+[features]
+default = ["allocator-mimalloc"]
+allocator-mimalloc = []
+allocator-buddy = []
+
 [dependencies]
-bootloader_api = "0.11.10"
 x86_64 = "=0.15.2"
 spin = "0.10.0"
 pic8259 = "0.10.1"
@@ -28,8 +32,6 @@ raw-cpuid = "11.5.0"
 acpi = "5.2.0"
 goblin = { version = "0.10.0", features = [
     "endian_fd",
-    "elf64",
-    "elf32",
     "pe64",
     "pe32",
     "mach64",
@@ -37,7 +39,6 @@ goblin = { version = "0.10.0", features = [
     "archive",
     "te",
 ], default-features = false }
-gimli = { version = "0.32.3", default-features = false, features = ["read"] }
 hashbrown = "0.15.4"
 bincode = { version = "2.0.1", default-features = false, features = [
     "alloc",
@@ -47,7 +48,6 @@ serde_json = { version = "1.0.140", default-features = false, features = [
     "alloc",
 ] }
 buddy_system_allocator = "0.11.0"
-baby-mimalloc = { version = "*", features = ["spin_mutex", "deferred_free"] }
 toml = { version = "0.9.5", default-features = false, features = ["parse"] }
 libm = { version = "0.2", default-features = false }
 kernel_types = { path = "../kernel_types", default-features = false, features = [
@@ -64,11 +64,23 @@ crossbeam-queue = { version = "0.3.12", default-features = false, features = [
 ] }
 kernel_executor = { path = "../kernel_executor" }
 kernel_macros = { path = "../kernel_macros" }
+kernel_sync = { path = "../kernel_sync", default-features = false }
+crossbeam-epoch = { version = "0.9", default-features = false, features = [
+    "alloc",
+] }
+cfg-if = "1.0.4"
 
 
 [dependencies.lazy_static]
 version = "1.0"
 features = ["spin_no_std"]
+
+[lints.rust]
+unused_must_use = "deny"
+
+[build-dependencies]
+cc = "1.2"
+implib = "0.4"
 [profile.dev]
 opt-level = 3
 lto = true

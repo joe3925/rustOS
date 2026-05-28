@@ -160,6 +160,13 @@ impl BootInfoFrameAllocator {
         Self::allocate_contiguous_frames_aligned(num_frames, 1)
     }
 
+    pub fn allocate_contiguous_2mib_frames(num_frames: usize) -> Option<PhysAddr> {
+        let frames_4k = num_frames.checked_mul(FRAMES_PER_2M)?;
+        let phys = Self::allocate_contiguous_frames_aligned(frames_4k, FRAMES_PER_2M)?;
+        USED_MEMORY.fetch_add(num_frames * Size2MiB::SIZE as usize, Ordering::SeqCst);
+        Some(phys)
+    }
+
     pub fn deallocate_frame<S: PageSize>(&self, frame: PhysFrame<S>) {
         let base_idx = (frame.start_address().as_u64() >> 12) as usize;
         let (len, bytes_u64) = match S::SIZE {
@@ -294,7 +301,7 @@ unsafe impl FrameAllocator<Size2MiB> for BootInfoFrameAllocator {
                 *w = u64::MAX;
             }
 
-            NEXT_WORD_2M.store(word_idx, Ordering::Relaxed);
+            NEXT_WORD_2M.store(start_w + WORDS_PER_2M, Ordering::Relaxed);
 
             USED_MEMORY.fetch_add(0x20_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;
@@ -354,7 +361,7 @@ unsafe impl FrameAllocator<Size1GiB> for BootInfoFrameAllocator {
                 *w = u64::MAX;
             }
 
-            NEXT_WORD_1G.store(word_idx, Ordering::Relaxed);
+            NEXT_WORD_1G.store(start_w + WORDS_PER_1G, Ordering::Relaxed);
 
             USED_MEMORY.fetch_add(0x4000_0000, Ordering::SeqCst);
             let phys = (base as u64) << 12;

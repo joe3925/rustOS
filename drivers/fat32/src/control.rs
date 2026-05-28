@@ -17,7 +17,6 @@ use kernel_api::{
         driver_set_evt_device_add, pnp_create_control_device_and_link,
         pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
-    println,
     request::{RequestHandle, RequestType, TraversalPolicy},
     request_handler,
     runtime::spawn_detached,
@@ -26,20 +25,16 @@ use kernel_api::{
 
 use crate::block_dev::BlockDev;
 use crate::volume::{FIRST_FILE_OWNER_ID, METADATA_OWNER_ID, VolCtrlDevExt, fs_op_dispatch};
-use log::{Level, Metadata, Record};
+use log::{Metadata, Record};
 
 struct KernelLogger;
 
 impl log::Log for KernelLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Debug
+    fn enabled(&self, _metadata: &Metadata) -> bool {
+        false
     }
 
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            println!("FAT32 [{}]: {}", record.level(), record.args());
-        }
-    }
+    fn log(&self, _record: &Record) {}
 
     fn flush(&self) {}
 }
@@ -48,7 +43,7 @@ static LOGGER: KernelLogger = KernelLogger;
 
 fn init_logger() {
     let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Off);
 }
 
 #[inline]
@@ -175,7 +170,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
                             (true, Some(vol_ctrl))
                         }
-                        Err(_) => (false, None),
+                        Err(_e) => (false, None),
                     }
                 }
                 _ => (false, None),
@@ -231,7 +226,7 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
             RequestData::from_t::<Vec<u8>>(ctrl_link.into_bytes()),
         );
         binding.set_traversal_policy(TraversalPolicy::ForwardLower);
-        pnp_ioctl_via_symlink(
+        let _ioctl_status = pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),
             IOCTL_MOUNTMGR_REGISTER_FS,
             &mut binding,

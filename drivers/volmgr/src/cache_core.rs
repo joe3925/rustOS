@@ -4,6 +4,7 @@ use super::cache::{
 };
 use crate::alloc::vec::Vec;
 use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use core::cmp::min;
 use core::marker::PhantomData;
@@ -102,7 +103,8 @@ struct Page<const BLOCK_SIZE: usize> {
     generation: AtomicU64,
     wb_generation: AtomicU64,
     active_ops: AtomicUsize,
-    /// File-level owner tag. 0 = unowned (included in all targeted flushes).
+    /// File-level owner tag. 0 = unowned; owner-targeted flushes only match
+    /// explicit non-zero owners.
     owner: AtomicU64,
 }
 
@@ -356,6 +358,7 @@ struct PreparedFlushPage<const BLOCK_SIZE: usize> {
     lba: u64,
     page: Arc<Page<BLOCK_SIZE>>,
     wb_generation: u64,
+    owner: u64,
 }
 
 pub(crate) struct FlushJobHandle<E> {
@@ -377,6 +380,7 @@ where
     cfg: CacheConfig,
     stats: Arc<StatsInner>,
     dirty_pages: Arc<AtomicUsize>,
+    dirty_owner_keys: Arc<Mutex<BTreeMap<u64, BTreeSet<u64>>>>,
     background_writeback_active: AtomicBool,
     closed: AtomicBool,
     flush_job: Mutex<Option<Arc<FlushJobHandle<B::Error>>>>,
@@ -453,6 +457,7 @@ where
             cfg,
             stats: Arc::new(StatsInner::new()),
             dirty_pages: Arc::new(AtomicUsize::new(0)),
+            dirty_owner_keys: Arc::new(Mutex::new(BTreeMap::new())),
             background_writeback_active: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             flush_job: Mutex::new(None),
@@ -473,12 +478,65 @@ where
         Ok(())
     }
 
-    fn mark_cached_page_dirty(&self, page: &Page<BLOCK_SIZE>, owner: u64) {
-        let became_dirty = if owner == 0 {
-            page.mark_dirty()
-        } else {
-            page.mark_dirty_with_owner(owner)
+    fn track_dirty_owner_insert_locked(
+        owners: &mut BTreeMap<u64, BTreeSet<u64>>,
+        owner: u64,
+        lba: u64,
+    ) {
+        if owner == 0 {
+            return;
+        }
+
+        owners.entry(owner).or_default().insert(lba);
+    }
+
+    fn track_dirty_owner_remove_locked(
+        owners: &mut BTreeMap<u64, BTreeSet<u64>>,
+        owner: u64,
+        lba: u64,
+    ) {
+        if owner == 0 {
+            return;
+        }
+
+        let remove_owner = match owners.get_mut(&owner) {
+            Some(keys) => {
+                keys.remove(&lba);
+                keys.is_empty()
+            }
+            None => false,
         };
+
+        if remove_owner {
+            owners.remove(&owner);
+        }
+    }
+
+    fn track_dirty_owner_remove(
+        dirty_owner_keys: &Mutex<BTreeMap<u64, BTreeSet<u64>>>,
+        owner: u64,
+        lba: u64,
+    ) {
+        if owner == 0 {
+            return;
+        }
+
+        let mut owners = dirty_owner_keys.lock();
+        Self::track_dirty_owner_remove_locked(&mut owners, owner, lba);
+    }
+
+    fn mark_cached_page_dirty(&self, lba: u64, page: &Page<BLOCK_SIZE>, owner: u64) {
+        let old_owner = page.owner.swap(owner, Ordering::AcqRel);
+        page.generation.fetch_add(1, Ordering::AcqRel);
+        let became_dirty = !page.dirty.swap(true, Ordering::AcqRel);
+
+        if became_dirty || old_owner != owner {
+            let mut owners = self.dirty_owner_keys.lock();
+            if !became_dirty {
+                Self::track_dirty_owner_remove_locked(&mut owners, old_owner, lba);
+            }
+            Self::track_dirty_owner_insert_locked(&mut owners, owner, lba);
+        }
 
         if became_dirty {
             self.dirty_pages.fetch_add(1, Ordering::AcqRel);
@@ -638,6 +696,7 @@ where
             Arc::clone(&self.backend),
             Arc::clone(&self.stats),
             Arc::clone(&self.dirty_pages),
+            Arc::clone(&self.dirty_owner_keys),
             lba,
             page,
         )
@@ -976,6 +1035,7 @@ where
         backend: Arc<B>,
         stats: Arc<StatsInner>,
         dirty_pages: Arc<AtomicUsize>,
+        dirty_owner_keys: Arc<Mutex<BTreeMap<u64, BTreeSet<u64>>>>,
         lba: u64,
         page: Arc<Page<BLOCK_SIZE>>,
     ) -> Result<bool, CacheError<B::Error>> {
@@ -999,6 +1059,7 @@ where
 
         let wb_gen = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_gen, Ordering::Release);
+        let wb_owner = page.owner.load(Ordering::Acquire);
 
         let write_res = {
             let data_guard = page.data.read();
@@ -1029,6 +1090,7 @@ where
                 if cur_gen == wb_gen {
                     if page.dirty.swap(false, Ordering::AcqRel) {
                         dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                        Self::track_dirty_owner_remove(&dirty_owner_keys, wb_owner, lba);
                     }
                 }
                 page.writeback.store(false, Ordering::Release);
@@ -1050,6 +1112,7 @@ where
         backend: Arc<B>,
         stats: Arc<StatsInner>,
         dirty_pages: Arc<AtomicUsize>,
+        dirty_owner_keys: Arc<Mutex<BTreeMap<u64, BTreeSet<u64>>>>,
         pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
         joins: &mut Vec<FfiFuture<()>>,
         parallelism: usize,
@@ -1069,13 +1132,23 @@ where
             let backend = Arc::clone(&backend);
             let stats = Arc::clone(&stats);
             let dirty_pages = Arc::clone(&dirty_pages);
+            let dirty_owner_keys = Arc::clone(&dirty_owner_keys);
             let page = Arc::clone(page);
             let lba = *lba;
             let first_error_ptr_copy = first_error_ptr;
             let writebacks_ptr_copy = writebacks_ptr;
 
             let handle = spawn(async move {
-                match Self::flush_page_task(backend, stats, dirty_pages, lba, page).await {
+                match Self::flush_page_task(
+                    backend,
+                    stats,
+                    dirty_pages,
+                    dirty_owner_keys,
+                    lba,
+                    page,
+                )
+                .await
+                {
                     Ok(true) => {
                         // SAFETY: We await all handles before returning from this function,
                         // guaranteeing that `writebacks` safely outlives this spawned task.
@@ -1171,6 +1244,7 @@ where
                     Arc::clone(&self.backend),
                     Arc::clone(&self.stats),
                     Arc::clone(&self.dirty_pages),
+                    Arc::clone(&self.dirty_owner_keys),
                     &batch,
                     &mut joins,
                     parallelism,
@@ -1231,16 +1305,19 @@ where
 
         let wb_generation = page.generation.load(Ordering::Acquire);
         page.wb_generation.store(wb_generation, Ordering::Release);
+        let owner = page.owner.load(Ordering::Acquire);
         Some(PreparedFlushPage {
             lba,
             page,
             wb_generation,
+            owner,
         })
     }
 
     fn finish_prepared_flush_pages(
         stats: &StatsInner,
         dirty_pages: &AtomicUsize,
+        dirty_owner_keys: &Mutex<BTreeMap<u64, BTreeSet<u64>>>,
         pages: &[PreparedFlushPage<BLOCK_SIZE>],
         success: bool,
     ) {
@@ -1251,6 +1328,7 @@ where
                     && prepared.page.dirty.swap(false, Ordering::AcqRel)
                 {
                     dirty_pages.fetch_sub(1, Ordering::AcqRel);
+                    Self::track_dirty_owner_remove(dirty_owner_keys, prepared.owner, prepared.lba);
                 }
                 stats.flush_success.fetch_add(1, Ordering::Relaxed);
             } else if !prepared.page.dirty.swap(true, Ordering::AcqRel) {
@@ -1264,6 +1342,7 @@ where
         backend: &Arc<B>,
         stats: &Arc<StatsInner>,
         dirty_pages: &Arc<AtomicUsize>,
+        dirty_owner_keys: &Arc<Mutex<BTreeMap<u64, BTreeSet<u64>>>>,
         run: &[PreparedFlushPage<BLOCK_SIZE>],
         frames: &mut Vec<IoBufferPageFrame>,
     ) -> Result<usize, CacheError<B::Error>> {
@@ -1292,7 +1371,7 @@ where
                 .checked_add(page_frames.len())
                 .is_none_or(|len| len > IOBUFFER_MAX_FRAME_CAPACITY)
             {
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                Self::finish_prepared_flush_pages(stats, dirty_pages, dirty_owner_keys, run, false);
                 return Err(CacheError::InvalidIoBuffer);
             }
             frames.extend_from_slice(page_frames);
@@ -1307,7 +1386,7 @@ where
             Ok(io_buf) => io_buf,
             Err(_) => {
                 frames.clear();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                Self::finish_prepared_flush_pages(stats, dirty_pages, dirty_owner_keys, run, false);
                 return Err(CacheError::InvalidIoBuffer);
             }
         };
@@ -1325,11 +1404,11 @@ where
                 stats
                     .backend_writes
                     .fetch_add(run.len() as u64, Ordering::Relaxed);
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, true);
+                Self::finish_prepared_flush_pages(stats, dirty_pages, dirty_owner_keys, run, true);
                 Ok(run.len())
             }
             Err(err) => {
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+                Self::finish_prepared_flush_pages(stats, dirty_pages, dirty_owner_keys, run, false);
                 Err(err)
             }
         }
@@ -1347,6 +1426,20 @@ where
             Some(Arc::clone(page))
         } else {
             None
+        }
+    }
+
+    fn append_dirty_owner_keys(&self, owner: u64, keys: &mut Vec<u64>) {
+        if owner == 0 {
+            return;
+        }
+
+        let owners = self.dirty_owner_keys.lock();
+        if let Some(owner_keys) = owners.get(&owner) {
+            keys.reserve(owner_keys.len());
+            for key in owner_keys {
+                keys.push(*key);
+            }
         }
     }
 
@@ -1389,6 +1482,7 @@ where
                     &self.backend,
                     &self.stats,
                     &self.dirty_pages,
+                    &self.dirty_owner_keys,
                     &run,
                     frame_scratch.frames_mut(),
                 )
@@ -1413,6 +1507,7 @@ where
                         &self.backend,
                         &self.stats,
                         &self.dirty_pages,
+                        &self.dirty_owner_keys,
                         &run,
                         frame_scratch.frames_mut(),
                     )
@@ -1436,6 +1531,7 @@ where
                     &self.backend,
                     &self.stats,
                     &self.dirty_pages,
+                    &self.dirty_owner_keys,
                     &run,
                     frame_scratch.frames_mut(),
                 )
@@ -1456,6 +1552,7 @@ where
                 &self.backend,
                 &self.stats,
                 &self.dirty_pages,
+                &self.dirty_owner_keys,
                 &run,
                 frame_scratch.frames_mut(),
             )
@@ -1481,15 +1578,22 @@ where
             core::mem::take(&mut scratch.keys)
         };
 
-        let mut shard_idx = 0usize;
-        while shard_idx < self.shards.len() {
-            let shard = self.shards[shard_idx].lock();
-            shard.index.for_each(|lba, page| {
-                if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
-                    keys.push(lba);
+        match filter {
+            FlushFilter::Owner(owner) => {
+                self.append_dirty_owner_keys(*owner, &mut keys);
+            }
+            FlushFilter::All | FlushFilter::BlockRange(_) => {
+                let mut shard_idx = 0usize;
+                while shard_idx < self.shards.len() {
+                    let shard = self.shards[shard_idx].lock();
+                    shard.index.for_each(|lba, page| {
+                        if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+                            keys.push(lba);
+                        }
+                    });
+                    shard_idx += 1;
                 }
-            });
-            shard_idx += 1;
+            }
         }
 
         keys.sort_unstable();
@@ -1508,6 +1612,19 @@ where
     }
 
     async fn has_dirty_pages_filtered(&self, filter: &FlushFilter<'_>) -> bool {
+        if let FlushFilter::Owner(owner) = filter {
+            let mut keys = Vec::new();
+            self.append_dirty_owner_keys(*owner, &mut keys);
+            let mut i = 0usize;
+            while i < keys.len() {
+                if self.page_for_flush_key(keys[i], filter).is_some() {
+                    return true;
+                }
+                i += 1;
+            }
+            return false;
+        }
+
         let mut shard_idx = 0usize;
         while shard_idx < self.shards.len() {
             let shard = self.shards[shard_idx].lock();
@@ -1602,7 +1719,7 @@ where
             .flush_filtered_batched(filter, max_blocks_per_run)
             .await?;
 
-        if force_device_flush || writebacks != 0 {
+        if writebacks != 0 || (force_device_flush && matched == 0) {
             self.backend
                 .flush_device()
                 .await
@@ -1893,7 +2010,7 @@ where
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    cache.mark_cached_page_dirty(&page, owner);
+                    cache.mark_cached_page_dirty(lba, &page, owner);
                 }
                 WriteAcquire::Direct(page) => {
                     {

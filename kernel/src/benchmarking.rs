@@ -4,7 +4,6 @@ use crate::drivers::pnp::manager::PNP_MANAGER;
 use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
-use crate::memory::allocator::ALLOCATOR;
 use crate::memory::{
     heap::HEAP_SIZE,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
@@ -12,6 +11,7 @@ use crate::memory::{
 use crate::profiling::unwind::{
     capture_callchain_from_state_limited, CapturedCallchain, MAX_CALLCHAIN_DEPTH,
 };
+use crate::scheduling::runtime::runtime::spawn;
 use crate::scheduling::runtime::runtime::{
     block_on, spawn_blocking, spawn_blocking_many, spawn_detached, JoinAll,
 };
@@ -26,11 +26,13 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cmp::min;
 use core::fmt::Write;
 use core::future::Future;
 use core::hint::black_box;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::task::Waker;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use kernel_types::bench_archive::BENCH_ARCHIVE_EXTENSION;
@@ -49,7 +51,7 @@ use serde_json::{json, Value};
 use spin::{Mutex, Once};
 use x86_64::instructions::interrupts;
 //const BENCH_ENABLED: bool = cfg!(debug_assertions);
-const BENCH_ENABLED: bool = false;
+pub const BENCH_ENABLED: bool = false;
 
 const DEFAULT_SAMPLE_CAPACITY: usize = 8192;
 const DEFAULT_SAMPLE_CHUNK_CAPACITY: usize = 1024;
@@ -486,9 +488,11 @@ static ACTIVE_DRAIN_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PAUSE_PENDING: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PAUSE_POLICY: AtomicU32 =
     AtomicU32::new(BenchOverflowPolicy::PauseFlushWallTime as u32);
+static ACTIVE_PAUSE_START_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SAMPLING_STOPPED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_PERTURBED_BY_WORKER: AtomicBool = AtomicBool::new(false);
 static ACTIVE_OVERFLOW_WORKER_RUNNING: AtomicBool = AtomicBool::new(false);
+static ACTIVE_OVERFLOW_WINDOW: Once<Mutex<Option<BenchWindow>>> = Once::new();
 
 fn bench_policy_from_raw(raw: u32) -> BenchOverflowPolicy {
     match raw {
@@ -524,8 +528,28 @@ fn activate_bench_sampling_config(cfg: ResolvedBenchWindowConfig) {
     ACTIVE_MAX_UNWIND_DEPTH.store(cfg.max_unwind_depth, Ordering::Release);
     ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
     ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+    ACTIVE_PAUSE_START_NS.store(0, Ordering::Release);
     ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
     ACTIVE_PERTURBED_BY_WORKER.store(false, Ordering::Release);
+}
+
+fn active_overflow_window() -> &'static Mutex<Option<BenchWindow>> {
+    ACTIVE_OVERFLOW_WINDOW.call_once(|| Mutex::new(None))
+}
+
+fn set_active_overflow_window(window: BenchWindow) {
+    *active_overflow_window().lock() = Some(window);
+}
+
+fn clear_active_overflow_window(window: &BenchWindow) {
+    let mut active = active_overflow_window().lock();
+    if active
+        .as_ref()
+        .map(|w| Arc::ptr_eq(&w.inner, &window.inner))
+        .unwrap_or(false)
+    {
+        *active = None;
+    }
 }
 
 fn bench_state() -> Option<&'static BenchState> {
@@ -658,14 +682,75 @@ fn callchain_from_external_stack(rip: u64, stack: &[u64]) -> CapturedCallchain {
 fn bench_request_drain_worker() {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
     let _ = ACTIVE_DRAIN_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    bench_spawn_overflow_worker_if_needed();
 }
 
 #[inline]
 fn bench_request_pause_flush(policy: BenchOverflowPolicy) {
     ACTIVE_PERTURBED_BY_WORKER.store(true, Ordering::Release);
-    ACTIVE_PAUSE_POLICY.store(policy as u32, Ordering::Release);
     ACTIVE_SAMPLING_STOPPED.store(true, Ordering::Release);
-    let _ = ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    if !ACTIVE_PAUSE_PENDING.load(Ordering::Acquire) {
+        ACTIVE_PAUSE_POLICY.store(policy as u32, Ordering::Release);
+        ACTIVE_PAUSE_START_NS.store(bench_now_ns(), Ordering::Release);
+        let _ =
+            ACTIVE_PAUSE_PENDING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+    }
+    bench_spawn_overflow_worker_if_needed();
+}
+
+fn bench_spawn_overflow_worker_if_needed() {
+    if ACTIVE_OVERFLOW_WORKER_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+
+    let window = {
+        let active = active_overflow_window().lock();
+        active.clone()
+    };
+
+    let Some(window) = window else {
+        ACTIVE_DRAIN_PENDING.store(false, Ordering::Release);
+        ACTIVE_PAUSE_PENDING.store(false, Ordering::Release);
+        ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
+        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
+        return;
+    };
+
+    spawn_blocking(move || {
+        loop {
+            let mut did_work = false;
+
+            if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
+                if let Some(state) = bench_state_get() {
+                    state.drain_all_to_spill();
+                }
+                window.mark_worker_perturbed();
+                did_work = true;
+            }
+
+            if ACTIVE_PAUSE_PENDING.swap(false, Ordering::AcqRel) {
+                let policy = bench_policy_from_raw(ACTIVE_PAUSE_POLICY.load(Ordering::Acquire));
+                let pause_start_ns = ACTIVE_PAUSE_START_NS.swap(0, Ordering::AcqRel);
+                window.handle_pause_flush(policy, pause_start_ns);
+                did_work = true;
+            }
+
+            if !did_work {
+                break;
+            }
+        }
+
+        ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
+
+        if ACTIVE_DRAIN_PENDING.load(Ordering::Acquire)
+            || ACTIVE_PAUSE_PENDING.load(Ordering::Acquire)
+        {
+            bench_spawn_overflow_worker_if_needed();
+        }
+    });
 }
 
 #[inline]
@@ -681,11 +766,15 @@ fn bench_note_sample_push_outcome(
         BenchPushOutcome::Stored => {}
         BenchPushOutcome::StoredNearFull => match policy {
             BenchOverflowPolicy::QueueDrainWorker => bench_request_drain_worker(),
+            BenchOverflowPolicy::PauseFlushCompactTime => {
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushCompactTime)
+            }
+            BenchOverflowPolicy::PauseFlushWallTime => {
+                bench_request_pause_flush(BenchOverflowPolicy::PauseFlushWallTime)
+            }
             BenchOverflowPolicy::Panic
             | BenchOverflowPolicy::DropAndCount
             | BenchOverflowPolicy::StopSampling
-            | BenchOverflowPolicy::PauseFlushCompactTime
-            | BenchOverflowPolicy::PauseFlushWallTime
             | BenchOverflowPolicy::OverwriteOldest => {}
         },
         BenchPushOutcome::OverwroteOldest => {
@@ -723,7 +812,6 @@ fn bench_note_sample_push_outcome(
                 if let Some(drops) = drops {
                     drops.ring_full.fetch_add(1, Ordering::Relaxed);
                     drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
-                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
                 }
                 bench_request_pause_flush(BenchOverflowPolicy::PauseFlushCompactTime);
             }
@@ -731,7 +819,6 @@ fn bench_note_sample_push_outcome(
                 if let Some(drops) = drops {
                     drops.ring_full.fetch_add(1, Ordering::Relaxed);
                     drops.samples_dropped.fetch_add(1, Ordering::Relaxed);
-                    drops.sampling_stopped.fetch_add(1, Ordering::Relaxed);
                 }
                 bench_request_pause_flush(BenchOverflowPolicy::PauseFlushWallTime);
             }
@@ -1342,6 +1429,39 @@ struct BenchPauseInterval {
     reason: &'static str,
 }
 
+fn logical_time_adjustment_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> u64 {
+    let mut adjustment = 0u64;
+    for interval in pause_intervals {
+        if !interval.logical_time_shifted {
+            continue;
+        }
+
+        let interval_adjustment = if ts >= interval.pause_end_ns {
+            interval.duration_ns
+        } else if ts > interval.pause_start_ns {
+            ts.saturating_sub(interval.pause_start_ns)
+        } else {
+            0
+        };
+
+        adjustment = adjustment.saturating_add(interval_adjustment);
+    }
+    adjustment
+}
+
+fn adjusted_event_timestamp_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> Option<u64> {
+    let adjustment = logical_time_adjustment_ns(ts, pause_intervals);
+    if adjustment == 0 {
+        None
+    } else {
+        Some(ts.saturating_sub(adjustment))
+    }
+}
+
+fn logical_event_timestamp_ns(ts: u64, pause_intervals: &[BenchPauseInterval]) -> u64 {
+    adjusted_event_timestamp_ns(ts, pause_intervals).unwrap_or(ts)
+}
+
 fn make_empty_bundle(ncores: usize) -> ExportBundle {
     let mut samples = Vec::with_capacity(ncores + 1);
     let mut spans_rows = Vec::with_capacity(ncores + 1);
@@ -1391,7 +1511,11 @@ fn heap_build(heap: &mut [(u64, u16, u64, usize)]) {
     }
 }
 
-fn sample_proto_from_event(ev: &BenchEvent, sample: BenchSampleEvent) -> BenchSampleProto {
+fn sample_proto_from_event(
+    ev: &BenchEvent,
+    sample: BenchSampleEvent,
+    pause_intervals: &[BenchPauseInterval],
+) -> BenchSampleProto {
     let depth = core::cmp::min(sample.depth as usize, MAX_CALLCHAIN_DEPTH);
     BenchSampleProto {
         seq: ev.seq,
@@ -1404,7 +1528,7 @@ fn sample_proto_from_event(ev: &BenchEvent, sample: BenchSampleEvent) -> BenchSa
         frame_kinds: sample.frame_kinds[..depth].to_vec(),
         stack_low: sample.stack_low,
         stack_high: sample.stack_high,
-        adjusted_timestamp_ns: None,
+        adjusted_timestamp_ns: adjusted_event_timestamp_ns(ev.timestamp_ns, pause_intervals),
     }
 }
 
@@ -1551,6 +1675,7 @@ async fn build_exports_for_window(
     last_export_seq: &[u64],
     ncores: usize,
     open_spans: &mut BTreeMap<u32, (BenchSpanEvent, u64, u16)>,
+    pause_intervals: &[BenchPauseInterval],
 ) -> Vec<ExportBundle> {
     if !BENCH_ENABLED {
         return vec![make_empty_bundle(ncores)];
@@ -1706,7 +1831,7 @@ async fn build_exports_for_window(
         match ev.kind {
             BenchEventKind::Sample if log_samples => {
                 if let BenchEventData::Sample(s) = ev.data {
-                    let sample = sample_proto_from_event(&ev, s);
+                    let sample = sample_proto_from_event(&ev, s, pause_intervals);
                     if per_core_enabled && scan_core < ncores {
                         bundle.samples[scan_core].push(sample.clone());
                     }
@@ -1715,22 +1840,17 @@ async fn build_exports_for_window(
             }
             BenchEventKind::Metrics if want_mem_stream => {
                 if let BenchEventData::Metrics(m) = ev.data {
+                    let ts = logical_event_timestamp_ns(ev.timestamp_ns, pause_intervals);
                     if per_core_enabled && scan_core < ncores {
                         write_metrics_row(
                             &mut bundle.mem_rows[scan_core],
                             run_id,
-                            ev.timestamp_ns,
+                            ts,
                             ev.core_id,
                             &m,
                         );
                     }
-                    write_metrics_row(
-                        &mut bundle.mem_rows[avg],
-                        run_id,
-                        ev.timestamp_ns,
-                        ev.core_id,
-                        &m,
-                    );
+                    write_metrics_row(&mut bundle.mem_rows[avg], run_id, ts, ev.core_id, &m);
                 }
             }
             BenchEventKind::SpanBegin if log_spans => {
@@ -1743,7 +1863,11 @@ async fn build_exports_for_window(
                     if let Some((start_span, start_ts, start_core)) =
                         open_spans.remove(&span.span_id)
                     {
-                        let dur = ev.timestamp_ns.saturating_sub(start_ts);
+                        let logical_start_ts =
+                            logical_event_timestamp_ns(start_ts, pause_intervals);
+                        let logical_end_ts =
+                            logical_event_timestamp_ns(ev.timestamp_ns, pause_intervals);
+                        let dur = logical_end_ts.saturating_sub(logical_start_ts);
 
                         write_span_row(
                             &mut bundle.spans_rows[avg],
@@ -1751,7 +1875,7 @@ async fn build_exports_for_window(
                             start_span.tag,
                             start_span.object_id,
                             start_core,
-                            start_ts,
+                            logical_start_ts,
                             dur,
                         );
 
@@ -1763,7 +1887,7 @@ async fn build_exports_for_window(
                                 start_span.tag,
                                 start_span.object_id,
                                 start_core,
-                                start_ts,
+                                logical_start_ts,
                                 dur,
                             );
                         }
@@ -1935,11 +2059,11 @@ impl BenchWindow {
 
         let (folder, name) = {
             let inner = self.inner.lock();
-            (inner.cfg.folder, inner.cfg.name)
+            (inner.cfg.folder.clone(), inner.cfg.name.clone())
         };
 
-        let session = ensure_session_async(folder).await;
-        let window_dir = allocate_window_name_async(&session.archive_path, name).await;
+        let session = ensure_session_async(&folder).await;
+        let window_dir = allocate_window_name_async(&session.archive_path, &name).await;
 
         {
             let mut inner = self.inner.lock();
@@ -1960,7 +2084,7 @@ impl BenchWindow {
         inner.perturbed_by_worker = true;
     }
 
-    fn handle_pause_flush(&self, policy: BenchOverflowPolicy) {
+    fn handle_pause_flush(&self, policy: BenchOverflowPolicy, pause_start_ns: u64) {
         let logical_time_shifted = match policy {
             BenchOverflowPolicy::PauseFlushCompactTime => true,
             BenchOverflowPolicy::PauseFlushWallTime => false,
@@ -1971,7 +2095,11 @@ impl BenchWindow {
             | BenchOverflowPolicy::OverwriteOldest => return,
         };
 
-        let pause_start_ns = bench_now_ns();
+        let pause_start_ns = if pause_start_ns == 0 {
+            bench_now_ns()
+        } else {
+            pause_start_ns
+        };
         if let Some(state) = bench_state_get() {
             state.drain_all_to_spill();
         }
@@ -2005,55 +2133,6 @@ impl BenchWindow {
 
         ACTIVE_SAMPLING_STOPPED.store(false, Ordering::Release);
     }
-
-    fn spawn_overflow_worker_if_needed(&self, policy: BenchOverflowPolicy) {
-        match policy {
-            BenchOverflowPolicy::QueueDrainWorker
-            | BenchOverflowPolicy::PauseFlushCompactTime
-            | BenchOverflowPolicy::PauseFlushWallTime => {}
-            BenchOverflowPolicy::Panic
-            | BenchOverflowPolicy::DropAndCount
-            | BenchOverflowPolicy::StopSampling
-            | BenchOverflowPolicy::OverwriteOldest => return,
-        }
-
-        if ACTIVE_OVERFLOW_WORKER_RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
-        let this = self.clone();
-        spawn_blocking(move || {
-            let interval = Duration::from_millis(1);
-            loop {
-                interrupt_index::wait_duration(interval);
-
-                if ACTIVE_DRAIN_PENDING.swap(false, Ordering::AcqRel) {
-                    if let Some(state) = bench_state_get() {
-                        state.drain_all_to_spill();
-                    }
-                    this.mark_worker_perturbed();
-                }
-
-                if ACTIVE_PAUSE_PENDING.swap(false, Ordering::AcqRel) {
-                    let policy = bench_policy_from_raw(ACTIVE_PAUSE_POLICY.load(Ordering::Acquire));
-                    this.handle_pause_flush(policy);
-                }
-
-                let running = {
-                    let inner = this.inner.lock();
-                    inner.running
-                };
-                if !running {
-                    break;
-                }
-            }
-            ACTIVE_OVERFLOW_WORKER_RUNNING.store(false, Ordering::Release);
-        });
-    }
-
     pub fn start(&self) {
         if !BENCH_ENABLED {
             return;
@@ -2062,7 +2141,6 @@ impl BenchWindow {
         let auto_persist_secs_opt;
         let timeout_ms_opt;
         let resolved_cfg;
-        let log_samples_for_worker;
 
         {
             let mut inner = self.inner.lock();
@@ -2071,7 +2149,6 @@ impl BenchWindow {
             }
 
             resolved_cfg = inner.resolved_cfg;
-            log_samples_for_worker = inner.cfg.log_samples;
 
             inner.running = true;
             inner.start_ns = bench_now_ns();
@@ -2087,6 +2164,7 @@ impl BenchWindow {
             }
 
             if inner.cfg.log_samples {
+                set_active_overflow_window(self.clone());
                 activate_bench_sampling_config(resolved_cfg);
                 SAMPLE_REFCOUNT.fetch_add(1, Ordering::Relaxed);
             }
@@ -2095,10 +2173,6 @@ impl BenchWindow {
             }
             auto_persist_secs_opt = inner.cfg.auto_persist_secs;
             timeout_ms_opt = inner.cfg.timeout_ms;
-        }
-
-        if log_samples_for_worker {
-            self.spawn_overflow_worker_if_needed(resolved_cfg.overflow_policy);
         }
 
         if let Some(timeout_ms) = timeout_ms_opt {
@@ -2160,6 +2234,7 @@ impl BenchWindow {
         };
 
         if log_samples {
+            clear_active_overflow_window(self);
             SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
         if log_spans {
@@ -2200,6 +2275,7 @@ impl BenchWindow {
         let ncores: usize;
 
         let last_export_seq: Vec<u64>;
+        let pause_intervals: Vec<BenchPauseInterval>;
 
         let mut open_spans: BTreeMap<u32, (BenchSpanEvent, u64, u16)>;
 
@@ -2223,6 +2299,7 @@ impl BenchWindow {
             ncores = inner.ncores;
 
             last_export_seq = inner.last_export_seq.clone();
+            pause_intervals = inner.pause_intervals.clone();
 
             open_spans = inner.open_spans.clone();
         }
@@ -2240,6 +2317,7 @@ impl BenchWindow {
             &last_export_seq,
             ncores,
             &mut open_spans,
+            &pause_intervals,
         )
         .await;
 
@@ -2372,7 +2450,6 @@ impl BenchWindow {
             inner_pause_flush_ns,
             inner_logical_time_compacted,
             inner_perturbed_by_worker,
-            pause_intervals,
         ) = {
             let inner = self.inner.lock();
             (
@@ -2380,7 +2457,6 @@ impl BenchWindow {
                 inner.pause_flush_ns,
                 inner.logical_time_compacted,
                 inner.perturbed_by_worker,
-                inner.pause_intervals.clone(),
             )
         };
         let sampling_truncated = inner_sampling_truncated
@@ -2492,6 +2568,7 @@ impl Drop for BenchWindow {
         }
 
         if dec_samples {
+            clear_active_overflow_window(self);
             SAMPLE_REFCOUNT.fetch_sub(1, Ordering::Relaxed);
         }
 
@@ -2551,13 +2628,25 @@ pub async fn write_named_file(path: &str, file_name: &str, data: &[u8]) -> Resul
 }
 
 pub fn used_memory() -> usize {
-    HEAP_SIZE as usize - ALLOCATOR.free_memory()
+    #[cfg(feature = "allocator-mimalloc")]
+    {
+        let capacity = crate::memory::heap::BOOTSTRAP_HEAP_SIZE as usize
+            + crate::memory::heap::MIMALLOC_OS_HEAP_SIZE as usize;
+        let used_non_arena = capacity - crate::memory::heap::ALLOCATOR.free_memory();
+        let used_arena = crate::memory::heap::mimalloc::MIMALLOC_ARENA_COMMITTED
+            .load(core::sync::atomic::Ordering::Relaxed);
+        used_non_arena + used_arena
+    }
+    #[cfg(feature = "allocator-buddy")]
+    {
+        crate::memory::heap::HEAP_SIZE as usize - crate::memory::heap::ALLOCATOR.free_memory()
+    }
 }
 
 const DEPTH: usize = 1_000;
-const ITERS: usize = 500_000;
+const ITERS: usize = 50_000;
 
-const BLOCK_TASKS: usize = 500_000;
+const ASYNC_TASKS: usize = 50_000;
 
 pub fn bench_async_vs_sync_call_latency() {
     spawn_detached(async {
@@ -2565,25 +2654,11 @@ pub fn bench_async_vs_sync_call_latency() {
     });
 }
 
-#[inline(never)]
-fn sync_leaf(x: u64) -> u64 {
-    x.wrapping_add(1)
-}
-
-#[inline(never)]
-fn sync_chain(mut x: u64) -> u64 {
-    let mut i = 0usize;
-    while i < DEPTH {
-        x = sync_leaf(x);
-        i += 1;
-    }
-    x
-}
-
 struct Ready;
 
 impl Future for Ready {
     type Output = ();
+
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Ready(())
@@ -2595,6 +2670,39 @@ fn ready() -> Ready {
     Ready
 }
 
+pub struct YieldOnce {
+    yielded: bool,
+    test: bool,
+}
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    #[inline(always)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = self.get_mut();
+        if this.test {
+            panic!("polled after ready");
+        }
+        if this.yielded {
+            this.test = true;
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+#[inline(always)]
+pub fn yield_once() -> YieldOnce {
+    YieldOnce {
+        yielded: false,
+        test: false,
+    }
+}
+
 #[inline(never)]
 async fn async_leaf(x: u64) -> u64 {
     ready().await;
@@ -2602,42 +2710,48 @@ async fn async_leaf(x: u64) -> u64 {
 }
 
 #[inline(never)]
-async fn async_chain(mut x: u64) -> u64 {
+pub async fn async_chain(mut x: u64) -> u64 {
     let mut i = 0usize;
+
     while i < DEPTH {
         x = async_leaf(x).await;
         i += 1;
     }
+
     x
 }
 
 #[inline(never)]
-async fn blocking_chain(x: u64) -> u64 {
-    spawn_blocking(move || {
-        // if ret % 10_000 == 0 {
-        //     println!("blocking done num: {}", ret);
-        // }
-        sync_chain(x)
+pub async fn async_spawn_wake_chain(x: u64) -> u64 {
+    spawn(async move {
+        yield_once().await;
+        async_chain(x).await
     })
     .await
 }
 
 #[inline(never)]
-async fn blocking_queue_stress(seed: u64) -> u64 {
-    let mut funcs = Vec::with_capacity(BLOCK_TASKS);
-    for i in 0..BLOCK_TASKS {
+async fn async_queue_stress(seed: u64) -> u64 {
+    let mut joins = Vec::with_capacity(ASYNC_TASKS);
+
+    for i in 0..ASYNC_TASKS {
         let x = seed.wrapping_add(i as u64);
-        funcs.push(move || {
-            // if ret % 10_000 == 0 {
-            //     println!("blocking done num: {}", ret);
-            // }
-            sync_chain(x)
-        });
+
+        joins.push(spawn(async move {
+            yield_once().await;
+            async_chain(x).await
+        }));
     }
 
-    let joins = spawn_blocking_many(funcs);
-    let _results = JoinAll::new(joins).await;
-    BLOCK_TASKS as u64
+    let results = JoinAll::new(joins).await;
+
+    let mut acc = 0u64;
+    for r in results {
+        acc = acc.wrapping_add(r);
+    }
+
+    black_box(acc);
+    ASYNC_TASKS as u64
 }
 
 #[inline(always)]
@@ -2659,7 +2773,7 @@ fn nanos_per_call(total_micros: u64, call_count: u64) -> f64 {
     if call_count == 0 {
         0.0
     } else {
-        (total_micros as f64 * 1000.0) / call_count as f64
+        total_micros as f64 * 1000.0 / call_count as f64
     }
 }
 
@@ -2673,6 +2787,15 @@ fn safe_ratio(num: u64, den: u64) -> f64 {
 }
 
 #[inline(always)]
+fn safe_ratio_f64(num: f64, den: f64) -> f64 {
+    if den == 0.0 {
+        0.0
+    } else {
+        num / den
+    }
+}
+
+#[inline(always)]
 fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
     if total_micros == 0 {
         0.0
@@ -2682,30 +2805,17 @@ fn ops_per_sec_from_micros(total_ops: u64, total_micros: u64) -> f64 {
 }
 
 pub async fn bench_async_vs_sync_call_latency_async() {
-    let mut warm = 0u64;
-    for _ in 0..10_000 {
-        warm = sync_chain(warm);
-    }
-
     let mut warm_async = 0u64;
     for _ in 0..10_000 {
         warm_async = async_chain(warm_async).await;
     }
     black_box(warm_async);
 
-    let mut warm_blk = 0u64;
-    for _ in 0..200_000 {
-        warm_blk = blocking_chain(warm_blk).await;
+    let mut warm_spawn = 0u64;
+    for _ in 0..10_000 {
+        warm_spawn = async_spawn_wake_chain(warm_spawn).await;
     }
-    black_box(warm_blk);
-
-    let mut s = 0u64;
-    let sw_sync = Stopwatch::start();
-    for _ in 0..ITERS {
-        s = sync_chain(s);
-    }
-    let sync_us = sw_sync.elapsed_micros();
-    black_box(s);
+    black_box(warm_spawn);
 
     let mut a = 0u64;
     let sw_async = Stopwatch::start();
@@ -2715,161 +2825,562 @@ pub async fn bench_async_vs_sync_call_latency_async() {
     let async_us = sw_async.elapsed_micros();
     black_box(a);
 
-    let mut b = 0u64;
-    let sw_blk = Stopwatch::start();
+    let mut sw = 0u64;
+    let sw_spawn = Stopwatch::start();
     for _ in 0..ITERS {
-        b = blocking_chain(b).await;
+        sw = async_spawn_wake_chain(sw).await;
     }
-    let blk_us = sw_blk.elapsed_micros();
-    black_box(b);
+    let spawn_us = sw_spawn.elapsed_micros();
+    black_box(sw);
 
     let mut q = 0u64;
     let sw_q = Stopwatch::start();
-    for index in 1..2u64 {
-        q = 0;
-        q = blocking_queue_stress(q).await;
-        println!("blocking num: {}", index * q);
-    }
+    q = async_queue_stress(q).await;
     let q_us = sw_q.elapsed_micros();
     black_box(q);
 
     let iters_u64 = ITERS as u64;
     let inner_calls_u64 = (ITERS as u64) * (DEPTH as u64);
+    let asyncq_inner_calls_u64 = (ASYNC_TASKS as u64) * (DEPTH as u64);
 
-    let sync_us_per_chain = avg_micros_per(sync_us, iters_u64);
     let async_us_per_chain = avg_micros_per(async_us, iters_u64);
-    let blk_us_per_chain = avg_micros_per(blk_us, iters_u64);
+    let spawn_us_per_chain = avg_micros_per(spawn_us, iters_u64);
+    let asyncq_us_per_task = avg_micros_per(q_us, ASYNC_TASKS as u64);
 
-    let sync_ns_per_inner = nanos_per_call(sync_us, inner_calls_u64);
     let async_ns_per_inner = nanos_per_call(async_us, inner_calls_u64);
+    let spawn_ns_per_inner = nanos_per_call(spawn_us, inner_calls_u64);
+    let asyncq_ns_per_inner = nanos_per_call(q_us, asyncq_inner_calls_u64);
 
-    let sync_ms = micros_to_ms(sync_us);
     let async_ms = micros_to_ms(async_us);
-    let blk_ms = micros_to_ms(blk_us);
-
+    let spawn_ms = micros_to_ms(spawn_us);
     let q_ms = micros_to_ms(q_us);
-    let q_us_per_task = avg_micros_per(q_us, BLOCK_TASKS as u64);
 
-    println!("[bench] iters={} depth={}", ITERS, DEPTH);
+    let async_ops_sec = ops_per_sec_from_micros(iters_u64, async_us);
+    let spawn_ops_sec = ops_per_sec_from_micros(iters_u64, spawn_us);
+    let asyncq_ops_sec = ops_per_sec_from_micros(ASYNC_TASKS as u64, q_us);
+
+    let spawn_vs_async = safe_ratio(spawn_us, async_us);
+    let asyncq_vs_async = safe_ratio_f64(asyncq_us_per_task, async_us_per_chain);
+    let spawn_vs_asyncq = safe_ratio_f64(spawn_us_per_chain, asyncq_us_per_task);
+
+    let spawn_overhead_us = spawn_us_per_chain - async_us_per_chain;
+    let asyncq_overhead_us = asyncq_us_per_task - async_us_per_chain;
+
     println!(
-        "[bench] sync:  total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
-        sync_ms, sync_us_per_chain, sync_ns_per_inner
-    );
-    println!(
-        "[bench] async: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}",
-        async_ms, async_us_per_chain, async_ns_per_inner
-    );
-    println!(
-        "[bench] blk:   total={:.3} ms  us/chain={:.3}",
-        blk_ms, blk_us_per_chain
-    );
-    println!(
-        "[bench] blkq:  tasks={} total={:.3} ms  us/task={:.3}",
-        BLOCK_TASKS, q_ms, q_us_per_task
+        "[bench] iters={} depth={} async_tasks={}",
+        ITERS, DEPTH, ASYNC_TASKS
     );
 
-    // Everything relative to sync baseline
-    let sm_vs_sync = safe_ratio(async_us, sync_us);
-    let blk_vs_sync = safe_ratio(blk_us, sync_us);
-    let blk_vs_blkq = safe_ratio(blk_us, q_us);
+    println!(
+        "[bench] async-sm:         total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
+        async_ms,
+        async_us_per_chain,
+        async_ns_per_inner,
+        async_ops_sec
+    );
 
-    // Isolate pure overhead costs (us per chain, relative to sync)
-    let sm_overhead_us = async_us_per_chain - sync_us_per_chain;
-    let blk_overhead_us = blk_us_per_chain - sync_us_per_chain;
-    // pending+wake = blk - async (the spawn/wake cost on top of state machine)
-    let pw_overhead_us = blk_us_per_chain - async_us_per_chain;
+    println!(
+        "[bench] async-spawn-wake: total={:.3} ms  us/chain={:.3}  ns/inner_call={:.3}  chains/sec={:.3}",
+        spawn_ms,
+        spawn_us_per_chain,
+        spawn_ns_per_inner,
+        spawn_ops_sec
+    );
 
-    println!("[bench] --- vs sync baseline ---");
     println!(
-        "[bench] state_machine/sync  = {:.3}x  (async overhead: {:.3} us/chain)",
-        sm_vs_sync, sm_overhead_us
+        "[bench] asyncq:           tasks={} total={:.3} ms  us/task={:.3}  ns/inner_call={:.3}  tasks/sec={:.3}",
+        ASYNC_TASKS,
+        q_ms,
+        asyncq_us_per_task,
+        asyncq_ns_per_inner,
+        asyncq_ops_sec
     );
+
+    println!("[bench] --- async overheads ---");
+
     println!(
-        "[bench] blk/sync            = {:.3}x  (spawn+wake+sm overhead: {:.3} us/chain)",
-        blk_vs_sync, blk_overhead_us
+        "[bench] spawn_wake/async_sm = {:.3}x  overhead={:.3} us/chain",
+        spawn_vs_async, spawn_overhead_us
     );
-    let pw_vs_sync = if async_us_per_chain == 0.0 {
-        0.0
-    } else {
-        blk_us_per_chain / async_us_per_chain
-    };
+
     println!(
-        "[bench] pending+wake/sync   = {:.3}x  (blk/async, pure spawn+wake cost)",
-        pw_vs_sync
+        "[bench] asyncq/async_sm      = {:.3}x  overhead={:.3} us/task",
+        asyncq_vs_async, asyncq_overhead_us
     );
+
     println!(
-        "[bench] blk/blkq            = {:.3}x  (sequential blocking vs bulk queue)",
-        blk_vs_blkq
+        "[bench] spawn_wake/asyncq    = {:.3}x  sequential spawn/join per-chain vs queued bulk async tasks",
+        spawn_vs_asyncq
     );
 }
 
-// =====================
-// Realistic traffic benchmark
-// =====================
+const SPAWN_DETACHED_ITERS: usize = 50_000;
+const SPAWN_JOIN_ITERS: usize = 50_000;
 
-// Simulates a driver-like workload: async setup -> blocking device work -> async postprocess
-// Runs at varying concurrency levels to find saturation point and measure scheduling overhead.
+const DRIVER_REQUESTS: usize = 32_768;
+const DRIVER_WAKE_BATCH: usize = 64;
+const DRIVER_STAGE_POLLS: usize = 3;
 
-const TRAFFIC_TOTAL_TASKS: usize = 100_000;
-const TRAFFIC_CONCURRENCY: &[usize] = &[4, 8, 16, 32, 64, 128, 256, 512, 1024, 0x1000];
-const TRAFFIC_WORK_NS: u64 = 1000; // simulated device work per blocking task
-const TRAFFIC_ASYNC_DEPTH: usize = 10; // async setup + postprocess depth
-#[inline(never)]
-fn traffic_blocking_work(seed: u64) -> u64 {
-    // Simulate real device work: spin for TRAFFIC_WORK_NS then do a small compute
-    if TRAFFIC_WORK_NS > 0 {
-        crate::drivers::interrupt_index::wait_duration(Duration::from_nanos(TRAFFIC_WORK_NS));
-    }
-    let mut x = seed;
-    for _ in 0..100 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-    }
-    x
+pub async fn bench_runtime_executor_async() {
+    println!("=== runtime executor benchmark ===");
+    println!("detached spawns: {}", SPAWN_DETACHED_ITERS);
+    println!("join spawns:     {}", SPAWN_JOIN_ITERS);
+    println!("driver requests: {}", DRIVER_REQUESTS);
+    println!("wake batch:      {}", DRIVER_WAKE_BATCH);
+
+    bench_spawn_detached().await;
+    bench_spawn_join().await;
+    bench_driver_traffic().await;
+
+    println!("=== runtime executor benchmark done ===");
 }
 
-#[inline(never)]
-async fn traffic_async_work(mut x: u64, depth: usize) -> u64 {
-    for _ in 0..depth {
-        x = async_leaf(x).await;
-    }
-    x
-}
+async fn bench_spawn_detached() {
+    let done = CountDown::new(SPAWN_DETACHED_ITERS);
 
-/// One "request": async setup -> spawn_blocking device work -> async postprocess
-#[inline(never)]
-async fn traffic_one_request(seed: u64) -> u64 {
-    let prepared = traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await;
+    let t0 = rdtsc_ordered();
 
-    let device_result = spawn_blocking(move || traffic_blocking_work(prepared)).await;
-
-    let result = traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await;
-    result
-}
-
-/// One "request" using bulk queue for the blocking phase
-#[inline(never)]
-async fn traffic_batch_request(seeds: Vec<u64>) -> Vec<u64> {
-    let count = seeds.len();
-
-    let mut prepared = Vec::with_capacity(count);
-    for &seed in &seeds {
-        prepared.push(traffic_async_work(seed, TRAFFIC_ASYNC_DEPTH / 2).await);
+    let mut i = 0usize;
+    while i < SPAWN_DETACHED_ITERS {
+        spawn_detached(detached_spawn_task(done.clone(), i as u64));
+        i += 1;
     }
 
-    let funcs: Vec<_> = prepared
-        .iter()
-        .map(|&p| move || traffic_blocking_work(p))
-        .collect();
-    let joins = spawn_blocking_many(funcs);
-    let device_results = JoinAll::new(joins).await;
+    let t1 = rdtsc_ordered();
+    done.wait().await;
+    let t2 = rdtsc_ordered();
 
-    let mut results = Vec::with_capacity(count);
-    for device_result in device_results {
-        results.push(traffic_async_work(device_result, TRAFFIC_ASYNC_DEPTH / 2).await);
-    }
-    results
+    println!("--- detached spawn ---");
+    print_cycles_per("enqueue", t1.wrapping_sub(t0), SPAWN_DETACHED_ITERS);
+    print_cycles_per("enqueue+run", t2.wrapping_sub(t0), SPAWN_DETACHED_ITERS);
 }
 
+async fn detached_spawn_task(done: Arc<CountDown>, value: u64) {
+    DriverStage::new(1).await;
+    black_box(value.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+    done.done_one();
+}
+
+async fn bench_spawn_join() {
+    let mut handles = Vec::with_capacity(SPAWN_JOIN_ITERS);
+
+    let t0 = rdtsc_ordered();
+
+    let mut i = 0usize;
+    while i < SPAWN_JOIN_ITERS {
+        handles.push(spawn(join_spawn_task(i as u64)));
+        i += 1;
+    }
+
+    let t1 = rdtsc_ordered();
+    let results = JoinAll::new(handles).await;
+    let t2 = rdtsc_ordered();
+
+    let mut checksum = 0u64;
+    for v in results {
+        checksum = checksum.wrapping_add(v);
+    }
+
+    black_box(checksum);
+
+    println!("--- joinable spawn ---");
+    print_cycles_per("enqueue", t1.wrapping_sub(t0), SPAWN_JOIN_ITERS);
+    print_cycles_per("enqueue+join", t2.wrapping_sub(t0), SPAWN_JOIN_ITERS);
+    println!("checksum: {:#x}", checksum);
+}
+
+async fn join_spawn_task(value: u64) -> u64 {
+    DriverStage::new(1).await;
+    value.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+async fn bench_driver_traffic() {
+    let shared = DriverBenchShared::new(DRIVER_REQUESTS);
+    let mut requests = Vec::with_capacity(DRIVER_REQUESTS);
+
+    let t0 = rdtsc_ordered();
+
+    let mut i = 0usize;
+    while i < DRIVER_REQUESTS {
+        let req = Arc::new(DriverRequest::new(i, shared.clone()));
+        requests.push(req.clone());
+        spawn_detached(driver_request_task(req));
+        i += 1;
+    }
+
+    let t_spawned = rdtsc_ordered();
+
+    ParkedWait::new(shared.clone()).await;
+
+    let t_parked = rdtsc_ordered();
+
+    let mut wake_call_cycles = 0u64;
+    let mut idx = 0usize;
+
+    while idx < requests.len() {
+        let end = min(idx + DRIVER_WAKE_BATCH, requests.len());
+
+        let b0 = rdtsc_ordered();
+
+        while idx < end {
+            requests[idx].signal();
+            idx += 1;
+        }
+
+        let b1 = rdtsc_ordered();
+        wake_call_cycles = wake_call_cycles.wrapping_add(b1.wrapping_sub(b0));
+
+        yield_once().await;
+    }
+
+    let t_wakes_done = rdtsc_ordered();
+
+    shared.done.wait().await;
+
+    let t_done = rdtsc_ordered();
+
+    let latency_sum = shared.wake_latency_sum.load(Ordering::Relaxed);
+    let latency_max = shared.wake_latency_max.load(Ordering::Relaxed);
+    let completed = shared.completed.load(Ordering::Relaxed);
+
+    println!("--- driver realistic traffic ---");
+    print_cycles_per(
+        "spawn request task",
+        t_spawned.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    print_cycles_per(
+        "spawn+park request",
+        t_parked.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    print_cycles_per("waker.signal call", wake_call_cycles, DRIVER_REQUESTS);
+    print_cycles_per("wake-to-task-observed", latency_sum, DRIVER_REQUESTS);
+    print_cycles_per(
+        "end-to-end request",
+        t_done.wrapping_sub(t0),
+        DRIVER_REQUESTS,
+    );
+    println!("wake-to-task max: {} cycles", latency_max);
+    println!("completed: {}", completed);
+    println!(
+        "wake pump total: {} cycles",
+        t_wakes_done.wrapping_sub(t_parked)
+    );
+}
+
+async fn driver_request_task(req: Arc<DriverRequest>) {
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+    DriverStage::new(DRIVER_STAGE_POLLS).await;
+
+    DriverCompletionFuture::new(req.clone()).await;
+
+    DriverStage::new(1).await;
+
+    let now = rdtsc_ordered();
+    let wake = req.wake_tsc.load(Ordering::Acquire);
+    let latency = now.wrapping_sub(wake);
+
+    req.shared
+        .wake_latency_sum
+        .fetch_add(latency, Ordering::Relaxed);
+    atomic_max(&req.shared.wake_latency_max, latency);
+    req.shared.completed.fetch_add(1, Ordering::Relaxed);
+    req.shared.done.done_one();
+
+    black_box(req.index);
+}
+
+struct DriverStage {
+    remaining: usize,
+}
+
+impl DriverStage {
+    fn new(remaining: usize) -> Self {
+        Self { remaining }
+    }
+}
+
+impl Future for DriverStage {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.remaining == 0 {
+            Poll::Ready(())
+        } else {
+            this.remaining -= 1;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+struct DriverRequest {
+    index: usize,
+    ready: AtomicBool,
+    parked_once: AtomicBool,
+    wake_tsc: AtomicU64,
+    waker: Mutex<Option<Waker>>,
+    shared: Arc<DriverBenchShared>,
+}
+
+impl DriverRequest {
+    fn new(index: usize, shared: Arc<DriverBenchShared>) -> Self {
+        Self {
+            index,
+            ready: AtomicBool::new(false),
+            parked_once: AtomicBool::new(false),
+            wake_tsc: AtomicU64::new(0),
+            waker: Mutex::new(None),
+            shared,
+        }
+    }
+
+    fn signal(&self) {
+        let t = rdtsc_ordered();
+
+        self.wake_tsc.store(t, Ordering::Release);
+        self.ready.store(true, Ordering::Release);
+
+        let waker = {
+            let mut guard = self.waker.lock();
+            guard.take()
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+
+    fn mark_parked(&self) {
+        if self.parked_once.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let parked = self.shared.parked.fetch_add(1, Ordering::AcqRel) + 1;
+
+        if parked == self.shared.total {
+            let guard = self.shared.parked_waker.lock();
+            if let Some(w) = guard.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+    }
+}
+
+struct DriverCompletionFuture {
+    req: Arc<DriverRequest>,
+}
+
+impl DriverCompletionFuture {
+    fn new(req: Arc<DriverRequest>) -> Self {
+        Self { req }
+    }
+}
+
+impl Future for DriverCompletionFuture {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.req.ready.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.req.waker.lock();
+
+        if this.req.ready.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        drop(guard);
+
+        this.req.mark_parked();
+
+        if this.req.ready.load(Ordering::Acquire) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct DriverBenchShared {
+    total: usize,
+    parked: AtomicUsize,
+    parked_waker: Mutex<Option<Waker>>,
+    wake_latency_sum: AtomicU64,
+    wake_latency_max: AtomicU64,
+    completed: AtomicUsize,
+    done: Arc<CountDown>,
+}
+
+impl DriverBenchShared {
+    fn new(total: usize) -> Arc<Self> {
+        Arc::new(Self {
+            total,
+            parked: AtomicUsize::new(0),
+            parked_waker: Mutex::new(None),
+            wake_latency_sum: AtomicU64::new(0),
+            wake_latency_max: AtomicU64::new(0),
+            completed: AtomicUsize::new(0),
+            done: CountDown::new(total),
+        })
+    }
+}
+
+struct ParkedWait {
+    shared: Arc<DriverBenchShared>,
+}
+
+impl ParkedWait {
+    fn new(shared: Arc<DriverBenchShared>) -> Self {
+        Self { shared }
+    }
+}
+
+impl Future for ParkedWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.shared.parked.load(Ordering::Acquire) >= this.shared.total {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.shared.parked_waker.lock();
+
+        if this.shared.parked.load(Ordering::Acquire) >= this.shared.total {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+struct CountDown {
+    remaining: AtomicUsize,
+    waker: Mutex<Option<Waker>>,
+}
+
+impl CountDown {
+    fn new(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(count),
+            waker: Mutex::new(None),
+        })
+    }
+
+    fn done_one(&self) {
+        let old = self.remaining.fetch_sub(1, Ordering::AcqRel);
+
+        if old == 1 {
+            let guard = self.waker.lock();
+            if let Some(w) = guard.as_ref() {
+                w.wake_by_ref();
+            }
+        }
+    }
+
+    fn wait(self: &Arc<Self>) -> CountDownWait {
+        CountDownWait {
+            inner: self.clone(),
+        }
+    }
+}
+
+struct CountDownWait {
+    inner: Arc<CountDown>,
+}
+
+impl Future for CountDownWait {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.inner.remaining.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+
+        let mut guard = this.inner.waker.lock();
+
+        if this.inner.remaining.load(Ordering::Acquire) == 0 {
+            return Poll::Ready(());
+        }
+
+        match guard.as_ref() {
+            Some(w) if w.will_wake(cx.waker()) => {}
+            _ => {
+                *guard = Some(cx.waker().clone());
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+fn atomic_max(dst: &AtomicU64, value: u64) {
+    let mut cur = dst.load(Ordering::Relaxed);
+
+    while value > cur {
+        match dst.compare_exchange_weak(cur, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(next) => cur = next,
+        }
+    }
+}
+
+fn print_cycles_per(name: &str, total: u64, count: usize) {
+    let count = count as u64;
+
+    if count == 0 {
+        println!("{}: n/a", name);
+        return;
+    }
+
+    let whole = total / count;
+    let frac = ((total % count) * 100) / count;
+
+    println!("{}: {}.{:02} cycles/op", name, whole, frac);
+}
+
+#[inline(always)]
+fn rdtsc_ordered() -> u64 {
+    let low: u32;
+    let high: u32;
+
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    ((high as u64) << 32) | low as u64
+}
 // =====================
 // Config
 // =====================
@@ -3002,16 +3513,6 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 }
 
 // =====================
-// Entry point
-// =====================
-
-pub fn benchmark_async() {
-    spawn_detached(async {
-        benchmark_async_async().await;
-    });
-}
-
-// =====================
 // Benchmark
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
@@ -3111,6 +3612,7 @@ pub async fn bench_c_drive_io_async() {
                 "[disk-bench] failed to size benchmark file to {} bytes: {:?}",
                 bench_len, e
             );
+            let _ = file.close().await;
             return;
         }
         if let Err(e) = file.flush().await {
@@ -3118,6 +3620,7 @@ pub async fn bench_c_drive_io_async() {
                 "[disk-bench] failed to flush benchmark file sizing: {:?}",
                 e
             );
+            let _ = file.close().await;
             return;
         }
     }
@@ -3177,10 +3680,24 @@ pub async fn bench_c_drive_io_async() {
         let mut total_read = 0u64;
         let mut offset = 0u64;
         for op in 0..ops {
-            match file.read_at(offset, chunk_sz).await {
-                Ok(buf) => {
-                    total_read = total_read.saturating_add(buf.len() as u64);
-                    offset = offset.saturating_add(chunk_sz as u64);
+            match file.read_at_into(offset, &mut chunk).await {
+                Ok(n) => {
+                    if n == 0 {
+                        println!(
+                            "[disk-bench] short read at op {} (size {}): 0 of {}",
+                            op, chunk_sz, chunk_sz
+                        );
+                        break;
+                    }
+                    total_read = total_read.saturating_add(n as u64);
+                    offset = offset.saturating_add(n as u64);
+                    if n != chunk_sz {
+                        println!(
+                            "[disk-bench] short read at op {} (size {}): {} of {}",
+                            op, chunk_sz, n, chunk_sz
+                        );
+                        break;
+                    }
                 }
                 Err(e) => {
                     println!(
@@ -3291,187 +3808,9 @@ pub async fn bench_c_drive_io_async() {
             ops_10
         );
     }
-}
 
-pub async fn benchmark_async_async() {
-    let tsc_hz = TSC_HZ.load(Ordering::SeqCst);
-    assert!(tsc_hz != 0, "TSC not calibrated");
-
-    let csv_path = Path::from_string(BENCH_CSV_PATH);
-
-    let header = "run_id,x_inflight,x_inflight_log2,ops,elapsed_cycles,elapsed_ns,cycles_per_op,ns_per_op,ops_per_sec,p50_ns,p99_ns,p999_ns,work_ns,use_batch,iters,warmup";
-    let _ = ensure_csv_header(&csv_path, header).await;
-
-    println!("{header}");
-
-    let run_id = cpu::get_cycles();
-
-    let mut inflight = BENCH_INFLIGHT_START;
-    while inflight <= BENCH_INFLIGHT_END {
-        let target_samples = (inflight as usize).saturating_mul(BENCH_ITERS as usize);
-
-        let mut lats_ns: Vec<u64> = Vec::new();
-        if BENCH_MAX_LAT_SAMPLES == 0 || target_samples <= BENCH_MAX_LAT_SAMPLES {
-            lats_ns.reserve(target_samples);
-        } else {
-            lats_ns.reserve(BENCH_MAX_LAT_SAMPLES);
-        }
-
-        let mut total_cycles: u64 = 0;
-        let mut total_ns: u64 = 0;
-        let mut ops_total: u64 = 0;
-
-        let mut iter: u64 = 0;
-        while iter < (BENCH_WARMUP_ITERS + BENCH_ITERS) {
-            let gate = Arc::new(AtomicBool::new(false));
-
-            if BENCH_USE_BATCH_SPAWN {
-                let mut funcs = Vec::with_capacity(inflight as usize);
-
-                let mut i = 0u64;
-                while i < inflight {
-                    let gate = gate.clone();
-                    funcs.push(move || -> u64 {
-                        while !gate.load(Ordering::Acquire) {
-                            core::hint::spin_loop();
-                        }
-                        let start = cpu::get_cycles();
-                        if BENCH_WORK_NS != 0 {
-                            wait_duration(Duration::from_nanos(BENCH_WORK_NS));
-                        }
-                        let end = cpu::get_cycles();
-                        end.wrapping_sub(start)
-                    });
-
-                    i += 1;
-                }
-
-                let joins = spawn_blocking_many(funcs);
-
-                let sw = Stopwatch::start();
-                gate.store(true, Ordering::Release);
-
-                for join in joins.into_iter() {
-                    let lat_cycles = join.await;
-
-                    if iter >= BENCH_WARMUP_ITERS {
-                        let lat = cycles_to_ns(lat_cycles, tsc_hz);
-
-                        let sample_idx = ops_total as usize;
-                        if should_keep_sample(sample_idx, target_samples) {
-                            lats_ns.push(lat);
-                        }
-                        ops_total = ops_total.wrapping_add(1);
-                    }
-                }
-
-                if iter >= BENCH_WARMUP_ITERS {
-                    total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
-                    total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
-                }
-            } else {
-                let mut joins = Vec::with_capacity(inflight as usize);
-
-                let mut i = 0u64;
-                while i < inflight {
-                    let gate = gate.clone();
-                    let join = spawn_blocking(move || -> u64 {
-                        while !gate.load(Ordering::Acquire) {
-                            core::hint::spin_loop();
-                        }
-                        let start = cpu::get_cycles();
-                        if BENCH_WORK_NS != 0 {
-                            wait_duration(Duration::from_nanos(BENCH_WORK_NS));
-                        }
-                        let end = cpu::get_cycles();
-                        end.wrapping_sub(start)
-                    });
-
-                    joins.push(join);
-                    i += 1;
-                }
-
-                let sw = Stopwatch::start();
-                gate.store(true, Ordering::Release);
-
-                for join in joins.into_iter() {
-                    let lat_cycles = join.await;
-
-                    if iter >= BENCH_WARMUP_ITERS {
-                        let lat = cycles_to_ns(lat_cycles, tsc_hz);
-
-                        let sample_idx = ops_total as usize;
-                        if should_keep_sample(sample_idx, target_samples) {
-                            lats_ns.push(lat);
-                        }
-                        ops_total = ops_total.wrapping_add(1);
-                    }
-                }
-
-                if iter >= BENCH_WARMUP_ITERS {
-                    total_cycles = total_cycles.wrapping_add(sw.elapsed_cycles());
-                    total_ns = total_ns.wrapping_add(sw.elapsed_nanos());
-                }
-            }
-
-            iter += 1;
-        }
-
-        lats_ns.sort_unstable();
-        let p50 = percentile_from_sorted(&lats_ns, 500);
-        let p99 = percentile_from_sorted(&lats_ns, 990);
-        let p999 = percentile_from_sorted(&lats_ns, 999);
-
-        let cycles_per_op = if ops_total == 0 {
-            0
-        } else {
-            total_cycles / ops_total
-        };
-        let ns_per_op = if ops_total == 0 {
-            0
-        } else {
-            total_ns / ops_total
-        };
-        let ops_per_sec = if total_ns == 0 {
-            0
-        } else {
-            ((ops_total as u128 * 1_000_000_000u128) / (total_ns as u128)) as u64
-        };
-
-        let use_batch = if BENCH_USE_BATCH_SPAWN { 1u64 } else { 0u64 };
-        let x_log2 = ilog2_u64(inflight) as u64;
-
-        let line = format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            run_id,
-            inflight,
-            x_log2,
-            ops_total,
-            total_cycles,
-            total_ns,
-            cycles_per_op,
-            ns_per_op,
-            ops_per_sec,
-            p50,
-            p99,
-            p999,
-            BENCH_WORK_NS,
-            use_batch,
-            BENCH_ITERS,
-            BENCH_WARMUP_ITERS
-        );
-
-        println!("{line}");
-
-        match append_csv_line(&csv_path, &line).await {
-            Ok(_) => {}
-            Err(e) => println!("bench csv append failed: {:?}", e),
-        }
-
-        inflight = inflight.saturating_add(BENCH_INFLIGHT_STEP);
-        if inflight == 0 {
-            break;
-        }
+    if let Err(e) = file.close().await {
+        println!("[disk-bench] close failed: {:?}", e);
     }
 }
 

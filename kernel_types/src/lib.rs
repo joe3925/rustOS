@@ -8,6 +8,7 @@
 #![feature(generic_const_exprs)]
 #![feature(const_trait_impl)]
 #![feature(specialization)]
+#![feature(try_trait_v2_residual)]
 extern crate alloc;
 extern crate self as kernel_types;
 
@@ -23,6 +24,7 @@ pub mod fs;
 pub mod io;
 pub mod irq;
 pub mod memory;
+pub mod mpmc_ring;
 pub mod object_manager;
 pub mod pnp;
 pub mod request;
@@ -86,6 +88,7 @@ pub type DpcFn = extern "win64" fn(usize);
 #[unsafe(export_name = "_fltused")]
 static _FLTUSED: i32 = 0;
 
+#[cfg(not(any(test, feature = "hosted-tests")))]
 #[unsafe(no_mangle)]
 pub extern "system" fn __CxxFrameHandler3(_: *mut u8, _: *mut u8, _: *mut u8, _: *mut u8) -> i32 {
     unimplemented!()

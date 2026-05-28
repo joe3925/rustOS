@@ -1,9 +1,11 @@
 use crate::cpu;
+use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::drivers::interrupt_index::{
     current_cpu_id, get_current_logical_id, send_eoi, IpiDest, IpiKind, LocalApic, APIC,
 };
 use crate::drivers::timer_driver::TIMER;
 use crate::executable::program::PROGRAM_MANAGER;
+use crate::idt::InterruptGuard;
 use crate::idt::SCHED_IPI_VECTOR;
 use crate::memory::paging::stack::StackSize;
 use crate::scheduling::runtime::runtime::yield_now;
@@ -12,8 +14,8 @@ use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_U
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
 
+use crate::println;
 pub use crate::scheduling::task::TaskHandle;
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -32,7 +34,7 @@ use x86_64::registers::control::Cr3;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 
-const MAX_TASKS: usize = 65_536;
+const MAX_TASKS: usize = 4096;
 
 #[derive(Debug)]
 #[repr(u32)]
@@ -101,7 +103,8 @@ impl TaskTable {
 }
 
 /// Saves the current task's FPU/SIMD state for the duration of a kernel handler.
-/// Restores it only if we return to the same task (i.e., no context switch happened).
+/// Restores the task selected at handler exit so post-schedule handler code
+/// cannot clobber the FPU/SIMD state that will be resumed by `iretq`.
 pub struct KernelFpuGuard {
     saved_task: Option<TaskHandle>,
 }
@@ -129,18 +132,15 @@ impl KernelFpuGuard {
 
 impl Drop for KernelFpuGuard {
     fn drop(&mut self) {
-        let Some(task) = self.saved_task.take() else {
-            return;
-        };
+        self.saved_task.take();
 
         let cpu_id = current_cpu_id();
         if let Some(current) = SCHEDULER.get_current_task(cpu_id) {
-            if Arc::ptr_eq(&task, &current) {
-                let mut guard = current.inner.try_write().expect(
-                    "Failed to acquire task lock for restoring FPU state in interrupt handler",
-                );
-                guard.restore_fpu_state();
-            }
+            let mut guard = current
+                .inner
+                .try_write()
+                .expect("Failed to acquire task lock for restoring FPU state in interrupt handler");
+            guard.restore_fpu_state();
         }
     }
 }
@@ -161,7 +161,7 @@ struct SchedulerState {
 
 pub struct Scheduler {
     all_tasks: TaskTable,
-    cores: RwLock<Vec<Arc<CoreScheduler>>>,
+    cores: IrqSafeRwLock<Vec<Arc<CoreScheduler>>>,
     next_task_id: AtomicU64,
     num_cores: AtomicUsize,
     last_balance_tick: AtomicUsize,
@@ -176,7 +176,7 @@ impl Scheduler {
     fn new() -> Self {
         Self {
             all_tasks: TaskTable::new(MAX_TASKS),
-            cores: RwLock::new(Vec::new()),
+            cores: IrqSafeRwLock::new(Vec::new()),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
             last_balance_tick: AtomicUsize::new(0),
@@ -255,6 +255,7 @@ impl Scheduler {
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
         self.enqueue_inbound(best_cpu, task);
+        self.kick_remote_core(best_cpu);
         id
     }
 
@@ -268,6 +269,7 @@ impl Scheduler {
         let best_cpu = self.choose_core_for_new_task(n);
         task.set_target_cpu(best_cpu);
         self.enqueue_inbound(best_cpu, task);
+        self.kick_remote_core(best_cpu);
         id
     }
 
@@ -289,6 +291,25 @@ impl Scheduler {
             ) {
                 Ok(_) => break,
                 Err(new_head) => current_head = new_head,
+            }
+        }
+    }
+
+    fn kick_remote_core(&self, cpu: usize) {
+        if cpu == current_cpu_id() || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+
+        if let Some(core) = self.core(cpu) {
+            unsafe {
+                if let Some(a) = APIC.lock().as_ref() {
+                    a.lapic.send_ipi(
+                        IpiDest::ApicId(core.lapic_id),
+                        IpiKind::Fixed {
+                            vector: SCHED_IPI_VECTOR,
+                        },
+                    )
+                }
             }
         }
     }
@@ -418,24 +439,8 @@ impl Scheduler {
                     };
                     task.set_target_cpu(best_cpu);
 
-                    if best_cpu != current_cpu_id() {
-                        self.enqueue_inbound(best_cpu, task.clone());
-
-                        if let Some(best_core) = self.core(best_cpu) {
-                            unsafe {
-                                if let Some(a) = APIC.lock().as_ref() {
-                                    a.lapic.send_ipi(
-                                        IpiDest::ApicId(best_core.lapic_id),
-                                        IpiKind::Fixed {
-                                            vector: SCHED_IPI_VECTOR,
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                    } else {
-                        self.enqueue_inbound(best_cpu, task.clone());
-                    }
+                    self.enqueue_inbound(best_cpu, task.clone());
+                    self.kick_remote_core(best_cpu);
 
                     return;
                 }
@@ -599,7 +604,7 @@ impl Scheduler {
             }
         }
 
-        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(task) => task,
             None => return prev_task,
         };
@@ -618,6 +623,7 @@ impl Scheduler {
         cpu_id: usize,
         core: &Arc<CoreScheduler>,
         now_cycles: u64,
+        prev_fpu_already_saved: bool,
     ) -> Option<TaskHandle> {
         let mut sched_state = core.sched_lock.write();
 
@@ -628,7 +634,9 @@ impl Scheduler {
 
             let mut lock_failed = false;
             if let Some(mut guard) = prev.inner.try_write() {
-                guard.save_fpu_state();
+                if !prev_fpu_already_saved {
+                    guard.save_fpu_state();
+                }
                 if !prev_is_idle {
                     guard.account_switched_out(now_cycles);
                 }
@@ -796,9 +804,7 @@ impl Scheduler {
 
         loop {
             let mut min_idx = 0;
-            let mut max_idx = 0;
             let mut min_load = usize::MAX;
-            let mut max_load = 0;
 
             for i in 0..n {
                 let Some(load) = self.core_effective_load(i) else {
@@ -809,13 +815,41 @@ impl Scheduler {
                     min_idx = i;
                     min_load = load;
                 }
-                if load > max_load {
+            }
+
+            if min_load == usize::MAX {
+                break;
+            }
+
+            let mut max_idx = 0;
+            let mut max_stealable = 0usize;
+
+            for i in 0..n {
+                if i == min_idx {
+                    continue;
+                }
+
+                let Some(core) = self.core(i) else {
+                    continue;
+                };
+
+                let stealable = core.run_queue.len();
+
+                if stealable > max_stealable {
+                    max_stealable = stealable;
                     max_idx = i;
-                    max_load = load;
                 }
             }
 
-            if min_load == usize::MAX || max_load <= min_load + 1 {
+            if max_stealable == 0 {
+                break;
+            }
+
+            let Some(max_load) = self.core_effective_load(max_idx) else {
+                break;
+            };
+
+            if max_load <= min_load + 1 {
                 break;
             }
 
@@ -823,22 +857,24 @@ impl Scheduler {
                 break;
             };
 
-            let task = match max_core.run_queue.pop() {
-                Some(t) => {
-                    max_core.load.fetch_sub(1, Ordering::Release);
-                    Some(t)
+            let Some(task) = max_core.run_queue.pop() else {
+                break;
+            };
+
+            max_core.load.fetch_sub(1, Ordering::Release);
+
+            match task.sched_state() {
+                SchedState::Terminated | SchedState::Parking | SchedState::Blocked => {
+                    continue;
                 }
-                None => None,
-            };
+                SchedState::Runnable | SchedState::Running => {}
+            }
 
-            let Some(task) = task else {
-                continue;
-            };
-
-            task.set_target_cpu(min_idx);
             let Some(min_core) = self.core(min_idx) else {
                 break;
             };
+
+            task.set_target_cpu(min_idx);
             Self::push_runqueue_or_panic(min_idx, &min_core.run_queue, &min_core.load, task);
         }
     }
@@ -871,11 +907,7 @@ impl Scheduler {
         }
 
         let now_cycles = cpu::get_cycles();
-        if let Some(mut guard) = core.idle_task.inner.try_write() {
-            guard.save_fpu_state();
-        }
-
-        let next = match self.schedule_next(cpu_id, &core, now_cycles) {
+        let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
                 send_eoi(SCHED_IPI_VECTOR);
@@ -898,6 +930,7 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    let guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_ipi(state, cpu_id);
@@ -908,6 +941,7 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
+    let guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
     SCHEDULER.on_timer_tick(state, cpu_id);
@@ -1003,7 +1037,20 @@ pub extern "win64" fn yield_interrupt_entry() {
     );
 }
 
-pub fn kernel_task_end() -> ! {
+#[unsafe(naked)]
+pub extern "win64" fn task_return_trampoline() -> ! {
+    naked_asm!(
+        "cld",
+        "sub rsp, 8",
+        "mov qword ptr [rsp], 0",
+        "jmp {task_end}",
+        task_end = sym kernel_task_end,
+    );
+}
+
+pub extern "win64" fn kernel_task_end() -> ! {
+    crate::memory::heap::mimalloc_thread_done();
+
     interrupts::without_interrupts(|| {
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
@@ -1015,7 +1062,7 @@ pub fn kernel_task_end() -> ! {
 
 // ── Panic dump ────────────────────────────────────────────────────────────────
 
-const MAX_DUMP_CPUS: usize = 16;
+const MAX_DUMP_CPUS: usize = 24;
 const MAX_DUMP_QUEUE: usize = 128;
 
 pub struct QueueSnapshot {
@@ -1056,34 +1103,34 @@ pub struct SchedulerDump {
 /// - Interrupts must be disabled before calling (panic_common already does this).
 ///
 /// Does not allocate heap memory. Does not acquire any locks.
-pub fn dump_scheduler() -> SchedulerDump {
-    let mut dump = SchedulerDump {
-        num_cores: SCHEDULER.num_cores.load(Ordering::Acquire),
-        next_task_id: SCHEDULER.next_task_id.load(Ordering::Acquire),
-        last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
-        current_tasks: [const { None }; MAX_DUMP_CPUS],
-        run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
-        inbound_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
-        core_loads: [0usize; MAX_DUMP_CPUS],
-        lapic_ids: [0u8; MAX_DUMP_CPUS],
-    };
+// pub fn dump_scheduler() -> SchedulerDump {
+//     let mut dump = SchedulerDump {
+//         num_cores: SCHEDULER.num_cores.load(Ordering::Acquire),
+//         next_task_id: SCHEDULER.next_task_id.load(Ordering::Acquire),
+//         last_balance_tick: SCHEDULER.last_balance_tick.load(Ordering::Acquire),
+//         current_tasks: [const { None }; MAX_DUMP_CPUS],
+//         run_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+//         inbound_queues: [const { QueueSnapshot::empty() }; MAX_DUMP_CPUS],
+//         core_loads: [0usize; MAX_DUMP_CPUS],
+//         lapic_ids: [0u8; MAX_DUMP_CPUS],
+//     };
 
-    // SAFETY: We bypass the RwLock on `cores` because:
-    //   1. Interrupts are disabled — no timer tick, no IPI.
-    //   2. The caller guarantees nothing else will touch the scheduler.
-    //   3. `cores` is only mutated at startup; it is effectively immutable here.
-    let cores: &Vec<Arc<CoreScheduler>> = unsafe { bypass_spin_rwlock(&SCHEDULER.cores) };
+//     // SAFETY: We bypass the RwLock on `cores` because:
+//     //   1. Interrupts are disabled — no timer tick, no IPI.
+//     //   2. The caller guarantees nothing else will touch the scheduler.
+//     //   3. `cores` is only mutated at startup; it is effectively immutable here.
+//     let cores: &Vec<Arc<CoreScheduler>> = unsafe { bypass_spin_rwlock(&SCHEDULER.cores) };
 
-    for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
-        dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
-        dump.run_queues[i] = drain_array_queue(&core.run_queue);
-        dump.inbound_queues[i] = drain_inbound_queue(&core.inbound_queue);
-        dump.core_loads[i] = core.load.load(Ordering::Acquire);
-        dump.lapic_ids[i] = core.lapic_id;
-    }
+//     for (i, core) in cores.iter().enumerate().take(MAX_DUMP_CPUS) {
+//         dump.current_tasks[i] = clone_arc_from_current_ptr(&core.current_ptr);
+//         dump.run_queues[i] = drain_array_queue(&core.run_queue);
+//         dump.inbound_queues[i] = drain_inbound_queue(&core.inbound_queue);
+//         dump.core_loads[i] = core.load.load(Ordering::Acquire);
+//         dump.lapic_ids[i] = core.lapic_id;
+//     }
 
-    dump
-}
+//     dump
+// }
 
 /// Bypass a `spin::RwLock<T>` without acquiring it.
 ///

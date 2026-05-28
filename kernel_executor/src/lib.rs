@@ -1,12 +1,15 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(any(test, loom, feature = "loom"))]
+extern crate std;
 
 pub mod global_async;
 pub mod platform;
 pub mod runtime;
+mod sync;
 
-#[cfg(test)]
+#[cfg(all(test, not(any(loom, feature = "loom"))))]
 mod test;
 
 #[macro_export]

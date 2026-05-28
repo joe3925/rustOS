@@ -79,6 +79,7 @@ pub extern "win64" fn disk_device_add(
     dev_init.io_vtable.set(IoType::Read(disk_read), 0);
     dev_init.io_vtable.set(IoType::Write(disk_write), 0);
     dev_init.io_vtable.set(IoType::DeviceControl(disk_ioctl), 0);
+    dev_init.io_vtable.set(IoType::Flush(disk_flush), 0);
 
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::RemoveDevice, disk_pnp_remove);
@@ -183,6 +184,25 @@ pub async fn disk_write<'a, 'b>(
 
     req.write().traversal_policy = TraversalPolicy::ForwardLower;
     kernel_api::pnp::DriverStep::Continue
+}
+
+#[request_handler]
+pub async fn disk_flush<'a, 'b>(
+    dev: &Arc<DeviceObject>,
+    req: &'b mut RequestHandle<'a, '_>,
+) -> kernel_api::pnp::DriverStep {
+    match req.read().kind {
+        RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
+        _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
+    }
+
+    let mut handle = RequestHandle::new(
+        RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
+        RequestData::empty(),
+    );
+    handle.set_traversal_policy(TraversalPolicy::ForwardLower);
+    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
+    kernel_api::pnp::DriverStep::complete(status)
 }
 
 #[request_handler]

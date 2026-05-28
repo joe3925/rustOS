@@ -14,6 +14,10 @@ mod virtqueue;
 
 use alloc::vec;
 use alloc::{sync::Arc, vec::Vec};
+use blk::{
+    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_FLUSH,
+    VIRTIO_BLK_T_IN, VIRTIO_BLK_T_OUT,
+};
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
@@ -21,16 +25,20 @@ use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 use core::time::Duration;
+use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use kernel_api::benchmark::{
     BENCH_FLAG_IRQ, BENCH_FLAG_POLL, BENCH_FLAG_REQUEST, BenchSweepBothResult, BenchSweepParams,
     BenchSweepResult,
 };
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
+use kernel_api::irq::IrqBorrowedHandleExt;
 use kernel_api::irq::{
-    IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector, irq_register_isr,
-    irq_register_isr_gsi, irq_wait_closed,
+    IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_alloc_vector, irq_free_vector,
+    irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
-use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{
+    FromDevice, IoBuffer, IoBufferDmaSegment, PhysFramed, ToDevice,
+};
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
@@ -53,12 +61,6 @@ use temp_benchmark::{
     IOCTL_BLOCK_BENCH_SWEEP, IOCTL_BLOCK_BENCH_SWEEP_BOTH, IOCTL_BLOCK_BENCH_SWEEP_POLLING,
     bench_sweep, bench_sweep_params, bench_sweep_params_request, sanitize_bench_params,
 };
-
-use blk::{
-    BlkIoSlots, VIRTIO_BLK_S_IOERR, VIRTIO_BLK_S_OK, VIRTIO_BLK_S_UNSUPP, VIRTIO_BLK_T_IN,
-    VIRTIO_BLK_T_OUT,
-};
-use dev_ext::{ChildExt, DevExt, DevExtInner, QueueSelectionStrategy, QueueState};
 use virtqueue::Virtqueue;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
@@ -109,8 +111,8 @@ where
             break;
         }
     }
-
-    completion.await
+    let res = completion.await;
+    res
 }
 // legacy helpers
 #[inline(always)]
@@ -141,6 +143,103 @@ fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
             "virtio-blk: {operation} failed: unknown device status {other:#x}"
         )),
     }
+}
+
+async fn submit_virtio_no_data_request(
+    inner: &DevExtInner,
+    qs: &QueueState,
+    req_type: u32,
+    operation: &str,
+) -> DriverStatus {
+    let completion = loop {
+        let completion = match qs.completion_slots.alloc() {
+            Some(completion) => completion,
+            None => {
+                let drained = drain_queue_completions(qs);
+                if drained == 0 {
+                    let mut done = false;
+                    core::future::poll_fn(|cx| {
+                        if done {
+                            core::task::Poll::Ready(())
+                        } else {
+                            done = true;
+                            cx.waker().wake_by_ref();
+                            core::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+                continue;
+            }
+        };
+        let mut completion = Some(completion);
+        let submitted = {
+            let mut vq = qs.queue.write();
+            match qs.arena.submit_request(
+                &mut vq,
+                req_type,
+                0,
+                core::iter::empty::<IoBufferDmaSegment>(),
+                false,
+            ) {
+                Some(h) => {
+                    qs.completion_slots
+                        .attach(h, completion.as_ref().expect("completion missing"));
+                    let queue_full = vq.num_free == 0;
+                    let _submit_guard = SubmitTasksGuard::new(
+                        &qs.submitting_tasks,
+                        &vq,
+                        inner.notify_base,
+                        inner.notify_off_multiplier,
+                        queue_full,
+                    );
+                    true
+                }
+                None => {
+                    vq.notify(inner.notify_base, inner.notify_off_multiplier);
+                    false
+                }
+            }
+        };
+
+        if submitted {
+            break completion.take().expect("completion missing");
+        }
+
+        let mut done = false;
+        core::future::poll_fn(|cx| {
+            if done {
+                core::task::Poll::Ready(())
+            } else {
+                done = true;
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            }
+        })
+        .await;
+    };
+
+    match wait_completion_hybrid(qs, completion, COMPLETION_POLL_TIME).await {
+        Ok(device_status) => blk_status_to_driver_status(operation, device_status),
+        Err(_) => virtio_device_error(alloc::format!(
+            "virtio-blk: {operation} failed: completion canceled before device status"
+        )),
+    }
+}
+
+async fn flush_virtio_cache(pdo: &Arc<DeviceObject>) -> DriverStatus {
+    let (_parent, inner) = match get_parent_inner(pdo) {
+        Ok(v) => v,
+        Err(s) => return s,
+    };
+
+    if !inner.flush_supported {
+        return DriverStatus::NotImplemented;
+    }
+
+    let queue_idx = inner.select_queue();
+    let qs = inner.get_queue(queue_idx);
+    submit_virtio_no_data_request(&inner, qs, VIRTIO_BLK_T_FLUSH, "flush").await
 }
 
 #[cfg(not(test))]
@@ -180,7 +279,7 @@ extern "win64" fn virtio_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
     let isr_va = ctx as *const u8;
@@ -201,13 +300,14 @@ extern "win64" fn virtio_msix_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     _ctx: usize,
 ) -> bool {
     handle.signal_one(IrqMeta {
         tag: 0,
         data: [0; 3],
     });
+
     true
 }
 
@@ -664,6 +764,7 @@ async fn virtio_pnp_start<'a, 'b>(
             mapped_bars: Mutex::new(bar_list),
             msix_pba,
             indirect_desc_enabled: init_result.indirect_desc_supported,
+            flush_supported: init_result.flush_supported,
         })
     });
 
@@ -757,6 +858,7 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
     io_vt.set(IoType::Read(virtio_pdo_read), 0);
     io_vt.set(IoType::Write(virtio_pdo_write), 0);
     io_vt.set(IoType::DeviceControl(virtio_pdo_ioctl), 0);
+    io_vt.set(IoType::Flush(virtio_pdo_flush), 0);
 
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);
@@ -1227,6 +1329,20 @@ pub async fn virtio_pdo_write<'a, 'b>(
 }
 
 #[request_handler]
+pub async fn virtio_pdo_flush<'a, 'b>(
+    pdo: &Arc<DeviceObject>,
+    req: &'b mut RequestHandle<'a, '_>,
+) -> DriverStep {
+    match req.read().kind {
+        RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
+        _ => return complete_req(req, DriverStatus::InvalidParameter),
+    }
+
+    let status = flush_virtio_cache(pdo).await;
+    complete_req(req, status)
+}
+
+#[request_handler]
 pub async fn virtio_pdo_ioctl<'a, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a, '_>,
@@ -1243,7 +1359,10 @@ pub async fn virtio_pdo_ioctl<'a, 'b>(
     };
 
     match code {
-        IOCTL_BLOCK_FLUSH => complete_req(req, DriverStatus::Success),
+        IOCTL_BLOCK_FLUSH => {
+            let status = flush_virtio_cache(pdo).await;
+            complete_req(req, status)
+        }
 
         IOCTL_BLOCK_BENCH_SWEEP => {
             let (parent, inner) = match get_parent_inner(pdo) {

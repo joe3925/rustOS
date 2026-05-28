@@ -2,7 +2,14 @@ cargo-features = ["profile-rustflags"]
 
 
 [workspace]
-members = ["os", "kernel_executor", "kernel_abi", "kernel_stub", "xtask"]
+members = [
+    "os",
+    "kernel_executor",
+    "kernel_abi",
+    "kernel_stub",
+    "kernel_sync",
+    "xtask",
+]
 exclude = ["rustos-api", "kernel"]
 resolver = "2"
 

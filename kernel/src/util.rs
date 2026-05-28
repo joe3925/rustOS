@@ -6,8 +6,8 @@ use crate::console::Screen;
 use crate::drivers::driver_install::install_prepacked_drivers;
 use crate::drivers::interrupt_index::{
     apic_calibrate_ticks_per_ns_via_wait, apic_program_period_ns, calibrate_tsc, current_cpu_id,
-    get_current_logical_id, init_percpu_gs, wait_using_pit_50ms, ApicImpl, IpiDest, IpiKind,
-    LocalApic,
+    current_is_in_interrupt_atomic, get_current_logical_id, init_percpu_gs, wait_using_pit_50ms,
+    ApicImpl, IpiDest, IpiKind, LocalApic,
 };
 use crate::drivers::interrupt_index::{APIC, PICS};
 use crate::drivers::pnp::manager::PNP_MANAGER;
@@ -19,6 +19,7 @@ use crate::gdt::PER_CPU_GDT;
 use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
+use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
@@ -29,7 +30,7 @@ use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::{dump_scheduler, task_name_panic, SCHEDULER};
+use crate::scheduling::scheduler::{task_name_panic, SCHEDULER};
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
@@ -38,6 +39,7 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
 use core::arch::asm;
+use core::cmp::max;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::panic::PanicInfo;
@@ -60,32 +62,32 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 250_000;
+pub const APIC_START_PERIOD: u64 = 250000;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
 pub static PANIC_ACTIVE: AtomicBool = AtomicBool::new(false);
 static PANIC_OWNER: Mutex<Option<u32>> = Mutex::new(None);
-lazy_static! {
-    pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
-        name: "drive",
-        folder: "C:\\system\\logs",
-        log_samples: true,
-        log_spans: false,
-        log_mem_on_persist: false,
-        export_debug_metadata: true,
-        end_on_drop: false,
-        timeout_ms: None,
-        auto_persist_secs: None,
-        sample_reserve: 256,
-        span_reserve: 256,
-        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::PauseFlushCompactTime),
-        sample_capacity: None,
-        sample_chunk_capacity: None,
-        max_unwind_depth: None,
-        disable_per_core: true
-    });
-}
+// lazy_static! {
+//     pub static ref DRIVE_WINDOW: BenchWindow = BenchWindow::new(BenchWindowConfig {
+//         name: "drive",
+//         folder: "C:\\system\\logs",
+//         log_samples: true,
+//         log_spans: false,
+//         log_mem_on_persist: false,
+//         export_debug_metadata: true,
+//         end_on_drop: false,
+//         timeout_ms: None,
+//         auto_persist_secs: None,
+//         sample_reserve: 400000,
+//         span_reserve: 0,
+//         overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+//         sample_capacity: None,
+//         sample_chunk_capacity: None,
+//         max_unwind_depth: None,
+//         disable_per_core: true
+//     });
+// }
 const TLS_SELF_TEST_PENDING: u8 = 0;
 const TLS_SELF_TEST_PASS: u8 = 1;
 const TLS_SELF_TEST_FAIL: u8 = 2;
@@ -115,9 +117,19 @@ pub unsafe fn init() {
     init_kernel_cr3();
     let memory_map = &boot_info().memory_regions;
     BootInfoFrameAllocator::init_start(memory_map);
+    let apic_time;
+    let mut start_aps = false;
     {
         let _init_lock = INIT_LOCK.lock();
         init_heap();
+        {
+            let boot = boot_info();
+            crate::profiling::unwind::register_kernel_pe_unwind_module(
+                boot.kernel_image_base,
+                boot.kernel_image_size,
+                boot.kernel_sections.as_slice(),
+            );
+        }
         reclaim_kernel_stub();
         Screen::clear_framebuffer();
         load_idt();
@@ -137,21 +149,27 @@ pub unsafe fn init() {
         let tsc_end = cpu::get_cycles();
         calibrate_tsc(tsc_start, tsc_end, 50);
         TOTAL_TIME.call_once(Stopwatch::start);
-        let apic_time = Stopwatch::start();
+        apic_time = Stopwatch::start();
         match ApicImpl::init_apic_full() {
             Ok(_) => {
-                APIC.lock().as_ref().unwrap().start_aps();
-                println!(
-                    "APIC init and AP start successful in {} s!",
-                    apic_time.elapsed_sec()
-                );
+                start_aps = true;
             }
             Err(err) => {
                 println!("APIC transition failed {}!", err.to_str());
             }
         }
     }
-    while CORE_LOCK.load(Ordering::SeqCst) != 0 {}
+    if start_aps {
+        APIC.lock().as_ref().unwrap().start_aps();
+        println!(
+            "APIC init and AP start successful in {} s!",
+            apic_time.elapsed_sec()
+        );
+    }
+
+    while CORE_LOCK.load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
 
     init_percpu_gs(CPU_ID.fetch_add(1, Ordering::Acquire) as u32);
 
@@ -174,8 +192,9 @@ pub unsafe fn init() {
     }
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
+    crate::memory::heap::enable_mimalloc();
     init_executor_platform();
-    GlobalAsyncExecutor::global().init(NUM_CORES.load(Ordering::Acquire));
+    GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
     test_kernel_tls_runtime();
     let mut program = Program::new(
@@ -189,7 +208,7 @@ pub extern "win64" fn kernel_main(ctx: usize) {
     program.main_thread = Some(SCHEDULER.get_current_task(current_cpu_id()).unwrap());
 
     program.modules = RwLock::new(vec![Arc::new(RwLock::new(Module {
-        title: "kernel.efi".into(),
+        title: "kernel.exe".into(),
         image_path: Path::from_string(""),
         parent_pid: 0,
         image_base: VirtAddr::new(0xFFFF_8500_0000_0000),
@@ -257,6 +276,10 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
     };
     if is_owner {
         println!("=== KERNEL PANIC [{}] ===", mod_name);
+        println!(
+            "is in interrupt: {:#?}",
+            current_is_in_interrupt_atomic().load(Ordering::Relaxed)
+        );
         println!("{}", info);
 
         // let dump = dump_scheduler();
@@ -343,6 +366,7 @@ pub fn trigger_breakpoint() {
 }
 
 pub fn test_full_heap() {
+    let time = Stopwatch::start();
     let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
@@ -356,7 +380,8 @@ pub fn test_full_heap() {
     }
 
     println!(
-        "Heap test passed: allocated and verified {} elements in the heap",
+        "Heap test passed in {:2}ms: allocated and verified {} elements in the heap",
+        time.elapsed_millis(),
         element_count
     );
 }
@@ -563,13 +588,10 @@ pub fn test_kernel_tls_runtime() {
     ));
 
     let mut completed = false;
-    for _ in 0..4096 {
-        if TLS_SELF_TEST_RESULT.load(Ordering::Acquire) != TLS_SELF_TEST_PENDING {
-            completed = true;
-            break;
-        }
+    while TLS_SELF_TEST_RESULT.load(Ordering::Acquire) == TLS_SELF_TEST_PENDING {
         yield_now();
     }
+    completed = true;
 
     let current_snapshot = unsafe { tls_test_snapshot() };
     unsafe {

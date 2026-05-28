@@ -7,6 +7,7 @@
 extern crate alloc;
 
 mod dev_ext;
+use kernel_api::irq::IrqBorrowedHandleExt;
 
 use alloc::sync::Weak;
 use alloc::vec;
@@ -20,7 +21,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use core::time::Duration;
 use kernel_api::device::{DeviceInit, DeviceObject, DriverObject};
 use kernel_api::irq::{
-    IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
+    IrqBorrowedHandle, IrqHandle, IrqHandleExt, irq_register_isr, irq_register_isr_gsi, irq_wait_ok,
 };
 use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{
@@ -184,7 +185,7 @@ extern "win64" fn ide_isr(
     _vector: u8,
     _cpu: u32,
     _frame: &mut kernel_api::x86_64::structures::idt::InterruptStackFrame,
-    handle: IrqHandle,
+    handle: IrqBorrowedHandle,
     ctx: usize,
 ) -> bool {
     // Read the status register to acknowledge/clear the IDE interrupt.

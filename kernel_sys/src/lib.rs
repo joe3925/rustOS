@@ -18,7 +18,7 @@ use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
     IoBufferInner,
 };
-use kernel_types::irq::{DropHook, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
+use kernel_types::irq::{DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
 use kernel_types::runtime::{BlockOnThreadState, Stopwatch};
 
@@ -52,8 +52,6 @@ unsafe extern "win64" {
     pub fn create_kernel_task(entry: extern "win64" fn(usize), ctx: usize, name: String) -> u64;
     pub fn kill_kernel_task_by_id(id: u64) -> Result<(), TaskError>;
     pub fn pnp_queue_dpc(func: DpcFn, arg: usize);
-    pub fn submit_runtime_internal(trampoline: extern "win64" fn(usize), ctx: usize);
-    pub fn submit_blocking_internal(trampoline: extern "win64" fn(usize), ctx: usize);
     pub fn try_steal_blocking_one() -> bool;
     pub unsafe fn park_self_and_yield();
     pub unsafe fn wake_task(id: u64);
@@ -61,10 +59,10 @@ unsafe extern "win64" {
     // IRQ
     pub fn kernel_irq_register(vector: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
     pub fn kernel_irq_register_gsi(gsi: u8, isr: IrqIsrFn, ctx: usize) -> IrqHandle;
-    pub fn kernel_irq_signal(handle: &IrqHandle, meta: IrqMeta);
-    pub fn kernel_irq_signal_n(handle: &IrqHandle, meta: IrqMeta, n: u32);
-    pub fn kernel_irq_signal_all(handle: &IrqHandle, meta: IrqMeta);
-    pub fn kernel_irq_ensure_signal(handle: &IrqHandle, meta: IrqMeta);
+    pub fn kernel_irq_borrowed_signal(handle: IrqBorrowedHandle, meta: IrqMeta);
+    pub fn kernel_irq_borrowed_signal_n(handle: IrqBorrowedHandle, meta: IrqMeta, n: u32);
+    pub fn kernel_irq_borrowed_signal_all(handle: IrqBorrowedHandle, meta: IrqMeta);
+    pub fn kernel_irq_borrowed_ensure_signal(handle: IrqBorrowedHandle, meta: IrqMeta);
     pub fn irq_handle_create(drop_hook: DropHook) -> IrqHandle;
 
     pub fn irq_handle_clone(h: &IrqHandle) -> IrqHandle;

@@ -1,51 +1,92 @@
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 
 use kernel_executor::platform::{self as exec_platform, ExecutorPlatform, Job};
 use kernel_executor::runtime::runtime as exec_runtime;
+use spin::Once;
 
 use crate::static_handlers::{print, task_yield};
-use crate::structs::thread_pool::{Job as TpJob, ThreadPool};
+use crate::structs::thread_pool::{BoundedThreadPool, ThreadPool};
 
-lazy_static::lazy_static! {
-    pub static ref RUNTIME_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new(3));
-    pub static ref BLOCKING_POOL: Arc<ThreadPool> = Arc::new(ThreadPool::new_blocking(3));
+struct KernelExecutorPlatform {
+    runtime_pool: Once<Arc<BoundedThreadPool>>,
+    blocking_pool: Once<Arc<ThreadPool>>,
 }
 
-struct KernelExecutorPlatform;
+impl KernelExecutorPlatform {
+    pub const fn new() -> Self {
+        Self {
+            runtime_pool: Once::new(),
+            blocking_pool: Once::new(),
+        }
+    }
+
+    fn runtime_pool(&self) -> &Arc<BoundedThreadPool> {
+        self.runtime_pool
+            .get()
+            .expect("runtime executor pool not initialized")
+    }
+
+    fn blocking_pool(&self) -> &Arc<ThreadPool> {
+        self.blocking_pool
+            .get()
+            .expect("blocking executor pool not initialized")
+    }
+}
+
 pub fn yield_now() {
     unsafe { task_yield() };
 }
+
 impl ExecutorPlatform for KernelExecutorPlatform {
+    fn init_runtime(&self, max_threads: usize, max_jobs: usize) {
+        let threads = max_threads.max(1);
+        let jobs = max_jobs.max(1);
+
+        self.runtime_pool
+            .call_once(|| Arc::new(BoundedThreadPool::new(threads, jobs)));
+    }
+
+    fn init_blocking(&self, max_threads: usize) {
+        let threads = max_threads.max(1);
+
+        self.blocking_pool
+            .call_once(|| Arc::new(ThreadPool::new_blocking(threads)));
+    }
+
     fn submit_runtime(&self, job: Job) {
-        RUNTIME_POOL.submit(job.f, job.a);
+        let accepted = self.runtime_pool().submit(job.f, job.a);
+
+        if !accepted {
+            panic!("runtime executor pool queue full size");
+        }
     }
 
     fn submit_blocking(&self, job: Job) {
-        BLOCKING_POOL.submit(job.f, job.a);
+        self.blocking_pool().submit(job.f, job.a);
     }
 
     fn submit_blocking_many(&self, jobs: &[Job]) {
-        let mut mapped: Vec<TpJob> = Vec::with_capacity(jobs.len());
-        for j in jobs {
-            mapped.push(TpJob { f: j.f, a: j.a });
+        let pool = self.blocking_pool();
+
+        for job in jobs {
+            pool.submit(job.f, job.a);
         }
-        BLOCKING_POOL.submit_many(&mapped);
     }
 
     fn try_steal_blocking_one(&self) -> bool {
-        BLOCKING_POOL.try_execute_one()
+        self.blocking_pool().try_execute_one()
     }
 
     fn yield_now(&self) {
         yield_now();
     }
+
     fn print(&self, string: &str) {
         print(string);
     }
 }
 
-static PLATFORM: KernelExecutorPlatform = KernelExecutorPlatform;
+static PLATFORM: KernelExecutorPlatform = KernelExecutorPlatform::new();
 
 pub fn init_executor_platform() {
     exec_platform::init(&PLATFORM);

@@ -7,12 +7,13 @@ use alloc::{
 };
 use bincode::{Decode, Encode};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use kernel_types::async_types::AsyncMutex;
 use kernel_types::{
     fs::{FsSeekWhence, OpenFlags, Path},
     status::{Data, RegError},
 };
 use lazy_static::lazy_static;
-use spin::{Mutex, RwLock};
+use spin::RwLock;
 
 // File paths
 const SNAP_PATH: &str = "C:/system/registry/registry.snap";
@@ -130,7 +131,7 @@ lazy_static! {
 }
 
 static REGISTRY_INIT: AtomicBool = AtomicBool::new(false);
-static REGISTRY_INIT_LOCK: Mutex<()> = Mutex::new(());
+static REGISTRY_INIT_LOCK: AsyncMutex<()> = AsyncMutex::new(());
 
 fn init_class_catalog(reg: &mut Registry) {
     let system = reg.root.entry("SYSTEM".into()).or_insert_with(Key::empty);
@@ -447,7 +448,7 @@ async fn ensure_loaded() {
         return;
     }
 
-    let _guard = REGISTRY_INIT_LOCK.lock();
+    let _guard = REGISTRY_INIT_LOCK.lock().await;
 
     if REGISTRY_INIT.load(Ordering::Acquire) {
         return;
