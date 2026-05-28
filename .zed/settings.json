@@ -1,30 +1,30 @@
 {
-  "lsp": {
-    "rust-analyzer": {
-      "binary": {
-        // TODO: remove this when ever RA fixes the E0308 regression
-        //"path": "C:\\Users\\Boden\\Downloads\\rust-analyzer.exe",
-      },
+    "lsp": {
+        "rust-analyzer": {
+            "initialization_options": {
+                "cargo": {
+                    "metadataExtraArgs": ["-Zjson-target-spec"],
+                    "extraArgs": ["-Zjson-target-spec"],
+                },
+                "diagnostics": {
+                    "disabled": ["mismatched-types"],
+                },
+                "procMacro": {
+                    "enable": true,
+                },
 
-      "initialization_options": {
-        "diagnostics": {
-          "disabled": ["mismatched-types"],
+                "check": {
+                    "allTargets": false,
+                    "extraArgs": ["-Zjson-target-spec"],
+                },
+                "checkOnSave": true,
+                "linkedProjects": [
+                    "drivers/Cargo.toml",
+                    "kernel/Cargo.toml",
+                    "rust-fatfs/Cargo.toml",
+                    "Cargo.toml",
+                ],
+            },
         },
-        "procMacro": {
-          "enable": true,
-        },
-
-        "check": {
-          "allTargets": false,
-        },
-        "checkOnSave": true,
-        "linkedProjects": [
-          "drivers/Cargo.toml",
-          "kernel/Cargo.toml",
-          "rust-fatfs/Cargo.toml",
-          "Cargo.toml",
-        ],
-      },
     },
-  },
 }

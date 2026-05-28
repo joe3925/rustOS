@@ -804,9 +804,7 @@ impl Scheduler {
 
         loop {
             let mut min_idx = 0;
-            let mut max_idx = 0;
             let mut min_load = usize::MAX;
-            let mut max_load = 0;
 
             for i in 0..n {
                 let Some(load) = self.core_effective_load(i) else {
@@ -817,13 +815,41 @@ impl Scheduler {
                     min_idx = i;
                     min_load = load;
                 }
-                if load > max_load {
+            }
+
+            if min_load == usize::MAX {
+                break;
+            }
+
+            let mut max_idx = 0;
+            let mut max_stealable = 0usize;
+
+            for i in 0..n {
+                if i == min_idx {
+                    continue;
+                }
+
+                let Some(core) = self.core(i) else {
+                    continue;
+                };
+
+                let stealable = core.run_queue.len();
+
+                if stealable > max_stealable {
+                    max_stealable = stealable;
                     max_idx = i;
-                    max_load = load;
                 }
             }
 
-            if min_load == usize::MAX || max_load <= min_load + 1 {
+            if max_stealable == 0 {
+                break;
+            }
+
+            let Some(max_load) = self.core_effective_load(max_idx) else {
+                break;
+            };
+
+            if max_load <= min_load + 1 {
                 break;
             }
 
@@ -831,22 +857,24 @@ impl Scheduler {
                 break;
             };
 
-            let task = match max_core.run_queue.pop() {
-                Some(t) => {
-                    max_core.load.fetch_sub(1, Ordering::Release);
-                    Some(t)
+            let Some(task) = max_core.run_queue.pop() else {
+                break;
+            };
+
+            max_core.load.fetch_sub(1, Ordering::Release);
+
+            match task.sched_state() {
+                SchedState::Terminated | SchedState::Parking | SchedState::Blocked => {
+                    continue;
                 }
-                None => None,
-            };
+                SchedState::Runnable | SchedState::Running => {}
+            }
 
-            let Some(task) = task else {
-                continue;
-            };
-
-            task.set_target_cpu(min_idx);
             let Some(min_core) = self.core(min_idx) else {
                 break;
             };
+
+            task.set_target_cpu(min_idx);
             Self::push_runqueue_or_panic(min_idx, &min_core.run_queue, &min_core.load, task);
         }
     }
