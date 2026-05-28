@@ -4,7 +4,9 @@ use crate::memory::heap::{
     MIMALLOC_HEAP_START, MIMALLOC_OS_HEAP_SIZE,
 };
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
-use crate::memory::paging::paging::{map_kernel_2mib_frame, unmap_range_keep_frames_unchecked};
+use crate::memory::paging::paging::{
+    map_kernel_2mib_frame, trigger_tlb_shootdown, unmap_range_keep_frames_unchecked,
+};
 use crate::memory::paging::tables::init_mapper;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
@@ -769,6 +771,7 @@ impl RawLargeAllocator {
                 (meta.committed_units * RAW_LARGE_UNIT_SIZE) as u64,
             );
         }
+        trigger_tlb_shootdown();
         for unit in meta.base_unit..meta.base_unit + meta.committed_units {
             self.frames[unit] = 0;
         }
@@ -917,6 +920,7 @@ impl RawLargeAllocator {
                     RAW_LARGE_UNIT_SIZE as u64,
                 );
             }
+            trigger_tlb_shootdown();
 
             let boot_info = boot_info();
             let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);

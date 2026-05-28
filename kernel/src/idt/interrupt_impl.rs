@@ -951,6 +951,7 @@ pub fn irq_free_vector(vector: u8) -> bool {
 }
 
 pub const SCHED_IPI_VECTOR: u8 = 0xF2;
+pub const TLB_FLUSH_VECTOR: u8 = 0xF3;
 
 pub struct InterruptGuard {}
 

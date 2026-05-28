@@ -124,10 +124,7 @@ pub fn bounded_mpmc_channel<T>(
     capacity: usize,
     max_consumers: usize,
 ) -> (BoundedMpmcSender<T>, BoundedMpmcReceiver<T>) {
-    kernel_sync::bounded_mpmc::bounded_mpmc_channel::<KernelPlatform, T>(
-        capacity,
-        max_consumers,
-    )
+    kernel_sync::bounded_mpmc::bounded_mpmc_channel::<KernelPlatform, T>(capacity, max_consumers)
 }
 
 #[inline]

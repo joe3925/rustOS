@@ -4,6 +4,7 @@
   "os": "windows",
   "env": "msvc",
   "vendor": "pc",
+  "linker": "lld-link",
   "linker-flavor": "msvc",
   "linker-is-gnu": false,
   "lld-flavor": "link",

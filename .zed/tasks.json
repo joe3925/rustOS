@@ -1,16 +1,30 @@
 [
   {
     "label": "build all",
-    "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { cargo run -p xtask }",
+    "command": "cargo",
+    "args": ["run", "-p", "xtask", "--", "build", "--drivers"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
   },
   {
     "label": "build kernel",
-    "command": "cargo run -p xtask",
+    "command": "cargo",
+    "args": ["run", "-p", "xtask"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
+  },
+  {
+    "label": "debug kernel qemu",
+    "command": "cargo",
+    "args": ["run", "-p", "xtask", "--", "qemu", "--debug", "--detach"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "allow_concurrent_runs": false,
   },
   {
     "label": "no dbg full chain",
-    // If you choose to use this config do not use a dynamic vhdx, these are broken on qemu and cause qemu to crash after it grows 1 - 10 gb.
-    "command": "cd drivers; if ($?) { cargo build }; if ($?) { cd .. }; if ($?) { cargo run -p xtask }; if ($?) { & 'C:/Program Files/qemu/qemu-system-x86_64.exe' -m 8G -cpu 'qemu64,+apic,+acpi' -machine q35 -accel 'whpx' -smp 16 -device 'intel-iommu,intremap=off' -bios 'C:/Program Files/qemu/OVMF_X64.fd' -vga std -drive 'file=target/debug/boot.img,format=raw' -drive 'file=rustOS.vhdx,if=none,format=vhdx,id=sysdisk' -device 'virtio-blk-pci,drive=sysdisk,disable-legacy=on,disable-modern=off,iommu_platform=on' }",
+    "command": "cargo",
+    "args": ["run", "-p", "xtask", "--", "qemu"],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "allow_concurrent_runs": false,
   },
 ]

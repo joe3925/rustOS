@@ -11,8 +11,8 @@ use crate::gdt::{
     DOUBLE_FAULT_IST_INDEX, PAGE_FAULT_IST_INDEX, SCHED_IPI_IST_INDEX, TIMER_IST_INDEX,
     YIELD_IST_INDEX,
 };
+use crate::memory::paging::paging::tlb_flush_entry;
 use crate::scheduling::scheduler::{ipi_entry, yield_interrupt_entry, KernelFpuGuard};
-
 mod interrupt_impl;
 pub use interrupt_impl::*;
 
@@ -375,7 +375,7 @@ fn init_idt() -> InterruptDescriptorTable {
         idt[SCHED_IPI_VECTOR]
             .set_handler_addr(VirtAddr::new(ipi_entry as *const () as u64))
             .set_stack_index(SCHED_IPI_IST_INDEX);
-
+        idt[TLB_FLUSH_VECTOR].set_handler_addr(VirtAddr::new(tlb_flush_entry as *const () as u64));
         idt[0x80]
             .set_handler_addr(VirtAddr::new(yield_interrupt_entry as *const () as u64))
             .set_stack_index(YIELD_IST_INDEX);
