@@ -3630,7 +3630,24 @@ pub async fn bench_c_drive_io_async() {
     let mut read_ns_per_op: Vec<u64> = Vec::new();
     let mut write_throughput: Vec<f64> = Vec::new();
     let mut read_throughput: Vec<f64> = Vec::new();
-
+    let window = BenchWindow::new(BenchWindowConfig {
+        name: "drive".to_string(),
+        folder: "C:\\system\\logs".to_string(),
+        log_samples: true,
+        log_spans: false,
+        log_mem_on_persist: false,
+        export_debug_metadata: true,
+        end_on_drop: false,
+        timeout_ms: None,
+        auto_persist_secs: None,
+        sample_reserve: 400000,
+        span_reserve: 0,
+        overflow_policy: Some(kernel_types::benchmark::BenchOverflowPolicy::Panic),
+        sample_capacity: None,
+        sample_chunk_capacity: None,
+        max_unwind_depth: None,
+        disable_per_core: true,
+    });
     for &chunk_sz in DISK_BENCH_SIZES {
         let ops = (DISK_BENCH_TOTAL_BYTES / chunk_sz).max(1);
 
@@ -3641,6 +3658,7 @@ pub async fn bench_c_drive_io_async() {
         let mut total_written = 0u64;
         let mut offset = 0u64;
         println!("starting chunk size: {}", chunk_sz);
+        window.start();
         for op in 0..ops {
             chunk[..8].copy_from_slice(&(op as u64).to_le_bytes());
             let sw_write = Stopwatch::start();
@@ -3666,6 +3684,7 @@ pub async fn bench_c_drive_io_async() {
             }
             write_elapsed += sw_write.elapsed_nanos();
         }
+        window.stop_and_persist().await;
         let write_mib_s = mib_per_sec(total_written, write_elapsed);
         let per_write_ns = write_elapsed / ops as u64;
 

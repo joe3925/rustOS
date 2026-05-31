@@ -53,8 +53,6 @@ fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
 
-const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
-
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
 const ATA_CMD_WRITE_SECTORS: u8 = 0x30;

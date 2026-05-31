@@ -102,12 +102,13 @@ impl BlockDev {
         src: &[u8],
         kind: IoKind,
     ) -> Result<(), DriverStatus> {
+        let no_buffer = false;
         let volume = self.volume.clone();
         let mut req = RequestHandle::new(
             RequestType::Write {
                 offset,
                 len: src.len(),
-                no_buffer: false,
+                no_buffer: no_buffer,
                 owner: self.current_owner.load(Ordering::Acquire),
             },
             RequestData::empty(),

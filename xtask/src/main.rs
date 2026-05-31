@@ -636,7 +636,7 @@ fn qemu_args(
     options: &QemuOptions,
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
-    let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "10".to_string());
+    let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
     let accel = env::var("RUSTOS_QEMU_ACCEL").unwrap_or_else(|_| "tcg".to_string());
     let machine = format!("q35,accel={accel}");
     let gdb = format!("tcp::{}", options.gdb_port);

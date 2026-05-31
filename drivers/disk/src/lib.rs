@@ -36,7 +36,6 @@ fn panic(info: &PanicInfo) -> ! {
     panic_common(MOD_NAME, info)
 }
 
-const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
 fn has_from_device_buffer(
@@ -191,18 +190,7 @@ pub async fn disk_flush<'a, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a, '_>,
 ) -> kernel_api::pnp::DriverStep {
-    match req.read().kind {
-        RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
-        _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
-    }
-
-    let mut handle = RequestHandle::new(
-        RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-        RequestData::empty(),
-    );
-    handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
-    kernel_api::pnp::DriverStep::complete(status)
+    kernel_api::pnp::DriverStep::Continue
 }
 
 #[request_handler]
@@ -255,15 +243,6 @@ pub async fn disk_ioctl<'a, 'b>(
 
             req.write().set_data_t::<DiskInfo>(info);
             kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
-        }
-        IOCTL_BLOCK_FLUSH => {
-            let mut handle = RequestHandle::new(
-                RequestType::DeviceControl(IOCTL_BLOCK_FLUSH),
-                RequestData::empty(),
-            );
-            handle.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let status = pnp_forward_request_to_next_lower(dev.clone(), &mut handle).await;
-            kernel_api::pnp::DriverStep::complete(status)
         }
         _ => kernel_api::pnp::DriverStep::Continue,
     }

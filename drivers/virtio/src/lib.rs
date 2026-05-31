@@ -1333,13 +1333,7 @@ pub async fn virtio_pdo_flush<'a, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'a, '_>,
 ) -> DriverStep {
-    match req.read().kind {
-        RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
-        _ => return complete_req(req, DriverStatus::InvalidParameter),
-    }
-
-    let status = flush_virtio_cache(pdo).await;
-    complete_req(req, status)
+    complete_req(req, DriverStatus::Success)
 }
 
 #[request_handler]
