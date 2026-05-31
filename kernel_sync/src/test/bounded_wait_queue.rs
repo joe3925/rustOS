@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
+use crate::bounded_wait_queue::BoundedWaitQueueEnqueue;
 use crate::bounded_wait_queue::BoundedWaitQueueError;
+
 use crate::platform::{ParkReason, Platform};
 use crate::test::{recv_timeout, P};
 use crate::BoundedWaitQueue;
@@ -11,7 +13,7 @@ fn enqueue_clear_and_already_queued() {
 
     assert_eq!(queue.capacity(), 2);
     assert!(queue.is_empty());
-    assert_eq!(queue.enqueue_current(), Ok(()));
+    assert_eq!(queue.enqueue_current().is_ok(), true);
     assert_eq!(
         queue.enqueue_current(),
         Err(BoundedWaitQueueError::AlreadyQueued)
@@ -32,7 +34,7 @@ fn capacity_is_enforced_across_tasks() {
 
     let first_queue = queue.clone();
     let first = std::thread::spawn(move || {
-        assert_eq!(first_queue.enqueue_current(), Ok(()));
+        assert_eq!(first_queue.enqueue_current().is_ok(), true);
         ready_tx.send(()).unwrap();
         <P as Platform>::park_current(ParkReason::None);
     });
@@ -65,7 +67,7 @@ fn wake_one_then_wake_all_unparks_waiters() {
         let ready_tx = ready_tx.clone();
         let done_tx = done_tx.clone();
         handles.push(std::thread::spawn(move || {
-            assert_eq!(worker_queue.enqueue_current(), Ok(()));
+            assert_eq!(worker_queue.enqueue_current().is_ok(), true);
             ready_tx.send(()).unwrap();
             <P as Platform>::park_current(ParkReason::None);
             done_tx.send(()).unwrap();

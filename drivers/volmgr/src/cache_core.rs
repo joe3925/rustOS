@@ -289,16 +289,19 @@ struct FlushScratch<const BLOCK_SIZE: usize> {
     frames: Vec<IoBufferPageFrame>,
     keys: Vec<u64>,
     joins: Vec<FfiFuture<()>>,
+    run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
 }
 
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
     fn new(join_cap: usize) -> Self {
         let capacity = if join_cap == 0 { 1 } else { join_cap };
+
         Self {
             batch: Vec::new(),
             frames: Vec::new(),
             keys: Vec::new(),
             joins: Vec::with_capacity(capacity),
+            run: Vec::new(),
         }
     }
 
@@ -307,6 +310,7 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         self.frames.clear();
         self.keys.clear();
         self.joins.clear();
+        self.run.clear();
     }
 
     fn ensure_join_capacity(&mut self, requested: usize) {
@@ -316,7 +320,45 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         }
     }
 }
+struct FlushRunScratchLease<'a, const BLOCK_SIZE: usize> {
+    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
+    run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
+}
 
+impl<'a, const BLOCK_SIZE: usize> FlushRunScratchLease<'a, BLOCK_SIZE> {
+    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
+        let run = {
+            let mut scratch = scratch.lock();
+            core::mem::take(&mut scratch.run)
+        };
+
+        Self {
+            scratch,
+            run: Some(run),
+        }
+    }
+
+    fn run_mut(&mut self) -> &mut Vec<PreparedFlushPage<BLOCK_SIZE>> {
+        self.run
+            .as_mut()
+            .expect("flush run scratch lease used after drop")
+    }
+}
+
+impl<const BLOCK_SIZE: usize> Drop for FlushRunScratchLease<'_, BLOCK_SIZE> {
+    fn drop(&mut self) {
+        let Some(mut run) = self.run.take() else {
+            return;
+        };
+
+        run.clear();
+
+        let mut scratch = self.scratch.lock();
+        if scratch.run.capacity() < run.capacity() {
+            scratch.run = run;
+        }
+    }
+}
 struct FlushFrameScratchLease<'a, const BLOCK_SIZE: usize> {
     scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
     frames: Option<Vec<IoBufferPageFrame>>,
@@ -1465,9 +1507,17 @@ where
             .min(max_blocks_per_run.max(1))
             .min(cache_safe_limit);
 
-        let mut run: Vec<PreparedFlushPage<BLOCK_SIZE>> =
-            Vec::with_capacity(max_blocks_per_buffer.min(keys.len()));
+        let run_capacity = max_blocks_per_buffer.min(keys.len());
+
         let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
+        let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
+        let run = run_scratch.run_mut();
+
+        run.clear();
+        if run.capacity() < run_capacity {
+            run.reserve(run_capacity - run.capacity());
+        }
+
         let mut writebacks = 0usize;
         let mut result = Ok(());
 
@@ -1483,7 +1533,7 @@ where
                     &self.stats,
                     &self.dirty_pages,
                     &self.dirty_owner_keys,
-                    &run,
+                    run.as_slice(),
                     frame_scratch.frames_mut(),
                 )
                 .await
@@ -1494,6 +1544,7 @@ where
                         break;
                     }
                 }
+
                 run.clear();
             }
 
@@ -1508,7 +1559,7 @@ where
                         &self.stats,
                         &self.dirty_pages,
                         &self.dirty_owner_keys,
-                        &run,
+                        run.as_slice(),
                         frame_scratch.frames_mut(),
                     )
                     .await
@@ -1519,8 +1570,10 @@ where
                             break;
                         }
                     }
+
                     run.clear();
                 }
+
                 continue;
             };
 
@@ -1532,7 +1585,7 @@ where
                     &self.stats,
                     &self.dirty_pages,
                     &self.dirty_owner_keys,
-                    &run,
+                    run.as_slice(),
                     frame_scratch.frames_mut(),
                 )
                 .await
@@ -1543,6 +1596,7 @@ where
                         break;
                     }
                 }
+
                 run.clear();
             }
         }
@@ -1553,7 +1607,7 @@ where
                 &self.stats,
                 &self.dirty_pages,
                 &self.dirty_owner_keys,
-                &run,
+                run.as_slice(),
                 frame_scratch.frames_mut(),
             )
             .await
@@ -1562,6 +1616,7 @@ where
                 Err(err) => result = Err(err),
             }
         }
+
         run.clear();
 
         result.map(|()| writebacks)
