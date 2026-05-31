@@ -23,7 +23,9 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 const PAGE_SIZE: usize = 4096;
-const MIMALLOC_COMMIT_GRANULARITY: usize = 1024 * 1024 * 1024;
+const MIMALLOC_STATS_ENABLED: bool = false;
+const MIMALLOC_OS_ALLOC_ZEROES: bool = false;
+const MIMALLOC_COMMIT_GRANULARITY: usize = 2 * 1024 * 1024;
 const MIMALLOC_HEAP_END: usize = MIMALLOC_HEAP_START + MIMALLOC_HEAP_SIZE as usize;
 const MIMALLOC_COMMIT_TRACK_START: usize =
     align_down_const(MIMALLOC_ARENA_START, MIMALLOC_COMMIT_GRANULARITY);
@@ -167,26 +169,27 @@ pub fn get_mimalloc_free_memory() -> usize {
 }
 
 pub unsafe fn mimalloc_alloc(layout: Layout) -> *mut u8 {
-    let start = cpu::get_cycles();
+    let start = mimalloc_stats_start();
     let mut ptr = null_mut();
+
     if raw_large_alloc_enabled(layout.size(), layout.align()) {
         ptr = RAW_LARGE_ALLOCATOR
             .lock()
             .alloc(layout.size(), layout.align());
     }
+
     if ptr.is_null() {
         ptr = mi_malloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
     }
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
-    MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-    MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-    MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+
+    mimalloc_record_alloc(layout.size(), start);
     ptr
 }
 
 pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
-    let start = cpu::get_cycles();
+    let start = mimalloc_stats_start();
     let mut ptr = null_mut();
+
     if raw_large_alloc_enabled(layout.size(), layout.align()) {
         ptr = RAW_LARGE_ALLOCATOR
             .lock()
@@ -195,36 +198,29 @@ pub unsafe fn mimalloc_alloc_zeroed(layout: Layout) -> *mut u8 {
             core::ptr::write_bytes(ptr, 0, layout.size());
         }
     }
+
     if ptr.is_null() {
         ptr = mi_zalloc_aligned(layout.size().max(1), layout.align()) as *mut u8;
     }
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
-    MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-    MIMALLOC_ALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-    MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+
+    mimalloc_record_alloc(layout.size(), start);
     ptr
 }
 
 pub unsafe fn mimalloc_dealloc(ptr: *mut u8, layout: Layout) {
-    let start = cpu::get_cycles();
-    if ptr_is_raw_large(ptr) {
-        if RAW_LARGE_ALLOCATOR.lock().dealloc(ptr) {
-            let elapsed = cpu::get_cycles().wrapping_sub(start);
-            MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-            MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-            MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-            return;
-        }
+    let start = mimalloc_stats_start();
+
+    if ptr_is_raw_large(ptr) && RAW_LARGE_ALLOCATOR.lock().dealloc(ptr) {
+        mimalloc_record_dealloc(layout.size(), start);
+        return;
     }
+
     mi_free(ptr.cast::<c_void>());
-    let elapsed = cpu::get_cycles().wrapping_sub(start);
-    MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-    MIMALLOC_DEALLOC_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-    MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+    mimalloc_record_dealloc(layout.size(), start);
 }
 
 pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    let start = cpu::get_cycles();
+    let start = mimalloc_stats_start();
     let new_ptr = if ptr_is_raw_large(ptr) {
         RAW_LARGE_ALLOCATOR
             .lock()
@@ -241,12 +237,55 @@ pub unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) ->
     } else {
         mi_realloc_aligned(ptr.cast::<c_void>(), new_size.max(1), layout.align()) as *mut u8
     };
+
+    mimalloc_record_realloc(layout.size(), new_size, start);
+    new_ptr
+}
+
+#[inline(always)]
+fn mimalloc_stats_start() -> u64 {
+    if MIMALLOC_STATS_ENABLED {
+        cpu::get_cycles()
+    } else {
+        0
+    }
+}
+
+#[inline(always)]
+fn mimalloc_record_alloc(size: usize, start: u64) {
+    if !MIMALLOC_STATS_ENABLED {
+        return;
+    }
+
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_ALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
+    MIMALLOC_ALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn mimalloc_record_dealloc(size: usize, start: u64) {
+    if !MIMALLOC_STATS_ENABLED {
+        return;
+    }
+
+    let elapsed = cpu::get_cycles().wrapping_sub(start);
+    MIMALLOC_DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_BYTES.fetch_add(size, Ordering::Relaxed);
+    MIMALLOC_DEALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
+}
+
+#[inline(always)]
+fn mimalloc_record_realloc(old_size: usize, new_size: usize, start: u64) {
+    if !MIMALLOC_STATS_ENABLED {
+        return;
+    }
+
     let elapsed = cpu::get_cycles().wrapping_sub(start);
     MIMALLOC_REALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
-    MIMALLOC_REALLOC_OLD_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+    MIMALLOC_REALLOC_OLD_BYTES.fetch_add(old_size, Ordering::Relaxed);
     MIMALLOC_REALLOC_NEW_BYTES.fetch_add(new_size, Ordering::Relaxed);
     MIMALLOC_REALLOC_CYCLES.fetch_add(elapsed, Ordering::Relaxed);
-    new_ptr
 }
 
 pub struct Locked<A> {
@@ -328,7 +367,9 @@ impl RangeAllocator {
         }
 
         self.free_bytes = self.free_bytes.saturating_sub(size);
-        core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
+        if MIMALLOC_OS_ALLOC_ZEROES {
+            core::ptr::write_bytes(alloc_start as *mut u8, 0, size);
+        }
         alloc_start as *mut u8
     }
 
@@ -396,10 +437,6 @@ impl RangeAllocator {
     }
 
     fn find_region(&mut self, size: usize, align: usize) -> Option<(&'static mut ListNode, usize)> {
-        let mut best_fit_size = usize::MAX;
-        let mut best_fit_prev: *mut ListNode = core::ptr::null_mut();
-        let mut best_fit_alloc_start = 0usize;
-
         let mut prev: *mut ListNode = &mut self.free_list.head as *mut ListNode;
 
         unsafe {
@@ -407,28 +444,18 @@ impl RangeAllocator {
                 let region_ptr = &mut **next_ref as *mut ListNode;
 
                 if let Ok(alloc_start) = Self::alloc_from_region(&mut *region_ptr, size, align) {
-                    let region_size = (*region_ptr).size;
-                    if region_size < best_fit_size {
-                        best_fit_size = region_size;
-                        best_fit_prev = prev;
-                        best_fit_alloc_start = alloc_start;
-                    }
+                    let prev_ref = &mut *prev;
+                    let region = prev_ref.next.take().unwrap();
+                    let next = region.next.take();
+                    prev_ref.next = next;
+                    return Some((region, alloc_start));
                 }
 
                 prev = region_ptr;
             }
-
-            if best_fit_prev.is_null() {
-                return None;
-            }
-
-            let prev_ref = &mut *best_fit_prev;
-            let region = prev_ref.next.take().unwrap();
-            let next = region.next.take();
-            prev_ref.next = next;
-
-            Some((region, best_fit_alloc_start))
         }
+
+        None
     }
 
     fn alloc_from_region(region: &mut ListNode, size: usize, align: usize) -> Result<usize, ()> {
@@ -930,7 +957,10 @@ impl RawLargeAllocator {
             self.frames[unit] = 0;
         }
 
-        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::HUGE_PAGE
+            | PageTableFlags::NO_EXECUTE;
         if unsafe {
             map_kernel_2mib_frame(
                 VirtAddr::new(Self::unit_addr(unit) as u64),
@@ -1004,9 +1034,12 @@ pub fn init_mimalloc_diagnostics() {
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> bool {
-    let start_cycles = crate::cpu::get_cycles();
-    MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
-    MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
+    let start_cycles = mimalloc_stats_start();
+
+    if MIMALLOC_STATS_ENABLED {
+        MIMALLOC_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        MIMALLOC_COMMIT_REQUESTED.fetch_add(size, Ordering::Relaxed);
+    }
 
     let addr_usize = addr as usize;
     let Some(end_usize) = addr_usize.checked_add(size) else {
@@ -1015,10 +1048,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
             addr,
             size
         );
-        MIMALLOC_COMMIT_CYCLES.fetch_add(
-            crate::cpu::get_cycles().wrapping_sub(start_cycles),
-            Ordering::Relaxed,
-        );
+        mimalloc_record_commit_cycles(start_cycles);
         return false;
     };
 
@@ -1030,10 +1060,7 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
             addr,
             size
         );
-        MIMALLOC_COMMIT_CYCLES.fetch_add(
-            crate::cpu::get_cycles().wrapping_sub(start_cycles),
-            Ordering::Relaxed,
-        );
+        mimalloc_record_commit_cycles(start_cycles);
         return false;
     }
 
@@ -1078,24 +1105,27 @@ pub unsafe extern "C" fn rustos_mi_os_commit(addr: *mut c_void, size: usize) -> 
 
         if let Err(e) = res {
             crate::println!("MIMALLOC COMMIT FAILED: address={:p}, size={}, commit_start={:#x}, commit_size={}, flags={:?}, reason=Page mapping failed ({:?})", addr, size, run_addr, run_size, flags, e);
-            MIMALLOC_COMMIT_CYCLES.fetch_add(
-                crate::cpu::get_cycles().wrapping_sub(start_cycles),
-                Ordering::Relaxed,
-            );
+            mimalloc_record_commit_cycles(start_cycles);
             return false;
         }
 
         mimalloc_commit_mark_range(run_start, chunk);
-        MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
-        MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
         MIMALLOC_ARENA_COMMITTED.fetch_add(run_size, Ordering::Relaxed);
+        if MIMALLOC_STATS_ENABLED {
+            MIMALLOC_COMMIT_MAP_CALLS.fetch_add(1, Ordering::Relaxed);
+            MIMALLOC_COMMIT_MAPPED.fetch_add(run_size, Ordering::Relaxed);
+        }
     }
 
-    MIMALLOC_COMMIT_CYCLES.fetch_add(
-        crate::cpu::get_cycles().wrapping_sub(start_cycles),
-        Ordering::Relaxed,
-    );
+    mimalloc_record_commit_cycles(start_cycles);
     true
+}
+
+#[inline(always)]
+fn mimalloc_record_commit_cycles(start: u64) {
+    if MIMALLOC_STATS_ENABLED {
+        MIMALLOC_COMMIT_CYCLES.fetch_add(cpu::get_cycles().wrapping_sub(start), Ordering::Relaxed);
+    }
 }
 
 #[no_mangle]
@@ -1114,15 +1144,15 @@ pub unsafe extern "C" fn rustos_mi_os_alloc(size: usize, alignment: usize) -> *m
             alignment
         );
     }
+
     ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn rustos_mi_os_free(addr: *mut c_void, size: usize) {
-    if addr.is_null() {
-        return;
+    if !addr.is_null() {
+        without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
     }
-    without_interrupts(|| MIMALLOC_OS_ALLOCATOR.lock().free(addr.cast::<u8>(), size));
 }
 
 #[no_mangle]
@@ -1171,7 +1201,11 @@ pub unsafe extern "C" fn rustos_mi_out_stderr(_msg: *const i8) {}
 
 #[no_mangle]
 pub extern "C" fn rustos_mi_thread_yield() {
-    core::hint::spin_loop();
+    if x86_64::instructions::interrupts::are_enabled() {
+        x86_64::instructions::hlt();
+    } else {
+        core::hint::spin_loop();
+    }
 }
 
 #[inline(always)]

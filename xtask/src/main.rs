@@ -157,7 +157,7 @@ fn usage() -> String {
         "                    defaults to rustOS.vhdx on Windows, rustOS.dmg elsewhere",
         "  RUSTOS_QEMU_ACCEL QEMU accelerator, defaults to tcg",
         "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
-        "  RUSTOS_QEMU_SMP   QEMU CPU count, defaults to 4",
+        "  RUSTOS_QEMU_SMP   QEMU CPU count",
     ]
     .join("\n")
 }

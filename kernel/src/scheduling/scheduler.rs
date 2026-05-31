@@ -20,7 +20,6 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
-use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use crossbeam_queue::ArrayQueue;
 use kernel_types::irq::IrqSafeRwLock;
@@ -42,62 +41,278 @@ pub enum TaskError {
     NotFound(u64),
 }
 
+const TASK_SLOT_EMPTY: usize = 0;
+const TASK_SLOT_RESERVED: usize = 1;
+const TASK_SLOT_LIVE: usize = 2;
+const TASK_SLOT_RETIRING: usize = 3;
+const TASK_SLOT_RETIRED: usize = 4;
+const TASK_SLOT_REAPING: usize = 5;
+
+struct TaskSlot {
+    generation: AtomicU64,
+    retire_epoch: AtomicU64,
+    readers: AtomicUsize,
+    ptr: AtomicPtr<TaskRef>,
+    state: AtomicUsize,
+}
+
 struct TaskTable {
-    slots: Box<[AtomicPtr<TaskRef>]>,
+    slots: Box<[TaskSlot]>,
+    free_hint: AtomicUsize,
+    retired_slots: ArrayQueue<usize>,
+    reclaim_epoch: AtomicU64,
+}
+
+impl TaskSlot {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            retire_epoch: AtomicU64::new(0),
+            readers: AtomicUsize::new(0),
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            state: AtomicUsize::new(TASK_SLOT_EMPTY),
+        }
+    }
 }
 
 impl TaskTable {
     fn new(max_tasks: usize) -> Self {
-        let mut v: Vec<AtomicPtr<TaskRef>> = Vec::with_capacity(max_tasks + 1);
+        let mut v: Vec<TaskSlot> = Vec::with_capacity(max_tasks + 1);
         for _ in 0..=max_tasks {
-            v.push(AtomicPtr::new(ptr::null_mut()));
+            v.push(TaskSlot::new());
         }
         Self {
             slots: v.into_boxed_slice(),
+            free_hint: AtomicUsize::new(0),
+            retired_slots: ArrayQueue::new(max_tasks + 1),
+            reclaim_epoch: AtomicU64::new(0),
         }
     }
 
     #[inline(always)]
-    fn insert(&self, id: u64, task: &TaskHandle) {
-        let idx = id as usize;
-        if idx == 0 || idx >= self.slots.len() {
-            panic!(
-                "task id {} out of bounds (cap={})",
-                id,
-                self.slots.len() - 1
-            );
-        }
-
-        let raw = Arc::into_raw(task.clone()) as *mut TaskRef;
-
-        let prev = self.slots[idx].compare_exchange(
-            ptr::null_mut(),
-            raw,
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-
-        if prev.is_err() {
-            unsafe { drop(Arc::from_raw(raw)) };
-            panic!("task id {} reused / slot not empty", id);
-        }
+    fn stride(&self) -> u64 {
+        self.slots.len() as u64
     }
 
     #[inline(always)]
-    fn get(&self, id: u64) -> Option<TaskHandle> {
-        let idx = id as usize;
+    fn current_reclaim_epoch(&self) -> u64 {
+        self.reclaim_epoch.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    fn readable_state(state: usize) -> bool {
+        state == TASK_SLOT_LIVE || state == TASK_SLOT_RETIRING || state == TASK_SLOT_RETIRED
+    }
+
+    #[inline(always)]
+    fn make_id(&self, idx: usize, generation: u64) -> u64 {
+        generation
+            .checked_mul(self.stride())
+            .and_then(|base| base.checked_add(idx as u64))
+            .expect("task id generation overflow")
+    }
+
+    #[inline(always)]
+    fn decode_id(&self, id: u64) -> Option<(usize, u64)> {
+        let stride = self.stride();
+        let idx = (id % stride) as usize;
+        let generation = id / stride;
+
         if idx == 0 || idx >= self.slots.len() {
             return None;
         }
 
-        let p = self.slots[idx].load(Ordering::Acquire);
+        Some((idx, generation))
+    }
+
+    #[inline(always)]
+    fn try_insert_at(&self, idx: usize, task: &TaskHandle) -> Option<u64> {
+        if idx == 0 || idx >= self.slots.len() {
+            return None;
+        }
+
+        let slot = &self.slots[idx];
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_EMPTY,
+                TASK_SLOT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        let generation = slot.generation.load(Ordering::Acquire);
+        let id = self.make_id(idx, generation);
+        task.set_task_id(id);
+
+        let raw = Arc::into_raw(task.clone()) as *mut TaskRef;
+        slot.ptr.store(raw, Ordering::Release);
+        slot.state.store(TASK_SLOT_LIVE, Ordering::Release);
+        Some(id)
+    }
+
+    fn insert(&self, task: &TaskHandle) -> Option<u64> {
+        let hinted = self.free_hint.swap(0, Ordering::AcqRel);
+        if let Some(id) = self.try_insert_at(hinted, task) {
+            return Some(id);
+        }
+
+        for idx in 1..self.slots.len() {
+            if let Some(id) = self.try_insert_at(idx, task) {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    fn get(&self, id: u64) -> Option<TaskHandle> {
+        let (idx, generation) = self.decode_id(id)?;
+        let slot = &self.slots[idx];
+
+        let state = slot.state.load(Ordering::Acquire);
+        if !Self::readable_state(state) {
+            return None;
+        }
+
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+
+        slot.readers.fetch_add(1, Ordering::Acquire);
+
+        let state = slot.state.load(Ordering::Acquire);
+        if !Self::readable_state(state) || slot.generation.load(Ordering::Acquire) != generation {
+            slot.readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+
+        let p = slot.ptr.load(Ordering::Acquire);
         if p.is_null() {
+            slot.readers.fetch_sub(1, Ordering::Release);
             return None;
         }
 
         unsafe {
             Arc::increment_strong_count(p);
-            Some(Arc::from_raw(p))
+        }
+
+        slot.readers.fetch_sub(1, Ordering::Release);
+
+        unsafe { Some(Arc::from_raw(p)) }
+    }
+
+    #[inline(always)]
+    fn retire(&self, id: u64, task: &TaskHandle) -> bool {
+        let Some((idx, generation)) = self.decode_id(id) else {
+            return false;
+        };
+
+        let slot = &self.slots[idx];
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+
+        let expected = Arc::as_ptr(task) as *mut TaskRef;
+        if slot.ptr.load(Ordering::Acquire) != expected {
+            return false;
+        }
+
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_LIVE,
+                TASK_SLOT_RETIRING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let epoch = self.reclaim_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        slot.retire_epoch.store(epoch, Ordering::Release);
+        slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
+
+        if self.retired_slots.push(idx).is_err() {
+            panic!("retired task slot queue overflow");
+        }
+
+        true
+    }
+
+    fn reap_retired(&self, min_drained_epoch: u64) {
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut checked = 0usize;
+        while checked < self.slots.len() {
+            checked += 1;
+
+            let Some(idx) = self.retired_slots.pop() else {
+                break;
+            };
+
+            let slot = &self.slots[idx];
+            if slot.state.load(Ordering::Acquire) != TASK_SLOT_RETIRED {
+                continue;
+            }
+
+            let retire_epoch = slot.retire_epoch.load(Ordering::Acquire);
+            if retire_epoch > min_drained_epoch || slot.readers.load(Ordering::Acquire) != 0 {
+                if self.retired_slots.push(idx).is_err() {
+                    panic!("retired task slot queue overflow while requeueing");
+                }
+                continue;
+            }
+
+            if slot
+                .state
+                .compare_exchange(
+                    TASK_SLOT_RETIRED,
+                    TASK_SLOT_REAPING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            if slot.readers.load(Ordering::Acquire) != 0 {
+                slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
+                if self.retired_slots.push(idx).is_err() {
+                    panic!("retired task slot queue overflow while requeueing");
+                }
+                continue;
+            }
+
+            let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
+            if !p.is_null() {
+                unsafe {
+                    drop(Arc::from_raw(p));
+                }
+            }
+
+            if slot
+                .generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| g.checked_add(1))
+                .is_err()
+            {
+                panic!("task slot generation exhausted");
+            }
+
+            slot.retire_epoch.store(0, Ordering::Release);
+            slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
+            self.free_hint.store(idx, Ordering::Release);
         }
     }
 }
@@ -153,6 +368,7 @@ pub struct CoreScheduler {
     current_ptr: AtomicPtr<TaskRef>,
     lapic_id: u8,
     load: AtomicUsize,
+    drained_reclaim_epoch: AtomicU64,
 }
 
 struct SchedulerState {
@@ -197,11 +413,8 @@ impl Scheduler {
         idle.inner.write().context.r10 = 0x1c82f35548bcbe24;
         idle.inner.write().context.r11 = 0x890189d70ecaca7f;
 
-        let idle_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        idle.set_task_id(idle_id);
+        let _idle_id = self.register_task_no_reap(idle.clone());
         idle.set_target_cpu(cpu_id);
-
-        self.all_tasks.insert(idle_id, &idle);
 
         let idle_ptr = Arc::as_ptr(&idle) as *mut TaskRef;
 
@@ -213,6 +426,7 @@ impl Scheduler {
             current_ptr: AtomicPtr::new(idle_ptr),
             lapic_id,
             load: AtomicUsize::new(0),
+            drained_reclaim_epoch: AtomicU64::new(0),
         })
     }
 
@@ -236,13 +450,75 @@ impl Scheduler {
     }
 
     fn register_task(&self, task: TaskHandle) -> u64 {
-        let id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
-        if (id as usize) > MAX_TASKS {
-            panic!("task table exhausted: id {} > MAX_TASKS {}", id, MAX_TASKS);
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            panic!("attempted to register task from interrupt context");
         }
-        task.set_task_id(id);
-        self.all_tasks.insert(id, &task);
+
+        self.reap_retired_tasks();
+
+        if let Some(id) = self.all_tasks.insert(&task) {
+            self.next_task_id.fetch_add(1, Ordering::Relaxed);
+            return id;
+        }
+
+        self.reap_retired_tasks();
+
+        let id = self.all_tasks.insert(&task).unwrap_or_else(|| {
+            panic!(
+                "task table exhausted: no free slots (MAX_TASKS={})",
+                MAX_TASKS
+            )
+        });
+
+        self.next_task_id.fetch_add(1, Ordering::Relaxed);
         id
+    }
+    fn register_task_no_reap(&self, task: TaskHandle) -> u64 {
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            panic!("attempted to register task from interrupt context");
+        }
+
+        let id = self
+            .all_tasks
+            .insert(&task)
+            .unwrap_or_else(|| panic!("task table exhausted while registering non-reap task"));
+
+        self.next_task_id.fetch_add(1, Ordering::Relaxed);
+        id
+    }
+    #[inline(always)]
+    fn min_drained_reclaim_epoch(&self) -> u64 {
+        let cores = self.cores.read();
+        if cores.is_empty() {
+            return u64::MAX;
+        }
+
+        let mut min = u64::MAX;
+        for core in cores.iter() {
+            let epoch = core.drained_reclaim_epoch.load(Ordering::Acquire);
+            if epoch < min {
+                min = epoch;
+            }
+        }
+        min
+    }
+
+    #[inline(always)]
+    pub fn reap_retired_tasks(&self) {
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            return;
+        }
+
+        let min_epoch = self.min_drained_reclaim_epoch();
+        self.all_tasks.reap_retired(min_epoch);
+    }
+
+    #[inline(always)]
+    fn unregister_task(&self, task: &TaskHandle) {
+        let id = task.task_id();
+        if id != 0 {
+            self.all_tasks.retire(id, task);
+        }
     }
 
     pub fn spawn_task(&self, task: TaskHandle) -> u64 {
@@ -586,7 +862,6 @@ impl Scheduler {
         };
 
         let now_cycles = cpu::get_cycles();
-        self.maybe_balance();
 
         let mut prev_task = None;
 
@@ -609,6 +884,8 @@ impl Scheduler {
             None => return prev_task,
         };
 
+        self.maybe_balance();
+
         self.restore_page_table(&next);
         self.restore_thread_local_storage(&next);
 
@@ -616,6 +893,28 @@ impl Scheduler {
         unsafe { ctx_guard.context.restore(state) };
 
         prev_task
+    }
+
+    fn drain_inbound_to_runqueue(&self, cpu_id: usize, core: &Arc<CoreScheduler>) {
+        let drain_epoch = self.all_tasks.current_reclaim_epoch();
+        let mut curr = core.inbound_queue.swap(0, Ordering::Acquire);
+
+        while curr != 0 {
+            let task = self
+                .get_task_by_id(curr)
+                .expect("task in inbound_queue not found");
+            let next = task.inbound_next.load(Ordering::Relaxed);
+            task.inbound_next.store(0, Ordering::Relaxed);
+
+            if core.run_queue.push(task).err().is_some() {
+                panic!("run queue overflow on cpu {}", cpu_id);
+            }
+
+            curr = next;
+        }
+
+        core.drained_reclaim_epoch
+            .store(drain_epoch, Ordering::Release);
     }
 
     fn schedule_next(
@@ -626,8 +925,8 @@ impl Scheduler {
         prev_fpu_already_saved: bool,
     ) -> Option<TaskHandle> {
         let mut sched_state = core.sched_lock.write();
-
         let previous = sched_state.current.take();
+        let mut requeue_previous = None;
 
         if let Some(prev) = previous {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
@@ -655,23 +954,13 @@ impl Scheduler {
                 match prev.sched_state() {
                     SchedState::Running | SchedState::Runnable => {
                         prev.set_sched_state(SchedState::Runnable);
-                        Self::push_runqueue_or_panic(
-                            cpu_id,
-                            &core.run_queue,
-                            &core.load,
-                            prev.clone(),
-                        );
+                        requeue_previous = Some(prev.clone());
                     }
                     SchedState::Parking => {
                         if prev.consume_permit() {
                             prev.set_sched_state(SchedState::Runnable);
                             //prev.set_block_reason(BlockReason::None);
-                            Self::push_runqueue_or_panic(
-                                cpu_id,
-                                &core.run_queue,
-                                &core.load,
-                                prev.clone(),
-                            );
+                            requeue_previous = Some(prev.clone());
                         } else if prev
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
                             .is_ok()
@@ -681,33 +970,21 @@ impl Scheduler {
                                 .is_ok()
                         {
                             //prev.set_block_reason(BlockReason::None);
-                            Self::push_runqueue_or_panic(
-                                cpu_id,
-                                &core.run_queue,
-                                &core.load,
-                                prev.clone(),
-                            );
+                            requeue_previous = Some(prev.clone());
                         }
                     }
                     SchedState::Blocked => {}
-                    SchedState::Terminated => {}
+                    SchedState::Terminated => {
+                        self.unregister_task(&prev);
+                    }
                 }
             }
         }
 
-        // Drain the lock-free IPI queue into the main run queue
-        let mut curr = core.inbound_queue.swap(0, Ordering::Acquire);
-        while curr != 0 {
-            let task = self
-                .get_task_by_id(curr)
-                .expect("task in inbound_queue not found");
-            let next = task.inbound_next.load(Ordering::Relaxed);
+        self.drain_inbound_to_runqueue(cpu_id, core);
 
-            // We bypass push_runqueue_or_panic because the load was already incremented
-            if core.run_queue.push(task).err().is_some() {
-                panic!("run queue overflow on cpu {}", cpu_id);
-            }
-            curr = next;
+        if let Some(prev) = requeue_previous {
+            Self::push_runqueue_or_panic(cpu_id, &core.run_queue, &core.load, prev);
         }
 
         loop {
@@ -719,7 +996,10 @@ impl Scheduler {
             };
 
             match cand.sched_state() {
-                SchedState::Terminated => continue,
+                SchedState::Terminated => {
+                    self.unregister_task(&cand);
+                    continue;
+                }
                 SchedState::Parking => continue,
                 SchedState::Blocked => continue,
                 SchedState::Runnable | SchedState::Running => {
@@ -796,10 +1076,60 @@ impl Scheduler {
         self.balance();
     }
 
+    fn steal_youngest_runnable(
+        &self,
+        cpu_id: usize,
+        core: &Arc<CoreScheduler>,
+    ) -> Option<TaskHandle> {
+        let _state = core.sched_lock.write();
+
+        loop {
+            let len = core.run_queue.len();
+            if len == 0 {
+                return None;
+            }
+
+            let mut rotated = 0usize;
+            while rotated + 1 < len {
+                let Some(task) = core.run_queue.pop() else {
+                    return None;
+                };
+
+                if core.run_queue.push(task).err().is_some() {
+                    panic!("run queue rotation overflow on cpu {}", cpu_id);
+                }
+
+                rotated += 1;
+            }
+
+            let Some(task) = core.run_queue.pop() else {
+                return None;
+            };
+
+            core.load.fetch_sub(1, Ordering::Release);
+
+            match task.sched_state() {
+                SchedState::Terminated => {
+                    self.unregister_task(&task);
+                }
+                SchedState::Parking | SchedState::Blocked => {}
+                SchedState::Runnable | SchedState::Running => {
+                    return Some(task);
+                }
+            }
+        }
+    }
+
     fn balance(&self) {
         let n = self.num_cores.load(Ordering::Acquire);
         if n < 2 {
             return;
+        }
+
+        for i in 0..n {
+            if let Some(core) = self.core(i) {
+                self.drain_inbound_to_runqueue(i, &core);
+            }
         }
 
         loop {
@@ -857,18 +1187,9 @@ impl Scheduler {
                 break;
             };
 
-            let Some(task) = max_core.run_queue.pop() else {
+            let Some(task) = self.steal_youngest_runnable(max_idx, &max_core) else {
                 break;
             };
-
-            max_core.load.fetch_sub(1, Ordering::Release);
-
-            match task.sched_state() {
-                SchedState::Terminated | SchedState::Parking | SchedState::Blocked => {
-                    continue;
-                }
-                SchedState::Runnable | SchedState::Running => {}
-            }
 
             let Some(min_core) = self.core(min_idx) else {
                 break;
@@ -876,6 +1197,7 @@ impl Scheduler {
 
             task.set_target_cpu(min_idx);
             Self::push_runqueue_or_panic(min_idx, &min_core.run_queue, &min_core.load, task);
+            self.kick_remote_core(min_idx);
         }
     }
 
@@ -1224,3 +1546,5 @@ fn drain_inbound_queue(head: &AtomicU64) -> QueueSnapshot {
     }
     snap
 }
+// REMEBR TO CMD + Y
+// // REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y// REMEBR TO CMD + Y

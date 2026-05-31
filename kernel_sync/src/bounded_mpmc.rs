@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueError};
+use crate::bounded_wait_queue::{BoundedWaitQueue, BoundedWaitQueueEnqueue, BoundedWaitQueueError};
 use crate::mpmc::{RecvError, TryRecvError};
 use crate::platform::{ParkReason, Platform};
 
@@ -55,9 +55,7 @@ struct WaitFreeBoundedQueue<T> {
     slots: Vec<QueueSlot<T>>,
     push_hint: AtomicUsize,
     pop_hint: AtomicUsize,
-    // Counts reserved capacity, not just published values. SLOT_RESERVED and
-    // SLOT_TAKING must keep their permits so interrupt-time senders never spin
-    // waiting for the interrupted context to finish a transient slot update.
+    free_slots: AtomicUsize,
     len: AtomicUsize,
 }
 
@@ -74,18 +72,17 @@ impl<T> WaitFreeBoundedQueue<T> {
             slots,
             push_hint: AtomicUsize::new(0),
             pop_hint: AtomicUsize::new(0),
+            free_slots: AtomicUsize::new(capacity),
             len: AtomicUsize::new(0),
         }
     }
 
     fn try_push(&self, value: T) -> Result<(), T> {
-        let cap = self.slots.len();
-
         if self
-            .len
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |len| {
-                if len < cap {
-                    Some(len + 1)
+            .free_slots
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                if free != 0 {
+                    Some(free - 1)
                 } else {
                     None
                 }
@@ -95,10 +92,10 @@ impl<T> WaitFreeBoundedQueue<T> {
             return Err(value);
         }
 
+        let cap = self.slots.len();
         let start = self.push_hint.fetch_add(1, Ordering::Relaxed);
-        let mut offset = 0usize;
 
-        loop {
+        for offset in 0..cap {
             let idx = start.wrapping_add(offset) % cap;
             let slot = &self.slots[idx];
 
@@ -110,22 +107,22 @@ impl<T> WaitFreeBoundedQueue<T> {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_ok()
+                .is_err()
             {
-                unsafe {
-                    slot.write_value(value);
-                }
-
-                slot.state.store(SLOT_FULL, Ordering::Release);
-                return Ok(());
+                continue;
             }
 
-            offset += 1;
-            if offset == cap {
-                offset = 0;
-                core::hint::spin_loop();
+            unsafe {
+                slot.write_value(value);
             }
+
+            self.len.fetch_add(1, Ordering::Release);
+            slot.state.store(SLOT_FULL, Ordering::Release);
+            return Ok(());
         }
+
+        self.free_slots.fetch_add(1, Ordering::Release);
+        panic!("free permit existed but no EMPTY slot was found");
     }
 
     fn try_pop(&self) -> Option<T> {
@@ -148,6 +145,7 @@ impl<T> WaitFreeBoundedQueue<T> {
 
             slot.state.store(SLOT_EMPTY, Ordering::Release);
             self.len.fetch_sub(1, Ordering::Release);
+            self.free_slots.fetch_add(1, Ordering::Release);
 
             return Some(value);
         }
@@ -168,7 +166,7 @@ impl<T> WaitFreeBoundedQueue<T> {
     }
 
     fn is_full_approx(&self) -> bool {
-        self.len_approx() >= self.capacity()
+        self.free_slots.load(Ordering::Acquire) == 0
     }
 }
 
@@ -307,7 +305,8 @@ impl<P: Platform, T> BoundedReceiver<P, T> {
             }
 
             match self.inner.receivers_waiting.enqueue_current() {
-                Ok(()) => {}
+                Ok(BoundedWaitQueueEnqueue::Queued) => {}
+                Ok(BoundedWaitQueueEnqueue::Woken) => continue,
                 Err(BoundedWaitQueueError::AlreadyQueued) => {
                     if self.inner.receivers_waiting.is_current_enqueued() {
                         P::park_current(ParkReason::ChannelRecv);
