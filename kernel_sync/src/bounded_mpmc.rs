@@ -76,53 +76,55 @@ impl<T> WaitFreeBoundedQueue<T> {
             len: AtomicUsize::new(0),
         }
     }
-
+    // TODO: temp fix, this can be made wait free with a per slot permit
     fn try_push(&self, value: T) -> Result<(), T> {
-        if self
-            .free_slots
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
-                if free != 0 {
-                    Some(free - 1)
-                } else {
-                    None
-                }
-            })
-            .is_err()
-        {
-            return Err(value);
-        }
-
-        let cap = self.slots.len();
-        let start = self.push_hint.fetch_add(1, Ordering::Relaxed);
-
-        for offset in 0..cap {
-            let idx = start.wrapping_add(offset) % cap;
-            let slot = &self.slots[idx];
-
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_EMPTY,
-                    SLOT_RESERVED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+        loop {
+            if self
+                .free_slots
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                    if free != 0 {
+                        Some(free - 1)
+                    } else {
+                        None
+                    }
+                })
                 .is_err()
             {
-                continue;
+                return Err(value);
             }
 
-            unsafe {
-                slot.write_value(value);
+            let cap = self.slots.len();
+            let start = self.push_hint.fetch_add(1, Ordering::Relaxed);
+
+            for offset in 0..cap {
+                let idx = start.wrapping_add(offset) % cap;
+                let slot = &self.slots[idx];
+
+                if slot
+                    .state
+                    .compare_exchange(
+                        SLOT_EMPTY,
+                        SLOT_RESERVED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    continue;
+                }
+
+                unsafe {
+                    slot.write_value(value);
+                }
+
+                slot.state.store(SLOT_FULL, Ordering::Release);
+                self.len.fetch_add(1, Ordering::Release);
+                return Ok(());
             }
 
-            self.len.fetch_add(1, Ordering::Release);
-            slot.state.store(SLOT_FULL, Ordering::Release);
-            return Ok(());
+            self.free_slots.fetch_add(1, Ordering::Release);
+            core::hint::spin_loop();
         }
-
-        self.free_slots.fetch_add(1, Ordering::Release);
-        panic!("free permit existed but no EMPTY slot was found");
     }
 
     fn try_pop(&self) -> Option<T> {
