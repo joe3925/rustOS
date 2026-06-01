@@ -1,7 +1,7 @@
 use crate::blk::{VIRTIO_BLK_S_OK, VIRTIO_BLK_T_IN};
 use crate::completion::CompletionToken;
 use crate::dev_ext::{DevExtInner, QueueState};
-use crate::{SubmitTasksGuard, drain_queue_completions, rdtsc};
+use crate::{SubmitTasksGuard, drain_queue_completions, rdtsc, virtio_data_mapping_strategy};
 use alloc::{sync::Arc, vec::Vec};
 use core::hint::spin_loop;
 use core::pin::Pin;
@@ -11,8 +11,8 @@ use kernel_api::benchmark::{
 };
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::dma::{
-    Described, DmaMapped, DmaMappingStrategy, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY,
-    IOBUFFER_PAGE_SIZE, IoBuffer, IoBufferDmaSegments,
+    Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
+    IoBufferDmaSegments,
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
@@ -112,11 +112,8 @@ impl BenchDmaBuffer {
         let slice =
             unsafe { core::slice::from_raw_parts_mut(base_va.as_u64() as *mut u8, byte_len) };
         let described = IoBuffer::<Described, FromDevice>::new(slice);
-        let mapped = match kernel_api::dma::map_buffer(
-            parent,
-            described,
-            DmaMappingStrategy::SingleContiguous,
-        ) {
+        let strategy = virtio_data_mapping_strategy(&described);
+        let mapped = match kernel_api::dma::map_buffer(parent, described, strategy) {
             Ok(mapped) => mapped,
             Err((described, _)) => {
                 drop(described);

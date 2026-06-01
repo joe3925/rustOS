@@ -37,7 +37,8 @@ use kernel_api::irq::{
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{
-    FromDevice, IoBuffer, IoBufferDmaSegment, PhysFramed, ToDevice,
+    DmaMappingStrategy, FromDevice, IoBuffer, IoBufferDirection, IoBufferDmaSegment, IoBufferState,
+    PhysFramed, ToDevice,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
@@ -142,6 +143,20 @@ fn blk_status_to_driver_status(operation: &str, status: u8) -> DriverStatus {
         other => virtio_device_error(alloc::format!(
             "virtio-blk: {operation} failed: unknown device status {other:#x}"
         )),
+    }
+}
+
+pub(crate) fn virtio_data_mapping_strategy<State, D>(
+    buffer: &IoBuffer<'_, State, D>,
+) -> DmaMappingStrategy
+where
+    State: IoBufferState,
+    D: IoBufferDirection,
+{
+    if buffer.is_single_extent() {
+        DmaMappingStrategy::SingleContiguous
+    } else {
+        DmaMappingStrategy::ScatterGather
     }
 }
 
@@ -1120,7 +1135,7 @@ pub async fn virtio_pdo_read<'a, 'b>(
         let mapped_buffer = match kernel_api::dma::map_buffer_ref(
             &parent,
             buffer,
-            kernel_api::kernel_types::dma::DmaMappingStrategy::SingleContiguous,
+            virtio_data_mapping_strategy(buffer),
         ) {
             Ok(b) => b,
             Err(_) => break 'transfer DriverStatus::InsufficientResources,
@@ -1245,7 +1260,7 @@ pub async fn virtio_pdo_write<'a, 'b>(
         let mapped_buffer = match kernel_api::dma::map_buffer_ref(
             &parent,
             buffer,
-            kernel_api::kernel_types::dma::DmaMappingStrategy::SingleContiguous,
+            virtio_data_mapping_strategy(buffer),
         ) {
             Ok(b) => b,
             Err(_) => break 'transfer DriverStatus::InsufficientResources,

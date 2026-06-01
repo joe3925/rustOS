@@ -433,11 +433,15 @@ struct FlushGuardScratchLease<'a, const BLOCK_SIZE: usize> {
 }
 
 impl<'a, const BLOCK_SIZE: usize> FlushGuardScratchLease<'a, BLOCK_SIZE> {
-    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
-        let guards = {
+    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>, capacity_hint: usize) -> Self {
+        let mut guards = {
             let mut scratch = scratch.lock();
             core::mem::replace(&mut scratch.guards, ReadGuardScratch::empty())
         };
+
+        if guards.capacity() < capacity_hint {
+            guards = ReadGuardScratch::new(capacity_hint);
+        }
 
         Self {
             scratch,
@@ -788,8 +792,8 @@ where
         };
 
         let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
-        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch);
         let run = [prepared];
+        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch, run.len());
         Self::flush_prepared_run(
             &self.backend,
             &self.stats,
@@ -1314,7 +1318,7 @@ where
         let run_capacity = max_blocks_per_buffer.min(keys.len());
 
         let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
-        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch);
+        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch, run_capacity);
         let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
         let run = run_scratch.run_mut();
 

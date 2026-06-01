@@ -1,5 +1,6 @@
 use alloc::sync::Arc;
 use kernel_api::device::DeviceObject;
+use kernel_api::kernel_types::dma::{IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBufferDmaSegment};
 use kernel_api::x86_64::VirtAddr;
 
 use crate::dma_region::ContiguousDmaRegion;
@@ -209,9 +210,11 @@ pub fn reset_device(common_cfg: VirtAddr) {
     unsafe { pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, 0) };
 }
 
+/// Maximum data descriptors accepted from an `IoBuffer` DMA mapping.
+pub const MAX_DATA_DESCRIPTORS: usize = IOBUFFER_INLINE_SEGMENT_CAPACITY;
 /// Maximum descriptors in an indirect table.
-/// 1 for header + up to 32 for data (from `IoBufferDmaSegment`) + 1 for status = 34.
-pub const MAX_INDIRECT_DESCRIPTORS: usize = 34;
+/// 1 for header + data descriptors + 1 for status.
+pub const MAX_INDIRECT_DESCRIPTORS: usize = MAX_DATA_DESCRIPTORS + 2;
 
 #[repr(C)]
 pub struct BlkSlot {
@@ -259,9 +262,26 @@ impl BlkIoSlots {
         vq: &mut Virtqueue,
         req_type: u32,
         sector: u64,
-        data_segments: impl IntoIterator<Item = kernel_api::kernel_types::dma::IoBufferDmaSegment>,
+        data_segments: impl IntoIterator<Item = IoBufferDmaSegment>,
         is_write: bool,
     ) -> Option<u16> {
+        let mut segments = [IoBufferDmaSegment {
+            dma_addr: 0,
+            byte_len: 0,
+            reserved: 0,
+        }; MAX_DATA_DESCRIPTORS];
+        let mut segment_count = 0usize;
+        for seg in data_segments {
+            if seg.byte_len == 0 {
+                continue;
+            }
+            if segment_count == MAX_DATA_DESCRIPTORS {
+                return None;
+            }
+            segments[segment_count] = seg;
+            segment_count += 1;
+        }
+
         let head = vq.alloc_desc()?;
         let slot_ptr = self.get_slot_ptr(head);
 
@@ -281,20 +301,20 @@ impl BlkIoSlots {
 
             core::ptr::write_volatile(&mut (*slot_ptr).status, 0xFF);
 
-            let mut desc_count = 0;
+            let mut desc_count = 0usize;
             let table = (*slot_ptr).indirect_table.as_mut_ptr();
 
             // Header
             (*table.add(desc_count)).addr = header_phys;
-            (*table.add(desc_count)).len = 16;
+            (*table.add(desc_count)).len = core::mem::size_of::<VirtioBlkReqHeader>() as u32;
             (*table.add(desc_count)).flags = VRING_DESC_F_NEXT;
             (*table.add(desc_count)).next = (desc_count + 1) as u16;
             desc_count += 1;
 
             let data_flags = if is_write { 0 } else { VRING_DESC_F_WRITE };
-            for seg in data_segments {
+            for seg in &segments[..segment_count] {
                 (*table.add(desc_count)).addr = seg.dma_addr;
-                (*table.add(desc_count)).len = seg.byte_len as u32;
+                (*table.add(desc_count)).len = seg.byte_len;
                 (*table.add(desc_count)).flags = data_flags | VRING_DESC_F_NEXT;
                 (*table.add(desc_count)).next = (desc_count + 1) as u16;
                 desc_count += 1;
@@ -304,10 +324,10 @@ impl BlkIoSlots {
             (*table.add(desc_count)).addr = status_phys;
             (*table.add(desc_count)).len = 1;
             (*table.add(desc_count)).flags = VRING_DESC_F_WRITE;
-            // no next for the last descriptor
+            (*table.add(desc_count)).next = 0;
             desc_count += 1;
 
-            let total_table_len = (desc_count * 16) as u32;
+            let total_table_len = (desc_count * core::mem::size_of::<VirtqDesc>()) as u32;
             vq.push_allocated_indirect(head, indirect_phys, total_table_len);
         }
 

@@ -155,7 +155,7 @@ fn usage() -> String {
         "  RUSTOS_DISK       path to an existing system disk image",
         "  RUSTOS_DISK_FORMAT disk format for RUSTOS_DISK, e.g. raw or vhdx",
         "                    defaults to rustOS.vhdx on Windows, rustOS.dmg elsewhere",
-        "  RUSTOS_QEMU_ACCEL QEMU accelerator, defaults to tcg",
+        "  RUSTOS_QEMU_ACCEL QEMU accelerator, overrides the default",
         "  RUSTOS_QEMU_MEMORY QEMU memory size, defaults to 8G",
         "  RUSTOS_QEMU_SMP   QEMU CPU count",
     ]
@@ -175,7 +175,7 @@ fn run_qemu(root: &Path, options: QemuOptions) -> Result<(), String> {
     let qemu = find_qemu()?;
     let firmware = find_ovmf_code(root, &qemu)?;
     let system_disk = system_disk(root)?;
-    let args = qemu_args(&firmware, &boot_image, &system_disk, &options)?;
+    let args = qemu_args(root, &qemu, &firmware, &boot_image, &system_disk, &options)?;
 
     assert_exists(&boot_image, "boot image")?;
 
@@ -465,8 +465,8 @@ fn find_qemu() -> Result<PathBuf, String> {
 
     let names: &[&str] = if cfg!(windows) {
         &[
-            "qemu-system-x86_64w.exe",
             "qemu-system-x86_64.exe",
+            "qemu-system-x86_64w.exe",
             "qemu-system-x86_64",
         ]
     } else {
@@ -498,10 +498,10 @@ fn qemu_fallback_paths() -> Vec<PathBuf> {
 
     if cfg!(windows) {
         paths.extend([
-            PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64w.exe"),
             PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64w.exe"),
+            PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64w.exe"),
             PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64w.exe"),
         ]);
     }
 
@@ -630,6 +630,8 @@ fn disk_format(path: &Path) -> String {
 }
 
 fn qemu_args(
+    root: &Path,
+    qemu: &Path,
     firmware: &Path,
     boot_image: &Path,
     system_disk: &SystemDisk,
@@ -637,18 +639,12 @@ fn qemu_args(
 ) -> Result<Vec<OsString>, String> {
     let memory = env::var("RUSTOS_QEMU_MEMORY").unwrap_or_else(|_| "8G".to_string());
     let smp = env::var("RUSTOS_QEMU_SMP").unwrap_or_else(|_| "1".to_string());
-    let accel = env::var("RUSTOS_QEMU_ACCEL").unwrap_or_else(|_| "tcg".to_string());
-    let machine = format!("q35,accel={accel}");
+    let accel = qemu_accel(qemu, options);
+    let iommu_device = qemu_iommu_device(&accel);
     let gdb = format!("tcp::{}", options.gdb_port);
     let firmware_path = path_string(firmware)?;
-    let boot_image_path = path_string(boot_image)?;
-    let system_disk_path = path_string(&system_disk.path)?;
-    let firmware_drive = drive_arg(&[
-        ("if", "pflash"),
-        ("format", "raw"),
-        ("readonly", "on"),
-        ("file", &firmware_path),
-    ]);
+    let boot_image_path = qemu_path_string(root, boot_image)?;
+    let system_disk_path = qemu_path_string(root, &system_disk.path)?;
     let boot_drive = drive_arg(&[("file", &boot_image_path), ("format", "raw")]);
     let system_drive = drive_arg(&[
         ("file", &system_disk_path),
@@ -663,7 +659,9 @@ fn qemu_args(
         "-cpu".into(),
         "qemu64,+apic,+acpi".into(),
         "-machine".into(),
-        machine.into(),
+        "q35".into(),
+        "-accel".into(),
+        accel.into(),
         "-smp".into(),
         smp.into(),
     ];
@@ -674,9 +672,11 @@ fn qemu_args(
 
     args.extend([
         "-device".into(),
-        "amd-iommu,dma-remap=on,dma-translation=on".into(),
-        "-drive".into(),
-        firmware_drive.into(),
+        iommu_device.into(),
+        "-bios".into(),
+        firmware_path.into(),
+        "-vga".into(),
+        "std".into(),
         "-drive".into(),
         boot_drive.into(),
         "-drive".into(),
@@ -687,6 +687,39 @@ fn qemu_args(
     ]);
 
     Ok(args)
+}
+
+fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
+    if let Ok(accel) = env::var("RUSTOS_QEMU_ACCEL") {
+        if !accel.is_empty() {
+            return accel;
+        }
+    }
+
+    if cfg!(windows) && !options.debug && qemu_supports_accel(qemu, "whpx") {
+        "whpx".to_string()
+    } else {
+        "tcg".to_string()
+    }
+}
+
+fn qemu_supports_accel(qemu: &Path, accel: &str) -> bool {
+    let output = match ProcessCommand::new(qemu).args(["-accel", "help"]).output() {
+        Ok(output) => output,
+        Err(_) => return false,
+    };
+
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text.lines().any(|line| line.trim() == accel)
+}
+
+fn qemu_iommu_device(accel: &str) -> &'static str {
+    if accel == "whpx" {
+        "intel-iommu,intremap=off"
+    } else {
+        "amd-iommu,dma-remap=on,dma-translation=on"
+    }
 }
 
 fn drive_arg(options: &[(&str, &str)]) -> String {
@@ -701,6 +734,11 @@ fn path_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_string)
         .ok_or_else(|| format!("path is not valid UTF-8: {}", path.display()))
+}
+
+fn qemu_path_string(root: &Path, path: &Path) -> Result<String, String> {
+    let path = path.strip_prefix(root).unwrap_or(path);
+    path_string(path).map(|path| path.replace('\\', "/"))
 }
 
 fn spawn_qemu_detached(
