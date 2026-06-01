@@ -56,17 +56,20 @@ pub const IOBUFFER_INLINE_PAGE_CAPACITY: usize = 8;
 pub const IOBUFFER_MAX_PAGE_CAPACITY: usize = 512;
 pub const IOBUFFER_INLINE_FRAME_CAPACITY: usize = IOBUFFER_INLINE_PAGE_CAPACITY;
 pub const IOBUFFER_MAX_FRAME_CAPACITY: usize = IOBUFFER_MAX_PAGE_CAPACITY;
+pub const IOBUFFER_INLINE_EXTENT_CAPACITY: usize = 8;
+pub const IOBUFFER_MAX_EXTENT_CAPACITY: usize = 64;
 pub const IOBUFFER_INLINE_SEGMENT_CAPACITY: usize = 32;
 
-/// Region described from a virtual borrow.
+/// Region described from one or more virtual borrows.
 ///
-/// A `Described` buffer has both virtual backing and physical frame backing.
+/// A `Described` buffer has virtual backing for each logical extent and
+/// physical frame backing for the whole logical byte stream.
 pub enum Described {}
 
 /// Region described directly from physical frames.
 ///
 /// A `PhysFramed` buffer has physical frame backing, but no required virtual
-/// backing. This can represent a region that is not mapped in this address
+/// backing. This can represent regions that are not mapped in this address
 /// space.
 pub enum PhysFramed {}
 pub struct DmaMapped<Source = Described>(PhantomData<fn() -> Source>);
@@ -110,39 +113,35 @@ impl<S: sealed::VirtualBackedState> sealed::VirtualBackedState for DmaMapped<S> 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaMappingStrategy {
-    /// Entire buffer mapped as a single contiguous IOVA region -> 1 segment.
+    /// Entire logical buffer mapped as a single contiguous IOVA region -> 1 segment.
     SingleContiguous,
-    /// Buffer divided into N equal chunks; each chunk is one contiguous IOVA
-    /// segment. Requires `buffer.len() % chunk_size == 0` and
-    /// `chunk_size % PAGE_SIZE == 0`.
+    /// Buffer divided into N equal contiguous IOVA chunks. Requires
+    /// `buffer.len() % chunk_size == 0` and `chunk_size % PAGE_SIZE == 0`.
     ContiguousChunks { chunk_size: usize },
     /// Every page's IOVA == its physical address. Adjacent physical pages are
     /// merged into a single segment.
     FullIdentity,
-    /// One IOVA segment per page (scatter-gather, no merging).
+    /// One IOVA segment per backing frame, without merging adjacent frames.
     ScatterGather,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DmaMapError {
-    /// IOMMU not available or device not registered.
     NoIommu,
-    /// Mapping would require allocating synthetic IOVA space, which is not
-    /// implemented yet for this path.
     RemappingUnavailable,
-    /// `chunk_size` does not evenly divide `buffer.len()`.
     UnalignedChunkSize {
         buffer_len: usize,
         chunk_size: usize,
     },
-    /// `chunk_size` is not a multiple of `IOBUFFER_PAGE_SIZE`.
-    ChunkSizeNotPageAligned { chunk_size: usize },
-    /// Buffer spans more frames than frame storage can describe
-    /// (capacity = 512).
-    PageCapacityExceeded { required: usize },
-    /// Too many resulting segments to fit in inline storage (capacity = 32).
-    SegmentCapacityExceeded { required: usize },
-    /// `chunk_size` is zero or buffer is empty.
+    ChunkSizeNotPageAligned {
+        chunk_size: usize,
+    },
+    PageCapacityExceeded {
+        required: usize,
+    },
+    SegmentCapacityExceeded {
+        required: usize,
+    },
     InvalidSize,
 }
 
@@ -193,12 +192,68 @@ pub struct IoBufferDmaSegment {
     pub reserved: u32,
 }
 
-const IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY: usize = 4;
+const IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY: usize = IOBUFFER_INLINE_SEGMENT_CAPACITY;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoBufferExtent {
+    pub virtual_addr: Option<usize>,
+    pub frame_offset: usize,
+    pub byte_len: usize,
+    pub first_frame: usize,
+    pub frame_count: usize,
+}
+
+impl IoBufferExtent {
+    pub const fn new(
+        virtual_addr: Option<usize>,
+        frame_offset: usize,
+        byte_len: usize,
+        first_frame: usize,
+        frame_count: usize,
+    ) -> Self {
+        Self {
+            virtual_addr,
+            frame_offset,
+            byte_len,
+            first_frame,
+            frame_count,
+        }
+    }
+
+    pub fn virtual_address(&self) -> Option<usize> {
+        self.virtual_addr
+    }
+
+    pub fn frame_offset(&self) -> usize {
+        self.frame_offset
+    }
+
+    pub fn page_offset(&self) -> usize {
+        self.frame_offset
+    }
+
+    pub fn len(&self) -> usize {
+        self.byte_len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+
+    pub fn frame_range(&self) -> core::ops::Range<usize> {
+        self.first_frame..self.first_frame + self.frame_count
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoBufferError {
     PageCapacityExceeded {
+        required: usize,
+        capacity: usize,
+    },
+    ExtentCapacityExceeded {
         required: usize,
         capacity: usize,
     },
@@ -217,6 +272,14 @@ pub enum IoBufferError {
         frame_offset: usize,
         byte_len: usize,
     },
+    InvalidExtentLayout {
+        extent_index: usize,
+    },
+    OverlappingMutableExtents {
+        first: usize,
+        second: usize,
+    },
+    LengthOverflow,
     TranslationFailed {
         virt_addr: usize,
     },
@@ -228,6 +291,7 @@ const EMPTY_DMA_SEGMENT: IoBufferDmaSegment = IoBufferDmaSegment {
     byte_len: 0,
     reserved: 0,
 };
+const EMPTY_EXTENT: IoBufferExtent = IoBufferExtent::new(None, 0, 0, 0, 0);
 
 #[derive(Clone, Copy, Debug)]
 enum DmaSegmentLayout {
@@ -358,7 +422,7 @@ fn p1_index(addr: u64) -> usize {
     ((addr >> 12) & 0x1ff) as usize
 }
 
-#[inline(always)]
+#[inline]
 unsafe fn read_pte(table_phys: u64, index: usize) -> u64 {
     let table = (crate::PHYSICAL_MEMORY_OFFSET.as_u64() + table_phys) as *const u64;
     unsafe { core::ptr::read(table.add(index)) }
@@ -427,15 +491,13 @@ fn translate_virtual_frame(virt_addr: usize) -> Option<VirtualFrameTranslation> 
     }
 }
 
-fn describe_virtual_buffer(
+fn describe_virtual_buffer_to_frames(
     virt_addr: usize,
     byte_len: usize,
-) -> Result<(PageFrameStorage, usize, usize), IoBufferError> {
-    let mut inline_frames = [EMPTY_PAGE_FRAME; IOBUFFER_INLINE_PAGE_CAPACITY];
-    let mut heap_frames: Option<Vec<IoBufferPageFrame>> = None;
-
+    frames: &mut Vec<IoBufferPageFrame>,
+) -> Result<(usize, usize), IoBufferError> {
     if byte_len == 0 {
-        return Ok((PageFrameStorage::empty(), 0, 0));
+        return Ok((0, 0));
     }
 
     let mut consumed = 0usize;
@@ -449,9 +511,9 @@ fn describe_virtual_buffer(
         let translated = translate_virtual_frame(current)
             .ok_or(IoBufferError::TranslationFailed { virt_addr: current })?;
 
-        if frame_count >= IOBUFFER_MAX_PAGE_CAPACITY {
+        if frames.len() >= IOBUFFER_MAX_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
-                required: frame_count + 1,
+                required: frames.len() + 1,
                 capacity: IOBUFFER_MAX_PAGE_CAPACITY,
             });
         }
@@ -460,24 +522,11 @@ fn describe_virtual_buffer(
             first_frame_offset = translated.offset as usize;
         }
 
-        let frame = IoBufferPageFrame::with_virtual(
+        frames.push(IoBufferPageFrame::with_virtual(
             translated.phys_addr,
             translated.byte_len,
             current - translated.offset as usize,
-        );
-
-        if let Some(frames) = heap_frames.as_mut() {
-            frames.push(frame);
-        } else if frame_count < IOBUFFER_INLINE_PAGE_CAPACITY {
-            inline_frames[frame_count] = frame;
-        } else {
-            let mut frames = Vec::with_capacity(
-                (IOBUFFER_INLINE_PAGE_CAPACITY * 2).min(IOBUFFER_MAX_PAGE_CAPACITY),
-            );
-            frames.extend_from_slice(&inline_frames);
-            frames.push(frame);
-            heap_frames = Some(frames);
-        }
+        ));
 
         frame_count += 1;
 
@@ -485,12 +534,84 @@ fn describe_virtual_buffer(
         consumed += (byte_len - consumed).min(bytes_in_frame);
     }
 
-    let storage = match heap_frames {
-        Some(frames) => PageFrameStorage::from_boxed(frames.into_boxed_slice()),
-        None => PageFrameStorage::from_inline(inline_frames),
-    };
+    Ok((frame_count, first_frame_offset))
+}
 
-    Ok((storage, frame_count, first_frame_offset))
+fn describe_virtual_extents(
+    regions: &[(usize, usize)],
+) -> Result<(PageFrameStorage, usize, ExtentStorage, usize, usize), IoBufferError> {
+    if regions.len() > IOBUFFER_MAX_EXTENT_CAPACITY {
+        return Err(IoBufferError::ExtentCapacityExceeded {
+            required: regions.len(),
+            capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+        });
+    }
+
+    let mut frames = Vec::new();
+    let mut extents = Vec::with_capacity(regions.len());
+    let mut total_len = 0usize;
+
+    for &(virt_addr, byte_len) in regions {
+        let first_frame = frames.len();
+        let (frame_count, frame_offset) =
+            describe_virtual_buffer_to_frames(virt_addr, byte_len, &mut frames)?;
+        total_len = total_len
+            .checked_add(byte_len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+        extents.push(IoBufferExtent::new(
+            Some(virt_addr),
+            frame_offset,
+            byte_len,
+            first_frame,
+            frame_count,
+        ));
+    }
+
+    let page_frames_len = frames.len();
+    let extents_len = extents.len();
+    let page_frames = PageFrameStorage::from_slice(&frames)?;
+    let extents = ExtentStorage::from_slice(&extents)?;
+    Ok((
+        page_frames,
+        page_frames_len,
+        extents,
+        extents_len,
+        total_len,
+    ))
+}
+
+fn validate_virtual_ranges_disjoint(regions: &[(usize, usize)]) -> Result<(), IoBufferError> {
+    for first in 0..regions.len() {
+        let (first_addr, first_len) = regions[first];
+        if first_len == 0 {
+            continue;
+        }
+        let first_end =
+            first_addr
+                .checked_add(first_len)
+                .ok_or(IoBufferError::TranslationFailed {
+                    virt_addr: first_addr,
+                })?;
+
+        for second in first + 1..regions.len() {
+            let (second_addr, second_len) = regions[second];
+            if second_len == 0 {
+                continue;
+            }
+            let second_end =
+                second_addr
+                    .checked_add(second_len)
+                    .ok_or(IoBufferError::TranslationFailed {
+                        virt_addr: second_addr,
+                    })?;
+
+            if first_addr < second_end && second_addr < first_end {
+                return Err(IoBufferError::OverlappingMutableExtents { first, second });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_physical_frames(
@@ -555,54 +676,79 @@ fn validate_physical_frames(
     Ok(())
 }
 
+fn validate_physical_extents(
+    frames: &[IoBufferPageFrame],
+    extents: &[IoBufferExtent],
+) -> Result<usize, IoBufferError> {
+    if frames.len() > IOBUFFER_MAX_PAGE_CAPACITY {
+        return Err(IoBufferError::PageCapacityExceeded {
+            required: frames.len(),
+            capacity: IOBUFFER_MAX_PAGE_CAPACITY,
+        });
+    }
+
+    if extents.len() > IOBUFFER_MAX_EXTENT_CAPACITY {
+        return Err(IoBufferError::ExtentCapacityExceeded {
+            required: extents.len(),
+            capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+        });
+    }
+
+    let mut total_len = 0usize;
+    for (idx, extent) in extents.iter().copied().enumerate() {
+        let Some(end_frame) = extent.first_frame.checked_add(extent.frame_count) else {
+            return Err(IoBufferError::InvalidExtentLayout { extent_index: idx });
+        };
+        if end_frame > frames.len() {
+            return Err(IoBufferError::InvalidExtentLayout { extent_index: idx });
+        }
+        validate_physical_frames(
+            extent.frame_offset,
+            extent.byte_len,
+            &frames[extent.first_frame..end_frame],
+        )?;
+        total_len = total_len
+            .checked_add(extent.byte_len)
+            .ok_or(IoBufferError::LengthOverflow)?;
+    }
+
+    Ok(total_len)
+}
+
 #[repr(C)]
 enum IoBufferBorrow<'a> {
-    ReadOnly(&'a [u8]),
-    Writable(&'a mut [u8]),
+    None,
+    ReadOnly(Box<[&'a [u8]]>),
+    Writable(Box<[&'a mut [u8]]>),
 }
 
 impl<'a> IoBufferBorrow<'a> {
-    fn len(&self) -> usize {
+    fn is_virtual_backed(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn single_slice(&self) -> Option<&[u8]> {
         match self {
-            Self::ReadOnly(buf) => buf.len(),
-            Self::Writable(buf) => buf.len(),
+            Self::ReadOnly(slices) if slices.len() == 1 => Some(slices[0]),
+            Self::Writable(slices) if slices.len() == 1 => Some(&*slices[0]),
+            _ => None,
         }
     }
 
-    fn as_ptr(&self) -> *const u8 {
+    fn single_mut_slice(&mut self) -> Option<&mut [u8]> {
         match self {
-            Self::ReadOnly(buf) => buf.as_ptr(),
-            Self::Writable(buf) => buf.as_ptr(),
-        }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::ReadOnly(buf) => buf,
-            Self::Writable(buf) => buf,
-        }
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        match self {
-            Self::Writable(buf) => buf.as_mut_ptr(),
-            Self::ReadOnly(_) => unreachable!("mutable IoBuffer access on read-only borrow"),
-        }
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        match self {
-            Self::Writable(buf) => buf,
-            Self::ReadOnly(_) => unreachable!("mutable IoBuffer access on read-only borrow"),
+            Self::Writable(slices) if slices.len() == 1 => {
+                slices.get_mut(0).map(|slice| &mut **slice)
+            }
+            _ => None,
         }
     }
 }
 
-/// A run of `IoBufferPageFrame`s with one virtual-backing shape.
+/// A logical extent of an `IoBuffer`.
 ///
-/// A mapped run stays in the same region only while every next frame's virtual
-/// base is exactly the previous frame's virtual base plus its byte length.
-/// Consecutive unmapped frames are grouped into one physical-only region.
+/// All `IoBuffer`s are extent-based. The old contiguous case is represented as
+/// one extent; caller-provided scatter-gather buffers have multiple extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IoBufferRegion<'a> {
     virtual_addr: Option<usize>,
@@ -646,19 +792,17 @@ impl<'a> IoBufferRegion<'a> {
 }
 
 pub struct IoBufferRegionIter<'a> {
+    extents: &'a [IoBufferExtent],
     page_frames: &'a [IoBufferPageFrame],
-    next_frame: usize,
-    frame_offset: usize,
-    remaining: usize,
+    next_extent: usize,
 }
 
 impl<'a> IoBufferRegionIter<'a> {
-    fn new(page_frames: &'a [IoBufferPageFrame], frame_offset: usize, byte_len: usize) -> Self {
+    fn new(extents: &'a [IoBufferExtent], page_frames: &'a [IoBufferPageFrame]) -> Self {
         Self {
+            extents,
             page_frames,
-            next_frame: 0,
-            frame_offset,
-            remaining: byte_len,
+            next_extent: 0,
         }
     }
 }
@@ -667,68 +811,26 @@ impl<'a> Iterator for IoBufferRegionIter<'a> {
     type Item = IoBufferRegion<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 || self.next_frame >= self.page_frames.len() {
-            return None;
-        }
+        while self.next_extent < self.extents.len() {
+            let extent = self.extents[self.next_extent];
+            self.next_extent += 1;
 
-        let start_frame = self.next_frame;
-        let start_offset = self.frame_offset;
-        let first_frame = self.page_frames[start_frame];
-        let first_frame_len = first_frame.byte_len as usize;
-        if start_offset >= first_frame_len {
-            self.remaining = 0;
-            return None;
-        }
-
-        let virtual_addr = first_frame
-            .virtual_address()
-            .and_then(|addr| addr.checked_add(start_offset));
-        let mut byte_len = 0usize;
-        let mut current_frame = start_frame;
-        let mut current_offset = start_offset;
-
-        loop {
-            let frame = self.page_frames[current_frame];
-            let frame_len = frame.byte_len as usize;
-            if current_offset >= frame_len {
-                self.remaining = 0;
-                return None;
+            if extent.byte_len == 0 {
+                continue;
             }
 
-            let frame_bytes = (frame_len - current_offset).min(self.remaining);
-            byte_len += frame_bytes;
-            self.remaining -= frame_bytes;
-            current_frame += 1;
+            let end_frame = extent.first_frame.checked_add(extent.frame_count)?;
+            let page_frames = self.page_frames.get(extent.first_frame..end_frame)?;
 
-            if self.remaining == 0 || current_frame >= self.page_frames.len() {
-                break;
-            }
-
-            let next_frame = self.page_frames[current_frame];
-            let same_region = match (frame.virtual_address(), next_frame.virtual_address()) {
-                (Some(current), Some(next)) => current
-                    .checked_add(frame_len)
-                    .map_or(false, |expected| expected == next),
-                (None, None) => true,
-                _ => false,
-            };
-
-            if !same_region {
-                break;
-            }
-
-            current_offset = 0;
+            return Some(IoBufferRegion {
+                virtual_addr: extent.virtual_addr,
+                frame_offset: extent.frame_offset,
+                byte_len: extent.byte_len,
+                page_frames,
+            });
         }
 
-        self.next_frame = current_frame;
-        self.frame_offset = 0;
-
-        Some(IoBufferRegion {
-            virtual_addr,
-            frame_offset: start_offset,
-            byte_len,
-            page_frames: &self.page_frames[start_frame..current_frame],
-        })
+        None
     }
 }
 
@@ -972,10 +1074,6 @@ fn next_identity_segment(
         *frame_index += 1;
     }
 
-    if byte_len > u32::MAX as usize {
-        byte_len = u32::MAX as usize;
-    }
-
     Some(IoBufferDmaSegment {
         dma_addr,
         byte_len: byte_len as u32,
@@ -1086,13 +1184,112 @@ impl PageFrameStorage {
     }
 }
 
+struct ExtentStorage {
+    inline: [IoBufferExtent; IOBUFFER_INLINE_EXTENT_CAPACITY],
+    heap: Option<Box<[IoBufferExtent]>>,
+}
+
+impl ExtentStorage {
+    fn empty() -> Self {
+        Self {
+            inline: [EMPTY_EXTENT; IOBUFFER_INLINE_EXTENT_CAPACITY],
+            heap: None,
+        }
+    }
+
+    fn boxed_empty(capacity: usize) -> Box<[IoBufferExtent]> {
+        let mut extents = Vec::with_capacity(capacity);
+        extents.resize(capacity, EMPTY_EXTENT);
+        extents.into_boxed_slice()
+    }
+
+    fn from_slice(extents: &[IoBufferExtent]) -> Result<Self, IoBufferError> {
+        if extents.len() > IOBUFFER_MAX_EXTENT_CAPACITY {
+            return Err(IoBufferError::ExtentCapacityExceeded {
+                required: extents.len(),
+                capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+            });
+        }
+
+        let mut storage = Self::empty();
+        storage.replace(extents)?;
+        Ok(storage)
+    }
+
+    fn as_slice(&self, len: usize) -> &[IoBufferExtent] {
+        match self.heap.as_ref() {
+            Some(extents) => &extents[..len],
+            None => &self.inline[..len],
+        }
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [IoBufferExtent] {
+        match self.heap.as_mut() {
+            Some(extents) => &mut extents[..len],
+            None => &mut self.inline[..len],
+        }
+    }
+
+    fn replace(&mut self, extents: &[IoBufferExtent]) -> Result<(), IoBufferError> {
+        if extents.len() > IOBUFFER_MAX_EXTENT_CAPACITY {
+            return Err(IoBufferError::ExtentCapacityExceeded {
+                required: extents.len(),
+                capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+            });
+        }
+
+        self.inline.fill(EMPTY_EXTENT);
+        if extents.len() <= IOBUFFER_INLINE_EXTENT_CAPACITY {
+            self.heap = None;
+            self.inline[..extents.len()].copy_from_slice(extents);
+        } else {
+            let mut heap = Self::boxed_empty(extents.len());
+            heap.copy_from_slice(extents);
+            self.heap = Some(heap);
+        }
+        Ok(())
+    }
+
+    fn ensure_capacity(&mut self, capacity: usize) -> Result<(), IoBufferError> {
+        if capacity > IOBUFFER_MAX_EXTENT_CAPACITY {
+            return Err(IoBufferError::ExtentCapacityExceeded {
+                required: capacity,
+                capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+            });
+        }
+
+        if capacity <= IOBUFFER_INLINE_EXTENT_CAPACITY {
+            return Ok(());
+        }
+
+        let needs_heap = self
+            .heap
+            .as_ref()
+            .map(|extents| extents.len() < capacity)
+            .unwrap_or(true);
+        if needs_heap {
+            let mut heap = Self::boxed_empty(capacity);
+            heap[..IOBUFFER_INLINE_EXTENT_CAPACITY].copy_from_slice(&self.inline);
+            self.heap = Some(heap);
+        }
+        Ok(())
+    }
+
+    fn capacity_slice_mut(&mut self) -> &mut [IoBufferExtent] {
+        match self.heap.as_mut() {
+            Some(extents) => extents,
+            None => &mut self.inline,
+        }
+    }
+}
+
 /// ABI-erased `IoBuffer` storage passed across the kernel DMA map/unmap calls.
 #[repr(C)]
 pub struct IoBufferInner<'a> {
-    borrow: Option<IoBufferBorrow<'a>>,
-    virt_addr: usize,
+    borrow: IoBufferBorrow<'a>,
     byte_len: usize,
-    frame_offset: usize,
+    extents: ExtentStorage,
+    extents_len: usize,
     page_frames: PageFrameStorage,
     page_frames_len: usize,
     dma_segments: DmaSegmentLayout,
@@ -1102,48 +1299,102 @@ pub struct IoBufferInner<'a> {
 
 impl<'a> IoBufferInner<'a> {
     fn new_read_only(buf: &'a [u8]) -> Self {
-        Self::new_virtual(IoBufferBorrow::ReadOnly(buf))
+        Self::try_new_read_only(buf)
+            .expect("IoBuffer<Described> could not describe virtual backing")
     }
 
-    fn new_writable(buf: &'a mut [u8]) -> Self {
-        Self::new_virtual(IoBufferBorrow::Writable(buf))
+    fn try_new_read_only(buf: &'a [u8]) -> Result<Self, IoBufferError> {
+        Self::new_read_only_slices(&[buf])
     }
 
-    fn new_virtual(borrow: IoBufferBorrow<'a>) -> Self {
-        let virt_addr = borrow.as_ptr() as usize;
-        let len = borrow.len();
-        let (page_frames, page_frames_len, frame_offset) = describe_virtual_buffer(virt_addr, len)
-            .expect("IoBuffer<Described> could not describe virtual backing");
+    fn new_read_only_slices(slices: &[&'a [u8]]) -> Result<Self, IoBufferError> {
+        let mut regions = Vec::with_capacity(slices.len());
+        let mut owned = Vec::with_capacity(slices.len());
 
-        Self {
-            borrow: Some(borrow),
-            virt_addr,
-            byte_len: len,
-            frame_offset,
+        for &slice in slices {
+            regions.push((slice.as_ptr() as usize, slice.len()));
+            owned.push(slice);
+        }
+
+        let (page_frames, page_frames_len, extents, extents_len, byte_len) =
+            describe_virtual_extents(&regions)?;
+
+        Ok(Self {
+            borrow: IoBufferBorrow::ReadOnly(owned.into_boxed_slice()),
+            byte_len,
+            extents,
+            extents_len,
             page_frames,
             page_frames_len,
             dma_segments: DmaSegmentLayout::empty(),
             mapped_by: None,
             dma_drop: None,
-        }
+        })
     }
-    /// Creates a new `IoBuffer` from physical page frames.
-    ///
-    /// The frames are the required physical backing and should be in order
-    /// from start to end of the buffer. Virtual backing is optional.
+
+    fn new_writable(buf: &'a mut [u8]) -> Self {
+        Self::try_new_writable(buf).expect("IoBuffer<Described> could not describe virtual backing")
+    }
+
+    fn try_new_writable(buf: &'a mut [u8]) -> Result<Self, IoBufferError> {
+        let mut slices = Vec::with_capacity(1);
+        slices.push(buf);
+        Self::new_writable_vec(slices)
+    }
+
+    fn new_writable_vec(slices: Vec<&'a mut [u8]>) -> Result<Self, IoBufferError> {
+        let mut regions = Vec::with_capacity(slices.len());
+
+        for slice in &slices {
+            regions.push((slice.as_ptr() as usize, slice.len()));
+        }
+
+        validate_virtual_ranges_disjoint(&regions)?;
+        let (page_frames, page_frames_len, extents, extents_len, byte_len) =
+            describe_virtual_extents(&regions)?;
+
+        Ok(Self {
+            borrow: IoBufferBorrow::Writable(slices.into_boxed_slice()),
+            byte_len,
+            extents,
+            extents_len,
+            page_frames,
+            page_frames_len,
+            dma_segments: DmaSegmentLayout::empty(),
+            mapped_by: None,
+            dma_drop: None,
+        })
+    }
+
     fn new_physical(
         frame_offset: usize,
         byte_len: usize,
         frames: &[IoBufferPageFrame],
     ) -> Result<Self, IoBufferError> {
         validate_physical_frames(frame_offset, byte_len, frames)?;
+        let virtual_addr = frames.first().and_then(|frame| {
+            frame
+                .virtual_address()
+                .and_then(|addr| addr.checked_add(frame_offset))
+        });
+        let extent = IoBufferExtent::new(virtual_addr, frame_offset, byte_len, 0, frames.len());
+        Self::new_physical_extents(frames, &[extent])
+    }
+
+    fn new_physical_extents(
+        frames: &[IoBufferPageFrame],
+        extents: &[IoBufferExtent],
+    ) -> Result<Self, IoBufferError> {
+        let byte_len = validate_physical_extents(frames, extents)?;
+        let extents_len = extents.len();
         let page_frames = PageFrameStorage::from_slice(frames)?;
+        let extents = ExtentStorage::from_slice(extents)?;
 
         Ok(Self {
-            borrow: None,
-            virt_addr: 0,
+            borrow: IoBufferBorrow::None,
             byte_len,
-            frame_offset,
+            extents,
+            extents_len,
             page_frames,
             page_frames_len: frames.len(),
             dma_segments: DmaSegmentLayout::empty(),
@@ -1156,32 +1407,55 @@ impl<'a> IoBufferInner<'a> {
         self.byte_len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.byte_len == 0
+    }
+
+    pub fn extent_count(&self) -> usize {
+        self.extents_len
+    }
+
+    pub fn is_single_extent(&self) -> bool {
+        self.extents_len == 1
+    }
+
     pub fn as_ptr(&self) -> *const u8 {
-        self.borrow
-            .as_ref()
-            .expect("IoBuffer has no virtual backing")
-            .as_ptr()
+        self.as_slice().as_ptr()
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        self.borrow
-            .as_ref()
-            .expect("IoBuffer has no virtual backing")
-            .as_slice()
+        self.try_as_slice()
+            .expect("IoBuffer is not backed by exactly one virtual extent")
+    }
+
+    pub fn try_as_slice(&self) -> Option<&[u8]> {
+        self.borrow.single_slice()
     }
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.borrow
-            .as_mut()
-            .expect("IoBuffer has no virtual backing")
-            .as_mut_ptr()
+        self.as_mut_slice().as_mut_ptr()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.borrow
-            .as_mut()
-            .expect("IoBuffer has no virtual backing")
-            .as_mut_slice()
+        self.try_as_mut_slice()
+            .expect("IoBuffer is not backed by exactly one writable virtual extent")
+    }
+
+    pub fn try_as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        self.borrow.single_mut_slice()
+    }
+
+    pub fn virtual_address(&self) -> Option<usize> {
+        if self.extents_len != 1 {
+            return None;
+        }
+        self.extents()
+            .first()
+            .and_then(|extent| extent.virtual_addr)
+    }
+
+    pub fn extents(&self) -> &[IoBufferExtent] {
+        self.extents.as_slice(self.extents_len)
     }
 
     pub fn page_frames(&self) -> &[IoBufferPageFrame] {
@@ -1193,15 +1467,34 @@ impl<'a> IoBufferInner<'a> {
     }
 
     pub fn iter(&self) -> IoBufferRegionIter<'_> {
-        IoBufferRegionIter::new(self.page_frames(), self.frame_offset, self.byte_len)
+        IoBufferRegionIter::new(self.extents(), self.page_frames())
     }
 
     pub fn replace_page_frames(
         &mut self,
         frames: &[IoBufferPageFrame],
     ) -> Result<(), IoBufferError> {
+        if self.extents_len > 1 && frames.len() != self.page_frames_len {
+            return Err(IoBufferError::InvalidExtentLayout { extent_index: 0 });
+        }
+
         self.page_frames.replace(frames)?;
         self.page_frames_len = frames.len();
+
+        if self.extents_len == 1 {
+            let extents = self.extents.as_mut_slice(self.extents_len);
+            extents[0].first_frame = 0;
+            extents[0].frame_count = frames.len();
+        }
+
+        Ok(())
+    }
+
+    pub fn replace_extents(&mut self, extents: &[IoBufferExtent]) -> Result<(), IoBufferError> {
+        let byte_len = validate_physical_extents(self.page_frames(), extents)?;
+        self.extents.replace(extents)?;
+        self.extents_len = extents.len();
+        self.byte_len = byte_len;
         Ok(())
     }
 
@@ -1216,57 +1509,18 @@ impl<'a> IoBufferInner<'a> {
             });
         }
 
-        if segments.len() <= IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY {
-            let mut inline = [EMPTY_DMA_SEGMENT; IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY];
-            inline[..segments.len()].copy_from_slice(segments);
-            self.dma_segments = DmaSegmentLayout::Inline {
-                segments: inline,
-                len: segments.len(),
-            };
+        if segments.is_empty() {
+            self.dma_segments = DmaSegmentLayout::empty();
             return Ok(());
         }
 
-        let first = segments[0];
-        let is_contiguous = segments.windows(2).all(|pair| {
-            pair[0].dma_addr + pair[0].byte_len as u64 == pair[1].dma_addr && pair[0].reserved == 0
-        }) && segments[segments.len() - 1].reserved == 0;
-        if is_contiguous {
-            let total_len = segments.iter().try_fold(0usize, |total, segment| {
-                total.checked_add(segment.byte_len as usize)
-            });
-            if let Some(total_len) = total_len {
-                if total_len <= u32::MAX as usize {
-                    self.dma_segments = DmaSegmentLayout::Contiguous {
-                        segment: IoBufferDmaSegment {
-                            dma_addr: first.dma_addr,
-                            byte_len: total_len as u32,
-                            reserved: 0,
-                        },
-                    };
-                    return Ok(());
-                }
-            }
-        }
-
-        let is_fixed_chunks = first.byte_len != 0
-            && segments.iter().enumerate().all(|(idx, segment)| {
-                segment.byte_len == first.byte_len
-                    && segment.dma_addr == first.dma_addr + (idx as u64 * first.byte_len as u64)
-                    && segment.reserved == 0
-            });
-        if is_fixed_chunks {
-            self.dma_segments = DmaSegmentLayout::FixedChunks {
-                dma_addr: first.dma_addr,
-                chunk_len: first.byte_len,
-                count: segments.len(),
-            };
-            return Ok(());
-        }
-
-        Err(IoBufferError::SegmentCapacityExceeded {
-            required: segments.len(),
-            capacity: IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY,
-        })
+        let mut inline = [EMPTY_DMA_SEGMENT; IOBUFFER_INLINE_STORED_SEGMENT_CAPACITY];
+        inline[..segments.len()].copy_from_slice(segments);
+        self.dma_segments = DmaSegmentLayout::Inline {
+            segments: inline,
+            len: segments.len(),
+        };
+        Ok(())
     }
 
     pub fn set_dma_segments_contiguous(
@@ -1356,6 +1610,10 @@ impl<'a> IoBufferInner<'a> {
         Ok(())
     }
 
+    pub fn set_dma_segments_identity_all(&mut self) -> Result<(), IoBufferError> {
+        self.set_dma_segments_identity(self.page_offset(), self.byte_len)
+    }
+
     pub fn set_dma_drop(&mut self, mapped_by: Arc<DeviceObject>, unmap: DmaUnmapFn, cookie: usize) {
         self.mapped_by = Some(mapped_by.clone());
         self.dma_drop = Some(DmaDropContext {
@@ -1366,15 +1624,28 @@ impl<'a> IoBufferInner<'a> {
     }
 
     pub fn page_base_address(&self) -> usize {
-        let page_offset = self.virt_addr & (IOBUFFER_PAGE_SIZE - 1);
-        self.virt_addr - page_offset
+        let virt_addr = self
+            .virtual_address()
+            .expect("IoBuffer is not backed by exactly one virtual extent");
+        let page_offset = virt_addr & (IOBUFFER_PAGE_SIZE - 1);
+        virt_addr - page_offset
     }
 
     pub fn page_offset(&self) -> usize {
-        self.frame_offset
+        self.extents()
+            .first()
+            .map_or(0, |extent| extent.frame_offset)
+    }
+
+    pub fn frame_offset(&self) -> usize {
+        self.page_offset()
     }
 
     pub fn page_count(&self) -> usize {
+        self.page_frames_len
+    }
+
+    pub fn frame_count(&self) -> usize {
         self.page_frames_len
     }
 
@@ -1385,6 +1656,13 @@ impl<'a> IoBufferInner<'a> {
         self.page_frames.capacity_slice_mut()
     }
 
+    pub fn extents_storage_mut(&mut self) -> &mut [IoBufferExtent] {
+        self.extents
+            .ensure_capacity(IOBUFFER_MAX_EXTENT_CAPACITY)
+            .expect("IoBuffer extent storage could not grow to max capacity");
+        self.extents.capacity_slice_mut()
+    }
+
     pub fn set_page_frames_len(&mut self, len: usize) -> Result<(), IoBufferError> {
         if len > IOBUFFER_MAX_PAGE_CAPACITY {
             return Err(IoBufferError::PageCapacityExceeded {
@@ -1392,8 +1670,30 @@ impl<'a> IoBufferInner<'a> {
                 capacity: IOBUFFER_MAX_PAGE_CAPACITY,
             });
         }
+        if self.extents_len > 1 && len != self.page_frames_len {
+            return Err(IoBufferError::InvalidExtentLayout { extent_index: 0 });
+        }
         self.page_frames.ensure_capacity(len)?;
         self.page_frames_len = len;
+        if self.extents_len == 1 {
+            let extents = self.extents.as_mut_slice(self.extents_len);
+            extents[0].first_frame = 0;
+            extents[0].frame_count = len;
+        }
+        Ok(())
+    }
+
+    pub fn set_extents_len(&mut self, len: usize) -> Result<(), IoBufferError> {
+        if len > IOBUFFER_MAX_EXTENT_CAPACITY {
+            return Err(IoBufferError::ExtentCapacityExceeded {
+                required: len,
+                capacity: IOBUFFER_MAX_EXTENT_CAPACITY,
+            });
+        }
+        self.extents.ensure_capacity(len)?;
+        let extents = self.extents.as_slice(len);
+        self.byte_len = validate_physical_extents(self.page_frames(), extents)?;
+        self.extents_len = len;
         Ok(())
     }
 
@@ -1406,8 +1706,14 @@ impl<'a> IoBufferInner<'a> {
     }
 
     pub fn remove_virtual_backing_in_place(&mut self) {
-        self.borrow = None;
-        self.virt_addr = 0;
+        self.borrow = IoBufferBorrow::None;
+        for extent in self.extents.as_mut_slice(self.extents_len) {
+            extent.virtual_addr = None;
+        }
+        let page_frames_len = self.page_frames_len;
+        for frame in &mut self.page_frames.capacity_slice_mut()[..page_frames_len] {
+            frame.virt_addr = None;
+        }
     }
 }
 
@@ -1437,7 +1743,6 @@ pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
 }
 
 impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State, Direction> {
-    /// Rebuild an `IoBuffer` from its ABI-erased inner storage.
     pub fn from_inner(inner: IoBufferInner<'a>) -> Self {
         Self {
             inner,
@@ -1446,8 +1751,6 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
         }
     }
 
-    /// Erase the state and direction markers while preserving the underlying
-    /// buffer storage.
     pub fn into_inner(self) -> IoBufferInner<'a> {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
@@ -1455,6 +1758,10 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
 
     pub fn as_inner(&self) -> &IoBufferInner<'a> {
         &self.inner
+    }
+
+    pub fn as_inner_mut(&mut self) -> &mut IoBufferInner<'a> {
+        &mut self.inner
     }
 
     fn cast_state<NextState: IoBufferState>(self) -> IoBuffer<'a, NextState, Direction> {
@@ -1466,7 +1773,15 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.len() == 0
+        self.inner.is_empty()
+    }
+
+    pub fn extent_count(&self) -> usize {
+        self.inner.extent_count()
+    }
+
+    pub fn is_single_extent(&self) -> bool {
+        self.inner.is_single_extent()
     }
 
     pub fn page_offset(&self) -> usize {
@@ -1478,11 +1793,15 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
     }
 
     pub fn frame_offset(&self) -> usize {
-        self.inner.page_offset()
+        self.inner.frame_offset()
     }
 
     pub fn frame_count(&self) -> usize {
-        self.inner.page_count()
+        self.inner.frame_count()
+    }
+
+    pub fn extents(&self) -> &[IoBufferExtent] {
+        self.inner.extents()
     }
 
     pub fn page_frames(&self) -> &[IoBufferPageFrame] {
@@ -1517,7 +1836,13 @@ impl<'a, State: VirtualBackedIoBufferState, Direction: IoBufferDirection>
     IoBuffer<'a, State, Direction>
 {
     pub fn virtual_address(&self) -> usize {
-        self.inner.virt_addr
+        self.inner
+            .virtual_address()
+            .expect("IoBuffer is not backed by exactly one virtual extent")
+    }
+
+    pub fn try_virtual_address(&self) -> Option<usize> {
+        self.inner.virtual_address()
     }
 
     pub fn page_base_address(&self) -> usize {
@@ -1530,6 +1855,10 @@ impl<'a, State: VirtualBackedIoBufferState, Direction: IoBufferDirection>
 
     pub fn as_slice(&self) -> &[u8] {
         self.inner.as_slice()
+    }
+
+    pub fn try_as_slice(&self) -> Option<&[u8]> {
+        self.inner.try_as_slice()
     }
 }
 
@@ -1551,11 +1880,33 @@ impl<'a, State: VirtualBackedIoBufferState, Direction: WritableIoBufferDirection
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.inner.as_mut_slice()
     }
+
+    pub fn try_as_mut_slice(&mut self) -> Option<&mut [u8]> {
+        self.inner.try_as_mut_slice()
+    }
 }
 
 impl<'a> IoBuffer<'a, Described, ToDevice> {
     pub fn new(buf: &'a [u8]) -> Self {
         Self::from_inner(IoBufferInner::new_read_only(buf))
+    }
+
+    pub fn try_new(buf: &'a [u8]) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::try_new_read_only(buf)?))
+    }
+
+    pub fn from_slices<const N: usize>(slices: [&'a [u8]; N]) -> Result<Self, IoBufferError> {
+        let mut vec = Vec::with_capacity(N);
+        for slice in slices {
+            vec.push(slice);
+        }
+        Self::from_slice_list(&vec)
+    }
+
+    pub fn from_slice_list(slices: &[&'a [u8]]) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::new_read_only_slices(
+            slices,
+        )?))
     }
 }
 
@@ -1563,11 +1914,43 @@ impl<'a> IoBuffer<'a, Described, FromDevice> {
     pub fn new(buf: &'a mut [u8]) -> Self {
         Self::from_inner(IoBufferInner::new_writable(buf))
     }
+
+    pub fn try_new(buf: &'a mut [u8]) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::try_new_writable(buf)?))
+    }
+
+    pub fn from_slices<const N: usize>(slices: [&'a mut [u8]; N]) -> Result<Self, IoBufferError> {
+        let mut vec = Vec::with_capacity(N);
+        for slice in slices {
+            vec.push(slice);
+        }
+        Self::from_slice_vec(vec)
+    }
+
+    pub fn from_slice_vec(slices: Vec<&'a mut [u8]>) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::new_writable_vec(slices)?))
+    }
 }
 
 impl<'a> IoBuffer<'a, Described, Bidirectional> {
     pub fn new(buf: &'a mut [u8]) -> Self {
         Self::from_inner(IoBufferInner::new_writable(buf))
+    }
+
+    pub fn try_new(buf: &'a mut [u8]) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::try_new_writable(buf)?))
+    }
+
+    pub fn from_slices<const N: usize>(slices: [&'a mut [u8]; N]) -> Result<Self, IoBufferError> {
+        let mut vec = Vec::with_capacity(N);
+        for slice in slices {
+            vec.push(slice);
+        }
+        Self::from_slice_vec(vec)
+    }
+
+    pub fn from_slice_vec(slices: Vec<&'a mut [u8]>) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::new_writable_vec(slices)?))
     }
 }
 
@@ -1583,35 +1966,26 @@ impl<'a, Direction: IoBufferDirection> IoBuffer<'a, PhysFramed, Direction> {
             frames,
         )?))
     }
+
+    pub fn from_physical_extents(
+        frames: &[IoBufferPageFrame],
+        extents: &[IoBufferExtent],
+    ) -> Result<Self, IoBufferError> {
+        Ok(Self::from_inner(IoBufferInner::new_physical_extents(
+            frames, extents,
+        )?))
+    }
 }
 
 impl<'a, Direction: IoBufferDirection> IoBuffer<'a, Described, Direction> {
-    /// Reborrow this described buffer as a physical-frame-only view.
-    ///
-    /// `Described` already carries valid physical frame backing. This conversion
-    /// only hides the virtual-backed API at the type level; it does not rebuild
-    /// frame storage or remove the underlying virtual borrow.
     pub fn as_phys_framed(&self) -> &IoBuffer<'a, PhysFramed, Direction> {
-        // SAFETY: `IoBuffer` stores its state marker only in zero-sized
-        // `PhantomData` fields. `Described` satisfies the `PhysFramed`
-        // invariant because described buffers always carry physical frames.
         unsafe { &*(self as *const Self as *const IoBuffer<'a, PhysFramed, Direction>) }
     }
 
-    /// Mutably reborrow this described buffer as a physical-frame-only view.
-    ///
-    /// This is the mutable counterpart to [`Self::as_phys_framed`].
     pub fn as_phys_framed_mut(&mut self) -> &mut IoBuffer<'a, PhysFramed, Direction> {
-        // SAFETY: same type-state-only cast as `as_phys_framed`, with the
-        // caller's exclusive borrow preserving mutable aliasing rules.
         unsafe { &mut *(self as *mut Self as *mut IoBuffer<'a, PhysFramed, Direction>) }
     }
 
-    /// Convert this described buffer into a physical-frame-only buffer.
-    ///
-    /// This is a zero-cost type-state conversion. The virtual backing remains
-    /// owned by the buffer, but the returned type exposes only the APIs common
-    /// to physical-frame-backed buffers.
     pub fn into_phys_framed(self) -> IoBuffer<'a, PhysFramed, Direction> {
         self.cast_state()
     }
@@ -1652,10 +2026,6 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> Drop
 }
 
 impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, S, D> {
-    /// Consume this buffer, fill DMA segments, register the unmap callback,
-    /// and return an `IoBuffer<DmaMapped<S>, D>`.
-    ///
-    /// On error the original buffer is returned so the caller can recover it.
     pub fn apply_dma_mapping(
         self,
         segments: &[IoBufferDmaSegment],
@@ -1673,9 +2043,6 @@ impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, S, D> {
 }
 
 impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, DmaMapped<S>, D> {
-    /// Consume this `DmaMapped` buffer, invoke the stored unmap callback,
-    /// clear all DMA segments, and return a buffer with its original source
-    /// state.
     pub fn remove_dma_mapping(self) -> IoBuffer<'a, S, D> {
         let mut inner = self.into_inner();
         if let Some(ctx) = inner.dma_drop.take() {
@@ -1694,10 +2061,13 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> fmt::Debug
         f.debug_struct("IoBuffer")
             .field("state", &core::any::type_name::<State>())
             .field("direction", &core::any::type_name::<Direction>())
-            .field("virt_addr", &self.inner.virt_addr)
+            .field("virtual_address", &self.inner.virtual_address())
             .field("len", &self.inner.len())
-            .field("has_virtual_backing", &self.inner.borrow.is_some())
-            .field("frame_offset", &self.inner.frame_offset)
+            .field(
+                "has_virtual_backing",
+                &self.inner.borrow.is_virtual_backed(),
+            )
+            .field("extent_count", &self.inner.extent_count())
             .field("page_frames_len", &self.inner.page_frames_len)
             .field("dma_segments_len", &self.inner.dma_segments().len())
             .field("mapped", &self.inner.mapped_by.is_some())

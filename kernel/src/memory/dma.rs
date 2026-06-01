@@ -105,6 +105,12 @@ pub fn platform_iommu_info() -> &'static PlatformIommuInfo {
 // IoBuffer mapping
 // ---------------------------------------------------------------------------
 
+struct PreparedDmaMapping {
+    records: PendingMappingRecords,
+    segments: [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
+    segments_len: usize,
+}
+
 pub fn map_buffer<'a>(
     device: &Arc<DeviceObject>,
     mut buffer: IoBufferInner<'a>,
@@ -137,218 +143,13 @@ pub fn map_buffer<'a>(
         domain
     };
 
-    let frame_count = buffer.page_count();
-    let buffer_len = buffer.len();
-    let frame_offset = buffer.page_offset();
-    if buffer_len == 0 || frame_count == 0 {
-        return Err((buffer, DmaMapError::InvalidSize));
-    }
-    if frame_count > IOBUFFER_MAX_PAGE_CAPACITY {
-        return Err((
-            buffer,
-            DmaMapError::PageCapacityExceeded {
-                required: frame_count,
-            },
-        ));
-    }
-
-    let frames = buffer.page_frames();
-    if !frames_cover_buffer(frames, frame_offset, buffer_len) {
-        return Err((buffer, DmaMapError::InvalidSize));
-    }
-    let Some(iommu_page_count) = covered_iommu_page_count(frames, frame_offset, buffer_len) else {
-        return Err((buffer, DmaMapError::InvalidSize));
-    };
-    let Ok(iommu_page_count_u32) = u32::try_from(iommu_page_count) else {
-        return Err((buffer, DmaMapError::InvalidSize));
-    };
-    let Some(map_size) = (iommu_page_count as u64).checked_mul(IOBUFFER_PAGE_SIZE as u64) else {
-        return Err((buffer, DmaMapError::InvalidSize));
-    };
-    let dma_page_offset = frame_offset & (IOBUFFER_PAGE_SIZE - 1);
-
-    let mut records = PendingMappingRecords::new();
-    let pending_segments = match strategy {
-        DmaMappingStrategy::SingleContiguous => {
-            let Some(iova_base) = domain.alloc_iova(map_size) else {
-                return Err((buffer, DmaMapError::RemappingUnavailable));
-            };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err((buffer, err));
-            }
-
-            if let Err(err) = records.push(MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
-                return Err((buffer, err));
-            }
-
-            if buffer_len > u32::MAX as usize {
-                rollback_mappings(&domain, &records);
-                return Err((buffer, DmaMapError::InvalidSize));
-            }
-
-            PendingDmaSegments::Contiguous {
-                dma_addr: iova_base + dma_page_offset as u64,
-                byte_len: buffer_len,
-            }
-        }
-        DmaMappingStrategy::ScatterGather => {
-            if iommu_page_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
-                return Err((
-                    buffer,
-                    DmaMapError::SegmentCapacityExceeded {
-                        required: iommu_page_count,
-                    },
-                ));
-            }
-
-            let Some(iova_base) = domain.alloc_iova(map_size) else {
-                return Err((buffer, DmaMapError::RemappingUnavailable));
-            };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err((buffer, err));
-            }
-
-            if let Err(err) = records.push(MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
-                return Err((buffer, err));
-            }
-
-            PendingDmaSegments::PageChunks {
-                iova_base,
-                page_offset: dma_page_offset,
-                byte_len: buffer_len,
-            }
-        }
-        DmaMappingStrategy::ContiguousChunks { chunk_size } => {
-            if chunk_size == 0 {
-                return Err((buffer, DmaMapError::InvalidSize));
-            }
-            if (chunk_size % IOBUFFER_PAGE_SIZE) != 0 {
-                return Err((buffer, DmaMapError::ChunkSizeNotPageAligned { chunk_size }));
-            }
-            if (buffer_len % chunk_size) != 0 {
-                return Err((
-                    buffer,
-                    DmaMapError::UnalignedChunkSize {
-                        buffer_len,
-                        chunk_size,
-                    },
-                ));
-            }
-
-            let Some(iova_base) = domain.alloc_iova(map_size) else {
-                return Err((buffer, DmaMapError::RemappingUnavailable));
-            };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err((buffer, err));
-            }
-            if let Err(err) = records.push(MappingRecord {
-                iova_base,
-                page_count: iommu_page_count_u32,
-                is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
-                return Err((buffer, err));
-            }
-
-            let chunk_count = buffer_len / chunk_size;
-            if chunk_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
-                rollback_mappings(&domain, &records);
-                return Err((
-                    buffer,
-                    DmaMapError::SegmentCapacityExceeded {
-                        required: chunk_count,
-                    },
-                ));
-            }
-
-            if chunk_size > u32::MAX as usize {
-                rollback_mappings(&domain, &records);
-                return Err((buffer, DmaMapError::InvalidSize));
-            }
-
-            PendingDmaSegments::FixedChunks {
-                dma_addr: iova_base + dma_page_offset as u64,
-                chunk_len: chunk_size,
-                count: chunk_count,
-            }
-        }
-        DmaMappingStrategy::FullIdentity => {
-            if let Err(err) =
-                map_identity_frames(&domain, frames, frame_offset, buffer_len, &mut records)
-            {
-                rollback_mappings(&domain, &records);
-                return Err((buffer, err));
-            }
-
-            PendingDmaSegments::Identity {
-                frame_offset,
-                byte_len: buffer_len,
-            }
-        }
+    let prepared = match prepare_dma_mapping(&domain, &buffer, strategy) {
+        Ok(prepared) => prepared,
+        Err(err) => return Err((buffer, err)),
     };
 
-    let segment_result = match pending_segments {
-        PendingDmaSegments::Contiguous { dma_addr, byte_len } => {
-            buffer.set_dma_segments_contiguous(dma_addr, byte_len)
-        }
-        PendingDmaSegments::PageChunks {
-            iova_base,
-            page_offset,
-            byte_len,
-        } => buffer.set_dma_segments_page_chunks(iova_base, page_offset, byte_len),
-        PendingDmaSegments::FixedChunks {
-            dma_addr,
-            chunk_len,
-            count,
-        } => buffer.set_dma_segments_fixed_chunks(dma_addr, chunk_len, count),
-        PendingDmaSegments::Identity {
-            frame_offset,
-            byte_len,
-        } => buffer.set_dma_segments_identity(frame_offset, byte_len),
-    };
-
-    if let Err(err) = segment_result {
-        rollback_mappings(&domain, &records);
+    if let Err(err) = buffer.replace_dma_segments(&prepared.segments[..prepared.segments_len]) {
+        rollback_mappings(&domain, &prepared.records);
         return Err((
             buffer,
             match err {
@@ -363,9 +164,10 @@ pub fn map_buffer<'a>(
         ));
     }
 
-    if records.is_empty() {
+    if prepared.records.is_empty() {
         return Err((buffer, DmaMapError::RemappingUnavailable));
     }
+
     let cookie = state.next_cookie;
     state.next_cookie = state.next_cookie.wrapping_add(1);
     state.pending_unmaps.insert(
@@ -373,7 +175,7 @@ pub fn map_buffer<'a>(
         PendingUnmap {
             device_key: key,
             domain: domain.clone(),
-            records,
+            records: prepared.records,
         },
     );
 
@@ -419,23 +221,57 @@ pub fn map_buffer_ref<'map, 'buffer>(
         domain
     };
 
-    let frame_count = buffer.page_count();
-    let buffer_len = buffer.len();
-    let frame_offset = buffer.page_offset();
-    if buffer_len == 0 || frame_count == 0 {
-        return Err(DmaMapError::InvalidSize);
-    }
-    if frame_count > IOBUFFER_MAX_PAGE_CAPACITY {
-        return Err(DmaMapError::PageCapacityExceeded {
-            required: frame_count,
-        });
+    let prepared = prepare_dma_mapping(&domain, buffer, strategy)?;
+
+    if prepared.records.is_empty() {
+        return Err(DmaMapError::RemappingUnavailable);
     }
 
-    let frames = buffer.page_frames();
-    if !frames_cover_buffer(frames, frame_offset, buffer_len) {
-        return Err(DmaMapError::InvalidSize);
-    }
-    let Some(iommu_page_count) = covered_iommu_page_count(frames, frame_offset, buffer_len) else {
+    let cookie = state.next_cookie;
+    let mapping = match BorrowedDmaMapping::new(
+        &prepared.segments[..prepared.segments_len],
+        pdo,
+        unmap_trampoline,
+        cookie as usize,
+    ) {
+        Ok(mapping) => mapping,
+        Err(kernel_types::dma::IoBufferError::SegmentCapacityExceeded { required, .. }) => {
+            rollback_mappings(&domain, &prepared.records);
+            return Err(DmaMapError::SegmentCapacityExceeded { required });
+        }
+        Err(kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. }) => {
+            rollback_mappings(&domain, &prepared.records);
+            return Err(DmaMapError::PageCapacityExceeded { required });
+        }
+        Err(_) => {
+            rollback_mappings(&domain, &prepared.records);
+            return Err(DmaMapError::InvalidSize);
+        }
+    };
+
+    state.next_cookie = state.next_cookie.wrapping_add(1);
+    state.pending_unmaps.insert(
+        cookie,
+        PendingUnmap {
+            device_key: key,
+            domain: domain.clone(),
+            records: prepared.records,
+        },
+    );
+
+    iommu::invalidate(&domain);
+    Ok(mapping)
+}
+
+fn prepare_dma_mapping(
+    domain: &IommuDomain,
+    buffer: &IoBufferInner<'_>,
+    strategy: DmaMappingStrategy,
+) -> Result<PreparedDmaMapping, DmaMapError> {
+    validate_dma_buffer(buffer)?;
+
+    let buffer_len = buffer.len();
+    let Some(iommu_page_count) = covered_iommu_page_count_for_buffer(buffer) else {
         return Err(DmaMapError::InvalidSize);
     };
     let Ok(iommu_page_count_u32) = u32::try_from(iommu_page_count) else {
@@ -444,7 +280,6 @@ pub fn map_buffer_ref<'map, 'buffer>(
     let Some(map_size) = (iommu_page_count as u64).checked_mul(IOBUFFER_PAGE_SIZE as u64) else {
         return Err(DmaMapError::InvalidSize);
     };
-    let dma_page_offset = frame_offset & (IOBUFFER_PAGE_SIZE - 1);
 
     let mut records = PendingMappingRecords::new();
     let mut segments = [IoBufferDmaSegment {
@@ -458,35 +293,33 @@ pub fn map_buffer_ref<'map, 'buffer>(
             if buffer_len > u32::MAX as usize {
                 return Err(DmaMapError::InvalidSize);
             }
+            if !buffer_supports_contiguous_iova(buffer) {
+                return Err(DmaMapError::RemappingUnavailable);
+            }
 
             let Some(iova_base) = domain.alloc_iova(map_size) else {
                 return Err(DmaMapError::RemappingUnavailable);
             };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err(err);
-            }
 
-            if let Err(err) = records.push(MappingRecord {
+            let rec = MappingRecord {
                 iova_base,
                 page_count: iommu_page_count_u32,
                 is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
+            };
+            records.push(rec)?;
+
+            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
+                rollback_mappings(domain, &records);
                 return Err(err);
             }
 
+            let Some(page_offset) = first_dma_page_offset(buffer) else {
+                rollback_mappings(domain, &records);
+                return Err(DmaMapError::InvalidSize);
+            };
+
             segments[0] = IoBufferDmaSegment {
-                dma_addr: iova_base + dma_page_offset as u64,
+                dma_addr: iova_base + page_offset as u64,
                 byte_len: buffer_len as u32,
                 reserved: 0,
             };
@@ -502,39 +335,23 @@ pub fn map_buffer_ref<'map, 'buffer>(
             let Some(iova_base) = domain.alloc_iova(map_size) else {
                 return Err(DmaMapError::RemappingUnavailable);
             };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err(err);
-            }
 
-            if let Err(err) = records.push(MappingRecord {
+            let rec = MappingRecord {
                 iova_base,
                 page_count: iommu_page_count_u32,
                 is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
+            };
+            records.push(rec)?;
+
+            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
+                rollback_mappings(domain, &records);
                 return Err(err);
             }
 
-            match build_segments_from_contiguous_iova(
-                iova_base,
-                dma_page_offset,
-                buffer_len,
-                false,
-                &mut segments,
-            ) {
+            match build_scatter_segments_from_iova(buffer, iova_base, &mut segments) {
                 Ok(len) => len,
                 Err(err) => {
-                    rollback_mappings(&domain, &records);
+                    rollback_mappings(domain, &records);
                     return Err(err);
                 }
             }
@@ -552,6 +369,12 @@ pub fn map_buffer_ref<'map, 'buffer>(
                     chunk_size,
                 });
             }
+            if chunk_size > u32::MAX as usize {
+                return Err(DmaMapError::InvalidSize);
+            }
+            if !buffer_supports_contiguous_iova(buffer) {
+                return Err(DmaMapError::RemappingUnavailable);
+            }
 
             let chunk_count = buffer_len / chunk_size;
             if chunk_count > IOBUFFER_INLINE_SEGMENT_CAPACITY {
@@ -559,101 +382,65 @@ pub fn map_buffer_ref<'map, 'buffer>(
                     required: chunk_count,
                 });
             }
-            if chunk_size > u32::MAX as usize {
-                return Err(DmaMapError::InvalidSize);
-            }
 
             let Some(iova_base) = domain.alloc_iova(map_size) else {
                 return Err(DmaMapError::RemappingUnavailable);
             };
-            if let Err(err) =
-                map_buffer_frames_to_iova(&domain, iova_base, frames, frame_offset, buffer_len)
-            {
-                domain.free_iova(iova_base, map_size);
-                return Err(err);
-            }
-            if let Err(err) = records.push(MappingRecord {
+
+            let rec = MappingRecord {
                 iova_base,
                 page_count: iommu_page_count_u32,
                 is_identity: false,
-            }) {
-                unmap_record(
-                    &domain,
-                    MappingRecord {
-                        iova_base,
-                        page_count: iommu_page_count_u32,
-                        is_identity: false,
-                    },
-                );
+            };
+            records.push(rec)?;
+
+            if let Err(err) = map_buffer_frames_to_iova(domain, iova_base, buffer) {
+                rollback_mappings(domain, &records);
                 return Err(err);
             }
 
-            let dma_addr = iova_base + dma_page_offset as u64;
-            for (idx, segment) in segments.iter_mut().take(chunk_count).enumerate() {
-                *segment = IoBufferDmaSegment {
+            let Some(page_offset) = first_dma_page_offset(buffer) else {
+                rollback_mappings(domain, &records);
+                return Err(DmaMapError::InvalidSize);
+            };
+
+            let dma_addr = iova_base + page_offset as u64;
+            for idx in 0..chunk_count {
+                segments[idx] = IoBufferDmaSegment {
                     dma_addr: dma_addr + (idx as u64 * chunk_size as u64),
                     byte_len: chunk_size as u32,
                     reserved: 0,
                 };
             }
+
             chunk_count
         }
         DmaMappingStrategy::FullIdentity => {
-            if let Err(err) =
-                map_identity_frames(&domain, frames, frame_offset, buffer_len, &mut records)
-            {
-                rollback_mappings(&domain, &records);
+            if let Err(err) = map_identity_frames(domain, buffer, &mut records) {
+                rollback_mappings(domain, &records);
                 return Err(err);
             }
 
-            match build_identity_segments(frames, frame_offset, buffer_len, &mut segments) {
+            match build_identity_segments(buffer, &mut segments) {
                 Ok(len) => len,
                 Err(err) => {
-                    rollback_mappings(&domain, &records);
+                    rollback_mappings(domain, &records);
                     return Err(err);
                 }
             }
         }
     };
 
-    if records.is_empty() {
+    if segments_len == 0 || records.is_empty() {
+        rollback_mappings(domain, &records);
         return Err(DmaMapError::RemappingUnavailable);
     }
 
-    let cookie = state.next_cookie;
-    let mapping = match BorrowedDmaMapping::new(
-        &segments[..segments_len],
-        pdo,
-        unmap_trampoline,
-        cookie as usize,
-    ) {
-        Ok(mapping) => mapping,
-        Err(kernel_types::dma::IoBufferError::SegmentCapacityExceeded { required, .. }) => {
-            rollback_mappings(&domain, &records);
-            return Err(DmaMapError::SegmentCapacityExceeded { required });
-        }
-        Err(kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. }) => {
-            rollback_mappings(&domain, &records);
-            return Err(DmaMapError::PageCapacityExceeded { required });
-        }
-        Err(_) => {
-            rollback_mappings(&domain, &records);
-            return Err(DmaMapError::InvalidSize);
-        }
-    };
-
-    state.next_cookie = state.next_cookie.wrapping_add(1);
-    state.pending_unmaps.insert(
-        cookie,
-        PendingUnmap {
-            device_key: key,
-            domain: domain.clone(),
-            records,
-        },
-    );
-
-    iommu::invalidate(&domain);
-    Ok(mapping)
+    Ok(PreparedDmaMapping {
+        records,
+        segments,
+        segments_len,
+    })
 }
 
 extern "win64" fn unmap_trampoline(_device: &Arc<DeviceObject>, cookie: usize) {
@@ -676,6 +463,106 @@ fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
         | iommu::IommuError::HardwareError
         | iommu::IommuError::Unsupported => DmaMapError::NoIommu,
     }
+}
+
+fn validate_dma_buffer(buffer: &IoBufferInner<'_>) -> Result<(), DmaMapError> {
+    if buffer.len() == 0 || buffer.page_count() == 0 || buffer.extent_count() == 0 {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    if buffer.page_count() > IOBUFFER_MAX_PAGE_CAPACITY {
+        return Err(DmaMapError::PageCapacityExceeded {
+            required: buffer.page_count(),
+        });
+    }
+
+    if !buffer_frames_cover_extents(buffer) {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    if covered_iommu_page_count_for_buffer(buffer).is_none() {
+        return Err(DmaMapError::InvalidSize);
+    }
+
+    Ok(())
+}
+
+fn for_each_buffer_extent<F>(buffer: &IoBufferInner<'_>, mut f: F) -> Result<(), DmaMapError>
+where
+    F: FnMut(&[IoBufferPageFrame], usize, usize) -> Result<(), DmaMapError>,
+{
+    let frames = buffer.page_frames();
+
+    for extent in buffer.extents() {
+        if extent.byte_len == 0 {
+            continue;
+        }
+
+        let Some(end_frame) = extent.first_frame.checked_add(extent.frame_count) else {
+            return Err(DmaMapError::InvalidSize);
+        };
+        let Some(extent_frames) = frames.get(extent.first_frame..end_frame) else {
+            return Err(DmaMapError::InvalidSize);
+        };
+
+        f(extent_frames, extent.frame_offset, extent.byte_len)?;
+    }
+
+    Ok(())
+}
+
+fn buffer_frames_cover_extents(buffer: &IoBufferInner<'_>) -> bool {
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        if frames_cover_buffer(frames, frame_offset, byte_len) {
+            Ok(())
+        } else {
+            Err(DmaMapError::InvalidSize)
+        }
+    })
+    .is_ok()
+}
+
+fn first_dma_page_offset(buffer: &IoBufferInner<'_>) -> Option<usize> {
+    for extent in buffer.extents() {
+        if extent.byte_len != 0 {
+            return Some(extent.frame_offset & (IOBUFFER_PAGE_SIZE - 1));
+        }
+    }
+    None
+}
+
+fn buffer_supports_contiguous_iova(buffer: &IoBufferInner<'_>) -> bool {
+    let mut logical_len = 0usize;
+    let mut first_offset = None;
+
+    for extent in buffer.extents() {
+        if extent.byte_len == 0 {
+            continue;
+        }
+
+        let start_offset = extent.frame_offset & (IOBUFFER_PAGE_SIZE - 1);
+        match first_offset {
+            Some(_) if start_offset != 0 => return false,
+            None => first_offset = Some(start_offset),
+            _ => {}
+        }
+
+        let Some(next_logical_len) = logical_len.checked_add(extent.byte_len) else {
+            return false;
+        };
+        logical_len = next_logical_len;
+
+        if logical_len < buffer.len() {
+            let Some(total_offset) = first_offset.unwrap_or(0).checked_add(logical_len) else {
+                return false;
+            };
+            if (total_offset & (IOBUFFER_PAGE_SIZE - 1)) != 0 {
+                return false;
+            }
+        }
+    }
+
+    first_offset.is_some() && logical_len == buffer.len()
 }
 
 fn frames_cover_buffer(
@@ -703,6 +590,21 @@ fn frames_cover_buffer(
     }
 
     available >= buffer_len
+}
+
+fn covered_iommu_page_count_for_buffer(buffer: &IoBufferInner<'_>) -> Option<usize> {
+    let mut total = 0usize;
+
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        let Some(count) = covered_iommu_page_count(frames, frame_offset, byte_len) else {
+            return Err(DmaMapError::InvalidSize);
+        };
+        total = total.checked_add(count).ok_or(DmaMapError::InvalidSize)?;
+        Ok(())
+    })
+    .ok()?;
+
+    Some(total)
 }
 
 fn covered_iommu_page_count(
@@ -822,29 +724,31 @@ fn map_phys_run_to_iova(
 fn map_buffer_frames_to_iova(
     domain: &IommuDomain,
     iova_base: u64,
-    frames: &[IoBufferPageFrame],
-    frame_offset: usize,
-    buffer_len: usize,
+    buffer: &IoBufferInner<'_>,
 ) -> Result<(), DmaMapError> {
     let mut iova_cursor = iova_base;
-    for_each_covered_page_run(frames, frame_offset, buffer_len, |phys_base, page_count| {
-        map_phys_run_to_iova(domain, iova_cursor, phys_base, page_count)?;
-        iova_cursor += (page_count * IOBUFFER_PAGE_SIZE) as u64;
-        Ok(())
+
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        for_each_covered_page_run(frames, frame_offset, byte_len, |phys_base, page_count| {
+            map_phys_run_to_iova(domain, iova_cursor, phys_base, page_count)?;
+            iova_cursor = iova_cursor
+                .checked_add((page_count * IOBUFFER_PAGE_SIZE) as u64)
+                .ok_or(DmaMapError::InvalidSize)?;
+            Ok(())
+        })
     })
 }
 
 fn map_identity_frames(
     domain: &IommuDomain,
-    frames: &[IoBufferPageFrame],
-    frame_offset: usize,
-    buffer_len: usize,
+    buffer: &IoBufferInner<'_>,
     records: &mut PendingMappingRecords,
 ) -> Result<(), DmaMapError> {
-    for_each_covered_page_run(frames, frame_offset, buffer_len, |phys_base, page_count| {
-        map_phys_run_to_iova(domain, phys_base, phys_base, page_count)?;
-        records.push_or_extend_identity(phys_base, page_count)?;
-        Ok(())
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        for_each_covered_page_run(frames, frame_offset, byte_len, |phys_base, page_count| {
+            records.push_or_extend_identity(phys_base, page_count)?;
+            map_phys_run_to_iova(domain, phys_base, phys_base, page_count)
+        })
     })
 }
 
@@ -864,6 +768,38 @@ fn rollback_mappings(domain: &IommuDomain, records: &PendingMappingRecords) {
     }
 }
 
+fn build_scatter_segments_from_iova(
+    buffer: &IoBufferInner<'_>,
+    iova_base: u64,
+    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
+) -> Result<usize, DmaMapError> {
+    let mut count = 0usize;
+    let mut iova_cursor = iova_base;
+
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        let Some(page_count) = covered_iommu_page_count(frames, frame_offset, byte_len) else {
+            return Err(DmaMapError::InvalidSize);
+        };
+
+        append_segments_from_contiguous_iova(
+            iova_cursor,
+            frame_offset & (IOBUFFER_PAGE_SIZE - 1),
+            byte_len,
+            false,
+            segments,
+            &mut count,
+        )?;
+
+        iova_cursor = iova_cursor
+            .checked_add((page_count * IOBUFFER_PAGE_SIZE) as u64)
+            .ok_or(DmaMapError::InvalidSize)?;
+
+        Ok(())
+    })?;
+
+    Ok(count)
+}
+
 fn build_segments_from_contiguous_iova(
     iova_base: u64,
     page_offset: usize,
@@ -871,13 +807,39 @@ fn build_segments_from_contiguous_iova(
     merge_adjacent: bool,
     segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
 ) -> Result<usize, DmaMapError> {
-    let mut remaining = buffer_len;
     let mut count = 0usize;
+    append_segments_from_contiguous_iova(
+        iova_base,
+        page_offset,
+        buffer_len,
+        merge_adjacent,
+        segments,
+        &mut count,
+    )?;
+    Ok(count)
+}
+
+fn append_segments_from_contiguous_iova(
+    iova_base: u64,
+    page_offset: usize,
+    buffer_len: usize,
+    merge_adjacent: bool,
+    segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
+    count: &mut usize,
+) -> Result<(), DmaMapError> {
+    if buffer_len == 0 {
+        return Ok(());
+    }
+    if page_offset >= IOBUFFER_PAGE_SIZE {
+        return Err(DmaMapError::InvalidSize);
+    }
+
     let page_count = page_offset
         .checked_add(buffer_len)
         .ok_or(DmaMapError::InvalidSize)?
         .div_ceil(IOBUFFER_PAGE_SIZE);
 
+    let mut remaining = buffer_len;
     for idx in 0..page_count {
         if remaining == 0 {
             break;
@@ -887,27 +849,29 @@ fn build_segments_from_contiguous_iova(
         let bytes = remaining.min(IOBUFFER_PAGE_SIZE - start_in_page);
         let dma_addr = iova_base + (idx * IOBUFFER_PAGE_SIZE + start_in_page) as u64;
 
-        append_dma_segment(dma_addr, bytes, merge_adjacent, segments, &mut count)?;
+        append_dma_segment(dma_addr, bytes, merge_adjacent, segments, count)?;
         remaining -= bytes;
     }
 
     if remaining != 0 {
-        return Err(DmaMapError::NoIommu);
+        return Err(DmaMapError::InvalidSize);
     }
 
-    Ok(count)
+    Ok(())
 }
 
 fn build_identity_segments(
-    frames: &[IoBufferPageFrame],
-    frame_offset: usize,
-    buffer_len: usize,
+    buffer: &IoBufferInner<'_>,
     segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
 ) -> Result<usize, DmaMapError> {
     let mut count = 0usize;
-    for_each_covered_data_run(frames, frame_offset, buffer_len, |dma_addr, bytes| {
-        append_dma_segment(dma_addr, bytes, true, segments, &mut count)
+
+    for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
+        for_each_covered_data_run(frames, frame_offset, byte_len, |dma_addr, bytes| {
+            append_dma_segment(dma_addr, bytes, true, segments, &mut count)
+        })
     })?;
+
     Ok(count)
 }
 
@@ -918,6 +882,9 @@ fn append_dma_segment(
     segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
     count: &mut usize,
 ) -> Result<(), DmaMapError> {
+    if byte_len == 0 {
+        return Ok(());
+    }
     if byte_len > u32::MAX as usize {
         return Err(DmaMapError::InvalidSize);
     }
