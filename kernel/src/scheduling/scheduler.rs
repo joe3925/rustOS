@@ -33,7 +33,14 @@ use x86_64::registers::control::Cr3;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 
-const MAX_TASKS: usize = 4096;
+const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
+const TASK_TABLE_CHUNK_BITS: usize = 8;
+const TASK_TABLE_CHUNK_SIZE: usize = 1 << TASK_TABLE_CHUNK_BITS;
+const TASK_TABLE_CHUNK_MASK: usize = TASK_TABLE_CHUNK_SIZE - 1;
+const TASK_ID_INDEX_BITS: u64 = 32;
+const TASK_ID_INDEX_MASK: u64 = (1u64 << TASK_ID_INDEX_BITS) - 1;
+const TASK_ID_INDEX_CAPACITY: usize = 1usize << 32;
+const TASK_ID_MAX_GENERATION: u64 = 1u64 << (64 - TASK_ID_INDEX_BITS);
 
 #[derive(Debug)]
 #[repr(u32)]
@@ -52,47 +59,169 @@ struct TaskSlot {
     generation: AtomicU64,
     retire_epoch: AtomicU64,
     readers: AtomicUsize,
+    retired_next: AtomicUsize,
     ptr: AtomicPtr<TaskRef>,
     state: AtomicUsize,
 }
 
-struct TaskTable {
+struct TaskChunk {
     slots: Box<[TaskSlot]>,
+}
+
+struct TaskChunkEntry {
+    chunk: Option<Box<TaskChunk>>,
+    saved_generations: Option<Box<[u64]>>,
+}
+
+struct TaskTableInner {
+    chunks: Vec<TaskChunkEntry>,
+    active_chunks: usize,
+}
+
+struct TaskTable {
+    inner: IrqSafeRwLock<TaskTableInner>,
+    min_chunks: usize,
     free_hint: AtomicUsize,
-    retired_slots: ArrayQueue<usize>,
+    retired_head: AtomicUsize,
     reclaim_epoch: AtomicU64,
+    reap_lock: Mutex<()>,
 }
 
 impl TaskSlot {
     #[inline(always)]
     fn new() -> Self {
+        Self::new_with_generation(0)
+    }
+
+    #[inline(always)]
+    fn new_with_generation(generation: u64) -> Self {
         Self {
-            generation: AtomicU64::new(0),
+            generation: AtomicU64::new(generation),
             retire_epoch: AtomicU64::new(0),
             readers: AtomicUsize::new(0),
+            retired_next: AtomicUsize::new(0),
             ptr: AtomicPtr::new(core::ptr::null_mut()),
             state: AtomicUsize::new(TASK_SLOT_EMPTY),
         }
     }
 }
 
-impl TaskTable {
-    fn new(max_tasks: usize) -> Self {
-        let mut v: Vec<TaskSlot> = Vec::with_capacity(max_tasks + 1);
-        for _ in 0..=max_tasks {
-            v.push(TaskSlot::new());
+impl TaskChunk {
+    fn new() -> Self {
+        let mut slots = Vec::with_capacity(TASK_TABLE_CHUNK_SIZE);
+        for _ in 0..TASK_TABLE_CHUNK_SIZE {
+            slots.push(TaskSlot::new());
         }
         Self {
-            slots: v.into_boxed_slice(),
-            free_hint: AtomicUsize::new(0),
-            retired_slots: ArrayQueue::new(max_tasks + 1),
-            reclaim_epoch: AtomicU64::new(0),
+            slots: slots.into_boxed_slice(),
+        }
+    }
+
+    fn new_with_generations(generations: Box<[u64]>) -> Self {
+        assert!(
+            generations.len() == TASK_TABLE_CHUNK_SIZE,
+            "bad task chunk generation snapshot length"
+        );
+
+        let mut slots = Vec::with_capacity(TASK_TABLE_CHUNK_SIZE);
+        for generation in generations.iter().copied() {
+            slots.push(TaskSlot::new_with_generation(generation));
+        }
+        Self {
+            slots: slots.into_boxed_slice(),
         }
     }
 
     #[inline(always)]
-    fn stride(&self) -> u64 {
-        self.slots.len() as u64
+    fn is_empty(&self) -> bool {
+        for slot in self.slots.iter() {
+            if slot.state.load(Ordering::Acquire) != TASK_SLOT_EMPTY {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn into_generation_snapshot(self: Box<Self>) -> Box<[u64]> {
+        let mut generations = Vec::with_capacity(TASK_TABLE_CHUNK_SIZE);
+        for slot in self.slots.iter() {
+            generations.push(slot.generation.load(Ordering::Acquire));
+        }
+        generations.into_boxed_slice()
+    }
+}
+
+impl TaskTableInner {
+    #[inline(always)]
+    fn active_slots(&self) -> usize {
+        self.active_chunks * TASK_TABLE_CHUNK_SIZE
+    }
+
+    #[inline(always)]
+    fn slot(&self, idx: usize) -> Option<&TaskSlot> {
+        if idx == 0 || idx >= self.active_slots() {
+            return None;
+        }
+
+        let chunk_idx = idx >> TASK_TABLE_CHUNK_BITS;
+        let slot_idx = idx & TASK_TABLE_CHUNK_MASK;
+        let chunk = self.chunks.get(chunk_idx)?.chunk.as_ref()?;
+        Some(&chunk.slots[slot_idx])
+    }
+
+    fn push_active_chunk(&mut self) -> bool {
+        if self.active_slots() > TASK_ID_INDEX_CAPACITY - TASK_TABLE_CHUNK_SIZE {
+            return false;
+        }
+
+        if self.active_chunks < self.chunks.len() {
+            let entry = &mut self.chunks[self.active_chunks];
+            if entry.chunk.is_some() {
+                panic!("inactive task table chunk still allocated");
+            }
+
+            let chunk = match entry.saved_generations.take() {
+                Some(generations) => Box::new(TaskChunk::new_with_generations(generations)),
+                None => Box::new(TaskChunk::new()),
+            };
+
+            entry.chunk = Some(chunk);
+            self.active_chunks += 1;
+            return true;
+        }
+
+        self.chunks.push(TaskChunkEntry {
+            chunk: Some(Box::new(TaskChunk::new())),
+            saved_generations: None,
+        });
+        self.active_chunks += 1;
+        true
+    }
+}
+
+impl TaskTable {
+    fn new(initial_slots: usize) -> Self {
+        let initial_chunks =
+            (initial_slots + 1 + TASK_TABLE_CHUNK_SIZE - 1) / TASK_TABLE_CHUNK_SIZE;
+        let mut inner = TaskTableInner {
+            chunks: Vec::with_capacity(initial_chunks),
+            active_chunks: 0,
+        };
+
+        for _ in 0..initial_chunks {
+            if !inner.push_active_chunk() {
+                panic!("initial task table is too large for task id encoding");
+            }
+        }
+
+        Self {
+            inner: IrqSafeRwLock::new(inner),
+            min_chunks: initial_chunks,
+            free_hint: AtomicUsize::new(0),
+            retired_head: AtomicUsize::new(0),
+            reclaim_epoch: AtomicU64::new(0),
+            reap_lock: Mutex::new(()),
+        }
     }
 
     #[inline(always)]
@@ -106,20 +235,23 @@ impl TaskTable {
     }
 
     #[inline(always)]
-    fn make_id(&self, idx: usize, generation: u64) -> u64 {
-        generation
-            .checked_mul(self.stride())
-            .and_then(|base| base.checked_add(idx as u64))
-            .expect("task id generation overflow")
+    fn make_id(idx: usize, generation: u64) -> u64 {
+        if idx == 0 || idx as u64 > TASK_ID_INDEX_MASK {
+            panic!("task id index overflow");
+        }
+        if generation >= TASK_ID_MAX_GENERATION {
+            panic!("task id generation overflow");
+        }
+
+        (generation << TASK_ID_INDEX_BITS) | idx as u64
     }
 
     #[inline(always)]
-    fn decode_id(&self, id: u64) -> Option<(usize, u64)> {
-        let stride = self.stride();
-        let idx = (id % stride) as usize;
-        let generation = id / stride;
+    fn decode_id(id: u64) -> Option<(usize, u64)> {
+        let idx = (id & TASK_ID_INDEX_MASK) as usize;
+        let generation = id >> TASK_ID_INDEX_BITS;
 
-        if idx == 0 || idx >= self.slots.len() {
+        if idx == 0 {
             return None;
         }
 
@@ -127,12 +259,8 @@ impl TaskTable {
     }
 
     #[inline(always)]
-    fn try_insert_at(&self, idx: usize, task: &TaskHandle) -> Option<u64> {
-        if idx == 0 || idx >= self.slots.len() {
-            return None;
-        }
-
-        let slot = &self.slots[idx];
+    fn try_insert_at_locked(inner: &TaskTableInner, idx: usize, task: &TaskHandle) -> Option<u64> {
+        let slot = inner.slot(idx)?;
         if slot
             .state
             .compare_exchange(
@@ -147,23 +275,30 @@ impl TaskTable {
         }
 
         let generation = slot.generation.load(Ordering::Acquire);
-        let id = self.make_id(idx, generation);
+        let id = Self::make_id(idx, generation);
         task.set_task_id(id);
 
         let raw = Arc::into_raw(task.clone()) as *mut TaskRef;
+        slot.retire_epoch.store(0, Ordering::Release);
+        slot.retired_next.store(0, Ordering::Release);
         slot.ptr.store(raw, Ordering::Release);
         slot.state.store(TASK_SLOT_LIVE, Ordering::Release);
         Some(id)
     }
 
-    fn insert(&self, task: &TaskHandle) -> Option<u64> {
+    fn try_insert_existing(&self, task: &TaskHandle) -> Option<u64> {
+        let inner = self.inner.read();
+        let active_slots = inner.active_slots();
         let hinted = self.free_hint.swap(0, Ordering::AcqRel);
-        if let Some(id) = self.try_insert_at(hinted, task) {
-            return Some(id);
+
+        if hinted != 0 && hinted < active_slots {
+            if let Some(id) = Self::try_insert_at_locked(&inner, hinted, task) {
+                return Some(id);
+            }
         }
 
-        for idx in 1..self.slots.len() {
-            if let Some(id) = self.try_insert_at(idx, task) {
+        for idx in 1..active_slots {
+            if let Some(id) = Self::try_insert_at_locked(&inner, idx, task) {
                 return Some(id);
             }
         }
@@ -171,10 +306,32 @@ impl TaskTable {
         None
     }
 
+    fn grow_one_chunk(&self) -> bool {
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            panic!("attempted to grow task table from interrupt context");
+        }
+
+        let mut inner = self.inner.write();
+        inner.push_active_chunk()
+    }
+
+    fn insert(&self, task: &TaskHandle) -> Option<u64> {
+        loop {
+            if let Some(id) = self.try_insert_existing(task) {
+                return Some(id);
+            }
+
+            if !self.grow_one_chunk() {
+                return None;
+            }
+        }
+    }
+
     #[inline(always)]
     fn get(&self, id: u64) -> Option<TaskHandle> {
-        let (idx, generation) = self.decode_id(id)?;
-        let slot = &self.slots[idx];
+        let (idx, generation) = Self::decode_id(id)?;
+        let inner = self.inner.read();
+        let slot = inner.slot(idx)?;
 
         let state = slot.state.load(Ordering::Acquire);
         if !Self::readable_state(state) {
@@ -209,12 +366,43 @@ impl TaskTable {
     }
 
     #[inline(always)]
-    fn retire(&self, id: u64, task: &TaskHandle) -> bool {
-        let Some((idx, generation)) = self.decode_id(id) else {
+    fn push_retired_idx_locked(&self, inner: &TaskTableInner, idx: usize) -> bool {
+        let Some(slot) = inner.slot(idx) else {
             return false;
         };
 
-        let slot = &self.slots[idx];
+        let mut head = self.retired_head.load(Ordering::Acquire);
+        loop {
+            slot.retired_next.store(head, Ordering::Relaxed);
+            match self.retired_head.compare_exchange_weak(
+                head,
+                idx,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(new_head) => head = new_head,
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn push_retired_idx(&self, idx: usize) -> bool {
+        let inner = self.inner.read();
+        self.push_retired_idx_locked(&inner, idx)
+    }
+
+    #[inline(always)]
+    fn retire(&self, id: u64, task: &TaskHandle) -> bool {
+        let Some((idx, generation)) = Self::decode_id(id) else {
+            return false;
+        };
+
+        let inner = self.inner.read();
+        let Some(slot) = inner.slot(idx) else {
+            return false;
+        };
+
         if slot.generation.load(Ordering::Acquire) != generation {
             return false;
         }
@@ -241,11 +429,108 @@ impl TaskTable {
         slot.retire_epoch.store(epoch, Ordering::Release);
         slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
 
-        if self.retired_slots.push(idx).is_err() {
-            panic!("retired task slot queue overflow");
+        if !self.push_retired_idx_locked(&inner, idx) {
+            panic!("failed to enqueue retired task slot");
         }
 
         true
+    }
+
+    fn reap_one_retired_idx(&self, idx: usize, min_drained_epoch: u64) -> Option<*mut TaskRef> {
+        let inner = self.inner.read();
+        let Some(slot) = inner.slot(idx) else {
+            return None;
+        };
+
+        if slot.state.load(Ordering::Acquire) != TASK_SLOT_RETIRED {
+            return None;
+        }
+
+        let retire_epoch = slot.retire_epoch.load(Ordering::Acquire);
+        if retire_epoch > min_drained_epoch || slot.readers.load(Ordering::Acquire) != 0 {
+            if !self.push_retired_idx_locked(&inner, idx) {
+                panic!("failed to requeue retired task slot");
+            }
+            return None;
+        }
+
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_RETIRED,
+                TASK_SLOT_REAPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        if slot.readers.load(Ordering::Acquire) != 0 {
+            slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
+            if !self.push_retired_idx_locked(&inner, idx) {
+                panic!("failed to requeue retired task slot");
+            }
+            return None;
+        }
+
+        let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
+
+        if slot
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                let next = g.checked_add(1)?;
+                if next >= TASK_ID_MAX_GENERATION {
+                    None
+                } else {
+                    Some(next)
+                }
+            })
+            .is_err()
+        {
+            panic!("task slot generation exhausted");
+        }
+
+        slot.retire_epoch.store(0, Ordering::Release);
+        slot.retired_next.store(0, Ordering::Release);
+        slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
+        self.free_hint.store(idx, Ordering::Release);
+
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
+    fn shrink_empty_tail_chunks(&self) {
+        let mut inner = self.inner.write();
+
+        while inner.active_chunks > self.min_chunks {
+            let idx = inner.active_chunks - 1;
+            let Some(entry) = inner.chunks.get_mut(idx) else {
+                break;
+            };
+
+            let can_shrink = match entry.chunk.as_ref() {
+                Some(chunk) => chunk.is_empty(),
+                None => false,
+            };
+
+            if !can_shrink {
+                break;
+            }
+
+            let chunk = entry.chunk.take().unwrap();
+            entry.saved_generations = Some(chunk.into_generation_snapshot());
+            inner.active_chunks -= 1;
+        }
+
+        let active_slots = inner.active_slots();
+        if self.free_hint.load(Ordering::Acquire) >= active_slots {
+            self.free_hint.store(0, Ordering::Release);
+        }
     }
 
     fn reap_retired(&self, min_drained_epoch: u64) {
@@ -253,67 +538,41 @@ impl TaskTable {
             return;
         }
 
+        let Some(_guard) = self.reap_lock.try_lock() else {
+            return;
+        };
+
+        let mut curr = self.retired_head.swap(0, Ordering::AcqRel);
         let mut checked = 0usize;
-        while checked < self.slots.len() {
+
+        while curr != 0 {
             checked += 1;
 
-            let Some(idx) = self.retired_slots.pop() else {
-                break;
+            let (idx, next) = {
+                let inner = self.inner.read();
+                match inner.slot(curr) {
+                    Some(slot) => {
+                        let next = slot.retired_next.swap(0, Ordering::AcqRel);
+                        (curr, next)
+                    }
+                    None => (curr, 0),
+                }
             };
 
-            let slot = &self.slots[idx];
-            if slot.state.load(Ordering::Acquire) != TASK_SLOT_RETIRED {
-                continue;
-            }
-
-            let retire_epoch = slot.retire_epoch.load(Ordering::Acquire);
-            if retire_epoch > min_drained_epoch || slot.readers.load(Ordering::Acquire) != 0 {
-                if self.retired_slots.push(idx).is_err() {
-                    panic!("retired task slot queue overflow while requeueing");
-                }
-                continue;
-            }
-
-            if slot
-                .state
-                .compare_exchange(
-                    TASK_SLOT_RETIRED,
-                    TASK_SLOT_REAPING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
-
-            if slot.readers.load(Ordering::Acquire) != 0 {
-                slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
-                if self.retired_slots.push(idx).is_err() {
-                    panic!("retired task slot queue overflow while requeueing");
-                }
-                continue;
-            }
-
-            let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
-            if !p.is_null() {
+            if let Some(p) = self.reap_one_retired_idx(idx, min_drained_epoch) {
                 unsafe {
                     drop(Arc::from_raw(p));
                 }
             }
 
-            if slot
-                .generation
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| g.checked_add(1))
-                .is_err()
-            {
-                panic!("task slot generation exhausted");
-            }
+            curr = next;
 
-            slot.retire_epoch.store(0, Ordering::Release);
-            slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
-            self.free_hint.store(idx, Ordering::Release);
+            if checked > TASK_ID_INDEX_MASK as usize {
+                panic!("retired task slot list cycle detected");
+            }
         }
+
+        self.shrink_empty_tail_chunks();
     }
 }
 
@@ -391,7 +650,7 @@ lazy_static! {
 impl Scheduler {
     fn new() -> Self {
         Self {
-            all_tasks: TaskTable::new(MAX_TASKS),
+            all_tasks: TaskTable::new(TASK_TABLE_INITIAL_SLOTS),
             cores: IrqSafeRwLock::new(Vec::new()),
             next_task_id: AtomicU64::new(1),
             num_cores: AtomicUsize::new(0),
@@ -463,12 +722,10 @@ impl Scheduler {
 
         self.reap_retired_tasks();
 
-        let id = self.all_tasks.insert(&task).unwrap_or_else(|| {
-            panic!(
-                "task table exhausted: no free slots (MAX_TASKS={})",
-                MAX_TASKS
-            )
-        });
+        let id = self
+            .all_tasks
+            .insert(&task)
+            .unwrap_or_else(|| panic!("task table exhausted: task id index space is full"));
 
         self.next_task_id.fetch_add(1, Ordering::Relaxed);
         id

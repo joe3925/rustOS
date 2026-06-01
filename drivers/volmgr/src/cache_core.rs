@@ -16,10 +16,9 @@ use kernel_api::kernel_types::dma::{
     Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
     IoBufferPageFrame, PhysFramed, ToDevice,
 };
-use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::virt_to_phys;
 use kernel_api::println;
-use kernel_api::request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 use kernel_api::x86_64::VirtAddr;
@@ -138,13 +137,17 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
         while offset < BLOCK_SIZE {
             let virt_addr = base.checked_add(offset as u64)?;
             let phys_addr = virt_to_phys(VirtAddr::new(virt_addr))?.as_u64();
+
             if phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0 {
                 return None;
             }
 
+            let remaining = BLOCK_SIZE - offset;
+            let byte_len = remaining.min(IOBUFFER_PAGE_SIZE);
+
             frames.push(IoBufferPageFrame {
                 phys_addr,
-                byte_len: IOBUFFER_PAGE_SIZE as u64,
+                byte_len: byte_len as u64,
                 virt_addr: Some(virt_addr as usize),
             });
 
@@ -313,19 +316,17 @@ impl FlushFilter<'_> {
 }
 
 struct FlushScratch<const BLOCK_SIZE: usize> {
-    batch: Vec<(u64, Arc<Page<BLOCK_SIZE>>)>,
     frames: Vec<IoBufferPageFrame>,
     keys: Vec<u64>,
-    joins: Vec<FfiFuture<()>>,
     run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
     guards: ReadGuardScratch<BLOCK_SIZE>,
 }
 
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
-    fn new(join_cap: usize, cache_capacity_blocks: usize) -> Self {
-        let capacity = if join_cap == 0 { 1 } else { join_cap };
+    fn new(run_hint: usize, cache_capacity_blocks: usize) -> Self {
+        let run_hint = run_hint.max(1);
         let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        let scratch_key_capacity = cache_capacity_blocks.max(capacity);
+        let scratch_key_capacity = cache_capacity_blocks.max(run_hint);
         let run_capacity = if BLOCK_SIZE.is_multiple_of(IOBUFFER_PAGE_SIZE) {
             (IOBUFFER_MAX_FRAME_CAPACITY / frames_per_block.max(1))
                 .max(1)
@@ -335,30 +336,20 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         };
 
         Self {
-            batch: Vec::with_capacity(capacity),
             frames: Vec::with_capacity(IOBUFFER_MAX_FRAME_CAPACITY),
             keys: Vec::with_capacity(scratch_key_capacity),
-            joins: Vec::with_capacity(capacity),
             run: Vec::with_capacity(run_capacity),
             guards: ReadGuardScratch::new(run_capacity),
         }
     }
 
     fn reset(&mut self) {
-        self.batch.clear();
         self.frames.clear();
         self.keys.clear();
-        self.joins.clear();
         self.run.clear();
     }
-
-    fn ensure_join_capacity(&mut self, requested: usize) {
-        let target = if requested == 0 { 1 } else { requested };
-        if self.joins.capacity() < target {
-            self.joins.reserve(target - self.joins.capacity());
-        }
-    }
 }
+
 struct FlushRunScratchLease<'a, const BLOCK_SIZE: usize> {
     scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
     run: Option<Vec<PreparedFlushPage<BLOCK_SIZE>>>,
@@ -792,12 +783,20 @@ where
             return Ok(false);
         };
 
-        Self::flush_page_task(
-            Arc::clone(&self.backend),
-            Arc::clone(&self.stats),
-            Arc::clone(&self.dirty_pages),
-            lba,
-            page,
+        let Some(prepared) = Self::prepare_flush_page(&self.stats, lba, page) else {
+            return Ok(true);
+        };
+
+        let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
+        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch);
+        let run = [prepared];
+        Self::flush_prepared_run(
+            &self.backend,
+            &self.stats,
+            &self.dirty_pages,
+            &run,
+            frame_scratch.frames_mut(),
+            &mut guard_scratch,
         )
         .await?;
 
@@ -1128,239 +1127,6 @@ where
         self.stats.direct_writebacks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
-    }
-
-    async fn flush_page_task(
-        backend: Arc<B>,
-        stats: Arc<StatsInner>,
-        dirty_pages: Arc<AtomicUsize>,
-        lba: u64,
-        page: Arc<Page<BLOCK_SIZE>>,
-    ) -> Result<bool, CacheError<B::Error>> {
-        stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
-
-        if !page.dirty.load(Ordering::Acquire) {
-            stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
-        }
-
-        if page.writeback.swap(true, Ordering::AcqRel) {
-            stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
-        }
-
-        if !page.dirty.load(Ordering::Acquire) {
-            page.writeback.store(false, Ordering::Release);
-            stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
-        }
-
-        let wb_gen = page.generation.load(Ordering::Acquire);
-        page.wb_generation.store(wb_gen, Ordering::Release);
-        let write_res = {
-            let data_guard = page.data.read();
-            let io_buf =
-                IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]).into_phys_framed();
-            let mut req = RequestHandle::new_t(
-                RequestType::Write {
-                    offset: lba * BLOCK_SIZE as u64,
-                    len: BLOCK_SIZE,
-                    no_buffer: false,
-                    owner: 0,
-                },
-                io_buf,
-            );
-            req.set_traversal_policy(TraversalPolicy::ForwardLower);
-            let res = backend
-                .write_request(&mut req)
-                .await
-                .map_err(CacheError::Backend);
-            drop(req);
-            res
-        };
-
-        match write_res {
-            Ok(()) => {
-                stats.backend_writes.fetch_add(1, Ordering::Relaxed);
-                let cur_gen = page.generation.load(Ordering::Acquire);
-                if cur_gen == wb_gen {
-                    if page.dirty.swap(false, Ordering::AcqRel) {
-                        dirty_pages.fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
-                page.writeback.store(false, Ordering::Release);
-                stats.flush_success.fetch_add(1, Ordering::Relaxed);
-                Ok(true)
-            }
-            Err(e) => {
-                page.writeback.store(false, Ordering::Release);
-                if !page.dirty.swap(true, Ordering::AcqRel) {
-                    dirty_pages.fetch_add(1, Ordering::AcqRel);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Joins is a vector used to track in-flight flush task handles.
-    async fn flush_pages_parallel(
-        backend: Arc<B>,
-        stats: Arc<StatsInner>,
-        dirty_pages: Arc<AtomicUsize>,
-        pages: &[(u64, Arc<Page<BLOCK_SIZE>>)],
-        joins: &mut Vec<FfiFuture<()>>,
-        parallelism: usize,
-    ) -> Result<usize, CacheError<B::Error>> {
-        if pages.is_empty() {
-            return Ok(0);
-        }
-
-        joins.clear();
-        let first_error = Mutex::new(None);
-        let first_error_ptr = &first_error as *const _ as usize;
-        let writebacks = AtomicUsize::new(0);
-        let writebacks_ptr = &writebacks as *const _ as usize;
-        let parallelism = parallelism.max(1);
-
-        for (lba, page) in pages {
-            let backend = Arc::clone(&backend);
-            let stats = Arc::clone(&stats);
-            let dirty_pages = Arc::clone(&dirty_pages);
-            let page = Arc::clone(page);
-            let lba = *lba;
-            let first_error_ptr_copy = first_error_ptr;
-            let writebacks_ptr_copy = writebacks_ptr;
-
-            let handle = spawn(async move {
-                match Self::flush_page_task(backend, stats, dirty_pages, lba, page).await {
-                    Ok(true) => {
-                        // SAFETY: We await all handles before returning from this function,
-                        // guaranteeing that `writebacks` safely outlives this spawned task.
-                        let writebacks_ref =
-                            unsafe { &*(writebacks_ptr_copy as *const AtomicUsize) };
-                        writebacks_ref.fetch_add(1, Ordering::AcqRel);
-                    }
-                    Ok(false) => {}
-                    Err(err) => {
-                        println!(
-                            "volmgr: VolumeCache::flush_pages_parallel failed at lba {}: {:?}",
-                            lba, err
-                        );
-
-                        // SAFETY: We await all handles before returning from this function,
-                        // guaranteeing that `first_error` safely outlives this spawned task.
-                        let first_error_ref = unsafe {
-                            &*(first_error_ptr_copy as *const Mutex<Option<CacheError<B::Error>>>)
-                        };
-                        let mut slot = first_error_ref.lock();
-                        if slot.is_none() {
-                            *slot = Some(err);
-                        }
-                    }
-                }
-            });
-
-            joins.push(handle);
-
-            if joins.len() >= parallelism {
-                for handle in joins.drain(..) {
-                    handle.await;
-                }
-                if first_error.lock().is_some() {
-                    break;
-                }
-            }
-        }
-
-        for handle in joins.drain(..) {
-            handle.await;
-        }
-
-        if let Some(err) = first_error.into_inner() {
-            return Err(err);
-        }
-
-        Ok(writebacks.into_inner())
-    }
-    async fn flush_shard_streaming(
-        &self,
-        shard_idx: usize,
-        filter: &FlushFilter<'_>,
-        parallelism: usize,
-    ) -> Result<(usize, usize), CacheError<B::Error>> {
-        let parallelism = parallelism.max(1);
-        let mut start = 0usize;
-        let mut matched = 0usize;
-        let mut writebacks = 0usize;
-
-        loop {
-            let (walked, batch, mut joins) = {
-                let mut scratch = self.flush_scratch.lock();
-                scratch.reset();
-                scratch.ensure_join_capacity(parallelism);
-                let batch_capacity = scratch.batch.capacity();
-                if batch_capacity < parallelism {
-                    scratch.batch.reserve(parallelism - batch_capacity);
-                }
-
-                let walked = {
-                    let shard = self.shards[shard_idx].lock();
-                    shard.index.for_each_chunk(start, parallelism, |k, v| {
-                        if v.dirty.load(Ordering::Acquire) && filter.matches(k, v) {
-                            scratch.batch.push((k, Arc::clone(v)));
-                        }
-                    })
-                };
-
-                if walked == 0 {
-                    return Ok((matched, writebacks));
-                }
-
-                let batch = core::mem::take(&mut scratch.batch);
-                let joins = core::mem::take(&mut scratch.joins);
-                (walked, batch, joins)
-            };
-
-            matched += batch.len();
-
-            if !batch.is_empty() {
-                writebacks += Self::flush_pages_parallel(
-                    Arc::clone(&self.backend),
-                    Arc::clone(&self.stats),
-                    Arc::clone(&self.dirty_pages),
-                    &batch,
-                    &mut joins,
-                    parallelism,
-                )
-                .await?;
-            }
-
-            {
-                let mut scratch = self.flush_scratch.lock();
-                scratch.batch = batch;
-                scratch.joins = joins;
-                scratch.reset();
-            }
-
-            start += walked;
-        }
-    }
-    async fn flush_shards_streaming_all(
-        self: &Arc<Self>,
-        parallelism: usize,
-    ) -> Result<(usize, usize), CacheError<B::Error>> {
-        let mut shard_idx = 0usize;
-        let mut matched = 0usize;
-        let mut writebacks = 0usize;
-        while shard_idx < self.shards.len() {
-            let (shard_matched, shard_writebacks) = self
-                .flush_shard_streaming(shard_idx, &FlushFilter::All, parallelism)
-                .await?;
-            matched += shard_matched;
-            writebacks += shard_writebacks;
-            shard_idx += 1;
-        }
-        Ok((matched, writebacks))
     }
 
     fn prepare_flush_page(
