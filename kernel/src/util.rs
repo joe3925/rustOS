@@ -22,6 +22,8 @@ use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{init_heap, HEAP_SIZE};
 use crate::memory::iommu::init_iommu;
+use crate::memory::paging::frame_alloc::resize_bitmap_for_ram;
+use crate::memory::paging::frame_alloc::total_usable_bytes;
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
@@ -30,11 +32,12 @@ use crate::memory::paging::virt_tracker::KERNEL_RANGE_TRACKER;
 use crate::scheduling::global_async::GlobalAsyncExecutor;
 use crate::scheduling::runtime::runtime::yield_now;
 use crate::scheduling::runtime::runtime::{init_executor_platform, spawn_detached};
-use crate::scheduling::scheduler::{task_name_panic, SCHEDULER};
+use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
 use crate::structs::stopwatch::Stopwatch;
 use crate::syscalls::syscall::syscall_init;
 use crate::{cpu, println, BOOT_INFO, BOOT_INFO_INITIALIZED};
+use alloc::format;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::{vec, vec::Vec};
@@ -57,12 +60,14 @@ use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptDescriptorTable;
 use x86_64::VirtAddr;
+
 pub(crate) static KERNEL_INITIALIZED: AtomicBool = AtomicBool::new(false);
 pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
 pub const APIC_START_PERIOD: u64 = 250000;
+pub const MAX_CPUS: usize = 256;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"
 ];
@@ -193,6 +198,10 @@ pub unsafe fn init() {
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
+    resize_bitmap_for_ram(total_usable_bytes()).expect(&format!(
+        "Failed to resize phys frame bitmap to capacity {}",
+        total_usable_bytes()
+    ));
     init_executor_platform();
     GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
     install_file_provider(ProviderKind::Bootstrap);
@@ -275,65 +284,17 @@ pub extern "win64" fn panic_common(mod_name: &'static str, info: &PanicInfo) -> 
         None => false,
     };
     if is_owner {
+        unsafe {
+            if let Some(a) = APIC.lock().as_ref() {
+                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
+            }
+        }
         println!("=== KERNEL PANIC [{}] ===", mod_name);
         println!(
             "is in interrupt: {:#?}",
             current_is_in_interrupt_atomic().load(Ordering::Relaxed)
         );
         println!("{}", info);
-
-        // let dump = dump_scheduler();
-        // println!("--- Running tasks at panic ---");
-        // for (cpu_id, slot) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-        //     if let Some(task) = slot {
-        //         let name = unsafe { task_name_panic(task) };
-        //         println!(
-        //             "  CPU {}: \"{}\" (id={})",
-        //             cpu_id,
-        //             name,
-        //             task.id.load(Ordering::Relaxed)
-        //         );
-        //     } else {
-        //         println!("  CPU {}: <idle>", cpu_id);
-        //     }
-        // }
-        // println!("--- Tasks in run queue and ipi queue ---");
-        // for (cpu_id, queue) in dump.run_queues.iter().enumerate().take(dump.num_cores) {
-        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-        //     println!(
-        //         "  CPU {}: run_queue={} (captured={}, total_before_drain={})",
-        //         cpu_id, some_count, queue.captured, queue.total_before_drain
-        //     );
-        // }
-
-        // for (cpu_id, queue) in dump.ipi_queues.iter().enumerate().take(dump.num_cores) {
-        //     let some_count = queue.tasks.iter().filter(|task| task.is_some()).count();
-        //     println!(
-        //         "  CPU {}: ipi_queue={} (captured={}, total_before_drain={})",
-        //         cpu_id, some_count, queue.captured, queue.total_before_drain
-        //     );
-        // }
-        // for (cpu_id, task) in dump.current_tasks.iter().enumerate().take(dump.num_cores) {
-        //     match task {
-        //         Some(task) => {
-        //             let stack_size = task.stack_size.load(core::sync::atomic::Ordering::Acquire);
-        //             let guard_page = task.guard_page.load(core::sync::atomic::Ordering::Acquire);
-
-        //             println!(
-        //                 "  CPU {}: current_task stack_size={} guard_page={:#x}",
-        //                 cpu_id, stack_size, guard_page
-        //             );
-        //         }
-        //         None => {
-        //             println!("  CPU {}: current_task=None", cpu_id);
-        //         }
-        //     }
-        // }
-        unsafe {
-            if let Some(a) = APIC.lock().as_ref() {
-                a.lapic.send_ipi(IpiDest::AllExcludingSelf, IpiKind::Nmi)
-            }
-        }
 
         halt_loop()
     } else {

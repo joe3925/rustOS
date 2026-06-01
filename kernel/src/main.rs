@@ -62,6 +62,7 @@ use kernel_abi::{RUSTOS_BOOT_INFO_MAGIC, RUSTOS_BOOT_INFO_VERSION};
 use lazy_static::lazy_static;
 
 static mut BOOT_INFO: BootInfo = BootInfo::empty();
+
 static BOOT_INFO_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut BOOT_MEMORY_REGIONS: [MemoryRegion; MAX_BOOT_MEMORY_REGIONS] =
     [MemoryRegion::empty(); MAX_BOOT_MEMORY_REGIONS];
@@ -99,7 +100,6 @@ pub extern "win64" fn kernel_pe_entry(boot_info: *const BootInfo) -> ! {
 
     loop {}
 }
-
 unsafe fn copy_boot_info(src: &BootInfo) {
     BOOT_KERNEL_SYMBOL_STRING_LEN = 0;
 
@@ -246,14 +246,6 @@ fn copy_framebuffer(src: &Optional<FrameBuffer>) -> Optional<FrameBuffer> {
     }
 }
 
-#[inline]
-pub fn total_usable_bytes(regions: &[MemoryRegion]) -> u128 {
-    regions
-        .iter()
-        .filter(|r| r.kind == MemoryRegionKind::Usable && r.end > r.start)
-        .map(|r| (r.end - r.start) as u128)
-        .sum()
-}
 fn reserve_low_2mib(regions: &mut [MemoryRegion]) {
     const LOW_START: u64 = 0;
     const LOW_END: u64 = 0x20_0000;

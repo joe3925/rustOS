@@ -73,7 +73,7 @@ impl Platform for KernelPlatform {
 
     fn spawn_thread(name: String, entry: ThreadEntry, context: usize) {
         let task = Task::new_kernel_mode(entry, context, StackSize::Tiny, name, 0);
-        SCHEDULER.spawn_task(task);
+        SCHEDULER.add_task(task);
     }
 
     #[inline]

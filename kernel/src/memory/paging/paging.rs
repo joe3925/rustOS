@@ -3,6 +3,7 @@ use crate::drivers::interrupt_index::IpiKind;
 use crate::drivers::interrupt_index::LocalApic;
 use crate::drivers::timer_driver::NUM_CORES;
 use crate::idt::TLB_FLUSH_VECTOR;
+use crate::util::MAX_CPUS;
 use crate::{
     cpu::get_cpu_info,
     drivers::interrupt_index::{current_cpu_id, send_eoi, APIC},
@@ -24,7 +25,6 @@ use x86_64::{
     PhysAddr, VirtAddr,
 };
 
-const TLB_SHOOTDOWN_MAX_CPUS: usize = 256;
 const TLB_SHOOTDOWN_MODE_FULL: usize = 0;
 const TLB_SHOOTDOWN_MODE_RANGES: usize = 1;
 const TLB_SHOOTDOWN_RANGE_FLUSH_PAGE_LIMIT: u64 = 4096;
@@ -32,8 +32,7 @@ const CANONICAL_LOW_END: u64 = 1 << 47;
 
 static TLB_SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static TLB_SHOOTDOWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static TLB_SHOOTDOWN_ACKS: [AtomicU64; TLB_SHOOTDOWN_MAX_CPUS] =
-    [const { AtomicU64::new(0) }; TLB_SHOOTDOWN_MAX_CPUS];
+static TLB_SHOOTDOWN_ACKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TLB_SHOOTDOWN_MODE: AtomicUsize = AtomicUsize::new(TLB_SHOOTDOWN_MODE_FULL);
 static TLB_SHOOTDOWN_RANGES: AtomicPtr<TlbShootdownRange> = AtomicPtr::new(null_mut());
 static TLB_SHOOTDOWN_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1033,7 +1032,7 @@ fn flush_current_tlb_shootdown_request() {
 extern "win64" fn tlb_flush_ipi() {
     flush_current_tlb_shootdown_request();
     let cpu = current_cpu_id();
-    if cpu < TLB_SHOOTDOWN_MAX_CPUS {
+    if cpu < MAX_CPUS {
         let sequence = TLB_SHOOTDOWN_SEQUENCE.load(Ordering::SeqCst);
         TLB_SHOOTDOWN_ACKS[cpu].store(sequence, Ordering::SeqCst);
     }
@@ -1089,10 +1088,10 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
     }
 
     assert!(
-        cpu_count <= TLB_SHOOTDOWN_MAX_CPUS,
+        cpu_count <= MAX_CPUS,
         "TLB shootdown CPU count {} exceeds ack table size {}",
         cpu_count,
-        TLB_SHOOTDOWN_MAX_CPUS
+        MAX_CPUS
     );
     assert!(
         instructions::interrupts::are_enabled(),
@@ -1125,7 +1124,7 @@ fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
         }
     }
     flush_tlb_shootdown_request(ranges);
-    if current_cpu < TLB_SHOOTDOWN_MAX_CPUS {
+    if current_cpu < MAX_CPUS {
         TLB_SHOOTDOWN_ACKS[current_cpu].store(sequence, Ordering::SeqCst);
     }
 

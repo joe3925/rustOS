@@ -8,6 +8,7 @@ use kernel_types::object_manager::OmError;
 use x86_64::instructions::interrupts;
 
 use crate::memory::heap::allocator::KernelAllocator;
+use crate::scheduling::task::TaskError;
 use crate::{
     benchmarking::{
         bench_log_span_end, bench_span_guard, bench_submit_rip_sample, BenchSpanGuard, BenchWindow,
@@ -39,7 +40,7 @@ use crate::{
             block_on as kernel_block_on, spawn as kernel_spawn,
             spawn_blocking as kernel_spawn_blocking, spawn_detached as kernel_spawn_detached,
         },
-        scheduler::{TaskError, SCHEDULER},
+        scheduler::SCHEDULER,
         task::Task,
     },
     structs::stopwatch::Stopwatch,

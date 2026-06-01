@@ -1,4 +1,5 @@
 use crate::cpu::get_cpu_info;
+use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
 use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
@@ -6,11 +7,15 @@ use crate::memory::paging::virt_tracker::unmap_range;
 use crate::scheduling::scheduler::task_return_trampoline;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
+use crate::vec::Vec;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use core::arch::naked_asm;
+use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
+use spin::Mutex;
 use spin::RwLock;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
@@ -421,7 +426,391 @@ fn initial_win64_entry_rsp(stack_top: u64) -> u64 {
     // [rsp] return address, [rsp+8..rsp+40) caller-allocated shadow space.
     (stack_top & !0xf).saturating_sub(WIN64_ENTRY_FRAME_BYTES)
 }
+pub(crate) struct CurrentTask {
+    ptr: AtomicPtr<TaskRef>,
+}
 
+impl CurrentTask {
+    #[inline(always)]
+    pub(crate) fn new(task: &TaskHandle) -> Self {
+        Self {
+            ptr: AtomicPtr::new(Arc::as_ptr(task) as *mut TaskRef),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn store(&self, task: &TaskHandle) {
+        self.ptr
+            .store(Arc::as_ptr(task) as *mut TaskRef, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub(crate) fn load(&self) -> Option<TaskHandle> {
+        let p = self.ptr.load(Ordering::Acquire);
+        if p.is_null() {
+            return None;
+        }
+
+        unsafe {
+            Arc::increment_strong_count(p);
+            Some(Arc::from_raw(p))
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_task(&self, task: &TaskHandle) -> bool {
+        let p = self.ptr.load(Ordering::Acquire);
+        core::ptr::eq(p, Arc::as_ptr(task) as *mut TaskRef)
+    }
+}
+
+const TASK_ID_INDEX_BITS: u64 = 32;
+const TASK_ID_INDEX_MASK: u64 = (1u64 << TASK_ID_INDEX_BITS) - 1;
+const TASK_ID_MAX_GENERATION: u64 = 1u64 << (64 - TASK_ID_INDEX_BITS);
+
+#[derive(Debug)]
+#[repr(u32)]
+pub enum TaskError {
+    NotFound(u64),
+}
+
+const TASK_SLOT_EMPTY: usize = 0;
+const TASK_SLOT_RESERVED: usize = 1;
+const TASK_SLOT_LIVE: usize = 2;
+const TASK_SLOT_RETIRED: usize = 3;
+const TASK_SLOT_REAPING: usize = 4;
+
+struct TaskSlot {
+    generation: AtomicU64,
+    readers: AtomicUsize,
+    retired_next: AtomicUsize,
+    ptr: AtomicPtr<TaskRef>,
+    state: AtomicUsize,
+}
+
+pub(crate) struct TaskTable {
+    slots: Box<[TaskSlot]>,
+    free_hint: AtomicUsize,
+    retired_head: AtomicUsize,
+    reap_lock: Mutex<()>,
+}
+
+impl TaskSlot {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            readers: AtomicUsize::new(0),
+            retired_next: AtomicUsize::new(0),
+            ptr: AtomicPtr::new(core::ptr::null_mut()),
+            state: AtomicUsize::new(TASK_SLOT_EMPTY),
+        }
+    }
+}
+
+impl TaskTable {
+    pub(crate) fn new(initial_slots: usize) -> Self {
+        if initial_slots == 0 || initial_slots as u64 > TASK_ID_INDEX_MASK {
+            panic!("bad fixed task table capacity");
+        }
+
+        let slot_count = initial_slots
+            .checked_add(1)
+            .expect("fixed task table capacity overflow");
+        let mut slots = Vec::with_capacity(slot_count);
+
+        for _ in 0..slot_count {
+            slots.push(TaskSlot::new());
+        }
+
+        Self {
+            slots: slots.into_boxed_slice(),
+            free_hint: AtomicUsize::new(0),
+            retired_head: AtomicUsize::new(0),
+            reap_lock: Mutex::new(()),
+        }
+    }
+
+    #[inline(always)]
+    fn readable_state(state: usize) -> bool {
+        state == TASK_SLOT_LIVE
+    }
+
+    #[inline(always)]
+    fn make_id(idx: usize, generation: u64) -> u64 {
+        if idx == 0 || idx as u64 > TASK_ID_INDEX_MASK {
+            panic!("task id index overflow");
+        }
+        if generation >= TASK_ID_MAX_GENERATION {
+            panic!("task id generation overflow");
+        }
+
+        (generation << TASK_ID_INDEX_BITS) | idx as u64
+    }
+
+    #[inline(always)]
+    fn decode_id(id: u64) -> Option<(usize, u64)> {
+        let idx = (id & TASK_ID_INDEX_MASK) as usize;
+        let generation = id >> TASK_ID_INDEX_BITS;
+
+        if idx == 0 {
+            return None;
+        }
+
+        Some((idx, generation))
+    }
+
+    #[inline(always)]
+    fn slot(&self, idx: usize) -> Option<&TaskSlot> {
+        if idx == 0 {
+            return None;
+        }
+
+        self.slots.get(idx)
+    }
+
+    #[inline(always)]
+    fn try_insert_at(&self, idx: usize, task: &TaskHandle) -> Option<u64> {
+        let slot = self.slot(idx)?;
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_EMPTY,
+                TASK_SLOT_RESERVED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        let generation = slot.generation.load(Ordering::Acquire);
+        let id = Self::make_id(idx, generation);
+        task.set_task_id(id);
+
+        let raw = Arc::into_raw(task.clone()) as *mut TaskRef;
+        slot.retired_next.store(0, Ordering::Release);
+        slot.ptr.store(raw, Ordering::Release);
+        slot.state.store(TASK_SLOT_LIVE, Ordering::Release);
+        Some(id)
+    }
+
+    pub(crate) fn insert(&self, task: &TaskHandle) -> Option<u64> {
+        let hinted = self.free_hint.swap(0, Ordering::AcqRel);
+
+        if hinted != 0 && hinted < self.slots.len() {
+            if let Some(id) = self.try_insert_at(hinted, task) {
+                return Some(id);
+            }
+        }
+
+        for idx in 1..self.slots.len() {
+            if let Some(id) = self.try_insert_at(idx, task) {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, id: u64) -> Option<TaskHandle> {
+        let (idx, generation) = Self::decode_id(id)?;
+        let slot = self.slot(idx)?;
+
+        let state = slot.state.load(Ordering::Acquire);
+        if !Self::readable_state(state) {
+            return None;
+        }
+
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+
+        slot.readers.fetch_add(1, Ordering::Acquire);
+
+        let state = slot.state.load(Ordering::Acquire);
+        if !Self::readable_state(state) || slot.generation.load(Ordering::Acquire) != generation {
+            slot.readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+
+        let p = slot.ptr.load(Ordering::Acquire);
+        if p.is_null() {
+            slot.readers.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+
+        unsafe {
+            Arc::increment_strong_count(p);
+        }
+
+        slot.readers.fetch_sub(1, Ordering::Release);
+
+        unsafe { Some(Arc::from_raw(p)) }
+    }
+
+    #[inline(always)]
+    fn push_retired_idx(&self, idx: usize) -> bool {
+        let Some(slot) = self.slot(idx) else {
+            return false;
+        };
+
+        let mut head = self.retired_head.load(Ordering::Acquire);
+        loop {
+            slot.retired_next.store(head, Ordering::Relaxed);
+            match self.retired_head.compare_exchange_weak(
+                head,
+                idx,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(new_head) => head = new_head,
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn retire(&self, id: u64, task: &TaskHandle) -> bool {
+        let Some((idx, generation)) = Self::decode_id(id) else {
+            return false;
+        };
+
+        let Some(slot) = self.slot(idx) else {
+            return false;
+        };
+
+        if slot.generation.load(Ordering::Acquire) != generation {
+            return false;
+        }
+
+        let expected = Arc::as_ptr(task) as *mut TaskRef;
+        if slot.ptr.load(Ordering::Acquire) != expected {
+            return false;
+        }
+
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_LIVE,
+                TASK_SLOT_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        if !self.push_retired_idx(idx) {
+            panic!("failed to enqueue retired task slot");
+        }
+
+        true
+    }
+
+    fn reap_one_retired_idx(&self, idx: usize) -> Option<*mut TaskRef> {
+        let Some(slot) = self.slot(idx) else {
+            return None;
+        };
+
+        if slot.state.load(Ordering::Acquire) != TASK_SLOT_RETIRED {
+            return None;
+        }
+
+        if slot.readers.load(Ordering::Acquire) != 0 {
+            if !self.push_retired_idx(idx) {
+                panic!("failed to requeue retired task slot");
+            }
+            return None;
+        }
+
+        if slot
+            .state
+            .compare_exchange(
+                TASK_SLOT_RETIRED,
+                TASK_SLOT_REAPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+
+        if slot.readers.load(Ordering::Acquire) != 0 {
+            slot.state.store(TASK_SLOT_RETIRED, Ordering::Release);
+            if !self.push_retired_idx(idx) {
+                panic!("failed to requeue retired task slot");
+            }
+            return None;
+        }
+
+        let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
+
+        if slot
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |g| {
+                let next = g.checked_add(1)?;
+                if next >= TASK_ID_MAX_GENERATION {
+                    None
+                } else {
+                    Some(next)
+                }
+            })
+            .is_err()
+        {
+            panic!("task slot generation exhausted");
+        }
+
+        slot.retired_next.store(0, Ordering::Release);
+        slot.state.store(TASK_SLOT_EMPTY, Ordering::Release);
+        self.free_hint.store(idx, Ordering::Release);
+
+        if p.is_null() {
+            None
+        } else {
+            Some(p)
+        }
+    }
+
+    pub(crate) fn reap_retired(&self) {
+        if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Some(_guard) = self.reap_lock.try_lock() else {
+            return;
+        };
+
+        let mut curr = self.retired_head.swap(0, Ordering::AcqRel);
+        let mut checked = 0usize;
+
+        while curr != 0 {
+            checked += 1;
+
+            let idx = curr;
+            let next = match self.slot(curr) {
+                Some(slot) => slot.retired_next.swap(0, Ordering::AcqRel),
+                None => 0,
+            };
+
+            if let Some(p) = self.reap_one_retired_idx(idx) {
+                unsafe {
+                    drop(Arc::from_raw(p));
+                }
+            }
+
+            curr = next;
+
+            if checked > self.slots.len() {
+                panic!("retired task slot list cycle detected");
+            }
+        }
+    }
+}
 #[unsafe(naked)]
 pub(crate) extern "win64" fn idle_task(_ctx: usize) {
     naked_asm!("3:", "hlt", "jmp 3b",);
