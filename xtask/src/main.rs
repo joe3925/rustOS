@@ -465,8 +465,8 @@ fn find_qemu() -> Result<PathBuf, String> {
 
     let names: &[&str] = if cfg!(windows) {
         &[
-            "qemu-system-x86_64.exe",
             "qemu-system-x86_64w.exe",
+            "qemu-system-x86_64.exe",
             "qemu-system-x86_64",
         ]
     } else {
@@ -498,10 +498,10 @@ fn qemu_fallback_paths() -> Vec<PathBuf> {
 
     if cfg!(windows) {
         paths.extend([
-            PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64.exe"),
             PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64w.exe"),
-            PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe"),
+            PathBuf::from(r"C:\Program Files\qemu\qemu-system-x86_64.exe"),
             PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64w.exe"),
+            PathBuf::from(r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe"),
         ]);
     }
 
@@ -645,6 +645,12 @@ fn qemu_args(
     let firmware_path = path_string(firmware)?;
     let boot_image_path = qemu_path_string(root, boot_image)?;
     let system_disk_path = qemu_path_string(root, &system_disk.path)?;
+    let firmware_drive = drive_arg(&[
+        ("if", "pflash"),
+        ("format", "raw"),
+        ("readonly", "on"),
+        ("file", &firmware_path),
+    ]);
     let boot_drive = drive_arg(&[("file", &boot_image_path), ("format", "raw")]);
     let system_drive = drive_arg(&[
         ("file", &system_disk_path),
@@ -661,7 +667,7 @@ fn qemu_args(
         "-machine".into(),
         "q35".into(),
         "-accel".into(),
-        accel.into(),
+        accel.clone().into(),
         "-smp".into(),
         smp.into(),
     ];
@@ -670,11 +676,15 @@ fn qemu_args(
         args.extend(["-S".into(), "-gdb".into(), gdb.into()]);
     }
 
+    args.extend(["-device".into(), iommu_device.into()]);
+
+    if accel == "whpx" {
+        args.extend(["-bios".into(), firmware_path.into()]);
+    } else {
+        args.extend(["-drive".into(), firmware_drive.into()]);
+    }
+
     args.extend([
-        "-device".into(),
-        iommu_device.into(),
-        "-bios".into(),
-        firmware_path.into(),
         "-vga".into(),
         "std".into(),
         "-drive".into(),
@@ -688,7 +698,6 @@ fn qemu_args(
 
     Ok(args)
 }
-
 fn qemu_accel(qemu: &Path, options: &QemuOptions) -> String {
     if let Ok(accel) = env::var("RUSTOS_QEMU_ACCEL") {
         if !accel.is_empty() {
