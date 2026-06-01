@@ -2,7 +2,10 @@ use crate::{
     memory::paging::{
         constants::{MANAGED_KERNEL_RANGE_END, MANAGED_KERNEL_RANGE_START},
         frame_alloc::BootInfoFrameAllocator,
-        paging::{align_up_4k, map_range_with_huge_pages, unmap_range_impl},
+        paging::{
+            align_up_4k, map_contiguous_physical_range, map_range_with_huge_pages,
+            unmap_range_impl, TlbFlush,
+        },
         tables::init_mapper,
     },
     structs::range_tracker::{RangeAllocationError, RangeTracker},
@@ -12,10 +15,7 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
 use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
-use x86_64::{
-    structures::paging::{Mapper, Page, PageTableFlags, PhysFrame, Size1GiB, Size2MiB, Size4KiB},
-    PhysAddr, VirtAddr,
-};
+use x86_64::{structures::paging::PageTableFlags, VirtAddr};
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;
 static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
@@ -106,14 +106,17 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped_contiguous(
         BootInfoFrameAllocator::allocate_contiguous_frames_aligned(num_pages, phys_align_frames)
             .ok_or(PageMapError::NoMemory())?;
 
-    map_contiguous_range(
-        &mut mapper,
-        &mut frame_allocator,
-        addr,
-        phys_base,
-        align_size,
-        flags,
-    )?;
+    unsafe {
+        map_contiguous_physical_range(
+            &mut mapper,
+            &mut frame_allocator,
+            addr,
+            phys_base,
+            align_size,
+            flags,
+            TlbFlush::Flush,
+        )
+    }?;
 
     Ok(addr)
 }
@@ -204,79 +207,4 @@ pub extern "win64" fn unmap_range(virtual_addr: VirtAddr, size: u64) {
     deallocate_kernel_range(virtual_addr, size);
 
     unsafe { unmap_range_impl(virtual_addr, size) };
-}
-
-fn map_contiguous_range<M>(
-    mapper: &mut M,
-    frame_allocator: &mut BootInfoFrameAllocator,
-    virt_base: VirtAddr,
-    phys_base: PhysAddr,
-    size: u64,
-    flags: PageTableFlags,
-) -> Result<(), PageMapError>
-where
-    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
-{
-    use crate::cpu::get_cpu_info;
-
-    let mut cur_virt = virt_base.as_u64();
-    let mut cur_phys = phys_base.as_u64();
-    let mut remaining = align_up_4k(size);
-    let gib = 1u64 << 30;
-    let mib2 = 2u64 << 20;
-    let huge_flags = flags | PageTableFlags::HUGE_PAGE;
-    let supports_1g = get_cpu_info()
-        .get_extended_processor_and_feature_identifiers()
-        .expect("CPUID unavailable")
-        .has_1gib_pages();
-
-    while remaining > 0 {
-        if supports_1g
-            && remaining >= gib
-            && (cur_virt & (gib - 1)) == 0
-            && (cur_phys & (gib - 1)) == 0
-        {
-            let page = Page::<Size1GiB>::containing_address(VirtAddr::new(cur_virt));
-            let frame = PhysFrame::<Size1GiB>::containing_address(PhysAddr::new(cur_phys));
-            unsafe {
-                mapper
-                    .map_to(page, frame, huge_flags, frame_allocator)
-                    .map_err(PageMapError::Page1GiB)?
-                    .flush();
-            }
-            cur_virt += gib;
-            cur_phys += gib;
-            remaining -= gib;
-            continue;
-        }
-
-        if remaining >= mib2 && (cur_virt & (mib2 - 1)) == 0 && (cur_phys & (mib2 - 1)) == 0 {
-            let page = Page::<Size2MiB>::containing_address(VirtAddr::new(cur_virt));
-            let frame = PhysFrame::<Size2MiB>::containing_address(PhysAddr::new(cur_phys));
-            unsafe {
-                mapper
-                    .map_to(page, frame, huge_flags, frame_allocator)
-                    .map_err(PageMapError::Page2MiB)?
-                    .flush();
-            }
-            cur_virt += mib2;
-            cur_phys += mib2;
-            remaining -= mib2;
-            continue;
-        }
-
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(cur_virt));
-        let frame = PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(cur_phys));
-        unsafe {
-            mapper
-                .map_to(page, frame, flags, frame_allocator)
-                .map_err(PageMapError::Page4KiB)?
-                .flush();
-        }
-        cur_virt += 0x1000;
-        cur_phys += 0x1000;
-        remaining -= 0x1000;
-    }
-
-    Ok(())
 }

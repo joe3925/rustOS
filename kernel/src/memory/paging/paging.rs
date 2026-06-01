@@ -16,8 +16,9 @@ use kernel_types::status::PageMapError;
 use x86_64::{
     instructions,
     structures::paging::{
-        mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size1GiB,
-        Size2MiB, Size4KiB,
+        mapper::{MapToError, MapperFlush},
+        FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size1GiB, Size2MiB,
+        Size4KiB,
     },
     PhysAddr, VirtAddr,
 };
@@ -31,6 +32,20 @@ static TLB_SHOOTDOWN_ACKS: [AtomicU64; TLB_SHOOTDOWN_MAX_CPUS] =
 
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum TlbFlush {
+    Flush,
+    Defer,
+}
+
+#[inline(always)]
+fn finish_mapping<S: PageSize>(flush: MapperFlush<S>, mode: TlbFlush) {
+    match mode {
+        TlbFlush::Flush => flush.flush(),
+        TlbFlush::Defer => flush.ignore(),
+    }
 }
 
 // TODO: it is possible to remove all this unsafe, not urgent.
@@ -49,24 +64,15 @@ pub unsafe fn map_range_with_huge_pages<M>(
 where
     M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
 {
-    map_range_with_huge_pages_impl(mapper, addr, size, fa, flags, ignore_already_mapped, true)
-}
-
-/// SAFETY: Same as `map_range_with_huge_pages`. The caller must only use this
-/// for fresh virtual ranges that have not been accessed since they became
-/// unmapped, so there cannot be a stale present TLB entry.
-pub unsafe fn map_fresh_range_with_huge_pages_no_flush<M>(
-    mapper: &mut M,
-    addr: VirtAddr,
-    size: u64,
-    fa: &mut BootInfoFrameAllocator,
-    flags: PageTableFlags,
-    ignore_already_mapped: bool,
-) -> Result<(), PageMapError>
-where
-    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
-{
-    map_range_with_huge_pages_impl(mapper, addr, size, fa, flags, ignore_already_mapped, false)
+    map_range_with_huge_pages_impl(
+        mapper,
+        addr,
+        size,
+        fa,
+        flags,
+        ignore_already_mapped,
+        TlbFlush::Flush,
+    )
 }
 
 unsafe fn map_range_with_huge_pages_impl<M>(
@@ -76,7 +82,7 @@ unsafe fn map_range_with_huge_pages_impl<M>(
     fa: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
     ignore_already_mapped: bool,
-    flush_each: bool,
+    flush: TlbFlush,
 ) -> Result<(), PageMapError>
 where
     M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
@@ -93,7 +99,7 @@ where
 
     while remaining > 0 {
         if supports_1g && remaining >= gib && (cur.as_u64() & (gib - 1)) == 0 {
-            match unsafe { map_1gib_page_inner(mapper, cur, flags, fa, flush_each) } {
+            match unsafe { map_1gib_page_inner(mapper, cur, flags, fa, flush) } {
                 Ok(_) => {
                     cur += gib;
                     remaining -= gib;
@@ -117,7 +123,7 @@ where
         }
 
         if remaining >= mib2 && (cur.as_u64() & (mib2 - 1)) == 0 {
-            match unsafe { map_2mib_page_inner(mapper, cur, flags, fa, flush_each) } {
+            match unsafe { map_2mib_page_inner(mapper, cur, flags, fa, flush) } {
                 Ok(_) => {
                     cur += mib2;
                     remaining -= mib2;
@@ -141,7 +147,7 @@ where
         }
 
         let page4k = Page::<Size4KiB>::containing_address(cur);
-        match unsafe { map_page_inner(mapper, page4k, fa, flags, flush_each) } {
+        match unsafe { map_page_inner(mapper, page4k, fa, flags, flush) } {
             Ok(_) => {}
             Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {}
             Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {}
@@ -190,6 +196,28 @@ unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: U
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
+    unsafe {
+        unmap_range_with_mapper(
+            &mut mapper,
+            &mut frame_allocator,
+            virtual_addr,
+            size,
+            mode,
+            TlbFlush::Flush,
+        );
+    }
+}
+
+unsafe fn unmap_range_with_mapper<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    virtual_addr: VirtAddr,
+    size: u64,
+    mode: UnmapFrameMode,
+    flush_mode: TlbFlush,
+) where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
     // Constants
     const GI_B: u64 = 1 << 30;
     const MI_B2: u64 = 2 * 1024 * 1024;
@@ -202,7 +230,7 @@ unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: U
         // Try 1 GiB page
         if remaining >= GI_B
             && (cur.as_u64() & (GI_B - 1)) == 0
-            && unmap_page::<Size1GiB>(&mut mapper, &mut frame_allocator, cur, mode)
+            && unmap_page::<Size1GiB>(mapper, frame_allocator, cur, mode, flush_mode)
         {
             cur += GI_B;
             remaining -= GI_B;
@@ -212,7 +240,7 @@ unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: U
         // Try 2 MiB page
         if remaining >= MI_B2
             && (cur.as_u64() & (MI_B2 - 1)) == 0
-            && unmap_page::<Size2MiB>(&mut mapper, &mut frame_allocator, cur, mode)
+            && unmap_page::<Size2MiB>(mapper, frame_allocator, cur, mode, flush_mode)
         {
             cur += MI_B2;
             remaining -= MI_B2;
@@ -220,7 +248,7 @@ unsafe fn unmap_range_with_frame_mode(virtual_addr: VirtAddr, size: u64, mode: U
         }
 
         // Fall back to 4 KiB page
-        if unmap_page::<Size4KiB>(&mut mapper, &mut frame_allocator, cur, mode) {
+        if unmap_page::<Size4KiB>(mapper, frame_allocator, cur, mode, flush_mode) {
             // nothing else to do
         }
         cur += KI_B4;
@@ -235,11 +263,12 @@ fn unmap_page<S: x86_64::structures::paging::page::PageSize>(
     frame_allocator: &mut BootInfoFrameAllocator,
     addr: VirtAddr,
     mode: UnmapFrameMode,
+    flush_mode: TlbFlush,
 ) -> bool {
     let page = Page::<S>::containing_address(addr);
     match mapper.unmap(page) {
         Ok((frame, flush)) => {
-            flush.flush();
+            finish_mapping(flush, flush_mode);
             // SAFETY: the frame is no longer mapped
             match mode {
                 UnmapFrameMode::Accounted => frame_allocator.deallocate_frame(frame),
@@ -299,34 +328,18 @@ pub unsafe extern "win64" fn identity_map_page(
 
     Ok(())
 }
-/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
-/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
-/// The best way to do this is to reserve the range you want to map manually.
-pub unsafe fn map_page(
-    mapper: &mut impl Mapper<Size4KiB>,
-    page: Page<Size4KiB>,
-    frame_allocator: &mut BootInfoFrameAllocator,
-    flags: PageTableFlags,
-) -> Result<(), MapToError<Size4KiB>> {
-    map_page_inner(mapper, page, frame_allocator, flags, true)
-}
-
 unsafe fn map_page_inner(
     mapper: &mut impl Mapper<Size4KiB>,
     page: Page<Size4KiB>,
     frame_allocator: &mut BootInfoFrameAllocator,
     flags: PageTableFlags,
-    flush: bool,
+    flush: TlbFlush,
 ) -> Result<(), MapToError<Size4KiB>> {
     let frame = frame_allocator
         .allocate_frame()
         .ok_or(MapToError::FrameAllocationFailed)?;
     match unsafe { mapper.map_to(page, frame, flags, frame_allocator) } {
-        Ok(map_flush) => {
-            if flush {
-                map_flush.flush();
-            }
-        }
+        Ok(map_flush) => finish_mapping(map_flush, flush),
         Err(err) => {
             frame_allocator.deallocate_frame(frame);
             return Err(err);
@@ -334,28 +347,443 @@ unsafe fn map_page_inner(
     }
     Ok(())
 }
-/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
-/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
-/// The best way to do this is to reserve the range you want to map manually.
-#[inline(always)]
-unsafe fn map_1gib_page<M>(
-    mapper: &mut M,
+
+unsafe fn map_existing_frame_inner<S>(
+    mapper: &mut impl Mapper<S>,
     addr: VirtAddr,
+    phys_addr: PhysAddr,
     flags: PageTableFlags,
-    fa: &mut BootInfoFrameAllocator,
-) -> Result<(), MapToError<Size1GiB>>
+    frame_allocator: &mut BootInfoFrameAllocator,
+    flush: TlbFlush,
+) -> Result<(), MapToError<S>>
 where
-    M: Mapper<Size1GiB>,
+    S: PageSize,
 {
-    map_1gib_page_inner(mapper, addr, flags, fa, true)
+    let page = Page::<S>::containing_address(addr);
+    let frame = PhysFrame::<S>::containing_address(phys_addr);
+    let effective_flags = if S::SIZE > Size4KiB::SIZE && !flags.contains(PageTableFlags::HUGE_PAGE)
+    {
+        flags | PageTableFlags::HUGE_PAGE
+    } else {
+        flags
+    };
+
+    let map_flush = unsafe { mapper.map_to(page, frame, effective_flags, frame_allocator) }?;
+    finish_mapping(map_flush, flush);
+    Ok(())
 }
 
+pub(crate) unsafe fn map_contiguous_physical_range<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    virt_base: VirtAddr,
+    phys_base: PhysAddr,
+    size: u64,
+    flags: PageTableFlags,
+    flush: TlbFlush,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    let mut cur_virt = virt_base;
+    let mut cur_phys = phys_base;
+    let mut remaining = align_up_4k(size);
+    let mut mapped = 0u64;
+    let gib = 1u64 << 30;
+    let mib2 = 2u64 * 1024 * 1024;
+    let supports_1g = get_cpu_info()
+        .get_extended_processor_and_feature_identifiers()
+        .expect("CPUID unavailable")
+        .has_1gib_pages();
+
+    while remaining > 0 {
+        if supports_1g
+            && remaining >= gib
+            && (cur_virt.as_u64() & (gib - 1)) == 0
+            && (cur_phys.as_u64() & (gib - 1)) == 0
+        {
+            match unsafe {
+                map_existing_frame_inner::<Size1GiB>(
+                    mapper,
+                    cur_virt,
+                    cur_phys,
+                    flags,
+                    frame_allocator,
+                    flush,
+                )
+            } {
+                Ok(()) => {
+                    cur_virt += gib;
+                    cur_phys = PhysAddr::new(cur_phys.as_u64() + gib);
+                    remaining -= gib;
+                    mapped += gib;
+                    continue;
+                }
+                Err(MapToError::FrameAllocationFailed) => {}
+                Err(e) => {
+                    unsafe {
+                        rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
+                    }
+                    return Err(PageMapError::Page1GiB(e));
+                }
+            }
+        }
+
+        if remaining >= mib2
+            && (cur_virt.as_u64() & (mib2 - 1)) == 0
+            && (cur_phys.as_u64() & (mib2 - 1)) == 0
+        {
+            match unsafe {
+                map_existing_frame_inner::<Size2MiB>(
+                    mapper,
+                    cur_virt,
+                    cur_phys,
+                    flags,
+                    frame_allocator,
+                    flush,
+                )
+            } {
+                Ok(()) => {
+                    cur_virt += mib2;
+                    cur_phys = PhysAddr::new(cur_phys.as_u64() + mib2);
+                    remaining -= mib2;
+                    mapped += mib2;
+                    continue;
+                }
+                Err(MapToError::FrameAllocationFailed) => {}
+                Err(e) => {
+                    unsafe {
+                        rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
+                    }
+                    return Err(PageMapError::Page2MiB(e));
+                }
+            }
+        }
+
+        match unsafe {
+            map_existing_frame_inner::<Size4KiB>(
+                mapper,
+                cur_virt,
+                cur_phys,
+                flags,
+                frame_allocator,
+                flush,
+            )
+        } {
+            Ok(()) => {
+                cur_virt += 0x1000;
+                cur_phys = PhysAddr::new(cur_phys.as_u64() + 0x1000);
+                remaining -= 0x1000;
+                mapped += 0x1000;
+            }
+            Err(e) => {
+                unsafe {
+                    rollback_existing_range_mapping(mapper, frame_allocator, virt_base, mapped);
+                }
+                return Err(PageMapError::Page4KiB(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+unsafe fn rollback_existing_range_mapping<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    virt_base: VirtAddr,
+    size: u64,
+) where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    if size != 0 {
+        unsafe {
+            unmap_range_with_mapper(
+                mapper,
+                frame_allocator,
+                virt_base,
+                size,
+                UnmapFrameMode::KeepFrames,
+                TlbFlush::Defer,
+            );
+        }
+    }
+}
+
+pub(crate) unsafe fn map_existing_kernel_range(
+    addr: VirtAddr,
+    phys_addr: PhysAddr,
+    size: u64,
+    flags: PageTableFlags,
+    flush: TlbFlush,
+) -> Result<(), PageMapError> {
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    unsafe {
+        map_contiguous_physical_range(
+            &mut mapper,
+            &mut frame_allocator,
+            addr,
+            phys_addr,
+            size,
+            flags,
+            flush,
+        )
+    }
+}
+
+/// Maps missing 2 MiB units in a fixed kernel virtual window.
+///
+/// `frame_cache` is indexed by 2 MiB unit. A non-zero entry means that unit is
+/// already backed and left untouched. New mappings are treated as fresh and do
+/// not flush TLB entries; callers must have flushed any previous unmap first.
+pub(crate) unsafe fn ensure_kernel_2mib_units_mapped(
+    base_addr: VirtAddr,
+    start_unit: usize,
+    units: usize,
+    frame_cache: &mut [usize],
+    flags: PageTableFlags,
+) -> Result<(), PageMapError> {
+    if units == 0 {
+        return Ok(());
+    }
+    let end_unit = start_unit
+        .checked_add(units)
+        .ok_or(PageMapError::NoMemory())?;
+    if end_unit > frame_cache.len() || (base_addr.as_u64() & (Size2MiB::SIZE - 1)) != 0 {
+        return Err(PageMapError::TranslationFailed());
+    }
+
+    let boot_info = boot_info();
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
+    let mut mapper = init_mapper(phys_mem_offset);
+    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
+
+    let mut unit = start_unit;
+    while unit < end_unit {
+        if frame_cache[unit] != 0 {
+            unit += 1;
+            continue;
+        }
+
+        let run_start = unit;
+        while unit < end_unit && frame_cache[unit] == 0 {
+            unit += 1;
+        }
+
+        unsafe {
+            map_fresh_2mib_unit_run(
+                &mut mapper,
+                &mut frame_allocator,
+                base_addr,
+                run_start,
+                unit - run_start,
+                frame_cache,
+                flags,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+unsafe fn map_fresh_2mib_unit_run<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    base_addr: VirtAddr,
+    start_unit: usize,
+    units: usize,
+    frame_cache: &mut [usize],
+    flags: PageTableFlags,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    if let Some(phys_base) = BootInfoFrameAllocator::allocate_contiguous_2mib_frames(units) {
+        return unsafe {
+            map_fresh_contiguous_2mib_unit_run(
+                mapper,
+                frame_allocator,
+                base_addr,
+                start_unit,
+                units,
+                frame_cache,
+                flags,
+                phys_base,
+            )
+        };
+    }
+
+    unsafe {
+        map_fresh_sparse_2mib_unit_run(
+            mapper,
+            frame_allocator,
+            base_addr,
+            start_unit,
+            units,
+            frame_cache,
+            flags,
+        )
+    }
+}
+
+unsafe fn map_fresh_contiguous_2mib_unit_run<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    base_addr: VirtAddr,
+    start_unit: usize,
+    units: usize,
+    frame_cache: &mut [usize],
+    flags: PageTableFlags,
+    phys_base: PhysAddr,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    let unit_size = Size2MiB::SIZE as usize;
+    for offset in 0..units {
+        let unit = start_unit + offset;
+        let virt = base_addr + (unit * unit_size) as u64;
+        let phys = PhysAddr::new(phys_base.as_u64() + (offset * unit_size) as u64);
+
+        match unsafe {
+            map_existing_frame_inner::<Size2MiB>(
+                mapper,
+                virt,
+                phys,
+                flags,
+                frame_allocator,
+                TlbFlush::Defer,
+            )
+        } {
+            Ok(()) => frame_cache[unit] = phys.as_u64() as usize,
+            Err(e) => {
+                unsafe {
+                    rollback_2mib_unit_mappings(
+                        mapper,
+                        frame_allocator,
+                        base_addr,
+                        start_unit,
+                        offset,
+                        frame_cache,
+                    );
+                }
+                for free_offset in offset..units {
+                    let free_phys =
+                        PhysAddr::new(phys_base.as_u64() + (free_offset * unit_size) as u64);
+                    frame_allocator
+                        .deallocate_frame(PhysFrame::<Size2MiB>::containing_address(free_phys));
+                }
+                return Err(PageMapError::Page2MiB(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+unsafe fn map_fresh_sparse_2mib_unit_run<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    base_addr: VirtAddr,
+    start_unit: usize,
+    units: usize,
+    frame_cache: &mut [usize],
+    flags: PageTableFlags,
+) -> Result<(), PageMapError>
+where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    let unit_size = Size2MiB::SIZE as usize;
+    for offset in 0..units {
+        let unit = start_unit + offset;
+        let Some(frame) =
+            <BootInfoFrameAllocator as FrameAllocator<Size2MiB>>::allocate_frame(frame_allocator)
+        else {
+            unsafe {
+                rollback_2mib_unit_mappings(
+                    mapper,
+                    frame_allocator,
+                    base_addr,
+                    start_unit,
+                    offset,
+                    frame_cache,
+                );
+            }
+            return Err(PageMapError::NoMemory());
+        };
+
+        let virt = base_addr + (unit * unit_size) as u64;
+        let phys = frame.start_address();
+        match unsafe {
+            map_existing_frame_inner::<Size2MiB>(
+                mapper,
+                virt,
+                phys,
+                flags,
+                frame_allocator,
+                TlbFlush::Defer,
+            )
+        } {
+            Ok(()) => frame_cache[unit] = phys.as_u64() as usize,
+            Err(e) => {
+                frame_allocator.deallocate_frame(frame);
+                unsafe {
+                    rollback_2mib_unit_mappings(
+                        mapper,
+                        frame_allocator,
+                        base_addr,
+                        start_unit,
+                        offset,
+                        frame_cache,
+                    );
+                }
+                return Err(PageMapError::Page2MiB(e));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+unsafe fn rollback_2mib_unit_mappings<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    base_addr: VirtAddr,
+    start_unit: usize,
+    units: usize,
+    frame_cache: &mut [usize],
+) where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    if units == 0 {
+        return;
+    }
+
+    let unit_size = Size2MiB::SIZE as usize;
+    unsafe {
+        unmap_range_with_mapper(
+            mapper,
+            frame_allocator,
+            base_addr + (start_unit * unit_size) as u64,
+            (units * unit_size) as u64,
+            UnmapFrameMode::Accounted,
+            TlbFlush::Defer,
+        );
+    }
+    for unit in start_unit..start_unit + units {
+        frame_cache[unit] = 0;
+    }
+}
 unsafe fn map_1gib_page_inner<M>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
     fa: &mut BootInfoFrameAllocator,
-    flush: bool,
+    flush: TlbFlush,
 ) -> Result<(), MapToError<Size1GiB>>
 where
     M: Mapper<Size1GiB>,
@@ -372,11 +800,7 @@ where
     };
 
     match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
-        Ok(map_flush) => {
-            if flush {
-                map_flush.flush();
-            }
-        }
+        Ok(map_flush) => finish_mapping(map_flush, flush),
         Err(err) => {
             fa.deallocate_frame(frame);
             return Err(err);
@@ -384,28 +808,12 @@ where
     }
     Ok(())
 }
-/// SAFETY: Does not check the kernel range allocator before mapping the requested range.
-/// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions
-/// The best way to do this is to reserve the range you want to map manually.
-#[inline(always)]
-unsafe fn map_2mib_page<M>(
-    mapper: &mut M,
-    addr: VirtAddr,
-    flags: PageTableFlags,
-    fa: &mut BootInfoFrameAllocator,
-) -> Result<(), MapToError<Size2MiB>>
-where
-    M: Mapper<Size2MiB>,
-{
-    map_2mib_page_inner(mapper, addr, flags, fa, true)
-}
-
 unsafe fn map_2mib_page_inner<M>(
     mapper: &mut M,
     addr: VirtAddr,
     flags: PageTableFlags,
     fa: &mut BootInfoFrameAllocator,
-    flush: bool,
+    flush: TlbFlush,
 ) -> Result<(), MapToError<Size2MiB>>
 where
     M: Mapper<Size2MiB>,
@@ -423,11 +831,7 @@ where
     };
 
     match unsafe { mapper.map_to(page, frame, effective_flags, fa) } {
-        Ok(map_flush) => {
-            if flush {
-                map_flush.flush();
-            }
-        }
+        Ok(map_flush) => finish_mapping(map_flush, flush),
         Err(err) => {
             fa.deallocate_frame(frame);
             return Err(err);
@@ -444,49 +848,34 @@ pub unsafe fn map_kernel_range(
     flags: PageTableFlags,
     ignore_already_mapped: bool,
 ) -> Result<(), PageMapError> {
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-    map_range_with_huge_pages(
-        &mut mapper,
-        addr,
-        size,
-        &mut frame_allocator,
-        flags,
-        ignore_already_mapped,
-    )
+    unsafe {
+        map_kernel_range_with_flush(addr, size, flags, ignore_already_mapped, TlbFlush::Flush)
+    }
 }
 
-pub(crate) unsafe fn map_kernel_2mib_frame(
+unsafe fn map_kernel_range_with_flush(
     addr: VirtAddr,
-    phys_addr: PhysAddr,
+    size: u64,
     flags: PageTableFlags,
-    flush: bool,
-) -> Result<(), MapToError<Size2MiB>> {
+    ignore_already_mapped: bool,
+    flush: TlbFlush,
+) -> Result<(), PageMapError> {
     let boot_info = boot_info();
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-    let page = Page::<Size2MiB>::containing_address(addr);
-    let frame = PhysFrame::<Size2MiB>::containing_address(phys_addr);
-    let effective_flags = if flags.contains(PageTableFlags::HUGE_PAGE) {
-        flags
-    } else {
-        flags | PageTableFlags::HUGE_PAGE
-    };
 
-    match unsafe { mapper.map_to(page, frame, effective_flags, &mut frame_allocator) } {
-        Ok(map_flush) => {
-            if flush {
-                map_flush.flush();
-            }
-        }
-        Err(err) => return Err(err),
+    unsafe {
+        map_range_with_huge_pages_impl(
+            &mut mapper,
+            addr,
+            size,
+            &mut frame_allocator,
+            flags,
+            ignore_already_mapped,
+            flush,
+        )
     }
-
-    Ok(())
 }
 
 /// SAFETY: Same as `map_kernel_range`. This skips TLB invalidation and is only
@@ -497,19 +886,9 @@ pub unsafe fn map_fresh_kernel_range_no_flush(
     flags: PageTableFlags,
     ignore_already_mapped: bool,
 ) -> Result<(), PageMapError> {
-    let boot_info = boot_info();
-    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-    let mut mapper = init_mapper(phys_mem_offset);
-    let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
-
-    map_fresh_range_with_huge_pages_no_flush(
-        &mut mapper,
-        addr,
-        size,
-        &mut frame_allocator,
-        flags,
-        ignore_already_mapped,
-    )
+    unsafe {
+        map_kernel_range_with_flush(addr, size, flags, ignore_already_mapped, TlbFlush::Defer)
+    }
 }
 
 extern "win64" fn tlb_flush_ipi() {

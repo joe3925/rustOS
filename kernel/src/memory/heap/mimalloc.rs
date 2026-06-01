@@ -5,9 +5,9 @@ use crate::memory::heap::{
 };
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::{
-    map_kernel_2mib_frame, trigger_tlb_shootdown, unmap_range_keep_frames_unchecked,
+    ensure_kernel_2mib_units_mapped, map_existing_kernel_range, trigger_tlb_shootdown,
+    unmap_range_keep_frames_unchecked, TlbFlush,
 };
-use crate::memory::paging::tables::init_mapper;
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
 use core::alloc::Layout;
@@ -17,9 +17,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_abi::MemoryRegionKind;
 use x86_64::align_up;
 use x86_64::instructions::interrupts::without_interrupts;
-use x86_64::structures::paging::{
-    FrameAllocator, Mapper, Page, PageSize, PageTableFlags, PhysFrame, Size2MiB,
-};
+use x86_64::structures::paging::{PageSize, PageTableFlags, PhysFrame, Size2MiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 const PAGE_SIZE: usize = 4096;
@@ -770,6 +768,7 @@ impl RawLargeAllocator {
 
         self.set_run(new_base_unit, new_units);
 
+        let mut moved_units = 0usize;
         for offset in 0..meta.committed_units {
             let old_unit = meta.base_unit + offset;
             let new_unit = new_base_unit + offset;
@@ -777,9 +776,11 @@ impl RawLargeAllocator {
             if phys == 0
                 || !unsafe { self.replace_unit_mapping(new_unit, PhysAddr::new(phys as u64)) }
             {
+                unsafe { self.rollback_moved_units(new_base_unit, moved_units) };
                 self.clear_run(new_base_unit, new_units);
                 return null_mut();
             }
+            moved_units += 1;
         }
 
         if !unsafe {
@@ -788,6 +789,7 @@ impl RawLargeAllocator {
                 new_units - meta.committed_units,
             )
         } {
+            unsafe { self.rollback_moved_units(new_base_unit, moved_units) };
             self.clear_run(new_base_unit, new_units);
             return null_mut();
         }
@@ -814,129 +816,43 @@ impl RawLargeAllocator {
         Self::unit_addr(new_base_unit) as *mut u8
     }
 
+    unsafe fn rollback_moved_units(&mut self, base_unit: usize, units: usize) {
+        if units == 0 {
+            return;
+        }
+
+        unsafe {
+            unmap_range_keep_frames_unchecked(
+                VirtAddr::new(Self::unit_addr(base_unit) as u64),
+                (units * RAW_LARGE_UNIT_SIZE) as u64,
+            );
+        }
+        trigger_tlb_shootdown();
+        for unit in base_unit..base_unit + units {
+            self.frames[unit] = 0;
+        }
+    }
+
     unsafe fn ensure_units_mapped(&mut self, start: usize, units: usize) -> bool {
         if units == 0 {
             return true;
         }
 
-        let boot_info = boot_info();
-        let phys_mem_offset =
-            VirtAddr::new(boot_info.physical_memory_offset.into_option().unwrap());
-        let mut mapper = init_mapper(phys_mem_offset);
-        let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
         let flags = PageTableFlags::PRESENT
             | PageTableFlags::WRITABLE
             | PageTableFlags::HUGE_PAGE
             | PageTableFlags::NO_EXECUTE;
 
-        let end = start + units;
-        let mut unit = start;
-        while unit < end {
-            if self.frames[unit] != 0 {
-                unit += 1;
-                continue;
-            }
-
-            let run_start = unit;
-            while unit < end && self.frames[unit] == 0 {
-                unit += 1;
-            }
-            let run_units = unit - run_start;
-
-            match unsafe {
-                self.ensure_units_mapped_contiguous(
-                    run_start,
-                    run_units,
-                    &mut mapper,
-                    &mut frame_allocator,
-                    flags,
-                )
-            } {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(()) => return false,
-            }
-
-            for offset in 0..run_units {
-                let cur_unit = run_start + offset;
-                if !unsafe {
-                    self.ensure_unit_mapped_single(
-                        cur_unit,
-                        &mut mapper,
-                        &mut frame_allocator,
-                        flags,
-                    )
-                } {
-                    return false;
-                }
-            }
+        unsafe {
+            ensure_kernel_2mib_units_mapped(
+                VirtAddr::new(RAW_LARGE_HEAP_START as u64),
+                start,
+                units,
+                &mut self.frames,
+                flags,
+            )
+            .is_ok()
         }
-
-        true
-    }
-
-    unsafe fn ensure_units_mapped_contiguous(
-        &mut self,
-        start: usize,
-        units: usize,
-        mapper: &mut impl Mapper<Size2MiB>,
-        frame_allocator: &mut BootInfoFrameAllocator,
-        flags: PageTableFlags,
-    ) -> Result<bool, ()> {
-        let Some(phys_base) = BootInfoFrameAllocator::allocate_contiguous_2mib_frames(units) else {
-            return Ok(false);
-        };
-
-        for offset in 0..units {
-            let unit = start + offset;
-            let phys = PhysAddr::new(phys_base.as_u64() + (offset * RAW_LARGE_UNIT_SIZE) as u64);
-            let frame = PhysFrame::<Size2MiB>::containing_address(phys);
-            let page =
-                Page::<Size2MiB>::containing_address(VirtAddr::new(Self::unit_addr(unit) as u64));
-            let mapped = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
-
-            if mapped.is_err() {
-                for rollback_offset in offset..units {
-                    let rollback_phys = PhysAddr::new(
-                        phys_base.as_u64() + (rollback_offset * RAW_LARGE_UNIT_SIZE) as u64,
-                    );
-                    frame_allocator
-                        .deallocate_frame(PhysFrame::<Size2MiB>::containing_address(rollback_phys));
-                }
-                return Err(());
-            }
-
-            self.frames[unit] = phys.as_u64() as usize;
-        }
-
-        Ok(true)
-    }
-
-    unsafe fn ensure_unit_mapped_single(
-        &mut self,
-        unit: usize,
-        mapper: &mut impl Mapper<Size2MiB>,
-        frame_allocator: &mut BootInfoFrameAllocator,
-        flags: PageTableFlags,
-    ) -> bool {
-        let Some(frame) =
-            <BootInfoFrameAllocator as FrameAllocator<Size2MiB>>::allocate_frame(frame_allocator)
-        else {
-            return false;
-        };
-
-        let phys = frame.start_address();
-        let page =
-            Page::<Size2MiB>::containing_address(VirtAddr::new(Self::unit_addr(unit) as u64));
-        let mapped = unsafe { mapper.map_to(page, frame, flags, frame_allocator) };
-
-        if mapped.is_err() {
-            frame_allocator.deallocate_frame(frame);
-            return false;
-        }
-
-        self.frames[unit] = phys.as_u64() as usize;
-        true
     }
 
     unsafe fn replace_unit_mapping(&mut self, unit: usize, phys: PhysAddr) -> bool {
@@ -962,11 +878,12 @@ impl RawLargeAllocator {
             | PageTableFlags::HUGE_PAGE
             | PageTableFlags::NO_EXECUTE;
         if unsafe {
-            map_kernel_2mib_frame(
+            map_existing_kernel_range(
                 VirtAddr::new(Self::unit_addr(unit) as u64),
                 phys,
+                RAW_LARGE_UNIT_SIZE as u64,
                 flags,
-                false,
+                TlbFlush::Defer,
             )
         }
         .is_err()

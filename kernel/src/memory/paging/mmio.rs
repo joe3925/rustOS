@@ -1,25 +1,22 @@
-use core::sync::atomic::AtomicU64;
 use spin::Mutex;
 
 use kernel_types::status::PageMapError;
 use x86_64::{
-    structures::paging::{
-        mapper::MapToError, Mapper as _, Page, PageTableFlags, PhysFrame, Size1GiB, Size2MiB,
-        Size4KiB,
-    },
+    structures::paging::{Mapper as _, Page, PageTableFlags, Size1GiB, Size2MiB, Size4KiB},
     PhysAddr, VirtAddr,
 };
 
 use crate::{
     cpu::get_cpu_info,
     memory::paging::{
-        constants::MMIO_BASE, frame_alloc::BootInfoFrameAllocator, paging::align_up_4k,
-        tables::init_mapper, virt_tracker::allocate_auto_kernel_range_aligned,
+        frame_alloc::BootInfoFrameAllocator,
+        paging::{align_up_4k, map_contiguous_physical_range, TlbFlush},
+        tables::init_mapper,
+        virt_tracker::{allocate_auto_kernel_range_aligned, deallocate_kernel_range},
     },
     util::boot_info,
 };
 
-static NEXT_MMIO_VADDR: AtomicU64 = AtomicU64::new(MMIO_BASE);
 static MMIO_MAP_LOCK: Mutex<()> = Mutex::new(());
 
 const GIB: u64 = 1 << 30;
@@ -92,79 +89,20 @@ pub extern "win64" fn map_mmio_region_aligned(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    let supports_1g = get_cpu_info()
-        .get_extended_processor_and_feature_identifiers()
-        .expect("CPUID unavailable")
-        .has_1gib_pages();
-
     let base_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
-
-    let mut cur_v = virtual_addr;
-    let mut cur_p = aligned_phys;
-    let mut remaining = total_size;
-
-    while remaining > 0 {
-        if supports_1g
-            && remaining >= GIB
-            && (cur_v.as_u64() & (GIB - 1)) == 0
-            && (cur_p & (GIB - 1)) == 0
-        {
-            let page: Page<Size1GiB> = Page::containing_address(cur_v);
-            let frame: PhysFrame<Size1GiB> = PhysFrame::containing_address(PhysAddr::new(cur_p));
-            match unsafe {
-                mapper.map_to(
-                    page,
-                    frame,
-                    base_flags | PageTableFlags::HUGE_PAGE,
-                    &mut frame_allocator,
-                )
-            } {
-                Ok(flush) => {
-                    flush.flush();
-                    cur_v += GIB;
-                    cur_p += GIB;
-                    remaining -= GIB;
-                    continue;
-                }
-                Err(MapToError::FrameAllocationFailed) => {}
-                Err(e) => return Err(PageMapError::Page1GiB(e)),
-            }
-        }
-
-        if remaining >= MIB2 && (cur_v.as_u64() & (MIB2 - 1)) == 0 && (cur_p & (MIB2 - 1)) == 0 {
-            let page: Page<Size2MiB> = Page::containing_address(cur_v);
-            let frame: PhysFrame<Size2MiB> = PhysFrame::containing_address(PhysAddr::new(cur_p));
-            match unsafe {
-                mapper.map_to(
-                    page,
-                    frame,
-                    base_flags | PageTableFlags::HUGE_PAGE,
-                    &mut frame_allocator,
-                )
-            } {
-                Ok(flush) => {
-                    flush.flush();
-                    cur_v += MIB2;
-                    cur_p += MIB2;
-                    remaining -= MIB2;
-                    continue;
-                }
-                Err(MapToError::FrameAllocationFailed) => {}
-                Err(e) => return Err(PageMapError::Page2MiB(e)),
-            }
-        }
-
-        let page: Page<Size4KiB> = Page::containing_address(cur_v);
-        let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(cur_p));
-        unsafe {
-            mapper
-                .map_to(page, frame, base_flags, &mut frame_allocator)?
-                .flush();
-        }
-
-        cur_v += KIB4;
-        cur_p += KIB4;
-        remaining -= KIB4;
+    if let Err(err) = unsafe {
+        map_contiguous_physical_range(
+            &mut mapper,
+            &mut frame_allocator,
+            virtual_addr,
+            PhysAddr::new(aligned_phys),
+            total_size,
+            base_flags,
+            TlbFlush::Flush,
+        )
+    } {
+        deallocate_kernel_range(virtual_addr, total_size);
+        return Err(err);
     }
 
     Ok(VirtAddr::new(virtual_addr.as_u64() + off))
