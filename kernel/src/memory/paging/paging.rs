@@ -11,7 +11,8 @@ use crate::{
     KERNEL_INITIALIZED,
 };
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use kernel_types::status::PageMapError;
 use x86_64::{
     instructions,
@@ -24,11 +25,18 @@ use x86_64::{
 };
 
 const TLB_SHOOTDOWN_MAX_CPUS: usize = 256;
+const TLB_SHOOTDOWN_MODE_FULL: usize = 0;
+const TLB_SHOOTDOWN_MODE_RANGES: usize = 1;
+const TLB_SHOOTDOWN_RANGE_FLUSH_PAGE_LIMIT: u64 = 4096;
+const CANONICAL_LOW_END: u64 = 1 << 47;
 
 static TLB_SHOOTDOWN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 static TLB_SHOOTDOWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static TLB_SHOOTDOWN_ACKS: [AtomicU64; TLB_SHOOTDOWN_MAX_CPUS] =
     [const { AtomicU64::new(0) }; TLB_SHOOTDOWN_MAX_CPUS];
+static TLB_SHOOTDOWN_MODE: AtomicUsize = AtomicUsize::new(TLB_SHOOTDOWN_MODE_FULL);
+static TLB_SHOOTDOWN_RANGES: AtomicPtr<TlbShootdownRange> = AtomicPtr::new(null_mut());
+static TLB_SHOOTDOWN_RANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub const fn num_frames_4k(size: usize) -> usize {
     ((size + 0xFFF) >> 12)
@@ -38,6 +46,31 @@ pub const fn num_frames_4k(size: usize) -> usize {
 pub(crate) enum TlbFlush {
     Flush,
     Defer,
+}
+
+#[derive(Clone, Copy)]
+pub struct TlbShootdownRange {
+    pub start: VirtAddr,
+    pub size: u64,
+    page_size: u64,
+}
+
+impl TlbShootdownRange {
+    pub const fn new(start: VirtAddr, size: u64) -> Self {
+        Self {
+            start,
+            size,
+            page_size: Size4KiB::SIZE,
+        }
+    }
+
+    pub const fn new_2mib(start: VirtAddr, size: u64) -> Self {
+        Self {
+            start,
+            size,
+            page_size: Size2MiB::SIZE,
+        }
+    }
 }
 
 #[inline(always)]
@@ -891,8 +924,114 @@ pub unsafe fn map_fresh_kernel_range_no_flush(
     }
 }
 
+#[inline(always)]
+fn tlb_range_bounds(range: TlbShootdownRange) -> Option<(u64, u64)> {
+    let start = range.start.as_u64() & !(range.page_size - 1);
+    if range.size == 0 {
+        return Some((start, start));
+    }
+
+    let end_unaligned = range.start.as_u64().checked_add(range.size)?;
+    let end = end_unaligned
+        .checked_add(range.page_size - 1)
+        .map(|x| x & !(range.page_size - 1))?;
+    if end < start || (start < CANONICAL_LOW_END && end > CANONICAL_LOW_END) {
+        return None;
+    }
+
+    Some((start, end))
+}
+
+#[inline(always)]
+fn tlb_range_page_count(range: TlbShootdownRange) -> Option<u64> {
+    let (start, end) = tlb_range_bounds(range)?;
+    Some((end - start) / range.page_size)
+}
+
+fn tlb_ranges_page_count(ranges: &[TlbShootdownRange]) -> Option<u64> {
+    let mut total = 0u64;
+    for range in ranges {
+        total = total.checked_add(tlb_range_page_count(*range)?)?;
+    }
+    Some(total)
+}
+
+fn should_flush_all_for_tlb_ranges(ranges: &[TlbShootdownRange]) -> bool {
+    match tlb_ranges_page_count(ranges) {
+        Some(pages) => pages > TLB_SHOOTDOWN_RANGE_FLUSH_PAGE_LIMIT,
+        None => true,
+    }
+}
+
+fn flush_tlb_range(range: TlbShootdownRange) -> bool {
+    let Some((mut addr, end)) = tlb_range_bounds(range) else {
+        return false;
+    };
+
+    while addr < end {
+        let Ok(virt) = VirtAddr::try_new(addr) else {
+            return false;
+        };
+        instructions::tlb::flush(virt);
+        let Some(next) = addr.checked_add(range.page_size) else {
+            return false;
+        };
+        addr = next;
+    }
+
+    true
+}
+
+fn flush_tlb_ranges_or_all(ranges: &[TlbShootdownRange]) {
+    if should_flush_all_for_tlb_ranges(ranges) {
+        instructions::tlb::flush_all();
+        return;
+    }
+
+    for range in ranges {
+        if !flush_tlb_range(*range) {
+            instructions::tlb::flush_all();
+            return;
+        }
+    }
+}
+
+fn flush_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
+    match ranges {
+        Some(ranges) => flush_tlb_ranges_or_all(ranges),
+        None => instructions::tlb::flush_all(),
+    }
+}
+
+fn clear_tlb_shootdown_request() {
+    TLB_SHOOTDOWN_MODE.store(TLB_SHOOTDOWN_MODE_FULL, Ordering::SeqCst);
+    TLB_SHOOTDOWN_RANGES.store(null_mut(), Ordering::SeqCst);
+    TLB_SHOOTDOWN_RANGE_COUNT.store(0, Ordering::SeqCst);
+}
+
+fn flush_current_tlb_shootdown_request() {
+    if TLB_SHOOTDOWN_MODE.load(Ordering::SeqCst) != TLB_SHOOTDOWN_MODE_RANGES {
+        instructions::tlb::flush_all();
+        return;
+    }
+
+    let count = TLB_SHOOTDOWN_RANGE_COUNT.load(Ordering::SeqCst);
+    if count == 0 {
+        return;
+    }
+
+    let ptr = TLB_SHOOTDOWN_RANGES.load(Ordering::SeqCst);
+    if ptr.is_null() {
+        instructions::tlb::flush_all();
+        return;
+    }
+
+    let ranges = unsafe { core::slice::from_raw_parts(ptr as *const TlbShootdownRange, count) };
+    flush_tlb_ranges_or_all(ranges);
+}
+
 extern "win64" fn tlb_flush_ipi() {
-    instructions::tlb::flush_all();
+    flush_current_tlb_shootdown_request();
     let cpu = current_cpu_id();
     if cpu < TLB_SHOOTDOWN_MAX_CPUS {
         let sequence = TLB_SHOOTDOWN_SEQUENCE.load(Ordering::SeqCst);
@@ -925,10 +1064,27 @@ pub extern "win64" fn tlb_flush_entry() {
         handler = sym tlb_flush_ipi,
     );
 }
+
 pub fn trigger_tlb_shootdown() {
+    trigger_tlb_shootdown_request(None);
+}
+
+pub fn trigger_tlb_shootdown_range(start: VirtAddr, size: u64) {
+    let range = TlbShootdownRange::new(start, size);
+    trigger_tlb_shootdown_ranges(core::slice::from_ref(&range));
+}
+
+pub fn trigger_tlb_shootdown_ranges(ranges: &[TlbShootdownRange]) {
+    if matches!(tlb_ranges_page_count(ranges), Some(0)) {
+        return;
+    }
+    trigger_tlb_shootdown_request(Some(ranges));
+}
+
+fn trigger_tlb_shootdown_request(ranges: Option<&[TlbShootdownRange]>) {
     let cpu_count = NUM_CORES.load(Ordering::Acquire);
     if cpu_count <= 1 || !KERNEL_INITIALIZED.load(Ordering::Acquire) {
-        instructions::tlb::flush_all();
+        flush_tlb_shootdown_request(ranges);
         return;
     }
 
@@ -944,6 +1100,15 @@ pub fn trigger_tlb_shootdown() {
     );
 
     let _guard = TLB_SHOOTDOWN_LOCK.lock();
+    match ranges {
+        Some(ranges) => {
+            TLB_SHOOTDOWN_RANGES.store(ranges.as_ptr() as *mut TlbShootdownRange, Ordering::SeqCst);
+            TLB_SHOOTDOWN_RANGE_COUNT.store(ranges.len(), Ordering::SeqCst);
+            TLB_SHOOTDOWN_MODE.store(TLB_SHOOTDOWN_MODE_RANGES, Ordering::SeqCst);
+        }
+        None => clear_tlb_shootdown_request(),
+    }
+
     let sequence = TLB_SHOOTDOWN_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
     let current_cpu = current_cpu_id();
 
@@ -959,12 +1124,13 @@ pub fn trigger_tlb_shootdown() {
             sent = true;
         }
     }
-    instructions::tlb::flush_all();
+    flush_tlb_shootdown_request(ranges);
     if current_cpu < TLB_SHOOTDOWN_MAX_CPUS {
         TLB_SHOOTDOWN_ACKS[current_cpu].store(sequence, Ordering::SeqCst);
     }
 
     if !sent {
+        clear_tlb_shootdown_request();
         return;
     }
 
@@ -977,4 +1143,6 @@ pub fn trigger_tlb_shootdown() {
             core::hint::spin_loop();
         }
     }
+
+    clear_tlb_shootdown_request();
 }

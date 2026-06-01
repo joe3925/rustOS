@@ -5,8 +5,8 @@ use crate::memory::heap::{
 };
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::{
-    ensure_kernel_2mib_units_mapped, map_existing_kernel_range, trigger_tlb_shootdown,
-    unmap_range_keep_frames_unchecked, TlbFlush,
+    ensure_kernel_2mib_units_mapped, map_existing_kernel_range, trigger_tlb_shootdown_ranges,
+    unmap_range_keep_frames_unchecked, TlbFlush, TlbShootdownRange,
 };
 use crate::structs::linked_list::{LinkedList, ListNode};
 use crate::util::boot_info;
@@ -794,13 +794,13 @@ impl RawLargeAllocator {
             return null_mut();
         }
 
+        let old_addr = VirtAddr::new(Self::unit_addr(meta.base_unit) as u64);
+        let old_size = (meta.committed_units * RAW_LARGE_UNIT_SIZE) as u64;
         unsafe {
-            unmap_range_keep_frames_unchecked(
-                VirtAddr::new(Self::unit_addr(meta.base_unit) as u64),
-                (meta.committed_units * RAW_LARGE_UNIT_SIZE) as u64,
-            );
+            unmap_range_keep_frames_unchecked(old_addr, old_size);
         }
-        trigger_tlb_shootdown();
+        let ranges = [TlbShootdownRange::new_2mib(old_addr, old_size)];
+        trigger_tlb_shootdown_ranges(&ranges);
         for unit in meta.base_unit..meta.base_unit + meta.committed_units {
             self.frames[unit] = 0;
         }
@@ -821,13 +821,13 @@ impl RawLargeAllocator {
             return;
         }
 
+        let addr = VirtAddr::new(Self::unit_addr(base_unit) as u64);
+        let size = (units * RAW_LARGE_UNIT_SIZE) as u64;
         unsafe {
-            unmap_range_keep_frames_unchecked(
-                VirtAddr::new(Self::unit_addr(base_unit) as u64),
-                (units * RAW_LARGE_UNIT_SIZE) as u64,
-            );
+            unmap_range_keep_frames_unchecked(addr, size);
         }
-        trigger_tlb_shootdown();
+        let ranges = [TlbShootdownRange::new_2mib(addr, size)];
+        trigger_tlb_shootdown_ranges(&ranges);
         for unit in base_unit..base_unit + units {
             self.frames[unit] = 0;
         }
@@ -857,13 +857,15 @@ impl RawLargeAllocator {
 
     unsafe fn replace_unit_mapping(&mut self, unit: usize, phys: PhysAddr) -> bool {
         if self.frames[unit] != 0 {
+            let addr = VirtAddr::new(Self::unit_addr(unit) as u64);
             unsafe {
-                unmap_range_keep_frames_unchecked(
-                    VirtAddr::new(Self::unit_addr(unit) as u64),
-                    RAW_LARGE_UNIT_SIZE as u64,
-                );
+                unmap_range_keep_frames_unchecked(addr, RAW_LARGE_UNIT_SIZE as u64);
             }
-            trigger_tlb_shootdown();
+            let ranges = [TlbShootdownRange::new_2mib(
+                addr,
+                RAW_LARGE_UNIT_SIZE as u64,
+            )];
+            trigger_tlb_shootdown_ranges(&ranges);
 
             let boot_info = boot_info();
             let frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
