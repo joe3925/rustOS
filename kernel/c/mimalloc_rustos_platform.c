@@ -11,6 +11,7 @@
 extern void* rustos_mi_os_alloc(size_t size, size_t alignment);
 extern void rustos_mi_os_free(void* addr, size_t size);
 extern bool rustos_mi_os_commit(void* addr, size_t size);
+extern bool rustos_mi_os_decommit(void* addr, size_t size);
 extern size_t rustos_mi_physical_memory_kib(void);
 extern uint64_t rustos_mi_clock_now(void);
 extern bool rustos_mi_random_buf(void* buf, size_t len);
@@ -96,11 +97,12 @@ int _mi_prim_commit(void* addr, size_t size, bool* is_zero) {
 }
 
 int _mi_prim_decommit(void* addr, size_t size, bool* needs_recommit) {
-  (void)addr;
-  (void)size;
+  if (!rustos_mi_os_decommit(addr, size)) {
+    return RUSTOS_ENOMEM;
+  }
 
   if (needs_recommit != NULL) {
-    *needs_recommit = false;
+    *needs_recommit = true;
   }
 
   return 0;

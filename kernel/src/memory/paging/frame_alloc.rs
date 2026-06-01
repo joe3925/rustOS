@@ -113,6 +113,15 @@ pub fn total_usable_bytes() -> u64 {
     boot_usable + RECLAIMED_MEMORY_BYTES.load(Ordering::Acquire) as u64
 }
 
+pub fn boot_usable_bytes() -> u64 {
+    boot_info()
+        .memory_regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| r.end.saturating_sub(r.start))
+        .sum()
+}
+
 pub fn resize_bitmap_for_ram(total_ram_bytes: u64) -> Result<(), BitmapResizeError> {
     let physical_coverage_bytes = bitmap_physical_coverage_for_ram(total_ram_bytes)?;
     let (new_frames, new_words) = bitmap_layout_for_physical_coverage(physical_coverage_bytes)?;

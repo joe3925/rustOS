@@ -7,7 +7,6 @@ use crate::benchmarking::yield_once;
 
 use crate::benchmarking::BenchWindow;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::HEAP_SIZE;
 use crate::static_handlers::print;
 use crate::util::trigger_triple_fault;
 use alloc::format;

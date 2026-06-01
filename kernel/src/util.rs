@@ -20,10 +20,9 @@ use crate::idt::load_idt;
 use crate::lazy_static;
 use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
-use crate::memory::heap::{init_heap, HEAP_SIZE};
+use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::iommu::init_iommu;
-use crate::memory::paging::frame_alloc::resize_bitmap_for_ram;
-use crate::memory::paging::frame_alloc::total_usable_bytes;
+use crate::memory::paging::frame_alloc::{boot_usable_bytes, resize_bitmap_for_ram};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
@@ -198,9 +197,9 @@ pub unsafe fn init() {
 }
 pub extern "win64" fn kernel_main(ctx: usize) {
     crate::memory::heap::enable_mimalloc();
-    resize_bitmap_for_ram(total_usable_bytes()).expect(&format!(
+    resize_bitmap_for_ram(boot_usable_bytes()).expect(&format!(
         "Failed to resize phys frame bitmap to capacity {}",
-        total_usable_bytes()
+        boot_usable_bytes()
     ));
     init_executor_platform();
     GlobalAsyncExecutor::global().init(max(4, NUM_CORES.load(Ordering::Acquire)), 1_000_000);
@@ -328,7 +327,7 @@ pub fn trigger_breakpoint() {
 
 pub fn test_full_heap() {
     let time = Stopwatch::start();
-    let element_count = (HEAP_SIZE as usize / 4) / size_of::<u64>();
+    let element_count = (heap_capacity_bytes() as usize / 4) / size_of::<u64>();
 
     let mut vec: Vec<u64> = Vec::with_capacity(1);
     for i in 0..element_count {

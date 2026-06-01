@@ -1,7 +1,6 @@
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::memory::heap::buddylocked::BuddyLocked;
-
-use crate::memory::heap::HEAP_SIZE;
+use crate::memory::paging::frame_alloc::total_usable_bytes;
 use crate::memory::paging::stack::StackSize;
 use crate::println;
 use crate::scheduling::runtime::runtime::yield_now;
@@ -220,7 +219,8 @@ pub fn test_full_heap_parallel() {
     let threads_to_test = [1, 2, 4, 16];
 
     for &num_threads in &threads_to_test {
-        let element_count_per_thread = ((HEAP_SIZE as usize / 4) / size_of::<u64>()) / num_threads;
+        let element_count_per_thread =
+            ((total_usable_bytes() as usize / 4) / size_of::<u64>()) / num_threads;
 
         let gate = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicUsize::new(0));
@@ -317,6 +317,10 @@ pub fn test_full_heap_parallel() {
             push_total_ms.load(Ordering::Relaxed),
             verify_ms,
         );
+
+        drop(tasks);
+        drop(worker_vecs);
+        force_heap_collection();
     }
 }
 
@@ -325,6 +329,10 @@ cfg_if::cfg_if! {
         fn reset_parallel_heap_test_stats() {
             crate::memory::heap::mimalloc::mimalloc_commit_stats_reset();
             crate::memory::heap::mimalloc::mimalloc_alloc_stats_reset();
+        }
+
+        fn force_heap_collection() {
+            crate::memory::heap::mimalloc::mimalloc_collect(true);
         }
 
         fn print_parallel_heap_test_result(
@@ -366,6 +374,8 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(feature = "allocator-buddy")] {
         fn reset_parallel_heap_test_stats() {}
+
+        fn force_heap_collection() {}
 
         fn print_parallel_heap_test_result(
             num_threads: usize,
