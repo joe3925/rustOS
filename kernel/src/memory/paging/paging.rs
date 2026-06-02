@@ -122,6 +122,7 @@ where
     let mut cur = addr;
     debug_assert_eq!(cur.as_u64() & 0xFFF, 0);
     let mut remaining = align_up_4k(size);
+    let mut mapped = 0u64;
     let gib = 1u64 << 30;
     let mib2 = 2u64 * 1024 * 1024;
     let supports_1g = get_cpu_info()
@@ -135,6 +136,7 @@ where
                 Ok(_) => {
                     cur += gib;
                     remaining -= gib;
+                    mapped += gib;
                     continue;
                 }
                 Err(MapToError::FrameAllocationFailed) => {}
@@ -149,6 +151,11 @@ where
                     continue;
                 }
                 Err(e) => {
+                    if !ignore_already_mapped {
+                        unsafe {
+                            rollback_allocated_range_mapping(mapper, fa, addr, mapped);
+                        }
+                    }
                     return Err(PageMapError::Page1GiB(e));
                 }
             };
@@ -159,6 +166,7 @@ where
                 Ok(_) => {
                     cur += mib2;
                     remaining -= mib2;
+                    mapped += mib2;
                     continue;
                 }
                 Err(MapToError::FrameAllocationFailed) => {}
@@ -173,6 +181,11 @@ where
                     continue;
                 }
                 Err(e) => {
+                    if !ignore_already_mapped {
+                        unsafe {
+                            rollback_allocated_range_mapping(mapper, fa, addr, mapped);
+                        }
+                    }
                     return Err(PageMapError::Page2MiB(e));
                 }
             };
@@ -183,13 +196,43 @@ where
             Ok(_) => {}
             Err(MapToError::PageAlreadyMapped(_)) if ignore_already_mapped => {}
             Err(MapToError::ParentEntryHugePage) if ignore_already_mapped => {}
-            Err(e) => return Err(PageMapError::Page4KiB(e)),
+            Err(e) => {
+                if !ignore_already_mapped {
+                    unsafe {
+                        rollback_allocated_range_mapping(mapper, fa, addr, mapped);
+                    }
+                }
+                return Err(PageMapError::Page4KiB(e));
+            }
         }
         cur += 0x1000;
         remaining -= 0x1000;
+        mapped += 0x1000;
     }
 
     Ok(())
+}
+
+unsafe fn rollback_allocated_range_mapping<M>(
+    mapper: &mut M,
+    frame_allocator: &mut BootInfoFrameAllocator,
+    virt_base: VirtAddr,
+    size: u64,
+) where
+    M: Mapper<Size4KiB> + Mapper<Size2MiB> + Mapper<Size1GiB>,
+{
+    if size != 0 {
+        unsafe {
+            unmap_range_with_mapper(
+                mapper,
+                frame_allocator,
+                virt_base,
+                size,
+                UnmapFrameMode::Accounted,
+                TlbFlush::Flush,
+            );
+        }
+    }
 }
 /// SAFETY: Does not check the kernel range allocator before mapping the requested range.
 /// The caller must make sure that the range they request is not currently allocated and will not be later allocated by kernel map auto functions

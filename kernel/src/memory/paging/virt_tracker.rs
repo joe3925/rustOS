@@ -15,7 +15,10 @@ use alloc::sync::Arc;
 use core::sync::atomic::AtomicUsize;
 use kernel_types::status::PageMapError;
 use lazy_static::lazy_static;
-use x86_64::{structures::paging::PageTableFlags, VirtAddr};
+use x86_64::{
+    structures::paging::{PageTableFlags, PhysFrame, Size4KiB},
+    PhysAddr, VirtAddr,
+};
 
 pub(crate) const MAX_PENDING_FREES: usize = 64;
 static mut PENDING_FREES: [Option<(u64, u64)>; MAX_PENDING_FREES] = [None; MAX_PENDING_FREES];
@@ -59,7 +62,7 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    unsafe {
+    if let Err(err) = unsafe {
         map_range_with_huge_pages(
             &mut mapper,
             addr,
@@ -68,7 +71,10 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped(
             flags,
             false,
         )
-    }?;
+    } {
+        deallocate_kernel_range(addr, align_size);
+        return Err(err);
+    }
     Ok(addr)
 }
 
@@ -106,7 +112,7 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped_contiguous(
         BootInfoFrameAllocator::allocate_contiguous_frames_aligned(num_pages, phys_align_frames)
             .ok_or(PageMapError::NoMemory())?;
 
-    unsafe {
+    if let Err(err) = unsafe {
         map_contiguous_physical_range(
             &mut mapper,
             &mut frame_allocator,
@@ -116,7 +122,11 @@ pub extern "win64" fn allocate_auto_kernel_range_mapped_contiguous(
             flags,
             TlbFlush::Flush,
         )
-    }?;
+    } {
+        release_reserved_contiguous_frames(&frame_allocator, phys_base, num_pages);
+        deallocate_kernel_range(addr, align_size);
+        return Err(err);
+    }
 
     Ok(addr)
 }
@@ -137,7 +147,7 @@ pub extern "win64" fn allocate_kernel_range_mapped(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    unsafe {
+    if let Err(err) = unsafe {
         map_range_with_huge_pages(
             &mut mapper,
             addr,
@@ -146,7 +156,10 @@ pub extern "win64" fn allocate_kernel_range_mapped(
             flags,
             false,
         )
-    }?;
+    } {
+        deallocate_kernel_range(addr, align_size);
+        return Err(err);
+    }
     Ok(addr)
 }
 /// Allocate with specific alignment requirement
@@ -185,7 +198,7 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
     let mut mapper = init_mapper(phys_mem_offset);
     let mut frame_allocator = BootInfoFrameAllocator::init(&boot_info.memory_regions);
 
-    unsafe {
+    if let Err(err) = unsafe {
         map_range_with_huge_pages(
             &mut mapper,
             addr,
@@ -194,8 +207,23 @@ pub fn allocate_auto_kernel_range_mapped_aligned(
             flags,
             false,
         )
-    }?;
+    } {
+        deallocate_kernel_range(addr, align_size);
+        return Err(err);
+    }
     Ok(addr)
+}
+
+fn release_reserved_contiguous_frames(
+    frame_allocator: &BootInfoFrameAllocator,
+    phys_base: PhysAddr,
+    num_pages: usize,
+) {
+    for page in 0..num_pages {
+        let phys = PhysAddr::new(phys_base.as_u64() + (page as u64 * 0x1000));
+        let frame = PhysFrame::<Size4KiB>::containing_address(phys);
+        frame_allocator.release_reserved_frame(frame);
+    }
 }
 pub extern "win64" fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     debug_assert_eq!(addr.as_u64() & 0xFFF, 0);

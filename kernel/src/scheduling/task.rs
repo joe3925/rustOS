@@ -2,8 +2,7 @@ use crate::cpu::get_cpu_info;
 use crate::drivers::interrupt_index::current_is_in_interrupt_atomic;
 use crate::gdt::PER_CPU_GDT;
 use crate::memory::paging::paging::map_kernel_range;
-use crate::memory::paging::stack::{allocate_kernel_stack, StackSize};
-use crate::memory::paging::virt_tracker::unmap_range;
+use crate::memory::paging::stack::{allocate_kernel_stack, deallocate_kernel_stack, StackSize};
 use crate::scheduling::scheduler::task_return_trampoline;
 use crate::scheduling::state::{BlockReason, FpuState, SchedState, State};
 use crate::scheduling::tls::KernelTls;
@@ -214,9 +213,20 @@ impl TaskRef {
         if !self.is_kernel_mode.load(Ordering::Relaxed) {
             return;
         }
-        let start = self.stack_start.load(Ordering::Relaxed);
-        let size = self.stack_size.load(Ordering::Relaxed);
-        unmap_range(VirtAddr::new(start), size);
+        let stack_top = self.stack_start.swap(0, Ordering::AcqRel);
+        if stack_top == 0 {
+            return;
+        }
+
+        self.guard_page.store(0, Ordering::Release);
+        self.stack_size.store(0, Ordering::Release);
+        deallocate_kernel_stack(VirtAddr::new(stack_top));
+    }
+}
+
+impl Drop for TaskRef {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
 

@@ -189,6 +189,28 @@ struct ParallelCtx {
     worker_vecs: Arc<Mutex<Vec<Option<Vec<u64>>>>>,
 }
 
+struct ParallelCtxTaskArg(*mut ParallelCtx);
+
+impl ParallelCtxTaskArg {
+    fn new(ctx: Box<ParallelCtx>) -> Self {
+        Self(Box::into_raw(ctx))
+    }
+
+    fn as_usize(&self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl Drop for ParallelCtxTaskArg {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                drop(Box::from_raw(self.0));
+            }
+        }
+    }
+}
+
 extern "win64" fn parallel_worker(ctx: usize) {
     let ctx = unsafe { Box::from_raw(ctx as *mut ParallelCtx) };
 
@@ -245,13 +267,15 @@ pub fn test_full_heap_parallel() {
             });
 
             let name = format!("heap_test_worker_{}", i);
+            let ctx_arg = ParallelCtxTaskArg::new(ctx);
             let task = Task::new_kernel_mode(
                 parallel_worker,
-                Box::into_raw(ctx) as usize,
+                ctx_arg.as_usize(),
                 StackSize::Large,
                 name,
                 0,
             );
+            core::mem::forget(ctx_arg);
 
             tasks.push(task.clone());
             SCHEDULER.add_task(task);
@@ -317,6 +341,11 @@ pub fn test_full_heap_parallel() {
             push_total_ms.load(Ordering::Relaxed),
             verify_ms,
         );
+
+        while tasks.iter().any(|task| Arc::strong_count(task) > 1) {
+            SCHEDULER.reap_retired_tasks();
+            yield_now();
+        }
 
         drop(tasks);
         drop(worker_vecs);

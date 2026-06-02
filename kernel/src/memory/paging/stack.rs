@@ -74,11 +74,15 @@ pub fn allocate_kernel_stack(size: StackSize) -> Result<VirtAddr, PageMapError> 
     //   [stack_top-map_bytes .. stack_top)             mapped initial stack
     let map_start = stack_top - map_bytes;
 
-    unsafe { map_kernel_range(map_start, map_bytes, flags, false) }?;
+    if let Err(err) = unsafe { map_kernel_range(map_start, map_bytes, flags, false) } {
+        unmap_range(region_base, reserve_total);
+        return Err(err);
+    }
+
     Ok(stack_top)
 }
 
-pub fn deallocate_kernel_stack(stack_top: VirtAddr, _size: StackSize) {
+pub fn deallocate_kernel_stack(stack_top: VirtAddr) {
     let region_base = stack_top - KERNEL_STACK_RESERVATION_BYTES;
     unmap_range(region_base, KERNEL_STACK_RESERVATION_BYTES);
 }

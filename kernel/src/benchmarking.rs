@@ -5,7 +5,7 @@ use crate::drivers::timer_driver::{PER_CORE_SWITCHES, TIMER_TIME_SCHED};
 use crate::executable::program::PROGRAM_MANAGER;
 use crate::file_system::file::File;
 use crate::memory::{
-    heap::HEAP_SIZE,
+    heap::heap_capacity_bytes,
     paging::frame_alloc::{total_usable_bytes, USED_MEMORY},
 };
 use crate::profiling::unwind::{
@@ -611,7 +611,7 @@ fn bench_capture_metrics(core_id: usize, ts: u64) {
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
-    let heap_total_bytes = HEAP_SIZE;
+    let heap_total_bytes = heap_capacity_bytes();
 
     let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
@@ -925,7 +925,7 @@ fn bench_capture_metrics_try(core_id: usize, ts: u64) {
     used_bytes = used_bytes.saturating_add(boot_info().kernel_len as u64);
     let total_bytes = total_usable_bytes();
 
-    let heap_total_bytes = HEAP_SIZE;
+    let heap_total_bytes = heap_capacity_bytes();
 
     let core_sched_ns = unsafe { TIMER_TIME_SCHED.iter() }
         .nth(core_id)
