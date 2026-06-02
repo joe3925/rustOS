@@ -15,16 +15,15 @@ use crate::scheduling::task::CurrentTask;
 use crate::scheduling::task::TaskError;
 pub use crate::scheduling::task::TaskHandle;
 use crate::scheduling::task::TaskTable;
-use crate::scheduling::task::{idle_task, Task, TaskRef, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
+use crate::scheduling::task::{idle_task, Task, IDLE_MAGIC_LOWER, IDLE_UUID_UPPER};
 use crate::scheduling::tls;
 use crate::util::KERNEL_INITIALIZED;
-use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
-use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
-use crossbeam_queue::ArrayQueue;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use kernel_types::irq::IrqSafeRwLock;
+use kernel_types::mpmc_ring::{MpmcRing, RingError};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -33,6 +32,7 @@ use x86_64::registers::control::Cr3;
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
+type SchedulerQueue = MpmcRing<TaskHandle, RUNQ_CAP>;
 
 /// Saves the current task's FPU/SIMD state for the duration of a kernel handler.
 /// Restores the task selected at handler exit so post-schedule handler code
@@ -79,8 +79,8 @@ impl Drop for KernelFpuGuard {
 
 pub struct CoreScheduler {
     sched_lock: IrqSafeRwLock<SchedulerState>,
-    run_queue: ArrayQueue<TaskHandle>,
-    inbound_queue: ArrayQueue<TaskHandle>,
+    run_queue: SchedulerQueue,
+    inbound_queue: SchedulerQueue,
     idle_task: TaskHandle,
     current: CurrentTask,
     lapic_id: u8,
@@ -89,6 +89,12 @@ pub struct CoreScheduler {
 
 struct SchedulerState {
     current: Option<TaskHandle>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InboundDrain {
+    Available,
+    Contended,
 }
 
 pub struct Scheduler {
@@ -134,8 +140,8 @@ impl Scheduler {
 
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
-            run_queue: ArrayQueue::new(RUNQ_CAP),
-            inbound_queue: ArrayQueue::new(RUNQ_CAP),
+            run_queue: SchedulerQueue::new(),
+            inbound_queue: SchedulerQueue::new(),
             idle_task: idle.clone(),
             current: CurrentTask::new(&idle),
             lapic_id,
@@ -275,12 +281,12 @@ impl Scheduler {
     #[inline(always)]
     fn push_runqueue_or_panic(
         cpu: usize,
-        queue: &ArrayQueue<TaskHandle>,
+        queue: &SchedulerQueue,
         load: &AtomicUsize,
         task: TaskHandle,
     ) {
         Self::reserve_queue_load_or_panic(cpu, load, "run queue");
-        if queue.push(task).err().is_some() {
+        if queue.push(task).is_err() {
             load.fetch_sub(1, Ordering::Release);
             panic!("run queue overflow on cpu {cpu}");
         }
@@ -514,38 +520,50 @@ impl Scheduler {
         prev_task
     }
 
-    fn drain_inbound_to_runqueue(&self, cpu_id: usize, core: &Arc<CoreScheduler>) {
+    fn drain_inbound_to_runqueue(&self, cpu_id: usize, core: &Arc<CoreScheduler>) -> InboundDrain {
         loop {
-            if core.run_queue.len() >= RUNQ_CAP {
-                return;
+            if core.run_queue.len_approx() >= RUNQ_CAP {
+                return InboundDrain::Available;
             }
 
-            let Some(task) = core.inbound_queue.pop() else {
-                return;
+            let task = match core.inbound_queue.try_pop() {
+                Ok(task) => task,
+                Err(RingError::Empty) => return InboundDrain::Available,
+                Err(RingError::Contended) => return InboundDrain::Contended,
+                Err(RingError::Full | RingError::BadCapacity) => unreachable!(),
             };
 
             if let Err(task) = core.run_queue.push(task) {
                 if core.inbound_queue.push(task).is_err() {
                     panic!("failed to restore inbound task on cpu {}", cpu_id);
                 }
-                return;
+                return InboundDrain::Available;
             }
         }
     }
 
     #[inline(always)]
-    fn pop_queued_task(core: &Arc<CoreScheduler>) -> Option<TaskHandle> {
+    fn pop_queued_task(
+        core: &Arc<CoreScheduler>,
+        inbound_drain: InboundDrain,
+    ) -> Option<TaskHandle> {
         if let Some(task) = core.run_queue.pop() {
             core.load.fetch_sub(1, Ordering::Release);
             return Some(task);
         }
 
-        if let Some(task) = core.inbound_queue.pop() {
-            core.load.fetch_sub(1, Ordering::Release);
-            return Some(task);
+        if inbound_drain == InboundDrain::Contended {
+            return None;
         }
 
-        None
+        match core.inbound_queue.try_pop() {
+            Ok(task) => {
+                core.load.fetch_sub(1, Ordering::Release);
+                Some(task)
+            }
+            Err(RingError::Empty | RingError::Contended) => None,
+            Err(RingError::Full | RingError::BadCapacity) => unreachable!(),
+        }
     }
 
     fn schedule_next(
@@ -611,14 +629,14 @@ impl Scheduler {
             }
         }
 
-        self.drain_inbound_to_runqueue(cpu_id, core);
+        let inbound_drain = self.drain_inbound_to_runqueue(cpu_id, core);
 
         if let Some(prev) = requeue_previous {
             Self::push_runqueue_or_panic(cpu_id, &core.run_queue, &core.load, prev);
         }
 
         loop {
-            let cand = match Self::pop_queued_task(core) {
+            let cand = match Self::pop_queued_task(core, inbound_drain) {
                 Some(task) => task,
                 None => break,
             };
@@ -708,7 +726,7 @@ impl Scheduler {
         let _state = core.sched_lock.write();
 
         loop {
-            let len = core.run_queue.len();
+            let len = core.run_queue.len_approx();
             if len == 0 {
                 return None;
             }
@@ -719,7 +737,7 @@ impl Scheduler {
                     return None;
                 };
 
-                if core.run_queue.push(task).err().is_some() {
+                if core.run_queue.push(task).is_err() {
                     panic!("run queue rotation overflow on cpu {}", cpu_id);
                 }
 
@@ -787,7 +805,7 @@ impl Scheduler {
                     continue;
                 };
 
-                let stealable = core.run_queue.len();
+                let stealable = core.run_queue.len_approx();
 
                 if stealable > max_stealable {
                     max_stealable = stealable;

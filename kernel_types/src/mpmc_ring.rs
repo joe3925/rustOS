@@ -1,4 +1,4 @@
-use core::array;
+use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -7,7 +7,31 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 pub enum RingError {
     Full,
     Empty,
+    Contended,
     BadCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TryPushError<T> {
+    Full(T),
+    Contended(T),
+}
+
+impl<T> TryPushError<T> {
+    #[inline]
+    pub fn into_inner(self) -> T {
+        match self {
+            Self::Full(value) | Self::Contended(value) => value,
+        }
+    }
+
+    #[inline]
+    pub fn kind(&self) -> RingError {
+        match self {
+            Self::Full(_) => RingError::Full,
+            Self::Contended(_) => RingError::Contended,
+        }
+    }
 }
 
 #[repr(align(64))]
@@ -21,7 +45,7 @@ struct Slot<T> {
 pub struct MpmcRing<T, const CAP: usize> {
     enqueue_pos: CachePadded<AtomicUsize>,
     dequeue_pos: CachePadded<AtomicUsize>,
-    slots: [Slot<T>; CAP],
+    slots: Box<[Slot<T>]>,
 }
 
 unsafe impl<T: Send, const CAP: usize> Send for MpmcRing<T, CAP> {}
@@ -29,83 +53,103 @@ unsafe impl<T: Send, const CAP: usize> Sync for MpmcRing<T, CAP> {}
 
 impl<T, const CAP: usize> MpmcRing<T, CAP> {
     pub fn new() -> Self {
-        assert!(CAP > 0);
+        assert!(CAP > 1);
         assert!(CAP <= isize::MAX as usize);
+
+        let mut slots = Box::<[Slot<T>]>::new_uninit_slice(CAP);
+        for (i, slot) in slots.iter_mut().enumerate() {
+            slot.write(Slot {
+                sequence: AtomicUsize::new(i),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            });
+        }
+        let slots = unsafe { slots.assume_init() };
 
         Self {
             enqueue_pos: CachePadded(AtomicUsize::new(0)),
             dequeue_pos: CachePadded(AtomicUsize::new(0)),
-            slots: array::from_fn(|i| Slot {
-                sequence: AtomicUsize::new(i),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            }),
+            slots,
         }
     }
 
-    pub fn try_push(&self, value: T) -> Result<(), T> {
-        let mut pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+    pub fn try_push(&self, value: T) -> Result<(), TryPushError<T>> {
+        let pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+        let slot = &self.slots[pos % CAP];
+        let seq = slot.sequence.load(Ordering::Acquire);
+        let diff = seq.wrapping_sub(pos) as isize;
 
-        loop {
-            let slot = &self.slots[pos % CAP];
-            let seq = slot.sequence.load(Ordering::Acquire);
-            let diff = seq.wrapping_sub(pos) as isize;
-
-            if diff == 0 {
-                match self.enqueue_pos.0.compare_exchange_weak(
-                    pos,
-                    pos.wrapping_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        unsafe {
-                            (*slot.value.get()).write(value);
-                        }
-
-                        slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
-                        return Ok(());
+        if diff == 0 {
+            match self.enqueue_pos.0.compare_exchange(
+                pos,
+                pos.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    unsafe {
+                        (*slot.value.get()).write(value);
                     }
-                    Err(next) => {
-                        pos = next;
-                    }
+
+                    slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
+                    Ok(())
                 }
-            } else if diff < 0 {
-                return Err(value);
-            } else {
-                pos = self.enqueue_pos.0.load(Ordering::Relaxed);
+                Err(_) => Err(TryPushError::Contended(value)),
+            }
+        } else if diff < 0 {
+            Err(TryPushError::Full(value))
+        } else {
+            Err(TryPushError::Contended(value))
+        }
+    }
+
+    pub fn push(&self, mut value: T) -> Result<(), T> {
+        loop {
+            match self.try_push(value) {
+                Ok(()) => return Ok(()),
+                Err(TryPushError::Full(value)) => return Err(value),
+                Err(TryPushError::Contended(next_value)) => {
+                    value = next_value;
+                    core::hint::spin_loop();
+                }
             }
         }
     }
 
-    pub fn try_pop(&self) -> Option<T> {
-        let mut pos = self.dequeue_pos.0.load(Ordering::Relaxed);
+    pub fn try_pop(&self) -> Result<T, RingError> {
+        let pos = self.dequeue_pos.0.load(Ordering::Relaxed);
+        let slot = &self.slots[pos % CAP];
+        let seq = slot.sequence.load(Ordering::Acquire);
+        let diff = seq.wrapping_sub(pos.wrapping_add(1)) as isize;
 
-        loop {
-            let slot = &self.slots[pos % CAP];
-            let seq = slot.sequence.load(Ordering::Acquire);
-            let diff = seq.wrapping_sub(pos.wrapping_add(1)) as isize;
-
-            if diff == 0 {
-                match self.dequeue_pos.0.compare_exchange_weak(
-                    pos,
-                    pos.wrapping_add(1),
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        let value = unsafe { (*slot.value.get()).assume_init_read() };
-                        slot.sequence
-                            .store(pos.wrapping_add(CAP), Ordering::Release);
-                        return Some(value);
-                    }
-                    Err(next) => {
-                        pos = next;
-                    }
+        if diff == 0 {
+            match self.dequeue_pos.0.compare_exchange(
+                pos,
+                pos.wrapping_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    let value = unsafe { (*slot.value.get()).assume_init_read() };
+                    slot.sequence
+                        .store(pos.wrapping_add(CAP), Ordering::Release);
+                    Ok(value)
                 }
-            } else if diff < 0 {
-                return None;
-            } else {
-                pos = self.dequeue_pos.0.load(Ordering::Relaxed);
+                Err(_) => Err(RingError::Contended),
+            }
+        } else if diff < 0 {
+            Err(RingError::Empty)
+        } else {
+            Err(RingError::Contended)
+        }
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        loop {
+            match self.try_pop() {
+                Ok(value) => return Some(value),
+                Err(RingError::Empty) => return None,
+                Err(RingError::Contended) => core::hint::spin_loop(),
+                Err(RingError::Full | RingError::BadCapacity) => unreachable!(),
             }
         }
     }
@@ -131,6 +175,6 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
 
 impl<T, const CAP: usize> Drop for MpmcRing<T, CAP> {
     fn drop(&mut self) {
-        while self.try_pop().is_some() {}
+        while self.pop().is_some() {}
     }
 }

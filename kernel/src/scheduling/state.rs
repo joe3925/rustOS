@@ -1,4 +1,5 @@
 use core::arch::asm;
+use core::fmt;
 use x86_64::registers::rflags::RFlags;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -145,8 +146,7 @@ impl Default for FpuState {
     }
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct State {
     pub rax: u64,
@@ -260,5 +260,31 @@ impl State {
             VirtAddr::new(self.rsp),
             SegmentSelector(self.ss as u16),
         )
+    }
+}
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("State")
+            .field("rax", &format_args!("0x{:016x}", self.rax))
+            .field("rcx", &format_args!("0x{:016x}", self.rcx))
+            .field("rdx", &format_args!("0x{:016x}", self.rdx))
+            .field("rbx", &format_args!("0x{:016x}", self.rbx))
+            .field("rbp", &format_args!("0x{:016x}", self.rbp))
+            .field("rsi", &format_args!("0x{:016x}", self.rsi))
+            .field("rdi", &format_args!("0x{:016x}", self.rdi))
+            .field("r8", &format_args!("0x{:016x}", self.r8))
+            .field("r9", &format_args!("0x{:016x}", self.r9))
+            .field("r10", &format_args!("0x{:016x}", self.r10))
+            .field("r11", &format_args!("0x{:016x}", self.r11))
+            .field("r12", &format_args!("0x{:016x}", self.r12))
+            .field("r13", &format_args!("0x{:016x}", self.r13))
+            .field("r14", &format_args!("0x{:016x}", self.r14))
+            .field("r15", &format_args!("0x{:016x}", self.r15))
+            .field("rip", &format_args!("0x{:016x}", self.rip))
+            .field("cs", &format_args!("0x{:016x}", self.cs))
+            .field("rflags", &format_args!("0x{:016x}", self.rflags))
+            .field("rsp", &format_args!("0x{:016x}", self.rsp))
+            .field("ss", &format_args!("0x{:016x}", self.ss))
+            .finish()
     }
 }

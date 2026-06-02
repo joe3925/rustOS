@@ -6,6 +6,7 @@ mod device;
 mod dma;
 mod fs;
 mod io;
+mod mpmc_ring;
 mod pnp;
 mod request;
 mod runtime;
