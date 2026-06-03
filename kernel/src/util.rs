@@ -22,8 +22,8 @@ use crate::memory::dma::init_dma_manager;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::memory::heap::{heap_capacity_bytes, init_heap};
 use crate::memory::iommu::init_iommu;
-use crate::memory::paging::frame_alloc::{boot_usable_bytes, resize_bitmap_for_ram};
 use crate::memory::paging::frame_alloc::BootInfoFrameAllocator;
+use crate::memory::paging::frame_alloc::{boot_usable_bytes, resize_bitmap_for_ram};
 use crate::memory::paging::paging::unmap_reserved_range_unchecked;
 use crate::memory::paging::stack::StackSize;
 use crate::memory::paging::tables::{init_kernel_cr3, kernel_cr3};
@@ -65,7 +65,7 @@ pub static CORE_LOCK: AtomicUsize = AtomicUsize::new(0);
 pub static INIT_LOCK: Mutex<usize> = Mutex::new(0);
 pub static CPU_ID: AtomicUsize = AtomicUsize::new(0);
 pub static TOTAL_TIME: Once<Stopwatch> = Once::new();
-pub const APIC_START_PERIOD: u64 = 250000;
+pub const APIC_START_PERIOD: u64 = 500000;
 pub const MAX_CPUS: usize = 256;
 pub static BOOTSET: &[BootPkg] = boot_packages![
     "acpi", "pci", "ide", "disk", "partmgr", "volmgr", "mountmgr", "fat32", "i8042", "virtio"

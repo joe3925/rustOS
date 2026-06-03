@@ -428,24 +428,11 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
     spawn_detached(async move {
-        // println!("[bench-debug] detached benchmark task started");
-        // println!("[bench-debug] async-vs-sync benchmark returned");
-        println!("testing cold");
-        test_full_heap_parallel();
-        println!("testing warm");
-        test_full_heap_parallel();
-
-        //DRIVE_WINDOW.start();
-        //loop {
-        // test_full_heap_parallel();
-
-        //run_virtio_bench_matrix_print().await;
-        //wait_duration(Duration::from_secs(10));
-        //}
-        //DRIVE_WINDOW.stop_and_persist().await;
-        //run_virtio_bench_matrix_print().await;
-
-        //trigger_triple_fault();
+        bench_c_drive_io_async().await;
+        bench_c_drive_io_async().await;
+        // loop {
+        //     bench_c_drive_io_async().await;
+        // }
     });
     Ok(())
 }

@@ -51,7 +51,7 @@ mod cache_core;
 mod cache_traits;
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
-const BLOCK_SIZE: usize = 1024 * 16;
+const BLOCK_SIZE: usize = 1024 * 64;
 const CACHE_CAPACITY_BYTES: usize = 1024 * 1024 * 50;
 const LAZY_CACHE_PAGE_ALLOCATION: bool = false;
 const LAZY_INDEX_ALLOCATION: bool = false;

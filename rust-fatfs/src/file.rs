@@ -52,6 +52,49 @@ impl CachedFileState {
             fs,
         }
     }
+
+    /// Returns the on-disk directory entry position for this file, if it has one.
+    #[must_use]
+    pub fn entry_pos(&self) -> Option<u64> {
+        self.entry.as_ref().map(DirEntryEditor::pos)
+    }
+
+    /// Refreshes the directory-entry metadata while preserving this handle's cursor.
+    ///
+    /// This is used after operations such as rename which move the directory
+    /// entry but should not reset an already-open file handle's current offset.
+    pub fn refresh_dir_entry_from(&mut self, fresh: &Self) {
+        self.first_cluster = fresh.first_cluster;
+        self.entry = fresh.entry.clone();
+    }
+}
+
+/// Cached-state update returned when a rename moves an opened file's directory entry.
+#[derive(Clone, Debug)]
+pub struct RenamedFileState {
+    old_entry_pos: u64,
+    new_state: CachedFileState,
+}
+
+impl RenamedFileState {
+    pub(crate) fn new(old_entry_pos: u64, new_state: CachedFileState) -> Self {
+        Self {
+            old_entry_pos,
+            new_state,
+        }
+    }
+
+    /// Directory entry position used by cached handles before the rename.
+    #[must_use]
+    pub fn old_entry_pos(&self) -> u64 {
+        self.old_entry_pos
+    }
+
+    /// Fresh cached metadata for the renamed file.
+    #[must_use]
+    pub fn new_state(&self) -> &CachedFileState {
+        &self.new_state
+    }
 }
 
 /// An extent containing a file's data on disk.
@@ -87,7 +130,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
             first_cluster: self.first_cluster,
             current_cluster: self.current_cluster,
             offset: self.offset,
-            entry: self.entry.clone(),
+            entry: self.entry,
         }
     }
 
@@ -275,12 +318,6 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
                 e.set_size(offset);
             }
         }
-    }
-}
-
-impl<IO: ReadWriteSeek, TP, OCC> Drop for File<'_, IO, TP, OCC> {
-    fn drop(&mut self) {
-        // flush is async so we cannot call it in drop
     }
 }
 

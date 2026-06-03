@@ -1,8 +1,7 @@
-use alloc::{collections::btree_map::BTreeMap, string::ToString, sync::Arc, vec::Vec};
+use alloc::{string::ToString, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicBool, AtomicU64};
 use fatfs::FsOptions;
 use kernel_api::request::RequestDataView;
-use spin::RwLock;
 
 use kernel_api::{
     GLOBAL_CTRL_LINK, IOCTL_FS_IDENTIFY, IOCTL_MOUNTMGR_REGISTER_FS,
@@ -24,8 +23,11 @@ use kernel_api::{
 };
 
 use crate::block_dev::BlockDev;
-use crate::volume::{FIRST_FILE_OWNER_ID, METADATA_OWNER_ID, VolCtrlDevExt, fs_op_dispatch};
+use crate::volume::{
+    FILE_HANDLE_CAPACITY, FileHandleTable, METADATA_OWNER_ID, VolCtrlDevExt, fs_op_dispatch,
+};
 use log::{Metadata, Record};
+use spin::Mutex;
 
 struct KernelLogger;
 
@@ -150,8 +152,9 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
                             let ext = VolCtrlDevExt {
                                 fs: Arc::new(AsyncMutex::new(fs)),
-                                next_id: AtomicU64::new(FIRST_FILE_OWNER_ID),
-                                table: RwLock::new(BTreeMap::new()),
+                                handles: Mutex::new(FileHandleTable::with_capacity(
+                                    FILE_HANDLE_CAPACITY,
+                                )),
                                 volume_target: volume_fdo.clone(),
                                 should_flush,
                                 pending_flush_owner: Arc::new(AtomicU64::new(0)),

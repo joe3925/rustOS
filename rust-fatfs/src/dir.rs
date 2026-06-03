@@ -13,7 +13,7 @@ use crate::dir_entry::{
 use crate::dir_entry::{LFN_ENTRY_LAST_FLAG, LFN_PART_LEN};
 use crate::dir_entry::{SFN_PADDING, SFN_SIZE};
 use crate::error::{Error, IoError};
-use crate::file::File;
+use crate::file::{File, RenamedFileState};
 use crate::fs::{DiskSlice, FileSystem, FsIoAdapter, OemCpConverter, ReadWriteSeek};
 use crate::io::{self, IoBase, Read, Seek, SeekFrom, Write};
 use crate::time::TimeProvider;
@@ -446,6 +446,23 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         dst_dir: &Dir<'a, IO, TP, OCC>,
         dst_path: &str,
     ) -> Result<(), Error<IO::Error>> {
+        self.rename_with_cached_file_state(src_path, dst_dir, dst_path)
+            .await
+            .map(|_| ())
+    }
+
+    /// Renames or moves an existing file or directory and returns cached-state
+    /// refresh data when a file directory entry moved.
+    ///
+    /// The returned state can be applied to already-open cached file handles so
+    /// they keep using the new directory entry without storing a borrowed
+    /// [`FileSystem`] reference.
+    pub async fn rename_with_cached_file_state(
+        &self,
+        src_path: &str,
+        dst_dir: &Dir<'a, IO, TP, OCC>,
+        dst_path: &str,
+    ) -> Result<Option<RenamedFileState>, Error<IO::Error>> {
         trace!("Dir::rename {} {}", src_path, dst_path);
         let mut current_src_dir = self.clone();
         let mut current_src_path = src_path;
@@ -486,10 +503,12 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         src_name: &str,
         dst_dir: &Dir<'a, IO, TP, OCC>,
         dst_name: &str,
-    ) -> Result<(), Error<IO::Error>> {
+    ) -> Result<Option<RenamedFileState>, Error<IO::Error>> {
         trace!("Dir::rename_internal {} {}", src_name, dst_name);
         // find existing file
         let e = self.find_entry(src_name, None, None).await?;
+        let old_entry_pos = e.entry_pos;
+        let renamed_file = e.is_file();
         // check if destionation filename is unused
         let r = dst_dir.check_for_existence(dst_name, None).await?;
         let short_name = match r {
@@ -498,7 +517,7 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                 // check if source and destination entry is the same
                 if e.is_same_entry(dst_e) {
                     // nothing to do
-                    return Ok(());
+                    return Ok(None);
                 }
                 // destination file exists and it is not the same as source file - fail
                 return Err(Error::AlreadyExists);
@@ -519,8 +538,15 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
         }
         // save new directory entry
         let sfn_entry = e.data.renamed(short_name);
-        dst_dir.write_entry(dst_name, sfn_entry).await?;
-        Ok(())
+        let new_entry = dst_dir.write_entry(dst_name, sfn_entry).await?;
+        if renamed_file {
+            Ok(Some(RenamedFileState::new(
+                old_entry_pos,
+                new_entry.to_file().into_cached_state(),
+            )))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn find_free_entries(&self, num_entries: u32) -> Result<DirRawStream<'a, IO, TP, OCC>, Error<IO::Error>> {
