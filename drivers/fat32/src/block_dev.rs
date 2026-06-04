@@ -77,12 +77,12 @@ impl BlockDev {
     ) -> Result<(), DriverStatus> {
         let volume = self.volume.clone();
         let len = dst.len();
-        let buffer = IoBuffer::<Described, FromDevice>::new(dst);
+        let buffer = IoBuffer::<Described, FromDevice>::from_slice_mut(dst);
         let mut req = RequestHandle::new(ReadRequest {
             offset,
             len,
             no_buffer: false,
-            buffer: buffer.into(),
+            buffer,
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -107,13 +107,13 @@ impl BlockDev {
         let no_buffer = false;
         let volume = self.volume.clone();
         let len = src.len();
-        let buffer = IoBuffer::<Described, ToDevice>::new(src);
+        let buffer = IoBuffer::<Described, ToDevice>::from_slice(src);
         let mut req = RequestHandle::new(WriteRequest {
             offset,
             len,
             no_buffer,
             owner: self.current_owner.load(Ordering::Acquire),
-            buffer: buffer.into(),
+            buffer,
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 

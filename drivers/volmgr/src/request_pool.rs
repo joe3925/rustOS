@@ -31,7 +31,7 @@ impl<const BLOCK_SIZE: usize> RequestPool<BLOCK_SIZE> {
             len: BLOCK_SIZE,
             no_buffer: false,
             owner: 0,
-            buffer: IoBuffer::<Described, ToDevice>::new(&[]).into(),
+            buffer: IoBuffer::<Described, ToDevice>::from_slice(&[]),
         })
     }
 
@@ -84,3 +84,5 @@ impl<const BLOCK_SIZE: usize> Drop for PooledRequest<BLOCK_SIZE> {
         }
     }
 }
+
+

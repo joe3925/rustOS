@@ -273,12 +273,12 @@ async fn read_from_lower_async(
     len: usize,
 ) -> Result<Box<[u8]>, DriverStatus> {
     let mut data = vec![0u8; len];
-    let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
+    let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data[..]);
     let mut child_req = RequestHandle::new(Read {
         offset,
         len,
         no_buffer: false,
-        buffer: io_buf.into(),
+        buffer: io_buf,
     });
     child_req.set_traversal_policy(TraversalPolicy::ForwardLower);
 

@@ -85,8 +85,7 @@ fn borrowed_read_only_slice_cannot_be_mutated_or_consumed() {
     let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
 
     {
-        let mut borrowed =
-            BorrowedHandle::<_, [u8]>::read_only(&mut handle, &bytes);
+        let mut borrowed = BorrowedHandle::<_, [u8]>::read_only(&mut handle, &bytes);
         let view = borrowed.handle().data().read_only();
         assert_eq!(view.view::<[u8]>().unwrap(), &[4, 5, 6, 7]);
         assert!(!view.can_take_exact::<Vec<u8>>());
@@ -101,8 +100,7 @@ fn borrowed_writable_slice_exposes_mut_view_and_is_cleared_on_drop() {
     let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
 
     {
-        let mut borrowed =
-            BorrowedHandle::<_, [u8]>::writable(&mut handle, &mut bytes);
+        let mut borrowed = BorrowedHandle::<_, [u8]>::writable(&mut handle, &mut bytes);
         let mut view = borrowed.handle().data().try_writable().unwrap();
         let slice = view.view_mut::<[u8]>().unwrap();
         slice[1] = 9;

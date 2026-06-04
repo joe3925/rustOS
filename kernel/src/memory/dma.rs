@@ -42,8 +42,9 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 use kernel_types::device::DeviceObject;
 use kernel_types::dma::{
-    BorrowedDmaMapping, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy,
-    DmaPciDeviceIdentity, IoBufferDmaSegment, IoBufferInner, IoBufferPageFrame,
+    BorrowedDmaMapping, DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped,
+    DmaMappingStrategy, DmaPciDeviceIdentity, IoBuffer, IoBufferDmaSegment, IoBufferPageFrame,
+    PhysFramed, ToDevice,
     DMA_IOMMU_VENDOR_AMD_IVRS, DMA_IOMMU_VENDOR_INTEL_DMAR,
     DMA_PCI_IDENTITY_FLAG_BUS_MASTER_CAPABLE, IOBUFFER_INLINE_SEGMENT_CAPACITY,
     IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE,
@@ -113,9 +114,12 @@ struct PreparedDmaMapping {
 
 pub fn map_buffer<'a>(
     device: &Arc<DeviceObject>,
-    mut buffer: IoBufferInner<'a>,
+    buffer: IoBuffer<'a, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
-) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)> {
+) -> Result<
+    IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+    (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
+> {
     let m = manager();
     let key = match resolve_hardware_pdo(device) {
         Ok(pdo) => device_key(&pdo),
@@ -148,27 +152,35 @@ pub fn map_buffer<'a>(
         Err(err) => return Err((buffer, err)),
     };
 
-    if let Err(err) = buffer.replace_dma_segments(&prepared.segments[..prepared.segments_len]) {
-        rollback_mappings(&domain, &prepared.records);
-        return Err((
-            buffer,
-            match err {
-                kernel_types::dma::IoBufferError::SegmentCapacityExceeded { required, .. } => {
-                    DmaMapError::SegmentCapacityExceeded { required }
-                }
-                kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. } => {
-                    DmaMapError::PageCapacityExceeded { required }
-                }
-                _ => DmaMapError::InvalidSize,
-            },
-        ));
-    }
-
     if prepared.records.is_empty() {
         return Err((buffer, DmaMapError::RemappingUnavailable));
     }
 
     let cookie = state.next_cookie;
+    let mapped_buffer = match buffer.apply_dma_mapping(
+        &prepared.segments[..prepared.segments_len],
+        pdo,
+        unmap_trampoline,
+        cookie as usize,
+    ) {
+        Ok(mapped_buffer) => mapped_buffer,
+        Err((buffer, err)) => {
+            rollback_mappings(&domain, &prepared.records);
+            return Err((
+                buffer,
+                match err {
+                    kernel_types::dma::IoBufferError::SegmentCapacityExceeded {
+                        required, ..
+                    } => DmaMapError::SegmentCapacityExceeded { required },
+                    kernel_types::dma::IoBufferError::PageCapacityExceeded { required, .. } => {
+                        DmaMapError::PageCapacityExceeded { required }
+                    }
+                    _ => DmaMapError::InvalidSize,
+                },
+            ));
+        }
+    };
+
     state.next_cookie = state.next_cookie.wrapping_add(1);
     state.pending_unmaps.insert(
         cookie,
@@ -179,19 +191,19 @@ pub fn map_buffer<'a>(
         },
     );
 
-    buffer.set_dma_drop(pdo, unmap_trampoline, cookie as usize);
     iommu::invalidate(&domain);
-    Ok(buffer)
+    Ok(mapped_buffer)
 }
 
-pub fn unmap_buffer<'a>(mut buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
-    buffer.remove_dma_mapping_in_place();
-    buffer
+pub fn unmap_buffer<'a>(
+    buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+) -> IoBuffer<'a, PhysFramed, ToDevice> {
+    buffer.remove_dma_mapping()
 }
 
 pub fn map_buffer_ref<'map, 'buffer>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBufferInner<'buffer>,
+    buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError> {
     let m = manager();
@@ -265,7 +277,7 @@ pub fn map_buffer_ref<'map, 'buffer>(
 
 fn prepare_dma_mapping(
     domain: &IommuDomain,
-    buffer: &IoBufferInner<'_>,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
 ) -> Result<PreparedDmaMapping, DmaMapError> {
     validate_dma_buffer(buffer)?;
@@ -465,7 +477,7 @@ fn map_iommu_error(err: iommu::IommuError) -> DmaMapError {
     }
 }
 
-fn validate_dma_buffer(buffer: &IoBufferInner<'_>) -> Result<(), DmaMapError> {
+fn validate_dma_buffer(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> Result<(), DmaMapError> {
     if buffer.len() == 0 || buffer.page_count() == 0 || buffer.extent_count() == 0 {
         return Err(DmaMapError::InvalidSize);
     }
@@ -487,7 +499,10 @@ fn validate_dma_buffer(buffer: &IoBufferInner<'_>) -> Result<(), DmaMapError> {
     Ok(())
 }
 
-fn for_each_buffer_extent<F>(buffer: &IoBufferInner<'_>, mut f: F) -> Result<(), DmaMapError>
+fn for_each_buffer_extent<F>(
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+    mut f: F,
+) -> Result<(), DmaMapError>
 where
     F: FnMut(&[IoBufferPageFrame], usize, usize) -> Result<(), DmaMapError>,
 {
@@ -511,7 +526,7 @@ where
     Ok(())
 }
 
-fn buffer_frames_cover_extents(buffer: &IoBufferInner<'_>) -> bool {
+fn buffer_frames_cover_extents(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> bool {
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
         if frames_cover_buffer(frames, frame_offset, byte_len) {
             Ok(())
@@ -522,7 +537,7 @@ fn buffer_frames_cover_extents(buffer: &IoBufferInner<'_>) -> bool {
     .is_ok()
 }
 
-fn first_dma_page_offset(buffer: &IoBufferInner<'_>) -> Option<usize> {
+fn first_dma_page_offset(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> Option<usize> {
     for extent in buffer.extents() {
         if extent.byte_len != 0 {
             return Some(extent.frame_offset & (IOBUFFER_PAGE_SIZE - 1));
@@ -531,7 +546,7 @@ fn first_dma_page_offset(buffer: &IoBufferInner<'_>) -> Option<usize> {
     None
 }
 
-fn buffer_supports_contiguous_iova(buffer: &IoBufferInner<'_>) -> bool {
+fn buffer_supports_contiguous_iova(buffer: &IoBuffer<'_, PhysFramed, ToDevice>) -> bool {
     let mut logical_len = 0usize;
     let mut first_offset = None;
 
@@ -592,7 +607,9 @@ fn frames_cover_buffer(
     available >= buffer_len
 }
 
-fn covered_iommu_page_count_for_buffer(buffer: &IoBufferInner<'_>) -> Option<usize> {
+fn covered_iommu_page_count_for_buffer(
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
+) -> Option<usize> {
     let mut total = 0usize;
 
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
@@ -724,7 +741,7 @@ fn map_phys_run_to_iova(
 fn map_buffer_frames_to_iova(
     domain: &IommuDomain,
     iova_base: u64,
-    buffer: &IoBufferInner<'_>,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
 ) -> Result<(), DmaMapError> {
     let mut iova_cursor = iova_base;
 
@@ -741,7 +758,7 @@ fn map_buffer_frames_to_iova(
 
 fn map_identity_frames(
     domain: &IommuDomain,
-    buffer: &IoBufferInner<'_>,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
     records: &mut PendingMappingRecords,
 ) -> Result<(), DmaMapError> {
     for_each_buffer_extent(buffer, |frames, frame_offset, byte_len| {
@@ -769,7 +786,7 @@ fn rollback_mappings(domain: &IommuDomain, records: &PendingMappingRecords) {
 }
 
 fn build_scatter_segments_from_iova(
-    buffer: &IoBufferInner<'_>,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
     iova_base: u64,
     segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
 ) -> Result<usize, DmaMapError> {
@@ -861,7 +878,7 @@ fn append_segments_from_contiguous_iova(
 }
 
 fn build_identity_segments(
-    buffer: &IoBufferInner<'_>,
+    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
     segments: &mut [IoBufferDmaSegment; IOBUFFER_INLINE_SEGMENT_CAPACITY],
 ) -> Result<usize, DmaMapError> {
     let mut count = 0usize;
@@ -1913,3 +1930,5 @@ const IVRS_DEVICE_EXT_SELECT: u8 = 0x46;
 const IVRS_DEVICE_EXT_START_RANGE: u8 = 0x47;
 const IVRS_DEVICE_SPECIAL: u8 = 0x48;
 const IVRS_DEVICE_ACPI_HID: u8 = 0xF0;
+
+

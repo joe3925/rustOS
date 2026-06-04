@@ -16,7 +16,7 @@ use kernel_types::benchmark::{
 };
 use kernel_types::dma::{
     DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
-    IoBufferInner,
+    DmaMapped, IoBuffer, PhysFramed, ToDevice,
 };
 use kernel_types::irq::{DropHook, IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta, IrqWaitResult};
 use kernel_types::object_manager::OmError;
@@ -89,13 +89,18 @@ unsafe extern "win64" {
     pub fn kernel_dma_query_device_state(device: &Arc<DeviceObject>) -> Option<DmaDeviceState>;
     pub fn kernel_dma_map_buffer<'a>(
         device: &Arc<DeviceObject>,
-        buffer: IoBufferInner<'a>,
+        buffer: IoBuffer<'a, PhysFramed, ToDevice>,
         strategy: DmaMappingStrategy,
-    ) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)>;
-    pub fn kernel_dma_unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a>;
+    ) -> Result<
+        IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+        (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
+    >;
+    pub fn kernel_dma_unmap_buffer<'a>(
+        buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+    ) -> IoBuffer<'a, PhysFramed, ToDevice>;
     pub fn kernel_dma_map_buffer_ref<'map, 'buffer>(
         device: &Arc<DeviceObject>,
-        buffer: &'map IoBufferInner<'buffer>,
+        buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
         strategy: DmaMappingStrategy,
     ) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError>;
 

@@ -150,7 +150,7 @@ fn read_request_invokes_matching_io_handler_and_updates_buffer() {
         offset: 5,
         len: 12,
         no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::new(&mut out).into(),
+        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
     });
 
     let status = block_on_ready(send_request(dev, &mut handle));
@@ -168,7 +168,7 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
         len: 1,
         no_buffer: false,
         owner: 0,
-        buffer: IoBuffer::<Described, ToDevice>::new(&input[..1]).into(),
+        buffer: IoBuffer::<Described, ToDevice>::from_slice(&input[..1]),
     });
 
     assert_eq!(
@@ -186,7 +186,7 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
         len: 4,
         no_buffer: false,
         owner: 0,
-        buffer: IoBuffer::<Described, ToDevice>::new(&input).into(),
+        buffer: IoBuffer::<Described, ToDevice>::from_slice(&input),
     });
     handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -253,7 +253,7 @@ fn continuing_handler_can_forward_to_lower_handler() {
         offset: 0,
         len: 3,
         no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::new(&mut out).into(),
+        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut out),
     });
     handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -262,3 +262,5 @@ fn continuing_handler_can_forward_to_lower_handler() {
     assert_eq!(status, DriverStatus::Success);
     assert_eq!(out, [3, 0xAA]);
 }
+
+

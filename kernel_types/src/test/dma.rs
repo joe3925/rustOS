@@ -26,7 +26,7 @@ fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
         IoBufferPageFrame::new(0x9000, IOBUFFER_FRAME_SIZE_4KIB),
     ];
 
-    let buffer = IoBuffer::<PhysFramed, ToDevice>::new(128, 6000, &frames).unwrap();
+    let buffer = IoBuffer::<PhysFramed, ToDevice>::from_frames(128, 6000, &frames).unwrap();
     assert_eq!(buffer.len(), 6000);
     assert_eq!(buffer.frame_offset(), 128);
     assert_eq!(buffer.frame_count(), 3);
@@ -42,7 +42,7 @@ fn physical_iobuffer_validates_frame_layout_and_iterates_regions() {
 #[test]
 fn physical_iobuffer_rejects_invalid_frame_descriptions() {
     assert_eq!(
-        IoBuffer::<PhysFramed, ToDevice>::new(0, 1, &[]).unwrap_err(),
+        IoBuffer::<PhysFramed, ToDevice>::from_frames(0, 1, &[]).unwrap_err(),
         IoBufferError::InvalidFrameLayout {
             frame_offset: 0,
             byte_len: 1
@@ -50,7 +50,7 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
     );
 
     assert_eq!(
-        IoBuffer::<PhysFramed, ToDevice>::new(
+        IoBuffer::<PhysFramed, ToDevice>::from_frames(
             0,
             IOBUFFER_PAGE_SIZE,
             &[IoBufferPageFrame::new(0x2100, IOBUFFER_FRAME_SIZE_4KIB)]
@@ -63,7 +63,7 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
     );
 
     assert_eq!(
-        IoBuffer::<PhysFramed, ToDevice>::new(
+        IoBuffer::<PhysFramed, ToDevice>::from_frames(
             4096,
             1,
             &[IoBufferPageFrame::new(0x2000, IOBUFFER_FRAME_SIZE_4KIB)]
@@ -80,7 +80,7 @@ fn physical_iobuffer_rejects_invalid_frame_descriptions() {
 fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
     let frames = [IoBufferPageFrame::new(0x4000, IOBUFFER_FRAME_SIZE_4KIB)];
     let buffer =
-        IoBuffer::<PhysFramed, Bidirectional>::new(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
+        IoBuffer::<PhysFramed, Bidirectional>::from_frames(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
     let segments = [
         IoBufferDmaSegment {
             dma_addr: 0x8000,
@@ -132,7 +132,8 @@ fn dma_mapping_compresses_contiguous_segments_and_unmaps_once() {
 #[test]
 fn dma_mapping_rejects_too_many_noncompressible_segments_without_unmapping() {
     let frames = [IoBufferPageFrame::new(0x4000, IOBUFFER_FRAME_SIZE_4KIB)];
-    let buffer = IoBuffer::<PhysFramed, FromDevice>::new(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
+    let buffer =
+        IoBuffer::<PhysFramed, FromDevice>::from_frames(0, IOBUFFER_PAGE_SIZE, &frames).unwrap();
     let segments = [
         IoBufferDmaSegment {
             dma_addr: 0x1000,

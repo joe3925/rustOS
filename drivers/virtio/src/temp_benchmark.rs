@@ -12,7 +12,7 @@ use kernel_api::benchmark::{
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::dma::{
     Described, DmaMapped, FromDevice, IOBUFFER_MAX_PAGE_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
-    IoBufferDmaSegments,
+    IoBufferDmaSegments, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
@@ -94,7 +94,7 @@ fn bench_max_inflight_queue0(inner: &DevExtInner) -> usize {
 struct BenchDmaBuffer {
     base_va: VirtAddr,
     alloc_bytes: usize,
-    mapped: Option<IoBuffer<'static, DmaMapped, FromDevice>>,
+    mapped: Option<IoBuffer<'static, DmaMapped<PhysFramed>, FromDevice>>,
 }
 
 impl BenchDmaBuffer {
@@ -111,12 +111,13 @@ impl BenchDmaBuffer {
 
         let slice =
             unsafe { core::slice::from_raw_parts_mut(base_va.as_u64() as *mut u8, byte_len) };
-        let described = IoBuffer::<Described, FromDevice>::new(slice);
-        let strategy = virtio_data_mapping_strategy(&described);
-        let mapped = match kernel_api::dma::map_buffer(parent, described, strategy) {
+        let phys_framed =
+            IoBuffer::<Described, FromDevice>::from_slice_mut(slice).into_phys_framed();
+        let strategy = virtio_data_mapping_strategy(&phys_framed);
+        let mapped = match kernel_api::dma::map_buffer(parent, phys_framed, strategy) {
             Ok(mapped) => mapped,
-            Err((described, _)) => {
-                drop(described);
+            Err((phys_framed, _)) => {
+                drop(phys_framed);
                 unsafe { unmap_range(base_va, alloc_bytes as u64) };
                 deallocate_kernel_range(base_va, alloc_bytes as u64);
                 return Err(DriverStatus::InsufficientResources);
@@ -139,8 +140,8 @@ impl BenchDmaBuffer {
 
     fn destroy(&mut self) {
         if let Some(mapped) = self.mapped.take() {
-            let described = kernel_api::dma::unmap_buffer(mapped);
-            drop(described);
+            let phys_framed = kernel_api::dma::unmap_buffer(mapped);
+            drop(phys_framed);
         }
 
         if self.alloc_bytes == 0 {
@@ -504,12 +505,12 @@ async fn bench_read_via_request(
         DriverStatus::InsufficientResources
     } else {
         data.resize(len, 0);
-        let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
+        let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data[..]);
         let mut req = RequestHandle::new(Read {
             offset,
             len,
             no_buffer: false,
-            buffer: io_buf.into(),
+            buffer: io_buf,
         });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -807,3 +808,6 @@ fn percentile_index_permille(n: usize, permille: usize) -> usize {
     }
     ((n - 1) * permille) / 1000
 }
+
+
+

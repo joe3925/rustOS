@@ -25,8 +25,7 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{
-    IoBufferInner, IoBufferPageFrame, IoBufferStateKind, ReadIoBuffer, ReadIoBufferDirectionKind,
-    WriteIoBuffer, WriteIoBufferDirectionKind,
+    Described, FromDevice, IoBuffer, IoBufferPageFrame, ToDevice,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::IrqMeta;
@@ -90,8 +89,20 @@ struct PhysCursor<'a> {
 }
 
 impl<'a> PhysCursor<'a> {
-    fn from_inner(inner: &'a IoBufferInner<'_>, len: usize) -> Option<Self> {
-        Self::from_parts(inner.page_frames(), inner.frame_offset(), inner.len(), len)
+    fn from_buffer<State, Direction>(
+        buffer: &'a IoBuffer<'_, State, Direction>,
+        len: usize,
+    ) -> Option<Self>
+    where
+        State: kernel_api::kernel_types::dma::IoBufferState,
+        Direction: kernel_api::kernel_types::dma::IoBufferDirection,
+    {
+        Self::from_parts(
+            buffer.page_frames(),
+            buffer.frame_offset(),
+            buffer.len(),
+            len,
+        )
     }
 
     fn from_parts(
@@ -167,22 +178,18 @@ impl<'a> PhysCursor<'a> {
     }
 }
 
-fn read_buffer_cursor<'a>(buffer: &'a ReadIoBuffer<'_>, len: usize) -> Option<PhysCursor<'a>> {
-    match (buffer.state(), buffer.direction()) {
-        (
-            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed,
-            ReadIoBufferDirectionKind::FromDevice | ReadIoBufferDirectionKind::Bidirectional,
-        ) => PhysCursor::from_inner(buffer.as_inner(), len),
-    }
+fn read_buffer_cursor<'a>(
+    buffer: &'a IoBuffer<'_, Described, FromDevice>,
+    len: usize,
+) -> Option<PhysCursor<'a>> {
+    PhysCursor::from_buffer(buffer, len)
 }
 
-fn write_buffer_cursor<'a>(buffer: &'a WriteIoBuffer<'_>, len: usize) -> Option<PhysCursor<'a>> {
-    match (buffer.state(), buffer.direction()) {
-        (
-            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed,
-            WriteIoBufferDirectionKind::ToDevice | WriteIoBufferDirectionKind::Bidirectional,
-        ) => PhysCursor::from_inner(buffer.as_inner(), len),
-    }
+fn write_buffer_cursor<'a>(
+    buffer: &'a IoBuffer<'_, Described, ToDevice>,
+    len: usize,
+) -> Option<PhysCursor<'a>> {
+    PhysCursor::from_buffer(buffer, len)
 }
 
 /// IDE interrupt service routine.

@@ -17,10 +17,7 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::{
-            IoBufferStateKind, ReadIoBuffer, ReadIoBufferDirectionKind, WriteIoBuffer,
-            WriteIoBufferDirectionKind,
-        },
+        dma::{Described, FromDevice, IoBuffer, ToDevice},
         io::{DiskInfo, IoType},
         request::RequestData,
     },
@@ -43,34 +40,12 @@ fn panic(info: &PanicInfo) -> ! {
 
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
-fn has_from_device_buffer(buffer: &ReadIoBuffer<'_>, len: usize) -> bool {
-    let inner = buffer.as_inner();
-    let direction_ok = matches!(
-        buffer.direction(),
-        ReadIoBufferDirectionKind::FromDevice | ReadIoBufferDirectionKind::Bidirectional
-    );
-
-    direction_ok
-        && matches!(
-            buffer.state(),
-            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed
-        )
-        && inner.len() >= len
+fn has_from_device_buffer(buffer: &IoBuffer<'_, Described, FromDevice>, len: usize) -> bool {
+    buffer.len() >= len
 }
 
-fn has_to_device_buffer(buffer: &WriteIoBuffer<'_>, len: usize) -> bool {
-    let inner = buffer.as_inner();
-    let direction_ok = matches!(
-        buffer.direction(),
-        WriteIoBufferDirectionKind::ToDevice | WriteIoBufferDirectionKind::Bidirectional
-    );
-
-    direction_ok
-        && matches!(
-            buffer.state(),
-            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed
-        )
-        && inner.len() >= len
+fn has_to_device_buffer(buffer: &IoBuffer<'_, Described, ToDevice>, len: usize) -> bool {
+    buffer.len() >= len
 }
 
 #[repr(C)]

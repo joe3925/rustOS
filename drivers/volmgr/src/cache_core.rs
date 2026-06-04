@@ -8,22 +8,18 @@ use alloc::sync::Arc;
 use core::cmp::min;
 use core::hint::{cold_path, likely, unlikely};
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use futures::future::{FutureExt as FuturesFutureExt, Shared};
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer,
-    IoBufferPageFrame, PhysFramed, ToDevice,
+    Described, FromDevice, IOBUFFER_MAX_FRAME_CAPACITY, IOBUFFER_PAGE_SIZE, IoBuffer, ToDevice,
 };
-use kernel_api::memory::virt_to_phys;
 use kernel_api::println;
 use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
-use kernel_api::x86_64::VirtAddr;
-use spin::{Mutex, RwLock, RwLockReadGuard};
+use spin::{Mutex, RwLock};
 
 struct StatsInner {
     read_hits: AtomicU64,
@@ -97,7 +93,6 @@ impl<const BLOCK_SIZE: usize> PageBuf<BLOCK_SIZE> {
 
 struct Page<const BLOCK_SIZE: usize> {
     data: RwLock<Box<PageBuf<BLOCK_SIZE>>>,
-    data_phys_frames: Box<[IoBufferPageFrame]>,
     dirty: AtomicBool,
     writeback: AtomicBool,
     generation: AtomicU64,
@@ -110,12 +105,8 @@ struct Page<const BLOCK_SIZE: usize> {
 
 impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
     fn new_zeroed() -> Option<Self> {
-        let data = PageBuf::zeroed();
-        let data_phys_frames = Self::describe_data_phys_frames(&data)?;
-
         Some(Self {
-            data: RwLock::new(data),
-            data_phys_frames,
+            data: RwLock::new(PageBuf::zeroed()),
             dirty: AtomicBool::new(false),
             writeback: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -123,51 +114,6 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
             active_ops: AtomicUsize::new(0),
             owner: AtomicU64::new(0),
         })
-    }
-
-    fn describe_data_phys_frames(data: &PageBuf<BLOCK_SIZE>) -> Option<Box<[IoBufferPageFrame]>> {
-        let frame_count = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        if unlikely(frame_count > IOBUFFER_MAX_FRAME_CAPACITY) {
-            cold_path();
-            return None;
-        }
-
-        let mut frames = Vec::with_capacity(frame_count);
-        let base = data.bytes.as_ptr() as u64;
-        let mut offset = 0usize;
-
-        while offset < BLOCK_SIZE {
-            let Some(virt_addr) = base.checked_add(offset as u64) else {
-                cold_path();
-                return None;
-            };
-            let Some(phys_addr) = virt_to_phys(VirtAddr::new(virt_addr)).map(|p| p.as_u64()) else {
-                cold_path();
-                return None;
-            };
-
-            if unlikely(phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0) {
-                cold_path();
-                return None;
-            }
-
-            let remaining = BLOCK_SIZE - offset;
-            let byte_len = remaining.min(IOBUFFER_PAGE_SIZE);
-
-            frames.push(IoBufferPageFrame {
-                phys_addr,
-                byte_len: byte_len as u64,
-                virt_addr: Some(virt_addr as usize),
-            });
-
-            offset = offset.checked_add(IOBUFFER_PAGE_SIZE)?;
-        }
-
-        Some(frames.into_boxed_slice())
-    }
-
-    fn data_phys_frames(&self) -> &[IoBufferPageFrame] {
-        &self.data_phys_frames
     }
 
     fn mark_dirty(&self) -> bool {
@@ -220,34 +166,6 @@ impl<'a, const BLOCK_SIZE: usize> PageUseGuard<'a, BLOCK_SIZE> {
 impl<'a, const BLOCK_SIZE: usize> Drop for PageUseGuard<'a, BLOCK_SIZE> {
     fn drop(&mut self) {
         self.page.leave_use();
-    }
-}
-
-type ErasedReadGuard<const BLOCK_SIZE: usize> = RwLockReadGuard<'static, Box<PageBuf<BLOCK_SIZE>>>;
-
-struct ReadGuardScratch<const BLOCK_SIZE: usize> {
-    guards: Box<[MaybeUninit<ErasedReadGuard<BLOCK_SIZE>>]>,
-}
-
-impl<const BLOCK_SIZE: usize> ReadGuardScratch<BLOCK_SIZE> {
-    fn new(capacity: usize) -> Self {
-        let mut guards = Vec::with_capacity(capacity);
-        while guards.len() < capacity {
-            guards.push(MaybeUninit::uninit());
-        }
-        Self {
-            guards: guards.into_boxed_slice(),
-        }
-    }
-
-    fn empty() -> Self {
-        Self {
-            guards: Vec::new().into_boxed_slice(),
-        }
-    }
-
-    fn capacity(&self) -> usize {
-        self.guards.len()
     }
 }
 
@@ -327,10 +245,8 @@ impl FlushFilter<'_> {
 }
 
 struct FlushScratch<const BLOCK_SIZE: usize> {
-    frames: Vec<IoBufferPageFrame>,
     keys: Vec<u64>,
     run: Vec<PreparedFlushPage<BLOCK_SIZE>>,
-    guards: ReadGuardScratch<BLOCK_SIZE>,
 }
 
 impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
@@ -347,15 +263,12 @@ impl<const BLOCK_SIZE: usize> FlushScratch<BLOCK_SIZE> {
         };
 
         Self {
-            frames: Vec::with_capacity(IOBUFFER_MAX_FRAME_CAPACITY),
             keys: Vec::with_capacity(scratch_key_capacity),
             run: Vec::with_capacity(run_capacity),
-            guards: ReadGuardScratch::new(run_capacity),
         }
     }
 
     fn reset(&mut self) {
-        self.frames.clear();
         self.keys.clear();
         self.run.clear();
     }
@@ -400,122 +313,6 @@ impl<const BLOCK_SIZE: usize> Drop for FlushRunScratchLease<'_, BLOCK_SIZE> {
         }
     }
 }
-struct FlushFrameScratchLease<'a, const BLOCK_SIZE: usize> {
-    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
-    frames: Option<Vec<IoBufferPageFrame>>,
-}
-
-impl<'a, const BLOCK_SIZE: usize> FlushFrameScratchLease<'a, BLOCK_SIZE> {
-    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>) -> Self {
-        let frames = {
-            let mut scratch = scratch.lock();
-            core::mem::take(&mut scratch.frames)
-        };
-        Self {
-            scratch,
-            frames: Some(frames),
-        }
-    }
-
-    fn frames_mut(&mut self) -> &mut Vec<IoBufferPageFrame> {
-        self.frames
-            .as_mut()
-            .expect("flush frame scratch lease used after drop")
-    }
-}
-
-impl<const BLOCK_SIZE: usize> Drop for FlushFrameScratchLease<'_, BLOCK_SIZE> {
-    fn drop(&mut self) {
-        let Some(mut frames) = self.frames.take() else {
-            return;
-        };
-        frames.clear();
-        let mut scratch = self.scratch.lock();
-        if scratch.frames.capacity() < frames.capacity() {
-            scratch.frames = frames;
-        }
-    }
-}
-
-struct FlushGuardScratchLease<'a, const BLOCK_SIZE: usize> {
-    scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>,
-    guards: Option<ReadGuardScratch<BLOCK_SIZE>>,
-    len: usize,
-}
-
-impl<'a, const BLOCK_SIZE: usize> FlushGuardScratchLease<'a, BLOCK_SIZE> {
-    fn new(scratch: &'a Mutex<FlushScratch<BLOCK_SIZE>>, capacity_hint: usize) -> Self {
-        let mut guards = {
-            let mut scratch = scratch.lock();
-            core::mem::replace(&mut scratch.guards, ReadGuardScratch::empty())
-        };
-
-        if guards.capacity() < capacity_hint {
-            guards = ReadGuardScratch::new(capacity_hint);
-        }
-
-        Self {
-            scratch,
-            guards: Some(guards),
-            len: 0,
-        }
-    }
-
-    fn push<'g>(&mut self, guard: RwLockReadGuard<'g, Box<PageBuf<BLOCK_SIZE>>>) -> bool {
-        let guards = self
-            .guards
-            .as_mut()
-            .expect("flush guard scratch lease used after drop");
-
-        if self.len >= guards.capacity() {
-            return false;
-        }
-
-        // SAFETY: the erased guard is only stored inside this lease and is
-        // dropped before the lease returns its scratch storage. The pages are
-        // kept alive by the prepared run while the guards are held.
-        let guard = unsafe {
-            core::mem::transmute::<
-                RwLockReadGuard<'g, Box<PageBuf<BLOCK_SIZE>>>,
-                ErasedReadGuard<BLOCK_SIZE>,
-            >(guard)
-        };
-
-        guards.guards[self.len].write(guard);
-        self.len += 1;
-        true
-    }
-
-    fn clear(&mut self) {
-        let guards = self
-            .guards
-            .as_mut()
-            .expect("flush guard scratch lease used after drop");
-
-        while self.len != 0 {
-            self.len -= 1;
-            unsafe {
-                guards.guards[self.len].assume_init_drop();
-            }
-        }
-    }
-}
-
-impl<const BLOCK_SIZE: usize> Drop for FlushGuardScratchLease<'_, BLOCK_SIZE> {
-    fn drop(&mut self) {
-        self.clear();
-
-        let Some(guards) = self.guards.take() else {
-            return;
-        };
-
-        let mut scratch = self.scratch.lock();
-        if scratch.guards.capacity() < guards.capacity() {
-            scratch.guards = guards;
-        }
-    }
-}
-
 struct PreparedFlushPage<const BLOCK_SIZE: usize> {
     lba: u64,
     page: Arc<Page<BLOCK_SIZE>>,
@@ -807,18 +604,8 @@ where
             return Ok(true);
         };
 
-        let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
         let run = [prepared];
-        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch, run.len());
-        Self::flush_prepared_run(
-            &self.backend,
-            &self.stats,
-            &self.dirty_pages,
-            &run,
-            frame_scratch.frames_mut(),
-            &mut guard_scratch,
-        )
-        .await?;
+        Self::flush_prepared_run(&self.backend, &self.stats, &self.dirty_pages, &run).await?;
 
         Ok(true)
     }
@@ -916,14 +703,14 @@ where
         page: &mut Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
         let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
-        let io_buf =
-            IoBuffer::<PhysFramed, FromDevice>::new(0, BLOCK_SIZE, page.data_phys_frames())
-                .map_err(|_| CacheError::InvalidIoBuffer)?;
-        let bytes_read = self
-            .backend
-            .read_phys_framed(lba, 1, io_buf)
-            .await
-            .map_err(CacheError::Backend)?;
+        let bytes_read = {
+            let data = page.data.get_mut();
+            let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(&mut data.bytes[..]);
+            self.backend
+                .read_phys_framed(lba, 1, io_buf)
+                .await
+                .map_err(CacheError::Backend)?
+        };
         if unlikely(bytes_read > BLOCK_SIZE) {
             cold_path();
             return Err(CacheError::InvalidIoBuffer);
@@ -1135,13 +922,13 @@ where
         {
             let data_guard = page.data.read();
             let io_buf =
-                IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]).into_phys_framed();
+                IoBuffer::<Described, ToDevice>::from_slice(&data_guard.bytes[..]);
             let mut req = RequestHandle::new(Write {
                 offset: lba * BLOCK_SIZE as u64,
                 len: BLOCK_SIZE,
                 no_buffer: false,
                 owner: 0,
-                buffer: io_buf.into(),
+                buffer: io_buf,
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -1220,68 +1007,45 @@ where
         stats: &Arc<StatsInner>,
         dirty_pages: &Arc<AtomicUsize>,
         run: &[PreparedFlushPage<BLOCK_SIZE>],
-        frames: &mut Vec<IoBufferPageFrame>,
-        guards: &mut FlushGuardScratchLease<'_, BLOCK_SIZE>,
     ) -> Result<usize, CacheError<B::Error>> {
         if run.is_empty() {
             return Ok(0);
         }
 
-        frames.clear();
-        guards.clear();
-
         let frames_per_block = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        let frame_capacity = run
+        if run
             .len()
             .saturating_mul(frames_per_block)
-            .min(IOBUFFER_MAX_FRAME_CAPACITY);
-        if frames.capacity() < frame_capacity {
-            frames.reserve(frame_capacity - frames.capacity());
+            > IOBUFFER_MAX_FRAME_CAPACITY
+        {
+            cold_path();
+            Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
+            return Err(CacheError::InvalidIoBuffer);
         }
 
         let mut write_len = 0usize;
+        let mut read_guards = Vec::with_capacity(run.len());
 
         for prepared in run {
             let guard = prepared.page.data.read();
-            let page_frames = prepared.page.data_phys_frames();
-            if frames
-                .len()
-                .checked_add(page_frames.len())
-                .is_none_or(|len| len > IOBUFFER_MAX_FRAME_CAPACITY)
-            {
-                cold_path();
-                guards.clear();
-                frames.clear();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                return Err(CacheError::InvalidIoBuffer);
-            }
-
-            frames.extend_from_slice(page_frames);
-
             let Some(next_write_len) = write_len.checked_add(BLOCK_SIZE) else {
                 cold_path();
-                guards.clear();
-                frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
                 return Err(CacheError::OffsetOverflow);
             };
             write_len = next_write_len;
-
-            if !guards.push(guard) {
-                cold_path();
-                guards.clear();
-                frames.clear();
-                Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
-                return Err(CacheError::InvalidIoBuffer);
-            }
+            read_guards.push(guard);
         }
 
-        let io_buf = match IoBuffer::<PhysFramed, ToDevice>::new(0, write_len, &frames[..]) {
+        let mut segments = Vec::with_capacity(read_guards.len());
+        for guard in &read_guards {
+            segments.push(&guard.bytes[..]);
+        }
+
+        let io_buf = match IoBuffer::<Described, ToDevice>::from_segments(&segments[..]) {
             Ok(io_buf) => io_buf,
             Err(_) => {
                 cold_path();
-                guards.clear();
-                frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
                 return Err(CacheError::InvalidIoBuffer);
             }
@@ -1291,9 +1055,6 @@ where
             .write_phys_framed(run[0].lba, run.len(), io_buf)
             .await
             .map_err(CacheError::Backend);
-
-        guards.clear();
-        frames.clear();
 
         match write_res {
             Ok(()) => {
@@ -1352,8 +1113,6 @@ where
 
         let run_capacity = max_blocks_per_buffer.min(keys.len());
 
-        let mut frame_scratch = FlushFrameScratchLease::new(&self.flush_scratch);
-        let mut guard_scratch = FlushGuardScratchLease::new(&self.flush_scratch, run_capacity);
         let mut run_scratch = FlushRunScratchLease::new(&self.flush_scratch);
         let run = run_scratch.run_mut();
 
@@ -1377,8 +1136,6 @@ where
                     &self.stats,
                     &self.dirty_pages,
                     run.as_slice(),
-                    frame_scratch.frames_mut(),
-                    &mut guard_scratch,
                 )
                 .await
                 {
@@ -1406,8 +1163,6 @@ where
                         &self.stats,
                         &self.dirty_pages,
                         run.as_slice(),
-                        frame_scratch.frames_mut(),
-                        &mut guard_scratch,
                     )
                     .await
                     {
@@ -1434,8 +1189,6 @@ where
                     &self.stats,
                     &self.dirty_pages,
                     run.as_slice(),
-                    frame_scratch.frames_mut(),
-                    &mut guard_scratch,
                 )
                 .await
                 {
@@ -1457,8 +1210,6 @@ where
                 &self.stats,
                 &self.dirty_pages,
                 run.as_slice(),
-                frame_scratch.frames_mut(),
-                &mut guard_scratch,
             )
             .await
             {
@@ -2218,3 +1969,6 @@ where
         total
     }
 }
+
+
+

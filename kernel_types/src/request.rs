@@ -1,5 +1,5 @@
 use crate::CompletionRoutine;
-use crate::dma::{ReadIoBuffer, WriteIoBuffer};
+use crate::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
     FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
     FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams,
@@ -1061,7 +1061,7 @@ pub struct Read<'data> {
     pub offset: u64,
     pub len: usize,
     pub no_buffer: bool,
-    pub buffer: ReadIoBuffer<'data>,
+    pub buffer: IoBuffer<'data, Described, FromDevice>,
 }
 
 impl RequestKind for Read<'_> {
@@ -1076,7 +1076,7 @@ pub struct Write<'data> {
     pub no_buffer: bool,
     /// File-level owner tag. 0 = unowned (included in all targeted flushes).
     pub owner: u64,
-    pub buffer: WriteIoBuffer<'data>,
+    pub buffer: IoBuffer<'data, Described, ToDevice>,
 }
 
 impl RequestKind for Write<'_> {

@@ -19,7 +19,7 @@ use kernel_api::device::DevExtRef;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
-use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice};
+use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
 use kernel_api::kernel_types::io::IoType;
 use kernel_api::kernel_types::io::IoVtable;
@@ -89,7 +89,7 @@ impl VolumeCacheBackend for CacheBackend {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, PhysFramed, FromDevice>,
+        buffer: IoBuffer<'buffer, Described, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             if unlikely(blocks == 0) {
@@ -136,7 +136,7 @@ impl VolumeCacheBackend for CacheBackend {
                 offset,
                 len: total_len,
                 no_buffer: false,
-                buffer: buffer.into(),
+                buffer,
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -212,7 +212,7 @@ impl VolumeCacheBackend for CacheBackend {
         &'a self,
         lba: u64,
         blocks: usize,
-        buffer: IoBuffer<'buffer, PhysFramed, ToDevice>,
+        buffer: IoBuffer<'buffer, Described, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
             if unlikely(blocks == 0) {
@@ -253,7 +253,7 @@ impl VolumeCacheBackend for CacheBackend {
                 len: total_len,
                 no_buffer: false,
                 owner: 0,
-                buffer: buffer.into(),
+                buffer,
             });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
@@ -389,12 +389,12 @@ fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverSta
 
 async fn forward_no_buffer_read(target: IoTarget, offset: u64, dst: &mut [u8]) -> DriverStatus {
     let len = dst.len();
-    let io_buf = IoBuffer::<Described, FromDevice>::new(dst).into_phys_framed();
+    let io_buf = IoBuffer::<Described, FromDevice>::from_slice_mut(dst);
     let mut req = RequestHandle::new(Read {
         offset,
         len,
         no_buffer: true,
-        buffer: io_buf.into(),
+        buffer: io_buf,
     });
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(target, &mut req).await
@@ -407,13 +407,13 @@ async fn forward_no_buffer_write(
     owner: u64,
 ) -> DriverStatus {
     let len = src.len();
-    let io_buf = IoBuffer::<Described, ToDevice>::new(src).into_phys_framed();
+    let io_buf = IoBuffer::<Described, ToDevice>::from_slice(src);
     let mut req = RequestHandle::new(Write {
         offset,
         len,
         no_buffer: true,
         owner,
-        buffer: io_buf.into(),
+        buffer: io_buf,
     });
     req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(target, &mut req).await
@@ -626,7 +626,7 @@ pub async fn vol_pdo_read<'req, 'data, 'b>(
             r.body.offset,
             r.body.len,
             r.body.no_buffer,
-            r.body.buffer.as_inner().len(),
+            r.body.buffer.len(),
         )
     };
 
@@ -659,7 +659,7 @@ pub async fn vol_pdo_read<'req, 'data, 'b>(
             Some(t) => t.clone(),
             None => return DriverStep::complete(DriverStatus::NoSuchDevice),
         };
-        let dst = match req.write().body.buffer.as_inner_mut().try_as_mut_slice() {
+        let dst = match req.write().body.buffer.try_as_mut_slice() {
             Some(dst) => dst,
             None => {
                 cold_path();
@@ -678,7 +678,7 @@ pub async fn vol_pdo_read<'req, 'data, 'b>(
         }
     };
 
-    let dst = match req.write().body.buffer.as_inner_mut().try_as_mut_slice() {
+    let dst = match req.write().body.buffer.try_as_mut_slice() {
         Some(dst) => dst,
         None => {
             cold_path();
@@ -718,7 +718,7 @@ pub async fn vol_pdo_write<'req, 'data, 'b>(
             r.body.len,
             r.body.no_buffer,
             r.body.owner,
-            r.body.buffer.as_inner().len(),
+            r.body.buffer.len(),
         )
     };
 
@@ -746,7 +746,7 @@ pub async fn vol_pdo_write<'req, 'data, 'b>(
     }
 
     let data_addr = {
-        let src = match req.read().body.buffer.as_inner().try_as_slice() {
+        let src = match req.read().body.buffer.try_as_slice() {
             Some(src) => src,
             None => {
                 cold_path();
@@ -899,3 +899,6 @@ async fn vol_pdo_query_resources<'a, 'b>(
 
     DriverStep::complete(status)
 }
+
+
+

@@ -38,10 +38,8 @@ use kernel_api::irq::{
     irq_register_isr, irq_register_isr_gsi, irq_wait_closed,
 };
 use kernel_api::kernel_types::dma::{
-    Bidirectional, BorrowedDmaMapping, Described, DmaMappingStrategy, FromDevice, IoBuffer,
-    IoBufferDirection, IoBufferDmaSegment, IoBufferInner, IoBufferState, IoBufferStateKind,
-    MappableIoBufferState, PhysFramed, ReadIoBuffer, ReadIoBufferDirectionKind, ToDevice,
-    WriteIoBuffer, WriteIoBufferDirectionKind,
+    BorrowedDmaMapping, Described, DmaMappingStrategy, FromDevice, IoBuffer, IoBufferDirection,
+    IoBufferDmaSegment, IoBufferState, ToDevice,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
@@ -168,63 +166,20 @@ where
     }
 }
 
-fn map_inner_request_buffer<'map, 'buffer, State, Direction>(
+fn map_request_buffer<'map, 'buffer, Direction>(
     device: &Arc<DeviceObject>,
-    inner: &'map IoBufferInner<'buffer>,
+    buffer: &'map IoBuffer<'buffer, Described, Direction>,
 ) -> Result<BorrowedDmaMapping<'map>, DriverStatus>
 where
-    State: MappableIoBufferState + 'map,
     Direction: IoBufferDirection + 'map,
 {
-    // SAFETY: IoBuffer is #[repr(C)] with IoBufferInner as its first field and
-    // only zero-sized marker fields after it. This creates a borrowed typed
-    // view for the existing DMA API without taking ownership of the request
-    // buffer or duplicating its backing storage.
-    let buffer = unsafe {
-        &*(inner as *const IoBufferInner<'buffer> as *const IoBuffer<'buffer, State, Direction>)
-    };
-    kernel_api::dma::map_buffer_ref(device, buffer, virtio_data_mapping_strategy(buffer))
+    let phys_framed = buffer.as_phys_framed();
+    kernel_api::dma::map_buffer_ref(
+        device,
+        phys_framed,
+        virtio_data_mapping_strategy(phys_framed),
+    )
         .map_err(|_| DriverStatus::InsufficientResources)
-}
-
-fn map_read_request_buffer<'map, 'buffer>(
-    device: &Arc<DeviceObject>,
-    buffer: &'map ReadIoBuffer<'buffer>,
-) -> Result<BorrowedDmaMapping<'map>, DriverStatus> {
-    match (buffer.state(), buffer.direction()) {
-        (IoBufferStateKind::Described, ReadIoBufferDirectionKind::FromDevice) => {
-            map_inner_request_buffer::<Described, FromDevice>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::PhysFramed, ReadIoBufferDirectionKind::FromDevice) => {
-            map_inner_request_buffer::<PhysFramed, FromDevice>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::Described, ReadIoBufferDirectionKind::Bidirectional) => {
-            map_inner_request_buffer::<Described, Bidirectional>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::PhysFramed, ReadIoBufferDirectionKind::Bidirectional) => {
-            map_inner_request_buffer::<PhysFramed, Bidirectional>(device, buffer.as_inner())
-        }
-    }
-}
-
-fn map_write_request_buffer<'map, 'buffer>(
-    device: &Arc<DeviceObject>,
-    buffer: &'map WriteIoBuffer<'buffer>,
-) -> Result<BorrowedDmaMapping<'map>, DriverStatus> {
-    match (buffer.state(), buffer.direction()) {
-        (IoBufferStateKind::Described, WriteIoBufferDirectionKind::ToDevice) => {
-            map_inner_request_buffer::<Described, ToDevice>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::PhysFramed, WriteIoBufferDirectionKind::ToDevice) => {
-            map_inner_request_buffer::<PhysFramed, ToDevice>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::Described, WriteIoBufferDirectionKind::Bidirectional) => {
-            map_inner_request_buffer::<Described, Bidirectional>(device, buffer.as_inner())
-        }
-        (IoBufferStateKind::PhysFramed, WriteIoBufferDirectionKind::Bidirectional) => {
-            map_inner_request_buffer::<PhysFramed, Bidirectional>(device, buffer.as_inner())
-        }
-    }
 }
 
 async fn submit_virtio_no_data_request(
@@ -1195,11 +1150,12 @@ pub async fn virtio_pdo_read<'req, 'data, 'b>(
 
     let status = 'transfer: {
         let buffer = &req.read().body.buffer;
-        if unlikely(buffer.as_inner().len() < len) {
+        if unlikely(buffer.len() < len) {
             cold_path();
             break 'transfer DriverStatus::InvalidParameter;
         }
-        let mapped_buffer = match map_read_request_buffer(&parent, buffer) {
+        let mapped_buffer =
+            match map_request_buffer::<FromDevice>(&parent, buffer) {
             Ok(b) => b,
             Err(status) => {
                 cold_path();
@@ -1323,11 +1279,11 @@ pub async fn virtio_pdo_write<'req, 'data, 'b>(
 
     let status = 'transfer: {
         let buffer = &req.read().body.buffer;
-        if unlikely(buffer.as_inner().len() < len) {
+        if unlikely(buffer.len() < len) {
             cold_path();
             break 'transfer DriverStatus::InvalidParameter;
         }
-        let mapped_buffer = match map_write_request_buffer(&parent, buffer) {
+        let mapped_buffer = match map_request_buffer::<ToDevice>(&parent, buffer) {
             Ok(b) => b,
             Err(status) => {
                 cold_path();

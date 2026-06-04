@@ -4,7 +4,7 @@ use kernel_api::device::DeviceObject;
 use kernel_api::dma;
 use kernel_api::kernel_types::dma::{
     Bidirectional, Described, DmaMapped, DmaMappingStrategy, IOBUFFER_MAX_PAGE_CAPACITY,
-    IOBUFFER_PAGE_SIZE, IoBuffer,
+    IOBUFFER_PAGE_SIZE, IoBuffer, PhysFramed,
 };
 use kernel_api::memory::{
     PageTableFlags, allocate_auto_kernel_range_mapped_contiguous, deallocate_kernel_range,
@@ -18,7 +18,7 @@ struct DmaChunk {
     byte_offset: usize,
     byte_len: usize,
     dma_addr: u64,
-    buffer: Option<IoBuffer<'static, DmaMapped, Bidirectional>>,
+    buffer: Option<IoBuffer<'static, DmaMapped<PhysFramed>, Bidirectional>>,
 }
 
 pub struct ContiguousDmaRegion {
@@ -90,9 +90,11 @@ impl ContiguousDmaRegion {
             // Each chunk maps a disjoint sub-slice of the same contiguous allocation.
             let buf_ptr = (base_va.as_u64() as *mut u8).wrapping_add(byte_offset);
             let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, byte_len) };
+            let buffer =
+                IoBuffer::<Described, Bidirectional>::from_slice_mut(buf).into_phys_framed();
             let mapped = match dma::map_buffer(
                 device,
-                IoBuffer::<Described, Bidirectional>::new(buf),
+                buffer,
                 DmaMappingStrategy::SingleContiguous,
             ) {
                 Ok(mapped) => mapped,
@@ -176,3 +178,4 @@ impl Drop for ContiguousDmaRegion {
         self.destroy();
     }
 }
+

@@ -97,7 +97,7 @@ fn io_vtable_installs_each_handler_once() {
         offset: 0,
         len: 4,
         no_buffer: false,
-        buffer: IoBuffer::<Described, FromDevice>::new(&mut buffer).into(),
+        buffer: IoBuffer::<Described, FromDevice>::from_slice_mut(&mut buffer),
     });
     assert_eq!(handle.read().body.offset, 0);
     assert_eq!(handle.read().body.len, 4);

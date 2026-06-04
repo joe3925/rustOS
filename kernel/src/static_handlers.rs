@@ -60,8 +60,9 @@ use kernel_types::{
     },
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::{
-        DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMappingStrategy, DmaPciDeviceIdentity,
-        IoBufferInner,
+        DmaDeviceHandle, DmaDeviceState, DmaMapError, DmaMapped, DmaMappingStrategy,
+        DmaPciDeviceIdentity, IoBuffer, ToDevice,
+        PhysFramed,
     },
     fs::{OpenFlags, Path},
     io::IoTarget,
@@ -196,21 +197,26 @@ pub extern "win64" fn kernel_dma_query_device_state(
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_dma_map_buffer<'a>(
     device: &Arc<DeviceObject>,
-    buffer: IoBufferInner<'a>,
+    buffer: IoBuffer<'a, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
-) -> Result<IoBufferInner<'a>, (IoBufferInner<'a>, DmaMapError)> {
+) -> Result<
+    IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+    (IoBuffer<'a, PhysFramed, ToDevice>, DmaMapError),
+> {
     dma::map_buffer(device, buffer, strategy)
 }
 
 #[unsafe(no_mangle)]
-pub extern "win64" fn kernel_dma_unmap_buffer<'a>(buffer: IoBufferInner<'a>) -> IoBufferInner<'a> {
+pub extern "win64" fn kernel_dma_unmap_buffer<'a>(
+    buffer: IoBuffer<'a, DmaMapped<PhysFramed>, ToDevice>,
+) -> IoBuffer<'a, PhysFramed, ToDevice> {
     dma::unmap_buffer(buffer)
 }
 
 #[unsafe(no_mangle)]
 pub extern "win64" fn kernel_dma_map_buffer_ref<'map, 'buffer>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBufferInner<'buffer>,
+    buffer: &'map IoBuffer<'buffer, PhysFramed, ToDevice>,
     strategy: DmaMappingStrategy,
 ) -> Result<kernel_types::dma::BorrowedDmaMapping<'map>, DmaMapError> {
     dma::map_buffer_ref(device, buffer, strategy)
