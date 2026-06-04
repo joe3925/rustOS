@@ -41,7 +41,9 @@ impl PELoader {
     pub async fn new(path: &Path) -> Option<Self> {
         let open_flags = [OpenFlags::Open, OpenFlags::ReadOnly];
         let file_handle = File::open(path, &open_flags).await.ok()?;
-        let file_data: Vec<u8> = file_handle.read().await.ok()?;
+        let mut file_data = alloc::vec![0u8; file_handle.size as usize];
+        let n = file_handle.read(&mut file_data).await.ok()?;
+        file_data.truncate(n);
 
         let boxed: Box<[u8]> = file_data.into_boxed_slice();
 

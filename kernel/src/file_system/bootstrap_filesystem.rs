@@ -6,11 +6,9 @@ use alloc::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::RwLock;
 
-use crate::file_system::file_provider::FileProvider;
 use crate::util::BootPkg;
 use kernel_types::{
-    async_ffi::{FfiFuture, FutureExt},
-    fs::{Path, *},
+    fs::*,
     status::{DriverStatus, FileStatus},
 };
 
@@ -220,7 +218,7 @@ impl<'a> BootstrapProvider<'a> {
         p == norm_upcase(REG_SNAP_PATH) || p == norm_upcase(REG_WAL_PATH)
     }
 
-    fn seek_handle_sync(
+    pub(crate) fn seek_handle_sync(
         &self,
         file_id: u64,
         offset: i64,
@@ -363,7 +361,11 @@ impl<'a> BootstrapProvider<'a> {
 }
 
 impl<'a> BootstrapProvider<'a> {
-    fn open_path_sync(&self, path: &str, flags: &[OpenFlags]) -> (FsOpenResult, DriverStatus) {
+    pub(crate) fn open_path_sync(
+        &self,
+        path: &str,
+        flags: &[OpenFlags],
+    ) -> (FsOpenResult, DriverStatus) {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => {
@@ -451,7 +453,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn close_handle_sync(&self, file_id: u64) -> (FsCloseResult, DriverStatus) {
+    pub(crate) fn close_handle_sync(&self, file_id: u64) -> (FsCloseResult, DriverStatus) {
         let removed = self.handles.write().remove(&file_id).is_some();
         (
             FsCloseResult {
@@ -465,7 +467,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn read_at_sync(
+    pub(crate) fn read_at_sync(
         &self,
         file_id: u64,
         offset: u64,
@@ -505,7 +507,7 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn write_at_sync(
+    pub(crate) fn write_at_sync(
         &self,
         file_id: u64,
         offset: u64,
@@ -541,11 +543,11 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn flush_handle_sync(&self, _file_id: u64) -> (FsFlushResult, DriverStatus) {
+    pub(crate) fn flush_handle_sync(&self, _file_id: u64) -> (FsFlushResult, DriverStatus) {
         (FsFlushResult { error: None }, DriverStatus::Success)
     }
 
-    fn get_info_sync(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
+    pub(crate) fn get_info_sync(&self, file_id: u64) -> (FsGetInfoResult, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
@@ -589,7 +591,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn list_dir_path_sync(&self, path: &str) -> (FsListDirResult, DriverStatus) {
+    pub(crate) fn list_dir_path_sync(&self, path: &str) -> (FsListDirResult, DriverStatus) {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => {
@@ -643,7 +645,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn make_dir_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn make_dir_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
         let r = self.ensure_dir(path).err();
         (
             FsCreateResult {
@@ -653,7 +655,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn remove_dir_path_sync(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn remove_dir_path_sync(&self, _path: &str) -> (FsCreateResult, DriverStatus) {
         (
             FsCreateResult {
                 error: Some(FileStatus::UnknownFail),
@@ -662,7 +664,7 @@ impl<'a> BootstrapProvider<'a> {
         )
     }
 
-    fn rename_path_sync(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus) {
+    pub(crate) fn rename_path_sync(&self, src: &str, dst: &str) -> (FsRenameResult, DriverStatus) {
         let s = match self.must_c(src) {
             Ok(p) => p,
             Err(e) => return (FsRenameResult { error: Some(e) }, DriverStatus::Success),
@@ -734,7 +736,7 @@ impl<'a> BootstrapProvider<'a> {
         (FsRenameResult { error: None }, DriverStatus::Success)
     }
 
-    fn delete_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
+    pub(crate) fn delete_path_sync(&self, path: &str) -> (FsCreateResult, DriverStatus) {
         let p = match self.must_c(path) {
             Ok(p) => p,
             Err(e) => return (FsCreateResult { error: Some(e) }, DriverStatus::Success),
@@ -790,7 +792,11 @@ impl<'a> BootstrapProvider<'a> {
         (FsCreateResult { error: None }, DriverStatus::Success)
     }
 
-    fn set_len_sync(&self, file_id: u64, new_size: u64) -> (FsSetLenResult, DriverStatus) {
+    pub(crate) fn set_len_sync(
+        &self,
+        file_id: u64,
+        new_size: u64,
+    ) -> (FsSetLenResult, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
@@ -851,7 +857,7 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn append_sync(&self, file_id: u64, data: &[u8]) -> (FsAppendResult, DriverStatus) {
+    pub(crate) fn append_sync(&self, file_id: u64, data: &[u8]) -> (FsAppendResult, DriverStatus) {
         let path = match self.handles.read().get(&file_id) {
             Some(p) => p.clone(),
             None => {
@@ -932,7 +938,7 @@ impl<'a> BootstrapProvider<'a> {
         }
     }
 
-    fn zero_range_sync(
+    pub(crate) fn zero_range_sync(
         &self,
         file_id: u64,
         offset: u64,
@@ -1012,111 +1018,5 @@ impl<'a> BootstrapProvider<'a> {
                 DriverStatus::Success,
             ),
         }
-    }
-}
-
-impl<'a> FileProvider for BootstrapProvider<'a> {
-    fn open_path(
-        &self,
-        path: &Path,
-        flags: &[OpenFlags],
-        _write_through: bool,
-    ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
-        let res = self.open_path_sync(&path.to_string(), flags);
-        async move { res }.into_ffi()
-    }
-
-    fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)> {
-        let res = self.close_handle_sync(file_id);
-        async move { res }.into_ffi()
-    }
-    fn seek_handle(
-        &self,
-        file_id: u64,
-        offset: i64,
-        origin: FsSeekWhence,
-    ) -> FfiFuture<(FsSeekResult, DriverStatus)> {
-        let res = self.seek_handle_sync(file_id, offset, origin);
-        async move { res }.into_ffi()
-    }
-    fn read_at(
-        &self,
-        file_id: u64,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> FfiFuture<(FsReadResult, DriverStatus)> {
-        let res = self.read_at_sync(file_id, offset, buf);
-        async move { res }.into_ffi()
-    }
-
-    fn write_at(
-        &self,
-        file_id: u64,
-        offset: u64,
-        data: &[u8],
-        _write_through: bool,
-    ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
-        let res = self.write_at_sync(file_id, offset, data);
-        async move { res }.into_ffi()
-    }
-
-    fn flush_handle(&self, file_id: u64) -> FfiFuture<(FsFlushResult, DriverStatus)> {
-        let res = self.flush_handle_sync(file_id);
-        async move { res }.into_ffi()
-    }
-
-    fn get_info(&self, file_id: u64) -> FfiFuture<(FsGetInfoResult, DriverStatus)> {
-        let res = self.get_info_sync(file_id);
-        async move { res }.into_ffi()
-    }
-
-    fn list_dir_path(&self, path: &Path) -> FfiFuture<(FsListDirResult, DriverStatus)> {
-        let res = self.list_dir_path_sync(&path.to_string());
-        async move { res }.into_ffi()
-    }
-
-    fn make_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.make_dir_path_sync(&path.to_string());
-        async move { res }.into_ffi()
-    }
-
-    fn remove_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.remove_dir_path_sync(&path.to_string());
-        async move { res }.into_ffi()
-    }
-
-    fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)> {
-        let res = self.rename_path_sync(&src.to_string(), &dst.to_string());
-        async move { res }.into_ffi()
-    }
-
-    fn delete_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let res = self.delete_path_sync(&path.to_string());
-        async move { res }.into_ffi()
-    }
-
-    fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)> {
-        let res = self.set_len_sync(file_id, new_size);
-        async move { res }.into_ffi()
-    }
-
-    fn append(
-        &self,
-        file_id: u64,
-        data: &[u8],
-        _write_through: bool,
-    ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
-        let res = self.append_sync(file_id, data);
-        async move { res }.into_ffi()
-    }
-
-    fn zero_range(
-        &self,
-        file_id: u64,
-        offset: u64,
-        len: u64,
-    ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)> {
-        let res = self.zero_range_sync(file_id, offset, len);
-        async move { res }.into_ffi()
     }
 }

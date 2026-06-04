@@ -21,6 +21,8 @@ use spin::RwLock;
 
 use crate::executable::program::{MessageQueue, ProgramHandle};
 use crate::scheduling::scheduler::TaskHandle;
+use crate::structs::completion_queue::CompletionQueue;
+use crate::structs::io_request::FileObject;
 
 pub type TaskQueueRef = Arc<RwLock<MessageQueue>>;
 pub type ObjRef = Arc<dyn Any + Send + Sync>;
@@ -104,6 +106,8 @@ pub enum ObjectPayload {
     Program(ProgramHandle),
     Thread(TaskHandle),
     Queue(TaskQueueRef),
+    CompletionQueue(Arc<CompletionQueue>),
+    File(Arc<FileObject>),
     Module(ModuleHandle),
     Device(Arc<DeviceObject>),
 }
@@ -466,6 +470,8 @@ impl ObjectManager {
                 | ObjectTag::Program
                 | ObjectTag::Thread
                 | ObjectTag::Queue
+                | ObjectTag::CompletionQueue
+                | ObjectTag::File
                 | ObjectTag::Module
                 | ObjectTag::Device => {
                     if idx + 1 == comps.len() {
@@ -538,6 +544,8 @@ impl ObjectManager {
                 | ObjectTag::Program
                 | ObjectTag::Thread
                 | ObjectTag::Queue
+                | ObjectTag::CompletionQueue
+                | ObjectTag::File
                 | ObjectTag::Module
                 | ObjectTag::Device => {
                     if idx + 1 == comps.len() {

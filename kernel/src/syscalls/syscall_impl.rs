@@ -2,20 +2,22 @@ use crate::drivers::interrupt_index::current_cpu_id;
 use crate::executable::program::{
     Message, MessageId, ProgramHandle, RoutingAction, RoutingRule, UserHandle, PROGRAM_MANAGER,
 };
-use crate::file_system::file::File;
 use crate::memory::paging::constants::KERNEL_SPACE_BASE;
 use crate::memory::paging::stack::StackSize;
-use crate::scheduling::runtime::runtime::block_on;
 use crate::scheduling::scheduler::SCHEDULER;
 use crate::scheduling::task::Task;
+use crate::structs::completion_queue::{CompletionQueue, CompletionQueueError};
+use crate::structs::io_request::{
+    FileObject, IoOpcode, KernelIoOp, RequestId, UserIoCompletion, UserIoOp,
+};
 use crate::{format, print};
 use crate::{scheduling::scheduler::TaskHandle, util::generate_guid};
 use alloc::slice;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use kernel_types::fs::{OpenFlags, Path};
 use kernel_types::object_manager::ObjectTag;
-use x86_64::instructions::hlt;
 
 use crate::object_manager::{Object, ObjectPayload, TaskQueueRef, OBJECT_MANAGER};
 
@@ -149,8 +151,6 @@ pub fn err_code(v: u64) -> u16 {
 pub fn err_arg(v: u64) -> u32 {
     (v & 0xFFFF_FFFF) as u32
 }
-const NOWAIT: u32 = 0x01;
-
 #[repr(u16)]
 pub enum ErrClass {
     Common = 0x0001,
@@ -222,6 +222,292 @@ pub struct UserRoutingRule {
 #[inline]
 pub fn make_err(class: ErrClass, code: u16, arg: u32) -> u64 {
     ERR_FLAG | ((class as u64) << 48) | ((code as u64) << 32) | (arg as u64)
+}
+
+fn current_process() -> Result<(u64, ProgramHandle), u64> {
+    let caller_pid = SCHEDULER
+        .get_current_task(current_cpu_id())
+        .unwrap()
+        .inner
+        .read()
+        .parent_pid;
+
+    match PROGRAM_MANAGER.get(caller_pid) {
+        Some(handle) => Ok((caller_pid, handle)),
+        None => Err(make_err(
+            ErrClass::Program,
+            ProgErr::NotFound as u16,
+            caller_pid as u32,
+        )),
+    }
+}
+
+fn resolve_completion_queue(
+    handle: UserHandle,
+    caller_pid: u64,
+) -> Result<Arc<CompletionQueue>, u64> {
+    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+
+    let queue = match &obj.payload {
+        ObjectPayload::CompletionQueue(queue) => queue.clone(),
+        _ => {
+            return Err(make_err(
+                ErrClass::Common,
+                CommonErr::InvalidHandle as u16,
+                handle as u32,
+            ))
+        }
+    };
+
+    if queue.owner_pid != caller_pid {
+        return Err(make_err(
+            ErrClass::Common,
+            CommonErr::AccessDenied as u16,
+            handle as u32,
+        ));
+    }
+
+    Ok(queue)
+}
+
+fn resolve_file_object(handle: UserHandle) -> Result<Arc<FileObject>, u64> {
+    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )
+    })?;
+
+    match &obj.payload {
+        ObjectPayload::File(file) => Ok(file.clone()),
+        _ => Err(make_err(
+            ErrClass::Common,
+            CommonErr::InvalidHandle as u16,
+            handle as u32,
+        )),
+    }
+}
+
+fn resolve_message_queue(
+    handle: UserHandle,
+    caller_pid: u64,
+    caller: &ProgramHandle,
+) -> Result<TaskQueueRef, u64> {
+    if handle == 0 {
+        return Ok(ensure_default_queue_object(caller_pid, caller).1);
+    }
+
+    let obj = OBJECT_MANAGER.open_by_id(handle).ok_or_else(|| {
+        make_err(
+            ErrClass::Message,
+            MsgErr::TargetHandleInvalid as u16,
+            handle as u32,
+        )
+    })?;
+
+    match &obj.payload {
+        ObjectPayload::Queue(queue) => Ok(queue.clone()),
+        _ => Err(make_err(
+            ErrClass::Message,
+            MsgErr::TargetHandleInvalid as u16,
+            handle as u32,
+        )),
+    }
+}
+
+fn copy_user_bytes(addr: u64, len: usize) -> Result<Vec<u8>, u64> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let ptr = addr as *const u8;
+    if ptr.is_null() || !user_ptr_ok(ptr, len) {
+        return Err(make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0));
+    }
+
+    Ok(unsafe { slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
+fn copy_user_string(addr: u64, len: usize) -> Result<String, u64> {
+    if len == 0 {
+        return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+    }
+
+    let bytes = copy_user_bytes(addr, len)?;
+    let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+    core::str::from_utf8(&bytes[..end])
+        .map(|s| s.to_string())
+        .map_err(|_| make_err(ErrClass::File, FileErr::PathInvalid as u16, 0))
+}
+
+fn open_flags_from_bits(bits: u32) -> Vec<OpenFlags> {
+    let mut out = Vec::new();
+    let flags = [
+        OpenFlags::ReadOnly,
+        OpenFlags::WriteOnly,
+        OpenFlags::ReadWrite,
+        OpenFlags::Create,
+        OpenFlags::CreateNew,
+        OpenFlags::Open,
+        OpenFlags::WriteThrough,
+    ];
+
+    for flag in flags {
+        if bits & flag as u32 != 0 {
+            out.push(flag);
+        }
+    }
+
+    out
+}
+
+fn validate_user_buffer(addr: u64, len: usize) -> Result<(), u64> {
+    if len == 0 {
+        return Ok(());
+    }
+
+    let ptr = addr as *const u8;
+    if ptr.is_null() || !user_ptr_ok(ptr, len) {
+        return Err(make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0));
+    }
+    Ok(())
+}
+
+fn build_kernel_io_op(
+    caller_pid: u64,
+    caller: &ProgramHandle,
+    op: UserIoOp,
+) -> Result<KernelIoOp, u64> {
+    let opcode = IoOpcode::from_raw(op.opcode).ok_or_else(|| {
+        make_err(
+            ErrClass::Common,
+            CommonErr::NotImplemented as u16,
+            op.opcode,
+        )
+    })?;
+
+    match opcode {
+        IoOpcode::FileOpen => {
+            let path = copy_user_string(op.buffer, op.length as usize)?;
+            if path.is_empty() {
+                return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+            }
+
+            Ok(KernelIoOp::FileOpen {
+                owner_pid: caller_pid,
+                owner: caller.clone(),
+                path: resolve_with_working_dir(caller, &path),
+                flags: open_flags_from_bits(op.flags),
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::FileRead => {
+            let length = op.length as usize;
+            validate_user_buffer(op.buffer, length)?;
+            Ok(KernelIoOp::FileRead {
+                owner: caller.clone(),
+                file: resolve_file_object(op.target_handle)?,
+                buffer: op.buffer,
+                length,
+                offset: op.offset,
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::FileWrite => {
+            let data = copy_user_bytes(op.buffer, op.length as usize)?;
+            Ok(KernelIoOp::FileWrite {
+                file: resolve_file_object(op.target_handle)?,
+                data,
+                offset: op.offset,
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::FileDelete => {
+            if op.target_handle != 0 {
+                return Ok(KernelIoOp::FileDeleteHandle {
+                    file: resolve_file_object(op.target_handle)?,
+                    user_token: op.user_token,
+                });
+            }
+
+            let path = copy_user_string(op.buffer, op.length as usize)?;
+            if path.is_empty() {
+                return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+            }
+
+            Ok(KernelIoOp::FileDeletePath {
+                path: resolve_with_working_dir(caller, &path),
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::ListDir => {
+            let path = copy_user_string(op.buffer, op.length as usize)?;
+            if path.is_empty() {
+                return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+            }
+
+            Ok(KernelIoOp::ListDir {
+                owner: caller.clone(),
+                path: resolve_with_working_dir(caller, &path),
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::ChangeDirectory => {
+            let path = copy_user_string(op.buffer, op.length as usize)?;
+            if path.is_empty() {
+                return Err(make_err(ErrClass::File, FileErr::PathInvalid as u16, 0));
+            }
+
+            Ok(KernelIoOp::ChangeDirectory {
+                owner: caller.clone(),
+                path: resolve_with_working_dir(caller, &path),
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::MqReceive => {
+            let length = op.length as usize;
+            validate_user_buffer(op.buffer, length)?;
+            Ok(KernelIoOp::MqReceive {
+                owner: caller.clone(),
+                queue: resolve_message_queue(op.target_handle, caller_pid, caller)?,
+                buffer: op.buffer,
+                length,
+                user_token: op.user_token,
+            })
+        }
+        IoOpcode::SocketRecv
+        | IoOpcode::SocketSend
+        | IoOpcode::TimerWait
+        | IoOpcode::ProcessWait
+        | IoOpcode::Ioctl => Err(make_err(
+            ErrClass::Common,
+            CommonErr::NotImplemented as u16,
+            op.opcode,
+        )),
+    }
+}
+
+fn map_cq_error(err: CompletionQueueError) -> u64 {
+    match err {
+        CompletionQueueError::InvalidCapacity => {
+            make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0)
+        }
+        CompletionQueueError::RequestTableFull | CompletionQueueError::CompletionQueueFull => {
+            make_err(ErrClass::Common, CommonErr::BufferTooSmall as u16, 0)
+        }
+        CompletionQueueError::RequestNotFound => {
+            make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0)
+        }
+        CompletionQueueError::RequestAlreadyComplete => {
+            make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 1)
+        }
+    }
 }
 
 pub(crate) fn sys_print(ptr: *const u8) -> u64 {
@@ -319,179 +605,215 @@ pub(crate) fn sys_create_task(entry: usize) -> UserHandle {
     obj.id
 }
 
-pub(crate) fn sys_file_read(file: *mut File, max_len: usize) -> u64 {
-    if file.is_null() || !user_ptr(file) {
+pub(crate) fn sys_completion_queue_create(
+    request_capacity: usize,
+    completion_capacity: usize,
+    flags: u64,
+) -> UserHandle {
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+
+    if request_capacity == 0 || completion_capacity == 0 {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    if max_len == 0 {
-        return make_err(ErrClass::File, FileErr::ReadZeroLen as u16, 0);
-    }
-    let f = unsafe { &mut *file };
-    let data = match block_on(f.read()) {
-        Ok(d) => d,
-        Err(_) => return make_err(ErrClass::File, FileErr::Io as u16, 0),
-    };
-    let len = core::cmp::min(data.len(), max_len);
 
-    let pid = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let handle = match PROGRAM_MANAGER.get(pid) {
-        Some(h) => h,
-        None => return make_err(ErrClass::Program, ProgErr::NotFound as u16, pid as u32),
-    };
+    ensure_process_object(caller_pid, &caller);
 
+    let queue = match CompletionQueue::new(caller_pid, request_capacity, completion_capacity, flags)
     {
-        let prog = handle.write();
-        let va = match prog.tracker.alloc_auto(len as u64) {
-            Some(v) => v,
-            None => return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, len as u32),
-        };
-        if unsafe { prog.virtual_map(va, len) }.is_err() {
-            return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), va.as_mut_ptr::<u8>(), len);
-        }
-        va.as_u64()
+        Ok(queue) => queue,
+        Err(err) => return map_cq_error(err),
+    };
+
+    let dir = alloc::format!("\\Process\\{}\\CompletionQueues", caller_pid);
+    if OBJECT_MANAGER.mkdir_p(dir.clone()).is_err() {
+        return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 0);
     }
+
+    let name = guid_to_string(&generate_guid());
+    let object = Object::with_name(
+        ObjectTag::CompletionQueue,
+        name.clone(),
+        ObjectPayload::CompletionQueue(queue),
+    );
+    if OBJECT_MANAGER
+        .link(alloc::format!("{}\\{}", dir, name), &object)
+        .is_err()
+    {
+        return make_err(ErrClass::Common, CommonErr::InvalidHandle as u16, 1);
+    }
+
+    let handle = caller.read().create_user_handle_for_object(object);
+    handle
 }
 
-pub(crate) fn sys_file_write(file: *mut File, buf: *const u8, len: usize) -> u64 {
-    if file.is_null() || !user_ptr(file) || buf.is_null() || !user_ptr_ok(buf, len) {
+pub(crate) fn sys_io_enqueue(completion_queue_handle: UserHandle, op_ptr: *const UserIoOp) -> u64 {
+    if op_ptr.is_null() || !user_ptr_ok(op_ptr, core::mem::size_of::<UserIoOp>()) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    if len == 0 {
+
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+        Ok(queue) => queue,
+        Err(err) => return err,
+    };
+
+    let user_op = unsafe { core::ptr::read_unaligned(op_ptr) };
+    let op = match build_kernel_io_op(caller_pid, &caller, user_op) {
+        Ok(op) => op,
+        Err(err) => return err,
+    };
+
+    queue.enqueue(op).map_or_else(map_cq_error, |id| id)
+}
+
+pub(crate) fn sys_io_enqueue_many(
+    completion_queue_handle: UserHandle,
+    ops_ptr: *const UserIoOp,
+    count: usize,
+    out_request_ids: *mut RequestId,
+) -> u64 {
+    if count == 0 {
         return 0;
     }
-    let f = unsafe { &mut *file };
-    let src = unsafe { core::slice::from_raw_parts(buf, len) };
-    match block_on(f.write(src)) {
-        Ok(_) => len as u64,
-        Err(_) => make_err(ErrClass::File, FileErr::WriteFailed as u16, 0),
-    }
-}
 
-pub(crate) fn list_dir(path: *const u8) -> u64 {
-    if path.is_null() || !user_ptr(path) {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-    let pname = unsafe { core::ffi::CStr::from_ptr(path as *const i8) }
-        .to_str()
-        .unwrap_or("");
-    if pname.is_empty() {
-        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
-    }
-
-    let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let caller = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            )
-        }
+    let ops_bytes = match count.checked_mul(core::mem::size_of::<UserIoOp>()) {
+        Some(bytes) => bytes,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
     };
-    let abs_path = resolve_with_working_dir(&caller, pname);
-    let entries = match block_on(File::list_dir(&abs_path)) {
-        Ok(v) => v,
-        Err(_) => return make_err(ErrClass::File, FileErr::Io as u16, 0),
-    };
-    let joined = if entries.is_empty() {
-        String::new()
-    } else {
-        entries.join("\n")
-    };
-    let bytes = joined.as_bytes();
-    let total = bytes.len() + 1;
-
-    let va = {
-        let prog = caller.write();
-        let Some(dst) = prog.tracker.alloc_auto(total as u64) else {
-            return make_err(ErrClass::Memory, MemErr::AllocFailed as u16, total as u32);
-        };
-        if unsafe { prog.virtual_map(dst, total) }.is_err() {
-            return make_err(ErrClass::Memory, MemErr::MapFailed as u16, 0);
-        }
-        dst
+    let ids_bytes = match count.checked_mul(core::mem::size_of::<RequestId>()) {
+        Some(bytes) => bytes,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 1),
     };
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), va.as_mut_ptr::<u8>(), bytes.len());
-        *va.as_mut_ptr::<u8>().add(bytes.len()) = 0;
-    }
-    va.as_u64()
-}
-
-pub(crate) fn sys_file_open(
-    path: *const u8,
-    flags: *const OpenFlags,
-    n: usize,
-    out: *mut File,
-) -> u64 {
-    if path.is_null()
-        || !user_ptr(path)
-        || flags.is_null()
-        || !user_ptr(flags)
-        || out.is_null()
-        || !user_ptr(out)
-        || !user_ptr_ok(flags, n * core::mem::size_of::<OpenFlags>())
+    if ops_ptr.is_null()
+        || out_request_ids.is_null()
+        || !user_ptr_ok(ops_ptr, ops_bytes)
+        || !user_ptr_ok(out_request_ids, ids_bytes)
     {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    let pname = unsafe { core::ffi::CStr::from_ptr(path as *const i8) }
-        .to_str()
-        .unwrap_or("");
-    if pname.is_empty() {
-        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0);
+
+    let (caller_pid, caller) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+        Ok(queue) => queue,
+        Err(err) => return err,
+    };
+
+    let mut submitted = 0usize;
+    for idx in 0..count {
+        let user_op = unsafe { core::ptr::read_unaligned(ops_ptr.add(idx)) };
+        let op = match build_kernel_io_op(caller_pid, &caller, user_op) {
+            Ok(op) => op,
+            Err(err) => {
+                return if submitted == 0 {
+                    err
+                } else {
+                    submitted as u64
+                };
+            }
+        };
+
+        let request_id = match queue.enqueue(op) {
+            Ok(request_id) => request_id,
+            Err(err) => {
+                return if submitted == 0 {
+                    map_cq_error(err)
+                } else {
+                    submitted as u64
+                };
+            }
+        };
+
+        unsafe {
+            core::ptr::write_unaligned(out_request_ids.add(idx), request_id);
+        }
+        submitted += 1;
     }
 
-    let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let caller = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            )
-        }
-    };
-    let abs_path = resolve_with_working_dir(&caller, pname);
-    let flg = unsafe { core::slice::from_raw_parts(flags, n) };
-    match block_on(File::open(&abs_path, flg)) {
-        Ok(f) => unsafe {
-            core::ptr::write_unaligned(out, f);
-            0
-        },
-        Err(_) => make_err(ErrClass::File, FileErr::Io as u16, 0),
-    }
+    submitted as u64
 }
 
-pub(crate) fn sys_file_delete(file: *mut File) -> u64 {
-    if file.is_null() || !user_ptr(file) {
+pub(crate) fn sys_completion_poll(
+    completion_queue_handle: UserHandle,
+    out_completions: *mut UserIoCompletion,
+    max: usize,
+) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+
+    let bytes = match max.checked_mul(core::mem::size_of::<UserIoCompletion>()) {
+        Some(bytes) => bytes,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    if out_completions.is_null() || !user_ptr_ok(out_completions, bytes) {
         return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
     }
-    let f = unsafe { &mut *file };
-    match block_on(f.delete()) {
-        Ok(_) => 0,
-        Err(_) => make_err(ErrClass::File, FileErr::DeleteFailed as u16, 0),
+
+    let (caller_pid, _) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+        Ok(queue) => queue,
+        Err(err) => return err,
+    };
+
+    let out = unsafe { slice::from_raw_parts_mut(out_completions, max) };
+    queue.poll_completions(out) as u64
+}
+
+pub(crate) fn sys_completion_wait(
+    completion_queue_handle: UserHandle,
+    out_completions: *mut UserIoCompletion,
+    max: usize,
+    timeout_ns: u64,
+) -> u64 {
+    if max == 0 {
+        return 0;
     }
+
+    let bytes = match max.checked_mul(core::mem::size_of::<UserIoCompletion>()) {
+        Some(bytes) => bytes,
+        None => return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0),
+    };
+    if out_completions.is_null() || !user_ptr_ok(out_completions, bytes) {
+        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
+    }
+
+    let (caller_pid, _) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+        Ok(queue) => queue,
+        Err(err) => return err,
+    };
+
+    let out = unsafe { slice::from_raw_parts_mut(out_completions, max) };
+    queue.wait_completions(out, timeout_ns) as u64
+}
+
+pub(crate) fn sys_io_cancel(completion_queue_handle: UserHandle, request_id: RequestId) -> u64 {
+    let (caller_pid, _) = match current_process() {
+        Ok(current) => current,
+        Err(err) => return err,
+    };
+    let queue = match resolve_completion_queue(completion_queue_handle, caller_pid) {
+        Ok(queue) => queue,
+        Err(err) => return err,
+    };
+
+    queue.cancel(request_id).map_or_else(map_cq_error, |_| 0)
 }
 
 pub(crate) fn sys_get_thread() -> UserHandle {
@@ -537,7 +859,7 @@ pub(crate) fn sys_mq_request(target: UserHandle, message_ptr: *mut Message) -> u
             0
         }
         ObjectPayload::Queue(qh) => {
-            qh.write().queue.push_back(msg.clone());
+            qh.write().push_message(msg.clone());
             0
         }
         _ => make_err(ErrClass::Message, MsgErr::UnsupportedTargetType as u16, 0),
@@ -721,61 +1043,12 @@ pub(crate) fn sys_mq_peek(qh: UserHandle, msg_ptr: *mut Message) -> u64 {
     };
 
     let q = qref.write();
-    match q.queue.front() {
+    match q.peek_message() {
         Some(m) => unsafe {
             core::ptr::write_unaligned(msg_ptr, m.clone());
             0
         },
         None => make_err(ErrClass::Message, MsgErr::TargetResolveFailed as u16, 0),
-    }
-}
-
-pub(crate) fn sys_mq_receive(qh: UserHandle, msg_ptr: *mut Message, flags: u32) -> u64 {
-    if msg_ptr.is_null() || !user_ptr(msg_ptr) {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-
-    let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let prog = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            )
-        }
-    };
-
-    let qref = if qh == 0 {
-        ensure_default_queue_object(caller_pid, &prog).1
-    } else {
-        let o = match OBJECT_MANAGER.open_by_id(qh) {
-            Some(o) => o,
-            None => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
-        };
-        match &o.payload {
-            ObjectPayload::Queue(q) => q.clone(),
-            _ => return make_err(ErrClass::Message, MsgErr::TargetHandleInvalid as u16, 0),
-        }
-    };
-
-    loop {
-        if let Some(m) = qref.write().queue.pop_front() {
-            unsafe {
-                core::ptr::write_unaligned(msg_ptr, m);
-            }
-            return 0;
-        }
-        if flags & NOWAIT == NOWAIT {
-            return make_err(ErrClass::Message, MsgErr::NoMessageInQueue as u16, 1);
-        }
-        hlt();
     }
 }
 
@@ -811,49 +1084,11 @@ pub(crate) fn sys_create_mq() -> UserHandle {
 
     let name = guid_to_string(&generate_guid());
     let qh: TaskQueueRef = alloc::sync::Arc::new(spin::RwLock::new(
-        crate::executable::program::MessageQueue {
-            queue: alloc::collections::vec_deque::VecDeque::new(),
-        },
+        crate::executable::program::MessageQueue::new(),
     ));
     let obj = Object::with_name(ObjectTag::Queue, name.clone(), ObjectPayload::Queue(qh));
     let _ = OBJECT_MANAGER.link(alloc::format!("{}\\{}", dir, name), &obj);
     obj.id
-}
-
-pub(crate) fn sys_change_directory(path: *const u8) -> u64 {
-    if path.is_null() || !user_ptr(path) {
-        return make_err(ErrClass::Common, CommonErr::InvalidPtr as u16, 0);
-    }
-    let caller_pid = SCHEDULER
-        .get_current_task(current_cpu_id())
-        .unwrap()
-        .inner
-        .read()
-        .parent_pid;
-    let caller = match PROGRAM_MANAGER.get(caller_pid) {
-        Some(p) => p,
-        None => {
-            return make_err(
-                ErrClass::Program,
-                ProgErr::NotFound as u16,
-                caller_pid as u32,
-            )
-        }
-    };
-    let c = unsafe { core::ffi::CStr::from_ptr(path as *const i8) };
-    let raw = match c.to_str() {
-        Ok(s) if !s.is_empty() => s,
-        _ => return make_err(ErrClass::File, FileErr::PathInvalid as u16, 0),
-    };
-    let abs_path = {
-        let base = caller.read().working_dir.clone();
-        Path::parse(raw, Some(&base))
-    };
-    if block_on(File::list_dir(&abs_path)).is_err() {
-        return make_err(ErrClass::File, FileErr::PathInvalid as u16, 1);
-    }
-    caller.write().working_dir = abs_path;
-    0
 }
 
 pub(crate) fn sys_get_working_dir(target_prog: UserHandle) -> u64 {

@@ -5,6 +5,7 @@ use alloc::{
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
+use core::task::Waker;
 use kernel_types::object_manager::ObjectTag;
 use kernel_types::status::LoadError::NoSuchSymbol;
 use kernel_types::{device::ModuleHandle, fs::Path, memory::PeInfo, status::PageMapError};
@@ -75,9 +76,57 @@ fn guid_to_string(g: &[u8; 16]) -> String {
     )
 }
 
-#[derive(Debug)]
 pub struct MessageQueue {
-    pub queue: VecDeque<Message>,
+    queue: VecDeque<Message>,
+    waiters: Vec<Waker>,
+}
+
+impl core::fmt::Debug for MessageQueue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MessageQueue")
+            .field("queued", &self.queue.len())
+            .field("waiters", &self.waiters.len())
+            .finish()
+    }
+}
+
+impl MessageQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            waiters: Vec::new(),
+        }
+    }
+
+    pub fn push_message(&mut self, msg: Message) {
+        self.queue.push_back(msg);
+        self.wake_waiters();
+    }
+
+    pub fn try_pop_message(&mut self) -> Option<Message> {
+        self.queue.pop_front()
+    }
+
+    pub fn peek_message(&self) -> Option<&Message> {
+        self.queue.front()
+    }
+
+    pub fn register_waker(&mut self, waker: &Waker) {
+        if self
+            .waiters
+            .iter()
+            .all(|existing| !existing.will_wake(waker))
+        {
+            self.waiters.push(waker.clone());
+        }
+    }
+
+    pub fn wake_waiters(&mut self) {
+        let waiters = core::mem::take(&mut self.waiters);
+        for waiter in waiters {
+            waiter.wake();
+        }
+    }
 }
 #[derive(Debug)]
 pub struct HandleTable {
@@ -188,9 +237,7 @@ impl Program {
             tracker,
             handle_table: RwLock::new(HandleTable::new()),
             working_dir,
-            default_queue: Arc::new(RwLock::new(MessageQueue {
-                queue: VecDeque::new(),
-            })),
+            default_queue: Arc::new(RwLock::new(MessageQueue::new())),
             page_table_lock: Mutex::new(()),
             extra_queues: Mutex::new(BTreeMap::new()),
             routing_rules: Mutex::new(Vec::new()),
@@ -438,9 +485,7 @@ impl Program {
     }
 
     pub fn new_mq(&self) -> ObjectRef {
-        let qh = Arc::new(RwLock::new(MessageQueue {
-            queue: VecDeque::new(),
-        }));
+        let qh = Arc::new(RwLock::new(MessageQueue::new()));
         let base = alloc::format!("\\Proc\\{}\\Queues", self.pid);
         let _ = OBJECT_MANAGER.mkdir_p("\\Proc");
         let _ = OBJECT_MANAGER.mkdir_p(alloc::format!("\\Proc\\{}", self.pid));
@@ -493,18 +538,18 @@ impl Program {
             Some(RoutingAction::Block) => {}
 
             Some(RoutingAction::Allow) | None => {
-                self.default_queue.write().queue.push_back(msg);
+                self.default_queue.write().push_message(msg);
             }
 
             Some(RoutingAction::Reroute(qh)) => {
-                qh.write().queue.push_back(msg);
+                qh.write().push_message(msg);
             }
 
             Some(RoutingAction::Callback(th, qh_opt)) => {
                 if let Some(qh) = qh_opt {
-                    qh.write().queue.push_back(msg);
+                    qh.write().push_message(msg);
                 } else {
-                    self.default_queue.write().queue.push_back(msg);
+                    self.default_queue.write().push_message(msg);
                 }
 
                 let task = th;

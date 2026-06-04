@@ -231,7 +231,9 @@ async fn load_snapshot() -> Option<Registry> {
     )
     .await
     .ok()?;
-    let buf = f.read().await.ok()?;
+    let mut buf = alloc::vec![0u8; f.size as usize];
+    let n = f.read(&mut buf).await.ok()?;
+    buf.truncate(n);
     let (reg, _) =
         bincode::decode_from_slice::<Registry, _>(&buf, bincode::config::standard()).ok()?;
     Some(reg)
@@ -341,10 +343,12 @@ async fn replay_wal(reg: &mut Registry) -> u64 {
         Err(_) => return 0,
     };
 
-    let buf = match f.read().await {
-        Ok(b) => b,
+    let mut buf = alloc::vec![0u8; f.size as usize];
+    let n = match f.read(&mut buf).await {
+        Ok(n) => n,
         Err(_) => return 0,
     };
+    buf.truncate(n);
 
     let mut offset = 0;
     let mut max_seq = 0u64;

@@ -19,6 +19,8 @@ pub enum ObjectTag {
     Program,
     Thread,
     Queue,
+    CompletionQueue,
+    File,
     Module,
     Device,
 }

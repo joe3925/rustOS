@@ -79,7 +79,9 @@ fn inner<T>(s: &Spanned<T>) -> &T {
 
 pub async fn parse_driver_toml(path: &Path) -> Result<DriverToml, FileStatus> {
     let f = File::open(path, &[OpenFlags::ReadOnly, OpenFlags::Open]).await?;
-    let bytes = f.read().await?;
+    let mut bytes = alloc::vec![0u8; f.size as usize];
+    let n = f.read(&mut bytes).await?;
+    bytes.truncate(n);
     let src = core::str::from_utf8(&bytes).map_err(|_| FileStatus::InternalError)?;
 
     let (tbl_span, _errs) = DeTable::parse_recoverable(src);

@@ -1,12 +1,11 @@
 use crate::drivers::interrupt_index::get_current_logical_id;
 
 use crate::executable::program::{Message, UserHandle};
-use crate::file_system::file::File;
 use crate::gdt::PER_CPU_GDT;
 use crate::scheduling::scheduler::KernelFpuGuard;
+use crate::structs::io_request::{RequestId, UserIoCompletion, UserIoOp};
 use crate::syscalls::syscall_impl::*;
 use core::arch::naked_asm;
-use kernel_types::fs::OpenFlags;
 use x86_64::registers::control::{Efer, EferFlags};
 use x86_64::registers::model_specific::{LStar, Star};
 use x86_64::VirtAddr;
@@ -117,47 +116,62 @@ make_wrapper!(wrap_print, sys_print, *const u8);
 make_wrapper!(wrap_destroy, sys_destroy_task, u64);
 make_wrapper!(wrap_create, sys_create_task, usize);
 make_wrapper!(
-    wrap_file_open,
-    sys_file_open,
-    *const u8,
-    *const OpenFlags,
+    wrap_completion_queue_create,
+    sys_completion_queue_create,
     usize,
-    *mut File
+    usize,
+    u64
 );
-make_wrapper!(wrap_file_read, sys_file_read, *mut File, usize);
-make_wrapper!(wrap_file_write, sys_file_write, *mut File, *const u8, usize);
-make_wrapper!(wrap_file_delete, sys_file_delete, *mut File);
+make_wrapper!(wrap_io_enqueue, sys_io_enqueue, UserHandle, *const UserIoOp);
+make_wrapper!(
+    wrap_io_enqueue_many,
+    sys_io_enqueue_many,
+    UserHandle,
+    *const UserIoOp,
+    usize,
+    *mut RequestId
+);
+make_wrapper!(
+    wrap_completion_poll,
+    sys_completion_poll,
+    UserHandle,
+    *mut UserIoCompletion,
+    usize
+);
+make_wrapper!(
+    wrap_completion_wait,
+    sys_completion_wait,
+    UserHandle,
+    *mut UserIoCompletion,
+    usize,
+    u64
+);
+make_wrapper!(wrap_io_cancel, sys_io_cancel, UserHandle, RequestId);
 make_wrapper!(wrap_get_thread, sys_get_thread,);
 make_wrapper!(wrap_mq_request, sys_mq_request, UserHandle, *mut Message);
 make_wrapper!(wrap_mq_route_add, sys_rule_add, *const UserRoutingRule);
 make_wrapper!(wrap_mq_route_clear, sys_rule_clear, *const UserRoutingRule);
 make_wrapper!(wrap_mq_peek, sys_mq_peek, UserHandle, *mut Message);
-make_wrapper!(
-    wrap_mq_receive,
-    sys_mq_receive,
-    UserHandle,
-    *mut Message,
-    u32
-);
 make_wrapper!(wrap_get_default_mq_handle, sys_get_default_mq_handle,);
 make_wrapper!(wrap_create_mq, sys_create_mq,);
 
 const SYSCALL_TABLE: &[Handler] = &[
-    wrap_print,                 // 0
-    wrap_destroy,               // 1
-    wrap_create,                // 2
-    wrap_file_open,             // 3
-    wrap_file_read,             // 4
-    wrap_file_write,            // 5
-    wrap_file_delete,           // 6
-    wrap_get_thread,            // 7
-    wrap_mq_request,            // 8
-    wrap_mq_route_add,          // 9
-    wrap_mq_route_clear,        // 10
-    wrap_mq_peek,               // 11
-    wrap_mq_receive,            // 12
-    wrap_get_default_mq_handle, // 13
-    wrap_create_mq,             // 14
+    wrap_print,                   // 0
+    wrap_destroy,                 // 1
+    wrap_create,                  // 2
+    wrap_completion_queue_create, // 3
+    wrap_io_enqueue,              // 4
+    wrap_io_enqueue_many,         // 5
+    wrap_completion_poll,         // 6
+    wrap_completion_wait,         // 7
+    wrap_io_cancel,               // 8
+    wrap_get_thread,              // 9
+    wrap_mq_request,              // 10
+    wrap_mq_route_add,            // 11
+    wrap_mq_route_clear,          // 12
+    wrap_mq_peek,                 // 13
+    wrap_get_default_mq_handle,   // 14
+    wrap_create_mq,               // 15
 ];
 
 #[no_mangle]

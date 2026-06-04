@@ -3706,7 +3706,7 @@ pub async fn bench_c_drive_io_async(write_through: bool) {
         let mut total_read = 0u64;
         let mut offset = 0u64;
         for op in 0..ops {
-            match file.read_at_into(offset, &mut chunk).await {
+            match file.read_at(offset, &mut chunk).await {
                 Ok(n) => {
                     if n == 0 {
                         println!(

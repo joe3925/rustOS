@@ -189,39 +189,15 @@ impl File {
 
         Ok(())
     }
-    pub async fn read(&self) -> Result<Vec<u8>, FileStatus> {
-        let (gi, st1) = file_provider::provider().get_info(self.fs_file_id).await;
-        if st1 != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
-        }
-        if let Some(e) = gi.error {
-            return Err(e);
-        }
-        let size = gi.size as usize;
-        let mut buf = alloc::vec![0u8; size];
-        let (rr, st2) = file_provider::provider()
-            .read_at(self.fs_file_id, 0, &mut buf)
-            .await;
-        if st2 != DriverStatus::Success {
-            return Err(FileStatus::UnknownFail);
-        }
-        match rr.error {
-            None => {
-                buf.truncate(rr.bytes_read);
-                Ok(buf)
-            }
-            Some(e) => Err(e),
-        }
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, FileStatus> {
+        self.read_at(0, buf).await
     }
 
-    pub async fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FileStatus> {
-        let mut buf = alloc::vec![0u8; len];
-        let n = self.read_at_into(offset, &mut buf).await?;
-        buf.truncate(n);
-        Ok(buf)
-    }
+    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileStatus> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
 
-    pub async fn read_at_into(&self, offset: u64, buf: &mut [u8]) -> Result<usize, FileStatus> {
         let (res, st) = file_provider::provider()
             .read_at(self.fs_file_id, offset, buf)
             .await;
@@ -389,7 +365,12 @@ async fn list(dir: &Path) -> Option<alloc::vec::Vec<alloc::string::String>> {
 
 async fn read_all(path: &Path) -> Option<alloc::vec::Vec<u8>> {
     match File::open(path, &[OpenFlags::Open, OpenFlags::ReadOnly]).await {
-        Ok(f) => f.read().await.ok(),
+        Ok(f) => {
+            let mut buf = alloc::vec![0u8; f.size as usize];
+            let n = f.read(&mut buf).await.ok()?;
+            buf.truncate(n);
+            Some(buf)
+        }
         Err(_) => None,
     }
 }

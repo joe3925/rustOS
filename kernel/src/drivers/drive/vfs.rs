@@ -1,20 +1,15 @@
 use crate::drivers::pnp::manager::PNP_MANAGER;
-use crate::file_system::file_provider::FileProvider;
 use crate::println;
 use alloc::string::ToString;
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
-use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
-use kernel_types::request::{
-    BorrowedHandle, RequestDataView, RequestHandle, RequestType, TraversalPolicy,
-};
+use kernel_types::request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::{
     fs::{Path, *},
-    request::RequestData,
     RequestPayload,
 };
 
@@ -867,193 +862,5 @@ impl Vfs {
                 st,
             ),
         }
-    }
-}
-
-impl FileProvider for Vfs {
-    fn open_path(
-        &self,
-        path: &Path,
-        flags: &[OpenFlags],
-        write_through: bool,
-    ) -> FfiFuture<(FsOpenResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.open(FsOpenParams {
-            flags: OpenFlagsMask::from(flags),
-            write_through,
-            path: path.clone(),
-        })
-        .into_ffi()
-    }
-
-    fn close_handle(&self, file_id: u64) -> FfiFuture<(FsCloseResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.close(FsCloseParams {
-            fs_file_id: file_id,
-        })
-        .into_ffi()
-    }
-
-    fn read_at(
-        &self,
-        file_id: u64,
-        offset: u64,
-        buf: &mut [u8],
-    ) -> FfiFuture<(FsReadResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.read(FsReadParams {
-            fs_file_id: file_id,
-            offset,
-            buf,
-        })
-        .into_ffi()
-    }
-    fn seek_handle(
-        &self,
-        file_id: u64,
-        offset: i64,
-        origin: FsSeekWhence,
-    ) -> FfiFuture<(FsSeekResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.seek(FsSeekParams {
-            fs_file_id: file_id,
-            offset,
-            origin,
-        })
-        .into_ffi()
-    }
-    fn write_at(
-        &self,
-        file_id: u64,
-        offset: u64,
-        data: &[u8],
-        write_through: bool,
-    ) -> FfiFuture<(FsWriteResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.write(FsWriteParams {
-            fs_file_id: file_id,
-            offset,
-            write_through,
-            data,
-        })
-        .into_ffi()
-    }
-
-    fn flush_handle(&self, file_id: u64) -> FfiFuture<(FsFlushResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.flush(FsFlushParams {
-            fs_file_id: file_id,
-        })
-        .into_ffi()
-    }
-
-    fn get_info(&self, file_id: u64) -> FfiFuture<(FsGetInfoResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.get_info(FsGetInfoParams {
-            fs_file_id: file_id,
-        })
-        .into_ffi()
-    }
-
-    fn list_dir_path(&self, path: &Path) -> FfiFuture<(FsListDirResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.list_dir(FsListDirParams { path: path.clone() })
-            .into_ffi()
-    }
-
-    fn make_dir_path(&self, path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.create(FsCreateParams {
-            path: path.clone(),
-            dir: true,
-            flags: OpenFlags::Create,
-        })
-        .into_ffi()
-    }
-
-    fn remove_dir_path(&self, _path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        async {
-            (
-                FsCreateResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            )
-        }
-        .into_ffi()
-    }
-
-    fn rename_path(&self, src: &Path, dst: &Path) -> FfiFuture<(FsRenameResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.rename(FsRenameParams {
-            src: src.clone(),
-            dst: dst.clone(),
-        })
-        .into_ffi()
-    }
-
-    fn delete_path(&self, _path: &Path) -> FfiFuture<(FsCreateResult, DriverStatus)> {
-        async {
-            (
-                FsCreateResult {
-                    error: Some(FileStatus::UnknownFail),
-                },
-                DriverStatus::Success,
-            )
-        }
-        .into_ffi()
-    }
-
-    fn set_len(&self, file_id: u64, new_size: u64) -> FfiFuture<(FsSetLenResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.set_len(FsSetLenParams {
-            fs_file_id: file_id,
-            new_size,
-        })
-        .into_ffi()
-    }
-
-    fn append(
-        &self,
-        file_id: u64,
-        data: &[u8],
-        write_through: bool,
-    ) -> FfiFuture<(FsAppendResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        // Pass the slice directly instead of allocating a Vec.
-        this.append(FsAppendParams {
-            fs_file_id: file_id,
-            data,
-            write_through,
-        })
-        .into_ffi()
-    }
-
-    fn zero_range(
-        &self,
-        file_id: u64,
-        offset: u64,
-        len: u64,
-    ) -> FfiFuture<(FsZeroRangeResult, DriverStatus)> {
-        let this: &'static Vfs = unsafe { &*(self as *const Vfs) };
-
-        this.zero_range(FsZeroRangeParams {
-            fs_file_id: file_id,
-            offset,
-            len,
-        })
-        .into_ffi()
     }
 }

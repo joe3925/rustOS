@@ -712,8 +712,7 @@ pub unsafe extern "C" fn rustos_mi_os_decommit(addr: *mut c_void, size: usize) -
 
     let decommit_start =
         align_up_const(addr_usize, MIMALLOC_COMMIT_GRANULARITY).max(MIMALLOC_ARENA_START);
-    let decommit_end =
-        align_down_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(arena_end);
+    let decommit_end = align_down_const(end_usize, MIMALLOC_COMMIT_GRANULARITY).min(arena_end);
     if decommit_end <= decommit_start {
         return true;
     }
