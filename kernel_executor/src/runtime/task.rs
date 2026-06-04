@@ -7,7 +7,9 @@ use core::task::{Context, Poll, Waker};
 use crate::sync::atomic::{AtomicU8, Ordering};
 use crate::sync::{Arc, Mutex};
 
-use super::runtime::submit_global;
+use crate::global_async::{DomainId, KERNEL_NORMAL_DOMAIN};
+
+use super::runtime::submit_global_to_domain;
 use super::waker;
 
 /// Task state machine. Transitions:
@@ -83,6 +85,7 @@ pub struct FutureTask {
     /// only the thread in POLLING state touches this field.
     future: UnsafeCell<Option<Pin<Box<dyn Future<Output = ()> + Send + 'static>>>>,
     state: AtomicU8,
+    domain_id: DomainId,
 }
 
 // Safety: The future is Send, and exclusive access is enforced by the state machine.
@@ -91,9 +94,17 @@ unsafe impl Sync for FutureTask {}
 
 impl FutureTask {
     pub fn new(future: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self::new_in_domain(KERNEL_NORMAL_DOMAIN, future)
+    }
+
+    pub fn new_in_domain(
+        domain_id: DomainId,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
         Self {
             future: UnsafeCell::new(Some(Box::pin(future))),
             state: AtomicU8::new(STATE_IDLE),
+            domain_id,
         }
     }
 }
@@ -102,7 +113,7 @@ impl TaskPoll for FutureTask {
     fn enqueue(self: &Arc<Self>) {
         if transition_enqueue(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -145,7 +156,7 @@ impl TaskPoll for FutureTask {
         // Poll returned Pending. If a wake arrived while polling, re-enqueue.
         if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -173,7 +184,7 @@ impl TaskPoll for FutureTask {
 
         if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -200,6 +211,7 @@ pub struct JoinableTask<T: Send + 'static> {
     result: Mutex<Option<T>>,
     waker: Mutex<Option<Waker>>,
     state: AtomicU8,
+    domain_id: DomainId,
 }
 
 // Safety: The future is Send, and exclusive access is enforced by the state machine.
@@ -209,11 +221,19 @@ unsafe impl<T: Send + 'static> Sync for JoinableTask<T> {}
 
 impl<T: Send + 'static> JoinableTask<T> {
     pub fn new(future: impl Future<Output = T> + Send + 'static) -> Self {
+        Self::new_in_domain(KERNEL_NORMAL_DOMAIN, future)
+    }
+
+    pub fn new_in_domain(
+        domain_id: DomainId,
+        future: impl Future<Output = T> + Send + 'static,
+    ) -> Self {
         Self {
             future: UnsafeCell::new(Some(Box::pin(future))),
             result: Mutex::new(None),
             waker: Mutex::new(None),
             state: AtomicU8::new(STATE_IDLE),
+            domain_id,
         }
     }
 
@@ -237,7 +257,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
     fn enqueue(self: &Arc<Self>) {
         if transition_enqueue(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -287,7 +307,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
         // Pending. If a wake arrived while polling, re-enqueue.
         if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 
@@ -322,7 +342,7 @@ impl<T: Send + 'static> TaskPoll for JoinableTask<T> {
 
         if transition_pending_poll_complete(&self.state) {
             let ptr = Arc::into_raw(self.clone()) as usize;
-            submit_global(poll_trampoline::<Self>, ptr);
+            submit_global_to_domain(self.domain_id, poll_trampoline::<Self>, ptr);
         }
     }
 

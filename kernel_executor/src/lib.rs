@@ -4,9 +4,11 @@ extern crate alloc;
 #[cfg(any(test, loom, feature = "loom"))]
 extern crate std;
 
+mod domain;
 pub mod global_async;
 pub mod platform;
 pub mod runtime;
+mod round_robin;
 mod sync;
 
 #[cfg(all(test, not(any(loom, feature = "loom"))))]

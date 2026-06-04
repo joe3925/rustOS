@@ -9,7 +9,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub use super::blocking::{spawn_blocking, spawn_blocking_many, BlockingJoin};
 
-use crate::global_async::GlobalAsyncExecutor;
+use crate::global_async::{DomainId, GlobalAsyncExecutor};
 use crate::platform::{platform, Job};
 use crate::sync::atomic::{AtomicBool, Ordering};
 use crate::sync::Arc;
@@ -19,6 +19,14 @@ use super::task::{FutureTask, JoinableTask};
 
 pub(crate) fn submit_global(trampoline: extern "win64" fn(usize), ctx: usize) {
     GlobalAsyncExecutor::global().submit(trampoline, ctx);
+}
+
+pub(crate) fn submit_global_to_domain(
+    domain_id: DomainId,
+    trampoline: extern "win64" fn(usize),
+    ctx: usize,
+) {
+    GlobalAsyncExecutor::global().submit_to_domain(domain_id, trampoline, ctx);
 }
 
 pub(crate) fn submit_blocking(trampoline: extern "win64" fn(usize), ctx: usize) {
@@ -130,6 +138,19 @@ where
     slab.record_joinable_fallback();
 
     let task = Arc::new(JoinableTask::new(future));
+    task.enqueue();
+
+    JoinHandle {
+        inner: JoinHandleInner::Arc(task),
+    }
+}
+
+pub fn spawn_in_domain<F, T>(domain_id: DomainId, future: F) -> JoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let task = Arc::new(JoinableTask::new_in_domain(domain_id, future));
     task.enqueue();
 
     JoinHandle {
@@ -260,6 +281,14 @@ where
         let task = Arc::new(FutureTask::new(future));
         task.enqueue();
     }
+}
+
+pub fn spawn_detached_in_domain<F>(domain_id: DomainId, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let task = Arc::new(FutureTask::new_in_domain(domain_id, future));
+    task.enqueue();
 }
 
 enum FutureSlot<F: Future> {

@@ -2,6 +2,7 @@ extern crate std;
 
 mod blocking;
 mod executor;
+mod round_robin;
 mod runtime;
 mod task;
 

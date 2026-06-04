@@ -1,4 +1,4 @@
-use alloc::{sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
 use core::future::Future;
 use core::mem::{align_of, size_of, ManuallyDrop};
 use core::pin::Pin;
@@ -8,9 +8,14 @@ use std::sync::{Condvar, Mutex};
 use std::task::Wake;
 use std::time::Duration;
 
-use crate::global_async::GlobalAsyncExecutor;
+use crate::global_async::{
+    DomainClass, DomainConfig, DomainId, GlobalAsyncExecutor, KERNEL_NORMAL_DOMAIN,
+    SimpleRoundRobinScheduler, SubmitErrorKind, WeightedDeficitRoundRobinScheduler,
+};
 use crate::runtime::ffi_spawn::kernel_spawn_ffi_internal;
-use crate::runtime::runtime::{block_on, spawn, spawn_detached, JoinAll};
+use crate::runtime::runtime::{
+    block_on, spawn, spawn_detached, spawn_detached_in_domain, spawn_in_domain, JoinAll,
+};
 use crate::runtime::slab::{INLINE_FUTURE_ALIGN, INLINE_FUTURE_SIZE, JOINABLE_STORAGE_SIZE};
 use kernel_types::async_ffi::FutureExt;
 
@@ -981,6 +986,148 @@ fn raw_global_executor_jobs_drain_under_queue_pressure() {
     super::wait_until(Duration::from_secs(10), || {
         counter.load(Ordering::Acquire) == jobs
     });
+}
+
+#[test]
+fn compatibility_submit_routes_through_kernel_normal_domain() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let before = GlobalAsyncExecutor::global()
+        .domain_stats(KERNEL_NORMAL_DOMAIN)
+        .expect("kernel normal domain missing");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::as_ptr(&counter) as usize;
+
+    GlobalAsyncExecutor::global().submit(increment_counter, ctx);
+
+    super::wait_until(Duration::from_secs(10), || {
+        counter.load(Ordering::Acquire) == 1
+    });
+
+    let after = GlobalAsyncExecutor::global()
+        .domain_stats(KERNEL_NORMAL_DOMAIN)
+        .expect("kernel normal domain missing");
+    assert!(after.submitted >= before.submitted + 1);
+    assert!(after.completed >= before.completed + 1);
+}
+
+#[test]
+fn submit_to_domain_executes_work_and_updates_domain_stats() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let jobs = super::stress_task_count(16);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::as_ptr(&counter) as usize;
+    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
+        class: DomainClass::Driver,
+        max_queued: jobs * 2,
+        quantum: 2,
+        ..DomainConfig::default()
+    });
+
+    for _ in 0..jobs {
+        GlobalAsyncExecutor::global().submit_to_domain(domain_id, increment_counter, ctx);
+    }
+
+    super::wait_until(Duration::from_secs(10), || {
+        counter.load(Ordering::Acquire) == jobs
+    });
+
+    let stats = GlobalAsyncExecutor::global()
+        .domain_stats(domain_id)
+        .expect("custom domain missing");
+    assert_eq!(stats.class, DomainClass::Driver);
+    assert!(stats.submitted >= jobs);
+    assert!(stats.completed >= jobs);
+    assert_eq!(stats.queued_count, 0);
+}
+
+#[test]
+fn invalid_domain_submission_fails_without_panicking() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let invalid = DomainId::from_parts(0x00FF_FFFF, 1);
+    let err = GlobalAsyncExecutor::global()
+        .try_submit_to_domain(invalid, increment_counter, Arc::as_ptr(&counter) as usize)
+        .expect_err("invalid domain unexpectedly accepted work");
+
+    assert_eq!(err.kind, SubmitErrorKind::InvalidDomain);
+    assert_eq!(counter.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn spawn_in_domain_completes_joinhandle() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
+        class: DomainClass::KernelHigh,
+        max_queued: 128,
+        ..DomainConfig::default()
+    });
+
+    let value = block_on(async { spawn_in_domain(domain_id, async { 1234usize }).await });
+    assert_eq!(value, 1234);
+
+    super::wait_until(Duration::from_secs(10), || {
+        GlobalAsyncExecutor::global()
+            .domain_stats(domain_id)
+            .is_some_and(|stats| stats.completed >= 1)
+    });
+}
+
+#[test]
+fn spawn_detached_in_domain_executes_work() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
+        class: DomainClass::KernelBackground,
+        max_queued: 128,
+        ..DomainConfig::default()
+    });
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_for_task = counter.clone();
+
+    spawn_detached_in_domain(domain_id, async move {
+        counter_for_task.fetch_add(1, Ordering::AcqRel);
+    });
+
+    super::wait_until(Duration::from_secs(10), || {
+        counter.load(Ordering::Acquire) == 1
+    });
+
+    super::wait_until(Duration::from_secs(10), || {
+        GlobalAsyncExecutor::global()
+            .domain_stats(domain_id)
+            .is_some_and(|stats| stats.completed >= 1)
+    });
+}
+
+#[test]
+fn executor_runs_with_simple_round_robin_scheduler_policy() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    GlobalAsyncExecutor::global().replace_scheduler_for_tests(Box::new(
+        SimpleRoundRobinScheduler::new(),
+    ));
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let ctx = Arc::as_ptr(&counter) as usize;
+    GlobalAsyncExecutor::global().submit(increment_counter, ctx);
+
+    super::wait_until(Duration::from_secs(10), || {
+        counter.load(Ordering::Acquire) == 1
+    });
+
+    GlobalAsyncExecutor::global().replace_scheduler_for_tests(Box::new(
+        WeightedDeficitRoundRobinScheduler::new(),
+    ));
 }
 
 // This test covers the global executor handoff where work is submitted by jobs

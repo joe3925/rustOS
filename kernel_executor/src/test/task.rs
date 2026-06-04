@@ -141,7 +141,9 @@ fn joinable_task_wake_during_inline_poll_requeues_completes_and_wakes_joiner() {
     assert!(task.try_start_inline_poll());
     task.clone().poll_once_inline();
 
-    super::wait_until(Duration::from_secs(10), || task.is_completed());
+    super::wait_until(Duration::from_secs(10), || {
+        task.is_completed() && wake_count.load(Ordering::Acquire) == 1
+    });
     assert_eq!(polls.load(Ordering::Acquire), 2);
     assert_eq!(task.take_result(), Some(123));
     assert_eq!(wake_count.load(Ordering::Acquire), 1);
