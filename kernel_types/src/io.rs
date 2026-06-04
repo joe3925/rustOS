@@ -281,14 +281,17 @@ impl<T> BoundedTreiberStack<T> {
         }
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         self.nodes.len()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         let packed = self.head.load(Ordering::Acquire);
         let (idx, _) = Self::unpack(packed);
@@ -296,6 +299,7 @@ impl<T> BoundedTreiberStack<T> {
         idx == NULL_INDEX
     }
 
+    #[inline]
     pub fn try_push(&self, data: T) -> Result<(), T> {
         let idx = match self.pop_index(&self.free) {
             Some(idx) => idx,
@@ -312,12 +316,14 @@ impl<T> BoundedTreiberStack<T> {
         Ok(())
     }
 
+    #[inline]
     pub fn push(&self, data: T) {
         if self.try_push(data).is_err() {
             panic!("BoundedTreiberStack full");
         }
     }
 
+    #[inline]
     pub fn pop(&self) -> Option<T> {
         let idx = self.pop_index(&self.head)?;
 
@@ -416,6 +422,7 @@ impl<T> BoundedTreiberStack<T> {
         removed
     }
 
+    #[inline]
     fn push_index(&self, stack: &AtomicU64, idx: u32) {
         loop {
             let old = stack.load(Ordering::Acquire);
@@ -439,6 +446,7 @@ impl<T> BoundedTreiberStack<T> {
         }
     }
 
+    #[inline]
     fn pop_index(&self, stack: &AtomicU64) -> Option<u32> {
         loop {
             let old = stack.load(Ordering::Acquire);
@@ -466,6 +474,7 @@ impl<T> BoundedTreiberStack<T> {
         }
     }
 
+    #[inline]
     fn take_all_indices(&self) -> u32 {
         loop {
             let old = self.head.load(Ordering::Acquire);

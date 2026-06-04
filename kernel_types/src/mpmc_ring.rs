@@ -72,6 +72,7 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
         }
     }
 
+    #[inline]
     pub fn try_push(&self, value: T) -> Result<(), TryPushError<T>> {
         let pos = self.enqueue_pos.0.load(Ordering::Relaxed);
         let slot = &self.slots[pos % CAP];
@@ -102,6 +103,7 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
         }
     }
 
+    #[inline]
     pub fn push(&self, mut value: T) -> Result<(), T> {
         loop {
             match self.try_push(value) {
@@ -115,6 +117,7 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
         }
     }
 
+    #[inline]
     pub fn try_pop(&self) -> Result<T, RingError> {
         let pos = self.dequeue_pos.0.load(Ordering::Relaxed);
         let slot = &self.slots[pos % CAP];
@@ -143,6 +146,7 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
         }
     }
 
+    #[inline]
     pub fn pop(&self) -> Option<T> {
         loop {
             match self.try_pop() {
@@ -154,20 +158,24 @@ impl<T, const CAP: usize> MpmcRing<T, CAP> {
         }
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
         CAP
     }
 
+    #[inline]
     pub fn len_approx(&self) -> usize {
         let enqueue = self.enqueue_pos.0.load(Ordering::Acquire);
         let dequeue = self.dequeue_pos.0.load(Ordering::Acquire);
         enqueue.wrapping_sub(dequeue).min(CAP)
     }
 
+    #[inline]
     pub fn is_empty_approx(&self) -> bool {
         self.len_approx() == 0
     }
 
+    #[inline]
     pub fn is_full_approx(&self) -> bool {
         self.len_approx() == CAP
     }

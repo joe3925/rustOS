@@ -24,31 +24,37 @@ unsafe extern "Rust" {
 }
 
 #[cfg(feature = "kernel_link")]
+#[inline]
 fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
     unsafe { routing_resolve_path_to_device_impl(path) }
 }
 
 #[cfg(feature = "kernel_link")]
+#[inline]
 pub fn print(s: &str) {
     unsafe { routing_print_impl(s) }
 }
 
 #[cfg(feature = "kernel_link")]
+#[inline]
 fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>> {
     unsafe { routing_get_stack_top_from_weak_impl(dev_node_weak) }
 }
 
 #[cfg(not(feature = "kernel_link"))]
+#[inline]
 fn resolve_path_to_device(path: &str) -> Option<IoTarget> {
     unsafe { kernel_sys::routing_resolve_path_to_device(path) }
 }
 
 #[cfg(not(feature = "kernel_link"))]
+#[inline]
 pub fn print(s: &str) {
     unsafe { kernel_sys::print(s) }
 }
 
 #[cfg(not(feature = "kernel_link"))]
+#[inline]
 fn get_stack_top_from_weak(dev_node_weak: &Weak<DevNode>) -> Option<Arc<DeviceObject>> {
     unsafe { kernel_sys::routing_get_stack_top_from_weak(dev_node_weak) }
 }
@@ -141,9 +147,22 @@ pub async fn send_request_to_stack_top(
 }
 
 /// Complete a request.
+#[inline]
 pub fn complete_request(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
     let guard = handle.write();
     guard.complete()
+}
+
+#[cold]
+fn complete_with_invalid_parameter(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
+    handle.write().status = DriverStatus::InvalidParameter;
+    complete_request(handle)
+}
+
+#[cold]
+fn complete_with_not_implemented(handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
+    handle.write().status = DriverStatus::NotImplemented;
+    complete_request(handle)
 }
 
 async fn call_device_handler(
@@ -159,8 +178,7 @@ async fn call_device_handler(
 
     if matches!(kind, RequestType::Pnp) {
         if policy != TraversalPolicy::ForwardLower {
-            handle.write().status = DriverStatus::InvalidParameter;
-            return complete_request(handle);
+            return complete_with_invalid_parameter(handle);
         }
 
         loop {
@@ -214,8 +232,7 @@ async fn call_device_handler(
                         continue;
                     }
                     Err(_) => {
-                        handle.write().status = DriverStatus::NotImplemented;
-                        return complete_request(handle);
+                        return complete_with_not_implemented(handle);
                     }
                 }
             }
@@ -298,16 +315,19 @@ async fn pnp_minor_dispatch(
 // Synchronization helpers
 // =============================================================================
 
+#[inline]
 fn wake_one(list: &kernel_types::io::TreiberStack<Waker>) {
     if let Some(w) = list.pop() {
         w.wake();
     }
 }
 
+#[inline]
 fn remove_waiter(list: &kernel_types::io::TreiberStack<Waker>, waker: &Waker) {
     let _ = list.remove_one_by(|w| w.will_wake(waker));
 }
 
+#[inline]
 fn try_acquire_slot(handler: &IoHandler) -> bool {
     loop {
         let cur = handler.running_request.load(Ordering::Acquire);
@@ -356,12 +376,14 @@ struct SlotGuard<'a> {
 }
 
 impl Drop for SlotGuard<'_> {
+    #[inline]
     fn drop(&mut self) {
         self.handler.running_request.fetch_sub(1, Ordering::Release);
         wake_one(&self.handler.waiters);
     }
 }
 
+#[inline]
 async fn acquire_slot(handler: &IoHandler) -> SlotGuard<'_> {
     SlotAcquireFuture { handler }.await;
     SlotGuard { handler }

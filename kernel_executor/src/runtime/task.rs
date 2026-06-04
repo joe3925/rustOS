@@ -26,6 +26,7 @@ pub const STATE_POLLING: u8 = 2;
 pub const STATE_NOTIFIED: u8 = 3;
 pub const STATE_COMPLETED: u8 = 4;
 
+#[inline]
 fn transition_enqueue(state: &AtomicU8) -> bool {
     // Retry loop to handle the race between POLLING+IDLE and our
     // POLLING+NOTIFIED attempt. Without the loop, observing POLLING
@@ -56,6 +57,7 @@ fn transition_enqueue(state: &AtomicU8) -> bool {
     }
 }
 
+#[inline]
 fn transition_pending_poll_complete(state: &AtomicU8) -> bool {
     let prev = state.compare_exchange(
         STATE_POLLING,

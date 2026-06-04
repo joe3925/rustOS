@@ -118,11 +118,7 @@ impl GlobalAsyncExecutor {
 
         let outcome = match runtime.domains.submit_to_domain(domain_id, work_item) {
             Ok(outcome) => outcome,
-            Err(error) => {
-                self.total_rejections.0.fetch_add(1, Ordering::AcqRel);
-                runtime.scheduler.lock().on_domain_rejected(domain_id);
-                return Err(error);
-            }
+            Err(error) => return self.reject_submit(runtime, domain_id, error),
         };
 
         self.total_submissions.0.fetch_add(1, Ordering::AcqRel);
@@ -133,6 +129,18 @@ impl GlobalAsyncExecutor {
 
         self.try_schedule();
         Ok(())
+    }
+
+    #[cold]
+    fn reject_submit(
+        &self,
+        runtime: &ExecutorRuntime,
+        domain_id: DomainId,
+        error: SubmitError,
+    ) -> Result<(), SubmitError> {
+        self.total_rejections.0.fetch_add(1, Ordering::AcqRel);
+        runtime.scheduler.lock().on_domain_rejected(domain_id);
+        Err(error)
     }
 
     pub fn create_domain(&self, config: DomainConfig) -> DomainId {

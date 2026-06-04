@@ -419,16 +419,14 @@ impl ExecutorDomain {
         match self.state() {
             DomainState::Active => {}
             DomainState::Draining => {
-                self.record_rejection();
-                return Err(SubmitError::new(
+                return Err(self.reject_submit(
                     SubmitErrorKind::DomainDraining,
                     domain_id,
                     work_item,
                 ));
             }
             DomainState::Dead => {
-                self.record_rejection();
-                return Err(SubmitError::new(
+                return Err(self.reject_submit(
                     SubmitErrorKind::DomainDead,
                     domain_id,
                     work_item,
@@ -444,8 +442,7 @@ impl ExecutorDomain {
             })
             .is_err()
         {
-            self.record_rejection();
-            return Err(SubmitError::new(
+            return Err(self.reject_submit(
                 SubmitErrorKind::DomainFull,
                 domain_id,
                 work_item,
@@ -454,8 +451,7 @@ impl ExecutorDomain {
 
         if self.state() != DomainState::Active {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-            self.record_rejection();
-            return Err(SubmitError::new(
+            return Err(self.reject_submit(
                 match self.state() {
                     DomainState::Active => SubmitErrorKind::DomainFull,
                     DomainState::Draining => SubmitErrorKind::DomainDraining,
@@ -468,8 +464,7 @@ impl ExecutorDomain {
 
         if let Err(work_item) = self.queues.try_push(work_item) {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-            self.record_rejection();
-            return Err(SubmitError::new(
+            return Err(self.reject_submit(
                 SubmitErrorKind::DomainFull,
                 domain_id,
                 work_item,
@@ -551,6 +546,17 @@ impl ExecutorDomain {
 
     fn record_rejection(&self) {
         self.rejected.0.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cold]
+    fn reject_submit(
+        &self,
+        kind: SubmitErrorKind,
+        domain_id: DomainId,
+        work_item: WorkItem,
+    ) -> SubmitError {
+        self.record_rejection();
+        SubmitError::new(kind, domain_id, work_item)
     }
 
     fn move_to_draining(&self) {
@@ -730,7 +736,7 @@ impl DomainTable {
         work_item: WorkItem,
     ) -> Result<Arc<ExecutorDomain>, SubmitError> {
         if !domain_id.is_valid() {
-            return Err(SubmitError::new(
+            return Err(Self::invalid_submit(
                 SubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
@@ -739,7 +745,7 @@ impl DomainTable {
 
         let slots = self.slots.lock();
         let Some(slot) = slots.get(domain_id.slot() as usize) else {
-            return Err(SubmitError::new(
+            return Err(Self::invalid_submit(
                 SubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
@@ -747,7 +753,7 @@ impl DomainTable {
         };
 
         if slot.generation != domain_id.generation() {
-            return Err(SubmitError::new(
+            return Err(Self::invalid_submit(
                 SubmitErrorKind::StaleDomain,
                 domain_id,
                 work_item,
@@ -755,7 +761,7 @@ impl DomainTable {
         }
 
         let Some(domain) = slot.domain.as_ref() else {
-            return Err(SubmitError::new(
+            return Err(Self::invalid_submit(
                 SubmitErrorKind::InvalidDomain,
                 domain_id,
                 work_item,
@@ -763,6 +769,15 @@ impl DomainTable {
         };
 
         Ok(domain.clone())
+    }
+
+    #[cold]
+    fn invalid_submit(
+        kind: SubmitErrorKind,
+        domain_id: DomainId,
+        work_item: WorkItem,
+    ) -> SubmitError {
+        SubmitError::new(kind, domain_id, work_item)
     }
 
     pub(crate) fn submit_to_domain(

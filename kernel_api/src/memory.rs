@@ -2,10 +2,12 @@ use core::alloc::{GlobalAlloc, Layout};
 use kernel_sys::{kernel_alloc, kernel_free};
 pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
+    #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         kernel_alloc(layout)
     }
 
+    #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         kernel_free(ptr, layout)
     }
@@ -57,12 +59,14 @@ pub fn allocate_kernel_range_mapped(
 pub fn deallocate_kernel_range(addr: VirtAddr, size: u64) {
     unsafe { kernel_sys::deallocate_kernel_range(addr, size) }
 }
+
 #[inline(always)]
 fn get_level4_page_table(mem_offset: VirtAddr) -> *mut PageTable {
     let (table_frame, _) = Cr3::read();
     let virt_addr = mem_offset + table_frame.start_address().as_u64();
     virt_addr.as_mut_ptr()
 }
+
 #[inline(always)]
 pub fn virt_to_phys(to_phys: VirtAddr) -> Option<PhysAddr> {
     let mem_offset = PHYSICAL_MEMORY_OFFSET;

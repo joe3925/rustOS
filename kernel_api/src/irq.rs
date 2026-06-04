@@ -24,22 +24,27 @@ pub trait IrqHandleExt {
 }
 
 impl IrqHandleExt for IrqHandle {
+    #[inline]
     fn unregister(&self) {
         unsafe { irq_handle_unregister(self) };
     }
 
+    #[inline]
     fn is_closed(&self) -> bool {
         unsafe { irq_handle_is_closed(self) }
     }
 
+    #[inline]
     fn set_user_ctx(&self, v: usize) {
         unsafe { irq_handle_set_user_ctx(self, v) };
     }
 
+    #[inline]
     fn user_ctx(&self) -> usize {
         unsafe { irq_handle_get_user_ctx(self) }
     }
 
+    #[inline]
     fn wait(&self, meta: IrqMeta) -> FfiFuture<IrqWaitResult> {
         unsafe { irq_handle_wait_ffi(self, meta) }
     }
@@ -53,24 +58,28 @@ pub trait IrqBorrowedHandleExt {
 }
 
 impl IrqBorrowedHandleExt for IrqBorrowedHandle {
+    #[inline]
     fn signal_one(self, meta: IrqMeta) {
         unsafe {
             kernel_irq_borrowed_signal(self, meta);
         }
     }
 
+    #[inline]
     fn signal_n(self, meta: IrqMeta, n: u32) {
         unsafe {
             kernel_irq_borrowed_signal_n(self, meta, n);
         }
     }
 
+    #[inline]
     fn signal_all(self, meta: IrqMeta) {
         unsafe {
             kernel_irq_borrowed_signal_all(self, meta);
         }
     }
 
+    #[inline]
     fn ensure_signal_exactly_one(self, meta: IrqMeta) {
         unsafe {
             kernel_irq_borrowed_ensure_signal(self, meta);
@@ -116,19 +125,27 @@ pub fn apic_cpu_ids() -> alloc::vec::Vec<u8> {
     unsafe { kernel_apic_cpu_ids() }
 }
 
+#[inline]
 pub fn irq_wait_ok(r: IrqWaitResult) -> bool {
     if r.code == IRQ_RESCUE_WAKEUP {
-        println!("saved by rescue wakeup");
-        return true;
+        return irq_rescue_wakeup_ok();
     }
 
     r.code == IRQ_WAIT_OK
 }
 
+#[cold]
+fn irq_rescue_wakeup_ok() -> bool {
+    println!("saved by rescue wakeup");
+    true
+}
+
+#[inline]
 pub fn irq_wait_closed(r: IrqWaitResult) -> bool {
     r.code == IRQ_WAIT_CLOSED
 }
 
+#[inline]
 pub fn irq_wait_null(r: IrqWaitResult) -> bool {
     r.code == IRQ_WAIT_NULL
 }
