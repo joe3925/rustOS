@@ -4,9 +4,9 @@ use crate::error::IoError;
 ///
 /// Must be implemented for all types that also implement at least one of the following traits: `Read`, `Write`,
 /// `Seek`.
-pub trait IoBase {
+pub trait IoBase: Send {
     /// Type of errors returned by input/output operations.
-    type Error: IoError;
+    type Error: IoError + Send;
 }
 
 /// The `Read` trait allows for reading bytes from a source.

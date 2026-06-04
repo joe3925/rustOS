@@ -29,6 +29,7 @@ pub struct TreiberStack<T> {
     head: AtomicPtr<TreiberNode<T>>,
     retired: AtomicPtr<TreiberNode<T>>,
     len: AtomicUsize,
+    op_lock: IrqSafeMutex<()>,
 }
 
 unsafe impl<T: Send> Send for TreiberStack<T> {}
@@ -40,6 +41,7 @@ impl<T> TreiberStack<T> {
             head: AtomicPtr::new(ptr::null_mut()),
             retired: AtomicPtr::new(ptr::null_mut()),
             len: AtomicUsize::new(0),
+            op_lock: IrqSafeMutex::new(()),
         }
     }
 
@@ -57,11 +59,13 @@ impl<T> TreiberStack<T> {
             next: AtomicPtr::new(ptr::null_mut()),
         }));
 
+        let _guard = self.op_lock.lock();
         self.len.fetch_add(1, Ordering::Release);
         unsafe { Self::push_raw(&self.head, node) };
     }
 
     pub fn pop(&self) -> Option<T> {
+        let _guard = self.op_lock.lock();
         let node = unsafe { Self::pop_raw(&self.head)? };
 
         self.len.fetch_sub(1, Ordering::AcqRel);
@@ -79,6 +83,7 @@ impl<T> TreiberStack<T> {
     where
         F: FnMut(T),
     {
+        let _guard = self.op_lock.lock();
         let mut list = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut reversed = ptr::null_mut();
         let mut count = 0usize;
@@ -117,6 +122,7 @@ impl<T> TreiberStack<T> {
     where
         F: FnMut(&T) -> bool,
     {
+        let _guard = self.op_lock.lock();
         let mut list = self.head.swap(ptr::null_mut(), Ordering::AcqRel);
         let mut keep = ptr::null_mut();
         let mut removed = None;

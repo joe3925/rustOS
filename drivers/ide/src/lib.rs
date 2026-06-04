@@ -89,13 +89,28 @@ impl<'a> PhysCursor<'a> {
         buffer: &'a IoBuffer<'buffer, PhysFramed, D>,
         len: usize,
     ) -> Option<Self> {
-        if buffer.len() < len {
+        Self::from_parts(
+            buffer.physical_frames(),
+            buffer.frame_offset(),
+            buffer.len(),
+            len,
+        )
+    }
+
+    fn from_parts(
+        frames: &'a [IoBufferPageFrame],
+        frame_offset: usize,
+        buffer_len: usize,
+        len: usize,
+    ) -> Option<Self> {
+        if buffer_len < len {
             return None;
         }
+
         Some(Self {
-            frames: buffer.physical_frames(),
+            frames,
             frame_idx: 0,
-            frame_offset: buffer.frame_offset(),
+            frame_offset,
             remaining: len,
         })
     }
@@ -175,6 +190,18 @@ fn has_to_device_buffer(
         || data
             .view::<IoBuffer<'_, Described, ToDevice>>()
             .map_or(false, |b| b.len() >= len)
+}
+
+enum IdeWriteBuffer {
+    Phys {
+        frames: Vec<IoBufferPageFrame>,
+        frame_offset: usize,
+        buffer_len: usize,
+    },
+    Described {
+        addr: usize,
+        buffer_len: usize,
+    },
 }
 
 /// IDE interrupt service routine.
@@ -582,22 +609,53 @@ pub async fn ide_pdo_write<'a, 'b>(
     let dh = cdx.dh.load(Ordering::Acquire);
     let irq = unsafe { dx.irq() };
 
-    let mut ctrl = dx.controller.lock().await;
-    let data = match req.data() {
-        RequestDataView::ReadOnly(data) => data,
-        RequestDataView::Writable(_) => return complete_req(req, DriverStatus::InvalidParameter),
+    let write_buffer = {
+        let data = match req.data() {
+            RequestDataView::ReadOnly(data) => data,
+            RequestDataView::Writable(_) => {
+                return complete_req(req, DriverStatus::InvalidParameter);
+            }
+        };
+
+        if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
+            IdeWriteBuffer::Phys {
+                frames: buf.physical_frames().to_vec(),
+                frame_offset: buf.frame_offset(),
+                buffer_len: buf.len(),
+            }
+        } else {
+            let buf = data
+                .view::<IoBuffer<'_, Described, ToDevice>>()
+                .expect("write req missing buffer");
+            IdeWriteBuffer::Described {
+                addr: buf.as_slice().as_ptr() as usize,
+                buffer_len: buf.len(),
+            }
+        }
     };
-    let ok = if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
-        ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await
-    } else {
-        let buf = &data
-            .view::<IoBuffer<'_, Described, ToDevice>>()
-            .expect("write req missing buffer")
-            .as_slice()[..len];
-        ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
+
+    let mut ctrl = dx.controller.lock().await;
+    let ok = match write_buffer {
+        IdeWriteBuffer::Phys {
+            frames,
+            frame_offset,
+            buffer_len,
+        } => match PhysCursor::from_parts(&frames, frame_offset, buffer_len, len) {
+            Some(cursor) => {
+                ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await
+            }
+            None => false,
+        },
+        IdeWriteBuffer::Described { addr, buffer_len } => {
+            if buffer_len < len {
+                false
+            } else {
+                let buf = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+                ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
+            }
+        }
     };
     drop(ctrl);
-    drop(data);
 
     complete_req(
         req,
@@ -958,12 +1016,8 @@ async fn ata_pio_write_phys_async(
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
-    buffer: &IoBuffer<'_, PhysFramed, ToDevice>,
-    len: usize,
+    mut data: PhysCursor<'_>,
 ) -> bool {
-    let Some(mut data) = PhysCursor::new(buffer, len) else {
-        return false;
-    };
     let p = &mut ctrl.ports;
 
     while sectors > 0 {

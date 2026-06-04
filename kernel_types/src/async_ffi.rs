@@ -399,13 +399,13 @@ impl<T> Drop for FfiFuture<T> {
     }
 }
 
-pub trait FutureExt: Future + Sized {
+pub trait FutureExt: Future + Sized + Send {
     fn into_ffi(self) -> FfiFuture<Self::Output>;
 }
 
 impl<F> FutureExt for F
 where
-    F: Future,
+    F: Future + Send,
 {
     fn into_ffi(self) -> FfiFuture<Self::Output> {
         ffi_future_from_future(self)

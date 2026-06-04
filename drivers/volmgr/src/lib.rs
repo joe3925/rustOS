@@ -741,14 +741,19 @@ pub async fn vol_pdo_write<'a, 'b>(
         return DriverStep::complete(DriverStatus::Success);
     }
 
+    let data_addr = {
+        let data = req.data().read_only();
+        let src = data.view::<[u8]>().expect("write req missing buffer");
+        src.as_ptr() as usize
+    };
+    let data = unsafe { core::slice::from_raw_parts(data_addr as *const u8, len) };
+
     if no_buffer {
         let target = match dx.backing.get() {
             Some(t) => t.clone(),
             None => return DriverStep::complete(DriverStatus::NoSuchDevice),
         };
-        let data = req.data().read_only();
-        let src = data.view::<[u8]>().expect("write req missing buffer");
-        let status = forward_no_buffer_write(target, offset, &src[..len], owner).await;
+        let status = forward_no_buffer_write(target, offset, data, owner).await;
         return DriverStep::complete(status);
     }
 
@@ -757,17 +762,9 @@ pub async fn vol_pdo_write<'a, 'b>(
         None => return DriverStep::complete(DriverStatus::NoSuchDevice),
     };
 
-    let data = match req.data() {
-        RequestDataView::ReadOnly(data) => data,
-        RequestDataView::Writable(_) => {
-            return DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
-    let data = data.view::<[u8]>().expect("write req missing buffer");
-
     let result = match owner {
-        o if o != 0 => cache.write_at_owned(offset, &data[..len], o).await,
-        _ => cache.write_at(offset, &data[..len]).await,
+        o if o != 0 => cache.write_at_owned(offset, data, o).await,
+        _ => cache.write_at(offset, data).await,
     };
 
     match result {

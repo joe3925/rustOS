@@ -38,6 +38,7 @@ mod error;
 mod file;
 mod fs;
 mod io;
+mod sync_cell;
 mod table;
 mod time;
 

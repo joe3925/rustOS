@@ -52,7 +52,7 @@ impl Drop for BlockOnActiveGuard<'_> {
     }
 }
 
-pub fn block_on<F: Future>(future: F) -> F::Output {
+pub fn block_on<F: Future + Send>(future: F) -> F::Output {
     let mut ffi_fut = future.into_ffi();
     let state = unsafe { kernel_block_on_thread_state() };
     if !state.try_enter() {

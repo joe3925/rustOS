@@ -15,7 +15,7 @@ use crate::error::{Error, IoError};
 use crate::file::File;
 use crate::fs::{FatType, FileSystem, OemCpConverter, ReadWriteSeek};
 use crate::io::{self, Read, ReadLeExt, Write, WriteLeExt};
-use crate::time::{Date, DateTime};
+use crate::time::{Date, DateTime, TimeProvider};
 
 bitflags! {
     /// A FAT file attributes.
@@ -550,7 +550,7 @@ pub struct DirEntry<'a, IO: ReadWriteSeek, TP, OCC> {
 }
 
 #[allow(clippy::len_without_is_empty)]
-impl<'a, IO: ReadWriteSeek, TP, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
+impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> DirEntry<'a, IO, TP, OCC> {
     /// Returns short file name.
     ///
     /// Non-ASCII characters are replaced by the replacement character (U+FFFD).

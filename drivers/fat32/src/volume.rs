@@ -399,13 +399,15 @@ async fn execute_fs_work(
     match op {
         FsOp::Open => {
             let result = {
-                let data = req.data().read_only();
+                let path = {
+                    let data = req.data().read_only();
 
-                let Some(p) = data.view::<FsOpenParams>() else {
-                    return DriverStatus::InvalidParameter;
+                    let Some(p) = data.view::<FsOpenParams>() else {
+                        return DriverStatus::InvalidParameter;
+                    };
+                    let _ = (p.flags, p.write_through);
+                    p.path.clone()
                 };
-                let _ = (p.flags, p.write_through);
-                let path = &p.path;
                 let path_str = path.as_str();
                 let root = fs.root_dir();
                 let open_res = match root.open_file(path_str).await {
@@ -656,13 +658,15 @@ async fn execute_fs_work(
 
         FsOp::Create => {
             let err = {
-                let data = req.data().read_only();
+                let (path, dir) = {
+                    let data = req.data().read_only();
 
-                let Some(p) = data.view::<FsCreateParams>() else {
-                    return DriverStatus::InvalidParameter;
+                    let Some(p) = data.view::<FsCreateParams>() else {
+                        return DriverStatus::InvalidParameter;
+                    };
+                    (p.path.clone(), p.dir)
                 };
-                let dir = p.dir;
-                match create_entry(&mut *fs, &p.path, dir).await {
+                match create_entry(&mut *fs, &path, dir).await {
                     Ok(()) => None,
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
@@ -674,12 +678,15 @@ async fn execute_fs_work(
 
         FsOp::Rename => {
             let err = {
-                let data = req.data().read_only();
+                let (src, dst) = {
+                    let data = req.data().read_only();
 
-                let Some(p) = data.view::<FsRenameParams>() else {
-                    return DriverStatus::InvalidParameter;
+                    let Some(p) = data.view::<FsRenameParams>() else {
+                        return DriverStatus::InvalidParameter;
+                    };
+                    (p.src.clone(), p.dst.clone())
                 };
-                match rename_entry(&mut *fs, &p.src, &p.dst).await {
+                match rename_entry(&mut *fs, &src, &dst).await {
                     Ok(renamed) => {
                         if let Some(renamed) = renamed {
                             vdx.handles.lock().update_renamed_file(&renamed);
@@ -696,12 +703,15 @@ async fn execute_fs_work(
 
         FsOp::ReadDir => {
             let res = {
-                let data = req.data().read_only();
+                let path = {
+                    let data = req.data().read_only();
 
-                let Some(p) = data.view::<FsListDirParams>() else {
-                    return DriverStatus::InvalidParameter;
+                    let Some(p) = data.view::<FsListDirParams>() else {
+                        return DriverStatus::InvalidParameter;
+                    };
+                    p.path.clone()
                 };
-                match list_names(&mut *fs, &p.path).await {
+                match list_names(&mut *fs, &path).await {
                     Ok(names) => FsListDirResult {
                         names: Some(names),
                         error: None,

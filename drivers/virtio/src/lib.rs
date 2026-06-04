@@ -1252,11 +1252,15 @@ pub async fn virtio_pdo_write<'a, 'b>(
     let qs = inner.get_queue(queue_idx);
 
     let status = 'transfer: {
-        let data = req.data().read_only();
-        let buffer = match data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
-            Some(buffer) => buffer,
-            None => break 'transfer DriverStatus::InvalidParameter,
+        let buffer_addr = {
+            let data = req.data().read_only();
+            match data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
+                Some(buffer) => buffer as *const IoBuffer<'_, PhysFramed, ToDevice> as usize,
+                None => break 'transfer DriverStatus::InvalidParameter,
+            }
         };
+        let buffer =
+            unsafe { &*(buffer_addr as *const IoBuffer<'_, PhysFramed, ToDevice>) };
         let mapped_buffer = match kernel_api::dma::map_buffer_ref(
             &parent,
             buffer,

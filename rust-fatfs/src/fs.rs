@@ -1,7 +1,6 @@
 #[cfg(feature = "alloc")]
 use alloc::string::String;
 use core::borrow::BorrowMut;
-use core::cell::{Cell, RefCell};
 use core::convert::TryFrom;
 use core::fmt::Debug;
 use core::marker::PhantomData;
@@ -12,6 +11,7 @@ use crate::dir_entry::{DirFileEntryData, FileAttributes, SFN_PADDING, SFN_SIZE};
 use crate::error::Error;
 use crate::file::File;
 use crate::io::{self, IoBase, Read, ReadLeExt, Seek, SeekFrom, Write, WriteLeExt};
+use crate::sync_cell::SendCell;
 use crate::table::{
     alloc_cluster, count_free_clusters, format_fat, read_fat_flags, ClusterIterator, RESERVED_FAT_ENTRIES,
 };
@@ -327,15 +327,15 @@ impl FileSystemStats {
 ///
 /// `FileSystem` struct is representing a state of a mounted FAT volume.
 pub struct FileSystem<IO: ReadWriteSeek, TP = DefaultTimeProvider, OCC = LossyOemCpConverter> {
-    pub(crate) disk: RefCell<IO>,
+    pub(crate) disk: SendCell<IO>,
     pub(crate) options: FsOptions<TP, OCC>,
     fat_type: FatType,
     bpb: BiosParameterBlock,
     first_data_sector: u32,
     root_dir_sectors: u32,
     total_clusters: u32,
-    fs_info: RefCell<FsInfoSector>,
-    current_status_flags: Cell<FsStatusFlags>,
+    fs_info: SendCell<FsInfoSector>,
+    current_status_flags: SendCell<FsStatusFlags>,
 }
 
 pub trait IntoStorage<T: Read + Write + Seek> {
@@ -348,7 +348,7 @@ impl<T: Read + Write + Seek> IntoStorage<T> for T {
     }
 }
 
-impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
+impl<IO: Read + Write + Seek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
     /// Creates a new filesystem object instance.
     ///
     /// Supplied `storage` parameter cannot be seeked. If there is a need to read a fragment of disk
@@ -407,15 +407,15 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
         let status_flags = bpb.status_flags();
         trace!("FileSystem::new end");
         Ok(Self {
-            disk: RefCell::new(disk),
+            disk: SendCell::new(disk),
             options,
             fat_type,
             bpb,
             first_data_sector,
             root_dir_sectors,
             total_clusters,
-            fs_info: RefCell::new(fs_info),
-            current_status_flags: Cell::new(status_flags),
+            fs_info: SendCell::new(fs_info),
+            current_status_flags: SendCell::new(status_flags),
         })
     }
 
@@ -632,7 +632,7 @@ impl<IO: Read + Write + Seek, TP, OCC> FileSystem<IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> FileSystem<IO, TP, OCC> {
     /// Returns a volume label from BPB in the Boot Sector as `String`.
     ///
     /// Non-ASCII characters are replaced by the replacement character (U+FFFD).
@@ -704,17 +704,17 @@ pub(crate) struct FsIoAdapter<'a, IO: ReadWriteSeek, TP, OCC> {
 
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 
-impl<IO: ReadWriteSeek, TP, OCC> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for FsIoAdapter<'_, IO, TP, OCC> {
     type Error = IO::Error;
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Read for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for FsIoAdapter<'_, IO, TP, OCC> {
     fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move { self.fs.disk.borrow_mut().read(buf, kind).await }.into_ffi()
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for FsIoAdapter<'_, IO, TP, OCC> {
     fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             let size = self.fs.disk.borrow_mut().write(buf, kind).await?;
@@ -731,7 +731,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Write for FsIoAdapter<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> Seek for FsIoAdapter<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Seek for FsIoAdapter<'_, IO, TP, OCC> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         self.fs.disk.borrow_mut().seek(pos)
     }
@@ -744,7 +744,7 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for FsIoAdapter<'_, IO, TP, OCC> {
     }
 }
 
-fn fat_slice<S: ReadWriteSeek, B: BorrowMut<S>>(
+fn fat_slice<S: ReadWriteSeek, B: BorrowMut<S> + Send>(
     io: B,
     bpb: &BiosParameterBlock,
 ) -> impl ReadWriteSeek<Error = Error<S::Error>> {
@@ -821,11 +821,11 @@ impl<B: Clone, S> Clone for DiskSlice<B, S> {
     }
 }
 
-impl<B, S: IoBase> IoBase for DiskSlice<B, S> {
+impl<B: Send, S: IoBase> IoBase for DiskSlice<B, S> {
     type Error = Error<S::Error>;
 }
 
-impl<B: BorrowMut<S>, S: Read + Seek> Read for DiskSlice<B, S> {
+impl<B: BorrowMut<S> + Send, S: Read + Seek> Read for DiskSlice<B, S> {
     fn read<'a>(&'a mut self, buf: &'a mut [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
@@ -839,7 +839,7 @@ impl<B: BorrowMut<S>, S: Read + Seek> Read for DiskSlice<B, S> {
     }
 }
 
-impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
+impl<B: BorrowMut<S> + Send, S: Write + Seek> Write for DiskSlice<B, S> {
     fn write<'a>(&'a mut self, buf: &'a [u8], _kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             let offset = self.begin + self.offset;
@@ -866,7 +866,7 @@ impl<B: BorrowMut<S>, S: Write + Seek> Write for DiskSlice<B, S> {
     }
 }
 
-impl<B, S: IoBase> Seek for DiskSlice<B, S> {
+impl<B: Send, S: IoBase> Seek for DiskSlice<B, S> {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
         let new_offset_opt: Option<u64> = match pos {
             SeekFrom::Current(x) => i64::try_from(self.offset)
@@ -898,7 +898,7 @@ impl<B, S: IoBase> Seek for DiskSlice<B, S> {
 ///
 /// Provides a custom implementation for a short name encoding/decoding.
 /// `OemCpConverter` is specified by the `oem_cp_converter` property in `FsOptions` struct.
-pub trait OemCpConverter: Debug {
+pub trait OemCpConverter: Debug + Send + Sync {
     fn decode(&self, oem_char: u8) -> char;
     fn encode(&self, uni_char: char) -> Option<u8>;
 }

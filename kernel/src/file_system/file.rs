@@ -5,6 +5,7 @@ use crate::benchmarking::bench_runtime_executor_async;
 use crate::benchmarking::used_memory;
 use crate::benchmarking::yield_once;
 
+use crate::benchmarking::bench_c_drive_io;
 use crate::benchmarking::BenchWindow;
 use crate::memory::heap::allocator::test_full_heap_parallel;
 use crate::static_handlers::print;
@@ -427,9 +428,12 @@ pub async fn switch_to_vfs() -> Result<(), RegError> {
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
     // spawn_blocking(|| loop {});
+    //
     spawn_detached(async move {
-        bench_c_drive_io_async().await;
-        bench_c_drive_io_async().await;
+        loop {
+            bench_c_drive_io_async(true).await;
+            bench_c_drive_io_async(false).await;
+        }
         // loop {
         //     bench_c_drive_io_async().await;
         // }

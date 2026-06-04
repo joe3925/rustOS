@@ -3,7 +3,7 @@ use core::convert::TryFrom;
 
 use crate::dir_entry::DirEntryEditor;
 use crate::error::Error;
-use crate::fs::{FileSystem, ReadWriteSeek};
+use crate::fs::{FileSystem, OemCpConverter, ReadWriteSeek};
 use crate::io::{IoBase, Read, SeekFrom, Write};
 use crate::time::{Date, DateTime, TimeProvider};
 
@@ -108,7 +108,7 @@ pub struct Extent {
     pub size: u32,
 }
 
-impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
+impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> File<'a, IO, TP, OCC> {
     pub(crate) fn new(
         first_cluster: Option<u32>,
         entry: Option<DirEntryEditor>,
@@ -308,7 +308,7 @@ impl<'a, IO: ReadWriteSeek, TP, OCC> File<'a, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> File<'_, IO, TP, OCC> {
     fn update_dir_entry_after_write(&mut self) {
         let offset = self.offset;
         if let Some(ref mut e) = self.entry {
@@ -334,11 +334,11 @@ impl<IO: ReadWriteSeek, TP, OCC> Clone for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP, OCC> IoBase for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> IoBase for File<'_, IO, TP, OCC> {
     type Error = Error<IO::Error>;
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Read for File<'_, IO, TP, OCC> {
     fn read<'a>(&'a mut self, buf: &'a mut [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::read");
@@ -448,7 +448,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Read for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Write for File<'_, IO, TP, OCC> {
     fn write<'a>(&'a mut self, buf: &'a [u8], kind: IoKind) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
             trace!("File::write");
@@ -567,7 +567,7 @@ impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> Write for File<'_, IO, TP, OCC> {
     }
 }
 
-impl<IO: ReadWriteSeek, TP: TimeProvider, OCC> File<'_, IO, TP, OCC> {
+impl<IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> File<'_, IO, TP, OCC> {
     pub async fn seek(&mut self, pos: SeekFrom) -> Result<u64, Error<IO::Error>> {
         trace!("File::seek");
         let size_opt = self.size();

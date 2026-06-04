@@ -3517,7 +3517,7 @@ async fn append_csv_line(path: &Path, line: &str) -> Result<(), FileStatus> {
 // =====================
 const DISK_BENCH_DIR: &str = "C:\\bench";
 const DISK_BENCH_FILE: &str = "io_bench.bin";
-const DISK_BENCH_TOTAL_BYTES: usize = 1024 * 1024 * 1024;
+const DISK_BENCH_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 const DISK_BENCH_SIZES: &[usize] = &[
     1 * 1024,
     16 * 1024,
@@ -3528,7 +3528,7 @@ const DISK_BENCH_SIZES: &[usize] = &[
     1024 * 1024,
     2 * 1024 * 1024,
     4 * 1024 * 1024,
-    64 * 1024 * 1024,
+    // 64 * 1024 * 1024,
 ];
 
 #[inline(always)]
@@ -3571,13 +3571,13 @@ fn lin_regress_overhead(bytes: &[u64], ns_per_op: &[u64]) -> Option<(f64, f64)> 
     Some((intercept, slope))
 }
 
-pub fn bench_c_drive_io() {
-    spawn_detached(async {
-        bench_c_drive_io_async().await;
+pub fn bench_c_drive_io(write_through: bool) {
+    spawn_detached(async move {
+        bench_c_drive_io_async(write_through).await;
     });
 }
 
-pub async fn bench_c_drive_io_async() {
+pub async fn bench_c_drive_io_async(write_through: bool) {
     // Ensure the target directory exists so the benchmark file can be created.
     let mut dir_path = Path::from_string(DISK_BENCH_DIR);
     if let Err(e) = File::make_dir(&dir_path).await {
@@ -3590,11 +3590,15 @@ pub async fn bench_c_drive_io_async() {
     dir_path.push(DISK_BENCH_FILE);
     let mut file = match File::open(
         &dir_path,
-        &[
-            OpenFlags::Create,
-            OpenFlags::ReadWrite,
-            //OpenFlags::WriteThrough,
-        ],
+        if (write_through) {
+            &[
+                OpenFlags::Create,
+                OpenFlags::ReadWrite,
+                OpenFlags::WriteThrough,
+            ]
+        } else {
+            &[OpenFlags::Create, OpenFlags::ReadWrite]
+        },
     )
     .await
     {
