@@ -6,6 +6,7 @@ use crate::alloc::vec::Vec;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::cmp::min;
+use core::hint::{cold_path, likely, unlikely};
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::Range;
@@ -126,7 +127,8 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
 
     fn describe_data_phys_frames(data: &PageBuf<BLOCK_SIZE>) -> Option<Box<[IoBufferPageFrame]>> {
         let frame_count = BLOCK_SIZE.div_ceil(IOBUFFER_PAGE_SIZE);
-        if frame_count > IOBUFFER_MAX_FRAME_CAPACITY {
+        if unlikely(frame_count > IOBUFFER_MAX_FRAME_CAPACITY) {
+            cold_path();
             return None;
         }
 
@@ -135,10 +137,17 @@ impl<const BLOCK_SIZE: usize> Page<BLOCK_SIZE> {
         let mut offset = 0usize;
 
         while offset < BLOCK_SIZE {
-            let virt_addr = base.checked_add(offset as u64)?;
-            let phys_addr = virt_to_phys(VirtAddr::new(virt_addr))?.as_u64();
+            let Some(virt_addr) = base.checked_add(offset as u64) else {
+                cold_path();
+                return None;
+            };
+            let Some(phys_addr) = virt_to_phys(VirtAddr::new(virt_addr)).map(|p| p.as_u64()) else {
+                cold_path();
+                return None;
+            };
 
-            if phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0 {
+            if unlikely(phys_addr & (IOBUFFER_PAGE_SIZE as u64 - 1) != 0) {
+                cold_path();
                 return None;
             }
 
@@ -282,6 +291,8 @@ impl<const BLOCK_SIZE: usize> PagePool<BLOCK_SIZE> {
         if let Some(inner) = Arc::get_mut(&mut page) {
             inner.reset_for_reuse();
             self.free.lock().push(page);
+        } else {
+            cold_path();
         }
     }
 }
@@ -557,15 +568,18 @@ where
         mut cfg: CacheConfig,
         factory: F,
     ) -> Result<Self, CacheError<B::Error>> {
-        if BLOCK_SIZE == 0 || cfg.capacity_blocks == 0 {
+        if unlikely(BLOCK_SIZE == 0 || cfg.capacity_blocks == 0) {
+            cold_path();
             return Err(CacheError::InvalidConfig);
         }
 
-        if cfg.shards == 0 {
+        if unlikely(cfg.shards == 0) {
+            cold_path();
             cfg.shards = 1;
         }
 
-        if cfg.flush_parallelism == 0 {
+        if unlikely(cfg.flush_parallelism == 0) {
+            cold_path();
             cfg.flush_parallelism = 1;
         }
 
@@ -623,7 +637,8 @@ where
     }
 
     fn check_open(&self) -> Result<(), CacheError<B::Error>> {
-        if self.closed.load(Ordering::Acquire) {
+        if unlikely(self.closed.load(Ordering::Acquire)) {
+            cold_path();
             return Err(CacheError::Closed);
         }
         Ok(())
@@ -657,7 +672,8 @@ where
     }
 
     fn start_flush_job_background(cache: &Arc<Self>) {
-        if cache.closed.load(Ordering::Acquire) {
+        if unlikely(cache.closed.load(Ordering::Acquire)) {
+            cold_path();
             return;
         }
 
@@ -821,7 +837,8 @@ where
         &self,
         lba: u64,
     ) -> Result<Arc<Page<BLOCK_SIZE>>, CacheError<B::Error>> {
-        if self.cfg.lazy_page_allocation {
+        if unlikely(self.cfg.lazy_page_allocation) {
+            cold_path();
             return Ok(Arc::new(
                 Page::new_zeroed().ok_or(CacheError::InvalidIoBuffer)?,
             ));
@@ -842,6 +859,7 @@ where
         }
 
         if self.cfg.direct_io_on_no_free_pages {
+            cold_path();
             return Err(CacheError::NoFreePages);
         }
 
@@ -873,6 +891,7 @@ where
         let mut shard = self.shards[idx].lock();
 
         if let Some(existing) = shard.index.get(&lba) {
+            cold_path();
             let existing = Arc::clone(&*existing);
             drop(shard);
             self.recycle_or_drop_page(page);
@@ -905,10 +924,12 @@ where
             .read_phys_framed(lba, 1, io_buf)
             .await
             .map_err(CacheError::Backend)?;
-        if bytes_read > BLOCK_SIZE {
+        if unlikely(bytes_read > BLOCK_SIZE) {
+            cold_path();
             return Err(CacheError::InvalidIoBuffer);
         }
-        if bytes_read < BLOCK_SIZE {
+        if unlikely(bytes_read < BLOCK_SIZE) {
+            cold_path();
             let data = page.data.get_mut();
             data.bytes[bytes_read..].fill(0);
         }
@@ -981,9 +1002,11 @@ where
             return Ok(page);
         }
 
+        cold_path();
         self.stats.read_misses.fetch_add(1, Ordering::Relaxed);
 
-        if !self.cfg.read_allocate {
+        if unlikely(!self.cfg.read_allocate) {
+            cold_path();
             return self.load_detached_page_from_backend(lba).await;
         }
 
@@ -1003,6 +1026,7 @@ where
             return Ok(WriteAcquire::Cached(page));
         }
 
+        cold_path();
         self.stats.write_misses.fetch_add(1, Ordering::Relaxed);
 
         let is_full_block = block_off == 0 && write_len == BLOCK_SIZE;
@@ -1035,7 +1059,8 @@ where
         offset: u64,
         out: &mut [u8],
     ) -> Result<(), CacheError<B::Error>> {
-        if out.is_empty() {
+        if unlikely(out.is_empty()) {
+            cold_path();
             return Ok(());
         }
 
@@ -1068,7 +1093,8 @@ where
         data: &[u8],
         _owner: u64,
     ) -> Result<(), CacheError<B::Error>> {
-        if data.is_empty() {
+        if unlikely(data.is_empty()) {
+            cold_path();
             return Ok(());
         }
 
@@ -1140,17 +1166,20 @@ where
     ) -> Option<PreparedFlushPage<BLOCK_SIZE>> {
         stats.flush_attempts.fetch_add(1, Ordering::Relaxed);
 
-        if !page.dirty.load(Ordering::Acquire) {
+        if unlikely(!page.dirty.load(Ordering::Acquire)) {
+            cold_path();
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        if page.writeback.swap(true, Ordering::AcqRel) {
+        if unlikely(page.writeback.swap(true, Ordering::AcqRel)) {
+            cold_path();
             stats.flush_skipped_busy.fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
-        if !page.dirty.load(Ordering::Acquire) {
+        if unlikely(!page.dirty.load(Ordering::Acquire)) {
+            cold_path();
             page.writeback.store(false, Ordering::Release);
             stats.flush_skipped_clean.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -1172,7 +1201,7 @@ where
         success: bool,
     ) {
         for prepared in pages {
-            if success {
+            if likely(success) {
                 let cur_gen = prepared.page.generation.load(Ordering::Acquire);
                 if cur_gen == prepared.wb_generation
                     && prepared.page.dirty.swap(false, Ordering::AcqRel)
@@ -1181,6 +1210,7 @@ where
                 }
                 stats.flush_success.fetch_add(1, Ordering::Relaxed);
             } else if !prepared.page.dirty.swap(true, Ordering::AcqRel) {
+                cold_path();
                 dirty_pages.fetch_add(1, Ordering::AcqRel);
             }
             prepared.page.writeback.store(false, Ordering::Release);
@@ -1221,6 +1251,7 @@ where
                 .checked_add(page_frames.len())
                 .is_none_or(|len| len > IOBUFFER_MAX_FRAME_CAPACITY)
             {
+                cold_path();
                 guards.clear();
                 frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
@@ -1230,6 +1261,7 @@ where
             frames.extend_from_slice(page_frames);
 
             let Some(next_write_len) = write_len.checked_add(BLOCK_SIZE) else {
+                cold_path();
                 guards.clear();
                 frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
@@ -1238,6 +1270,7 @@ where
             write_len = next_write_len;
 
             if !guards.push(guard) {
+                cold_path();
                 guards.clear();
                 frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
@@ -1248,6 +1281,7 @@ where
         let io_buf = match IoBuffer::<PhysFramed, ToDevice>::new(0, write_len, &frames[..]) {
             Ok(io_buf) => io_buf,
             Err(_) => {
+                cold_path();
                 guards.clear();
                 frames.clear();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
@@ -1272,6 +1306,7 @@ where
                 Ok(run.len())
             }
             Err(err) => {
+                cold_path();
                 Self::finish_prepared_flush_pages(stats, dirty_pages, run, false);
                 Err(err)
             }
@@ -1286,9 +1321,10 @@ where
         let shard_idx = self.shard_index(lba);
         let shard = self.shards[shard_idx].lock();
         let page = shard.index.peek(&lba)?;
-        if page.dirty.load(Ordering::Acquire) && filter.matches(lba, page) {
+        if likely(page.dirty.load(Ordering::Acquire) && filter.matches(lba, page)) {
             Some(Arc::clone(page))
         } else {
+            cold_path();
             None
         }
     }
@@ -1299,7 +1335,8 @@ where
         keys: &[u64],
         max_blocks_per_run: usize,
     ) -> Result<usize, CacheError<B::Error>> {
-        if keys.is_empty() {
+        if unlikely(keys.is_empty()) {
+            cold_path();
             return Ok(0);
         }
 
@@ -1349,6 +1386,7 @@ where
                 {
                     Ok(flushed) => writebacks += flushed,
                     Err(err) => {
+                        cold_path();
                         result = Err(err);
                         break;
                     }
@@ -1358,10 +1396,12 @@ where
             }
 
             if result.is_err() {
+                cold_path();
                 break;
             }
 
             let Some(page) = self.page_for_flush_key(*lba, filter) else {
+                cold_path();
                 if !run.is_empty() {
                     match Self::flush_prepared_run(
                         &self.backend,
@@ -1375,6 +1415,7 @@ where
                     {
                         Ok(flushed) => writebacks += flushed,
                         Err(err) => {
+                            cold_path();
                             result = Err(err);
                             break;
                         }
@@ -1389,6 +1430,7 @@ where
             if let Some(prepared) = Self::prepare_flush_page(&self.stats, *lba, page) {
                 run.push(prepared);
             } else if !run.is_empty() {
+                cold_path();
                 match Self::flush_prepared_run(
                     &self.backend,
                     &self.stats,
@@ -1401,6 +1443,7 @@ where
                 {
                     Ok(flushed) => writebacks += flushed,
                     Err(err) => {
+                        cold_path();
                         result = Err(err);
                         break;
                     }
@@ -1422,7 +1465,10 @@ where
             .await
             {
                 Ok(flushed) => writebacks += flushed,
-                Err(err) => result = Err(err),
+                Err(err) => {
+                    cold_path();
+                    result = Err(err);
+                }
             }
         }
 
@@ -1449,7 +1495,8 @@ where
         owner: u64,
         max_blocks_per_run: usize,
     ) -> Result<(usize, usize), CacheError<B::Error>> {
-        if owner == 0 {
+        if unlikely(owner == 0) {
+            cold_path();
             return Ok((0, 0));
         }
 
@@ -1709,12 +1756,13 @@ where
     }
 
     fn should_start_background_writeback(&self) -> bool {
-        if self.closed.load(Ordering::Acquire) {
+        if unlikely(self.closed.load(Ordering::Acquire)) {
+            cold_path();
             return false;
         }
 
         let dirty = self.dirty_pages.load(Ordering::Acquire);
-        if dirty == 0 {
+        if likely(dirty == 0) {
             return false;
         }
 
@@ -1723,12 +1771,14 @@ where
 
     async fn background_writeback_loop(&self) {
         loop {
-            if self.closed.load(Ordering::Acquire) {
+            if unlikely(self.closed.load(Ordering::Acquire)) {
+                cold_path();
                 break;
             }
 
             let dirty_before = self.dirty_pages.load(Ordering::Acquire);
-            if dirty_before == 0 {
+            if unlikely(dirty_before == 0) {
+                cold_path();
                 break;
             }
 
@@ -1744,6 +1794,7 @@ where
             let (matched, writebacks) = match self.flush_internal_filtered(&filter, false).await {
                 Ok(pass) => pass,
                 Err(err) => {
+                    cold_path();
                     println!(
                         "volmgr: VolumeCache::background_writeback_loop failed: {:?}",
                         err
@@ -1764,7 +1815,7 @@ where
     }
 
     fn maybe_start_background_writeback(cache: &Arc<Self>) {
-        if !cache.should_start_background_writeback() {
+        if likely(!cache.should_start_background_writeback()) {
             return;
         }
 
@@ -1772,6 +1823,7 @@ where
             .background_writeback_active
             .swap(true, Ordering::AcqRel)
         {
+            cold_path();
             return;
         }
 
@@ -1798,13 +1850,15 @@ where
     }
 
     pub(crate) fn flush_owner_background(cache: &Arc<Self>, owner: u64) {
-        if cache.closed.load(Ordering::Acquire) {
+        if unlikely(cache.closed.load(Ordering::Acquire)) {
+            cold_path();
             return;
         }
 
         let cache = Arc::clone(cache);
         spawn_detached(async move {
             if let Err(err) = cache.flush_internal_owner(owner).await {
+                cold_path();
                 println!(
                     "volmgr: VolumeCache::flush_owner_background owner {} failed: {:?}",
                     owner, err
@@ -1858,16 +1912,21 @@ where
     }
 
     pub fn prefetch_range(self: &Arc<Self>, offset: u64, len: usize) {
-        if self.closed.load(Ordering::Acquire) {
+        if unlikely(self.closed.load(Ordering::Acquire)) {
+            cold_path();
             return;
         }
 
         let range = match Self::block_range_from_bytes(offset, len) {
             Ok(r) => r,
-            Err(_) => return,
+            Err(_) => {
+                cold_path();
+                return;
+            }
         };
 
-        if !self.cfg.read_allocate {
+        if unlikely(!self.cfg.read_allocate) {
+            cold_path();
             return;
         }
 
@@ -1882,6 +1941,7 @@ where
                             let _ = cache.insert_page_or_get_existing(lba, page).await;
                         }
                         Err(err) => {
+                            cold_path();
                             println!(
                                 "volmgr: VolumeCache::prefetch_range failed at lba {}: {:?}",
                                 lba, err
@@ -1904,7 +1964,8 @@ where
         cache.check_open()?;
         let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, data.len())?;
 
-        if data.is_empty() {
+        if unlikely(data.is_empty()) {
+            cold_path();
             return Ok(());
         }
 
@@ -1924,6 +1985,7 @@ where
             {
                 Ok(acquired) => acquired,
                 Err(CacheError::NoFreePages) if cache.cfg.direct_io_on_no_free_pages => {
+                    cold_path();
                     if !no_free_flush_started {
                         Self::start_flush_job_background(cache);
                         no_free_flush_started = true;
@@ -1935,7 +1997,10 @@ where
                     cur_off += take as u64;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    cold_path();
+                    return Err(err);
+                }
             };
 
             match acquired {
@@ -1951,13 +2016,14 @@ where
                     cache.mark_cached_page_dirty(lba, &page, owner);
                 }
                 WriteAcquire::Direct(page) => {
+                    cold_path();
                     {
                         let mut page_data = page.data.write();
                         page_data.bytes[block_off..block_off + take]
                             .copy_from_slice(&data[src_pos..src_pos + take]);
                     }
 
-                    if owner == 0 {
+                    if likely(owner == 0) {
                         page.mark_dirty();
                     } else {
                         page.mark_dirty_with_owner(owner);
@@ -1986,7 +2052,8 @@ where
         self.check_open()?;
         let _ = VolumeCache::<B, BLOCK_SIZE, F>::end_offset(offset, out.len())?;
 
-        if out.is_empty() {
+        if unlikely(out.is_empty()) {
+            cold_path();
             return Ok(());
         }
 
@@ -2003,6 +2070,7 @@ where
             let page = match self.get_or_create_read_page(lba).await {
                 Ok(page) => page,
                 Err(CacheError::NoFreePages) if self.cfg.direct_io_on_no_free_pages => {
+                    cold_path();
                     if !no_free_flush_started {
                         VolumeCache::<B, BLOCK_SIZE, F>::start_flush_job_background(self);
                         no_free_flush_started = true;
@@ -2013,7 +2081,10 @@ where
                     cur_off += take as u64;
                     continue;
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    cold_path();
+                    return Err(err);
+                }
             };
             let _use_guard = PageUseGuard::new(&page);
 
@@ -2113,7 +2184,8 @@ where
     }
 
     fn flush_background_pass(&self) {
-        if self.closed.load(Ordering::Acquire) {
+        if unlikely(self.closed.load(Ordering::Acquire)) {
+            cold_path();
             return;
         }
 
@@ -2123,7 +2195,8 @@ where
         });
     }
     async fn flush_async(&self) {
-        if self.closed.load(Ordering::Acquire) {
+        if unlikely(self.closed.load(Ordering::Acquire)) {
+            cold_path();
             return;
         }
 

@@ -2,11 +2,13 @@
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+#![feature(likely_unlikely)]
 extern crate alloc;
 
 use crate::vec::Vec;
 use alloc::sync::Weak;
 use alloc::{boxed::Box, string::String, sync::Arc, vec};
+use core::hint::{cold_path, likely, unlikely};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 use core::ptr;
@@ -119,7 +121,10 @@ pub async fn partition_pdo_read<'a, 'b>(
     let end_lba = *dx.end_lba.get().unwrap();
     let block_size = match dx.block_size.get() {
         Some(v) if *v != 0 => *v as u64,
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
     let off_res = {
@@ -130,27 +135,36 @@ pub async fn partition_pdo_read<'a, 'b>(
                 len,
                 no_buffer,
             } => {
-                if buf_len != len {
+                if unlikely(buf_len != len) {
+                    cold_path();
                     Err(DriverStatus::InvalidParameter)
                 } else {
                     let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                    if offset + (buf_len as u64) > part_bytes {
+                    if unlikely(offset + (buf_len as u64) > part_bytes) {
+                        cold_path();
                         Err(DriverStatus::InvalidParameter)
-                    } else if offset % block_size != 0
-                        || !(buf_len as u64).is_multiple_of(block_size)
-                    {
+                    } else if unlikely(
+                        offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
+                    ) {
+                        cold_path();
                         Err(DriverStatus::InvalidParameter)
                     } else {
                         Ok((offset, no_buffer))
                     }
                 }
             }
-            _ => Err(DriverStatus::InvalidParameter),
+            _ => {
+                cold_path();
+                Err(DriverStatus::InvalidParameter)
+            }
         }
     };
     let (off, no_buffer) = match off_res {
         Ok(v) => v,
-        Err(st) => return DriverStep::complete(st),
+        Err(st) => {
+            cold_path();
+            return DriverStep::complete(st);
+        }
     };
 
     let phys_off = off + ((start_lba as u64) << 9);
@@ -177,7 +191,10 @@ pub async fn partition_pdo_write<'a, 'b>(
     let end_lba = *dx.end_lba.get().unwrap();
     let block_size = match dx.block_size.get() {
         Some(v) if *v != 0 => *v as u64,
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
     let off_res = {
@@ -189,27 +206,36 @@ pub async fn partition_pdo_write<'a, 'b>(
                 no_buffer,
                 owner,
             } => {
-                if buf_len != len {
+                if unlikely(buf_len != len) {
+                    cold_path();
                     Err(DriverStatus::InvalidParameter)
                 } else {
                     let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-                    if offset + (buf_len as u64) > part_bytes {
+                    if unlikely(offset + (buf_len as u64) > part_bytes) {
+                        cold_path();
                         Err(DriverStatus::InvalidParameter)
-                    } else if offset % block_size != 0
-                        || !(buf_len as u64).is_multiple_of(block_size)
-                    {
+                    } else if unlikely(
+                        offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
+                    ) {
+                        cold_path();
                         Err(DriverStatus::InvalidParameter)
                     } else {
                         Ok((offset, no_buffer, owner))
                     }
                 }
             }
-            _ => Err(DriverStatus::InvalidParameter),
+            _ => {
+                cold_path();
+                Err(DriverStatus::InvalidParameter)
+            }
         }
     };
     let (off, no_buffer, owner) = match off_res {
         Ok(v) => v,
-        Err(st) => return DriverStep::complete(st),
+        Err(st) => {
+            cold_path();
+            return DriverStep::complete(st);
+        }
     };
 
     let phys_off = off + ((start_lba as u64) << 9);
@@ -235,7 +261,10 @@ pub async fn partition_pdo_flush<'a, 'b>(
 ) -> DriverStep {
     match request.read().kind {
         RequestType::Flush { .. } | RequestType::FlushDirty { .. } => {}
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     }
 
     let dx = ext::<PartDevExt>(&device);
@@ -292,9 +321,10 @@ async fn read_from_lower_async(
 
     drop(child_req);
 
-    if status == DriverStatus::Success {
+    if likely(status == DriverStatus::Success) {
         Ok(data.into_boxed_slice())
     } else {
+        cold_path();
         Err(status)
     }
 }

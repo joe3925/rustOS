@@ -2,12 +2,14 @@
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+#![feature(likely_unlikely)]
 #![allow(async_fn_in_trait)]
 
 extern crate alloc;
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::arch::asm;
+use core::hint::{cold_path, unlikely};
 use core::panic::PanicInfo;
 use core::sync::atomic::AtomicBool;
 use kernel_api::async_ffi::FfiFuture;
@@ -72,7 +74,8 @@ impl CacheBackend {
     #[inline]
     fn block_len(&self, lba: u64) -> Option<usize> {
         let start = lba.checked_mul(BLOCK_SIZE as u64)?;
-        if start >= self.volume_bytes {
+        if unlikely(start >= self.volume_bytes) {
+            cold_path();
             return None;
         }
         let remaining = self.volume_bytes - start;
@@ -90,22 +93,26 @@ impl VolumeCacheBackend for CacheBackend {
         buffer: IoBuffer<'buffer, PhysFramed, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>> {
         async move {
-            if blocks == 0 {
+            if unlikely(blocks == 0) {
+                cold_path();
                 return Ok(0);
             }
 
-            let offset = lba
-                .checked_mul(BLOCK_SIZE as u64)
-                .ok_or(DriverStatus::InvalidParameter)?;
+            let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
+                cold_path();
+                return Err(DriverStatus::InvalidParameter);
+            };
             let mut total_len = 0usize;
             let mut block_idx = 0usize;
             while block_idx < blocks {
-                let block_lba = lba
-                    .checked_add(block_idx as u64)
-                    .ok_or(DriverStatus::InvalidParameter)?;
+                let Some(block_lba) = lba.checked_add(block_idx as u64) else {
+                    cold_path();
+                    return Err(DriverStatus::InvalidParameter);
+                };
                 let block_len = match self.block_len(block_lba) {
                     Some(block_len) => block_len,
                     None => {
+                        cold_path();
                         println!(
                             "volmgr: CacheBackend::read_phys_framed invalid lba {} for volume length {}",
                             block_lba, self.volume_bytes
@@ -113,13 +120,16 @@ impl VolumeCacheBackend for CacheBackend {
                         return Err(DriverStatus::InvalidParameter);
                     }
                 };
-                total_len = total_len
-                    .checked_add(block_len)
-                    .ok_or(DriverStatus::InvalidParameter)?;
+                let Some(next_total_len) = total_len.checked_add(block_len) else {
+                    cold_path();
+                    return Err(DriverStatus::InvalidParameter);
+                };
+                total_len = next_total_len;
                 block_idx += 1;
             }
 
-            if buffer.len() < total_len {
+            if unlikely(buffer.len() < total_len) {
+                cold_path();
                 return Err(DriverStatus::InvalidParameter);
             }
 
@@ -135,7 +145,8 @@ impl VolumeCacheBackend for CacheBackend {
 
             let status = pnp_send_request(self.target.clone(), &mut req).await;
 
-            if status != DriverStatus::Success {
+            if unlikely(status != DriverStatus::Success) {
+                cold_path();
                 println!(
                     "volmgr: CacheBackend::read_phys_framed lower read failed at lba {} blocks {} len {}: {}",
                     lba, blocks, total_len, status
@@ -170,6 +181,7 @@ impl VolumeCacheBackend for CacheBackend {
                     let max_len = match self.block_len(lba) {
                         Some(max_len) => max_len,
                         None => {
+                            cold_path();
                             println!(
                                 "volmgr: CacheBackend::write_request invalid write offset {} len {} for volume length {}",
                                 offset, len, self.volume_bytes
@@ -178,14 +190,15 @@ impl VolumeCacheBackend for CacheBackend {
                         }
                     };
                     let clamped = len.min(max_len);
-                    if clamped == 0 {
+                    if unlikely(clamped == 0) {
+                        cold_path();
                         println!(
                             "volmgr: CacheBackend::write_request zero-length write after clamp at offset {} len {}",
                             offset, len
                         );
                         return Err(DriverStatus::InvalidParameter);
                     }
-                    if clamped != len {
+                    if unlikely(clamped != len) {
                         w.kind = RequestType::Write {
                             offset,
                             len: clamped,
@@ -199,7 +212,8 @@ impl VolumeCacheBackend for CacheBackend {
             }
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_send_request(self.target.clone(), req).await;
-            if status != DriverStatus::Success {
+            if unlikely(status != DriverStatus::Success) {
+                cold_path();
                 println!(
                     "volmgr: CacheBackend::write_request lower write failed at offset {} len {}: {}",
                     write_offset, write_len, status
@@ -218,29 +232,36 @@ impl VolumeCacheBackend for CacheBackend {
         buffer: IoBuffer<'buffer, PhysFramed, ToDevice>,
     ) -> FfiFuture<Result<(), Self::Error>> {
         async move {
-            if blocks == 0 {
+            if unlikely(blocks == 0) {
+                cold_path();
                 return Ok(());
             }
 
-            let offset = lba
-                .checked_mul(BLOCK_SIZE as u64)
-                .ok_or(DriverStatus::InvalidParameter)?;
+            let Some(offset) = lba.checked_mul(BLOCK_SIZE as u64) else {
+                cold_path();
+                return Err(DriverStatus::InvalidParameter);
+            };
             let mut total_len = 0usize;
             let mut block_idx = 0usize;
             while block_idx < blocks {
-                let block_lba = lba
-                    .checked_add(block_idx as u64)
-                    .ok_or(DriverStatus::InvalidParameter)?;
-                let block_len = self
-                    .block_len(block_lba)
-                    .ok_or(DriverStatus::InvalidParameter)?;
-                total_len = total_len
-                    .checked_add(block_len)
-                    .ok_or(DriverStatus::InvalidParameter)?;
+                let Some(block_lba) = lba.checked_add(block_idx as u64) else {
+                    cold_path();
+                    return Err(DriverStatus::InvalidParameter);
+                };
+                let Some(block_len) = self.block_len(block_lba) else {
+                    cold_path();
+                    return Err(DriverStatus::InvalidParameter);
+                };
+                let Some(next_total_len) = total_len.checked_add(block_len) else {
+                    cold_path();
+                    return Err(DriverStatus::InvalidParameter);
+                };
+                total_len = next_total_len;
                 block_idx += 1;
             }
 
-            if buffer.len() < total_len {
+            if unlikely(buffer.len() < total_len) {
+                cold_path();
                 return Err(DriverStatus::InvalidParameter);
             }
 
@@ -257,7 +278,8 @@ impl VolumeCacheBackend for CacheBackend {
 
             let status = pnp_send_request(self.target.clone(), &mut req).await;
 
-            if status != DriverStatus::Success {
+            if unlikely(status != DriverStatus::Success) {
+                cold_path();
                 println!(
                     "volmgr: CacheBackend::write_phys_framed lower write failed at lba {} blocks {} len {}: {}",
                     lba, blocks, total_len, status
@@ -278,7 +300,8 @@ impl VolumeCacheBackend for CacheBackend {
             );
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
             let status = pnp_send_request(self.target.clone(), &mut req).await;
-            if status != DriverStatus::Success && status != DriverStatus::NotImplemented {
+            if unlikely(status != DriverStatus::Success && status != DriverStatus::NotImplemented) {
+                cold_path();
                 println!(
                     "volmgr: CacheBackend::flush_device lower flush failed: {}",
                     status
@@ -357,7 +380,8 @@ fn partition_len_bytes(pi: &PartitionInfo) -> Option<u64> {
     let sector_sz = pi.disk.logical_block_size as u64;
     let ent = pi.gpt_entry?;
 
-    if sector_sz == 0 {
+    if unlikely(sector_sz == 0) {
+        cold_path();
         return None;
     }
 
@@ -370,10 +394,12 @@ fn partition_len_bytes(pi: &PartitionInfo) -> Option<u64> {
 fn cache_error_status(context: &str, err: CacheError<DriverStatus>) -> DriverStatus {
     match err {
         CacheError::Backend(status) => {
+            cold_path();
             println!("volmgr: {} lower-device error: {}", context, status);
             status
         }
         err => {
+            cold_path();
             println!("volmgr: {} cache error: {:?}", context, err);
             match err {
                 CacheError::InvalidIoBuffer => DriverStatus::InvalidParameter,
@@ -458,10 +484,12 @@ pub async fn vol_prepare_hardware<'a, 'b>(
     );
 
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut query_req).await;
-    if st == DriverStatus::NoSuchDevice {
+    if unlikely(st == DriverStatus::NoSuchDevice) {
+        cold_path();
         return DriverStep::complete(DriverStatus::Success);
     }
-    if st != DriverStatus::Success {
+    if unlikely(st != DriverStatus::Success) {
+        cold_path();
         println!(
             "volmgr: vol_prepare_hardware lower QueryResources dispatch failed: {}",
             st
@@ -471,7 +499,8 @@ pub async fn vol_prepare_hardware<'a, 'b>(
 
     let dx = ext::<VolExt>(&dev);
     let status = query_req.read().status.clone();
-    if status != DriverStatus::Success {
+    if unlikely(status != DriverStatus::Success) {
+        cold_path();
         println!(
             "volmgr: vol_prepare_hardware lower QueryResources completed with: {}",
             status
@@ -611,7 +640,10 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        None => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        }
     };
 
     let (offset, len_req, no_buffer) = {
@@ -622,24 +654,31 @@ pub async fn vol_pdo_read<'a, 'b>(
                 len,
                 no_buffer,
             } => (offset, len, no_buffer),
-            _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+            _ => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
         }
     };
 
-    if offset >= vol_len {
+    if unlikely(offset >= vol_len) {
+        cold_path();
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if offset
-        .checked_add(len_req as u64)
-        .map_or(true, |end| end > vol_len)
-    {
+    if unlikely(
+        offset
+            .checked_add(len_req as u64)
+            .map_or(true, |end| end > vol_len),
+    ) {
+        cold_path();
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
     let req_data_len = match req.data() {
         RequestDataView::Writable(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
         RequestDataView::ReadOnly(_) => {
+            cold_path();
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     };
@@ -648,11 +687,13 @@ pub async fn vol_pdo_read<'a, 'b>(
     len = core::cmp::min(len, buf_len);
     len = core::cmp::min(len, req_data_len);
 
-    if len == 0 {
+    if unlikely(len == 0) {
+        cold_path();
         return DriverStep::complete(DriverStatus::Success);
     }
 
-    if no_buffer {
+    if unlikely(no_buffer) {
+        cold_path();
         let target = match dx.backing.get() {
             Some(t) => t.clone(),
             None => return DriverStep::complete(DriverStatus::NoSuchDevice),
@@ -660,6 +701,7 @@ pub async fn vol_pdo_read<'a, 'b>(
         let mut data = match req.data() {
             RequestDataView::Writable(data) => data,
             RequestDataView::ReadOnly(_) => {
+                cold_path();
                 return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         };
@@ -672,12 +714,16 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     let cache = match dx.cache.get() {
         Some(c) => c,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        None => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        }
     };
 
     let mut data = match req.data() {
         RequestDataView::Writable(data) => data,
         RequestDataView::ReadOnly(_) => {
+            cold_path();
             return DriverStep::complete(DriverStatus::InvalidParameter);
         }
     };
@@ -687,7 +733,10 @@ pub async fn vol_pdo_read<'a, 'b>(
 
     match cache.read_at(offset, &mut dst[..len]).await {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
-        Err(err) => DriverStep::complete(cache_error_status("vol_pdo_read cache.read_at", err)),
+        Err(err) => {
+            cold_path();
+            DriverStep::complete(cache_error_status("vol_pdo_read cache.read_at", err))
+        }
     }
 }
 
@@ -701,7 +750,10 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let vol_len = match dx.len_bytes.get() {
         Some(v) => *v,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        None => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        }
     };
 
     let (offset, len_req, no_buffer, owner) = match req.read().kind {
@@ -711,17 +763,23 @@ pub async fn vol_pdo_write<'a, 'b>(
             no_buffer,
             owner,
         } => (offset, len, no_buffer, owner),
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
-    if offset >= vol_len {
+    if unlikely(offset >= vol_len) {
+        cold_path();
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
-    if offset
-        .checked_add(len_req as u64)
-        .map_or(true, |end| end > vol_len)
-    {
+    if unlikely(
+        offset
+            .checked_add(len_req as u64)
+            .map_or(true, |end| end > vol_len),
+    ) {
+        cold_path();
         return DriverStep::complete(DriverStatus::InvalidParameter);
     }
 
@@ -732,12 +790,14 @@ pub async fn vol_pdo_write<'a, 'b>(
         match req.data() {
             RequestDataView::ReadOnly(data) => data.view::<[u8]>().map(|b| b.len()).unwrap_or(0),
             RequestDataView::Writable(_) => {
+                cold_path();
                 return DriverStep::complete(DriverStatus::InvalidParameter);
             }
         },
     );
 
-    if len == 0 {
+    if unlikely(len == 0) {
+        cold_path();
         return DriverStep::complete(DriverStatus::Success);
     }
 
@@ -748,7 +808,8 @@ pub async fn vol_pdo_write<'a, 'b>(
     };
     let data = unsafe { core::slice::from_raw_parts(data_addr as *const u8, len) };
 
-    if no_buffer {
+    if unlikely(no_buffer) {
+        cold_path();
         let target = match dx.backing.get() {
             Some(t) => t.clone(),
             None => return DriverStep::complete(DriverStatus::NoSuchDevice),
@@ -759,7 +820,10 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     let cache = match dx.cache.get() {
         Some(c) => c,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        None => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        }
     };
 
     let result = match owner {
@@ -769,7 +833,10 @@ pub async fn vol_pdo_write<'a, 'b>(
 
     match result {
         Ok(()) => DriverStep::complete(DriverStatus::Success),
-        Err(err) => DriverStep::complete(cache_error_status("vol_pdo_write cache.write", err)),
+        Err(err) => {
+            cold_path();
+            DriverStep::complete(cache_error_status("vol_pdo_write cache.write", err))
+        }
     }
 }
 
@@ -782,7 +849,10 @@ pub async fn vol_pdo_flush<'a, 'b>(
 
     let cache = match dx.cache.get() {
         Some(c) => c,
-        None => return DriverStep::complete(DriverStatus::NoSuchDevice),
+        None => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::NoSuchDevice);
+        }
     };
 
     let (should_block, flush_owner) = match req.read().kind {
@@ -793,7 +863,10 @@ pub async fn vol_pdo_flush<'a, 'b>(
             owner,
             should_block,
         } => (should_block, Some(owner)),
-        _ => return DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
     if let Some(owner) = flush_owner {
@@ -803,6 +876,7 @@ pub async fn vol_pdo_flush<'a, 'b>(
                     return DriverStep::complete(DriverStatus::Success);
                 }
                 Err(err) => {
+                    cold_path();
                     return DriverStep::complete(cache_error_status(
                         "vol_pdo_flush cache.flush_owner",
                         err,
@@ -818,10 +892,13 @@ pub async fn vol_pdo_flush<'a, 'b>(
     if should_block {
         match cache.wait_for_flush_job().await {
             Ok(()) => DriverStep::complete(DriverStatus::Success),
-            Err(err) => DriverStep::complete(cache_error_status(
-                "vol_pdo_flush cache.wait_for_flush_job",
-                err,
-            )),
+            Err(err) => {
+                cold_path();
+                DriverStep::complete(cache_error_status(
+                    "vol_pdo_flush cache.wait_for_flush_job",
+                    err,
+                ))
+            }
         }
     } else {
         let _ = cache.ensure_flush_job().await;

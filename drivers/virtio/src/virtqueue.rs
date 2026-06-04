@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::hint::{cold_path, likely, unlikely};
 use core::sync::atomic::{AtomicU16, Ordering};
 use kernel_api::device::DeviceObject;
 use kernel_api::println;
@@ -128,7 +129,8 @@ impl Virtqueue {
     }
     /// Allocate a single descriptor from the free list. Returns descriptor index.
     pub fn alloc_desc(&mut self) -> Option<u16> {
-        if self.num_free == 0 {
+        if unlikely(self.num_free == 0) {
+            cold_path();
             return None;
         }
         let idx = self.free_head;
@@ -180,7 +182,8 @@ impl Virtqueue {
     /// Push a chain of buffers into the virtqueue.
     /// Returns the head descriptor index of the chain.
     pub fn push_chain(&mut self, bufs: &[(PhysAddr, u32, u16)]) -> Option<u16> {
-        if bufs.is_empty() || bufs.len() as u16 > self.num_free {
+        if unlikely(bufs.is_empty() || bufs.len() as u16 > self.num_free) {
+            cold_path();
             return None;
         }
 
@@ -267,7 +270,7 @@ impl Virtqueue {
         let used_idx = unsafe { (*used_idx_ptr).load(core::sync::atomic::Ordering::Acquire) };
 
         let last = self.last_used_idx.load(Ordering::Acquire);
-        if last == used_idx {
+        if unlikely(last == used_idx) {
             return None;
         }
 
@@ -284,7 +287,8 @@ impl Virtqueue {
     pub fn free_chain(&mut self, head: u16) {
         let mut idx = head;
         loop {
-            if idx >= self.size {
+            if unlikely(idx >= self.size) {
+                cold_path();
                 panic!(
                     "virtio: descriptor index {} out of bounds (size {})",
                     idx, self.size
@@ -295,7 +299,7 @@ impl Virtqueue {
             let next = unsafe { (*desc).next };
 
             // For an indirect descriptor, only free the single head descriptor.
-            if (flags & VRING_DESC_F_INDIRECT) != 0 {
+            if likely((flags & VRING_DESC_F_INDIRECT) != 0) {
                 self.free_desc(idx);
                 return;
             }

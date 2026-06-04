@@ -1,4 +1,5 @@
 use core::cmp::min;
+use core::hint::{cold_path, likely, unlikely};
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,9 +88,10 @@ impl BlockDev {
             pnp_send_request(volume, borrow.handle()).await
         };
 
-        if status == DriverStatus::Success {
+        if likely(status == DriverStatus::Success) {
             Ok(())
         } else {
+            cold_path();
             println!("Read Error: {:#?}", status);
             Err(status)
         }
@@ -120,20 +122,23 @@ impl BlockDev {
             pnp_send_request(volume, borrow.handle()).await
         };
 
-        if status == DriverStatus::Success {
+        if likely(status == DriverStatus::Success) {
             Ok(())
         } else {
+            cold_path();
             println!("Write Error: {:#?}", status);
             Err(status)
         }
     }
 
     async fn read_bytes(&mut self, dst: &mut [u8], kind: IoKind) -> Result<usize, DriverStatus> {
-        if dst.is_empty() {
+        if unlikely(dst.is_empty()) {
+            cold_path();
             return Ok(0);
         }
         let cap_bytes = self.capacity_bytes();
-        if self.pos >= cap_bytes {
+        if unlikely(self.pos >= cap_bytes) {
+            cold_path();
             return Ok(0);
         }
         let len = min(dst.len(), (cap_bytes - self.pos) as usize);
@@ -143,11 +148,13 @@ impl BlockDev {
     }
 
     async fn write_bytes(&mut self, src: &[u8], kind: IoKind) -> Result<usize, DriverStatus> {
-        if src.is_empty() {
+        if unlikely(src.is_empty()) {
+            cold_path();
             return Ok(0);
         }
         let cap_bytes = self.capacity_bytes();
-        if self.pos >= cap_bytes {
+        if unlikely(self.pos >= cap_bytes) {
+            cold_path();
             println!(
                 "attempt to sec to pos {}, with capacity {}",
                 cap_bytes,
@@ -219,21 +226,24 @@ impl Seek for BlockDev {
             SeekFrom::Start(o) => o,
             SeekFrom::End(off) => {
                 let base = cap as i128 + off as i128;
-                if base < 0 {
+                if unlikely(base < 0) {
+                    cold_path();
                     return Err(());
                 }
                 base as u64
             }
             SeekFrom::Current(off) => {
                 let base = self.pos as i128 + off as i128;
-                if base < 0 {
+                if unlikely(base < 0) {
+                    cold_path();
                     return Err(());
                 }
                 base as u64
             }
         };
 
-        if new > cap {
+        if unlikely(new > cap) {
+            cold_path();
             return Err(());
         }
         self.pos = new;

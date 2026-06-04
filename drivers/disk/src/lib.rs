@@ -2,10 +2,12 @@
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+#![feature(likely_unlikely)]
 extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
+    hint::{cold_path, unlikely},
     mem::size_of,
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -104,35 +106,43 @@ pub async fn disk_read<'a, 'b>(
 ) -> kernel_api::pnp::DriverStep {
     let (off, total) = match req.read().kind {
         RequestType::Read { offset, len, .. } => (offset, len),
-        _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
-    if total == 0 {
+    if unlikely(total == 0) {
+        cold_path();
         return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(Ordering::Acquire)
-        && let Err(st) = query_props_sync(&dev).await
-    {
-        return kernel_api::pnp::DriverStep::complete(st);
+    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+        if let Err(st) = query_props_sync(&dev).await {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(st);
+        }
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
 
     match req.data() {
         RequestDataView::Writable(data) => {
-            if !has_from_device_buffer(data) {
+            if unlikely(!has_from_device_buffer(data)) {
+                cold_path();
                 return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
             }
         }
         RequestDataView::ReadOnly(_) => {
+            cold_path();
             return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
         }
     }
 
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
-    if !aligned {
+    if unlikely(!aligned) {
+        cold_path();
         req.write().status = DriverStatus::InvalidParameter;
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
@@ -154,29 +164,36 @@ pub async fn disk_write<'a, 'b>(
             no_buffer: _,
             owner: _,
         } => (offset, len),
-        _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
-    if total == 0 {
+    if unlikely(total == 0) {
+        cold_path();
         return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
     }
 
     let dx = disk_ext(&dev);
-    if !dx.props_ready.load(Ordering::Acquire)
-        && let Err(st) = query_props_sync(&dev).await
-    {
-        return kernel_api::pnp::DriverStep::complete(st);
+    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+        if let Err(st) = query_props_sync(&dev).await {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(st);
+        }
     }
 
     let bs = dx.block_size.load(Ordering::Acquire) as u64;
     let data = req.data().read_only();
 
-    if !has_to_device_buffer(data) {
+    if unlikely(!has_to_device_buffer(data)) {
+        cold_path();
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
-    if !aligned {
+    if unlikely(!aligned) {
+        cold_path();
         req.write().status = DriverStatus::InvalidParameter;
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
     }
@@ -200,7 +217,10 @@ pub async fn disk_ioctl<'a, 'b>(
 ) -> kernel_api::pnp::DriverStep {
     let code = match req.read().kind {
         RequestType::DeviceControl(c) => c,
-        _ => return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter),
+        _ => {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
     };
 
     match code {
@@ -217,7 +237,8 @@ pub async fn disk_ioctl<'a, 'b>(
             );
 
             let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
-            if st != DriverStatus::Success {
+            if unlikely(st != DriverStatus::Success) {
+                cold_path();
                 return kernel_api::pnp::DriverStep::complete(st);
             }
 
@@ -227,7 +248,7 @@ pub async fn disk_ioctl<'a, 'b>(
                     .as_mut()
                     .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
             };
-            if info_opt.is_none() {
+            if unlikely(info_opt.is_none()) {
                 info_opt = ch
                     .read()
                     .pnp
@@ -238,7 +259,10 @@ pub async fn disk_ioctl<'a, 'b>(
 
             let info = match info_opt {
                 Some(di) => di,
-                None => return kernel_api::pnp::DriverStep::complete(DriverStatus::Unsuccessful),
+                None => {
+                    cold_path();
+                    return kernel_api::pnp::DriverStep::complete(DriverStatus::Unsuccessful);
+                }
             };
 
             req.write().set_data_t::<DiskInfo>(info);
@@ -266,10 +290,12 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     );
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
 
-    if st != DriverStatus::Success {
+    if unlikely(st != DriverStatus::Success) {
+        cold_path();
         return Err(st);
     }
-    if ch.read().status != DriverStatus::Success {
+    if unlikely(ch.read().status != DriverStatus::Success) {
+        cold_path();
         return Err(ch.read().status.clone());
     }
 
@@ -280,7 +306,7 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
             .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
     };
 
-    if di_opt.is_none() {
+    if unlikely(di_opt.is_none()) {
         let req = ch.read();
         di_opt = req
             .pnp
@@ -305,7 +331,10 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
 
     let di = match di_opt {
         Some(di) => di,
-        None => return Err(DriverStatus::Unsuccessful),
+        None => {
+            cold_path();
+            return Err(DriverStatus::Unsuccessful);
+        }
     };
 
     let dx = disk_ext(dev);

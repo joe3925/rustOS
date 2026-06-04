@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(const_option_ops)]
 #![feature(const_trait_impl)]
+#![feature(likely_unlikely)]
 extern crate alloc;
 
 use core::panic::PanicInfo;

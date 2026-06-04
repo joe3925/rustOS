@@ -3,6 +3,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::hint::{cold_path, likely, unlikely};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{
     CachedFileState, Dir as FatDirT, Error as FatError, FileSystem as FatFsT, IoBase,
@@ -99,7 +100,8 @@ impl FileHandleTable {
     }
 
     fn index_and_generation(&self, fs_file_id: u64) -> Option<(usize, u64)> {
-        if fs_file_id < FIRST_FILE_OWNER_ID || self.slots.is_empty() {
+        if unlikely(fs_file_id < FIRST_FILE_OWNER_ID || self.slots.is_empty()) {
+            cold_path();
             return None;
         }
         let raw = fs_file_id - FIRST_FILE_OWNER_ID;
@@ -110,7 +112,12 @@ impl FileHandleTable {
     fn slot_mut(&mut self, fs_file_id: u64) -> Option<&mut FileSlot> {
         let (index, generation) = self.index_and_generation(fs_file_id)?;
         let slot = &mut self.slots[index];
-        (slot.generation == generation && slot.ctx.is_some()).then_some(slot)
+        if likely(slot.generation == generation && slot.ctx.is_some()) {
+            Some(slot)
+        } else {
+            cold_path();
+            None
+        }
     }
 
     fn ctx_mut(&mut self, fs_file_id: u64) -> Result<&mut FileCtx, FileStatus> {
@@ -132,7 +139,10 @@ impl FileHandleTable {
     }
 
     fn insert(&mut self, ctx: FileCtx) -> Result<u64, FileStatus> {
-        let index = self.free_head.ok_or(FileStatus::InternalError)?;
+        let Some(index) = self.free_head else {
+            cold_path();
+            return Err(FileStatus::InternalError);
+        };
         self.free_head = self.slots[index].next_free.take();
         self.slots[index].ctx = Some(ctx);
         Ok(self.id_for_slot(index))
@@ -143,10 +153,14 @@ impl FileHandleTable {
             .index_and_generation(fs_file_id)
             .ok_or(FileStatus::PathNotFound)?;
         let slot = &mut self.slots[index];
-        if slot.generation != generation {
+        if unlikely(slot.generation != generation) {
+            cold_path();
             return Err(FileStatus::PathNotFound);
         }
-        let ctx = slot.ctx.take().ok_or(FileStatus::PathNotFound)?;
+        let Some(ctx) = slot.ctx.take() else {
+            cold_path();
+            return Err(FileStatus::PathNotFound);
+        };
         slot.generation = slot.generation.wrapping_add(1);
         slot.next_free = self.free_head;
         self.free_head = Some(index);
@@ -155,7 +169,8 @@ impl FileHandleTable {
 
     fn take_cached_state(&mut self, fs_file_id: u64) -> Result<CachedFileState, FileStatus> {
         let ctx = self.ctx_mut(fs_file_id)?;
-        if ctx.is_dir {
+        if unlikely(ctx.is_dir) {
+            cold_path();
             return Err(FileStatus::AccessDenied);
         }
         ctx.cached
@@ -196,6 +211,7 @@ fn map_fatfs_err(e: &FsError) -> FileStatus {
         fatfs::Error::CorruptedFileSystem => FileStatus::CorruptFilesystem,
         fatfs::Error::FileTooLarge => FileStatus::FileTooLarge,
         e => {
+            cold_path();
             println!("Mapping {:#?} to UnknownFail", e);
             FileStatus::UnknownFail
         }
@@ -308,8 +324,10 @@ async fn flush_cached_file(
 ) -> Option<FileStatus> {
     let err = file.flush().await.err().map(|e| map_fatfs_err(&e));
     restore_cached_file(vdx, fs_file_id, file);
-    if err.is_none() {
+    if likely(err.is_none()) {
         schedule_lower_flush(vdx, fs_file_id, lower_flush);
+    } else {
+        cold_path();
     }
     err
 }
@@ -386,13 +404,22 @@ async fn execute_fs_work(
 
     let op = match req.read().kind {
         RequestType::Fs(op) => op,
-        RequestType::DeviceControl(_) => return DriverStatus::NotImplemented,
-        _ => return DriverStatus::InvalidParameter,
+        RequestType::DeviceControl(_) => {
+            cold_path();
+            return DriverStatus::NotImplemented;
+        }
+        _ => {
+            cold_path();
+            return DriverStatus::InvalidParameter;
+        }
     };
 
     let owner = match current_owner_for_op(op, req) {
         Ok(owner) => owner,
-        Err(status) => return status,
+        Err(status) => {
+            cold_path();
+            return status;
+        }
     };
     vdx.current_owner.store(owner, Ordering::Release);
 
@@ -403,6 +430,7 @@ async fn execute_fs_work(
                     let data = req.data().read_only();
 
                     let Some(p) = data.view::<FsOpenParams>() else {
+                        cold_path();
                         return DriverStatus::InvalidParameter;
                     };
                     let _ = (p.flags, p.write_through);
@@ -467,6 +495,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsCloseParams>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 p.fs_file_id
@@ -495,6 +524,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsReadParams<'_>>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 (
@@ -554,6 +584,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsWriteParams<'_>>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 (
@@ -581,12 +612,12 @@ async fn execute_fs_work(
                                 Err(e) => Err(map_fatfs_err(&e)),
                             }
                         };
-                        let lower_flush = if write_through && res.is_ok() {
+                        let lower_flush = if unlikely(write_through) && res.is_ok() {
                             LowerFlush::Blocking
                         } else {
                             LowerFlush::None
                         };
-                        let flush_err = if write_through {
+                        let flush_err = if unlikely(write_through) {
                             flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                         } else {
                             restore_cached_file(&vdx, fs_file_id, file);
@@ -630,6 +661,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsFlushParams>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 p.fs_file_id
@@ -662,6 +694,7 @@ async fn execute_fs_work(
                     let data = req.data().read_only();
 
                     let Some(p) = data.view::<FsCreateParams>() else {
+                        cold_path();
                         return DriverStatus::InvalidParameter;
                     };
                     (p.path.clone(), p.dir)
@@ -682,6 +715,7 @@ async fn execute_fs_work(
                     let data = req.data().read_only();
 
                     let Some(p) = data.view::<FsRenameParams>() else {
+                        cold_path();
                         return DriverStatus::InvalidParameter;
                     };
                     (p.src.clone(), p.dst.clone())
@@ -707,6 +741,7 @@ async fn execute_fs_work(
                     let data = req.data().read_only();
 
                     let Some(p) = data.view::<FsListDirParams>() else {
+                        cold_path();
                         return DriverStatus::InvalidParameter;
                     };
                     p.path.clone()
@@ -731,6 +766,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsGetInfoParams>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 p.fs_file_id
@@ -766,6 +802,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsSetLenParams>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 (p.fs_file_id, p.new_size)
@@ -806,6 +843,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsAppendParams<'_>>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 (p.fs_file_id, p.write_through, p.data.as_ptr(), p.data.len())
@@ -839,12 +877,12 @@ async fn execute_fs_work(
                                     }
                                     Err(e) => Err(map_fatfs_err(&e)),
                                 };
-                                let lower_flush = if write_through && res.is_ok() {
+                                let lower_flush = if unlikely(write_through) && res.is_ok() {
                                     LowerFlush::Blocking
                                 } else {
                                     LowerFlush::None
                                 };
-                                let flush_err = if write_through {
+                                let flush_err = if unlikely(write_through) {
                                     flush_cached_file(&vdx, fs_file_id, file, lower_flush).await
                                 } else {
                                     restore_cached_file(&vdx, fs_file_id, file);
@@ -889,6 +927,7 @@ async fn execute_fs_work(
                 let data = req.data().read_only();
 
                 let Some(p) = data.view::<FsZeroRangeParams>() else {
+                    cold_path();
                     return DriverStatus::InvalidParameter;
                 };
                 (p.fs_file_id, p.offset, p.len)
@@ -944,6 +983,7 @@ fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) ->
         let data = req.data().read_only();
 
         let Some(p) = data.view::<FsSeekParams>() else {
+            cold_path();
             return DriverStatus::InvalidParameter;
         };
         (p.fs_file_id, p.origin, p.offset)
@@ -995,7 +1035,7 @@ pub async fn fs_op_dispatch(
     dev: &Arc<DeviceObject>,
     req: &mut RequestHandle<'_, '_>,
 ) -> DriverStep {
-    if matches!(req.read().kind, RequestType::Fs(FsOp::Seek)) {
+    if unlikely(matches!(req.read().kind, RequestType::Fs(FsOp::Seek))) {
         let status = handle_seek_fast(dev, req);
         req.write().status = status.clone();
         return DriverStep::complete(status);
@@ -1017,15 +1057,17 @@ pub async fn fs_op_dispatch(
 
     let status = execute_fs_work(dev, &fs_arc, req).await;
 
-    if flush_flag.swap(false, Ordering::AcqRel) {
+    if unlikely(flush_flag.swap(false, Ordering::AcqRel)) {
         let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
         let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
-        if owner != 0 {
+        if likely(owner != 0) {
             let _ = send_flush_owner(volume_target.clone(), owner, should_block).await;
+        } else {
+            cold_path();
         }
     }
 
-    if flush_metadata_after_op {
+    if unlikely(flush_metadata_after_op) {
         let _ = send_flush_owner(volume_target, METADATA_OWNER_ID, true).await;
     }
 

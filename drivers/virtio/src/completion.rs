@@ -1,4 +1,5 @@
 use core::future::Future;
+use core::hint::{cold_path, unlikely};
 use core::pin::Pin;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::task::{Context, Poll, Waker};
@@ -34,7 +35,8 @@ impl CompletionHeadSlot {
 
     fn put(&self, cell_idx: u16) {
         let mut guard = self.cell.lock();
-        if guard.is_some() {
+        if unlikely(guard.is_some()) {
+            cold_path();
             panic!("virtio: completion head slot already occupied");
         }
         *guard = Some(cell_idx);
@@ -78,7 +80,8 @@ impl CompletionCell {
 
     fn prepare_allocated(&self) -> u32 {
         let mut state = self.state.lock();
-        if state.phase != PHASE_FREE {
+        if unlikely(state.phase != PHASE_FREE) {
+            cold_path();
             panic!("virtio: allocated completion cell was not free");
         }
 
@@ -107,7 +110,8 @@ unsafe impl Sync for CompletionTable {}
 
 impl CompletionTable {
     pub fn new(len: usize) -> Option<Self> {
-        if len == 0 || len > MAX_COMPLETION_SLOTS {
+        if unlikely(len == 0 || len > MAX_COMPLETION_SLOTS) {
+            cold_path();
             return None;
         }
 
@@ -141,7 +145,8 @@ impl CompletionTable {
     pub fn alloc(&self) -> Option<CompletionToken<'_>> {
         let cell_idx = {
             let mut free = self.free.lock();
-            if free.head == INVALID_INDEX {
+            if unlikely(free.head == INVALID_INDEX) {
+                cold_path();
                 return None;
             }
 
@@ -161,16 +166,19 @@ impl CompletionTable {
     }
 
     pub fn attach(&self, head: u16, token: &CompletionToken<'_>) {
-        if !core::ptr::eq(token.table, self) {
+        if unlikely(!core::ptr::eq(token.table, self)) {
+            cold_path();
             panic!("virtio: completion token attached to the wrong table");
         }
-        if head as usize >= self.len {
+        if unlikely(head as usize >= self.len) {
+            cold_path();
             panic!("virtio: completion head index outside table");
         }
 
         {
             let mut state = self.cells[token.cell_idx as usize].state.lock();
-            if state.generation != token.generation || state.phase != PHASE_ALLOCATED {
+            if unlikely(state.generation != token.generation || state.phase != PHASE_ALLOCATED) {
+                cold_path();
                 panic!("virtio: completion token was not attachable");
             }
             state.phase = PHASE_WAITING;
@@ -180,11 +188,13 @@ impl CompletionTable {
     }
 
     pub fn complete_head(&self, head: u16, status: u8) -> bool {
-        if head as usize >= self.len {
+        if unlikely(head as usize >= self.len) {
+            cold_path();
             return false;
         }
 
         let Some(cell_idx) = self.heads[head as usize].take() else {
+            cold_path();
             return false;
         };
 
@@ -214,16 +224,20 @@ impl CompletionTable {
                     wake = state.waker.take();
                 }
                 PHASE_ABANDONED => {
+                    cold_path();
                     state.status = 0xFF;
                     state.phase = PHASE_FREE;
                     state.waker = None;
                     should_free = true;
                 }
-                _ => panic!("virtio: completion cell finished in invalid state"),
+                _ => {
+                    cold_path();
+                    panic!("virtio: completion cell finished in invalid state");
+                }
             }
         }
 
-        if should_free {
+        if unlikely(should_free) {
             self.push_free(cell_idx);
         }
         if let Some(waker) = wake {
@@ -244,6 +258,7 @@ impl CompletionTable {
                     wake = state.waker.take();
                 }
                 PHASE_ABANDONED => {
+                    cold_path();
                     state.phase = PHASE_FREE;
                     state.waker = None;
                     should_free = true;
@@ -253,7 +268,7 @@ impl CompletionTable {
             }
         }
 
-        if should_free {
+        if unlikely(should_free) {
             self.push_free(cell_idx);
         }
         if let Some(waker) = wake {
@@ -272,7 +287,8 @@ impl CompletionTable {
         {
             let cell = &self.cells[cell_idx as usize];
             let mut state = cell.state.lock();
-            if state.generation != generation {
+            if unlikely(state.generation != generation) {
+                cold_path();
                 return Poll::Ready(Err(CompletionError::Canceled));
             }
 
@@ -299,7 +315,10 @@ impl CompletionTable {
                     }
                 }
                 PHASE_ALLOCATED => {}
-                _ => return Poll::Ready(Err(CompletionError::Canceled)),
+                _ => {
+                    cold_path();
+                    return Poll::Ready(Err(CompletionError::Canceled));
+                }
             }
         }
 
@@ -321,7 +340,8 @@ impl CompletionTable {
         {
             let cell = &self.cells[cell_idx as usize];
             let mut state = cell.state.lock();
-            if state.generation != generation {
+            if unlikely(state.generation != generation) {
+                cold_path();
                 return Err(CompletionError::Canceled);
             }
 
@@ -339,7 +359,10 @@ impl CompletionTable {
                     state.waker = None;
                 }
                 PHASE_WAITING | PHASE_ALLOCATED => {}
-                _ => return Err(CompletionError::Canceled),
+                _ => {
+                    cold_path();
+                    return Err(CompletionError::Canceled);
+                }
             }
         }
 
@@ -362,7 +385,8 @@ impl CompletionTable {
         {
             let cell = &self.cells[cell_idx as usize];
             let mut state = cell.state.lock();
-            if state.generation != generation {
+            if unlikely(state.generation != generation) {
+                cold_path();
                 return;
             }
 
@@ -381,7 +405,7 @@ impl CompletionTable {
             }
         }
 
-        if should_free {
+        if unlikely(should_free) {
             self.push_free(cell_idx);
         }
     }
@@ -393,7 +417,8 @@ impl CompletionTable {
             .store(free.head, Ordering::Relaxed);
         free.head = cell_idx;
         free.count = free.count.saturating_add(1);
-        if free.count as usize > self.len {
+        if unlikely(free.count as usize > self.len) {
+            cold_path();
             panic!("virtio: completion cell double-free");
         }
     }
@@ -408,7 +433,8 @@ pub struct CompletionToken<'a> {
 
 impl CompletionToken<'_> {
     pub fn try_recv(&mut self) -> Result<Option<u8>, CompletionError> {
-        if !self.active {
+        if unlikely(!self.active) {
+            cold_path();
             return Err(CompletionError::Canceled);
         }
 
@@ -430,7 +456,8 @@ impl Future for CompletionToken<'_> {
     type Output = Result<u8, CompletionError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if !self.active {
+        if unlikely(!self.active) {
+            cold_path();
             return Poll::Ready(Err(CompletionError::Canceled));
         }
 
@@ -446,7 +473,8 @@ impl Future for CompletionToken<'_> {
 
 impl Drop for CompletionToken<'_> {
     fn drop(&mut self) {
-        if self.active {
+        if unlikely(self.active) {
+            cold_path();
             self.table.drop_token(self.cell_idx, self.generation);
             self.active = false;
         }

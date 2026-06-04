@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use core::hint::{cold_path, unlikely};
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::dma::{IOBUFFER_INLINE_SEGMENT_CAPACITY, IoBufferDmaSegment};
 use kernel_api::x86_64::VirtAddr;
@@ -93,7 +94,8 @@ pub fn init_device(
     let dev_features = (dev_features_hi as u64) << 32 | dev_features_lo as u64;
 
     // Modern virtio-pci requires VERSION_1; fail early if missing.
-    if dev_features & VIRTIO_F_VERSION_1 == 0 {
+    if unlikely(dev_features & VIRTIO_F_VERSION_1 == 0) {
+        cold_path();
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
@@ -106,7 +108,8 @@ pub fn init_device(
     let flush_supported = (dev_features & VIRTIO_BLK_F_FLUSH) != 0;
     let access_platform_supported = (dev_features & VIRTIO_F_ACCESS_PLATFORM) != 0;
 
-    if !access_platform_supported {
+    if unlikely(!access_platform_supported) {
+        cold_path();
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
@@ -152,7 +155,8 @@ pub fn init_device(
     };
 
     let status = unsafe { pci::common_read_u8(common_cfg, pci::COMMON_DEVICE_STATUS) };
-    if status & VIRTIO_STATUS_FEATURES_OK == 0 {
+    if unlikely(status & VIRTIO_STATUS_FEATURES_OK == 0) {
+        cold_path();
         unsafe {
             pci::common_write_u8(common_cfg, pci::COMMON_DEVICE_STATUS, VIRTIO_STATUS_FAILED)
         };
@@ -272,17 +276,22 @@ impl BlkIoSlots {
         }; MAX_DATA_DESCRIPTORS];
         let mut segment_count = 0usize;
         for seg in data_segments {
-            if seg.byte_len == 0 {
+            if unlikely(seg.byte_len == 0) {
+                cold_path();
                 continue;
             }
-            if segment_count == MAX_DATA_DESCRIPTORS {
+            if unlikely(segment_count == MAX_DATA_DESCRIPTORS) {
+                cold_path();
                 return None;
             }
             segments[segment_count] = seg;
             segment_count += 1;
         }
 
-        let head = vq.alloc_desc()?;
+        let Some(head) = vq.alloc_desc() else {
+            cold_path();
+            return None;
+        };
         let slot_ptr = self.get_slot_ptr(head);
 
         let slot_dma_base = self
