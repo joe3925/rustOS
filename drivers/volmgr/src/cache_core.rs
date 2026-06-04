@@ -19,7 +19,7 @@ use kernel_api::kernel_types::dma::{
 };
 use kernel_api::memory::virt_to_phys;
 use kernel_api::println;
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{RequestHandle, TraversalPolicy, Write};
 use kernel_api::runtime::spawn;
 use kernel_api::runtime::spawn_detached;
 use kernel_api::x86_64::VirtAddr;
@@ -916,7 +916,7 @@ where
         page: &mut Arc<Page<BLOCK_SIZE>>,
     ) -> Result<(), CacheError<B::Error>> {
         let page = Arc::get_mut(page).ok_or(CacheError::NoFreePages)?;
-        let mut io_buf =
+        let io_buf =
             IoBuffer::<PhysFramed, FromDevice>::new(0, BLOCK_SIZE, page.data_phys_frames())
                 .map_err(|_| CacheError::InvalidIoBuffer)?;
         let bytes_read = self
@@ -1136,15 +1136,13 @@ where
             let data_guard = page.data.read();
             let io_buf =
                 IoBuffer::<Described, ToDevice>::new(&data_guard.bytes[..]).into_phys_framed();
-            let mut req = RequestHandle::new_t(
-                RequestType::Write {
-                    offset: lba * BLOCK_SIZE as u64,
-                    len: BLOCK_SIZE,
-                    no_buffer: false,
-                    owner: 0,
-                },
-                io_buf,
-            );
+            let mut req = RequestHandle::new(Write {
+                offset: lba * BLOCK_SIZE as u64,
+                len: BLOCK_SIZE,
+                no_buffer: false,
+                owner: 0,
+                buffer: io_buf.into(),
+            });
             req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
             self.backend

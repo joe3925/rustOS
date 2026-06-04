@@ -54,7 +54,7 @@ use alloc::{
     vec::Vec,
 };
 use kernel_types::{
-    async_ffi::{BorrowingFfiFuture, FfiFuture, FutureExt},
+    async_ffi::{FfiFuture, FutureExt},
     benchmark::{
         BenchCoreId, BenchObjectId, BenchSpanId, BenchTag, BenchWindowConfig, BenchWindowHandle,
     },
@@ -67,7 +67,7 @@ use kernel_types::{
     io::IoTarget,
     irq::{IrqBorrowedHandle, IrqHandle, IrqIsrFn, IrqMeta},
     pnp::{DeviceIds, DeviceRelationType},
-    request::RequestHandle,
+    request::{DeviceControl, RequestHandle, RequestKind},
     runtime::BlockOnThreadState,
     status::{Data, DriverError, DriverStatus, FileStatus, PageMapError, RegError},
     ClassAddCallback, EvtDriverDeviceAdd, EvtDriverUnload,
@@ -355,88 +355,79 @@ pub extern "win64" fn pnp_get_device_target(instance_path: &str) -> Option<IoTar
     PNP_MANAGER.get_device_target(instance_path)
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_lower<'h, 'd>(
+pub async fn pnp_forward_request_to_next_lower<'req, K>(
     from: &Arc<DeviceObject>,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    let from = from.clone();
-    BorrowingFfiFuture::from_owned_ffi(
-        async move { PNP_MANAGER.send_request_to_next_lower(from, handle).await }.into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, K>,
+) -> DriverStatus
+where
+    K: kernel_routing::RoutedRequest,
+{
+    PNP_MANAGER
+        .send_request_to_next_lower(from.clone(), handle)
+        .await
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_forward_request_to_next_upper<'h, 'd>(
+pub async fn pnp_forward_request_to_next_upper<'req, K>(
     from: &Arc<DeviceObject>,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    let from = from.clone();
-    BorrowingFfiFuture::from_owned_ffi(
-        async move { PNP_MANAGER.send_request_to_next_upper(from, handle).await }.into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, K>,
+) -> DriverStatus
+where
+    K: kernel_routing::RoutedRequest,
+{
+    PNP_MANAGER
+        .send_request_to_next_upper(from.clone(), handle)
+        .await
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request<'h, 'd>(
+pub async fn pnp_send_request<'req, K>(
     target: IoTarget,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    BorrowingFfiFuture::from_owned_ffi(
-        async move { PNP_MANAGER.send_request(target, handle).await }.into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, K>,
+) -> DriverStatus
+where
+    K: kernel_routing::RoutedRequest,
+{
+    PNP_MANAGER.send_request(target, handle).await
 }
 
-pub extern "win64" fn pnp_complete_request<'h, 'd>(
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> DriverStatus {
+pub fn pnp_complete_request<'req, K>(handle: &mut RequestHandle<'req, K>) -> DriverStatus
+where
+    K: RequestKind,
+{
     PNP_MANAGER.complete_request(handle)
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_send_request_via_symlink<'h, 'd>(
+pub async fn pnp_send_request_via_symlink<'req, K>(
     link_path: String,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    BorrowingFfiFuture::from_owned_ffi(
-        async move {
-            PNP_MANAGER
-                .send_request_via_symlink(link_path, handle)
-                .await
-        }
-        .into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, K>,
+) -> DriverStatus
+where
+    K: kernel_routing::RoutedRequest,
+{
+    PNP_MANAGER
+        .send_request_via_symlink(link_path, handle)
+        .await
 }
 
-#[unsafe(no_mangle)]
-pub extern "win64" fn pnp_ioctl_via_symlink<'h, 'd>(
+pub async fn pnp_ioctl_via_symlink<'req, 'data>(
     link_path: String,
     control_code: u32,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    BorrowingFfiFuture::from_owned_ffi(
-        async move {
-            PNP_MANAGER
-                .ioctl_via_symlink(link_path, control_code, handle)
-                .await
-        }
-        .into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, DeviceControl<'data>>,
+) -> DriverStatus {
+    PNP_MANAGER
+        .ioctl_via_symlink(link_path, control_code, handle)
+        .await
 }
 
-#[no_mangle]
-pub extern "win64" fn pnp_send_request_to_stack_top<'h, 'd>(
+pub async fn pnp_send_request_to_stack_top<'req, K>(
     dev_node_weak: alloc::sync::Weak<DevNode>,
-    handle: &'h mut RequestHandle<'d, 'd>,
-) -> BorrowingFfiFuture<'d, DriverStatus> {
-    BorrowingFfiFuture::from_owned_ffi(
-        async move {
-            PNP_MANAGER
-                .send_request_to_stack_top(dev_node_weak, handle)
-                .await
-        }
-        .into_ffi(),
-    )
+    handle: &mut RequestHandle<'req, K>,
+) -> DriverStatus
+where
+    K: kernel_routing::RoutedRequest,
+{
+    PNP_MANAGER
+        .send_request_to_stack_top(dev_node_weak, handle)
+        .await
 }
 
 pub extern "win64" fn pnp_queue_dpc(func: DpcFn, arg: usize) {

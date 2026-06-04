@@ -2,7 +2,7 @@ use alloc::{string::String, vec, vec::Vec};
 use core::mem::size_of;
 
 use crate::request::{
-    BorrowedHandle, RequestData, RequestDataError, RequestHandle, RequestPayload, RequestType,
+    BorrowedHandle, DeviceControl, RequestData, RequestDataError, RequestHandle, RequestPayload,
     TraversalPolicy, type_name_stripped, type_tag,
 };
 
@@ -82,10 +82,11 @@ fn request_data_vec_payload_round_trips_without_aliasing() {
 #[test]
 fn borrowed_read_only_slice_cannot_be_mutated_or_consumed() {
     let bytes = [4u8, 5, 6, 7];
-    let mut handle = RequestHandle::new(RequestType::Dummy, RequestData::empty());
+    let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
 
     {
-        let mut borrowed = BorrowedHandle::<[u8]>::read_only(&mut handle, &bytes);
+        let mut borrowed =
+            BorrowedHandle::<_, [u8]>::read_only(&mut handle, &bytes);
         let view = borrowed.handle().data().read_only();
         assert_eq!(view.view::<[u8]>().unwrap(), &[4, 5, 6, 7]);
         assert!(!view.can_take_exact::<Vec<u8>>());
@@ -97,10 +98,11 @@ fn borrowed_read_only_slice_cannot_be_mutated_or_consumed() {
 #[test]
 fn borrowed_writable_slice_exposes_mut_view_and_is_cleared_on_drop() {
     let mut bytes = [1u8, 2, 3];
-    let mut handle = RequestHandle::new(RequestType::Dummy, RequestData::empty());
+    let mut handle = RequestHandle::new(DeviceControl::new(0, RequestData::empty()));
 
     {
-        let mut borrowed = BorrowedHandle::<[u8]>::writable(&mut handle, &mut bytes);
+        let mut borrowed =
+            BorrowedHandle::<_, [u8]>::writable(&mut handle, &mut bytes);
         let mut view = borrowed.handle().data().try_writable().unwrap();
         let slice = view.view_mut::<[u8]>().unwrap();
         slice[1] = 9;
@@ -114,14 +116,10 @@ fn borrowed_writable_slice_exposes_mut_view_and_is_cleared_on_drop() {
 
 #[test]
 fn request_handle_owns_request_state_and_data_view() {
-    let mut handle = RequestHandle::new_t(
-        RequestType::Read {
-            offset: 12,
-            len: 8,
-            no_buffer: false,
-        },
+    let mut handle = RequestHandle::new(DeviceControl::new_t(
+        0x100,
         SmallPayload { id: 7, flags: 3 },
-    );
+    ));
 
     assert!(handle.is_owned());
     assert!(!handle.is_stack());
@@ -130,6 +128,7 @@ fn request_handle_owns_request_state_and_data_view() {
         handle.read().traversal_policy,
         TraversalPolicy::FailIfUnhandled
     );
+    assert_eq!(handle.read().body.code, 0x100);
 
     handle.set_traversal_policy(TraversalPolicy::ForwardLower);
     assert_eq!(

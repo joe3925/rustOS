@@ -51,7 +51,6 @@ use kernel_abi::BootInfo;
 use kernel_types::benchmark::BenchWindowConfig;
 use kernel_types::fs::Path;
 use kernel_types::memory::Module;
-use kernel_types::request::{BorrowedHandle, RequestDataView, RequestHandle, RequestType};
 use rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use spin::rwlock::RwLock;

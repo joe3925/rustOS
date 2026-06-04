@@ -3,12 +3,12 @@ use alloc::sync::Arc;
 use crate::async_ffi::{FfiFuture, FutureExt};
 use crate::device::DeviceObject;
 use crate::pnp::{BootType, DriverStep, PnpMinorFunction, PnpVtable};
-use crate::request::RequestHandle;
+use crate::request::{Pnp, RequestHandle};
 use crate::status::DriverStatus;
 
 extern "win64" fn start_device_handler(
     _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, '_>,
+    _handle: &mut RequestHandle<'_, Pnp<'_>>,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }

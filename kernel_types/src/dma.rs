@@ -2015,6 +2015,223 @@ impl<'a, Direction: IoBufferDirection> From<IoBuffer<'a, Described, Direction>>
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IoBufferStateKind {
+    Described = 0,
+    PhysFramed = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReadIoBufferDirectionKind {
+    FromDevice = 0,
+    Bidirectional = 1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WriteIoBufferDirectionKind {
+    ToDevice = 0,
+    Bidirectional = 1,
+}
+
+#[repr(C)]
+pub struct ReadIoBuffer<'a> {
+    inner: IoBufferInner<'a>,
+    state: IoBufferStateKind,
+    direction: ReadIoBufferDirectionKind,
+}
+
+impl<'a> ReadIoBuffer<'a> {
+    #[inline]
+    fn new(
+        inner: IoBufferInner<'a>,
+        state: IoBufferStateKind,
+        direction: ReadIoBufferDirectionKind,
+    ) -> Self {
+        Self {
+            inner,
+            state,
+            direction,
+        }
+    }
+
+    #[inline]
+    pub fn state(&self) -> IoBufferStateKind {
+        self.state
+    }
+
+    #[inline]
+    pub fn direction(&self) -> ReadIoBufferDirectionKind {
+        self.direction
+    }
+
+    #[inline]
+    pub fn as_inner(&self) -> &IoBufferInner<'a> {
+        &self.inner
+    }
+
+    #[inline]
+    pub fn as_inner_mut(&mut self) -> &mut IoBufferInner<'a> {
+        &mut self.inner
+    }
+}
+
+#[repr(C)]
+pub struct WriteIoBuffer<'a> {
+    inner: IoBufferInner<'a>,
+    state: IoBufferStateKind,
+    direction: WriteIoBufferDirectionKind,
+}
+
+impl<'a> WriteIoBuffer<'a> {
+    #[inline]
+    fn new(
+        inner: IoBufferInner<'a>,
+        state: IoBufferStateKind,
+        direction: WriteIoBufferDirectionKind,
+    ) -> Self {
+        Self {
+            inner,
+            state,
+            direction,
+        }
+    }
+
+    #[inline]
+    pub fn state(&self) -> IoBufferStateKind {
+        self.state
+    }
+
+    #[inline]
+    pub fn direction(&self) -> WriteIoBufferDirectionKind {
+        self.direction
+    }
+
+    #[inline]
+    pub fn as_inner(&self) -> &IoBufferInner<'a> {
+        &self.inner
+    }
+
+    #[inline]
+    pub fn as_inner_mut(&mut self) -> &mut IoBufferInner<'a> {
+        &mut self.inner
+    }
+}
+
+macro_rules! impl_read_io_buffer_from {
+    ($state:ty, $direction:ty, $state_kind:expr, $direction_kind:expr) => {
+        impl<'a> From<IoBuffer<'a, $state, $direction>> for ReadIoBuffer<'a> {
+            #[inline]
+            fn from(buffer: IoBuffer<'a, $state, $direction>) -> Self {
+                Self::new(buffer.into_inner(), $state_kind, $direction_kind)
+            }
+        }
+    };
+}
+
+impl_read_io_buffer_from!(
+    Described,
+    FromDevice,
+    IoBufferStateKind::Described,
+    ReadIoBufferDirectionKind::FromDevice
+);
+impl_read_io_buffer_from!(
+    PhysFramed,
+    FromDevice,
+    IoBufferStateKind::PhysFramed,
+    ReadIoBufferDirectionKind::FromDevice
+);
+impl_read_io_buffer_from!(
+    Described,
+    Bidirectional,
+    IoBufferStateKind::Described,
+    ReadIoBufferDirectionKind::Bidirectional
+);
+impl_read_io_buffer_from!(
+    PhysFramed,
+    Bidirectional,
+    IoBufferStateKind::PhysFramed,
+    ReadIoBufferDirectionKind::Bidirectional
+);
+
+macro_rules! impl_write_io_buffer_from {
+    ($state:ty, $direction:ty, $state_kind:expr, $direction_kind:expr) => {
+        impl<'a> From<IoBuffer<'a, $state, $direction>> for WriteIoBuffer<'a> {
+            #[inline]
+            fn from(buffer: IoBuffer<'a, $state, $direction>) -> Self {
+                Self::new(buffer.into_inner(), $state_kind, $direction_kind)
+            }
+        }
+    };
+}
+
+impl_write_io_buffer_from!(
+    Described,
+    ToDevice,
+    IoBufferStateKind::Described,
+    WriteIoBufferDirectionKind::ToDevice
+);
+impl_write_io_buffer_from!(
+    PhysFramed,
+    ToDevice,
+    IoBufferStateKind::PhysFramed,
+    WriteIoBufferDirectionKind::ToDevice
+);
+impl_write_io_buffer_from!(
+    Described,
+    Bidirectional,
+    IoBufferStateKind::Described,
+    WriteIoBufferDirectionKind::Bidirectional
+);
+impl_write_io_buffer_from!(
+    PhysFramed,
+    Bidirectional,
+    IoBufferStateKind::PhysFramed,
+    WriteIoBufferDirectionKind::Bidirectional
+);
+
+impl Drop for ReadIoBuffer<'_> {
+    fn drop(&mut self) {
+        if let Some(drop_ctx) = self.inner.dma_drop.take() {
+            (drop_ctx.unmap)(&drop_ctx.mapped_by, drop_ctx.cookie);
+        }
+    }
+}
+
+impl Drop for WriteIoBuffer<'_> {
+    fn drop(&mut self) {
+        if let Some(drop_ctx) = self.inner.dma_drop.take() {
+            (drop_ctx.unmap)(&drop_ctx.mapped_by, drop_ctx.cookie);
+        }
+    }
+}
+
+impl fmt::Debug for ReadIoBuffer<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadIoBuffer")
+            .field("state", &self.state)
+            .field("direction", &self.direction)
+            .field("len", &self.inner.len())
+            .field("extent_count", &self.inner.extent_count())
+            .field("mapped", &self.inner.mapped_by.is_some())
+            .finish()
+    }
+}
+
+impl fmt::Debug for WriteIoBuffer<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteIoBuffer")
+            .field("state", &self.state)
+            .field("direction", &self.direction)
+            .field("len", &self.inner.len())
+            .field("extent_count", &self.inner.extent_count())
+            .field("mapped", &self.inner.mapped_by.is_some())
+            .finish()
+    }
+}
+
 impl<'a, State: IoBufferState, Direction: IoBufferDirection> Drop
     for IoBuffer<'a, State, Direction>
 {

@@ -44,7 +44,7 @@ use kernel_types::benchmark::{
 use kernel_types::benchmark::{BenchSweepBothResult, BENCH_FLAG_POLL, BENCH_PARAMS_VERSION_1};
 use kernel_types::fs::{FsSeekWhence, OpenFlags, Path};
 use kernel_types::memory::{PePdbFormat, PePdbInfo};
-use kernel_types::request::{RequestData, RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::request::{DeviceControl, RequestHandle, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
 use kernel_types::ProstMessage;
 use serde_json::{json, Value};
@@ -4192,20 +4192,20 @@ pub async fn bench_virtio_disk_sweep_both_matrix_run(
                             );
 
                             if matrix.discard_first_per_combo && trial == 0 {
-                                let mut warm = RequestHandle::new(
-                                    RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_BOTH),
-                                    RequestData::from_t(requested),
-                                );
+                                let mut warm = RequestHandle::new(DeviceControl::new_t(
+                                    IOCTL_BLOCK_BENCH_SWEEP_BOTH,
+                                    requested,
+                                ));
                                 warm.set_traversal_policy(TraversalPolicy::ForwardLower);
                                 let _ = PNP_MANAGER.send_request(target.clone(), &mut warm).await;
                                 trial += 1;
                                 continue;
                             }
 
-                            let mut req = RequestHandle::new(
-                                RequestType::DeviceControl(IOCTL_BLOCK_BENCH_SWEEP_BOTH),
-                                RequestData::from_t(requested),
-                            );
+                            let mut req = RequestHandle::new(DeviceControl::new_t(
+                                IOCTL_BLOCK_BENCH_SWEEP_BOTH,
+                                requested,
+                            ));
                             req.set_traversal_policy(TraversalPolicy::ForwardLower);
                             println!(
                                 "[virtio-bench] Starting trial {} for run_id {} with params: flags=0x{:X} total_bytes={} request_size={} start_sector={} max_inflight={}",

@@ -1,8 +1,9 @@
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
-use crate::pnp::DriverStep;
-use crate::request::{RequestHandle, RequestType};
-use crate::{EvtIoDeviceControl, EvtIoFlush, EvtIoFs, EvtIoRead, EvtIoWrite};
+use crate::{
+    EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoFs, EvtIoRead,
+    EvtIoWrite,
+};
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -16,7 +17,6 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::Ordering;
 use core::task::Waker;
-use spin::Once;
 
 #[repr(C)]
 struct TreiberNode<T> {
@@ -579,9 +579,11 @@ pub struct GptPartitionEntry {
 pub enum IoType {
     Read(EvtIoRead),
     Write(EvtIoWrite),
+    Flush(EvtIoFlush),
+    FlushDirty(EvtIoFlushDirty),
+    FlushOwner(EvtIoFlushOwner),
     DeviceControl(EvtIoDeviceControl),
     Fs(EvtIoFs),
-    Flush(EvtIoFlush),
 }
 
 impl IoType {
@@ -590,58 +592,25 @@ impl IoType {
         match self {
             IoType::Read(_) => 0,
             IoType::Write(_) => 1,
-            IoType::DeviceControl(_) => 2,
-            IoType::Fs(_) => 3,
-            IoType::Flush(_) => 4,
-        }
-    }
-
-    #[inline]
-    pub async fn invoke<'req, 'data>(
-        &self,
-        dev: &Arc<DeviceObject>,
-        handle: &mut RequestHandle<'req, 'data>,
-    ) -> DriverStep {
-        match *self {
-            IoType::Read(h) | IoType::Write(h) => match handle.read().kind {
-                RequestType::Read { len, .. } | RequestType::Write { len, .. } => {
-                    h(dev, handle, len).await
-                }
-                _ => {
-                    panic!("IoType doesn't match RequestType, this indicates UB")
-                }
-            },
-            IoType::DeviceControl(h) => h(dev, handle).await,
-            IoType::Fs(h) => h(dev, handle).await,
-            IoType::Flush(h) => h(dev, handle).await,
-        }
-    }
-
-    #[inline]
-    pub fn slot_for_request(r: &RequestType) -> Option<usize> {
-        match r {
-            RequestType::Read { .. } => Some(0),
-            RequestType::Write { .. } => Some(1),
-            RequestType::DeviceControl(_) => Some(2),
-            RequestType::Fs(_) => Some(3),
-            RequestType::Flush { .. }
-            | RequestType::FlushDirty { .. }
-            | RequestType::FlushOwner { .. } => Some(4),
-            _ => None,
+            IoType::Flush(_) => 2,
+            IoType::FlushDirty(_) => 3,
+            IoType::FlushOwner(_) => 4,
+            IoType::DeviceControl(_) => 5,
+            IoType::Fs(_) => 6,
         }
     }
 }
 
 #[repr(C)]
-pub struct IoHandler {
-    pub handler: IoType,
+pub struct IoHandler<T> {
+    pub handler: T,
     /// 0 = unlimited, 1 = serialized, >1 = bounded async queue depth
     pub depth: usize,
     pub running_request: AtomicU64,
     pub waiters: TreiberStack<Waker>,
 }
 
-impl core::fmt::Debug for IoHandler {
+impl<T> core::fmt::Debug for IoHandler<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IoHandler")
             .field("depth", &self.depth)
@@ -652,35 +621,70 @@ impl core::fmt::Debug for IoHandler {
 #[derive(Debug)]
 #[repr(C)]
 pub struct IoVtable {
-    pub handlers: [Once<IoHandler>; 5],
+    pub read: Option<IoHandler<EvtIoRead>>,
+    pub write: Option<IoHandler<EvtIoWrite>>,
+    pub flush: Option<IoHandler<EvtIoFlush>>,
+    pub flush_dirty: Option<IoHandler<EvtIoFlushDirty>>,
+    pub flush_owner: Option<IoHandler<EvtIoFlushOwner>>,
+    pub device_control: Option<IoHandler<EvtIoDeviceControl>>,
+    pub fs: Option<IoHandler<EvtIoFs>>,
 }
 
 impl IoVtable {
     #[inline]
     pub fn new() -> Self {
         Self {
-            handlers: array_init::array_init(|_| Once::new()),
+            read: None,
+            write: None,
+            flush: None,
+            flush_dirty: None,
+            flush_owner: None,
+            device_control: None,
+            fs: None,
         }
     }
 
     #[inline]
-    pub fn set(&self, cb: IoType, depth: usize) {
-        let i = cb.slot();
-        if i >= self.handlers.len() {
-            return;
-        }
-
-        let _ = self.handlers[i].call_once(|| IoHandler {
-            handler: cb,
+    fn make_handler<T>(handler: T, depth: usize) -> IoHandler<T> {
+        IoHandler {
+            handler,
             depth,
             running_request: AtomicU64::new(0),
             waiters: TreiberStack::<Waker>::new(),
-        });
+        }
     }
 
     #[inline]
-    pub fn get_for(&self, r: &RequestType) -> Option<&IoHandler> {
-        let i = IoType::slot_for_request(r)?;
-        self.handlers.get(i)?.get()
+    pub fn set(&mut self, cb: IoType, depth: usize) {
+        match cb {
+            IoType::Read(handler) => {
+                self.read
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::Write(handler) => {
+                self.write
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::Flush(handler) => {
+                self.flush
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::FlushDirty(handler) => {
+                self.flush_dirty
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::FlushOwner(handler) => {
+                self.flush_owner
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::DeviceControl(handler) => {
+                self.device_control
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+            IoType::Fs(handler) => {
+                self.fs
+                    .get_or_insert_with(|| Self::make_handler(handler, depth));
+            }
+        }
     }
 }

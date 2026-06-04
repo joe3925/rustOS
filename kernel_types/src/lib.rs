@@ -42,7 +42,10 @@ use x86_64::VirtAddr;
 use crate::async_ffi::FfiFuture;
 use crate::device::{DevNode, DeviceObject};
 use crate::pnp::DriverStep;
-use crate::request::{Request, RequestHandle};
+use crate::request::{
+    DeviceControl, Flush, FlushDirty, FlushOwner, Fs, Pnp, Read, Request, RequestHandle,
+    RequestKind, Write,
+};
 use crate::status::DriverStatus;
 pub const PHYSICAL_MEMORY_OFFSET: VirtAddr = VirtAddr::new(0xFFFF_8000_0000_0000);
 pub type EvtDriverDeviceAdd = extern "win64" fn(
@@ -54,33 +57,41 @@ pub type EvtDriverUnload =
 
 pub type EvtIoRead = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, Read<'data>>,
     usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoWrite = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, Write<'data>>,
     usize,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoDeviceControl = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> FfiFuture<DriverStep>;
 pub type EvtIoFs = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, Fs<'data>>,
 ) -> FfiFuture<DriverStep>;
-pub type EvtIoFlush = for<'req, 'data, 'b> extern "win64" fn(
+pub type EvtIoFlush = for<'req, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, Flush>,
+) -> FfiFuture<DriverStep>;
+pub type EvtIoFlushDirty = for<'req, 'b> extern "win64" fn(
+    &Arc<DeviceObject>,
+    &'b mut RequestHandle<'req, FlushDirty>,
+) -> FfiFuture<DriverStep>;
+pub type EvtIoFlushOwner = for<'req, 'b> extern "win64" fn(
+    &Arc<DeviceObject>,
+    &'b mut RequestHandle<'req, FlushOwner>,
 ) -> FfiFuture<DriverStep>;
 
 pub type ClassAddCallback = extern "win64" fn(node: Arc<DevNode>, listener_dev: &Arc<DeviceObject>);
-pub type CompletionRoutine<'data> =
-    extern "win64" fn(request: &mut Request<'data>, context: usize) -> DriverStatus;
+pub type CompletionRoutine<K: RequestKind> =
+    extern "win64" fn(request: &mut Request<K>, context: usize) -> DriverStatus;
 pub type PnpMinorCallback = for<'req, 'data, 'b> extern "win64" fn(
     &Arc<DeviceObject>,
-    &'b mut RequestHandle<'req, 'data>,
+    &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> FfiFuture<DriverStep>;
 
 pub type DpcFn = extern "win64" fn(usize);

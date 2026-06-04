@@ -17,7 +17,10 @@ use kernel_api::util::panic_common;
 use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
-        dma::{Described, FromDevice, IoBuffer, PhysFramed, ToDevice},
+        dma::{
+            IoBufferStateKind, ReadIoBuffer, ReadIoBufferDirectionKind, WriteIoBuffer,
+            WriteIoBufferDirectionKind,
+        },
         io::{DiskInfo, IoType},
         request::RequestData,
     },
@@ -25,7 +28,7 @@ use kernel_api::{
         DeviceRelationType, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
         driver_set_evt_device_add, pnp_forward_request_to_next_lower,
     },
-    request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy},
+    request::{DeviceControl, Flush, Pnp, Read, RequestHandle, TraversalPolicy, Write},
     request_handler,
     status::DriverStatus,
 };
@@ -40,16 +43,34 @@ fn panic(info: &PanicInfo) -> ! {
 
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
 
-fn has_from_device_buffer(
-    data: kernel_api::request::RequestDataRefMut<'_, '_, kernel_api::request::Writable>,
-) -> bool {
-    data.can_require::<IoBuffer<'_, PhysFramed, FromDevice>>()
+fn has_from_device_buffer(buffer: &ReadIoBuffer<'_>, len: usize) -> bool {
+    let inner = buffer.as_inner();
+    let direction_ok = matches!(
+        buffer.direction(),
+        ReadIoBufferDirectionKind::FromDevice | ReadIoBufferDirectionKind::Bidirectional
+    );
+
+    direction_ok
+        && matches!(
+            buffer.state(),
+            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed
+        )
+        && inner.len() >= len
 }
 
-fn has_to_device_buffer(
-    data: kernel_api::request::RequestDataRef<'_, '_, kernel_api::request::ReadOnly>,
-) -> bool {
-    data.can_require::<IoBuffer<'_, PhysFramed, ToDevice>>()
+fn has_to_device_buffer(buffer: &WriteIoBuffer<'_>, len: usize) -> bool {
+    let inner = buffer.as_inner();
+    let direction_ok = matches!(
+        buffer.direction(),
+        WriteIoBufferDirectionKind::ToDevice | WriteIoBufferDirectionKind::Bidirectional
+    );
+
+    direction_ok
+        && matches!(
+            buffer.state(),
+            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed
+        )
+        && inner.len() >= len
 }
 
 #[repr(C)]
@@ -82,7 +103,7 @@ pub extern "win64" fn disk_device_add(
     dev_init.io_vtable.set(IoType::DeviceControl(disk_ioctl), 0);
     dev_init.io_vtable.set(IoType::Flush(disk_flush), 0);
 
-    let mut pnp_vt = PnpVtable::new();
+    let pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::RemoveDevice, disk_pnp_remove);
     dev_init.pnp_vtable = Some(pnp_vt);
 
@@ -91,106 +112,43 @@ pub extern "win64" fn disk_device_add(
 }
 
 #[request_handler]
-async fn disk_pnp_remove<'a, 'b>(
+async fn disk_pnp_remove<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> kernel_api::pnp::DriverStep {
     kernel_api::pnp::DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn disk_read<'a, 'b>(
+pub async fn disk_read<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Read<'data>>,
     _buf_len: usize,
 ) -> kernel_api::pnp::DriverStep {
-    let (off, total) = match req.read().kind {
-        RequestType::Read { offset, len, .. } => (offset, len),
-        _ => {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
+    let body = &req.read().body;
+    let off = body.offset;
+    let total = body.len;
 
     if unlikely(total == 0) {
         cold_path();
         return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
     }
 
-    let dx = disk_ext(&dev);
-    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-        if let Err(st) = query_props_sync(&dev).await {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
-    }
-
-    let bs = dx.block_size.load(Ordering::Acquire) as u64;
-
-    match req.data() {
-        RequestDataView::Writable(data) => {
-            if unlikely(!has_from_device_buffer(data)) {
-                cold_path();
-                return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
-            }
-        }
-        RequestDataView::ReadOnly(_) => {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    }
-
-    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
-    if unlikely(!aligned) {
-        cold_path();
-        req.write().status = DriverStatus::InvalidParameter;
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-    }
-
-    req.write().traversal_policy = TraversalPolicy::ForwardLower;
-    kernel_api::pnp::DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn disk_write<'a, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
-    _buf_len: usize,
-) -> kernel_api::pnp::DriverStep {
-    let (off, total) = match req.read().kind {
-        RequestType::Write {
-            offset,
-            len,
-            no_buffer: _,
-            owner: _,
-        } => (offset, len),
-        _ => {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
-
-    if unlikely(total == 0) {
-        cold_path();
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
-    }
-
-    let dx = disk_ext(&dev);
-    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-        if let Err(st) = query_props_sync(&dev).await {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
-    }
-
-    let bs = dx.block_size.load(Ordering::Acquire) as u64;
-    let data = req.data().read_only();
-
-    if unlikely(!has_to_device_buffer(data)) {
+    if unlikely(!has_from_device_buffer(&body.buffer, total)) {
         cold_path();
         return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
     }
 
+    let dx = disk_ext(&dev);
+    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+        if let Err(st) = query_props_sync(&dev).await {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(st);
+        }
+    }
+
+    let bs = dx.block_size.load(Ordering::Acquire) as u64;
+
     let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
     if unlikely(!aligned) {
         cold_path();
@@ -203,38 +161,72 @@ pub async fn disk_write<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn disk_flush<'a, 'b>(
+pub async fn disk_write<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Write<'data>>,
+    _buf_len: usize,
+) -> kernel_api::pnp::DriverStep {
+    let body = &req.read().body;
+    let off = body.offset;
+    let total = body.len;
+
+    if unlikely(total == 0) {
+        cold_path();
+        return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
+    }
+
+    if unlikely(!has_to_device_buffer(&body.buffer, total)) {
+        cold_path();
+        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+    }
+
+    let dx = disk_ext(&dev);
+    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+        if let Err(st) = query_props_sync(&dev).await {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(st);
+        }
+    }
+
+    let bs = dx.block_size.load(Ordering::Acquire) as u64;
+
+    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
+    if unlikely(!aligned) {
+        cold_path();
+        req.write().status = DriverStatus::InvalidParameter;
+        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+    }
+
+    req.write().traversal_policy = TraversalPolicy::ForwardLower;
+    kernel_api::pnp::DriverStep::Continue
+}
+
+#[request_handler]
+pub async fn disk_flush<'req, 'b>(
+    _dev: &Arc<DeviceObject>,
+    _req: &'b mut RequestHandle<'req, Flush>,
 ) -> kernel_api::pnp::DriverStep {
     kernel_api::pnp::DriverStep::Continue
 }
 
 #[request_handler]
-pub async fn disk_ioctl<'a, 'b>(
+pub async fn disk_ioctl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> kernel_api::pnp::DriverStep {
-    let code = match req.read().kind {
-        RequestType::DeviceControl(c) => c,
-        _ => {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
+    let code = req.read().body.code;
 
     match code {
         IOCTL_DRIVE_IDENTIFY => {
-            let mut ch = RequestHandle::new_pnp(
-                PnpRequest {
+            let mut ch = RequestHandle::new(Pnp {
+                request: PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
                     id_type: QueryIdType::CompatibleIds,
                     ids_out: Vec::new(),
                     data_out: RequestData::empty(),
                 },
-                RequestData::empty(),
-            );
+            });
 
             let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
             if unlikely(st != DriverStatus::Success) {
@@ -243,17 +235,16 @@ pub async fn disk_ioctl<'a, 'b>(
             }
 
             let mut info_opt = {
-                let mut wr = ch.write();
-                wr.pnp
-                    .as_mut()
-                    .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
+                let wr = ch.write();
+                wr.body.request.data_out.take_exact::<DiskInfo>().ok()
             };
             if unlikely(info_opt.is_none()) {
                 info_opt = ch
                     .read()
-                    .pnp
-                    .as_ref()
-                    .and_then(|p| p.data_out_ref().view::<DiskInfo>())
+                    .body
+                    .request
+                    .data_out_ref()
+                    .view::<DiskInfo>()
                     .copied();
             }
 
@@ -265,7 +256,7 @@ pub async fn disk_ioctl<'a, 'b>(
                 }
             };
 
-            req.write().set_data_t::<DiskInfo>(info);
+            req.write().body.set_data_t::<DiskInfo>(info);
             kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
         }
         _ => kernel_api::pnp::DriverStep::Continue,
@@ -273,21 +264,20 @@ pub async fn disk_ioctl<'a, 'b>(
 }
 
 #[inline]
-pub fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
+fn disk_ext<'a>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, DiskExt> {
     dev.try_devext::<DiskExt>().expect("disk dev ext missing")
 }
 
 async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
-    let mut ch = RequestHandle::new_pnp(
-        PnpRequest {
+    let mut ch = RequestHandle::new(Pnp {
+        request: PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
             data_out: RequestData::empty(),
         },
-        RequestData::empty(),
-    );
+    });
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
 
     if unlikely(st != DriverStatus::Success) {
@@ -300,24 +290,22 @@ async fn query_props_sync(dev: &Arc<DeviceObject>) -> Result<(), DriverStatus> {
     }
 
     let mut di_opt = {
-        let mut req = ch.write();
-        req.pnp
-            .as_mut()
-            .and_then(|p| p.data_out.take_exact::<DiskInfo>().ok())
+        let req = ch.write();
+        req.body.request.data_out.take_exact::<DiskInfo>().ok()
     };
 
     if unlikely(di_opt.is_none()) {
         let req = ch.read();
         di_opt = req
-            .pnp
-            .as_ref()
-            .and_then(|p| p.data_out_ref().view::<DiskInfo>())
+            .body
+            .request
+            .data_out_ref()
+            .view::<DiskInfo>()
             .copied()
             .or_else(|| {
-                let Some(pnp) = req.pnp.as_ref() else {
-                    return None;
-                };
-                let blob = pnp
+                let blob = req
+                    .body
+                    .request
                     .data_out_ref()
                     .view::<Vec<u8>>()
                     .map(|v| v.as_slice())

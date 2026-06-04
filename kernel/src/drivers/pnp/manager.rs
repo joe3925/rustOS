@@ -23,7 +23,7 @@ use kernel_types::io::{IoTarget, IoVtable};
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
-use kernel_types::request::{Request, RequestData, RequestHandle};
+use kernel_types::request::{DeviceControl, Pnp, Request, RequestData, RequestHandle, RequestKind};
 use kernel_types::status::{Data, DriverStatus, RegError};
 use kernel_types::ClassAddCallback;
 use spin::{Mutex, RwLock};
@@ -778,7 +778,9 @@ impl PnpManager {
                 ids_out: Vec::new(),
                 data_out: RequestData::empty(),
             };
-            let mut start_request = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
+            let mut start_request = RequestHandle::new(Pnp {
+                request: pnp_payload,
+            });
 
             let ctx = Arc::into_raw(dn.clone()) as usize;
             start_request.write().add_completion(Self::start_io, ctx);
@@ -789,7 +791,7 @@ impl PnpManager {
         }
     }
 
-    pub extern "win64" fn start_io(req: &mut Request, context: usize) -> DriverStatus {
+    pub extern "win64" fn start_io(req: &mut Request<Pnp<'_>>, context: usize) -> DriverStatus {
         if context == 0 {
             return DriverStatus::InvalidParameter;
         }
@@ -811,8 +813,9 @@ impl PnpManager {
                     ids_out: Vec::new(),
                     data_out: RequestData::empty(),
                 };
-                let mut bus_enum_request =
-                    RequestHandle::new_pnp(pnp_payload, RequestData::empty());
+                let mut bus_enum_request = RequestHandle::new(Pnp {
+                    request: pnp_payload,
+                });
                 let ctx = Arc::into_raw(dev_node.clone()) as usize;
                 bus_enum_request
                     .write()
@@ -831,7 +834,7 @@ impl PnpManager {
     }
 
     pub extern "win64" fn process_enumerated_children(
-        req: &mut Request,
+        req: &mut Request<Pnp<'_>>,
         context: usize,
     ) -> DriverStatus {
         if context == 0 {
@@ -936,7 +939,9 @@ impl PnpManager {
             data_out: RequestData::empty(),
         };
 
-        let mut req = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
+        let mut req = RequestHandle::new(Pnp {
+            request: pnp_payload,
+        });
         let ctx = Arc::into_raw(dev_node.clone()) as usize;
         req.write()
             .add_completion(Self::process_enumerated_children, ctx);
@@ -1009,55 +1014,58 @@ impl PnpManager {
     }
 
     // Request routing methods delegate to kernel_routing crate
-    pub async fn send_request(
+    pub async fn send_request<K: kernel_routing::RoutedRequest>(
         &self,
         target: IoTarget,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, K>,
     ) -> DriverStatus {
         kernel_routing::send_request(target, handle).await
     }
 
-    pub async fn send_request_to_next_lower(
+    pub async fn send_request_to_next_lower<K: kernel_routing::RoutedRequest>(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, K>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_next_lower(from, handle).await
     }
 
-    pub async fn send_request_to_next_upper(
+    pub async fn send_request_to_next_upper<K: kernel_routing::RoutedRequest>(
         &self,
         from: Arc<DeviceObject>,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, K>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_next_upper(from, handle).await
     }
 
-    pub fn complete_request(&self, handle: &mut RequestHandle<'_, '_>) -> DriverStatus {
+    pub fn complete_request<K: RequestKind>(
+        &self,
+        handle: &mut RequestHandle<'_, K>,
+    ) -> DriverStatus {
         kernel_routing::complete_request(handle)
     }
 
-    pub async fn send_request_via_symlink(
+    pub async fn send_request_via_symlink<K: kernel_routing::RoutedRequest>(
         &self,
         link_path: String,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, K>,
     ) -> DriverStatus {
         kernel_routing::send_request_via_symlink(link_path, handle).await
     }
 
-    pub async fn send_request_to_stack_top(
+    pub async fn send_request_to_stack_top<K: kernel_routing::RoutedRequest>(
         &self,
         dev_node_weak: alloc::sync::Weak<DevNode>,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, K>,
     ) -> DriverStatus {
         kernel_routing::send_request_to_stack_top(dev_node_weak, handle).await
     }
 
-    pub async fn ioctl_via_symlink(
+    pub async fn ioctl_via_symlink<'data>(
         &self,
         link_path: String,
         control_code: u32,
-        handle: &mut RequestHandle<'_, '_>,
+        handle: &mut RequestHandle<'_, DeviceControl<'data>>,
     ) -> DriverStatus {
         kernel_routing::ioctl_via_symlink(link_path, control_code, handle).await
     }
@@ -1334,7 +1342,9 @@ impl PnpManager {
             ids_out: Vec::new(),
             data_out: RequestData::empty(),
         };
-        let mut start_request = RequestHandle::new_pnp(pnp_payload, RequestData::empty());
+        let mut start_request = RequestHandle::new(Pnp {
+            request: pnp_payload,
+        });
         let ctx = Arc::into_raw(dn.clone()) as usize;
         start_request.write().add_completion(Self::start_io, ctx);
 

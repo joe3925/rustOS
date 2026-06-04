@@ -1,6 +1,6 @@
 use kernel_api::async_ffi::FfiFuture;
 use kernel_api::kernel_types::dma::{FromDevice, IoBuffer, PhysFramed, ToDevice};
-use kernel_api::request::RequestHandle;
+use kernel_api::request::{RequestHandle, Write};
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
@@ -126,9 +126,9 @@ pub trait VolumeCacheBackend: Send + Sync + 'static {
         blocks: usize,
         buffer: IoBuffer<'buffer, PhysFramed, FromDevice>,
     ) -> FfiFuture<Result<usize, Self::Error>>;
-    fn write_request<'a>(
+    fn write_request<'a, 'req, 'data>(
         &'a self,
-        req: &'a mut RequestHandle<'_, '_>,
+        req: &'a mut RequestHandle<'req, Write<'data>>,
     ) -> FfiFuture<Result<(), Self::Error>>;
     fn write_phys_framed<'a, 'buffer>(
         &'a self,

@@ -16,7 +16,7 @@ use kernel_api::{
         driver_set_evt_device_add, pnp_create_control_device_and_link,
         pnp_create_control_device_with_init, pnp_ioctl_via_symlink, pnp_send_request,
     },
-    request::{RequestHandle, RequestType, TraversalPolicy},
+    request::{DeviceControl, Pnp, RequestHandle, TraversalPolicy},
     request_handler,
     runtime::spawn_detached,
     status::DriverStatus,
@@ -54,17 +54,11 @@ pub fn ext_mut<'a, T>(dev: &'a Arc<DeviceObject>) -> DevExtRef<'a, T> {
 }
 
 #[request_handler]
-pub async fn fs_root_ioctl<'a, 'b>(
+pub async fn fs_root_ioctl<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
-    let code = {
-        let r = req.read();
-        match r.kind {
-            RequestType::DeviceControl(c) => c,
-            _ => return DriverStep::complete(DriverStatus::NotImplemented),
-        }
-    };
+    let code = req.read().body.code;
 
     match code {
         IOCTL_FS_IDENTIFY => {
@@ -86,16 +80,15 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 volume_fdo
             };
 
-            let mut query = RequestHandle::new_pnp(
-                PnpRequest {
+            let mut query = RequestHandle::new(Pnp {
+                request: PnpRequest {
                     minor_function: PnpMinorFunction::QueryResources,
                     relation: DeviceRelationType::TargetDeviceRelation,
                     id_type: QueryIdType::DeviceId,
                     ids_out: Vec::new(),
                     data_out: RequestData::empty(),
                 },
-                RequestData::empty(),
-            );
+            });
 
             let st = pnp_send_request(volume_fdo.clone(), &mut query).await;
 
@@ -106,18 +99,22 @@ pub async fn fs_root_ioctl<'a, 'b>(
                 if st == DriverStatus::Success {
                     let q = query.write();
 
-                    if let Some(pnp) = q.pnp.as_mut() {
-                        if let Some(pi) = pnp.data_out.take_exact::<PartitionInfo>().ok() {
-                            sector_size = Some(if pi.disk.logical_block_size != 0 {
-                                pi.disk.logical_block_size as u16
-                            } else {
-                                512
-                            });
+                    if let Some(pi) = q
+                        .body
+                        .request
+                        .data_out
+                        .take_exact::<PartitionInfo>()
+                        .ok()
+                    {
+                        sector_size = Some(if pi.disk.logical_block_size != 0 {
+                            pi.disk.logical_block_size as u16
+                        } else {
+                            512
+                        });
 
-                            total_sectors = pi.gpt_entry.map(|ent| {
-                                ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
-                            });
-                        }
+                        total_sectors = pi.gpt_entry.map(|ent| {
+                            ent.last_lba.saturating_sub(ent.first_lba).saturating_add(1)
+                        });
                     }
                 }
 
@@ -147,7 +144,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
                     match result {
                         Ok(fs) => {
-                            let io_vtable = IoVtable::new();
+                            let mut io_vtable = IoVtable::new();
                             io_vtable.set(IoType::Fs(fs_op_dispatch), 1);
 
                             let ext = VolCtrlDevExt {
@@ -181,26 +178,27 @@ pub async fn fs_root_ioctl<'a, 'b>(
 
             {
                 let r = req.write();
-                match r.data() {
+                let mut replacement = Some(FsIdentify {
+                    mount_device,
+                    can_mount,
+                    volume_fdo,
+                });
+                let replace_payload = match r.data() {
                     RequestDataView::Writable(mut data) => {
                         if let Some(id) = data.view_mut::<FsIdentify>() {
-                            id.mount_device = mount_device;
+                            let value = replacement.take().unwrap();
+                            id.mount_device = value.mount_device;
                             id.can_mount = can_mount;
+                            false
                         } else {
-                            r.set_data_t(FsIdentify {
-                                mount_device,
-                                can_mount,
-                                volume_fdo: volume_fdo.clone(),
-                            });
+                            true
                         }
                     }
-                    RequestDataView::ReadOnly(_) => {
-                        r.set_data_t(FsIdentify {
-                            mount_device,
-                            can_mount,
-                            volume_fdo: volume_fdo.clone(),
-                        });
-                    }
+                    RequestDataView::ReadOnly(_) => true,
+                };
+
+                if replace_payload {
+                    r.set_data_t(replacement.unwrap());
                 }
 
                 r.status = DriverStatus::Success;
@@ -216,7 +214,7 @@ pub async fn fs_root_ioctl<'a, 'b>(
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, fs_device_add);
     init_logger();
-    let io_vtable = IoVtable::new();
+    let mut io_vtable = IoVtable::new();
     io_vtable.set(IoType::DeviceControl(fs_root_ioctl), 0);
     let init = DeviceInit::new(io_vtable, None);
     let ctrl_link = "\\GLOBAL\\FileSystems\\fat32".to_string();
@@ -224,10 +222,10 @@ pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     let _ctrl = pnp_create_control_device_and_link(ctrl_name, init, ctrl_link.clone());
 
     spawn_detached(async move {
-        let mut binding = RequestHandle::new(
-            RequestType::DeviceControl(IOCTL_MOUNTMGR_REGISTER_FS),
-            RequestData::from_t::<Vec<u8>>(ctrl_link.into_bytes()),
-        );
+        let mut binding = RequestHandle::new(DeviceControl::new_t(
+            IOCTL_MOUNTMGR_REGISTER_FS,
+            ctrl_link.into_bytes(),
+        ));
         binding.set_traversal_policy(TraversalPolicy::ForwardLower);
         let _ioctl_status = pnp_ioctl_via_symlink(
             GLOBAL_CTRL_LINK.to_string(),

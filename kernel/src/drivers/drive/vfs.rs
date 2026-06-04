@@ -6,12 +6,9 @@ use core::hint::spin_loop;
 use core::sync::atomic::{AtomicU64, Ordering};
 use kernel_types::async_types::{AsyncRwLock, AsyncRwLockReadGuard, AsyncRwLockWriteGuard};
 use kernel_types::io::IoTarget;
-use kernel_types::request::{RequestDataView, RequestHandle, RequestType, TraversalPolicy};
+use kernel_types::request::{Fs, FsPayload, RequestHandle, TraversalPolicy};
 use kernel_types::status::{DriverStatus, FileStatus};
-use kernel_types::{
-    fs::{Path, *},
-    RequestPayload,
-};
+use kernel_types::fs::{Path, *};
 
 #[derive(Clone, Debug)]
 pub struct MountedVolume {
@@ -36,6 +33,51 @@ pub struct Vfs {
     next_vh: AtomicU64,
     handles: AsyncRwLock<BTreeMap<u64, VfsHandle>>,
 }
+
+trait VfsFsCall<'data>: Sized {
+    type Result;
+
+    fn into_payload(self) -> FsPayload<'data>;
+    fn take_result(payload: &mut FsPayload<'data>) -> Option<Self::Result>;
+}
+
+macro_rules! impl_vfs_fs_call {
+    ($params:ty => $result:ty, $variant:ident) => {
+        impl<'data> VfsFsCall<'data> for $params {
+            type Result = $result;
+
+            #[inline]
+            fn into_payload(self) -> FsPayload<'data> {
+                FsPayload::$variant {
+                    params: self,
+                    result: None,
+                }
+            }
+
+            #[inline]
+            fn take_result(payload: &mut FsPayload<'data>) -> Option<Self::Result> {
+                match payload {
+                    FsPayload::$variant { result, .. } => result.take(),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+impl_vfs_fs_call!(FsOpenParams => FsOpenResult, Open);
+impl_vfs_fs_call!(FsCloseParams => FsCloseResult, Close);
+impl_vfs_fs_call!(FsReadParams<'data> => FsReadResult, Read);
+impl_vfs_fs_call!(FsWriteParams<'data> => FsWriteResult, Write);
+impl_vfs_fs_call!(FsFlushParams => FsFlushResult, Flush);
+impl_vfs_fs_call!(FsSeekParams => FsSeekResult, Seek);
+impl_vfs_fs_call!(FsCreateParams => FsCreateResult, Create);
+impl_vfs_fs_call!(FsRenameParams => FsRenameResult, Rename);
+impl_vfs_fs_call!(FsListDirParams => FsListDirResult, ReadDir);
+impl_vfs_fs_call!(FsGetInfoParams => FsGetInfoResult, GetInfo);
+impl_vfs_fs_call!(FsSetLenParams => FsSetLenResult, SetLen);
+impl_vfs_fs_call!(FsAppendParams<'data> => FsAppendResult, Append);
+impl_vfs_fs_call!(FsZeroRangeParams => FsZeroRangeResult, ZeroRange);
 
 impl Vfs {
     #[inline]
@@ -156,10 +198,9 @@ impl Vfs {
         param: TParam,
     ) -> Result<TResult, DriverStatus>
     where
-        TParam: RequestPayload<'a>,
-        TResult: 'static + Clone + RequestPayload<'a>,
+        TParam: VfsFsCall<'a, Result = TResult>,
     {
-        let mut request_handle = RequestHandle::new_t(RequestType::Fs(op), param);
+        let mut request_handle = RequestHandle::new(Fs::new(op, param.into_payload()));
         request_handle.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let status = {
@@ -176,21 +217,11 @@ impl Vfs {
             return Err(status);
         }
 
-        let mut data = request_handle.data();
-        match data {
-            RequestDataView::Writable(mut d) => {
-                let result = d.take_exact::<TResult>();
-                match result {
-                    Ok(r) => Ok(r),
-                    Err(e) => {
-                        println!("VFS: Failed to take result: {:?}\n", e);
-                        Err(DriverStatus::InvalidParameter)
-                    }
-                }
-            }
-            RequestDataView::ReadOnly(_) => {
-                println!("VFS: Result data is read-only\n");
-                Err(DriverStatus::Unsuccessful)
+        match TParam::take_result(&mut request_handle.write().body.payload) {
+            Some(result) => Ok(result),
+            None => {
+                println!("VFS: Failed to take result\n");
+                Err(DriverStatus::InvalidParameter)
             }
         }
     }

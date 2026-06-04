@@ -23,7 +23,7 @@ use kernel_api::{
     GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY,
     IOCTL_MOUNTMGR_REGISTER_FS, IOCTL_MOUNTMGR_RESYNC, IOCTL_MOUNTMGR_UNMOUNT,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    fs::{FsOp, FsOpenParams, FsOpenResult, notify_label_published, notify_label_unpublished},
+    fs::{FsOp, FsOpenParams, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
         io::{FsIdentify, IoType, IoVtable},
@@ -38,7 +38,7 @@ use kernel_api::{
         pnp_send_request_via_symlink,
     },
     reg::{self, switch_to_vfs_async},
-    request::{Request, RequestHandle, RequestType, TraversalPolicy},
+    request::{DeviceControl, Fs, FsPayload, Pnp, Request, RequestHandle, TraversalPolicy},
     request_handler,
     runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
@@ -129,9 +129,9 @@ pub extern "win64" fn volclass_device_add(
 }
 
 #[request_handler]
-pub async fn volclass_start<'a, 'b>(
+pub async fn volclass_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let _ = refresh_fs_registry_from_registry().await;
     init_volume_dx(&dev);
@@ -140,14 +140,11 @@ pub async fn volclass_start<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn volclass_ioctl<'a, 'b>(
+pub async fn volclass_ioctl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
-    let code = match req.read().kind {
-        RequestType::DeviceControl(c) => c,
-        _ => return DriverStep::complete(DriverStatus::NotImplemented),
-    };
+    let code = req.read().body.code;
 
     match code {
         IOCTL_MOUNTMGR_UNMOUNT => {
@@ -165,16 +162,13 @@ pub async fn volclass_ioctl<'a, 'b>(
                 }
                 dx.fs_attached.store(false, Ordering::Release);
             }
-            let mut w = req.write();
-            w.status = DriverStatus::Success;
+            req.write().status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_QUERY => {
-            let mut w = req.write();
-            w.set_data(RequestData::from_t::<Vec<u8>>(
+            req.write().set_data(RequestData::from_t::<Vec<u8>>(
                 build_status_blob(&dev).into_vec(),
             ));
-            drop(w);
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_RESYNC => {
@@ -182,14 +176,12 @@ pub async fn volclass_ioctl<'a, 'b>(
             mount_if_unmounted(dev.clone()).await;
             // Enumerate all volumes and assign labels on-demand
             enumerate_and_assign_all_labels().await;
-            let mut w = req.write();
-            w.status = DriverStatus::Success;
+            req.write().status = DriverStatus::Success;
             DriverStep::complete(DriverStatus::Success)
         }
         IOCTL_MOUNTMGR_LIST_FS => {
-            let mut w = req.write();
-            w.set_data(RequestData::from_t::<Vec<u8>>(list_fs_blob().into_vec()));
-            drop(w);
+            req.write()
+                .set_data(RequestData::from_t::<Vec<u8>>(list_fs_blob().into_vec()));
             DriverStep::complete(DriverStatus::Success)
         }
         _ => DriverStep::complete(DriverStatus::NotImplemented),
@@ -197,14 +189,11 @@ pub async fn volclass_ioctl<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn volclass_ctrl_ioctl<'a, 'b>(
+pub async fn volclass_ctrl_ioctl<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
-    let code = match req.read().kind {
-        RequestType::DeviceControl(c) => c,
-        _ => return DriverStep::complete(DriverStatus::NotImplemented),
-    };
+    let code = req.read().body.code;
     match code {
         IOCTL_MOUNTMGR_REGISTER_FS => {
             let tag = {
@@ -304,16 +293,15 @@ async fn mount_if_unmounted(dev: Arc<DeviceObject>) {
 /// Returns None if the volume lacks a valid GPT GUID.
 async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
     let vol_target = parent_fdo.clone();
-    let mut request = RequestHandle::new_pnp(
-        PnpRequest {
+    let mut request = RequestHandle::new(Pnp {
+        request: PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::with_capacity(0),
             data_out: RequestData::empty(),
         },
-        RequestData::empty(),
-    );
+    });
     request.set_traversal_policy(TraversalPolicy::ForwardLower);
     let status = kernel_api::pnp::pnp_send_request(vol_target, &mut request).await;
     if status != DriverStatus::Success {
@@ -323,7 +311,7 @@ async fn compute_stable_id(parent_fdo: &Arc<DeviceObject>) -> Option<String> {
     // PartitionInfo is returned in the PnP payload data_out for QueryResources
     let pi = {
         let req = request.read();
-        let pnp = req.pnp.as_ref()?;
+        let pnp = &req.body.request;
         if let Some(pi) = pnp
             .data_out_ref()
             .view::<kernel_api::kernel_types::io::PartitionInfo>()
@@ -399,14 +387,14 @@ async fn try_bind_filesystems_for_parent_fdo(
     let tags = FS_REGISTERED.read().clone();
 
     for tag in tags {
-        let mut identify_req = RequestHandle::new(
-            RequestType::DeviceControl(kernel_api::IOCTL_FS_IDENTIFY),
-            RequestData::from_t(FsIdentify {
+        let mut identify_req = RequestHandle::new(DeviceControl::new_t(
+            kernel_api::IOCTL_FS_IDENTIFY,
+            FsIdentify {
                 volume_fdo: parent_fdo.clone(),
                 mount_device: None,
                 can_mount: false,
-            }),
-        );
+            },
+        ));
         identify_req.set_traversal_policy(TraversalPolicy::ForwardLower);
         let err = pnp_ioctl_via_symlink(
             tag.clone(),
@@ -498,7 +486,7 @@ fn build_status_blob(dev: &Arc<DeviceObject>) -> Box<[u8]> {
     s.into_bytes().into_boxed_slice()
 }
 
-fn string_from_req(req: &mut Request) -> Option<String> {
+fn string_from_req<'data>(req: &mut Request<DeviceControl<'data>>) -> Option<String> {
     core::str::from_utf8(
         req.data()
             .read_only()
@@ -581,8 +569,13 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         write_through: false,
         path: Path::from_string(path),
     };
-    let mut req_inner =
-        RequestHandle::new(RequestType::Fs(FsOp::Open), RequestData::from_t(params));
+    let mut req_inner = RequestHandle::new(Fs::new(
+        FsOp::Open,
+        FsPayload::Open {
+            params,
+            result: None,
+        },
+    ));
     req_inner.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let err = pnp_send_request_via_symlink(public_link.to_string(), &mut req_inner).await;
@@ -595,16 +588,12 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         return false;
     }
 
-    if let Some(_) = req_inner
-        .write()
-        .data()
-        .read_only()
-        .view::<FsOpenResult>()
-        .map(|res| res.error.is_none())
-    {
-        return true;
+    match &req_inner.read().body.payload {
+        FsPayload::Open {
+            result: Some(res), ..
+        } => res.error.is_none(),
+        _ => false,
     }
-    false
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {

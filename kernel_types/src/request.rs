@@ -1,5 +1,12 @@
 use crate::CompletionRoutine;
-use crate::fs::FsOp;
+use crate::dma::{ReadIoBuffer, WriteIoBuffer};
+use crate::fs::{
+    FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
+    FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams,
+    FsListDirResult, FsOp, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams,
+    FsRenameResult, FsSeekParams, FsSeekResult, FsSetLenParams, FsSetLenResult, FsWriteParams,
+    FsWriteResult, FsZeroRangeParams, FsZeroRangeResult,
+};
 use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
@@ -1022,42 +1029,6 @@ impl<'data> RequestData<'data> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(C)]
-pub enum RequestType {
-    Read {
-        offset: u64,
-        len: usize,
-        no_buffer: bool,
-    },
-    Write {
-        offset: u64,
-        len: usize,
-        no_buffer: bool,
-        /// File-level owner tag. 0 = unowned (included in all targeted flushes).
-        owner: u64,
-    },
-    Flush {
-        /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
-        /// This flag can have unforeseen consequences if set to true, if something is activley writing data it is likely you won't return until they stop.
-        should_block: bool,
-    },
-    FlushDirty {
-        /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
-        /// This flag can have unforeseen consequences if set to true, if something is activley writing data it is likely you won't return until they stop.
-        should_block: bool,
-    },
-    /// Flush only dirty cache pages belonging to the given owner (and unowned pages).
-    FlushOwner {
-        owner: u64,
-        should_block: bool,
-    },
-    DeviceControl(u32),
-    Fs(FsOp),
-    Pnp,
-    Dummy,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum TraversalPolicy {
@@ -1066,76 +1037,112 @@ pub enum TraversalPolicy {
     ForwardUpper,
 }
 
-#[derive(Debug)]
-#[repr(C)]
-#[non_exhaustive]
-pub struct Request<'data> {
-    pub kind: RequestType,
-    pub(crate) data: RequestData<'data>,
-    pub completed: bool,
-    pub status: DriverStatus,
-    pub traversal_policy: TraversalPolicy,
-    pub pnp: Option<PnpRequest<'data>>,
-    pub completion_routine: Option<CompletionRoutine<'data>>,
-    pub completion_context: usize,
-    completion_is_chain: bool,
-    completion_chain: Option<Vec<CompletionEntry<'data>>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum RequestMajor {
+    Read,
+    Write,
+    Flush,
+    FlushDirty,
+    FlushOwner,
+    DeviceControl,
+    Fs,
+    Pnp,
+    Dummy,
 }
 
-impl<'data> Request<'data> {
-    /// Create a non-PnP request. Panics if called with `RequestType::Pnp`.
-    pub(crate) fn new(kind: RequestType, data: RequestData<'data>) -> Self {
-        if matches!(kind, RequestType::Pnp) {
-            panic!("Request::new called with RequestType::Pnp. Use Request::new_pnp instead.");
-        }
+pub trait RequestKind {
+    const MAJOR: RequestMajor;
+}
 
+#[repr(C)]
+#[derive(Debug)]
+pub struct Read<'data> {
+    pub offset: u64,
+    pub len: usize,
+    pub no_buffer: bool,
+    pub buffer: ReadIoBuffer<'data>,
+}
+
+impl RequestKind for Read<'_> {
+    const MAJOR: RequestMajor = RequestMajor::Read;
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct Write<'data> {
+    pub offset: u64,
+    pub len: usize,
+    pub no_buffer: bool,
+    /// File-level owner tag. 0 = unowned (included in all targeted flushes).
+    pub owner: u64,
+    pub buffer: WriteIoBuffer<'data>,
+}
+
+impl RequestKind for Write<'_> {
+    const MAJOR: RequestMajor = RequestMajor::Write;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Flush {
+    /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
+    /// This flag can have unforeseen consequences if set to true, if something is actively writing data it is likely you won't return until they stop.
+    pub should_block: bool,
+}
+
+impl RequestKind for Flush {
+    const MAJOR: RequestMajor = RequestMajor::Flush;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushDirty {
+    /// This flag indicates whether a flush job should be spawned, or if we should wait till all data is flushed.
+    /// This flag can have unforeseen consequences if set to true, if something is actively writing data it is likely you won't return until they stop.
+    pub should_block: bool,
+}
+
+impl RequestKind for FlushDirty {
+    const MAJOR: RequestMajor = RequestMajor::FlushDirty;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlushOwner {
+    /// Flush only dirty cache pages belonging to the given owner (and unowned pages).
+    pub owner: u64,
+    pub should_block: bool,
+}
+
+impl RequestKind for FlushOwner {
+    const MAJOR: RequestMajor = RequestMajor::FlushOwner;
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct DeviceControl<'data> {
+    pub code: u32,
+    pub data: RequestData<'data>,
+}
+
+impl<'data> DeviceControl<'data> {
+    #[inline]
+    pub fn new(code: u32, data: RequestData<'data>) -> Self {
+        Self { code, data }
+    }
+
+    #[inline]
+    pub fn new_t<T: RequestPayload<'data>>(code: u32, typed_payload: T) -> Self {
         Self {
-            kind,
-            data,
-            completed: false,
-            status: DriverStatus::ContinueStep,
-            traversal_policy: TraversalPolicy::FailIfUnhandled,
-            pnp: None,
-            completion_routine: None,
-            completion_context: 0,
-            completion_is_chain: false,
-            completion_chain: None,
+            code,
+            data: RequestData::from_t(typed_payload),
         }
     }
 
-    /// Create a PnP request.
     #[inline]
-    pub(crate) fn new_pnp(pnp_request: PnpRequest<'data>, data: RequestData<'data>) -> Self {
-        Self {
-            kind: RequestType::Pnp,
-            data,
-            completed: false,
-            status: DriverStatus::ContinueStep,
-            traversal_policy: TraversalPolicy::ForwardLower,
-            pnp: Some(pnp_request),
-            completion_routine: None,
-            completion_context: 0,
-            completion_is_chain: false,
-            completion_chain: None,
-        }
-    }
-
-    /// Create a request with typed payload.
-    #[inline]
-    pub(crate) fn new_t<T: RequestPayload<'data>>(kind: RequestType, data: T) -> Self {
-        Self::new(kind, RequestData::from_t(data))
-    }
-
-    /// Create a PnP request with typed payload.
-    #[inline]
-    pub(crate) fn new_pnp_t<T: RequestPayload<'data>>(pnp: PnpRequest<'data>, data: T) -> Self {
-        Self::new_pnp(pnp, RequestData::from_t(data))
-    }
-
-    #[inline]
-    pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
-        self.traversal_policy = policy;
-        self
+    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
+        request_data_view(&mut self.data)
     }
 
     #[inline]
@@ -1147,51 +1154,191 @@ impl<'data> Request<'data> {
     pub fn set_data_t<T: RequestPayload<'data>>(&mut self, data: T) {
         self.data = RequestData::from_t(data);
     }
+}
 
+impl RequestKind for DeviceControl<'_> {
+    const MAJOR: RequestMajor = RequestMajor::DeviceControl;
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub enum FsPayload<'data> {
+    Open {
+        params: FsOpenParams,
+        result: Option<FsOpenResult>,
+    },
+    Close {
+        params: FsCloseParams,
+        result: Option<FsCloseResult>,
+    },
+    Read {
+        params: FsReadParams<'data>,
+        result: Option<FsReadResult>,
+    },
+    Write {
+        params: FsWriteParams<'data>,
+        result: Option<FsWriteResult>,
+    },
+    Flush {
+        params: FsFlushParams,
+        result: Option<FsFlushResult>,
+    },
+    Seek {
+        params: FsSeekParams,
+        result: Option<FsSeekResult>,
+    },
+    Create {
+        params: FsCreateParams,
+        result: Option<FsCreateResult>,
+    },
+    Rename {
+        params: FsRenameParams,
+        result: Option<FsRenameResult>,
+    },
+    ReadDir {
+        params: FsListDirParams,
+        result: Option<FsListDirResult>,
+    },
+    GetInfo {
+        params: FsGetInfoParams,
+        result: Option<FsGetInfoResult>,
+    },
+    SetLen {
+        params: FsSetLenParams,
+        result: Option<FsSetLenResult>,
+    },
+    Append {
+        params: FsAppendParams<'data>,
+        result: Option<FsAppendResult>,
+    },
+    ZeroRange {
+        params: FsZeroRangeParams,
+        result: Option<FsZeroRangeResult>,
+    },
+}
+
+impl FsPayload<'_> {
     #[inline]
-    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
-        match self.data.mode {
-            StorageMode::BorrowedReadOnly => RequestDataView::ReadOnly(RequestDataRef {
-                data: &self.data,
-                _direction: PhantomData,
-            }),
-            StorageMode::BorrowedWritable | StorageMode::Inline | StorageMode::HeapTyped => {
-                RequestDataView::Writable(RequestDataRefMut {
-                    data: &mut self.data,
-                    _direction: PhantomData,
-                })
-            }
+    pub fn op(&self) -> FsOp {
+        match self {
+            Self::Open { .. } => FsOp::Open,
+            Self::Close { .. } => FsOp::Close,
+            Self::Read { .. } => FsOp::Read,
+            Self::Write { .. } => FsOp::Write,
+            Self::Flush { .. } => FsOp::Flush,
+            Self::Seek { .. } => FsOp::Seek,
+            Self::Create { .. } => FsOp::Create,
+            Self::Rename { .. } => FsOp::Rename,
+            Self::ReadDir { .. } => FsOp::ReadDir,
+            Self::GetInfo { .. } => FsOp::GetInfo,
+            Self::SetLen { .. } => FsOp::SetLen,
+            Self::Append { .. } => FsOp::Append,
+            Self::ZeroRange { .. } => FsOp::ZeroRange,
         }
     }
+}
 
-    /// Print all fields except the actual data payloads
-    pub fn print_meta(&self) -> alloc::string::String {
-        let pnp_str = match &self.pnp {
-            Some(p) => p.print_meta(),
-            None => alloc::string::String::from("None"),
-        };
-        alloc::format!(
-            "Request {{ kind: {:?}, data: {}, completed: {}, status: {:?}, traversal_policy: {:?}, pnp: {}, completion_routine: {:?}, completion_context: {:#x} }}",
-            self.kind,
-            self.data.print_meta(),
-            self.completed,
-            self.status,
-            self.traversal_policy,
-            pnp_str,
-            self.completion_routine.map(|_| "Some(fn)"),
-            self.completion_context,
-        )
+#[repr(C)]
+#[derive(Debug)]
+pub struct Fs<'data> {
+    pub op: FsOp,
+    pub payload: FsPayload<'data>,
+}
+
+impl<'data> Fs<'data> {
+    #[inline]
+    #[track_caller]
+    pub fn new(op: FsOp, payload: FsPayload<'data>) -> Self {
+        assert_eq!(op, payload.op(), "FsOp does not match FsPayload variant");
+        Self { op, payload }
+    }
+}
+
+impl RequestKind for Fs<'_> {
+    const MAJOR: RequestMajor = RequestMajor::Fs;
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct Pnp<'data> {
+    pub request: PnpRequest<'data>,
+}
+
+impl RequestKind for Pnp<'_> {
+    const MAJOR: RequestMajor = RequestMajor::Pnp;
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dummy;
+
+impl RequestKind for Dummy {
+    const MAJOR: RequestMajor = RequestMajor::Dummy;
+}
+
+#[inline]
+fn default_policy_for<K: RequestKind>() -> TraversalPolicy {
+    if K::MAJOR == RequestMajor::Pnp {
+        TraversalPolicy::ForwardLower
+    } else {
+        TraversalPolicy::FailIfUnhandled
+    }
+}
+
+#[inline]
+fn request_data_view<'a, 'data>(data: &'a mut RequestData<'data>) -> RequestDataView<'a, 'data> {
+    match data.mode {
+        StorageMode::BorrowedReadOnly => RequestDataView::ReadOnly(RequestDataRef {
+            data,
+            _direction: PhantomData,
+        }),
+        StorageMode::BorrowedWritable | StorageMode::Inline | StorageMode::HeapTyped => {
+            RequestDataView::Writable(RequestDataRefMut {
+                data,
+                _direction: PhantomData,
+            })
+        }
+    }
+}
+
+pub trait RequestDataCarrier<'data>: RequestKind {
+    fn request_data_mut(&mut self) -> &mut RequestData<'data>;
+}
+
+impl<'data> RequestDataCarrier<'data> for DeviceControl<'data> {
+    #[inline]
+    fn request_data_mut(&mut self) -> &mut RequestData<'data> {
+        &mut self.data
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+#[non_exhaustive]
+pub struct Request<K: RequestKind> {
+    pub body: K,
+    pub completed: bool,
+    pub status: DriverStatus,
+    pub traversal_policy: TraversalPolicy,
+    pub completion_routine: Option<CompletionRoutine<K>>,
+    pub completion_context: usize,
+    completion_is_chain: bool,
+    completion_chain: Option<Vec<CompletionEntry<K>>>,
+}
+
+impl<K: RequestKind> Request<K> {
+    #[inline]
+    pub fn new(body: K) -> Self {
+        Self::with_policy(body, default_policy_for::<K>())
     }
 
     #[inline]
-    pub(crate) fn empty() -> Self {
+    pub fn with_policy(body: K, policy: TraversalPolicy) -> Self {
         Self {
-            kind: RequestType::Dummy,
-            data: RequestData::empty(),
-            completed: true,
-            status: DriverStatus::Success,
-            traversal_policy: TraversalPolicy::FailIfUnhandled,
-            pnp: None,
+            body,
+            completed: false,
+            status: DriverStatus::ContinueStep,
+            traversal_policy: policy,
             completion_routine: None,
             completion_context: 0,
             completion_is_chain: false,
@@ -1199,7 +1346,13 @@ impl<'data> Request<'data> {
         }
     }
 
-    pub fn add_completion(&mut self, func: CompletionRoutine<'data>, ctx: usize) {
+    #[inline]
+    pub fn set_traversal_policy(mut self, policy: TraversalPolicy) -> Self {
+        self.traversal_policy = policy;
+        self
+    }
+
+    pub fn add_completion(&mut self, func: CompletionRoutine<K>, ctx: usize) {
         match self.completion_routine {
             None => {
                 self.completion_routine = Some(func);
@@ -1217,7 +1370,7 @@ impl<'data> Request<'data> {
 
                 if self.completion_is_chain {
                     if let Some(previous) = self.completion_chain.take() {
-                        chain.extend(previous.iter().copied());
+                        chain.extend(previous);
                     } else {
                         chain.push((prev, prev_ctx));
                     }
@@ -1225,7 +1378,7 @@ impl<'data> Request<'data> {
                     chain.push((prev, prev_ctx));
                 }
 
-                self.completion_routine = Some(chained_completion);
+                self.completion_routine = Some(chained_completion::<K>);
                 self.completion_context = 0;
                 self.completion_is_chain = true;
                 self.completion_chain = Some(chain);
@@ -1260,14 +1413,73 @@ impl<'data> Request<'data> {
         let _ = self.complete();
     }
 }
-impl<'data> Drop for Request<'data> {
+
+impl<K> Request<K>
+where
+    K: RequestKind + core::fmt::Debug,
+{
+    /// Print all fields except the actual data payloads.
+    pub fn print_meta(&self) -> alloc::string::String {
+        alloc::format!(
+            "Request {{ major: {:?}, body: {:?}, completed: {}, status: {:?}, traversal_policy: {:?}, completion_routine: {:?}, completion_context: {:#x} }}",
+            K::MAJOR,
+            self.body,
+            self.completed,
+            self.status,
+            self.traversal_policy,
+            self.completion_routine.map(|_| "Some(fn)"),
+            self.completion_context,
+        )
+    }
+}
+
+impl<'data, K> Request<K>
+where
+    K: RequestDataCarrier<'data>,
+{
+    #[inline]
+    pub fn set_data(&mut self, data: RequestData<'data>) {
+        *self.body.request_data_mut() = data;
+    }
+
+    #[inline]
+    pub fn set_data_t<T: RequestPayload<'data>>(&mut self, data: T) {
+        self.set_data(RequestData::from_t(data));
+    }
+
+    #[inline]
+    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
+        request_data_view(self.body.request_data_mut())
+    }
+}
+
+impl Request<Dummy> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self {
+            body: Dummy,
+            completed: true,
+            status: DriverStatus::Success,
+            traversal_policy: TraversalPolicy::FailIfUnhandled,
+            completion_routine: None,
+            completion_context: 0,
+            completion_is_chain: false,
+            completion_chain: None,
+        }
+    }
+}
+
+impl<K: RequestKind> Drop for Request<K> {
     fn drop(&mut self) {
         self.complete_for_drop();
     }
 }
-type CompletionEntry<'data> = (CompletionRoutine<'data>, usize);
+type CompletionEntry<K> = (CompletionRoutine<K>, usize);
 
-extern "win64" fn chained_completion(req: &mut Request<'_>, _ctx: usize) -> DriverStatus {
+extern "win64" fn chained_completion<K: RequestKind>(
+    req: &mut Request<K>,
+    _ctx: usize,
+) -> DriverStatus {
     let Some(entries) = req.completion_chain.take() else {
         return DriverStatus::Success;
     };
@@ -1286,36 +1498,32 @@ extern "win64" fn chained_completion(req: &mut Request<'_>, _ctx: usize) -> Driv
 /// Handle to a request - stack-borrowed or owned.
 #[repr(C)]
 #[derive(Debug)]
-pub enum RequestHandle<'req, 'data> {
+pub enum RequestHandle<'req, K: RequestKind> {
     /// Mutable borrow of a stack-allocated request.
-    Stack(&'req mut Request<'data>),
+    Stack(&'req mut Request<K>),
     /// Owned request - the RequestHandle owns the Request directly.
-    Owned(Request<'data>),
+    Owned(Request<K>),
 }
 
-impl<'req, 'data> RequestHandle<'req, 'data> {
-    /// Create a non-PnP request owned by the RequestHandle. Panics if called with `RequestType::Pnp`.
+impl<'req, K: RequestKind> RequestHandle<'req, K> {
     #[inline]
-    pub fn new(kind: RequestType, data: RequestData<'data>) -> Self {
-        RequestHandle::Owned(Request::new(kind, data))
+    pub fn stack(request: &'req mut Request<K>) -> Self {
+        RequestHandle::Stack(request)
     }
 
-    /// Create a PnP request owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp(pnp_request: PnpRequest<'data>, data: RequestData<'data>) -> Self {
-        RequestHandle::Owned(Request::new_pnp(pnp_request, data))
+    pub fn owned(request: Request<K>) -> Self {
+        RequestHandle::Owned(request)
     }
 
-    /// Create a request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_t<T: RequestPayload<'data>>(kind: RequestType, data: T) -> Self {
-        RequestHandle::Owned(Request::new_t(kind, data))
+    pub fn new(body: K) -> Self {
+        RequestHandle::Owned(Request::new(body))
     }
 
-    /// Create a PnP request with typed payload owned by the RequestHandle.
     #[inline]
-    pub fn new_pnp_t<T: RequestPayload<'data>>(pnp: PnpRequest<'data>, data: T) -> Self {
-        RequestHandle::Owned(Request::new_pnp_t(pnp, data))
+    pub fn with_policy(body: K, policy: TraversalPolicy) -> Self {
+        RequestHandle::Owned(Request::with_policy(body, policy))
     }
 
     #[inline]
@@ -1335,7 +1543,7 @@ impl<'req, 'data> RequestHandle<'req, 'data> {
 
     /// Acquire read access.
     #[inline]
-    pub fn read(&self) -> &Request<'data> {
+    pub fn read(&self) -> &Request<K> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
@@ -1344,16 +1552,11 @@ impl<'req, 'data> RequestHandle<'req, 'data> {
 
     /// Acquire write access.
     #[inline]
-    pub fn write(&mut self) -> &mut Request<'data> {
+    pub fn write(&mut self) -> &mut Request<K> {
         match self {
             RequestHandle::Stack(r) => r,
             RequestHandle::Owned(r) => r,
         }
-    }
-
-    #[inline]
-    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
-        self.write().data()
     }
 
     #[inline]
@@ -1363,15 +1566,25 @@ impl<'req, 'data> RequestHandle<'req, 'data> {
 
     /// Returns a raw pointer to the inner Request. Only for use by BorrowedHandle within
     /// this module — not accessible outside request.rs.
-    pub(super) fn write_raw(&mut self) -> *mut Request<'data> {
+    pub(super) fn write_raw(&mut self) -> *mut Request<K> {
         match self {
-            RequestHandle::Stack(r) => *r as *mut Request<'data>,
-            RequestHandle::Owned(r) => r as *mut Request<'data>,
+            RequestHandle::Stack(r) => *r as *mut Request<K>,
+            RequestHandle::Owned(r) => r as *mut Request<K>,
         }
     }
 }
 
-impl<'req, 'data> RequestHandleResult<'req, 'data> {
+impl<'req, 'data, K> RequestHandle<'req, K>
+where
+    K: RequestDataCarrier<'data>,
+{
+    #[inline]
+    pub fn data(&mut self) -> RequestDataView<'_, 'data> {
+        self.write().data()
+    }
+}
+
+impl<'req, K: RequestKind> RequestHandleResult<'req, K> {
     pub fn status(&self) -> DriverStatus {
         match &self.step {
             DriverStep::Complete { status } => status.clone(),
@@ -1382,9 +1595,9 @@ impl<'req, 'data> RequestHandleResult<'req, 'data> {
 
 /// Handler return type. Carries step + handle back to dispatcher.
 #[repr(C)]
-pub struct RequestHandleResult<'req, 'data> {
+pub struct RequestHandleResult<'req, K: RequestKind> {
     pub step: DriverStep,
-    pub handle: RequestHandle<'req, 'data>,
+    pub handle: RequestHandle<'req, K>,
 }
 // ============================================================================
 // BorrowedHandle — zero-copy driver-owned data borrow for forwarded requests
@@ -1413,23 +1626,34 @@ enum BorrowedStorage<'data, T: ?Sized> {
     Writable(PhantomData<&'data mut T>),
 }
 
-pub struct BorrowedHandle<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> {
-    handle: &'req mut RequestHandle<'h, 'data>,
+pub struct BorrowedHandle<
+    'data: 'req,
+    'req,
+    'h,
+    K: RequestDataCarrier<'data>,
+    T: RequestPayload<'data> + ?Sized,
+> {
+    handle: &'req mut RequestHandle<'h, K>,
     borrow: BorrowedStorage<'data, T>,
 }
 
-impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> BorrowedHandle<'data, 'req, 'h, T> {
+impl<'data: 'req, 'req, 'h, K, T> BorrowedHandle<'data, 'req, 'h, K, T>
+where
+    K: RequestDataCarrier<'data>,
+    T: RequestPayload<'data> + ?Sized,
+{
     fn install(
-        handle: &'req mut RequestHandle<'h, 'data>,
+        handle: &'req mut RequestHandle<'h, K>,
         parts: RequestPayloadRawParts,
         mode: StorageMode,
         borrow: BorrowedStorage<'data, T>,
     ) -> Self {
-        unsafe { &mut *handle.write_raw() }.data = RequestData::from_borrowed_raw::<T>(parts, mode);
+        *unsafe { &mut *handle.write_raw() }.body.request_data_mut() =
+            RequestData::from_borrowed_raw::<T>(parts, mode);
         Self { handle, borrow }
     }
 
-    pub fn read_only(handle: &'req mut RequestHandle<'h, 'data>, data: &'data T) -> Self {
+    pub fn read_only(handle: &'req mut RequestHandle<'h, K>, data: &'data T) -> Self {
         Self::install(
             handle,
             T::shared_raw_parts(data),
@@ -1438,7 +1662,7 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> BorrowedHandle<'d
         )
     }
 
-    pub fn writable(handle: &'req mut RequestHandle<'h, 'data>, data: &'data mut T) -> Self {
+    pub fn writable(handle: &'req mut RequestHandle<'h, K>, data: &'data mut T) -> Self {
         let parts = T::mut_raw_parts(data);
         Self::install(
             handle,
@@ -1449,13 +1673,15 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> BorrowedHandle<'d
     }
 
     /// Returns the inner handle for passing to lower drivers.
-    pub fn handle(&mut self) -> &mut RequestHandle<'h, 'data> {
+    pub fn handle(&mut self) -> &mut RequestHandle<'h, K> {
         self.handle
     }
 }
 
-impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> Drop
-    for BorrowedHandle<'data, 'req, 'h, T>
+impl<'data: 'req, 'req, 'h, K, T> Drop for BorrowedHandle<'data, 'req, 'h, K, T>
+where
+    K: RequestDataCarrier<'data>,
+    T: RequestPayload<'data> + ?Sized,
 {
     fn drop(&mut self) {
         let _ = &self.borrow;
@@ -1464,8 +1690,9 @@ impl<'data: 'req, 'req, 'h, T: RequestPayload<'data> + ?Sized> Drop
         // Only clear if the request still holds one of the borrowed modes. If the lower driver set
         // a response,
         // leave it intact so the upper driver can read it after the await.
-        if req.data.mode.is_borrowed() {
-            req.data = RequestData::empty();
+        let data = req.body.request_data_mut();
+        if data.mode.is_borrowed() {
+            *data = RequestData::empty();
         }
     }
 }

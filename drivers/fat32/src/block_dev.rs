@@ -5,10 +5,13 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use fatfs::{IoBase, IoKind, Read, Seek, SeekFrom, Write};
 use kernel_api::{
-    kernel_types::{io::IoTarget, request::RequestData},
+    kernel_types::{
+        dma::{Described, FromDevice, IoBuffer, ToDevice},
+        io::IoTarget,
+    },
     pnp::pnp_send_request,
     println,
-    request::{BorrowedHandle, RequestHandle, RequestType, TraversalPolicy},
+    request::{Read as ReadRequest, RequestHandle, TraversalPolicy, Write as WriteRequest},
     status::DriverStatus,
 };
 
@@ -70,23 +73,20 @@ impl BlockDev {
         &mut self,
         offset: u64,
         dst: &mut [u8],
-        kind: IoKind,
+        _kind: IoKind,
     ) -> Result<(), DriverStatus> {
         let volume = self.volume.clone();
-        let mut req = RequestHandle::new(
-            RequestType::Read {
-                offset,
-                len: dst.len(),
-                no_buffer: false,
-            },
-            RequestData::empty(),
-        );
+        let len = dst.len();
+        let buffer = IoBuffer::<Described, FromDevice>::new(dst);
+        let mut req = RequestHandle::new(ReadRequest {
+            offset,
+            len,
+            no_buffer: false,
+            buffer: buffer.into(),
+        });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let status = {
-            let mut borrow = BorrowedHandle::writable(&mut req, dst);
-            pnp_send_request(volume, borrow.handle()).await
-        };
+        let status = pnp_send_request(volume, &mut req).await;
 
         if likely(status == DriverStatus::Success) {
             Ok(())
@@ -102,25 +102,22 @@ impl BlockDev {
         &mut self,
         offset: u64,
         src: &[u8],
-        kind: IoKind,
+        _kind: IoKind,
     ) -> Result<(), DriverStatus> {
         let no_buffer = false;
         let volume = self.volume.clone();
-        let mut req = RequestHandle::new(
-            RequestType::Write {
-                offset,
-                len: src.len(),
-                no_buffer: no_buffer,
-                owner: self.current_owner.load(Ordering::Acquire),
-            },
-            RequestData::empty(),
-        );
+        let len = src.len();
+        let buffer = IoBuffer::<Described, ToDevice>::new(src);
+        let mut req = RequestHandle::new(WriteRequest {
+            offset,
+            len,
+            no_buffer,
+            owner: self.current_owner.load(Ordering::Acquire),
+            buffer: buffer.into(),
+        });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
-        let status = {
-            let mut borrow = BorrowedHandle::read_only(&mut req, src);
-            pnp_send_request(volume, borrow.handle()).await
-        };
+        let status = pnp_send_request(volume, &mut req).await;
 
         if likely(status == DriverStatus::Success) {
             Ok(())

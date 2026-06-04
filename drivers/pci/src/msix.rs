@@ -5,7 +5,7 @@ use core::ptr::{read_volatile, write_volatile};
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
 use kernel_api::pnp::DriverStep;
-use kernel_api::request::RequestHandle;
+use kernel_api::request::{DeviceControl, RequestHandle};
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::{PhysAddr, VirtAddr};
 
@@ -64,7 +64,10 @@ unsafe fn cfg_write16(base: VirtAddr, offset: u16, value: u16) {
 }
 
 /// Program MSI-X table and enable MSI-X capability.
-pub async fn pci_setup_msix(dev: Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) -> DriverStep {
+pub async fn pci_setup_msix<'req, 'data>(
+    dev: Arc<DeviceObject>,
+    req: &mut RequestHandle<'req, DeviceControl<'data>>,
+) -> DriverStep {
     let ext = match dev.try_devext::<PciPdoExt>() {
         Ok(e) => e,
         Err(_) => return DriverStep::complete(DriverStatus::NoSuchDevice),

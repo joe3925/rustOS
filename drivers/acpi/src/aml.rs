@@ -24,7 +24,7 @@ use kernel_api::pnp::QueryIdType;
 use kernel_api::pnp::ResourceKind;
 use kernel_api::pnp::get_acpi_tables;
 use kernel_api::pnp::pnp_create_child_devnode_and_pdo_with_init;
-use kernel_api::request::RequestHandle;
+use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
@@ -955,9 +955,9 @@ pub(crate) fn build_query_resources_blob(ctx: &mut AmlContext, dev: &AmlName) ->
 }
 
 #[request_handler]
-pub async fn acpi_pdo_query_resources<'a, 'b>(
+pub async fn acpi_pdo_query_resources<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
@@ -976,10 +976,8 @@ pub async fn acpi_pdo_query_resources<'a, 'b>(
     }
 
     {
-        let mut w = req.write();
-        if let Some(p) = w.pnp.as_mut() {
-            p.data_out = RequestData::from_t::<Vec<u8>>(blob);
-        }
+        let w = req.write();
+        w.body.request.data_out = RequestData::from_t::<Vec<u8>>(blob);
         w.status = DriverStatus::Success;
     }
 
@@ -987,13 +985,13 @@ pub async fn acpi_pdo_query_resources<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn acpi_pdo_query_id<'a, 'b>(
+pub async fn acpi_pdo_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let pext: &AcpiPdoExt = &dev.try_devext().expect("Failed to get devext");
 
-    let ty = { req.read().pnp.as_ref().unwrap().id_type };
+    let ty = { req.read().body.request.id_type };
 
     let ctx_lock = &pext.ctx;
     let mut guard = ctx_lock.write();
@@ -1002,8 +1000,8 @@ pub async fn acpi_pdo_query_id<'a, 'b>(
 
     let mut status = DriverStatus::Success;
     {
-        let mut w = req.write();
-        let p = w.pnp.as_mut().unwrap();
+        let w = req.write();
+        let p = &mut w.body.request;
 
         match ty {
             QueryIdType::HardwareIds => {
@@ -1037,9 +1035,9 @@ pub async fn acpi_pdo_query_id<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn acpi_pdo_start<'a, 'b>(
+pub async fn acpi_pdo_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

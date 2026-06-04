@@ -13,18 +13,16 @@ use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
 use kernel_api::kernel_types::io::IoTarget;
-use kernel_api::kernel_types::request::RequestData;
 use kernel_api::pnp::{DriverStep, pnp_send_request};
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{
+    FlushOwner, Fs as FsRequest, FsPayload, RequestHandle, TraversalPolicy,
+};
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
-        FileAttribute, FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult,
-        FsCreateParams, FsCreateResult, FsFlushParams, FsFlushResult, FsGetInfoParams,
-        FsGetInfoResult, FsListDirParams, FsListDirResult, FsOp, FsOpenParams, FsOpenResult,
-        FsReadParams, FsReadResult, FsRenameParams, FsRenameResult, FsSeekParams, FsSeekResult,
-        FsSeekWhence, FsSetLenParams, FsSetLenResult, FsWriteParams, FsWriteResult,
-        FsZeroRangeParams, FsZeroRangeResult,
+        FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsFlushResult,
+        FsGetInfoResult, FsListDirResult, FsOp, FsOpenResult, FsReadResult, FsRenameResult,
+        FsSeekResult, FsSeekWhence, FsSetLenResult, FsWriteResult, FsZeroRangeResult,
     },
     println, request_handler,
 };
@@ -332,111 +330,50 @@ async fn flush_cached_file(
     err
 }
 
-fn current_owner_for_op(op: FsOp, req: &mut RequestHandle<'_, '_>) -> Result<u64, DriverStatus> {
-    match op {
-        FsOp::Open | FsOp::Create | FsOp::ReadDir | FsOp::SetInfo | FsOp::Delete | FsOp::Rename => {
-            Ok(METADATA_OWNER_ID)
-        }
-        FsOp::Close => req
-            .data()
-            .read_only()
-            .view::<FsCloseParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::Read => req
-            .data()
-            .read_only()
-            .view::<FsReadParams<'_>>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::Write => req
-            .data()
-            .read_only()
-            .view::<FsWriteParams<'_>>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::Flush => req
-            .data()
-            .read_only()
-            .view::<FsFlushParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::Seek => req
-            .data()
-            .read_only()
-            .view::<FsSeekParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::GetInfo => req
-            .data()
-            .read_only()
-            .view::<FsGetInfoParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::SetLen => req
-            .data()
-            .read_only()
-            .view::<FsSetLenParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::Append => req
-            .data()
-            .read_only()
-            .view::<FsAppendParams<'_>>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
-        FsOp::ZeroRange => req
-            .data()
-            .read_only()
-            .view::<FsZeroRangeParams>()
-            .map(|p| p.fs_file_id)
-            .ok_or(DriverStatus::InvalidParameter),
+fn current_owner_for_payload(payload: &FsPayload<'_>) -> u64 {
+    match payload {
+        FsPayload::Open { .. }
+        | FsPayload::Create { .. }
+        | FsPayload::ReadDir { .. }
+        | FsPayload::Rename { .. } => METADATA_OWNER_ID,
+        FsPayload::Close { params, .. } => params.fs_file_id,
+        FsPayload::Read { params, .. } => params.fs_file_id,
+        FsPayload::Write { params, .. } => params.fs_file_id,
+        FsPayload::Flush { params, .. } => params.fs_file_id,
+        FsPayload::Seek { params, .. } => params.fs_file_id,
+        FsPayload::GetInfo { params, .. } => params.fs_file_id,
+        FsPayload::SetLen { params, .. } => params.fs_file_id,
+        FsPayload::Append { params, .. } => params.fs_file_id,
+        FsPayload::ZeroRange { params, .. } => params.fs_file_id,
     }
 }
 
 async fn execute_fs_work(
     dev: &Arc<DeviceObject>,
     fs_arc: &Arc<AsyncMutex<Fs>>,
-    req: &mut RequestHandle<'_, '_>,
+    req: &mut RequestHandle<'_, FsRequest<'_>>,
 ) -> DriverStatus {
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
     let mut fs = fs_arc.lock().await;
 
-    let op = match req.read().kind {
-        RequestType::Fs(op) => op,
-        RequestType::DeviceControl(_) => {
-            cold_path();
-            return DriverStatus::NotImplemented;
-        }
-        _ => {
-            cold_path();
-            return DriverStatus::InvalidParameter;
-        }
-    };
+    let op = req.read().body.op;
+    if matches!(op, FsOp::SetInfo | FsOp::Delete) {
+        return DriverStatus::NotImplemented;
+    }
 
-    let owner = match current_owner_for_op(op, req) {
-        Ok(owner) => owner,
-        Err(status) => {
-            cold_path();
-            return status;
-        }
-    };
+    if unlikely(op != req.read().body.payload.op()) {
+        cold_path();
+        return DriverStatus::InvalidParameter;
+    }
+
+    let owner = current_owner_for_payload(&req.read().body.payload);
     vdx.current_owner.store(owner, Ordering::Release);
 
-    match op {
-        FsOp::Open => {
-            let result = {
-                let path = {
-                    let data = req.data().read_only();
-
-                    let Some(p) = data.view::<FsOpenParams>() else {
-                        cold_path();
-                        return DriverStatus::InvalidParameter;
-                    };
-                    let _ = (p.flags, p.write_through);
-                    p.path.clone()
-                };
-                let path_str = path.as_str();
+    match &mut req.write().body.payload {
+        FsPayload::Open { params, result } => {
+            let _ = (params.flags, params.write_through);
+            let result_value = {
+                let path_str = params.path.as_str();
                 let root = fs.root_dir();
                 let open_res = match root.open_file(path_str).await {
                     Ok(mut f) => {
@@ -486,20 +423,12 @@ async fn execute_fs_work(
                 }
             };
 
-            req.write().set_data_t(result);
+            *result = Some(result_value);
             DriverStatus::Success
         }
 
-        FsOp::Close => {
-            let fs_file_id = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsCloseParams>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                p.fs_file_id
-            };
+        FsPayload::Close { params, result } => {
+            let fs_file_id = params.fs_file_id;
             let removed_ctx = { vdx.handles.lock().remove(fs_file_id) };
             let err = match removed_ctx {
                 Err(e) => Some(e),
@@ -515,28 +444,16 @@ async fn execute_fs_work(
             if err.is_none() {
                 flush_owner_blocking(&vdx, fs_file_id);
             }
-            req.write().set_data_t(FsCloseResult { error: err });
+            *result = Some(FsCloseResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::Read => {
-            let (fs_file_id, offset, buf_ptr, buf_len) = {
-                let data = req.data().read_only();
+        FsPayload::Read { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let offset = params.offset;
+            let buf = &mut *params.buf;
 
-                let Some(p) = data.view::<FsReadParams<'_>>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                (
-                    p.fs_file_id,
-                    p.offset,
-                    p.buf.as_ptr() as *mut u8,
-                    p.buf.len(),
-                )
-            };
-            let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, buf_len) };
-
-            let result: Result<usize, FileStatus> = {
+            let read_res: Result<usize, FileStatus> = {
                 let state = take_cached_file_state(&vdx, fs_file_id);
                 match state {
                     Err(e) => Err(e),
@@ -556,7 +473,7 @@ async fn execute_fs_work(
                 }
             };
 
-            let res = match result {
+            let res = match read_res {
                 Ok(n) => {
                     let new_pos = offset.saturating_add(n as u64);
                     {
@@ -575,27 +492,15 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            req.write().set_data_t(res);
+            *result = Some(res);
             DriverStatus::Success
         }
 
-        FsOp::Write => {
-            let (fs_file_id, offset, write_through, data_ptr, data_len) = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsWriteParams<'_>>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                (
-                    p.fs_file_id,
-                    p.offset,
-                    p.write_through,
-                    p.data.as_ptr(),
-                    p.data.len(),
-                )
-            };
-            let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
+        FsPayload::Write { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let offset = params.offset;
+            let write_through = params.write_through;
+            let data = params.data;
 
             let write_res: Result<usize, FileStatus> = {
                 let state = take_cached_file_state(&vdx, fs_file_id);
@@ -652,20 +557,12 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            req.write().set_data_t(res);
+            *result = Some(res);
             DriverStatus::Success
         }
 
-        FsOp::Flush => {
-            let fs_file_id = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsFlushParams>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                p.fs_file_id
-            };
+        FsPayload::Flush { params, result } => {
+            let fs_file_id = params.fs_file_id;
             let err = {
                 let is_dir = {
                     let handles = vdx.handles.lock();
@@ -684,43 +581,25 @@ async fn execute_fs_work(
                     }
                 }
             };
-            req.write().set_data_t(FsFlushResult { error: err });
+            *result = Some(FsFlushResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::Create => {
+        FsPayload::Create { params, result } => {
             let err = {
-                let (path, dir) = {
-                    let data = req.data().read_only();
-
-                    let Some(p) = data.view::<FsCreateParams>() else {
-                        cold_path();
-                        return DriverStatus::InvalidParameter;
-                    };
-                    (p.path.clone(), p.dir)
-                };
-                match create_entry(&mut *fs, &path, dir).await {
+                match create_entry(&mut *fs, &params.path, params.dir).await {
                     Ok(()) => None,
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
             };
             flush_owner_blocking(&vdx, owner);
-            req.write().set_data_t(FsCreateResult { error: err });
+            *result = Some(FsCreateResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::Rename => {
+        FsPayload::Rename { params, result } => {
             let err = {
-                let (src, dst) = {
-                    let data = req.data().read_only();
-
-                    let Some(p) = data.view::<FsRenameParams>() else {
-                        cold_path();
-                        return DriverStatus::InvalidParameter;
-                    };
-                    (p.src.clone(), p.dst.clone())
-                };
-                match rename_entry(&mut *fs, &src, &dst).await {
+                match rename_entry(&mut *fs, &params.src, &params.dst).await {
                     Ok(renamed) => {
                         if let Some(renamed) = renamed {
                             vdx.handles.lock().update_renamed_file(&renamed);
@@ -731,22 +610,13 @@ async fn execute_fs_work(
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
             };
-            req.write().set_data_t(FsRenameResult { error: err });
+            *result = Some(FsRenameResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::ReadDir => {
+        FsPayload::ReadDir { params, result } => {
             let res = {
-                let path = {
-                    let data = req.data().read_only();
-
-                    let Some(p) = data.view::<FsListDirParams>() else {
-                        cold_path();
-                        return DriverStatus::InvalidParameter;
-                    };
-                    p.path.clone()
-                };
-                match list_names(&mut *fs, &path).await {
+                match list_names(&mut *fs, &params.path).await {
                     Ok(names) => FsListDirResult {
                         names: Some(names),
                         error: None,
@@ -757,21 +627,13 @@ async fn execute_fs_work(
                     },
                 }
             };
-            req.write().set_data_t(res);
+            *result = Some(res);
             DriverStatus::Success
         }
 
-        FsOp::GetInfo => {
-            let fs_file_id = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsGetInfoParams>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                p.fs_file_id
-            };
-            let result = {
+        FsPayload::GetInfo { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let info_res = {
                 let handles = vdx.handles.lock();
                 match handles.ctx(fs_file_id) {
                     Err(e) => Err(e),
@@ -779,7 +641,7 @@ async fn execute_fs_work(
                     Ok(ctx) => Ok((false, ctx.size, u8::from(FileAttribute::Archive))),
                 }
             };
-            let res = match result {
+            let res = match info_res {
                 Ok((is_dir, size, attrs)) => FsGetInfoResult {
                     size,
                     is_dir,
@@ -793,20 +655,13 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            req.write().set_data_t(res);
+            *result = Some(res);
             DriverStatus::Success
         }
 
-        FsOp::SetLen => {
-            let (fs_file_id, new_size) = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsSetLenParams>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                (p.fs_file_id, p.new_size)
-            };
+        FsPayload::SetLen { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let new_size = params.new_size;
             let err = {
                 let state = take_cached_file_state(&vdx, fs_file_id);
                 match state {
@@ -834,23 +689,16 @@ async fn execute_fs_work(
                     }
                 }
             }
-            req.write().set_data_t(FsSetLenResult { error: err });
+            *result = Some(FsSetLenResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::Append => {
-            let (fs_file_id, write_through, data_ptr, data_len) = {
-                let data = req.data().read_only();
+        FsPayload::Append { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let write_through = params.write_through;
+            let data = params.data;
 
-                let Some(p) = data.view::<FsAppendParams<'_>>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                (p.fs_file_id, p.write_through, p.data.as_ptr(), p.data.len())
-            };
-            let data = unsafe { core::slice::from_raw_parts(data_ptr, data_len) };
-
-            let result: Result<(usize, u64), FileStatus> = {
+            let append_res: Result<(usize, u64), FileStatus> = {
                 let start_off = {
                     let handles = vdx.handles.lock();
                     match handles.ctx(fs_file_id) {
@@ -898,7 +746,7 @@ async fn execute_fs_work(
                 }
             };
 
-            if let Ok((_, new_size)) = result {
+            if let Ok((_, new_size)) = append_res {
                 let mut handles = vdx.handles.lock();
                 if let Ok(ctx) = handles.ctx_mut(fs_file_id) {
                     ctx.pos = new_size;
@@ -906,7 +754,7 @@ async fn execute_fs_work(
                 }
             }
 
-            let res = match result {
+            let res = match append_res {
                 Ok((written, new_size)) => FsAppendResult {
                     written,
                     new_size,
@@ -918,20 +766,14 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            req.write().set_data_t(res);
+            *result = Some(res);
             DriverStatus::Success
         }
 
-        FsOp::ZeroRange => {
-            let (fs_file_id, offset, len) = {
-                let data = req.data().read_only();
-
-                let Some(p) = data.view::<FsZeroRangeParams>() else {
-                    cold_path();
-                    return DriverStatus::InvalidParameter;
-                };
-                (p.fs_file_id, p.offset, p.len)
-            };
+        FsPayload::ZeroRange { params, result } => {
+            let fs_file_id = params.fs_file_id;
+            let offset = params.offset;
+            let len = params.len;
             let err = {
                 let state = take_cached_file_state(&vdx, fs_file_id);
                 match state {
@@ -968,25 +810,24 @@ async fn execute_fs_work(
                     }
                 }
             };
-            req.write().set_data_t(FsZeroRangeResult { error: err });
+            *result = Some(FsZeroRangeResult { error: err });
             DriverStatus::Success
         }
 
-        FsOp::Seek => handle_seek_fast(dev, req),
-
-        FsOp::SetInfo | FsOp::Delete => DriverStatus::NotImplemented,
+        FsPayload::Seek { .. } => handle_seek_fast(dev, req),
     }
 }
 
-fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) -> DriverStatus {
-    let (fs_file_id, origin, offset) = {
-        let data = req.data().read_only();
-
-        let Some(p) = data.view::<FsSeekParams>() else {
+fn handle_seek_fast(
+    dev: &Arc<DeviceObject>,
+    req: &mut RequestHandle<'_, FsRequest<'_>>,
+) -> DriverStatus {
+    let (fs_file_id, origin, offset) = match &req.read().body.payload {
+        FsPayload::Seek { params, .. } => (params.fs_file_id, params.origin, params.offset),
+        _ => {
             cold_path();
             return DriverStatus::InvalidParameter;
-        };
-        (p.fs_file_id, p.origin, p.offset)
+        }
     };
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
     let result = {
@@ -1014,35 +855,34 @@ fn handle_seek_fast(dev: &Arc<DeviceObject>, req: &mut RequestHandle<'_, '_>) ->
             error: Some(e),
         },
     };
-    req.write().set_data_t(res);
+    if let FsPayload::Seek { result, .. } = &mut req.write().body.payload {
+        *result = Some(res);
+    }
     DriverStatus::Success
 }
 
 async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(
-        RequestType::FlushOwner {
-            owner,
-            should_block,
-        },
-        RequestData::empty(),
-    );
+    let mut flush_req = RequestHandle::new(FlushOwner {
+        owner,
+        should_block,
+    });
     flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
     pnp_send_request(volume_target, &mut flush_req).await
 }
 
 #[request_handler]
-pub async fn fs_op_dispatch(
+pub async fn fs_op_dispatch<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &mut RequestHandle<'_, '_>,
+    req: &'b mut RequestHandle<'req, FsRequest<'data>>,
 ) -> DriverStep {
-    if unlikely(matches!(req.read().kind, RequestType::Fs(FsOp::Seek))) {
+    if unlikely(matches!(req.read().body.op, FsOp::Seek)) {
         let status = handle_seek_fast(dev, req);
         req.write().status = status.clone();
         return DriverStep::complete(status);
     }
 
     let flush_metadata_after_op =
-        matches!(req.read().kind, RequestType::Fs(FsOp::Close | FsOp::Flush));
+        matches!(req.read().body.op, FsOp::Close | FsOp::Flush);
 
     let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
         let vdx = ext_mut::<VolCtrlDevExt>(&dev);

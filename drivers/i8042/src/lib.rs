@@ -10,7 +10,6 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use i8042::probe_i8042;
-use kernel_api::println;
 use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{io::IoVtable, pnp::DeviceIds},
@@ -18,7 +17,7 @@ use kernel_api::{
         DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
     },
-    request::RequestHandle,
+    request::{Pnp, RequestHandle},
     request_handler,
     status::DriverStatus,
 };
@@ -53,7 +52,7 @@ pub extern "win64" fn ps2_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let mut pnp = PnpVtable::new();
+    let pnp = PnpVtable::new();
     pnp.set(PnpMinorFunction::StartDevice, ps2_start);
     pnp.set(PnpMinorFunction::QueryDeviceRelations, ps2_query_devrels);
 
@@ -67,9 +66,9 @@ pub extern "win64" fn ps2_device_add(
 }
 
 #[request_handler]
-pub async fn ps2_start<'a, 'b>(
+pub async fn ps2_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     if let Ok(ext) = dev.try_devext::<DevExt>() {
         if !ext.probed.swap(true, Ordering::Release) {
@@ -84,12 +83,12 @@ pub async fn ps2_start<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn ps2_query_devrels<'a, 'b>(
+pub async fn ps2_query_devrels<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     use kernel_api::pnp::DeviceRelationType;
-    let relation = req.read().pnp.as_ref().unwrap().relation;
+    let relation = req.read().body.request.relation;
     if relation != DeviceRelationType::BusRelations {
         return DriverStep::complete(DriverStatus::NotImplemented);
     }
@@ -155,7 +154,7 @@ fn make_child_pdo(
         compatible: compat.iter().map(|s| (*s).into()).collect(),
     };
 
-    let mut vt = PnpVtable::new();
+    let vt = PnpVtable::new();
     vt.set(PnpMinorFunction::QueryId, ps2_child_query_id);
     vt.set(PnpMinorFunction::StartDevice, ps2_child_start);
 
@@ -173,9 +172,9 @@ fn make_child_pdo(
 }
 
 #[request_handler]
-async fn ps2_child_query_id<'a, 'b>(
+async fn ps2_child_query_id<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let is_kbd = match dev.try_devext::<Ps2ChildExt>() {
         Ok(ext) => ext.is_kbd,
@@ -183,8 +182,8 @@ async fn ps2_child_query_id<'a, 'b>(
     };
 
     {
-        let mut r = req.write();
-        let p = r.pnp.as_mut().unwrap();
+        let r = req.write();
+        let p = &mut r.body.request;
 
         match p.id_type {
             QueryIdType::HardwareIds => {
@@ -231,9 +230,9 @@ async fn ps2_child_query_id<'a, 'b>(
 }
 
 #[request_handler]
-async fn ps2_child_start<'a, 'b>(
+async fn ps2_child_start<'req, 'data, 'b>(
     _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
 }

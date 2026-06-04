@@ -25,7 +25,8 @@ use kernel_api::irq::{
 };
 use kernel_api::kernel_types::PHYSICAL_MEMORY_OFFSET;
 use kernel_api::kernel_types::dma::{
-    Described, FromDevice, IoBuffer, IoBufferPageFrame, PhysFramed, ToDevice,
+    IoBufferInner, IoBufferPageFrame, IoBufferStateKind, ReadIoBuffer, ReadIoBufferDirectionKind,
+    WriteIoBuffer, WriteIoBufferDirectionKind,
 };
 use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
 use kernel_api::kernel_types::irq::IrqMeta;
@@ -36,7 +37,7 @@ use kernel_api::pnp::{
     ResourceKind, driver_set_evt_device_add, pnp_create_child_devnode_and_pdo_with_init,
     pnp_forward_request_to_next_lower,
 };
-use kernel_api::request::{RequestDataView, RequestHandle, RequestType};
+use kernel_api::request::{DeviceControl, Pnp, Read, RequestHandle, RequestKind, Write};
 use kernel_api::request_handler;
 use kernel_api::status::DriverStatus;
 use kernel_api::util::wait_duration;
@@ -57,6 +58,7 @@ const ATA_CMD_IDENTIFY: u8 = 0xEC;
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
 const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
 const ATA_CMD_FLUSH_CACHE: u8 = 0xE7;
+const IOCTL_BLOCK_FLUSH: u32 = 0xB000_0003;
 
 const ATA_SR_BSY: u8 = 1 << 7;
 const ATA_SR_DRDY: u8 = 1 << 6;
@@ -65,11 +67,14 @@ const ATA_SR_ERR: u8 = 1 << 0;
 
 const TIMEOUT_MS: u64 = 10000;
 
-fn complete_req(req: &mut RequestHandle, status: DriverStatus) -> DriverStep {
+fn complete_req<K: RequestKind>(
+    _req: &mut RequestHandle<'_, K>,
+    status: DriverStatus,
+) -> DriverStep {
     DriverStep::complete(status)
 }
 
-fn continue_req(req: &mut RequestHandle) -> DriverStep {
+fn continue_req<K: RequestKind>(_req: &mut RequestHandle<'_, K>) -> DriverStep {
     DriverStep::Continue
 }
 
@@ -85,16 +90,8 @@ struct PhysCursor<'a> {
 }
 
 impl<'a> PhysCursor<'a> {
-    fn new<'buffer, D: kernel_api::kernel_types::dma::IoBufferDirection>(
-        buffer: &'a IoBuffer<'buffer, PhysFramed, D>,
-        len: usize,
-    ) -> Option<Self> {
-        Self::from_parts(
-            buffer.physical_frames(),
-            buffer.frame_offset(),
-            buffer.len(),
-            len,
-        )
+    fn from_inner(inner: &'a IoBufferInner<'_>, len: usize) -> Option<Self> {
+        Self::from_parts(inner.page_frames(), inner.frame_offset(), inner.len(), len)
     }
 
     fn from_parts(
@@ -170,38 +167,22 @@ impl<'a> PhysCursor<'a> {
     }
 }
 
-fn has_from_device_buffer(
-    data: kernel_api::request::RequestDataRefMut<'_, '_, kernel_api::request::Writable>,
-    len: usize,
-) -> bool {
-    data.view::<IoBuffer<'_, PhysFramed, FromDevice>>()
-        .map_or(false, |b| b.len() >= len)
-        || data
-            .view::<IoBuffer<'_, Described, FromDevice>>()
-            .map_or(false, |b| b.len() >= len)
+fn read_buffer_cursor<'a>(buffer: &'a ReadIoBuffer<'_>, len: usize) -> Option<PhysCursor<'a>> {
+    match (buffer.state(), buffer.direction()) {
+        (
+            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed,
+            ReadIoBufferDirectionKind::FromDevice | ReadIoBufferDirectionKind::Bidirectional,
+        ) => PhysCursor::from_inner(buffer.as_inner(), len),
+    }
 }
 
-fn has_to_device_buffer(
-    data: kernel_api::request::RequestDataRef<'_, '_, kernel_api::request::ReadOnly>,
-    len: usize,
-) -> bool {
-    data.view::<IoBuffer<'_, PhysFramed, ToDevice>>()
-        .map_or(false, |b| b.len() >= len)
-        || data
-            .view::<IoBuffer<'_, Described, ToDevice>>()
-            .map_or(false, |b| b.len() >= len)
-}
-
-enum IdeWriteBuffer {
-    Phys {
-        frames: Vec<IoBufferPageFrame>,
-        frame_offset: usize,
-        buffer_len: usize,
-    },
-    Described {
-        addr: usize,
-        buffer_len: usize,
-    },
+fn write_buffer_cursor<'a>(buffer: &'a WriteIoBuffer<'_>, len: usize) -> Option<PhysCursor<'a>> {
+    match (buffer.state(), buffer.direction()) {
+        (
+            IoBufferStateKind::Described | IoBufferStateKind::PhysFramed,
+            WriteIoBufferDirectionKind::ToDevice | WriteIoBufferDirectionKind::Bidirectional,
+        ) => PhysCursor::from_inner(buffer.as_inner(), len),
+    }
 }
 
 /// IDE interrupt service routine.
@@ -258,20 +239,19 @@ pub extern "win64" fn ide_device_add(
 }
 
 #[request_handler]
-async fn ide_pnp_start<'a, 'b>(
+async fn ide_pnp_start<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let mut child_handle = RequestHandle::new_pnp(
-        PnpRequest {
+    let mut child_handle = RequestHandle::new(Pnp {
+        request: PnpRequest {
             minor_function: PnpMinorFunction::QueryResources,
             relation: DeviceRelationType::TargetDeviceRelation,
             id_type: QueryIdType::CompatibleIds,
             ids_out: Vec::new(),
             data_out: RequestData::empty(),
         },
-        RequestData::empty(),
-    );
+    });
     let st = pnp_forward_request_to_next_lower(dev.clone(), &mut child_handle).await;
     if st != DriverStatus::NoSuchDevice {
         let qst = child_handle.read().status.clone();
@@ -281,9 +261,8 @@ async fn ide_pnp_start<'a, 'b>(
         let binding = child_handle.read();
         let bars = {
             let data = binding
-                .pnp
-                .as_ref()
-                .unwrap()
+                .body
+                .request
                 .data_out_ref()
                 .view::<Vec<u8>>()
                 .map(|v| v.as_slice())
@@ -342,11 +321,11 @@ async fn ide_pnp_start<'a, 'b>(
 }
 
 #[request_handler]
-async fn ide_pnp_query_devrels<'a, 'b>(
+async fn ide_pnp_query_devrels<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
-    let relation = { req.read().pnp.as_ref().unwrap().relation };
+    let relation = { req.read().body.request.relation };
     if relation == DeviceRelationType::BusRelations {
         ide_enumerate_bus(&dev);
         return complete_req(req, DriverStatus::Success);
@@ -450,9 +429,9 @@ fn create_child_pdo(
 }
 
 #[request_handler]
-pub async fn ide_pdo_read<'a, 'b>(
+pub async fn ide_pdo_read<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Read<'data>>,
     _buf_len: usize,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -474,13 +453,9 @@ pub async fn ide_pdo_read<'a, 'b>(
         Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let kind = {
+    let (offset, len) = {
         let r = req.read();
-        r.kind
-    };
-    let (offset, len) = match kind {
-        RequestType::Read { offset, len, .. } => (offset, len),
-        _ => return complete_req(req, DriverStatus::InvalidParameter),
+        (r.body.offset, r.body.len)
     };
 
     if len == 0 {
@@ -498,60 +473,33 @@ pub async fn ide_pdo_read<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    match req.data() {
-        RequestDataView::Writable(data) => {
-            if !has_from_device_buffer(data, len) {
-                return complete_req(req, DriverStatus::InsufficientResources);
-            }
-        }
-        RequestDataView::ReadOnly(_) => return complete_req(req, DriverStatus::InvalidParameter),
-    }
-
     let dh = cdx.dh.load(Ordering::Acquire);
     let irq = unsafe { dx.irq() };
 
-    let mut ctrl = dx.controller.lock().await;
-    let data = match req.data() {
-        RequestDataView::Writable(data) => data,
-        RequestDataView::ReadOnly(_) => return complete_req(req, DriverStatus::InvalidParameter),
+    let read_status = {
+        let buffer = &req.read().body.buffer;
+        let Some(cursor) = read_buffer_cursor(buffer, len) else {
+            return complete_req(req, DriverStatus::InsufficientResources);
+        };
+
+        let mut ctrl = dx.controller.lock().await;
+        let status =
+            if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await {
+                DriverStatus::Success
+            } else {
+                DriverStatus::Unsuccessful
+            };
+        drop(ctrl);
+        status
     };
-    let read_status = if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, FromDevice>>() {
-        if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, buf, len).await {
-            DriverStatus::Success
-        } else {
-            DriverStatus::Unsuccessful
-        }
-    } else {
-        let described = data
-            .view::<IoBuffer<'_, Described, FromDevice>>()
-            .expect("read req missing buffer");
-        match IoBuffer::<PhysFramed, FromDevice>::new(
-            described.frame_offset(),
-            len,
-            described.physical_frames(),
-        ) {
-            Ok(phys_buf) => {
-                if ata_pio_read_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, &phys_buf, len)
-                    .await
-                {
-                    DriverStatus::Success
-                } else {
-                    DriverStatus::Unsuccessful
-                }
-            }
-            Err(_) => DriverStatus::InsufficientResources,
-        }
-    };
-    drop(ctrl);
-    drop(data);
 
     complete_req(req, read_status)
 }
 
 #[request_handler]
-pub async fn ide_pdo_write<'a, 'b>(
+pub async fn ide_pdo_write<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Write<'data>>,
     _buf_len: usize,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
@@ -573,13 +521,9 @@ pub async fn ide_pdo_write<'a, 'b>(
         Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let kind = {
+    let (offset, len) = {
         let r = req.read();
-        r.kind
-    };
-    let (offset, len) = match kind {
-        RequestType::Write { offset, len, .. } => (offset, len),
-        _ => return complete_req(req, DriverStatus::InvalidParameter),
+        (r.body.offset, r.body.len)
     };
 
     if len == 0 {
@@ -597,80 +541,33 @@ pub async fn ide_pdo_write<'a, 'b>(
         return complete_req(req, DriverStatus::InvalidParameter);
     }
 
-    match req.data() {
-        RequestDataView::ReadOnly(data) => {
-            if !has_to_device_buffer(data, len) {
-                return complete_req(req, DriverStatus::InsufficientResources);
-            }
-        }
-        RequestDataView::Writable(_) => return complete_req(req, DriverStatus::InvalidParameter),
-    }
-
     let dh = cdx.dh.load(Ordering::Acquire);
     let irq = unsafe { dx.irq() };
 
-    let write_buffer = {
-        let data = match req.data() {
-            RequestDataView::ReadOnly(data) => data,
-            RequestDataView::Writable(_) => {
-                return complete_req(req, DriverStatus::InvalidParameter);
-            }
+    let write_status = {
+        let buffer = &req.read().body.buffer;
+        let Some(cursor) = write_buffer_cursor(buffer, len) else {
+            return complete_req(req, DriverStatus::InsufficientResources);
         };
 
-        if let Some(buf) = data.view::<IoBuffer<'_, PhysFramed, ToDevice>>() {
-            IdeWriteBuffer::Phys {
-                frames: buf.physical_frames().to_vec(),
-                frame_offset: buf.frame_offset(),
-                buffer_len: buf.len(),
-            }
-        } else {
-            let buf = data
-                .view::<IoBuffer<'_, Described, ToDevice>>()
-                .expect("write req missing buffer");
-            IdeWriteBuffer::Described {
-                addr: buf.as_slice().as_ptr() as usize,
-                buffer_len: buf.len(),
-            }
-        }
-    };
+        let mut ctrl = dx.controller.lock().await;
+        let ok = ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await;
+        drop(ctrl);
 
-    let mut ctrl = dx.controller.lock().await;
-    let ok = match write_buffer {
-        IdeWriteBuffer::Phys {
-            frames,
-            frame_offset,
-            buffer_len,
-        } => match PhysCursor::from_parts(&frames, frame_offset, buffer_len, len) {
-            Some(cursor) => {
-                ata_pio_write_phys_async(&mut ctrl, irq, dh, lba as u32, sectors, cursor).await
-            }
-            None => false,
-        },
-        IdeWriteBuffer::Described { addr, buffer_len } => {
-            if buffer_len < len {
-                false
-            } else {
-                let buf = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
-                ata_pio_write_async(&mut ctrl, irq, dh, lba as u32, sectors, buf).await
-            }
-        }
-    };
-    drop(ctrl);
-
-    complete_req(
-        req,
         if ok {
             DriverStatus::Success
         } else {
             DriverStatus::Unsuccessful
-        },
-    )
+        }
+    };
+
+    complete_req(req, write_status)
 }
 
 #[request_handler]
-pub async fn ide_pdo_internal_ioctl<'a, 'b>(
+pub async fn ide_pdo_internal_ioctl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
@@ -690,14 +587,7 @@ pub async fn ide_pdo_internal_ioctl<'a, 'b>(
         Err(_) => return complete_req(req, DriverStatus::NoSuchDevice),
     };
 
-    let kind = {
-        let r = req.read();
-        r.kind
-    };
-    let code = match kind {
-        RequestType::DeviceControl(c) => c,
-        _ => return complete_req(req, DriverStatus::InvalidParameter),
-    };
+    let code = { req.read().body.code };
 
     match code {
         IOCTL_BLOCK_FLUSH => {
@@ -882,12 +772,8 @@ async fn ata_pio_read_phys_async(
     dh: u8,
     mut lba: u32,
     mut sectors: u32,
-    buffer: &IoBuffer<'_, PhysFramed, FromDevice>,
-    len: usize,
+    mut out: PhysCursor<'_>,
 ) -> bool {
-    let Some(mut out) = PhysCursor::new(buffer, len) else {
-        return false;
-    };
     let p = &mut ctrl.ports;
 
     while sectors > 0 {
@@ -935,79 +821,6 @@ async fn ata_pio_read_phys_async(
     }
 
     true
-}
-
-async fn ata_pio_write_async(
-    ctrl: &mut ControllerState,
-    irq: &Option<IrqHandle>,
-    dh: u8,
-    mut lba: u32,
-    mut sectors: u32,
-    data: &[u8],
-) -> bool {
-    let mut off = 0usize;
-    let p = &mut ctrl.ports;
-
-    while sectors > 0 {
-        let chunk = core::cmp::min(sectors, 256);
-        let sc = if chunk == 256 { 0u8 } else { chunk as u8 };
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        let devsel = (dh & 0xF0) | ((lba >> 24) as u8 & 0x0F);
-        unsafe { p.drive_head.write(devsel) };
-        io_wait_400ns(&mut p.control);
-
-        if !wait_ready_async(p, irq, TIMEOUT_MS).await {
-            return false;
-        }
-
-        unsafe {
-            p.sector_count.write(sc);
-            p.lba_lo.write((lba & 0xFF) as u8);
-            p.lba_mid.write(((lba >> 8) & 0xFF) as u8);
-            p.lba_hi.write(((lba >> 16) & 0xFF) as u8);
-            p.command.write(ATA_CMD_WRITE_SECTORS);
-        }
-
-        for sec_idx in 0..chunk {
-            if sec_idx == 0 {
-                // First sector: DRQ is immediate after command, no IRQ fires.
-                if !wait_drq_poll_brief(p) {
-                    return false;
-                }
-            } else {
-                // Subsequent sectors: wait for IRQ signaling device ready.
-                if !wait_drq_async(p, irq, TIMEOUT_MS).await {
-                    return false;
-                }
-            }
-
-            if off + 512 > data.len() {
-                return false;
-            }
-            for _ in 0..256 {
-                let lo = data[off] as u16;
-                let hi = data[off + 1] as u16;
-                unsafe { p.data.write(lo | (hi << 8)) };
-                off += 2;
-            }
-        }
-
-        lba = lba.wrapping_add(chunk);
-        sectors -= chunk;
-    }
-
-    // Wait for final write to complete
-    if !wait_not_busy_async(p, irq, TIMEOUT_MS).await {
-        return false;
-    }
-
-    // Flush cache
-    unsafe { p.command.write(ATA_CMD_FLUSH_CACHE) };
-    wait_not_busy_async(p, irq, TIMEOUT_MS).await
 }
 
 async fn ata_pio_write_phys_async(
@@ -1249,16 +1062,16 @@ fn wait_drq_poll_brief(ports: &mut Ports) -> bool {
 }
 
 #[request_handler]
-pub async fn ide_pdo_query_id<'a, 'b>(
+pub async fn ide_pdo_query_id<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     use QueryIdType::*;
-    let ty = { req.read().pnp.as_ref().unwrap().id_type };
+    let ty = { req.read().body.request.id_type };
 
     {
-        let mut w = req.write();
-        let p = w.pnp.as_mut().unwrap();
+        let w = req.write();
+        let p = &mut w.body.request;
         match ty {
             HardwareIds => {
                 p.ids_out.push("IDE\\Disk".into());
@@ -1288,9 +1101,9 @@ pub async fn ide_pdo_query_id<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn ide_pdo_query_resources<'a, 'b>(
+pub async fn ide_pdo_query_resources<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let cdx = match pdo.try_devext::<ChildExt>() {
         Ok(x) => x,
@@ -1300,16 +1113,14 @@ pub async fn ide_pdo_query_resources<'a, 'b>(
     };
 
     let status = {
-        let mut w = req.write();
-        match w.pnp.as_mut() {
-            Some(p) => match cdx.disk_info.as_ref() {
-                Some(di) => {
-                    p.data_out = RequestData::from_t::<DiskInfo>(*di);
-                    DriverStatus::Success
-                }
-                None => DriverStatus::DeviceNotReady,
-            },
-            None => DriverStatus::InvalidParameter,
+        let w = req.write();
+        let p = &mut w.body.request;
+        match cdx.disk_info.as_ref() {
+            Some(di) => {
+                p.data_out = RequestData::from_t::<DiskInfo>(*di);
+                DriverStatus::Success
+            }
+            None => DriverStatus::DeviceNotReady,
         }
     };
 
@@ -1317,9 +1128,9 @@ pub async fn ide_pdo_query_resources<'a, 'b>(
 }
 
 #[request_handler]
-pub async fn ide_pdo_start<'a, 'b>(
+pub async fn ide_pdo_start<'req, 'data, 'b>(
     _pdo: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'a, '_>,
+    req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }

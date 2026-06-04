@@ -8,7 +8,7 @@ use kernel_api::{
     device::{DeviceInit, DeviceObject, DriverObject},
     pnp::{DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add},
     println,
-    request::RequestHandle,
+    request::{Pnp, RequestHandle},
     request_handler,
     status::DriverStatus,
 };
@@ -37,9 +37,9 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware<'a, 'b>(
+pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     _device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     println!("BaseBusDriver: EvtDevicePrepareHardware called.\n");
     DriverStep::complete(DriverStatus::Success)

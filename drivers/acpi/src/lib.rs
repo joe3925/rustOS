@@ -18,7 +18,7 @@ use kernel_api::pnp::{
     DriverStep, PnpMinorFunction, PnpVtable, driver_set_evt_device_add, get_acpi_tables,
     pnp_create_child_devnode_and_pdo_with_init,
 };
-use kernel_api::request::RequestHandle;
+use kernel_api::request::{Pnp, RequestHandle};
 use kernel_api::runtime::spawn_blocking;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::PhysAddr;
@@ -58,9 +58,9 @@ pub extern "win64" fn bus_driver_device_add(
 }
 
 #[request_handler]
-pub async fn bus_driver_prepare_hardware<'a, 'b>(
+pub async fn bus_driver_prepare_hardware<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let (dsdt, ssdts) = {
         let acpi_tables = get_acpi_tables();
@@ -146,9 +146,9 @@ pub unsafe fn map_aml(paddr: usize, len: usize) -> &'static [u8] {
 }
 
 #[request_handler]
-pub async fn enumerate_bus<'a, 'b>(
+pub async fn enumerate_bus<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'a, '_>,
+    _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     let dev_ext: &DevExt = &device.try_devext().expect("Failed to get dev ext ACPI");
 

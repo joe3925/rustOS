@@ -19,7 +19,7 @@ use kernel_api::memory::{
     unmap_range,
 };
 use kernel_api::pnp::pnp_send_request;
-use kernel_api::request::{RequestHandle, RequestType, TraversalPolicy};
+use kernel_api::request::{Read, RequestHandle, TraversalPolicy};
 use kernel_api::runtime::spawn;
 use kernel_api::status::DriverStatus;
 use kernel_api::x86_64::VirtAddr;
@@ -505,14 +505,12 @@ async fn bench_read_via_request(
     } else {
         data.resize(len, 0);
         let io_buf = IoBuffer::<Described, FromDevice>::new(&mut data[..]).into_phys_framed();
-        let mut req = RequestHandle::new_t(
-            RequestType::Read {
-                offset,
-                len,
-                no_buffer: false,
-            },
-            io_buf,
-        );
+        let mut req = RequestHandle::new(Read {
+            offset,
+            len,
+            no_buffer: false,
+            buffer: io_buf.into(),
+        });
         req.set_traversal_policy(TraversalPolicy::ForwardLower);
 
         let start_tsc = rdtsc();

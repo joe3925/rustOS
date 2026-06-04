@@ -8,7 +8,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_api::device::DeviceObject;
 use kernel_api::memory::{map_mmio_region, unmap_mmio_region};
-use kernel_api::request::{Request, RequestData, RequestHandle};
+use kernel_api::request::{Pnp, Request, RequestData, RequestHandle};
 use kernel_api::status::{DriverStatus, PageMapError};
 
 use kernel_api::pnp::{
@@ -118,7 +118,7 @@ pub struct PciPdoExt {
 #[repr(C)]
 pub struct PrepareHardwareCtx<'a> {
     pub(crate) original_device: Arc<DeviceObject>,
-    pub(crate) original_request: Arc<RwLock<Request<'a>>>,
+    pub(crate) original_request: Arc<RwLock<Request<Pnp<'a>>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -571,13 +571,11 @@ struct WaitCtx {
     blob: UnsafeCell<Vec<u8>>,
 }
 
-extern "win64" fn on_complete(req: &mut Request, ctx: usize) -> DriverStatus {
+extern "win64" fn on_complete(req: &mut Request<Pnp<'_>>, ctx: usize) -> DriverStatus {
     let w = unsafe { &*(ctx as *const WaitCtx) };
     let mut out = Vec::new();
-    if let Some(p) = req.pnp.as_ref() {
-        if let Some(v) = p.data_out_ref().view::<Vec<u8>>() {
-            out.extend_from_slice(v);
-        }
+    if let Some(v) = req.body.request.data_out_ref().view::<Vec<u8>>() {
+        out.extend_from_slice(v);
     }
     unsafe {
         *w.status.get() = req.status.clone();
@@ -663,7 +661,7 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
         data_out: RequestData::empty(),
     };
 
-    let mut handle = RequestHandle::new_pnp(pnp, RequestData::empty());
+    let mut handle = RequestHandle::new(Pnp { request: pnp });
     let status = pnp_forward_request_to_next_lower(device.clone(), &mut handle).await;
 
     if status != DriverStatus::Success {
@@ -673,9 +671,10 @@ pub async fn load_segments_from_parent(device: &Arc<DeviceObject>) -> Vec<McfgSe
 
     let blob = handle
         .read()
-        .pnp
-        .as_ref()
-        .and_then(|p| p.data_out_ref().view::<Vec<u8>>())
+        .body
+        .request
+        .data_out_ref()
+        .view::<Vec<u8>>()
         .cloned()
         .unwrap_or_default();
 
