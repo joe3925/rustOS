@@ -12,7 +12,7 @@ use core::{
 use i8042::probe_i8042;
 use kernel_api::{
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
-    kernel_types::{io::IoVtable, pnp::DeviceIds},
+    kernel_types::pnp::DeviceIds,
     pnp::{
         DriverStep, PnpMinorFunction, PnpVtable, QueryIdType, driver_set_evt_device_add,
         pnp_create_child_devnode_and_pdo_with_init,
@@ -158,7 +158,7 @@ fn make_child_pdo(
     vt.set(PnpMinorFunction::QueryId, ps2_child_query_id);
     vt.set(PnpMinorFunction::StartDevice, ps2_child_start);
 
-    let mut child_init = DeviceInit::new(IoVtable::new(), Some(vt));
+    let mut child_init = DeviceInit::with_pnp(Some(vt));
     child_init.set_dev_ext_from(Ps2ChildExt { is_kbd });
 
     let (_dn, _pdo) = pnp_create_child_devnode_and_pdo_with_init(

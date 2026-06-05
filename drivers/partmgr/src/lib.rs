@@ -15,7 +15,8 @@ use core::sync::atomic::AtomicBool;
 use kernel_api::device::{DevExtRef, DevNode, DeviceInit, DeviceObject, DriverObject};
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer};
 use kernel_api::kernel_types::io::{
-    DiskInfo, GptHeader, GptPartitionEntry, IoType, IoVtable, PartitionInfo,
+    DeviceFlush, DeviceFlushDirty, DeviceRead, DeviceWrite, DiskInfo, GptHeader,
+    GptPartitionEntry, PartitionInfo,
 };
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -86,6 +87,154 @@ struct PartDevExt {
     parent: Once<Weak<DevNode>>,
 }
 
+struct PartitionPdoIo;
+
+impl DeviceRead for PartitionPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        device: &Arc<DeviceObject>,
+        request: &'b mut RequestHandle<'req, Read<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        let dx = ext::<PartDevExt>(&device);
+        let start_lba = *dx.start_lba.get().unwrap();
+        let end_lba = *dx.end_lba.get().unwrap();
+        let block_size = match dx.block_size.get() {
+            Some(v) if *v != 0 => *v as u64,
+            _ => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+
+        let off_res = {
+            let body = &request.read().body;
+            let offset = body.offset;
+            let len = body.len;
+            if unlikely(buf_len != len) {
+                cold_path();
+                Err(DriverStatus::InvalidParameter)
+            } else {
+                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
+                if unlikely(offset + (buf_len as u64) > part_bytes) {
+                    cold_path();
+                    Err(DriverStatus::InvalidParameter)
+                } else if unlikely(
+                    offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
+                ) {
+                    cold_path();
+                    Err(DriverStatus::InvalidParameter)
+                } else {
+                    Ok(offset)
+                }
+            }
+        };
+        let off = match off_res {
+            Ok(v) => v,
+            Err(st) => {
+                cold_path();
+                return DriverStep::complete(st);
+            }
+        };
+
+        let phys_off = off + ((start_lba as u64) << 9);
+        request.set_traversal_policy(TraversalPolicy::ForwardLower);
+        request.write().body.offset = phys_off;
+
+        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+
+        DriverStep::complete(status)
+    }
+}
+
+impl DeviceWrite for PartitionPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        device: &Arc<DeviceObject>,
+        request: &'b mut RequestHandle<'req, Write<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        let dx = ext::<PartDevExt>(&device);
+        let start_lba = *dx.start_lba.get().unwrap();
+        let end_lba = *dx.end_lba.get().unwrap();
+        let block_size = match dx.block_size.get() {
+            Some(v) if *v != 0 => *v as u64,
+            _ => {
+                cold_path();
+                return DriverStep::complete(DriverStatus::InvalidParameter);
+            }
+        };
+
+        let off_res = {
+            let body = &request.read().body;
+            let offset = body.offset;
+            let len = body.len;
+            if unlikely(buf_len != len) {
+                cold_path();
+                Err(DriverStatus::InvalidParameter)
+            } else {
+                let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
+                if unlikely(offset + (buf_len as u64) > part_bytes) {
+                    cold_path();
+                    Err(DriverStatus::InvalidParameter)
+                } else if unlikely(
+                    offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
+                ) {
+                    cold_path();
+                    Err(DriverStatus::InvalidParameter)
+                } else {
+                    Ok(offset)
+                }
+            }
+        };
+        let off = match off_res {
+            Ok(v) => v,
+            Err(st) => {
+                cold_path();
+                return DriverStep::complete(st);
+            }
+        };
+
+        let phys_off = off + ((start_lba as u64) << 9);
+
+        // Move caller buffer into forwarded request to avoid copying
+        request.set_traversal_policy(TraversalPolicy::ForwardLower);
+        request.write().body.offset = phys_off;
+
+        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+
+        DriverStep::complete(status)
+    }
+}
+
+impl DeviceFlush for PartitionPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        device: &Arc<DeviceObject>,
+        request: &'b mut RequestHandle<'req, Flush>,
+    ) -> DriverStep {
+        let dx = ext::<PartDevExt>(&device);
+        request.set_traversal_policy(TraversalPolicy::ForwardLower);
+        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+
+        DriverStep::complete(status)
+    }
+}
+
+impl DeviceFlushDirty for PartitionPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        device: &Arc<DeviceObject>,
+        request: &'b mut RequestHandle<'req, FlushDirty>,
+    ) -> DriverStep {
+        let dx = ext::<PartDevExt>(&device);
+        request.set_traversal_policy(TraversalPolicy::ForwardLower);
+        let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
+
+        DriverStep::complete(status)
+    }
+}
+
 #[request_handler]
 async fn partition_pdo_query_resources<'req, 'data, 'b>(
     device: &Arc<DeviceObject>,
@@ -101,144 +250,6 @@ async fn partition_pdo_query_resources<'req, 'data, 'b>(
     }
 
     DriverStep::complete(DriverStatus::Success)
-}
-
-#[request_handler]
-pub async fn partition_pdo_read<'req, 'data, 'b>(
-    device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Read<'data>>,
-    buf_len: usize,
-) -> DriverStep {
-    let dx = ext::<PartDevExt>(&device);
-    let start_lba = *dx.start_lba.get().unwrap();
-    let end_lba = *dx.end_lba.get().unwrap();
-    let block_size = match dx.block_size.get() {
-        Some(v) if *v != 0 => *v as u64,
-        _ => {
-            cold_path();
-            return DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
-
-    let off_res = {
-        let body = &request.read().body;
-        let offset = body.offset;
-        let len = body.len;
-        if unlikely(buf_len != len) {
-            cold_path();
-            Err(DriverStatus::InvalidParameter)
-        } else {
-            let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-            if unlikely(offset + (buf_len as u64) > part_bytes) {
-                cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else if unlikely(
-                offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
-            ) {
-                cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else {
-                Ok(offset)
-            }
-        }
-    };
-    let off = match off_res {
-        Ok(v) => v,
-        Err(st) => {
-            cold_path();
-            return DriverStep::complete(st);
-        }
-    };
-
-    let phys_off = off + ((start_lba as u64) << 9);
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-    request.write().body.offset = phys_off;
-
-    let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-    DriverStep::complete(status)
-}
-
-#[request_handler]
-pub async fn partition_pdo_write<'req, 'data, 'b>(
-    device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Write<'data>>,
-    buf_len: usize,
-) -> DriverStep {
-    let dx = ext::<PartDevExt>(&device);
-    let start_lba = *dx.start_lba.get().unwrap();
-    let end_lba = *dx.end_lba.get().unwrap();
-    let block_size = match dx.block_size.get() {
-        Some(v) if *v != 0 => *v as u64,
-        _ => {
-            cold_path();
-            return DriverStep::complete(DriverStatus::InvalidParameter);
-        }
-    };
-
-    let off_res = {
-        let body = &request.read().body;
-        let offset = body.offset;
-        let len = body.len;
-        if unlikely(buf_len != len) {
-            cold_path();
-            Err(DriverStatus::InvalidParameter)
-        } else {
-            let part_bytes = ((end_lba - start_lba + 1) << 9) as u64;
-            if unlikely(offset + (buf_len as u64) > part_bytes) {
-                cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else if unlikely(
-                offset % block_size != 0 || !(buf_len as u64).is_multiple_of(block_size),
-            ) {
-                cold_path();
-                Err(DriverStatus::InvalidParameter)
-            } else {
-                Ok(offset)
-            }
-        }
-    };
-    let off = match off_res {
-        Ok(v) => v,
-        Err(st) => {
-            cold_path();
-            return DriverStep::complete(st);
-        }
-    };
-
-    let phys_off = off + ((start_lba as u64) << 9);
-
-    // Move caller buffer into forwarded request to avoid copying
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-    request.write().body.offset = phys_off;
-
-    let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-    DriverStep::complete(status)
-}
-
-#[request_handler]
-pub async fn partition_pdo_flush<'req, 'b>(
-    device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, Flush>,
-) -> DriverStep {
-    let dx = ext::<PartDevExt>(&device);
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-    DriverStep::complete(status)
-}
-
-#[request_handler]
-pub async fn partition_pdo_flush_dirty<'req, 'b>(
-    device: &Arc<DeviceObject>,
-    request: &'b mut RequestHandle<'req, FlushDirty>,
-) -> DriverStep {
-    let dx = ext::<PartDevExt>(&device);
-    request.set_traversal_policy(TraversalPolicy::ForwardLower);
-    let status = pnp_send_request_to_stack_top(dx.parent.get().unwrap().clone(), request).await;
-
-    DriverStep::complete(status)
 }
 
 #[request_handler]
@@ -400,13 +411,11 @@ pub async fn partmgr_pnp_query_devrels<'req, 'data, 'b>(
             continue;
         }
 
-        let mut io_vt = IoVtable::new();
-        io_vt.set(IoType::Read(partition_pdo_read), 0);
-        io_vt.set(IoType::Write(partition_pdo_write), 0);
-        io_vt.set(IoType::Flush(partition_pdo_flush), 0);
-        io_vt.set(IoType::FlushDirty(partition_pdo_flush_dirty), 0);
-
-        let mut child_init = DeviceInit::new(io_vt, None);
+        let mut child_init = DeviceInit::new();
+        child_init.ops.read.register::<PartitionPdoIo>();
+        child_init.ops.write.register::<PartitionPdoIo>();
+        child_init.ops.flush.register::<PartitionPdoIo>();
+        child_init.ops.flush_dirty.register::<PartitionPdoIo>();
 
         let vt = PnpVtable::new();
         vt.set(

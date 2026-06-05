@@ -1,8 +1,16 @@
+use crate::async_ffi::FfiFuture;
 use crate::device::DeviceObject;
 use crate::irq::IrqSafeMutex;
+use crate::pnp::DriverStep;
+use crate::request::{
+    DeviceControl, Flush, FlushDirty, FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate,
+    FsFlush, FsGetInfo, FsOpen, FsRead, FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite,
+    FsZeroRange, Read, RequestHandle, Write,
+};
 use crate::{
-    EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoFs, EvtIoRead,
-    EvtIoWrite,
+    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
+    EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
+    EvtIoDeviceControl, EvtIoFlush, EvtIoFlushDirty, EvtIoFlushOwner, EvtIoRead, EvtIoWrite,
 };
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -574,33 +582,6 @@ pub struct GptPartitionEntry {
     pub name_utf16: [u16; 36],
 }
 
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub enum IoType {
-    Read(EvtIoRead),
-    Write(EvtIoWrite),
-    Flush(EvtIoFlush),
-    FlushDirty(EvtIoFlushDirty),
-    FlushOwner(EvtIoFlushOwner),
-    DeviceControl(EvtIoDeviceControl),
-    Fs(EvtIoFs),
-}
-
-impl IoType {
-    #[inline]
-    pub fn slot(&self) -> usize {
-        match self {
-            IoType::Read(_) => 0,
-            IoType::Write(_) => 1,
-            IoType::Flush(_) => 2,
-            IoType::FlushDirty(_) => 3,
-            IoType::FlushOwner(_) => 4,
-            IoType::DeviceControl(_) => 5,
-            IoType::Fs(_) => 6,
-        }
-    }
-}
-
 #[repr(C)]
 pub struct IoHandler<T> {
     pub handler: T,
@@ -618,73 +599,350 @@ impl<T> core::fmt::Debug for IoHandler<T> {
     }
 }
 
-#[derive(Debug)]
-#[repr(C)]
-pub struct IoVtable {
-    pub read: Option<IoHandler<EvtIoRead>>,
-    pub write: Option<IoHandler<EvtIoWrite>>,
-    pub flush: Option<IoHandler<EvtIoFlush>>,
-    pub flush_dirty: Option<IoHandler<EvtIoFlushDirty>>,
-    pub flush_owner: Option<IoHandler<EvtIoFlushOwner>>,
-    pub device_control: Option<IoHandler<EvtIoDeviceControl>>,
-    pub fs: Option<IoHandler<EvtIoFs>>,
-}
-
-impl IoVtable {
+impl<T> IoHandler<T> {
     #[inline]
-    pub fn new() -> Self {
-        Self {
-            read: None,
-            write: None,
-            flush: None,
-            flush_dirty: None,
-            flush_owner: None,
-            device_control: None,
-            fs: None,
-        }
-    }
-
-    #[inline]
-    fn make_handler<T>(handler: T, depth: usize) -> IoHandler<T> {
+    pub fn new(handler: T, depth: u32) -> Self {
         IoHandler {
             handler,
-            depth,
+            depth: depth as usize,
             running_request: AtomicU64::new(0),
             waiters: TreiberStack::<Waker>::new(),
         }
     }
+}
+
+pub trait DeviceRead {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Read<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait DeviceWrite {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Write<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait DeviceFlush {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Flush>,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait DeviceFlushDirty {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FlushDirty>,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait DeviceFlushOwner {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FlushOwner>,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait DeviceControlHandler {
+    const DEPTH: u32 = 0;
+
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> FfiFuture<DriverStep>;
+}
+
+pub trait FileSystem {
+    const OPEN_DEPTH: u32 = 0;
+    const CLOSE_DEPTH: u32 = 0;
+    const READ_DEPTH: u32 = 0;
+    const WRITE_DEPTH: u32 = 0;
+    const FLUSH_DEPTH: u32 = 1;
+    const SEEK_DEPTH: u32 = 0;
+    const CREATE_DEPTH: u32 = 0;
+    const RENAME_DEPTH: u32 = 0;
+    const READ_DIR_DEPTH: u32 = 0;
+    const GET_INFO_DEPTH: u32 = 0;
+    const SET_LEN_DEPTH: u32 = 0;
+    const APPEND_DEPTH: u32 = 0;
+    const ZERO_RANGE_DEPTH: u32 = 0;
+
+    extern "win64" fn open<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsOpen>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn close<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsClose>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn read<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRead>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn write<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsWrite>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn flush<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsFlush>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn seek<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSeek>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn create<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsCreate>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn rename<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRename>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn read_dir<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsReadDir>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn get_info<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsGetInfo>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn set_len<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSetLen>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn append<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsAppend>>,
+    ) -> FfiFuture<DriverStep>;
+
+    extern "win64" fn zero_range<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsZeroRange>>,
+    ) -> FfiFuture<DriverStep>;
+}
+
+macro_rules! define_device_slot {
+    ($slot:ident, $handler:ty, $trait:path) => {
+        #[repr(C)]
+        #[derive(Debug)]
+        pub struct $slot {
+            handler: Option<IoHandler<$handler>>,
+        }
+
+        impl $slot {
+            #[inline]
+            pub const fn empty() -> Self {
+                Self { handler: None }
+            }
+
+            #[inline]
+            pub fn as_handler(&self) -> Option<&IoHandler<$handler>> {
+                self.handler.as_ref()
+            }
+
+            #[inline]
+            pub fn register<T>(&mut self)
+            where
+                T: $trait + 'static,
+            {
+                self.handler = Some(IoHandler::new(T::handler, T::DEPTH));
+            }
+
+            #[inline]
+            pub fn clear(&mut self) {
+                self.handler = None;
+            }
+        }
+    };
+}
+
+macro_rules! define_fs_slot {
+    ($slot:ident, $handler:ty) => {
+        #[repr(C)]
+        #[derive(Debug)]
+        pub struct $slot {
+            handler: Option<IoHandler<$handler>>,
+        }
+
+        impl $slot {
+            #[inline]
+            pub const fn empty() -> Self {
+                Self { handler: None }
+            }
+
+            #[inline]
+            pub fn as_handler(&self) -> Option<&IoHandler<$handler>> {
+                self.handler.as_ref()
+            }
+
+            #[inline]
+            fn set(&mut self, handler: $handler, depth: u32) {
+                self.handler = Some(IoHandler::new(handler, depth));
+            }
+
+            #[inline]
+            pub fn clear(&mut self) {
+                self.handler = None;
+            }
+        }
+    };
+}
+
+define_device_slot!(ReadSlot, EvtIoRead, DeviceRead);
+define_device_slot!(WriteSlot, EvtIoWrite, DeviceWrite);
+define_device_slot!(FlushSlot, EvtIoFlush, DeviceFlush);
+define_device_slot!(FlushDirtySlot, EvtIoFlushDirty, DeviceFlushDirty);
+define_device_slot!(FlushOwnerSlot, EvtIoFlushOwner, DeviceFlushOwner);
+define_device_slot!(DeviceControlSlot, EvtIoDeviceControl, DeviceControlHandler);
+
+define_fs_slot!(FsOpenSlot, EvtFsOpen);
+define_fs_slot!(FsCloseSlot, EvtFsClose);
+define_fs_slot!(FsReadSlot, EvtFsRead);
+define_fs_slot!(FsWriteSlot, EvtFsWrite);
+define_fs_slot!(FsFlushSlot, EvtFsFlush);
+define_fs_slot!(FsSeekSlot, EvtFsSeek);
+define_fs_slot!(FsCreateSlot, EvtFsCreate);
+define_fs_slot!(FsRenameSlot, EvtFsRename);
+define_fs_slot!(FsReadDirSlot, EvtFsReadDir);
+define_fs_slot!(FsGetInfoSlot, EvtFsGetInfo);
+define_fs_slot!(FsSetLenSlot, EvtFsSetLen);
+define_fs_slot!(FsAppendSlot, EvtFsAppend);
+define_fs_slot!(FsZeroRangeSlot, EvtFsZeroRange);
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FsOps {
+    pub open: FsOpenSlot,
+    pub close: FsCloseSlot,
+    pub read: FsReadSlot,
+    pub write: FsWriteSlot,
+    pub flush: FsFlushSlot,
+    pub seek: FsSeekSlot,
+    pub create: FsCreateSlot,
+    pub rename: FsRenameSlot,
+    pub read_dir: FsReadDirSlot,
+    pub get_info: FsGetInfoSlot,
+    pub set_len: FsSetLenSlot,
+    pub append: FsAppendSlot,
+    pub zero_range: FsZeroRangeSlot,
+}
+
+impl FsOps {
+    pub const fn empty() -> Self {
+        Self {
+            open: FsOpenSlot::empty(),
+            close: FsCloseSlot::empty(),
+            read: FsReadSlot::empty(),
+            write: FsWriteSlot::empty(),
+            flush: FsFlushSlot::empty(),
+            seek: FsSeekSlot::empty(),
+            create: FsCreateSlot::empty(),
+            rename: FsRenameSlot::empty(),
+            read_dir: FsReadDirSlot::empty(),
+            get_info: FsGetInfoSlot::empty(),
+            set_len: FsSetLenSlot::empty(),
+            append: FsAppendSlot::empty(),
+            zero_range: FsZeroRangeSlot::empty(),
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct FsSlot {
+    ops: Option<FsOps>,
+}
+
+impl FsSlot {
+    #[inline]
+    pub const fn empty() -> Self {
+        Self { ops: None }
+    }
 
     #[inline]
-    pub fn set(&mut self, cb: IoType, depth: usize) {
-        match cb {
-            IoType::Read(handler) => {
-                self.read
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::Write(handler) => {
-                self.write
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::Flush(handler) => {
-                self.flush
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::FlushDirty(handler) => {
-                self.flush_dirty
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::FlushOwner(handler) => {
-                self.flush_owner
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::DeviceControl(handler) => {
-                self.device_control
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
-            IoType::Fs(handler) => {
-                self.fs
-                    .get_or_insert_with(|| Self::make_handler(handler, depth));
-            }
+    pub fn as_ops(&self) -> Option<&FsOps> {
+        self.ops.as_ref()
+    }
+
+    #[inline]
+    pub fn register<T>(&mut self)
+    where
+        T: FileSystem + 'static,
+    {
+        let mut ops = FsOps::empty();
+
+        ops.open.set(T::open, T::OPEN_DEPTH);
+        ops.close.set(T::close, T::CLOSE_DEPTH);
+        ops.read.set(T::read, T::READ_DEPTH);
+        ops.write.set(T::write, T::WRITE_DEPTH);
+        ops.flush.set(T::flush, T::FLUSH_DEPTH);
+        ops.seek.set(T::seek, T::SEEK_DEPTH);
+        ops.create.set(T::create, T::CREATE_DEPTH);
+        ops.rename.set(T::rename, T::RENAME_DEPTH);
+        ops.read_dir.set(T::read_dir, T::READ_DIR_DEPTH);
+        ops.get_info.set(T::get_info, T::GET_INFO_DEPTH);
+        ops.set_len.set(T::set_len, T::SET_LEN_DEPTH);
+        ops.append.set(T::append, T::APPEND_DEPTH);
+        ops.zero_range.set(T::zero_range, T::ZERO_RANGE_DEPTH);
+
+        self.ops = Some(ops);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.ops = None;
+    }
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct DeviceOps {
+    pub read: ReadSlot,
+    pub write: WriteSlot,
+    pub flush: FlushSlot,
+    pub flush_dirty: FlushDirtySlot,
+    pub flush_owner: FlushOwnerSlot,
+    pub device_control: DeviceControlSlot,
+    pub fs: FsSlot,
+}
+
+impl DeviceOps {
+    pub const fn empty() -> Self {
+        Self {
+            read: ReadSlot::empty(),
+            write: WriteSlot::empty(),
+            flush: FlushSlot::empty(),
+            flush_dirty: FlushDirtySlot::empty(),
+            flush_owner: FlushOwnerSlot::empty(),
+            device_control: DeviceControlSlot::empty(),
+            fs: FsSlot::empty(),
         }
     }
 }

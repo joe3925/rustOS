@@ -6,7 +6,6 @@ use crate::dma::{
     Bidirectional, DmaMapped, FromDevice, IOBUFFER_FRAME_SIZE_4KIB, IOBUFFER_PAGE_SIZE, IoBuffer,
     IoBufferDmaSegment, IoBufferError, IoBufferPageFrame, PhysFramed, ToDevice,
 };
-use crate::io::IoVtable;
 
 static UNMAP_COOKIE_SUM: AtomicUsize = AtomicUsize::new(0);
 
@@ -15,7 +14,7 @@ extern "win64" fn record_unmap(_dev: &Arc<DeviceObject>, cookie: usize) {
 }
 
 fn device() -> Arc<DeviceObject> {
-    DeviceObject::new(DeviceInit::new(IoVtable::new(), None))
+    DeviceObject::new(DeviceInit::new())
 }
 
 #[test]

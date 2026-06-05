@@ -1,16 +1,24 @@
 use crate::CompletionRoutine;
+use crate::async_ffi::FfiFuture;
+use crate::device::DeviceObject;
 use crate::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use crate::fs::{
     FsAppendParams, FsAppendResult, FsCloseParams, FsCloseResult, FsCreateParams, FsCreateResult,
     FsFlushParams, FsFlushResult, FsGetInfoParams, FsGetInfoResult, FsListDirParams,
-    FsListDirResult, FsOp, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams,
+    FsListDirResult, FsOpenParams, FsOpenResult, FsReadParams, FsReadResult, FsRenameParams,
     FsRenameResult, FsSeekParams, FsSeekResult, FsSetLenParams, FsSetLenResult, FsWriteParams,
     FsWriteResult, FsZeroRangeParams, FsZeroRangeResult,
 };
+use crate::io::{FsOps, IoHandler};
 use crate::pnp::DriverStep;
 use crate::pnp::PnpRequest;
 use crate::status::DriverStatus;
+use crate::{
+    EvtFsAppend, EvtFsClose, EvtFsCreate, EvtFsFlush, EvtFsGetInfo, EvtFsOpen, EvtFsRead,
+    EvtFsReadDir, EvtFsRename, EvtFsSeek, EvtFsSetLen, EvtFsWrite, EvtFsZeroRange,
+};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicBool;
 use core::{
@@ -1160,103 +1168,138 @@ impl RequestKind for DeviceControl<'_> {
     const MAJOR: RequestMajor = RequestMajor::DeviceControl;
 }
 
-#[repr(C)]
-#[derive(Debug)]
-pub enum FsPayload<'data> {
-    Open {
-        params: FsOpenParams,
-        result: Option<FsOpenResult>,
-    },
-    Close {
-        params: FsCloseParams,
-        result: Option<FsCloseResult>,
-    },
-    Read {
-        params: FsReadParams<'data>,
-        result: Option<FsReadResult>,
-    },
-    Write {
-        params: FsWriteParams<'data>,
-        result: Option<FsWriteResult>,
-    },
-    Flush {
-        params: FsFlushParams,
-        result: Option<FsFlushResult>,
-    },
-    Seek {
-        params: FsSeekParams,
-        result: Option<FsSeekResult>,
-    },
-    Create {
-        params: FsCreateParams,
-        result: Option<FsCreateResult>,
-    },
-    Rename {
-        params: FsRenameParams,
-        result: Option<FsRenameResult>,
-    },
-    ReadDir {
-        params: FsListDirParams,
-        result: Option<FsListDirResult>,
-    },
-    GetInfo {
-        params: FsGetInfoParams,
-        result: Option<FsGetInfoResult>,
-    },
-    SetLen {
-        params: FsSetLenParams,
-        result: Option<FsSetLenResult>,
-    },
-    Append {
-        params: FsAppendParams<'data>,
-        result: Option<FsAppendResult>,
-    },
-    ZeroRange {
-        params: FsZeroRangeParams,
-        result: Option<FsZeroRangeResult>,
-    },
-}
+pub struct FsOpen;
+pub struct FsClose;
+pub struct FsRead;
+pub struct FsWrite;
+pub struct FsFlush;
+pub struct FsSeek;
+pub struct FsCreate;
+pub struct FsRename;
+pub struct FsReadDir;
+pub struct FsGetInfo;
+pub struct FsSetLen;
+pub struct FsAppend;
+pub struct FsZeroRange;
 
-impl FsPayload<'_> {
-    #[inline]
-    pub fn op(&self) -> FsOp {
-        match self {
-            Self::Open { .. } => FsOp::Open,
-            Self::Close { .. } => FsOp::Close,
-            Self::Read { .. } => FsOp::Read,
-            Self::Write { .. } => FsOp::Write,
-            Self::Flush { .. } => FsOp::Flush,
-            Self::Seek { .. } => FsOp::Seek,
-            Self::Create { .. } => FsOp::Create,
-            Self::Rename { .. } => FsOp::Rename,
-            Self::ReadDir { .. } => FsOp::ReadDir,
-            Self::GetInfo { .. } => FsOp::GetInfo,
-            Self::SetLen { .. } => FsOp::SetLen,
-            Self::Append { .. } => FsOp::Append,
-            Self::ZeroRange { .. } => FsOp::ZeroRange,
-        }
-    }
+pub trait FsOperation: Sized {
+    type Params<'data>;
+    type Result;
+    type Handler: Copy;
+
+    fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>>;
+
+    fn call<'req, 'data, 'b>(
+        handler: Self::Handler,
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Fs<'data, Self>>,
+    ) -> FfiFuture<DriverStep>;
 }
 
 #[repr(C)]
-#[derive(Debug)]
-pub struct Fs<'data> {
-    pub op: FsOp,
-    pub payload: FsPayload<'data>,
+pub struct FsPayload<'data, O: FsOperation> {
+    pub params: O::Params<'data>,
+    pub result: Option<O::Result>,
+    pub _marker: PhantomData<&'data mut O>,
 }
 
-impl<'data> Fs<'data> {
-    #[inline]
-    #[track_caller]
-    pub fn new(op: FsOp, payload: FsPayload<'data>) -> Self {
-        assert_eq!(op, payload.op(), "FsOp does not match FsPayload variant");
-        Self { op, payload }
-    }
+#[repr(C)]
+pub struct Fs<'data, O: FsOperation> {
+    pub payload: FsPayload<'data, O>,
 }
 
-impl RequestKind for Fs<'_> {
+impl<'data, O> RequestKind for Fs<'data, O>
+where
+    O: FsOperation,
+{
     const MAJOR: RequestMajor = RequestMajor::Fs;
 }
+
+macro_rules! impl_fs_operation {
+    ($op:ty, $params:ty, $result:ty, $handler:ty, $slot:ident) => {
+        impl FsOperation for $op {
+            type Params<'data> = $params;
+            type Result = $result;
+            type Handler = $handler;
+
+            #[inline]
+            fn handler(ops: &FsOps) -> Option<&IoHandler<Self::Handler>> {
+                ops.$slot.as_handler()
+            }
+
+            #[inline]
+            fn call<'req, 'data, 'b>(
+                handler: Self::Handler,
+                dev: &Arc<DeviceObject>,
+                handle: &'b mut RequestHandle<'req, Fs<'data, Self>>,
+            ) -> FfiFuture<DriverStep> {
+                handler(dev, handle)
+            }
+        }
+    };
+}
+
+impl_fs_operation!(FsOpen, FsOpenParams, FsOpenResult, EvtFsOpen, open);
+impl_fs_operation!(FsClose, FsCloseParams, FsCloseResult, EvtFsClose, close);
+impl_fs_operation!(FsRead, FsReadParams<'data>, FsReadResult, EvtFsRead, read);
+impl_fs_operation!(
+    FsWrite,
+    FsWriteParams<'data>,
+    FsWriteResult,
+    EvtFsWrite,
+    write
+);
+impl_fs_operation!(FsFlush, FsFlushParams, FsFlushResult, EvtFsFlush, flush);
+impl_fs_operation!(FsSeek, FsSeekParams, FsSeekResult, EvtFsSeek, seek);
+impl_fs_operation!(
+    FsCreate,
+    FsCreateParams,
+    FsCreateResult,
+    EvtFsCreate,
+    create
+);
+impl_fs_operation!(
+    FsRename,
+    FsRenameParams,
+    FsRenameResult,
+    EvtFsRename,
+    rename
+);
+impl_fs_operation!(
+    FsReadDir,
+    FsListDirParams,
+    FsListDirResult,
+    EvtFsReadDir,
+    read_dir
+);
+impl_fs_operation!(
+    FsGetInfo,
+    FsGetInfoParams,
+    FsGetInfoResult,
+    EvtFsGetInfo,
+    get_info
+);
+impl_fs_operation!(
+    FsSetLen,
+    FsSetLenParams,
+    FsSetLenResult,
+    EvtFsSetLen,
+    set_len
+);
+impl_fs_operation!(
+    FsAppend,
+    FsAppendParams<'data>,
+    FsAppendResult,
+    EvtFsAppend,
+    append
+);
+impl_fs_operation!(
+    FsZeroRange,
+    FsZeroRangeParams,
+    FsZeroRangeResult,
+    EvtFsZeroRange,
+    zero_range
+);
 
 #[repr(C)]
 #[derive(Debug)]

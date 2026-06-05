@@ -6,11 +6,11 @@ use core::sync::atomic::Ordering;
 use core::task::{Context, Poll, Waker};
 use kernel_types::async_ffi::FfiFuture;
 use kernel_types::device::{DevNode, DeviceObject};
-use kernel_types::io::{IoHandler, IoTarget, IoVtable};
+use kernel_types::io::{DeviceOps, IoHandler, IoTarget};
 use kernel_types::pnp::DriverStep;
 use kernel_types::request::{
-    DeviceControl, Dummy, Flush, FlushDirty, FlushOwner, Fs, Pnp, Read, RequestHandle,
-    RequestKind, RequestMajor, TraversalPolicy, Write,
+    DeviceControl, Dummy, Flush, FlushDirty, FlushOwner, Fs, FsOperation, Pnp, Read,
+    RequestHandle, RequestKind, TraversalPolicy, Write,
 };
 use kernel_types::status::DriverStatus;
 
@@ -105,7 +105,7 @@ pub trait RoutedRequest: RequestKind + Sized {
 trait IoSlotRequest: RequestKind + Sized {
     type Handler: Copy;
 
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>>;
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>>;
 
     fn call<'req, 'b>(
         handler: Self::Handler,
@@ -118,8 +118,8 @@ impl<'data> IoSlotRequest for Read<'data> {
     type Handler = kernel_types::EvtIoRead;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.read.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.read.as_handler()
     }
 
     #[inline]
@@ -137,8 +137,8 @@ impl<'data> IoSlotRequest for Write<'data> {
     type Handler = kernel_types::EvtIoWrite;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.write.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.write.as_handler()
     }
 
     #[inline]
@@ -156,8 +156,8 @@ impl IoSlotRequest for Flush {
     type Handler = kernel_types::EvtIoFlush;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.flush.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.flush.as_handler()
     }
 
     #[inline]
@@ -174,8 +174,8 @@ impl IoSlotRequest for FlushDirty {
     type Handler = kernel_types::EvtIoFlushDirty;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.flush_dirty.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.flush_dirty.as_handler()
     }
 
     #[inline]
@@ -192,8 +192,8 @@ impl IoSlotRequest for FlushOwner {
     type Handler = kernel_types::EvtIoFlushOwner;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.flush_owner.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.flush_owner.as_handler()
     }
 
     #[inline]
@@ -210,8 +210,8 @@ impl<'data> IoSlotRequest for DeviceControl<'data> {
     type Handler = kernel_types::EvtIoDeviceControl;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.device_control.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        ops.device_control.as_handler()
     }
 
     #[inline]
@@ -224,12 +224,16 @@ impl<'data> IoSlotRequest for DeviceControl<'data> {
     }
 }
 
-impl<'data> IoSlotRequest for Fs<'data> {
-    type Handler = kernel_types::EvtIoFs;
+impl<'data, O> IoSlotRequest for Fs<'data, O>
+where
+    O: FsOperation,
+{
+    type Handler = O::Handler;
 
     #[inline]
-    fn handler(vtable: &IoVtable) -> Option<&IoHandler<Self::Handler>> {
-        vtable.fs.as_ref()
+    fn handler(ops: &DeviceOps) -> Option<&IoHandler<Self::Handler>> {
+        let fs = ops.fs.as_ops()?;
+        O::handler(fs)
     }
 
     #[inline]
@@ -238,7 +242,7 @@ impl<'data> IoSlotRequest for Fs<'data> {
         dev: &Arc<DeviceObject>,
         handle: &'b mut RequestHandle<'req, Self>,
     ) -> FfiFuture<DriverStep> {
-        handler(dev, handle)
+        O::call(handler, dev, handle)
     }
 }
 
@@ -246,7 +250,7 @@ async fn invoke_io_handler<K: IoSlotRequest>(
     dev: &Arc<DeviceObject>,
     handle: &mut RequestHandle<'_, K>,
 ) -> Option<DriverStep> {
-    let h = K::handler(&dev.dev_init.io_vtable)?;
+    let h = K::handler(&dev.ops)?;
 
     if h.depth == 0 {
         return Some(K::call(h.handler, dev, handle).await);
@@ -306,7 +310,13 @@ impl<'data> RoutedRequest for DeviceControl<'data> {
     }
 }
 
-impl<'data> RoutedRequest for Fs<'data> {
+impl<'data, O> RoutedRequest for Fs<'data, O>
+where
+    O: FsOperation + Send,
+    O::Handler: Sync,
+    for<'any> O::Params<'any>: Send,
+    O::Result: Send,
+{
     #[inline]
     fn invoke_at<'a, 'req>(
         dev: &'a Arc<DeviceObject>,
@@ -460,10 +470,6 @@ async fn call_device_handler<K: RoutedRequest>(
     handle: &mut RequestHandle<'_, K>,
     policy: TraversalPolicy,
 ) -> DriverStatus {
-    if K::MAJOR == RequestMajor::Dummy {
-        return complete_with_status(handle, DriverStatus::Success);
-    }
-
     if let Err(status) = K::validate_policy(policy) {
         return complete_with_status(handle, status);
     }
@@ -492,7 +498,6 @@ async fn pnp_minor_dispatch<'data>(
     let minor = handle.read().body.request.minor_function;
 
     if let Some(cb) = device
-        .dev_init
         .pnp_vtable
         .as_ref()
         .and_then(|vt| vt.get(minor))

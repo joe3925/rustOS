@@ -9,7 +9,6 @@ use crate::device::{
     StackLayer,
 };
 use crate::fs::Path;
-use crate::io::IoVtable;
 use crate::memory::Module;
 use crate::pnp::BootType;
 
@@ -53,7 +52,7 @@ fn driver_runtime_state_round_trips_through_atomic_storage() {
 
 #[test]
 fn device_init_moves_typed_extension_into_device_object() {
-    let mut init = DeviceInit::new(IoVtable::new(), None);
+    let mut init = DeviceInit::new();
     init.set_dev_ext_from(TestExt { value: 42 });
 
     let dev = DeviceObject::new(init);
@@ -70,7 +69,7 @@ fn device_init_moves_typed_extension_into_device_object() {
 
 #[test]
 fn device_init_can_install_default_extension() {
-    let mut init = DeviceInit::new(IoVtable::new(), None);
+    let mut init = DeviceInit::new();
     init.set_dev_ext_default::<TestExt>();
 
     let dev = DeviceObject::new(init);
@@ -79,8 +78,8 @@ fn device_init_can_install_default_extension() {
 
 #[test]
 fn device_object_links_lower_and_upper_devices_once() {
-    let upper = DeviceObject::new(DeviceInit::new(IoVtable::new(), None));
-    let lower = DeviceObject::new(DeviceInit::new(IoVtable::new(), None));
+    let upper = DeviceObject::new(DeviceInit::new());
+    let lower = DeviceObject::new(DeviceInit::new());
 
     DeviceObject::set_lower_upper(&upper, lower.clone());
 
@@ -96,7 +95,7 @@ fn device_stack_prefers_upper_then_function_then_lower() {
     let runtime = runtime("stack");
     let mk_layer = |name: &str| StackLayer {
         driver: crate::device::DriverObject::allocate(runtime.clone(), name.into()),
-        devobj: Some(DeviceObject::new(DeviceInit::new(IoVtable::new(), None))),
+        devobj: Some(DeviceObject::new(DeviceInit::new())),
     };
 
     let mut stack = DeviceStack::new();

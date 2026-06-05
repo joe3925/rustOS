@@ -3,9 +3,11 @@ use alloc::sync::Arc;
 use crate::async_ffi::{FfiFuture, FutureExt};
 use crate::device::DeviceObject;
 use crate::dma::{Described, FromDevice, IoBuffer};
-use crate::io::{IoType, IoVtable, TreiberStack};
+use crate::io::{
+    DeviceControlHandler, DeviceFlush, DeviceOps, DeviceRead, DeviceWrite, TreiberStack,
+};
 use crate::pnp::DriverStep;
-use crate::request::{DeviceControl, Flush, Fs, Read, RequestData, RequestHandle, Write};
+use crate::request::{DeviceControl, Flush, Read, RequestData, RequestHandle, Write};
 use crate::status::DriverStatus;
 
 extern "win64" fn read_handler(
@@ -38,18 +40,59 @@ extern "win64" fn device_control_handler(
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
 }
 
-extern "win64" fn fs_handler(
-    _dev: &Arc<DeviceObject>,
-    _handle: &mut RequestHandle<'_, Fs<'_>>,
-) -> FfiFuture<DriverStep> {
-    async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
-}
-
 extern "win64" fn flush_handler(
     _dev: &Arc<DeviceObject>,
     _handle: &mut RequestHandle<'_, Flush>,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::complete(DriverStatus::Success) }.into_ffi()
+}
+
+struct TestRead;
+
+impl DeviceRead for TestRead {
+    const DEPTH: u32 = 1;
+
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Read<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep> {
+        read_handler(dev, handle, len)
+    }
+}
+
+struct TestWrite;
+
+impl DeviceWrite for TestWrite {
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Write<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep> {
+        write_handler(dev, handle, len)
+    }
+}
+
+struct TestFlush;
+
+impl DeviceFlush for TestFlush {
+    extern "win64" fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Flush>,
+    ) -> FfiFuture<DriverStep> {
+        flush_handler(dev, handle)
+    }
+}
+
+struct TestDeviceControl;
+
+impl DeviceControlHandler for TestDeviceControl {
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> FfiFuture<DriverStep> {
+        device_control_handler(dev, handle)
+    }
 }
 
 #[test]
@@ -71,26 +114,19 @@ fn treiber_stack_is_lifo_and_tracks_length() {
 }
 
 #[test]
-fn io_type_slots_match_request_kinds() {
-    assert_eq!(IoType::Read(read_handler).slot(), 0);
-    assert_eq!(IoType::Write(write_handler).slot(), 1);
-    assert_eq!(IoType::Flush(flush_handler).slot(), 2);
-    assert_eq!(IoType::DeviceControl(device_control_handler).slot(), 5);
-    assert_eq!(IoType::Fs(fs_handler).slot(), 6);
-}
+fn device_ops_registers_typed_handlers() {
+    let mut ops = DeviceOps::empty();
 
-#[test]
-fn io_vtable_installs_each_handler_once() {
-    let mut vtable = IoVtable::new();
+    assert!(ops.read.as_handler().is_none());
+    ops.read.register::<TestRead>();
+    ops.write.register::<TestWrite>();
+    ops.flush.register::<TestFlush>();
+    ops.device_control.register::<TestDeviceControl>();
 
-    assert!(vtable.read.is_none());
-    vtable.set(IoType::Read(read_handler), 1);
-    vtable.set(IoType::Read(read_handler), 99);
-    vtable.set(IoType::Write(write_handler), 0);
-
-    assert_eq!(vtable.read.as_ref().unwrap().depth, 1);
-    assert_eq!(vtable.write.as_ref().unwrap().depth, 0);
-    assert!(vtable.device_control.is_none());
+    assert_eq!(ops.read.as_handler().unwrap().depth, 1);
+    assert_eq!(ops.write.as_handler().unwrap().depth, 0);
+    assert_eq!(ops.flush.as_handler().unwrap().depth, 0);
+    assert!(ops.device_control.as_handler().is_some());
 
     let mut buffer = [0u8; 4];
     let handle = RequestHandle::new(Read {

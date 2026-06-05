@@ -12,7 +12,7 @@ use alloc::{
     string::{String, ToString},
     sync::Arc,
 };
-use core::ptr::addr_of;
+use core::{marker::PhantomData, ptr::addr_of};
 use core::{
     panic::PanicInfo,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -23,10 +23,10 @@ use kernel_api::{
     GLOBAL_CTRL_LINK, GLOBAL_VOLUMES_BASE, IOCTL_MOUNTMGR_LIST_FS, IOCTL_MOUNTMGR_QUERY,
     IOCTL_MOUNTMGR_REGISTER_FS, IOCTL_MOUNTMGR_RESYNC, IOCTL_MOUNTMGR_UNMOUNT,
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
-    fs::{FsOp, FsOpenParams, notify_label_published, notify_label_unpublished},
+    fs::{FsOpenParams, notify_label_published, notify_label_unpublished},
     kernel_types::{
         fs::{OpenFlags, Path},
-        io::{FsIdentify, IoType, IoVtable},
+        io::{DeviceControlHandler, FsIdentify},
         pnp::DeviceIds,
         request::RequestData,
     },
@@ -38,7 +38,7 @@ use kernel_api::{
         pnp_send_request_via_symlink,
     },
     reg::{self, switch_to_vfs_async},
-    request::{DeviceControl, Fs, FsPayload, Pnp, Request, RequestHandle, TraversalPolicy},
+    request::{DeviceControl, Fs, FsOpen, FsPayload, Pnp, Request, RequestHandle, TraversalPolicy},
     request_handler,
     runtime::spawn_detached,
     status::{Data, DriverStatus, RegError},
@@ -98,10 +98,8 @@ fn panic(info: &PanicInfo) -> ! {
 pub extern "win64" fn DriverEntry(driver: &Arc<DriverObject>) -> DriverStatus {
     driver_set_evt_device_add(driver, volclass_device_add);
 
-    let mut io_vtable = IoVtable::new();
-    io_vtable.set(IoType::DeviceControl(volclass_ctrl_ioctl), 0);
-
-    let init = DeviceInit::new(io_vtable, None);
+    let mut init = DeviceInit::new();
+    init.ops.device_control.register::<VolclassCtrlIo>();
     let _ctrl = pnp_create_control_device_and_link(
         "\\Device\\volclass.ctrl".to_string(),
         init,
@@ -118,14 +116,36 @@ pub extern "win64" fn volclass_device_add(
     let mut pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::StartDevice, volclass_start);
 
-    dev_init
-        .io_vtable
-        .set(IoType::DeviceControl(volclass_ioctl), 0);
+    dev_init.ops.device_control.register::<VolclassIo>();
 
     dev_init.set_dev_ext_default::<VolFdoExt>();
     dev_init.pnp_vtable = Some(pnp_vtable);
 
     DriverStep::complete(DriverStatus::Success)
+}
+
+struct VolclassIo;
+
+impl DeviceControlHandler for VolclassIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> DriverStep {
+        volclass_ioctl(dev, req).await
+    }
+}
+
+struct VolclassCtrlIo;
+
+impl DeviceControlHandler for VolclassCtrlIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> DriverStep {
+        volclass_ctrl_ioctl(dev, req).await
+    }
 }
 
 #[request_handler]
@@ -436,7 +456,7 @@ async fn try_bind_filesystems_for_parent_fdo(
             class.clone(),
             &svc,
             &function_fdo.clone(),
-            DeviceInit::new(IoVtable::new(), None),
+            DeviceInit::new(),
         )
         .await;
 
@@ -569,13 +589,13 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         write_through: false,
         path: Path::from_string(path),
     };
-    let mut req_inner = RequestHandle::new(Fs::new(
-        FsOp::Open,
-        FsPayload::Open {
+    let mut req_inner = RequestHandle::new(Fs::<FsOpen> {
+        payload: FsPayload {
             params,
             result: None,
+            _marker: PhantomData,
         },
-    ));
+    });
     req_inner.set_traversal_policy(TraversalPolicy::ForwardLower);
 
     let err = pnp_send_request_via_symlink(public_link.to_string(), &mut req_inner).await;
@@ -588,12 +608,13 @@ async fn fs_check_open(public_link: &str, path: &str) -> bool {
         return false;
     }
 
-    match &req_inner.read().body.payload {
-        FsPayload::Open {
-            result: Some(res), ..
-        } => res.error.is_none(),
-        _ => false,
-    }
+    req_inner
+        .read()
+        .body
+        .payload
+        .result
+        .as_ref()
+        .is_some_and(|res| res.error.is_none())
 }
 
 fn start_boot_probe_async(public_link: &str, inst_path: &str, stable_id: &str) {

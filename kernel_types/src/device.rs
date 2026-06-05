@@ -11,7 +11,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use spin::{Mutex, Once, RwLock};
 
 use crate::fs::Path;
-use crate::io::IoVtable;
+use crate::io::DeviceOps;
 use crate::memory::Module;
 use crate::pnp::{BootType, DeviceIds, PnpVtable};
 use crate::request::Request;
@@ -175,7 +175,8 @@ pub struct DeviceObject {
     pub lower_device: Once<Arc<DeviceObject>>,
     pub upper_device: Once<Weak<DeviceObject>>,
     dev_ext: DevExtBox,
-    pub dev_init: DeviceInit,
+    pub ops: DeviceOps,
+    pub pnp_vtable: Option<PnpVtable>,
     pub dispatch_tickets: AtomicU32,
     pub dev_node: Once<Weak<DevNode>>,
     pub in_queue: AtomicBool,
@@ -188,7 +189,8 @@ impl DeviceObject {
             lower_device: Once::new(),
             upper_device: Once::new(),
             dev_ext,
-            dev_init: init,
+            ops: init.ops,
+            pnp_vtable: init.pnp_vtable,
             dispatch_tickets: AtomicU32::new(0),
             dev_node: Once::new(),
             in_queue: AtomicBool::new(false),
@@ -228,7 +230,7 @@ impl DeviceObject {
 #[repr(C)]
 #[derive(Debug)]
 pub struct DeviceInit {
-    pub io_vtable: IoVtable,
+    pub ops: DeviceOps,
     pub pnp_vtable: Option<PnpVtable>,
     pub(crate) dev_ext_type: Option<TypeId>,
     pub(crate) dev_ext_size: usize,
@@ -236,14 +238,20 @@ pub struct DeviceInit {
 }
 
 impl DeviceInit {
-    pub fn new(io_vtable: IoVtable, pnp_vtable: Option<PnpVtable>) -> Self {
+    pub fn new() -> Self {
         Self {
-            io_vtable,
-            pnp_vtable,
+            ops: DeviceOps::empty(),
+            pnp_vtable: None,
             dev_ext_type: None,
             dev_ext_size: 0,
             dev_ext_ready: None,
         }
+    }
+
+    pub fn with_pnp(pnp_vtable: Option<PnpVtable>) -> Self {
+        let mut init = Self::new();
+        init.pnp_vtable = pnp_vtable;
+        init
     }
 
     pub fn set_dev_ext_from<T: 'static + Send + Sync>(&mut self, value: T) {

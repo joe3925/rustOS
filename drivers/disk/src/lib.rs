@@ -18,7 +18,7 @@ use kernel_api::{
     device::{DevExtRef, DeviceInit, DeviceObject, DriverObject},
     kernel_types::{
         dma::{Described, FromDevice, IoBuffer, ToDevice},
-        io::{DiskInfo, IoType},
+        io::{DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo},
         request::RequestData,
     },
     pnp::{
@@ -39,6 +39,160 @@ fn panic(info: &PanicInfo) -> ! {
 }
 
 const IOCTL_DRIVE_IDENTIFY: u32 = 0xB000_0004;
+
+struct DiskIo;
+
+impl DeviceRead for DiskIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Read<'data>>,
+        _buf_len: usize,
+    ) -> kernel_api::pnp::DriverStep {
+        let body = &req.read().body;
+        let off = body.offset;
+        let total = body.len;
+
+        if unlikely(total == 0) {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
+        }
+
+        if unlikely(!has_from_device_buffer(&body.buffer, total)) {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+
+        let dx = disk_ext(&dev);
+        if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+            if let Err(st) = query_props_sync(&dev).await {
+                cold_path();
+                return kernel_api::pnp::DriverStep::complete(st);
+            }
+        }
+
+        let bs = dx.block_size.load(Ordering::Acquire) as u64;
+
+        let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
+        if unlikely(!aligned) {
+            cold_path();
+            req.write().status = DriverStatus::InvalidParameter;
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
+
+        req.write().traversal_policy = TraversalPolicy::ForwardLower;
+        kernel_api::pnp::DriverStep::Continue
+    }
+}
+
+impl DeviceWrite for DiskIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Write<'data>>,
+        _buf_len: usize,
+    ) -> kernel_api::pnp::DriverStep {
+        let body = &req.read().body;
+        let off = body.offset;
+        let total = body.len;
+
+        if unlikely(total == 0) {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
+        }
+
+        if unlikely(!has_to_device_buffer(&body.buffer, total)) {
+            cold_path();
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
+        }
+
+        let dx = disk_ext(&dev);
+        if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
+            if let Err(st) = query_props_sync(&dev).await {
+                cold_path();
+                return kernel_api::pnp::DriverStep::complete(st);
+            }
+        }
+
+        let bs = dx.block_size.load(Ordering::Acquire) as u64;
+
+        let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
+        if unlikely(!aligned) {
+            cold_path();
+            req.write().status = DriverStatus::InvalidParameter;
+            return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
+        }
+
+        req.write().traversal_policy = TraversalPolicy::ForwardLower;
+        kernel_api::pnp::DriverStep::Continue
+    }
+}
+
+impl DeviceFlush for DiskIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        _dev: &Arc<DeviceObject>,
+        _req: &'b mut RequestHandle<'req, Flush>,
+    ) -> kernel_api::pnp::DriverStep {
+        kernel_api::pnp::DriverStep::Continue
+    }
+}
+
+impl DeviceControlHandler for DiskIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> kernel_api::pnp::DriverStep {
+        let code = req.read().body.code;
+
+        match code {
+            IOCTL_DRIVE_IDENTIFY => {
+                let mut ch = RequestHandle::new(Pnp {
+                    request: PnpRequest {
+                        minor_function: PnpMinorFunction::QueryResources,
+                        relation: DeviceRelationType::TargetDeviceRelation,
+                        id_type: QueryIdType::CompatibleIds,
+                        ids_out: Vec::new(),
+                        data_out: RequestData::empty(),
+                    },
+                });
+
+                let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
+                if unlikely(st != DriverStatus::Success) {
+                    cold_path();
+                    return kernel_api::pnp::DriverStep::complete(st);
+                }
+
+                let mut info_opt = {
+                    let wr = ch.write();
+                    wr.body.request.data_out.take_exact::<DiskInfo>().ok()
+                };
+                if unlikely(info_opt.is_none()) {
+                    info_opt = ch
+                        .read()
+                        .body
+                        .request
+                        .data_out_ref()
+                        .view::<DiskInfo>()
+                        .copied();
+                }
+
+                let info = match info_opt {
+                    Some(di) => di,
+                    None => {
+                        cold_path();
+                        return kernel_api::pnp::DriverStep::complete(DriverStatus::Unsuccessful);
+                    }
+                };
+
+                req.write().body.set_data_t::<DiskInfo>(info);
+                kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
+            }
+            _ => kernel_api::pnp::DriverStep::Continue,
+        }
+    }
+}
 
 fn has_from_device_buffer(buffer: &IoBuffer<'_, Described, FromDevice>, len: usize) -> bool {
     buffer.len() >= len
@@ -73,10 +227,10 @@ pub extern "win64" fn disk_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> kernel_api::pnp::DriverStep {
-    dev_init.io_vtable.set(IoType::Read(disk_read), 0);
-    dev_init.io_vtable.set(IoType::Write(disk_write), 0);
-    dev_init.io_vtable.set(IoType::DeviceControl(disk_ioctl), 0);
-    dev_init.io_vtable.set(IoType::Flush(disk_flush), 0);
+    dev_init.ops.read.register::<DiskIo>();
+    dev_init.ops.write.register::<DiskIo>();
+    dev_init.ops.device_control.register::<DiskIo>();
+    dev_init.ops.flush.register::<DiskIo>();
 
     let pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::RemoveDevice, disk_pnp_remove);
@@ -92,150 +246,6 @@ async fn disk_pnp_remove<'req, 'data, 'b>(
     _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> kernel_api::pnp::DriverStep {
     kernel_api::pnp::DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn disk_read<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Read<'data>>,
-    _buf_len: usize,
-) -> kernel_api::pnp::DriverStep {
-    let body = &req.read().body;
-    let off = body.offset;
-    let total = body.len;
-
-    if unlikely(total == 0) {
-        cold_path();
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
-    }
-
-    if unlikely(!has_from_device_buffer(&body.buffer, total)) {
-        cold_path();
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
-    }
-
-    let dx = disk_ext(&dev);
-    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-        if let Err(st) = query_props_sync(&dev).await {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
-    }
-
-    let bs = dx.block_size.load(Ordering::Acquire) as u64;
-
-    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
-    if unlikely(!aligned) {
-        cold_path();
-        req.write().status = DriverStatus::InvalidParameter;
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-    }
-
-    req.write().traversal_policy = TraversalPolicy::ForwardLower;
-    kernel_api::pnp::DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn disk_write<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, Write<'data>>,
-    _buf_len: usize,
-) -> kernel_api::pnp::DriverStep {
-    let body = &req.read().body;
-    let off = body.offset;
-    let total = body.len;
-
-    if unlikely(total == 0) {
-        cold_path();
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::Success);
-    }
-
-    if unlikely(!has_to_device_buffer(&body.buffer, total)) {
-        cold_path();
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InsufficientResources);
-    }
-
-    let dx = disk_ext(&dev);
-    if unlikely(!dx.props_ready.load(Ordering::Acquire)) {
-        if let Err(st) = query_props_sync(&dev).await {
-            cold_path();
-            return kernel_api::pnp::DriverStep::complete(st);
-        }
-    }
-
-    let bs = dx.block_size.load(Ordering::Acquire) as u64;
-
-    let aligned = (off % bs == 0) && (total as u64).is_multiple_of(bs);
-    if unlikely(!aligned) {
-        cold_path();
-        req.write().status = DriverStatus::InvalidParameter;
-        return kernel_api::pnp::DriverStep::complete(DriverStatus::InvalidParameter);
-    }
-
-    req.write().traversal_policy = TraversalPolicy::ForwardLower;
-    kernel_api::pnp::DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn disk_flush<'req, 'b>(
-    _dev: &Arc<DeviceObject>,
-    _req: &'b mut RequestHandle<'req, Flush>,
-) -> kernel_api::pnp::DriverStep {
-    kernel_api::pnp::DriverStep::Continue
-}
-
-#[request_handler]
-pub async fn disk_ioctl<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-) -> kernel_api::pnp::DriverStep {
-    let code = req.read().body.code;
-
-    match code {
-        IOCTL_DRIVE_IDENTIFY => {
-            let mut ch = RequestHandle::new(Pnp {
-                request: PnpRequest {
-                    minor_function: PnpMinorFunction::QueryResources,
-                    relation: DeviceRelationType::TargetDeviceRelation,
-                    id_type: QueryIdType::CompatibleIds,
-                    ids_out: Vec::new(),
-                    data_out: RequestData::empty(),
-                },
-            });
-
-            let st = pnp_forward_request_to_next_lower(dev.clone(), &mut ch).await;
-            if unlikely(st != DriverStatus::Success) {
-                cold_path();
-                return kernel_api::pnp::DriverStep::complete(st);
-            }
-
-            let mut info_opt = {
-                let wr = ch.write();
-                wr.body.request.data_out.take_exact::<DiskInfo>().ok()
-            };
-            if unlikely(info_opt.is_none()) {
-                info_opt = ch
-                    .read()
-                    .body
-                    .request
-                    .data_out_ref()
-                    .view::<DiskInfo>()
-                    .copied();
-            }
-
-            let info = match info_opt {
-                Some(di) => di,
-                None => {
-                    cold_path();
-                    return kernel_api::pnp::DriverStep::complete(DriverStatus::Unsuccessful);
-                }
-            };
-
-            req.write().body.set_data_t::<DiskInfo>(info);
-            kernel_api::pnp::DriverStep::complete(DriverStatus::Success)
-        }
-        _ => kernel_api::pnp::DriverStep::Continue,
-    }
 }
 
 #[inline]

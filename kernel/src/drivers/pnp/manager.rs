@@ -19,7 +19,7 @@ use kernel_types::device::{
     DriverRuntime, DriverState, StackLayer,
 };
 use kernel_types::fs::Path;
-use kernel_types::io::{IoTarget, IoVtable};
+use kernel_types::io::IoTarget;
 use kernel_types::pnp::{
     BootType, DeviceIds, DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, QueryIdType,
 };
@@ -80,7 +80,7 @@ impl PnpManager {
                 hardware: vec![alloc::format!("ROOT\\{}", pkg.name)],
                 compatible: Vec::new(),
             };
-            let pdo_init = DeviceInit::new(IoVtable::new(), None);
+            let pdo_init = DeviceInit::new();
 
             let (devnode, _pdo) = self.create_child_devnode_and_pdo_with_init(
                 &root_node,
@@ -182,7 +182,7 @@ impl PnpManager {
         class: Option<String>,
     ) -> (Arc<DevNode>, Arc<DeviceObject>) {
         let dev_node = DevNode::new_child(name, instance_path, ids, class, parent);
-        let pdo = DeviceObject::new(DeviceInit::new(IoVtable::new(), None));
+        let pdo = DeviceObject::new(DeviceInit::new());
         pdo.attach_devnode(&dev_node);
         dev_node.set_pdo(pdo.clone());
 
@@ -604,7 +604,7 @@ impl PnpManager {
             return None;
         };
 
-        let mut dev_init = DeviceInit::new(IoVtable::new(), None);
+        let mut dev_init = DeviceInit::new();
         let step = cb(drv, &mut dev_init);
 
         match step {

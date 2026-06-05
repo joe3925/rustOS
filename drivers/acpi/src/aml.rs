@@ -12,7 +12,6 @@ use kernel_api::acpi::mcfg::Mcfg;
 use kernel_api::device::DevNode;
 use kernel_api::device::DeviceInit;
 use kernel_api::device::DeviceObject;
-use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
 use kernel_api::memory::map_mmio_region;
@@ -380,7 +379,7 @@ pub fn create_pnp_bus_from_acpi(
     vt.set(PnpMinorFunction::QueryId, acpi_pdo_query_id);
     vt.set(PnpMinorFunction::StartDevice, acpi_pdo_start);
 
-    let mut init = DeviceInit::new(IoVtable::new(), Some(vt));
+    let mut init = DeviceInit::with_pnp(Some(vt));
     let mut ext = AcpiPdoExt {
         acpi_path: dev_name.clone(),
         ctx: ctx_lock.clone(),

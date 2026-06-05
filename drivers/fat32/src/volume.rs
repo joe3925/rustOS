@@ -12,17 +12,18 @@ use fatfs::{
 use kernel_api::device::DeviceObject;
 use kernel_api::kernel_types::async_types::AsyncMutex;
 use kernel_api::kernel_types::fs::Path;
-use kernel_api::kernel_types::io::IoTarget;
+use kernel_api::kernel_types::io::{FileSystem, IoTarget};
 use kernel_api::pnp::{DriverStep, pnp_send_request};
 use kernel_api::request::{
-    FlushOwner, Fs as FsRequest, FsPayload, RequestHandle, TraversalPolicy,
+    FlushOwner, Fs as FsRequest, FsAppend, FsClose, FsCreate, FsFlush, FsGetInfo, FsOpen, FsRead,
+    FsReadDir, FsRename, FsSeek, FsSetLen, FsWrite, FsZeroRange, RequestHandle, TraversalPolicy,
 };
 use kernel_api::status::{DriverStatus, FileStatus};
 use kernel_api::{
     fs::{
         FileAttribute, FsAppendResult, FsCloseResult, FsCreateResult, FsFlushResult,
-        FsGetInfoResult, FsListDirResult, FsOp, FsOpenResult, FsReadResult, FsRenameResult,
-        FsSeekResult, FsSeekWhence, FsSetLenResult, FsWriteResult, FsZeroRangeResult,
+        FsGetInfoResult, FsListDirResult, FsOpenResult, FsReadResult, FsRenameResult, FsSeekResult,
+        FsSeekWhence, FsSetLenResult, FsWriteResult, FsZeroRangeResult,
     },
     println, request_handler,
 };
@@ -330,47 +331,86 @@ async fn flush_cached_file(
     err
 }
 
-fn current_owner_for_payload(payload: &FsPayload<'_>) -> u64 {
-    match payload {
-        FsPayload::Open { .. }
-        | FsPayload::Create { .. }
-        | FsPayload::ReadDir { .. }
-        | FsPayload::Rename { .. } => METADATA_OWNER_ID,
-        FsPayload::Close { params, .. } => params.fs_file_id,
-        FsPayload::Read { params, .. } => params.fs_file_id,
-        FsPayload::Write { params, .. } => params.fs_file_id,
-        FsPayload::Flush { params, .. } => params.fs_file_id,
-        FsPayload::Seek { params, .. } => params.fs_file_id,
-        FsPayload::GetInfo { params, .. } => params.fs_file_id,
-        FsPayload::SetLen { params, .. } => params.fs_file_id,
-        FsPayload::Append { params, .. } => params.fs_file_id,
-        FsPayload::ZeroRange { params, .. } => params.fs_file_id,
+pub struct Fat32Fs;
+
+async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
+    let mut flush_req = RequestHandle::new(FlushOwner {
+        owner,
+        should_block,
+    });
+    flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
+    pnp_send_request(volume_target, &mut flush_req).await
+}
+
+fn capture_fs_context(
+    dev: &Arc<DeviceObject>,
+) -> (
+    Arc<AsyncMutex<Fs>>,
+    IoTarget,
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+    Arc<AtomicBool>,
+) {
+    let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
+        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
+        (
+            vdx.fs.clone(),
+            vdx.volume_target.clone(),
+            vdx.should_flush.clone(),
+            vdx.pending_flush_owner.clone(),
+            vdx.pending_flush_block.clone(),
+        )
+    };
+    (
+        fs_arc,
+        volume_target,
+        flush_flag,
+        pending_flush_owner,
+        pending_flush_block,
+    )
+}
+
+async fn finish_fs_request(
+    volume_target: IoTarget,
+    flush_flag: Arc<AtomicBool>,
+    pending_flush_owner: Arc<AtomicU64>,
+    pending_flush_block: Arc<AtomicBool>,
+    flush_metadata_after_op: bool,
+) {
+    if unlikely(flush_flag.swap(false, Ordering::AcqRel)) {
+        let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
+        let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
+        if likely(owner != 0) {
+            let _ = send_flush_owner(volume_target.clone(), owner, should_block).await;
+        } else {
+            cold_path();
+        }
+    }
+
+    if unlikely(flush_metadata_after_op) {
+        let _ = send_flush_owner(volume_target, METADATA_OWNER_ID, true).await;
     }
 }
 
-async fn execute_fs_work(
-    dev: &Arc<DeviceObject>,
-    fs_arc: &Arc<AsyncMutex<Fs>>,
-    req: &mut RequestHandle<'_, FsRequest<'_>>,
-) -> DriverStatus {
+fn set_current_owner(dev: &Arc<DeviceObject>, owner: u64) {
     let vdx = ext_mut::<VolCtrlDevExt>(dev);
-    let mut fs = fs_arc.lock().await;
-
-    let op = req.read().body.op;
-    if matches!(op, FsOp::SetInfo | FsOp::Delete) {
-        return DriverStatus::NotImplemented;
-    }
-
-    if unlikely(op != req.read().body.payload.op()) {
-        cold_path();
-        return DriverStatus::InvalidParameter;
-    }
-
-    let owner = current_owner_for_payload(&req.read().body.payload);
     vdx.current_owner.store(owner, Ordering::Release);
+}
 
-    match &mut req.write().body.payload {
-        FsPayload::Open { params, result } => {
+impl FileSystem for Fat32Fs {
+    #[request_handler]
+    async fn open<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsOpen>>,
+    ) -> DriverStep {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let _ = (params.flags, params.write_through);
             let result_value = {
                 let path_str = params.path.as_str();
@@ -393,27 +433,25 @@ async fn execute_fs_work(
                     Err(e) => Err(e),
                 };
                 match open_res {
-                    Ok((is_dir, size, cached)) => {
-                        match vdx.handles.lock().insert(FileCtx {
+                    Ok((is_dir, size, cached)) => match vdx.handles.lock().insert(FileCtx {
+                        is_dir,
+                        pos: 0,
+                        size,
+                        cached,
+                    }) {
+                        Ok(id) => FsOpenResult {
+                            fs_file_id: id,
                             is_dir,
-                            pos: 0,
                             size,
-                            cached,
-                        }) {
-                            Ok(id) => FsOpenResult {
-                                fs_file_id: id,
-                                is_dir,
-                                size,
-                                error: None,
-                            },
-                            Err(e) => FsOpenResult {
-                                fs_file_id: 0,
-                                is_dir: false,
-                                size: 0,
-                                error: Some(e),
-                            },
-                        }
-                    }
+                            error: None,
+                        },
+                        Err(e) => FsOpenResult {
+                            fs_file_id: 0,
+                            is_dir: false,
+                            size: 0,
+                            error: Some(e),
+                        },
+                    },
                     Err(e) => FsOpenResult {
                         fs_file_id: 0,
                         is_dir: false,
@@ -422,12 +460,35 @@ async fn execute_fs_work(
                     },
                 }
             };
-
-            *result = Some(result_value);
+            payload.result = Some(result_value);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Close { params, result } => {
+    #[request_handler]
+    async fn close<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsClose>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let removed_ctx = { vdx.handles.lock().remove(fs_file_id) };
             let err = match removed_ctx {
@@ -444,11 +505,35 @@ async fn execute_fs_work(
             if err.is_none() {
                 flush_owner_blocking(&vdx, fs_file_id);
             }
-            *result = Some(FsCloseResult { error: err });
+            payload.result = Some(FsCloseResult { error: err });
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            true,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Read { params, result } => {
+    #[request_handler]
+    async fn read<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRead>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &mut payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
             let buf = &mut *params.buf;
@@ -492,11 +577,35 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            *result = Some(res);
+            payload.result = Some(res);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Write { params, result } => {
+    #[request_handler]
+    async fn write<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsWrite>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
             let write_through = params.write_through;
@@ -557,11 +666,35 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            *result = Some(res);
+            payload.result = Some(res);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Flush { params, result } => {
+    #[request_handler]
+    async fn flush<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsFlush>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let err = {
                 let is_dir = {
@@ -581,40 +714,161 @@ async fn execute_fs_work(
                     }
                 }
             };
-            *result = Some(FsFlushResult { error: err });
+            payload.result = Some(FsFlushResult { error: err });
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            true,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Create { params, result } => {
+    #[request_handler]
+    async fn seek<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSeek>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let params = &req.read().body.payload.params;
+            let (fs_file_id, origin, offset) = (params.fs_file_id, params.origin, params.offset);
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let result = {
+                let mut handles = vdx.handles.lock();
+                match handles.ctx_mut(fs_file_id) {
+                    Ok(ctx) => {
+                        let size = if ctx.is_dir { 0 } else { ctx.size };
+                        let base: i128 = match origin {
+                            FsSeekWhence::Set => 0,
+                            FsSeekWhence::Cur => ctx.pos as i128,
+                            FsSeekWhence::End => size as i128,
+                        };
+                        let pos_i = base + offset as i128;
+                        let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
+                        ctx.pos = clamped;
+                        Ok(clamped)
+                    }
+                    Err(e) => Err(e),
+                }
+            };
+            let res = match result {
+                Ok(pos) => FsSeekResult { pos, error: None },
+                Err(e) => FsSeekResult {
+                    pos: 0,
+                    error: Some(e),
+                },
+            };
+            req.write().body.payload.result = Some(res);
+            DriverStatus::Success
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
+
+    #[request_handler]
+    async fn create<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsCreate>>,
+    ) -> DriverStep {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let err = {
                 match create_entry(&mut *fs, &params.path, params.dir).await {
                     Ok(()) => None,
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
             };
-            flush_owner_blocking(&vdx, owner);
-            *result = Some(FsCreateResult { error: err });
+            flush_owner_blocking(&vdx, METADATA_OWNER_ID);
+            payload.result = Some(FsCreateResult { error: err });
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Rename { params, result } => {
+    #[request_handler]
+    async fn rename<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsRename>>,
+    ) -> DriverStep {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let mut fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let err = {
                 match rename_entry(&mut *fs, &params.src, &params.dst).await {
                     Ok(renamed) => {
                         if let Some(renamed) = renamed {
                             vdx.handles.lock().update_renamed_file(&renamed);
                         }
-                        flush_owner_blocking(&vdx, owner);
+                        flush_owner_blocking(&vdx, METADATA_OWNER_ID);
                         None
                     }
                     Err(e) => Some(map_fatfs_err(&e)),
                 }
             };
-            *result = Some(FsRenameResult { error: err });
+            payload.result = Some(FsRenameResult { error: err });
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::ReadDir { params, result } => {
+    #[request_handler]
+    async fn read_dir<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsReadDir>>,
+    ) -> DriverStep {
+        set_current_owner(dev, METADATA_OWNER_ID);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let mut fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let res = {
                 match list_names(&mut *fs, &params.path).await {
                     Ok(names) => FsListDirResult {
@@ -627,11 +881,34 @@ async fn execute_fs_work(
                     },
                 }
             };
-            *result = Some(res);
+            payload.result = Some(res);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::GetInfo { params, result } => {
+    #[request_handler]
+    async fn get_info<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsGetInfo>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (_, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let info_res = {
                 let handles = vdx.handles.lock();
@@ -655,11 +932,35 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            *result = Some(res);
+            payload.result = Some(res);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::SetLen { params, result } => {
+    #[request_handler]
+    async fn set_len<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsSetLen>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let new_size = params.new_size;
             let err = {
@@ -689,11 +990,35 @@ async fn execute_fs_work(
                     }
                 }
             }
-            *result = Some(FsSetLenResult { error: err });
+            payload.result = Some(FsSetLenResult { error: err });
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::Append { params, result } => {
+    #[request_handler]
+    async fn append<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsAppend>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let write_through = params.write_through;
             let data = params.data;
@@ -766,11 +1091,35 @@ async fn execute_fs_work(
                     error: Some(e),
                 },
             };
-            *result = Some(res);
+            payload.result = Some(res);
             DriverStatus::Success
-        }
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
+        )
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
+    }
 
-        FsPayload::ZeroRange { params, result } => {
+    #[request_handler]
+    async fn zero_range<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FsRequest<'data, FsZeroRange>>,
+    ) -> DriverStep {
+        let owner = req.read().body.payload.params.fs_file_id;
+        set_current_owner(dev, owner);
+        let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) =
+            capture_fs_context(dev);
+        let status = {
+            let vdx = ext_mut::<VolCtrlDevExt>(dev);
+            let fs = fs_arc.lock().await;
+            let payload = &mut req.write().body.payload;
+            let params = &payload.params;
             let fs_file_id = params.fs_file_id;
             let offset = params.offset;
             let len = params.len;
@@ -810,107 +1159,18 @@ async fn execute_fs_work(
                     }
                 }
             };
-            *result = Some(FsZeroRangeResult { error: err });
+            payload.result = Some(FsZeroRangeResult { error: err });
             DriverStatus::Success
-        }
-
-        FsPayload::Seek { .. } => handle_seek_fast(dev, req),
-    }
-}
-
-fn handle_seek_fast(
-    dev: &Arc<DeviceObject>,
-    req: &mut RequestHandle<'_, FsRequest<'_>>,
-) -> DriverStatus {
-    let (fs_file_id, origin, offset) = match &req.read().body.payload {
-        FsPayload::Seek { params, .. } => (params.fs_file_id, params.origin, params.offset),
-        _ => {
-            cold_path();
-            return DriverStatus::InvalidParameter;
-        }
-    };
-    let vdx = ext_mut::<VolCtrlDevExt>(dev);
-    let result = {
-        let mut handles = vdx.handles.lock();
-        match handles.ctx_mut(fs_file_id) {
-            Ok(ctx) => {
-                let size = if ctx.is_dir { 0 } else { ctx.size };
-                let base: i128 = match origin {
-                    FsSeekWhence::Set => 0,
-                    FsSeekWhence::Cur => ctx.pos as i128,
-                    FsSeekWhence::End => size as i128,
-                };
-                let pos_i = base + offset as i128;
-                let clamped = if pos_i < 0 { 0 } else { pos_i as u64 };
-                ctx.pos = clamped;
-                Ok(clamped)
-            }
-            Err(e) => Err(e),
-        }
-    };
-    let res = match result {
-        Ok(pos) => FsSeekResult { pos, error: None },
-        Err(e) => FsSeekResult {
-            pos: 0,
-            error: Some(e),
-        },
-    };
-    if let FsPayload::Seek { result, .. } = &mut req.write().body.payload {
-        *result = Some(res);
-    }
-    DriverStatus::Success
-}
-
-async fn send_flush_owner(volume_target: IoTarget, owner: u64, should_block: bool) -> DriverStatus {
-    let mut flush_req = RequestHandle::new(FlushOwner {
-        owner,
-        should_block,
-    });
-    flush_req.set_traversal_policy(TraversalPolicy::ForwardLower);
-    pnp_send_request(volume_target, &mut flush_req).await
-}
-
-#[request_handler]
-pub async fn fs_op_dispatch<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, FsRequest<'data>>,
-) -> DriverStep {
-    if unlikely(matches!(req.read().body.op, FsOp::Seek)) {
-        let status = handle_seek_fast(dev, req);
-        req.write().status = status.clone();
-        return DriverStep::complete(status);
-    }
-
-    let flush_metadata_after_op =
-        matches!(req.read().body.op, FsOp::Close | FsOp::Flush);
-
-    let (fs_arc, volume_target, flush_flag, pending_flush_owner, pending_flush_block) = {
-        let vdx = ext_mut::<VolCtrlDevExt>(&dev);
-        (
-            vdx.fs.clone(),
-            vdx.volume_target.clone(),
-            vdx.should_flush.clone(),
-            vdx.pending_flush_owner.clone(),
-            vdx.pending_flush_block.clone(),
+        };
+        finish_fs_request(
+            volume_target,
+            flush_flag,
+            pending_flush_owner,
+            pending_flush_block,
+            false,
         )
-    };
-
-    let status = execute_fs_work(dev, &fs_arc, req).await;
-
-    if unlikely(flush_flag.swap(false, Ordering::AcqRel)) {
-        let owner = pending_flush_owner.swap(0, Ordering::AcqRel);
-        let should_block = pending_flush_block.swap(false, Ordering::AcqRel);
-        if likely(owner != 0) {
-            let _ = send_flush_owner(volume_target.clone(), owner, should_block).await;
-        } else {
-            cold_path();
-        }
+        .await;
+        req.write().status = status.clone();
+        DriverStep::complete(status)
     }
-
-    if unlikely(flush_metadata_after_op) {
-        let _ = send_flush_owner(volume_target, METADATA_OWNER_ID, true).await;
-    }
-
-    req.write().status = status.clone();
-    DriverStep::complete(status)
 }

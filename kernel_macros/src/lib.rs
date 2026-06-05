@@ -7,7 +7,8 @@ use syn::visit::Visit;
 use syn::Data;
 use syn::DeriveInput;
 use syn::{
-    parse_macro_input, FnArg, GenericParam, ItemFn, Pat, ReturnType, Token, Type, WhereClause,
+    parse_macro_input, FnArg, GenericParam, ImplItemFn, ItemFn, Pat, ReturnType, Token, Type,
+    WhereClause,
 };
 
 #[derive(Default)]
@@ -782,13 +783,29 @@ pub fn request_handler(args: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let mut func = parse_macro_input!(input as ItemFn);
+    let input2 = TokenStream2::from(input);
+    if let Ok(mut func) = syn::parse2::<ItemFn>(input2.clone()) {
+        if let Err(e) = validate_function(&func.sig) {
+            return e.to_compile_error().into();
+        }
 
-    if let Err(e) = validate_function(&func) {
-        return e.to_compile_error().into();
+        return transform_function(&mut func).into();
     }
 
-    transform_function(&mut func).into()
+    if let Ok(mut func) = syn::parse2::<ImplItemFn>(input2) {
+        if let Err(e) = validate_function(&func.sig) {
+            return e.to_compile_error().into();
+        }
+
+        return transform_impl_function(&mut func).into();
+    }
+
+    syn::Error::new(
+        Span::call_site(),
+        "#[request_handler] expects a free function or associated function",
+    )
+    .to_compile_error()
+    .into()
 }
 
 /// Check if a type is `&mut RequestHandle`
@@ -831,9 +848,7 @@ fn find_request_handle_param(sig: &syn::Signature) -> Option<syn::Ident> {
     None
 }
 
-fn validate_function(func: &ItemFn) -> syn::Result<()> {
-    let sig = &func.sig;
-
+fn validate_function(sig: &syn::Signature) -> syn::Result<()> {
     if sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             sig.fn_token,
@@ -940,6 +955,47 @@ fn transform_function(func: &mut ItemFn) -> TokenStream2 {
     sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
 
     // Set the return type to FfiFuture<DriverStep>
+    sig.output = syn::parse_quote!(
+        -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
+    );
+
+    let original_stmts = &body.stmts;
+
+    let new_body = quote! {
+        {
+            ::kernel_api::async_ffi::FutureExt::into_ffi(
+                async move {
+                    let _bench_span = {
+                        let __obj: u64 = #obj_expr;
+                        ::kernel_api::benchmark::span(
+                            stringify!(#fn_ident),
+                            ::kernel_api::benchmark::object_id(__obj),
+                        )
+                    };
+
+                    #(#original_stmts)*
+                }
+            )
+        }
+    };
+
+    quote! {
+        #(#attrs)*
+        #vis #sig #new_body
+    }
+}
+
+fn transform_impl_function(func: &mut ImplItemFn) -> TokenStream2 {
+    let attrs = &func.attrs;
+    let vis = &func.vis;
+    let sig = &mut func.sig;
+    let body = &func.block;
+
+    let fn_ident = sig.ident.clone();
+    let obj_expr = choose_object_id_expr(sig);
+
+    sig.asyncness = None;
+    sig.abi = Some(syn::parse_str("extern \"win64\"").expect("Failed to parse win64 ABI"));
     sig.output = syn::parse_quote!(
         -> ::kernel_api::async_ffi::FfiFuture< ::kernel_api::pnp::DriverStep>
     );

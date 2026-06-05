@@ -26,11 +26,7 @@ use kernel_api::{
     IOCTL_PCI_SETUP_MSIX,
     device::{DevNode, DeviceInit, DeviceObject, DriverObject},
     dma::register_pci_pdo,
-    kernel_types::{
-        io::{IoType, IoVtable},
-        pnp::DeviceIds,
-        request::RequestData,
-    },
+    kernel_types::{io::DeviceControlHandler, pnp::DeviceIds, request::RequestData},
     memory::unmap_mmio_region,
     pnp::{
         DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
@@ -46,6 +42,23 @@ use kernel_api::{
 use spin::Once;
 
 static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
+
+struct PciPdoIo;
+
+impl DeviceControlHandler for PciPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> DriverStep {
+        let code = req.read().body.code;
+
+        match code {
+            IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
+            _ => DriverStep::complete(DriverStatus::NotImplemented),
+        }
+    }
+}
 
 #[cfg(not(test))]
 #[panic_handler]
@@ -314,10 +327,8 @@ fn make_pdo_for_function(parent: &Arc<DevNode>, p: &PciPdoExt) {
         pci_pdo_query_devrels,
     );
 
-    let mut io_vt = IoVtable::new();
-    io_vt.set(IoType::DeviceControl(pci_pdo_ioctl), 0);
-
-    let mut child_init = DeviceInit::new(io_vt, Some(vt));
+    let mut child_init = DeviceInit::with_pnp(Some(vt));
+    child_init.ops.device_control.register::<PciPdoIo>();
     child_init.set_dev_ext_from(*p);
 
     let name = name_for(p);
@@ -435,17 +446,4 @@ pub async fn pci_pdo_query_devrels<'req, 'data, 'b>(
     _req: &'b mut RequestHandle<'req, Pnp<'data>>,
 ) -> DriverStep {
     DriverStep::complete(DriverStatus::Success)
-}
-
-#[request_handler]
-pub async fn pci_pdo_ioctl<'req, 'data, 'b>(
-    dev: &Arc<DeviceObject>,
-    req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
-) -> DriverStep {
-    let code = req.read().body.code;
-
-    match code {
-        IOCTL_PCI_SETUP_MSIX => msix::pci_setup_msix(dev.clone(), req).await,
-        _ => DriverStep::complete(DriverStatus::NotImplemented),
-    }
 }

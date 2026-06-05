@@ -9,7 +9,7 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use kernel_types::async_ffi::{FfiFuture, FutureExt};
 use kernel_types::device::{DeviceInit, DeviceObject};
 use kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
-use kernel_types::io::{IoType, IoVtable};
+use kernel_types::io::{DeviceOps, DeviceRead, DeviceWrite};
 use kernel_types::pnp::{
     DeviceRelationType, DriverStep, PnpMinorFunction, PnpRequest, PnpVtable, QueryIdType,
 };
@@ -43,12 +43,18 @@ fn block_on_ready<F: Future>(mut future: F) -> F::Output {
     }
 }
 
-fn device_with_io(vtable: IoVtable) -> Arc<DeviceObject> {
-    DeviceObject::new(DeviceInit::new(vtable, None))
+fn device_with_ops(ops: DeviceOps) -> Arc<DeviceObject> {
+    let mut init = DeviceInit::new();
+    init.ops = ops;
+    DeviceObject::new(init)
+}
+
+fn device_without_io() -> Arc<DeviceObject> {
+    DeviceObject::new(DeviceInit::new())
 }
 
 fn device_with_pnp(vtable: PnpVtable) -> Arc<DeviceObject> {
-    DeviceObject::new(DeviceInit::new(IoVtable::new(), Some(vtable)))
+    DeviceObject::new(DeviceInit::with_pnp(Some(vtable)))
 }
 
 extern "win64" fn read_handler(
@@ -81,6 +87,42 @@ extern "win64" fn continue_handler(
     _len: usize,
 ) -> FfiFuture<DriverStep> {
     async { DriverStep::Continue }.into_ffi()
+}
+
+struct TestRead;
+
+impl DeviceRead for TestRead {
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Read<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep> {
+        read_handler(dev, handle, len)
+    }
+}
+
+struct ContinueRead;
+
+impl DeviceRead for ContinueRead {
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Read<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep> {
+        continue_handler(dev, handle, len)
+    }
+}
+
+struct TestWrite;
+
+impl DeviceWrite for TestWrite {
+    extern "win64" fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        handle: &'b mut RequestHandle<'req, Write<'data>>,
+        len: usize,
+    ) -> FfiFuture<DriverStep> {
+        write_handler(dev, handle, len)
+    }
 }
 
 extern "win64" fn not_implemented_pnp(
@@ -131,7 +173,7 @@ fn complete_request_runs_chained_completions_once() {
 
 #[test]
 fn dummy_request_completes_without_requiring_a_handler() {
-    let dev = device_with_io(IoVtable::new());
+    let dev = device_without_io();
     let mut handle = RequestHandle::new(Dummy);
 
     let status = block_on_ready(send_request(dev, &mut handle));
@@ -142,9 +184,9 @@ fn dummy_request_completes_without_requiring_a_handler() {
 
 #[test]
 fn read_request_invokes_matching_io_handler_and_updates_buffer() {
-    let mut vtable = IoVtable::new();
-    vtable.set(IoType::Read(read_handler), 0);
-    let dev = device_with_io(vtable);
+    let mut ops = DeviceOps::empty();
+    ops.read.register::<TestRead>();
+    let dev = device_with_ops(ops);
     let mut out = [0u8; 2];
     let mut handle = RequestHandle::new(Read {
         offset: 5,
@@ -161,7 +203,7 @@ fn read_request_invokes_matching_io_handler_and_updates_buffer() {
 
 #[test]
 fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
-    let upper = device_with_io(IoVtable::new());
+    let upper = device_without_io();
     let input = [0u8; 4];
     let mut handle = RequestHandle::new(Write {
         offset: 0,
@@ -176,9 +218,9 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
         DriverStatus::NotImplemented
     );
 
-    let mut vtable = IoVtable::new();
-    vtable.set(IoType::Write(write_handler), 0);
-    let lower = device_with_io(vtable);
+    let mut ops = DeviceOps::empty();
+    ops.write.register::<TestWrite>();
+    let lower = device_with_ops(ops);
     DeviceObject::set_lower_upper(&upper, lower);
 
     let mut handle = RequestHandle::new(Write {
@@ -198,7 +240,7 @@ fn unhandled_io_follows_policy_to_not_implemented_or_next_lower() {
 
 #[test]
 fn next_upper_and_next_lower_report_missing_links() {
-    let dev = device_with_io(IoVtable::new());
+    let dev = device_without_io();
     let mut handle = RequestHandle::new(Dummy);
 
     assert_eq!(
@@ -239,13 +281,13 @@ fn pnp_query_without_handler_continues_to_success_at_bottom_of_stack() {
 
 #[test]
 fn continuing_handler_can_forward_to_lower_handler() {
-    let mut upper_vtable = IoVtable::new();
-    upper_vtable.set(IoType::Read(continue_handler), 0);
-    let upper = device_with_io(upper_vtable);
+    let mut upper_ops = DeviceOps::empty();
+    upper_ops.read.register::<ContinueRead>();
+    let upper = device_with_ops(upper_ops);
 
-    let mut lower_vtable = IoVtable::new();
-    lower_vtable.set(IoType::Read(read_handler), 0);
-    let lower = device_with_io(lower_vtable);
+    let mut lower_ops = DeviceOps::empty();
+    lower_ops.read.register::<TestRead>();
+    let lower = device_with_ops(lower_ops);
     DeviceObject::set_lower_upper(&upper, lower);
 
     let mut out = [0u8; 2];
@@ -262,5 +304,3 @@ fn continuing_handler_can_forward_to_lower_handler() {
     assert_eq!(status, DriverStatus::Success);
     assert_eq!(out, [3, 0xAA]);
 }
-
-

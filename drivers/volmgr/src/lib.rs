@@ -21,8 +21,9 @@ use kernel_api::device::DeviceObject;
 use kernel_api::device::DriverObject;
 use kernel_api::kernel_types::dma::{Described, FromDevice, IoBuffer, ToDevice};
 use kernel_api::kernel_types::io::IoTarget;
-use kernel_api::kernel_types::io::IoType;
-use kernel_api::kernel_types::io::IoVtable;
+use kernel_api::kernel_types::io::{
+    DeviceFlush, DeviceFlushDirty, DeviceFlushOwner, DeviceRead, DeviceWrite,
+};
 use kernel_api::kernel_types::io::PartitionInfo;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -56,6 +57,61 @@ const BLOCK_SIZE: usize = 1024 * 64;
 const CACHE_CAPACITY_BYTES: usize = 1024 * 1024 * 50;
 const LAZY_CACHE_PAGE_ALLOCATION: bool = false;
 const LAZY_INDEX_ALLOCATION: bool = false;
+
+struct VolPdoIo;
+
+impl DeviceRead for VolPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Read<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        vol_pdo_read_impl(dev, req, buf_len).await
+    }
+}
+
+impl DeviceWrite for VolPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Write<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        vol_pdo_write_impl(dev, req, buf_len).await
+    }
+}
+
+impl DeviceFlush for VolPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Flush>,
+    ) -> DriverStep {
+        vol_pdo_flush_impl(dev, req).await
+    }
+}
+
+impl DeviceFlushDirty for VolPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FlushDirty>,
+    ) -> DriverStep {
+        vol_pdo_flush_dirty_impl(dev, req).await
+    }
+}
+
+impl DeviceFlushOwner for VolPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        dev: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, FlushOwner>,
+    ) -> DriverStep {
+        vol_pdo_flush_owner_impl(dev, req).await
+    }
+}
+
 struct CacheBackend {
     target: IoTarget,
     /// Total addressable bytes for the volume (computed from partition info).
@@ -550,18 +606,16 @@ pub async fn vol_enumerate_devices<'a, 'b>(
         compatible: vec!["STOR\\Volume".into()],
     };
 
-    let mut io_table = IoVtable::new();
-    io_table.set(IoType::Read(vol_pdo_read), 0);
-    io_table.set(IoType::Write(vol_pdo_write), 0);
-    io_table.set(IoType::Flush(vol_pdo_flush), 0);
-    io_table.set(IoType::FlushDirty(vol_pdo_flush_dirty), 0);
-    io_table.set(IoType::FlushOwner(vol_pdo_flush_owner), 0);
-
     let pnp_vtable = PnpVtable::new();
     pnp_vtable.set(PnpMinorFunction::QueryResources, vol_pdo_query_resources);
     pnp_vtable.set(PnpMinorFunction::RemoveDevice, vol_pdo_remove_device);
 
-    let mut init = DeviceInit::new(io_table, Some(pnp_vtable));
+    let mut init = DeviceInit::with_pnp(Some(pnp_vtable));
+    init.ops.read.register::<VolPdoIo>();
+    init.ops.write.register::<VolPdoIo>();
+    init.ops.flush.register::<VolPdoIo>();
+    init.ops.flush_dirty.register::<VolPdoIo>();
+    init.ops.flush_owner.register::<VolPdoIo>();
     init.set_dev_ext_default::<VolPdoExt>();
 
     let (_dn, pdo) = pnp_create_child_devnode_and_pdo_with_init(
@@ -604,8 +658,7 @@ pub async fn vol_enumerate_devices<'a, 'b>(
     DriverStep::Continue
 }
 
-#[request_handler]
-pub async fn vol_pdo_read<'req, 'data, 'b>(
+async fn vol_pdo_read_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Read<'data>>,
     buf_len: usize,
@@ -695,8 +748,7 @@ pub async fn vol_pdo_read<'req, 'data, 'b>(
     }
 }
 
-#[request_handler]
-pub async fn vol_pdo_write<'req, 'data, 'b>(
+async fn vol_pdo_write_impl<'req, 'data, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Write<'data>>,
     buf_len: usize,
@@ -789,24 +841,21 @@ pub async fn vol_pdo_write<'req, 'data, 'b>(
     }
 }
 
-#[request_handler]
-pub async fn vol_pdo_flush<'req, 'b>(
+async fn vol_pdo_flush_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Flush>,
 ) -> DriverStep {
     vol_pdo_flush_common(dev, req.read().body.should_block, None).await
 }
 
-#[request_handler]
-pub async fn vol_pdo_flush_dirty<'req, 'b>(
+async fn vol_pdo_flush_dirty_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, FlushDirty>,
 ) -> DriverStep {
     vol_pdo_flush_common(dev, req.read().body.should_block, None).await
 }
 
-#[request_handler]
-pub async fn vol_pdo_flush_owner<'req, 'b>(
+async fn vol_pdo_flush_owner_impl<'req, 'b>(
     dev: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, FlushOwner>,
 ) -> DriverStep {

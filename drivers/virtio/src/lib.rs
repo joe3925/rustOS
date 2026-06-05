@@ -41,7 +41,9 @@ use kernel_api::kernel_types::dma::{
     BorrowedDmaMapping, Described, DmaMappingStrategy, FromDevice, IoBuffer, IoBufferDirection,
     IoBufferDmaSegment, IoBufferState, ToDevice,
 };
-use kernel_api::kernel_types::io::{DiskInfo, IoType, IoVtable};
+use kernel_api::kernel_types::io::{
+    DeviceControlHandler, DeviceFlush, DeviceRead, DeviceWrite, DiskInfo,
+};
 use kernel_api::kernel_types::irq::{IRQ_RESCUE_WAKEUP, IrqMeta};
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::kernel_types::request::RequestData;
@@ -69,6 +71,50 @@ static MOD_NAME: &str = option_env!("CARGO_PKG_NAME").unwrap_or(module_path!());
 
 const PIC_BASE_VECTOR: u8 = 0x20;
 const COMPLETION_POLL_TIME: Duration = Duration::from_nanos(1494117);
+
+struct VirtioPdoIo;
+
+impl DeviceRead for VirtioPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        pdo: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Read<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        virtio_pdo_read_impl(pdo, req, buf_len).await
+    }
+}
+
+impl DeviceWrite for VirtioPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        pdo: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Write<'data>>,
+        buf_len: usize,
+    ) -> DriverStep {
+        virtio_pdo_write_impl(pdo, req, buf_len).await
+    }
+}
+
+impl DeviceFlush for VirtioPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'b>(
+        pdo: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, Flush>,
+    ) -> DriverStep {
+        virtio_pdo_flush_impl(pdo, req).await
+    }
+}
+
+impl DeviceControlHandler for VirtioPdoIo {
+    #[request_handler]
+    async fn handler<'req, 'data, 'b>(
+        pdo: &Arc<DeviceObject>,
+        req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
+    ) -> DriverStep {
+        virtio_pdo_ioctl_impl(pdo, req).await
+    }
+}
 
 #[inline]
 fn duration_to_tsc_cycles(duration: Duration, tsc_hz: u64) -> u64 {
@@ -179,7 +225,7 @@ where
         phys_framed,
         virtio_data_mapping_strategy(phys_framed),
     )
-        .map_err(|_| DriverStatus::InsufficientResources)
+    .map_err(|_| DriverStatus::InsufficientResources)
 }
 
 async fn submit_virtio_no_data_request(
@@ -301,8 +347,6 @@ pub extern "win64" fn virtio_device_add(
     _driver: &Arc<DriverObject>,
     dev_init: &mut DeviceInit,
 ) -> DriverStep {
-    let io_vt = IoVtable::new();
-
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::StartDevice, virtio_pnp_start);
     pnp_vt.set(PnpMinorFunction::RemoveDevice, virtio_pnp_remove);
@@ -311,7 +355,7 @@ pub extern "win64" fn virtio_device_add(
         virtio_pnp_query_devrels,
     );
 
-    let init = DeviceInit::new(io_vt, Some(pnp_vt));
+    let init = DeviceInit::with_pnp(Some(pnp_vt));
     *dev_init = init;
     dev_init.set_dev_ext_from(DevExt::new());
 
@@ -895,12 +939,6 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
         compatible: vec!["VirtIO\\Disk".into(), "GenDisk".into()],
     };
 
-    let mut io_vt = IoVtable::new();
-    io_vt.set(IoType::Read(virtio_pdo_read), 0);
-    io_vt.set(IoType::Write(virtio_pdo_write), 0);
-    io_vt.set(IoType::DeviceControl(virtio_pdo_ioctl), 0);
-    io_vt.set(IoType::Flush(virtio_pdo_flush), 0);
-
     let mut pnp_vt = PnpVtable::new();
     pnp_vt.set(PnpMinorFunction::QueryId, virtio_pdo_query_id);
     pnp_vt.set(PnpMinorFunction::QueryResources, virtio_pdo_query_resources);
@@ -917,7 +955,11 @@ fn create_child_pdo(parent: &Arc<DeviceObject>) {
         total_bytes_high: 0,
     };
 
-    let mut child_init = DeviceInit::new(io_vt, Some(pnp_vt));
+    let mut child_init = DeviceInit::with_pnp(Some(pnp_vt));
+    child_init.ops.read.register::<VirtioPdoIo>();
+    child_init.ops.write.register::<VirtioPdoIo>();
+    child_init.ops.device_control.register::<VirtioPdoIo>();
+    child_init.ops.flush.register::<VirtioPdoIo>();
     child_init.set_dev_ext_from(ChildExt {
         parent_device: Arc::downgrade(parent),
         disk_info,
@@ -1116,9 +1158,8 @@ fn get_parent_inner(
     let inner = dx.inner.get().ok_or(DriverStatus::DeviceNotReady)?.clone();
     Ok((parent, inner))
 }
-
-#[request_handler]
-pub async fn virtio_pdo_read<'req, 'data, 'b>(
+#[inline(always)]
+async fn virtio_pdo_read_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Read<'data>>,
     _buf_len: usize,
@@ -1154,8 +1195,7 @@ pub async fn virtio_pdo_read<'req, 'data, 'b>(
             cold_path();
             break 'transfer DriverStatus::InvalidParameter;
         }
-        let mapped_buffer =
-            match map_request_buffer::<FromDevice>(&parent, buffer) {
+        let mapped_buffer = match map_request_buffer::<FromDevice>(&parent, buffer) {
             Ok(b) => b,
             Err(status) => {
                 cold_path();
@@ -1244,9 +1284,8 @@ pub async fn virtio_pdo_read<'req, 'data, 'b>(
 
     complete_req(req, status)
 }
-
-#[request_handler]
-pub async fn virtio_pdo_write<'req, 'data, 'b>(
+#[inline(always)]
+async fn virtio_pdo_write_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Write<'data>>,
     _buf_len: usize,
@@ -1372,17 +1411,15 @@ pub async fn virtio_pdo_write<'req, 'data, 'b>(
 
     complete_req(req, status)
 }
-
-#[request_handler]
-pub async fn virtio_pdo_flush<'req, 'b>(
+#[inline(always)]
+async fn virtio_pdo_flush_impl<'req, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, Flush>,
 ) -> DriverStep {
     complete_req(req, DriverStatus::Success)
 }
-
-#[request_handler]
-pub async fn virtio_pdo_ioctl<'req, 'data, 'b>(
+#[inline(always)]
+async fn virtio_pdo_ioctl_impl<'req, 'data, 'b>(
     pdo: &Arc<DeviceObject>,
     req: &'b mut RequestHandle<'req, DeviceControl<'data>>,
 ) -> DriverStep {

@@ -11,7 +11,6 @@ use alloc::{boxed::Box, string::ToString, sync::Arc, vec::Vec};
 use aml::{KernelAmlHandler, PAGE_SIZE, create_pnp_bus_from_acpi};
 use dev_ext::DevExt;
 use kernel_api::device::{DevNode, DeviceInit, DeviceObject, DriverObject};
-use kernel_api::kernel_types::io::IoVtable;
 use kernel_api::kernel_types::pnp::DeviceIds;
 use kernel_api::memory::map_mmio_region;
 use kernel_api::pnp::{
@@ -196,7 +195,7 @@ fn create_synthetic_i8042_pdo(parent: &Arc<DevNode>) {
         compatible: alloc::vec![],
     };
 
-    let child_init = DeviceInit::new(IoVtable::new(), Some(PnpVtable::new()));
+    let child_init = DeviceInit::with_pnp(Some(PnpVtable::new()));
 
     let name = "\\Device\\ACPI_I8042".to_string();
     let instance = "ACPI\\I8042\\0".to_string();

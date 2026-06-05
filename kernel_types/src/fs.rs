@@ -107,26 +107,6 @@ impl core::ops::BitOr<OpenFlags> for OpenFlagsMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[repr(C)]
-pub enum FsOp {
-    Create,
-    Open,
-    Close,
-    Read,
-    Write,
-    Flush,
-    Seek,
-    ReadDir,
-    GetInfo,
-    SetInfo,
-    Delete,
-    Rename,
-    SetLen,
-    Append,
-    ZeroRange,
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, kernel_macros::RequestPayload)]
 pub struct FsOpenParams {
