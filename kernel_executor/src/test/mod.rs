@@ -50,10 +50,11 @@ impl ExecutorPlatform for ThreadPoolPlatform {
         let _ = self.blocking_pool.set(threadpool::ThreadPool::new(threads));
     }
 
-    fn submit_runtime(&self, job: Job) {
+    fn submit_runtime(&self, job: Job) -> bool {
         self.runtime_pool().execute(move || {
             (job.f)(job.a);
         });
+        true
     }
 
     fn submit_blocking(&self, job: Job) {

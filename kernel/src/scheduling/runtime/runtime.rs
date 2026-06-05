@@ -53,12 +53,8 @@ impl ExecutorPlatform for KernelExecutorPlatform {
             .call_once(|| Arc::new(ThreadPool::new_blocking(threads)));
     }
 
-    fn submit_runtime(&self, job: Job) {
-        let accepted = self.runtime_pool().submit(job.f, job.a);
-
-        if !accepted {
-            panic!("runtime pool is full");
-        }
+    fn submit_runtime(&self, job: Job) -> bool {
+        self.runtime_pool().submit(job.f, job.a)
     }
 
     fn submit_blocking(&self, job: Job) {

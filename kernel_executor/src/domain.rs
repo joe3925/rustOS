@@ -1,7 +1,10 @@
 use crate::global_async::{CacheAligned, WorkItem};
-use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use crate::sync::{Arc, Mutex};
+use crate::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use crate::sync::Arc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::ptr;
+use core::sync::atomic::AtomicPtr;
 use kernel_types::io::BoundedTreiberStack;
 
 const BUILTIN_GENERATION: u32 = 1;
@@ -9,6 +12,19 @@ const KERNEL_HIGH_SLOT: u32 = 0;
 const DRIVER_SLOT: u32 = 1;
 const KERNEL_NORMAL_SLOT: u32 = 2;
 const KERNEL_BACKGROUND_SLOT: u32 = 3;
+
+const DOMAIN_SCHEDULED: usize = 1 << 0;
+
+const DOMAIN_SLOT_EMPTY: usize = 0;
+const DOMAIN_SLOT_RESERVED: usize = 1;
+const DOMAIN_SLOT_ACTIVE: usize = 2;
+const DOMAIN_SLOT_BUILTIN: usize = 3;
+
+const DOMAIN_CHUNK_BITS: usize = 6;
+const DOMAIN_CHUNK_SIZE: usize = 1 << DOMAIN_CHUNK_BITS;
+const DOMAIN_CHUNK_MASK: usize = DOMAIN_CHUNK_SIZE - 1;
+const MAX_DOMAIN_CHUNKS: usize = 64;
+const MAX_DOMAIN_SLOTS: usize = DOMAIN_CHUNK_SIZE * MAX_DOMAIN_CHUNKS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
@@ -36,8 +52,7 @@ impl DomainId {
     }
 }
 
-pub const KERNEL_HIGH_DOMAIN: DomainId =
-    DomainId::from_parts(KERNEL_HIGH_SLOT, BUILTIN_GENERATION);
+pub const KERNEL_HIGH_DOMAIN: DomainId = DomainId::from_parts(KERNEL_HIGH_SLOT, BUILTIN_GENERATION);
 pub const DRIVER_DOMAIN: DomainId = DomainId::from_parts(DRIVER_SLOT, BUILTIN_GENERATION);
 pub const KERNEL_NORMAL_DOMAIN: DomainId =
     DomainId::from_parts(KERNEL_NORMAL_SLOT, BUILTIN_GENERATION);
@@ -77,6 +92,7 @@ impl DomainClass {
 
     pub fn default_max_active(self, cpu_count: usize) -> usize {
         let cpu_count = cpu_count.max(1);
+
         match self {
             DomainClass::KernelHigh => cpu_count,
             DomainClass::Driver => (cpu_count / 2).max(1),
@@ -210,7 +226,7 @@ pub struct DomainStats {
     pub quantum: usize,
     pub weight: usize,
     pub deficit: usize,
-    pub ready_enqueued: bool,
+    pub scheduled: bool,
     pub submitted: usize,
     pub completed: usize,
     pub rejected: usize,
@@ -239,7 +255,8 @@ struct ShardedQueues {
 
 impl ShardedQueues {
     fn new(shards: usize, max_work_items: usize) -> Self {
-        let shards = shards.max(1);
+        let max_work_items = max_work_items.max(1);
+        let shards = shards.max(1).min(max_work_items);
         let base = max_work_items / shards;
         let rem = max_work_items % shards;
 
@@ -322,15 +339,20 @@ pub struct ExecutorDomain {
     class: DomainClass,
     admission_policy: AdmissionPolicy,
     queues: ShardedQueues,
+
     state: AtomicU8,
+    max_queued: usize,
+
+    flags: CacheAligned,
+
     queued_count: CacheAligned,
     active_count: CacheAligned,
     max_active: CacheAligned,
-    max_queued: usize,
+
     quantum: CacheAligned,
     weight: CacheAligned,
     deficit: CacheAligned,
-    ready_enqueued: AtomicBool,
+
     submitted: CacheAligned,
     completed: CacheAligned,
     rejected: CacheAligned,
@@ -349,15 +371,20 @@ impl ExecutorDomain {
             class: config.class,
             admission_policy: config.admission_policy,
             queues: ShardedQueues::new(shards, config.max_queued),
+
             state: AtomicU8::new(DomainState::Active as u8),
+            max_queued: config.max_queued,
+
+            flags: CacheAligned(AtomicUsize::new(0)),
+
             queued_count: CacheAligned(AtomicUsize::new(0)),
             active_count: CacheAligned(AtomicUsize::new(0)),
             max_active: CacheAligned(AtomicUsize::new(config.max_active)),
-            max_queued: config.max_queued,
+
             quantum: CacheAligned(AtomicUsize::new(config.quantum)),
             weight: CacheAligned(AtomicUsize::new(config.weight)),
             deficit: CacheAligned(AtomicUsize::new(0)),
-            ready_enqueued: AtomicBool::new(false),
+
             submitted: CacheAligned(AtomicUsize::new(0)),
             completed: CacheAligned(AtomicUsize::new(0)),
             rejected: CacheAligned(AtomicUsize::new(0)),
@@ -365,6 +392,50 @@ impl ExecutorDomain {
             scheduler_selections: CacheAligned(AtomicUsize::new(0)),
             last_run_tick: CacheAligned(AtomicUsize::new(0)),
         }
+    }
+
+    #[inline]
+    pub fn try_mark_scheduled(&self) -> bool {
+        let mut flags = self.flags.0.load(Ordering::Acquire);
+
+        loop {
+            if flags & DOMAIN_SCHEDULED != 0 {
+                return false;
+            }
+
+            match self.flags.0.compare_exchange_weak(
+                flags,
+                flags | DOMAIN_SCHEDULED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => flags = next,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn clear_scheduled(&self) {
+        self.flags.0.fetch_and(!DOMAIN_SCHEDULED, Ordering::AcqRel);
+    }
+
+    #[inline]
+    pub fn is_scheduled(&self) -> bool {
+        self.flags.0.load(Ordering::Acquire) & DOMAIN_SCHEDULED != 0
+    }
+
+    #[inline]
+    pub fn is_schedulable_for_policy(&self) -> bool {
+        self.is_runnable_for_policy() && !self.is_at_active_limit()
+    }
+
+    pub(crate) fn mark_runnable(&self) -> bool {
+        self.try_mark_scheduled()
+    }
+
+    pub(crate) fn clear_runnable(&self) {
+        self.clear_scheduled();
     }
 
     pub fn id(&self) -> DomainId {
@@ -400,7 +471,7 @@ impl ExecutorDomain {
     }
 
     pub fn has_queued_work(&self) -> bool {
-        self.queued_count() != 0 || self.queues.has_pending_work()
+        self.queues.has_pending_work()
     }
 
     pub fn is_runnable_for_policy(&self) -> bool {
@@ -426,31 +497,30 @@ impl ExecutorDomain {
                 ));
             }
             DomainState::Dead => {
-                return Err(self.reject_submit(
-                    SubmitErrorKind::DomainDead,
-                    domain_id,
-                    work_item,
-                ));
+                return Err(self.reject_submit(SubmitErrorKind::DomainDead, domain_id, work_item));
             }
         }
 
-        if self
-            .queued_count
-            .0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                (queued < self.max_queued).then_some(queued + 1)
-            })
-            .is_err()
-        {
-            return Err(self.reject_submit(
-                SubmitErrorKind::DomainFull,
-                domain_id,
-                work_item,
-            ));
-        }
+        let previous_queued =
+            match self
+                .queued_count
+                .0
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                    (queued < self.max_queued).then_some(queued + 1)
+                }) {
+                Ok(previous) => previous,
+                Err(_) => {
+                    return Err(self.reject_submit(
+                        SubmitErrorKind::DomainFull,
+                        domain_id,
+                        work_item,
+                    ));
+                }
+            };
 
         if self.state() != DomainState::Active {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
+
             return Err(self.reject_submit(
                 match self.state() {
                     DomainState::Active => SubmitErrorKind::DomainFull,
@@ -464,25 +534,11 @@ impl ExecutorDomain {
 
         if let Err(work_item) = self.queues.try_push(work_item) {
             self.queued_count.0.fetch_sub(1, Ordering::AcqRel);
-            return Err(self.reject_submit(
-                SubmitErrorKind::DomainFull,
-                domain_id,
-                work_item,
-            ));
+            return Err(self.reject_submit(SubmitErrorKind::DomainFull, domain_id, work_item));
         }
 
-        self.submitted.0.fetch_add(1, Ordering::AcqRel);
-        Ok(self.mark_runnable())
-    }
-
-    pub(crate) fn mark_runnable(&self) -> bool {
-        self.ready_enqueued
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-
-    pub(crate) fn clear_runnable(&self) {
-        self.ready_enqueued.store(false, Ordering::Release);
+        self.submitted.0.fetch_add(1, Ordering::Relaxed);
+        Ok(previous_queued == 0)
     }
 
     pub(crate) fn pop_work(&self, cursor: usize) -> Option<(WorkItem, usize)> {
@@ -532,20 +588,20 @@ impl ExecutorDomain {
     }
 
     pub(crate) fn record_scheduler_selection(&self) {
-        self.scheduler_selections.0.fetch_add(1, Ordering::AcqRel);
+        self.scheduler_selections.0.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_run_started(&self, tick: usize) {
-        self.total_runs.0.fetch_add(1, Ordering::AcqRel);
+        self.total_runs.0.fetch_add(1, Ordering::Relaxed);
         self.last_run_tick.0.store(tick, Ordering::Release);
     }
 
     pub(crate) fn record_completed(&self) {
-        self.completed.0.fetch_add(1, Ordering::AcqRel);
+        self.completed.0.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_rejection(&self) {
-        self.rejected.0.fetch_add(1, Ordering::AcqRel);
+        self.rejected.0.fetch_add(1, Ordering::Relaxed);
     }
 
     #[cold]
@@ -569,9 +625,8 @@ impl ExecutorDomain {
     }
 
     fn move_to_dead(&self) {
-        self.state
-            .store(DomainState::Dead as u8, Ordering::Release);
-        self.clear_runnable();
+        self.state.store(DomainState::Dead as u8, Ordering::Release);
+        self.clear_scheduled();
     }
 
     pub(crate) fn maybe_finish_draining(&self) {
@@ -597,7 +652,7 @@ impl ExecutorDomain {
             quantum: self.quantum(),
             weight: self.weight(),
             deficit: self.deficit.0.load(Ordering::Acquire),
-            ready_enqueued: self.ready_enqueued.load(Ordering::Acquire),
+            scheduled: self.is_scheduled(),
             submitted: self.submitted.0.load(Ordering::Acquire),
             completed: self.completed.0.load(Ordering::Acquire),
             rejected: self.rejected.0.load(Ordering::Acquire),
@@ -609,21 +664,61 @@ impl ExecutorDomain {
 }
 
 struct DomainSlot {
-    generation: u32,
-    domain: Option<Arc<ExecutorDomain>>,
-    builtin: bool,
+    state: AtomicUsize,
+    generation: AtomicUsize,
+    domain: AtomicPtr<ExecutorDomain>,
+}
+
+impl DomainSlot {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(DOMAIN_SLOT_EMPTY),
+            generation: AtomicUsize::new(BUILTIN_GENERATION as usize),
+            domain: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    #[inline]
+    fn generation(&self) -> u32 {
+        self.generation.load(Ordering::Acquire) as u32
+    }
+
+    #[inline]
+    fn load_domain_ptr(&self) -> *mut ExecutorDomain {
+        self.domain.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    unsafe fn clone_domain_from_ptr(ptr: *mut ExecutorDomain) -> Arc<ExecutorDomain> {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
+}
+
+struct DomainChunk {
+    slots: [DomainSlot; DOMAIN_CHUNK_SIZE],
+}
+
+impl DomainChunk {
+    fn new() -> Self {
+        Self {
+            slots: core::array::from_fn(|_| DomainSlot::new()),
+        }
+    }
 }
 
 pub struct DomainTable {
     shards: usize,
-    slots: Mutex<Vec<DomainSlot>>,
+    next_slot: AtomicUsize,
+    chunks: [AtomicPtr<DomainChunk>; MAX_DOMAIN_CHUNKS],
 }
 
 impl DomainTable {
     pub(crate) fn new(shards: usize, max_work_items: usize) -> Self {
         let table = Self {
             shards: shards.max(1),
-            slots: Mutex::new(Vec::new()),
+            next_slot: AtomicUsize::new(0),
+            chunks: core::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
         };
 
         table.install_builtin(
@@ -646,46 +741,172 @@ impl DomainTable {
         table
     }
 
-    fn install_builtin(&self, slot_idx: u32, config: DomainConfig) {
-        let id = DomainId::from_parts(slot_idx, BUILTIN_GENERATION);
-        let mut slots = self.slots.lock();
-        while slots.len() <= slot_idx as usize {
-            slots.push(DomainSlot {
-                generation: BUILTIN_GENERATION,
-                domain: None,
-                builtin: false,
-            });
+    fn chunk_index(slot_idx: usize) -> usize {
+        slot_idx >> DOMAIN_CHUNK_BITS
+    }
+
+    fn chunk_slot_index(slot_idx: usize) -> usize {
+        slot_idx & DOMAIN_CHUNK_MASK
+    }
+
+    fn publish_slot_count(&self, required: usize) {
+        let mut current = self.next_slot.load(Ordering::Acquire);
+
+        while current < required {
+            match self.next_slot.compare_exchange_weak(
+                current,
+                required,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn get_or_create_chunk(&self, chunk_idx: usize) -> *mut DomainChunk {
+        assert!(
+            chunk_idx < MAX_DOMAIN_CHUNKS,
+            "executor domain table exhausted"
+        );
+
+        let existing = self.chunks[chunk_idx].load(Ordering::Acquire);
+        if !existing.is_null() {
+            return existing;
         }
 
-        slots[slot_idx as usize] = DomainSlot {
-            generation: BUILTIN_GENERATION,
-            domain: Some(Arc::new(ExecutorDomain::new(id, config, self.shards))),
-            builtin: true,
-        };
+        let new_chunk = Box::into_raw(Box::new(DomainChunk::new()));
+
+        match self.chunks[chunk_idx].compare_exchange(
+            ptr::null_mut(),
+            new_chunk,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => new_chunk,
+            Err(existing) => {
+                unsafe {
+                    drop(Box::from_raw(new_chunk));
+                }
+
+                existing
+            }
+        }
+    }
+
+    fn get_existing_chunk(&self, chunk_idx: usize) -> Option<*mut DomainChunk> {
+        if chunk_idx >= MAX_DOMAIN_CHUNKS {
+            return None;
+        }
+
+        let chunk = self.chunks[chunk_idx].load(Ordering::Acquire);
+        (!chunk.is_null()).then_some(chunk)
+    }
+
+    fn get_or_create_slot(&self, slot_idx: usize) -> &DomainSlot {
+        let chunk = self.get_or_create_chunk(Self::chunk_index(slot_idx));
+        let idx = Self::chunk_slot_index(slot_idx);
+
+        unsafe { &(*chunk).slots[idx] }
+    }
+
+    fn get_existing_slot(&self, slot_idx: usize) -> Option<&DomainSlot> {
+        let chunk = self.get_existing_chunk(Self::chunk_index(slot_idx))?;
+        let idx = Self::chunk_slot_index(slot_idx);
+
+        Some(unsafe { &(*chunk).slots[idx] })
+    }
+
+    fn install_builtin(&self, slot_idx: u32, config: DomainConfig) {
+        let slot_idx = slot_idx as usize;
+        let id = DomainId::from_parts(slot_idx as u32, BUILTIN_GENERATION);
+        let slot = self.get_or_create_slot(slot_idx);
+
+        slot.state.store(DOMAIN_SLOT_RESERVED, Ordering::Release);
+        slot.generation
+            .store(BUILTIN_GENERATION as usize, Ordering::Release);
+
+        let domain = Arc::new(ExecutorDomain::new(id, config, self.shards));
+        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
+
+        slot.domain.store(raw, Ordering::Release);
+        slot.state.store(DOMAIN_SLOT_BUILTIN, Ordering::Release);
+
+        self.publish_slot_count(slot_idx + 1);
     }
 
     pub fn create_domain(&self, config: DomainConfig) -> DomainId {
-        let mut slots = self.slots.lock();
         let config = config.normalized();
 
+        if let Some((idx, slot)) = self.reserve_reusable_slot() {
+            return self.install_user_domain(idx, slot, config);
+        }
+
+        loop {
+            let idx = self
+                .next_slot
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                    (next < MAX_DOMAIN_SLOTS).then_some(next + 1)
+                })
+                .expect("executor domain table exhausted");
+
+            let slot = self.get_or_create_slot(idx);
+
+            if slot
+                .state
+                .compare_exchange(
+                    DOMAIN_SLOT_EMPTY,
+                    DOMAIN_SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return self.install_user_domain(idx, slot, config);
+            }
+        }
+    }
+
+    fn reserve_reusable_slot(&self) -> Option<(usize, &DomainSlot)> {
+        let limit = self.next_slot.load(Ordering::Acquire);
         let mut idx = 0usize;
-        while idx < slots.len() {
-            if slots[idx].domain.is_none() && !slots[idx].builtin {
-                let generation = slots[idx].generation.max(1);
-                let id = DomainId::from_parts(idx as u32, generation);
-                slots[idx].domain = Some(Arc::new(ExecutorDomain::new(id, config, self.shards)));
-                return id;
+
+        while idx < limit {
+            let Some(slot) = self.get_existing_slot(idx) else {
+                idx += 1;
+                continue;
+            };
+
+            if slot
+                .state
+                .compare_exchange(
+                    DOMAIN_SLOT_EMPTY,
+                    DOMAIN_SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some((idx, slot));
             }
 
             idx += 1;
         }
 
-        let id = DomainId::from_parts(slots.len() as u32, BUILTIN_GENERATION);
-        slots.push(DomainSlot {
-            generation: BUILTIN_GENERATION,
-            domain: Some(Arc::new(ExecutorDomain::new(id, config, self.shards))),
-            builtin: false,
-        });
+        None
+    }
+
+    fn install_user_domain(&self, idx: usize, slot: &DomainSlot, config: DomainConfig) -> DomainId {
+        let generation = slot.generation.load(Ordering::Acquire).max(1) as u32;
+        let id = DomainId::from_parts(idx as u32, generation);
+
+        let domain = Arc::new(ExecutorDomain::new(id, config, self.shards));
+        let raw = Arc::into_raw(domain) as *mut ExecutorDomain;
+
+        slot.domain.store(raw, Ordering::Release);
+        slot.state.store(DOMAIN_SLOT_ACTIVE, Ordering::Release);
+
         id
     }
 
@@ -693,27 +914,51 @@ impl DomainTable {
         &self,
         domain_id: DomainId,
     ) -> Result<DestroyDomainResult, DestroyDomainError> {
-        let mut slots = self.slots.lock();
-        let Some(slot) = slots.get_mut(domain_id.slot() as usize) else {
-            return Err(DestroyDomainError::InvalidDomain);
-        };
+        let slot = self
+            .get_existing_slot(domain_id.slot() as usize)
+            .ok_or(DestroyDomainError::InvalidDomain)?;
 
-        if slot.generation != domain_id.generation() {
-            return Err(DestroyDomainError::StaleDomain);
-        }
+        let slot_state = slot.state.load(Ordering::Acquire);
 
-        if slot.builtin {
+        if slot_state == DOMAIN_SLOT_BUILTIN {
             return Err(DestroyDomainError::BuiltinDomain);
         }
 
-        let Some(domain) = slot.domain.as_ref() else {
+        if slot_state != DOMAIN_SLOT_ACTIVE {
+            return Err(DestroyDomainError::InvalidDomain);
+        }
+
+        if slot.generation() != domain_id.generation() {
+            return Err(DestroyDomainError::StaleDomain);
+        }
+
+        let Some(domain) = self.get_domain(domain_id) else {
             return Err(DestroyDomainError::InvalidDomain);
         };
 
         if domain.queued_count() == 0 && domain.active_count() == 0 {
             domain.move_to_dead();
-            slot.domain = None;
-            slot.generation = slot.generation.wrapping_add(1).max(1);
+
+            if slot
+                .state
+                .compare_exchange(
+                    DOMAIN_SLOT_ACTIVE,
+                    DOMAIN_SLOT_RESERVED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(DestroyDomainError::InvalidDomain);
+            }
+
+            slot.domain.store(ptr::null_mut(), Ordering::Release);
+
+            let next_generation = domain_id.generation().wrapping_add(1).max(1);
+            slot.generation
+                .store(next_generation as usize, Ordering::Release);
+            slot.state.store(DOMAIN_SLOT_EMPTY, Ordering::Release);
+
             return Ok(DestroyDomainResult::Destroyed);
         }
 
@@ -722,12 +967,42 @@ impl DomainTable {
     }
 
     pub fn get_domain(&self, domain_id: DomainId) -> Option<Arc<ExecutorDomain>> {
-        let slots = self.slots.lock();
-        let slot = slots.get(domain_id.slot() as usize)?;
-        if slot.generation != domain_id.generation() {
+        if !domain_id.is_valid() {
             return None;
         }
-        slot.domain.clone()
+
+        let slot = self.get_existing_slot(domain_id.slot() as usize)?;
+
+        let state = slot.state.load(Ordering::Acquire);
+        if state != DOMAIN_SLOT_ACTIVE && state != DOMAIN_SLOT_BUILTIN {
+            return None;
+        }
+
+        let generation = slot.generation.load(Ordering::Acquire) as u32;
+        if generation != domain_id.generation() {
+            return None;
+        }
+
+        let ptr = slot.load_domain_ptr();
+        if ptr.is_null() {
+            return None;
+        }
+
+        let domain = unsafe { DomainSlot::clone_domain_from_ptr(ptr) };
+
+        let state_after = slot.state.load(Ordering::Acquire);
+        let generation_after = slot.generation.load(Ordering::Acquire) as u32;
+        let ptr_after = slot.load_domain_ptr();
+
+        if ptr_after != ptr
+            || generation_after != domain_id.generation()
+            || (state_after != DOMAIN_SLOT_ACTIVE && state_after != DOMAIN_SLOT_BUILTIN)
+        {
+            drop(domain);
+            return None;
+        }
+
+        Some(domain)
     }
 
     fn resolve_submit_domain(
@@ -743,8 +1018,7 @@ impl DomainTable {
             ));
         }
 
-        let slots = self.slots.lock();
-        let Some(slot) = slots.get(domain_id.slot() as usize) else {
+        let Some(slot) = self.get_existing_slot(domain_id.slot() as usize) else {
             return Err(Self::invalid_submit(
                 SubmitErrorKind::InvalidDomain,
                 domain_id,
@@ -752,7 +1026,9 @@ impl DomainTable {
             ));
         };
 
-        if slot.generation != domain_id.generation() {
+        let slot_state = slot.state.load(Ordering::Acquire);
+
+        if slot.generation() != domain_id.generation() {
             return Err(Self::invalid_submit(
                 SubmitErrorKind::StaleDomain,
                 domain_id,
@@ -760,7 +1036,15 @@ impl DomainTable {
             ));
         }
 
-        let Some(domain) = slot.domain.as_ref() else {
+        if slot_state != DOMAIN_SLOT_ACTIVE && slot_state != DOMAIN_SLOT_BUILTIN {
+            return Err(Self::invalid_submit(
+                SubmitErrorKind::InvalidDomain,
+                domain_id,
+                work_item,
+            ));
+        }
+
+        let Some(domain) = self.get_domain(domain_id) else {
             return Err(Self::invalid_submit(
                 SubmitErrorKind::InvalidDomain,
                 domain_id,
@@ -768,7 +1052,7 @@ impl DomainTable {
             ));
         };
 
-        Ok(domain.clone())
+        Ok(domain)
     }
 
     #[cold]
@@ -795,8 +1079,23 @@ impl DomainTable {
     }
 
     pub fn domain_count(&self) -> usize {
-        let slots = self.slots.lock();
-        slots.iter().filter(|slot| slot.domain.is_some()).count()
+        let limit = self.next_slot.load(Ordering::Acquire);
+        let mut count = 0usize;
+        let mut idx = 0usize;
+
+        while idx < limit {
+            if let Some(slot) = self.get_existing_slot(idx) {
+                let state = slot.state.load(Ordering::Acquire);
+
+                if state == DOMAIN_SLOT_ACTIVE || state == DOMAIN_SLOT_BUILTIN {
+                    count += 1;
+                }
+            }
+
+            idx += 1;
+        }
+
+        count
     }
 }
 

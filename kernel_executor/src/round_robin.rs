@@ -1,4 +1,4 @@
-use alloc::vec::Vec;
+use alloc::collections::VecDeque;
 
 use crate::domain::{DomainId, DomainTable};
 
@@ -23,24 +23,24 @@ pub trait SchedulerPolicy: Send {
     fn runnable_len(&self) -> usize;
 }
 
-fn push_unique(queue: &mut Vec<DomainId>, domain_id: DomainId) {
+fn push_unique(queue: &mut VecDeque<DomainId>, domain_id: DomainId) {
     if !queue.iter().any(|queued| *queued == domain_id) {
-        queue.push(domain_id);
+        queue.push_back(domain_id);
     }
 }
 
-fn remove_all(queue: &mut Vec<DomainId>, domain_id: DomainId) {
+fn remove_all(queue: &mut VecDeque<DomainId>, domain_id: DomainId) {
     queue.retain(|queued| *queued != domain_id);
 }
 
 pub struct SimpleRoundRobinScheduler {
-    runnable: Vec<DomainId>,
+    runnable: VecDeque<DomainId>,
 }
 
 impl SimpleRoundRobinScheduler {
     pub fn new() -> Self {
         Self {
-            runnable: Vec::new(),
+            runnable: VecDeque::new(),
         }
     }
 }
@@ -61,7 +61,10 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
         let mut checked = 0usize;
 
         while checked < attempts {
-            let domain_id = self.runnable.remove(0);
+            let Some(domain_id) = self.runnable.pop_front() else {
+                break;
+            };
+
             checked += 1;
 
             let Some(domain) = domain_table.get_domain(domain_id) else {
@@ -113,13 +116,13 @@ impl SchedulerPolicy for SimpleRoundRobinScheduler {
 }
 
 pub struct WeightedDeficitRoundRobinScheduler {
-    runnable: Vec<DomainId>,
+    runnable: VecDeque<DomainId>,
 }
 
 impl WeightedDeficitRoundRobinScheduler {
     pub fn new() -> Self {
         Self {
-            runnable: Vec::new(),
+            runnable: VecDeque::new(),
         }
     }
 }
@@ -140,7 +143,10 @@ impl SchedulerPolicy for WeightedDeficitRoundRobinScheduler {
         let mut checked = 0usize;
 
         while checked < attempts {
-            let domain_id = self.runnable.remove(0);
+            let Some(domain_id) = self.runnable.pop_front() else {
+                break;
+            };
+
             checked += 1;
 
             let Some(domain) = domain_table.get_domain(domain_id) else {

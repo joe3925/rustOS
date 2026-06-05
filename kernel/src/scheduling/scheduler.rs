@@ -22,21 +22,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use kernel_types::bounded_mpmc::{BoundedMpmcPushError, BoundedMpmcQueue};
 use kernel_types::irq::IrqSafeRwLock;
-use kernel_types::mpmc_ring::{MpmcRing, RingError};
 use lazy_static::lazy_static;
 use spin::Mutex;
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::Cr3;
-
 const BALANCE_INTERVAL_TICKS: usize = 150;
 const RUNQ_CAP: usize = 4096;
 const TASK_TABLE_INITIAL_SLOTS: usize = 4096;
-type SchedulerQueue = MpmcRing<TaskHandle, RUNQ_CAP>;
 
-/// Saves the current task's FPU/SIMD state for the duration of a kernel handler.
-/// Restores the task selected at handler exit so post-schedule handler code
-/// cannot clobber the FPU/SIMD state that will be resumed by `iretq`.
+type SchedulerQueue = BoundedMpmcQueue<TaskHandle>;
+
 pub struct KernelFpuGuard {
     saved_task: Option<TaskHandle>,
 }
@@ -46,13 +43,13 @@ impl KernelFpuGuard {
     pub fn new() -> Self {
         let cpu_id = current_cpu_id();
         let saved_task = if let Some(task) = SCHEDULER.get_current_task(cpu_id) {
-            // Avoid blocking inside interrupts; skip if the lock is contended.
             {
                 let mut guard = task.inner.try_write().expect(
                     "Failed to acquire task lock for saving FPU state in interrupt handler",
                 );
                 guard.save_fpu_state();
             }
+
             Some(task)
         } else {
             None
@@ -140,8 +137,8 @@ impl Scheduler {
 
         Arc::new(CoreScheduler {
             sched_lock: IrqSafeRwLock::new(SchedulerState { current: None }),
-            run_queue: SchedulerQueue::new(),
-            inbound_queue: SchedulerQueue::new(),
+            run_queue: SchedulerQueue::new(RUNQ_CAP),
+            inbound_queue: SchedulerQueue::new(RUNQ_CAP),
             idle_task: idle.clone(),
             current: CurrentTask::new(&idle),
             lapic_id,
@@ -190,6 +187,7 @@ impl Scheduler {
         self.next_task_id.fetch_add(1, Ordering::Relaxed);
         id
     }
+
     fn register_task_no_reap(&self, task: TaskHandle) -> u64 {
         if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
             panic!("attempted to register task from interrupt context");
@@ -203,6 +201,7 @@ impl Scheduler {
         self.next_task_id.fetch_add(1, Ordering::Relaxed);
         id
     }
+
     #[inline(always)]
     pub fn reap_retired_tasks(&self) {
         if current_is_in_interrupt_atomic().load(Ordering::Relaxed) {
@@ -241,7 +240,7 @@ impl Scheduler {
 
         Self::reserve_queue_load_or_panic(cpu, &core.load, "inbound queue");
 
-        if core.inbound_queue.push(task).is_err() {
+        if core.inbound_queue.try_push(task).is_err() {
             core.load.fetch_sub(1, Ordering::Release);
             panic!("inbound queue overflow on cpu {}", cpu);
         }
@@ -268,8 +267,6 @@ impl Scheduler {
 
     #[inline(always)]
     fn reserve_queue_load_or_panic(cpu: usize, load: &AtomicUsize, queue_name: &str) {
-        // Reserve the shadow load slot before publishing to the queue so a
-        // concurrent pop cannot decrement a stale zero count and wrap it.
         if load
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1))
             .is_err()
@@ -286,7 +283,8 @@ impl Scheduler {
         task: TaskHandle,
     ) {
         Self::reserve_queue_load_or_panic(cpu, load, "run queue");
-        if queue.push(task).is_err() {
+
+        if queue.try_push(task).is_err() {
             load.fetch_sub(1, Ordering::Release);
             panic!("run queue overflow on cpu {cpu}");
         }
@@ -306,6 +304,7 @@ impl Scheduler {
             if best_load.is_none_or(|b| load < b) {
                 best_load = Some(load);
                 best = i;
+
                 if load == 0 {
                     break;
                 }
@@ -365,11 +364,10 @@ impl Scheduler {
                         continue;
                     }
 
-                    //task.set_block_reason(BlockReason::None);
-
                     let target = task.target_cpu();
                     let best_cpu = if target < n {
                         let target_load = self.core_effective_load(target).unwrap_or(usize::MAX);
+
                         if target_load == 0 {
                             target
                         } else {
@@ -378,6 +376,7 @@ impl Scheduler {
                     } else {
                         self.find_least_loaded_cpu(n, 0)
                     };
+
                     task.set_target_cpu(best_cpu);
 
                     self.enqueue_inbound(best_cpu, task.clone());
@@ -388,10 +387,12 @@ impl Scheduler {
 
                 SchedState::Parking => {
                     spins += 1;
+
                     if spins <= 64 {
                         core::hint::spin_loop();
                         continue;
                     }
+
                     return;
                 }
 
@@ -405,7 +406,6 @@ impl Scheduler {
     fn find_least_loaded_cpu(&self, n: usize, hint: usize) -> usize {
         let best = hint % n;
 
-        // Fast path: check hint CPU first
         if let Some(load) = self.core_effective_load(best) {
             if load == 0 {
                 return best;
@@ -429,6 +429,7 @@ impl Scheduler {
             if take {
                 best_load = Some(load);
                 best = i;
+
                 if load == 0 {
                     break;
                 }
@@ -482,6 +483,7 @@ impl Scheduler {
         if !KERNEL_INITIALIZED.load(Ordering::Acquire) {
             return None;
         }
+
         let Some(core) = self.core(cpu_id) else {
             return None;
         };
@@ -492,10 +494,12 @@ impl Scheduler {
 
         {
             let sched_state = core.sched_lock.read();
+
             if let Some(ref cur) = sched_state.current {
                 let Some(mut guard) = cur.inner.try_write() else {
                     return None;
                 };
+
                 guard.update_from_context(state);
 
                 if !Arc::ptr_eq(cur, &core.idle_task) {
@@ -522,22 +526,24 @@ impl Scheduler {
 
     fn drain_inbound_to_runqueue(&self, cpu_id: usize, core: &Arc<CoreScheduler>) -> InboundDrain {
         loop {
-            if core.run_queue.len_approx() >= RUNQ_CAP {
+            if core.run_queue.len() >= RUNQ_CAP {
                 return InboundDrain::Available;
             }
 
-            let task = match core.inbound_queue.try_pop() {
-                Ok(task) => task,
-                Err(RingError::Empty) => return InboundDrain::Available,
-                Err(RingError::Contended) => return InboundDrain::Contended,
-                Err(RingError::Full | RingError::BadCapacity) => unreachable!(),
+            let Ok(task) = core.inbound_queue.try_pop_wait_free() else {
+                return InboundDrain::Available;
             };
 
-            if let Err(task) = core.run_queue.push(task) {
-                if core.inbound_queue.push(task).is_err() {
-                    panic!("failed to restore inbound task on cpu {}", cpu_id);
+            match core.run_queue.try_push(task) {
+                Ok(()) => {}
+                Err(BoundedMpmcPushError::Full(task)) => {
+                    if core.inbound_queue.try_push(task).is_err() {
+                        panic!("failed to restore inbound task on cpu {}", cpu_id);
+                    }
+
+                    return InboundDrain::Available;
                 }
-                return InboundDrain::Available;
+                _ => unreachable!(),
             }
         }
     }
@@ -547,7 +553,7 @@ impl Scheduler {
         core: &Arc<CoreScheduler>,
         inbound_drain: InboundDrain,
     ) -> Option<TaskHandle> {
-        if let Some(task) = core.run_queue.pop() {
+        if let Ok(task) = core.run_queue.try_pop_wait_free() {
             core.load.fetch_sub(1, Ordering::Release);
             return Some(task);
         }
@@ -556,13 +562,11 @@ impl Scheduler {
             return None;
         }
 
-        match core.inbound_queue.try_pop() {
-            Ok(task) => {
-                core.load.fetch_sub(1, Ordering::Release);
-                Some(task)
-            }
-            Err(RingError::Empty | RingError::Contended) => None,
-            Err(RingError::Full | RingError::BadCapacity) => unreachable!(),
+        if let Ok(task) = core.inbound_queue.try_pop_wait_free() {
+            core.load.fetch_sub(1, Ordering::Release);
+            Some(task)
+        } else {
+            None
         }
     }
 
@@ -581,10 +585,12 @@ impl Scheduler {
             let prev_is_idle = Arc::ptr_eq(&prev, &core.idle_task);
 
             let mut lock_failed = false;
+
             if let Some(mut guard) = prev.inner.try_write() {
                 if !prev_fpu_already_saved {
                     guard.save_fpu_state();
                 }
+
                 if !prev_is_idle {
                     guard.account_switched_out(now_cycles);
                 }
@@ -607,7 +613,6 @@ impl Scheduler {
                     SchedState::Parking => {
                         if prev.consume_permit() {
                             prev.set_sched_state(SchedState::Runnable);
-                            //prev.set_block_reason(BlockReason::None);
                             requeue_previous = Some(prev.clone());
                         } else if prev
                             .cas_sched_state(SchedState::Parking, SchedState::Blocked)
@@ -617,7 +622,6 @@ impl Scheduler {
                                 .cas_sched_state(SchedState::Blocked, SchedState::Runnable)
                                 .is_ok()
                         {
-                            //prev.set_block_reason(BlockReason::None);
                             requeue_previous = Some(prev.clone());
                         }
                     }
@@ -665,6 +669,7 @@ impl Scheduler {
         }
 
         core.idle_task.set_sched_state(SchedState::Running);
+
         {
             let mut guard = core.idle_task.inner.write();
             guard.restore_fpu_state();
@@ -681,6 +686,7 @@ impl Scheduler {
         if task_handle.is_kernel_mode.load(Ordering::Relaxed) {
             return;
         }
+
         let pid = task_handle.inner.read().parent_pid;
 
         if let Some(program) = PROGRAM_MANAGER.get(pid) {
@@ -698,6 +704,7 @@ impl Scheduler {
         } else {
             0
         };
+
         tls::activate(thread_pointer);
     }
 
@@ -726,25 +733,27 @@ impl Scheduler {
         let _state = core.sched_lock.write();
 
         loop {
-            let len = core.run_queue.len_approx();
+            let len = core.run_queue.len();
+
             if len == 0 {
                 return None;
             }
 
             let mut rotated = 0usize;
+
             while rotated + 1 < len {
-                let Some(task) = core.run_queue.pop() else {
+                let Ok(task) = core.run_queue.try_pop_wait_free() else {
                     return None;
                 };
 
-                if core.run_queue.push(task).is_err() {
+                if core.run_queue.try_push(task).is_err() {
                     panic!("run queue rotation overflow on cpu {}", cpu_id);
                 }
 
                 rotated += 1;
             }
 
-            let Some(task) = core.run_queue.pop() else {
+            let Ok(task) = core.run_queue.try_pop_wait_free() else {
                 return None;
             };
 
@@ -764,6 +773,7 @@ impl Scheduler {
 
     fn balance(&self) {
         let n = self.num_cores.load(Ordering::Acquire);
+
         if n < 2 {
             return;
         }
@@ -805,7 +815,7 @@ impl Scheduler {
                     continue;
                 };
 
-                let stealable = core.run_queue.len_approx();
+                let stealable = core.run_queue.len();
 
                 if stealable > max_stealable {
                     max_stealable = stealable;
@@ -871,6 +881,7 @@ impl Scheduler {
         }
 
         let now_cycles = cpu::get_cycles();
+
         let next = match self.schedule_next(cpu_id, &core, now_cycles, true) {
             Some(t) => t,
             None => {
@@ -894,9 +905,11 @@ pub extern "win64" fn ipi_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let guard = InterruptGuard::new();
+
+    let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
+
     SCHEDULER.on_ipi(state, cpu_id);
 }
 
@@ -905,9 +918,11 @@ pub extern "win64" fn yield_handler_c(state: *mut State) {
     if !KERNEL_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
-    let guard = InterruptGuard::new();
+
+    let _guard = InterruptGuard::new();
     let _fpu_guard = KernelFpuGuard::new();
     let cpu_id = current_cpu_id();
+
     SCHEDULER.on_timer_tick(state, cpu_id);
 }
 
@@ -949,7 +964,7 @@ pub extern "win64" fn ipi_entry() {
         "pop  r9","pop  r10","pop  r11","pop  r12",
         "pop  r13","pop  r14","pop  r15",
         "iretq",
-        // TODO: Read the ABI for the caller saved registers
+
         "9:",
         "pop  rax",
         "push r15","push r14","push r13","push r12",
@@ -997,6 +1012,7 @@ pub extern "win64" fn yield_interrupt_entry() {
         "pop  r9","pop  r10","pop  r11","pop  r12",
         "pop  r13","pop  r14","pop  r15",
         "iretq",
+
         handler = sym yield_handler_c,
     );
 }
@@ -1019,6 +1035,7 @@ pub extern "win64" fn kernel_task_end() -> ! {
         let task = SCHEDULER.get_current_task(current_cpu_id()).unwrap();
         task.terminate();
     });
+
     loop {
         yield_now();
     }
