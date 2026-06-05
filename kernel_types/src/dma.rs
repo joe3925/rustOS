@@ -1164,7 +1164,7 @@ fn extent_storage_from_slice(extents: &[IoBufferExtent]) -> Result<ExtentStorage
 }
 
 #[repr(C)]
-struct IoBufferRepr<'a> {
+pub struct IoBufferRepr<'a> {
     borrow: IoBufferBorrow<'a>,
     byte_len: usize,
     extents: ExtentStorage,
@@ -1448,7 +1448,7 @@ pub struct IoBuffer<'a, State: IoBufferState, Direction: IoBufferDirection> {
 }
 
 impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State, Direction> {
-    fn from_repr(inner: IoBufferRepr<'a>) -> Self {
+    pub fn from_inner(inner: IoBufferRepr<'a>) -> Self {
         Self {
             inner,
             _state: PhantomData,
@@ -1456,19 +1456,23 @@ impl<'a, State: IoBufferState, Direction: IoBufferDirection> IoBuffer<'a, State,
         }
     }
 
-    fn into_repr(self) -> IoBufferRepr<'a> {
+    pub fn into_inner(self) -> IoBufferRepr<'a> {
         let this = ManuallyDrop::new(self);
         unsafe { ptr::read(&this.inner) }
     }
 
+    pub fn as_inner(&self) -> &IoBufferRepr<'a> {
+        &self.inner
+    }
+
     fn cast_state<NextState: IoBufferState>(self) -> IoBuffer<'a, NextState, Direction> {
-        IoBuffer::<'a, NextState, Direction>::from_repr(self.into_repr())
+        IoBuffer::<'a, NextState, Direction>::from_inner(self.into_inner())
     }
 
     fn cast_direction<NextDirection: IoBufferDirection>(
         self,
     ) -> IoBuffer<'a, State, NextDirection> {
-        IoBuffer::<'a, State, NextDirection>::from_repr(self.into_repr())
+        IoBuffer::<'a, State, NextDirection>::from_inner(self.into_inner())
     }
 
     pub fn len(&self) -> usize {
@@ -1595,15 +1599,15 @@ impl<'a, State: VirtualBackedIoBufferState, Direction: WritableIoBufferDirection
 
 impl<'a> IoBuffer<'a, Described, ToDevice> {
     pub fn from_slice(source: &'a [u8]) -> Self {
-        Self::from_repr(IoBufferRepr::new_source(source))
+        Self::from_inner(IoBufferRepr::new_source(source))
     }
 
     pub fn try_from_slice(source: &'a [u8]) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::try_new_source(source)?))
+        Ok(Self::from_inner(IoBufferRepr::try_new_source(source)?))
     }
 
     pub fn from_segments(segments: &[&'a [u8]]) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::new_source_segments(
+        Ok(Self::from_inner(IoBufferRepr::new_source_segments(
             segments,
         )?))
     }
@@ -1611,17 +1615,17 @@ impl<'a> IoBuffer<'a, Described, ToDevice> {
 
 impl<'a> IoBuffer<'a, Described, FromDevice> {
     pub fn from_slice_mut(destination: &'a mut [u8]) -> Self {
-        Self::from_repr(IoBufferRepr::new_destination(destination))
+        Self::from_inner(IoBufferRepr::new_destination(destination))
     }
 
     pub fn try_from_slice_mut(destination: &'a mut [u8]) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::try_new_destination(
+        Ok(Self::from_inner(IoBufferRepr::try_new_destination(
             destination,
         )?))
     }
 
     pub fn from_segments_mut(segments: Vec<&'a mut [u8]>) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::new_destination_segments(
+        Ok(Self::from_inner(IoBufferRepr::new_destination_segments(
             segments,
         )?))
     }
@@ -1629,15 +1633,15 @@ impl<'a> IoBuffer<'a, Described, FromDevice> {
 
 impl<'a> IoBuffer<'a, Described, Bidirectional> {
     pub fn from_slice_mut(memory: &'a mut [u8]) -> Self {
-        Self::from_repr(IoBufferRepr::new_destination(memory))
+        Self::from_inner(IoBufferRepr::new_destination(memory))
     }
 
     pub fn try_from_slice_mut(memory: &'a mut [u8]) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::try_new_destination(memory)?))
+        Ok(Self::from_inner(IoBufferRepr::try_new_destination(memory)?))
     }
 
     pub fn from_segments_mut(segments: Vec<&'a mut [u8]>) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::new_destination_segments(
+        Ok(Self::from_inner(IoBufferRepr::new_destination_segments(
             segments,
         )?))
     }
@@ -1649,7 +1653,7 @@ impl<'a, Direction: IoBufferDirection> IoBuffer<'a, PhysFramed, Direction> {
         byte_len: usize,
         frames: &[IoBufferPageFrame],
     ) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::new_physical(
+        Ok(Self::from_inner(IoBufferRepr::new_physical(
             frame_offset,
             byte_len,
             frames,
@@ -1660,7 +1664,7 @@ impl<'a, Direction: IoBufferDirection> IoBuffer<'a, PhysFramed, Direction> {
         frames: &[IoBufferPageFrame],
         extents: &[IoBufferExtent],
     ) -> Result<Self, IoBufferError> {
-        Ok(Self::from_repr(IoBufferRepr::new_physical_extents(
+        Ok(Self::from_inner(IoBufferRepr::new_physical_extents(
             frames, extents,
         )?))
     }
@@ -1738,24 +1742,24 @@ impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, S, D> {
         unmap: DmaUnmapFn,
         cookie: usize,
     ) -> Result<IoBuffer<'a, DmaMapped<S>, D>, (Self, IoBufferError)> {
-        let mut inner = self.into_repr();
+        let mut inner = self.into_inner();
         if let Err(e) = inner.replace_dma_segments(segments) {
-            return Err((IoBuffer::<'a, S, D>::from_repr(inner), e));
+            return Err((IoBuffer::<'a, S, D>::from_inner(inner), e));
         }
         inner.set_dma_drop(mapped_by, unmap, cookie);
-        Ok(IoBuffer::<'a, DmaMapped<S>, D>::from_repr(inner))
+        Ok(IoBuffer::<'a, DmaMapped<S>, D>::from_inner(inner))
     }
 }
 
 impl<'a, S: MappableIoBufferState, D: IoBufferDirection> IoBuffer<'a, DmaMapped<S>, D> {
     pub fn remove_dma_mapping(self) -> IoBuffer<'a, S, D> {
-        let mut inner = self.into_repr();
+        let mut inner = self.into_inner();
         if let Some(ctx) = inner.dma_drop.take() {
             (ctx.unmap)(&ctx.mapped_by, ctx.cookie);
         }
         inner.mapped_by = None;
         inner.dma_segments = DmaSegmentLayout::empty();
-        IoBuffer::<'a, S, D>::from_repr(inner)
+        IoBuffer::<'a, S, D>::from_inner(inner)
     }
 }
 

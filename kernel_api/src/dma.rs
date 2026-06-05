@@ -6,40 +6,9 @@ use kernel_types::device::DeviceObject;
 pub use kernel_types::dma;
 use kernel_types::dma::{
     BorrowedDmaMapping, DmaMapError, DmaMapped, DmaMappingStrategy, IoBuffer, IoBufferDirection,
-    IoBufferState, PhysFramed, ToDevice,
+    IoBufferState, MappableIoBufferState, PhysFramed, ToDevice,
 };
 use kernel_types::status::DriverStatus;
-
-unsafe fn cast_io_buffer<'a, S, D, NextS, NextD>(
-    buffer: IoBuffer<'a, S, D>,
-) -> IoBuffer<'a, NextS, NextD>
-where
-    S: IoBufferState,
-    D: IoBufferDirection,
-    NextS: IoBufferState,
-    NextD: IoBufferDirection,
-{
-    let buffer = ManuallyDrop::new(buffer);
-    unsafe {
-        ptr::read(
-            (&*buffer as *const IoBuffer<'a, S, D>).cast::<IoBuffer<'a, NextS, NextD>>(),
-        )
-    }
-}
-
-unsafe fn cast_io_buffer_ref<'map, 'buffer, S, D, NextS, NextD>(
-    buffer: &'map IoBuffer<'buffer, S, D>,
-) -> &'map IoBuffer<'buffer, NextS, NextD>
-where
-    S: IoBufferState,
-    D: IoBufferDirection,
-    NextS: IoBufferState,
-    NextD: IoBufferDirection,
-{
-    unsafe {
-        &*(buffer as *const IoBuffer<'buffer, S, D> as *const IoBuffer<'buffer, NextS, NextD>)
-    }
-}
 
 pub fn register_pci_pdo(
     pdo: &Arc<DeviceObject>,
@@ -58,43 +27,28 @@ pub fn query_device_state(device: &Arc<DeviceObject>) -> Option<dma::DmaDeviceSt
     unsafe { kernel_sys::kernel_dma_query_device_state(device) }
 }
 
-pub fn map_buffer<'a, D: IoBufferDirection>(
+pub fn map_buffer<'a, S: MappableIoBufferState, D: IoBufferDirection>(
     device: &Arc<DeviceObject>,
-    buffer: IoBuffer<'a, PhysFramed, D>,
+    buffer: IoBuffer<'a, S, D>,
     strategy: DmaMappingStrategy,
-) -> Result<
-    IoBuffer<'a, DmaMapped<PhysFramed>, D>,
-    (IoBuffer<'a, PhysFramed, D>, DmaMapError),
-> {
-    let erased = unsafe { cast_io_buffer::<PhysFramed, D, PhysFramed, ToDevice>(buffer) };
-    match unsafe { kernel_sys::kernel_dma_map_buffer(device, erased, strategy) } {
-        Ok(mapped) => Ok(unsafe {
-            cast_io_buffer::<DmaMapped<PhysFramed>, ToDevice, DmaMapped<PhysFramed>, D>(mapped)
-        }),
-        Err((erased, err)) => Err((
-            unsafe { cast_io_buffer::<PhysFramed, ToDevice, PhysFramed, D>(erased) },
-            err,
-        )),
+) -> Result<IoBuffer<'a, DmaMapped<S>, D>, (IoBuffer<'a, S, D>, DmaMapError)> {
+    match unsafe { kernel_sys::kernel_dma_map_buffer(device, buffer.into_inner(), strategy) } {
+        Ok(mapped) => Ok(IoBuffer::from_inner(mapped)),
+        Err((erased, err)) => Err((IoBuffer::from_inner(erased), err)),
     }
 }
 
-pub fn unmap_buffer<'a, D: IoBufferDirection>(
-    buffer: IoBuffer<'a, DmaMapped<PhysFramed>, D>,
-) -> IoBuffer<'a, PhysFramed, D> {
-    let erased =
-        unsafe {
-            cast_io_buffer::<DmaMapped<PhysFramed>, D, DmaMapped<PhysFramed>, ToDevice>(buffer)
-        };
-    let unmapped = unsafe { kernel_sys::kernel_dma_unmap_buffer(erased) };
-    unsafe { cast_io_buffer::<PhysFramed, ToDevice, PhysFramed, D>(unmapped) }
+pub fn unmap_buffer<'a, S: MappableIoBufferState, D: IoBufferDirection>(
+    buffer: IoBuffer<'a, DmaMapped<S>, D>,
+) -> IoBuffer<'a, S, D> {
+    let unmapped = unsafe { kernel_sys::kernel_dma_unmap_buffer(buffer.into_inner()) };
+    IoBuffer::from_inner(unmapped)
 }
 
-pub fn map_buffer_ref<'map, 'buffer, D: IoBufferDirection>(
+pub fn map_buffer_ref<'map, 'buffer, S: MappableIoBufferState, D: IoBufferDirection>(
     device: &Arc<DeviceObject>,
-    buffer: &'map IoBuffer<'buffer, PhysFramed, D>,
+    buffer: &'map IoBuffer<'buffer, S, D>,
     strategy: DmaMappingStrategy,
 ) -> Result<BorrowedDmaMapping<'map>, DmaMapError> {
-    let erased =
-        unsafe { cast_io_buffer_ref::<PhysFramed, D, PhysFramed, ToDevice>(buffer) };
-    unsafe { kernel_sys::kernel_dma_map_buffer_ref(device, erased, strategy) }
+    unsafe { kernel_sys::kernel_dma_map_buffer_ref(device, buffer.as_inner(), strategy) }
 }
