@@ -3,17 +3,16 @@ use crate::round_robin::SchedulerPolicy;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use alloc::boxed::Box;
+use kernel_types::irq::IrqSafeMutex;
 use spin::Once;
 
 pub use crate::domain::{
     AdmissionPolicy, DestroyDomainError, DestroyDomainResult, DomainClass, DomainConfig, DomainId,
-    DomainStats, DomainState, DomainTable, ExecutorDomain, GlobalExecutorStats, SubmitError,
+    DomainState, DomainStats, DomainTable, ExecutorDomain, GlobalExecutorStats, SubmitError,
     SubmitErrorKind, DRIVER_DOMAIN, KERNEL_BACKGROUND_DOMAIN, KERNEL_HIGH_DOMAIN,
     KERNEL_NORMAL_DOMAIN,
 };
-pub use crate::round_robin::{
-    SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler,
-};
+pub use crate::round_robin::{SimpleRoundRobinScheduler, WeightedDeficitRoundRobinScheduler};
 
 pub type Trampoline = extern "win64" fn(usize);
 
@@ -31,14 +30,14 @@ const MAX_SHARDS: usize = 32;
 
 struct ExecutorRuntime {
     domains: DomainTable,
-    scheduler: Mutex<Box<dyn SchedulerPolicy>>,
+    scheduler: IrqSafeMutex<Box<dyn SchedulerPolicy>>,
 }
 
 impl ExecutorRuntime {
     fn new(shards: usize, max_work_items: usize) -> Self {
         Self {
             domains: DomainTable::new(shards, max_work_items),
-            scheduler: Mutex::new(Box::new(WeightedDeficitRoundRobinScheduler::new())),
+            scheduler: IrqSafeMutex::new(Box::new(WeightedDeficitRoundRobinScheduler::new())),
         }
     }
 }
@@ -124,7 +123,10 @@ impl GlobalAsyncExecutor {
         self.total_submissions.0.fetch_add(1, Ordering::AcqRel);
 
         if outcome.became_runnable {
-            runtime.scheduler.lock().on_domain_runnable(outcome.domain_id);
+            runtime
+                .scheduler
+                .lock()
+                .on_domain_runnable(outcome.domain_id);
         }
 
         self.try_schedule();
@@ -217,10 +219,7 @@ impl GlobalAsyncExecutor {
         loop {
             let scheduled = {
                 let runtime = self.runtime();
-                runtime
-                    .scheduler
-                    .lock()
-                    .pick_next_domain(&runtime.domains)
+                runtime.scheduler.lock().pick_next_domain(&runtime.domains)
             };
 
             let Some(scheduled) = scheduled else {
