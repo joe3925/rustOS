@@ -13,8 +13,6 @@ const DRIVER_SLOT: u32 = 1;
 const KERNEL_NORMAL_SLOT: u32 = 2;
 const KERNEL_BACKGROUND_SLOT: u32 = 3;
 
-const DOMAIN_SCHEDULED: usize = 1 << 0;
-
 const DOMAIN_SLOT_EMPTY: usize = 0;
 const DOMAIN_SLOT_RESERVED: usize = 1;
 const DOMAIN_SLOT_ACTIVE: usize = 2;
@@ -343,7 +341,7 @@ pub struct ExecutorDomain {
     state: AtomicU8,
     max_queued: usize,
 
-    flags: CacheAligned,
+    scheduled_count: CacheAligned,
 
     queued_count: CacheAligned,
     active_count: CacheAligned,
@@ -375,7 +373,7 @@ impl ExecutorDomain {
             state: AtomicU8::new(DomainState::Active as u8),
             max_queued: config.max_queued,
 
-            flags: CacheAligned(AtomicUsize::new(0)),
+            scheduled_count: CacheAligned(AtomicUsize::new(0)),
 
             queued_count: CacheAligned(AtomicUsize::new(0)),
             active_count: CacheAligned(AtomicUsize::new(0)),
@@ -395,34 +393,8 @@ impl ExecutorDomain {
     }
 
     #[inline]
-    pub fn try_mark_scheduled(&self) -> bool {
-        let mut flags = self.flags.0.load(Ordering::Acquire);
-
-        loop {
-            if flags & DOMAIN_SCHEDULED != 0 {
-                return false;
-            }
-
-            match self.flags.0.compare_exchange_weak(
-                flags,
-                flags | DOMAIN_SCHEDULED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(next) => flags = next,
-            }
-        }
-    }
-
-    #[inline]
-    pub fn clear_scheduled(&self) {
-        self.flags.0.fetch_and(!DOMAIN_SCHEDULED, Ordering::AcqRel);
-    }
-
-    #[inline]
     pub fn is_scheduled(&self) -> bool {
-        self.flags.0.load(Ordering::Acquire) & DOMAIN_SCHEDULED != 0
+        self.scheduled_count.0.load(Ordering::Acquire) != 0
     }
 
     #[inline]
@@ -430,12 +402,8 @@ impl ExecutorDomain {
         self.is_runnable_for_policy() && !self.is_at_active_limit()
     }
 
-    pub(crate) fn mark_runnable(&self) -> bool {
-        self.try_mark_scheduled()
-    }
-
     pub(crate) fn clear_runnable(&self) {
-        self.clear_scheduled();
+        self.scheduled_count.0.store(0, Ordering::Release);
     }
 
     pub fn id(&self) -> DomainId {
@@ -480,6 +448,40 @@ impl ExecutorDomain {
 
     pub fn is_at_active_limit(&self) -> bool {
         self.active_count() >= self.max_active()
+    }
+
+    #[inline]
+    pub(crate) fn try_reserve_schedule_token(&self) -> bool {
+        let max_active = self.max_active();
+        let mut scheduled = self.scheduled_count.0.load(Ordering::Acquire);
+
+        loop {
+            let active = self.active_count();
+            if active >= max_active {
+                return false;
+            }
+
+            let queued = self.queued_count();
+            if scheduled >= queued || active.saturating_add(scheduled) >= max_active {
+                return false;
+            }
+
+            match self.scheduled_count.0.compare_exchange_weak(
+                scheduled,
+                scheduled + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(next) => scheduled = next,
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn release_schedule_token(&self) {
+        let previous = self.scheduled_count.0.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "executor domain schedule token underflow");
     }
 
     fn try_submit_work(
@@ -626,7 +628,7 @@ impl ExecutorDomain {
 
     fn move_to_dead(&self) {
         self.state.store(DomainState::Dead as u8, Ordering::Release);
-        self.clear_scheduled();
+        self.clear_runnable();
     }
 
     pub(crate) fn maybe_finish_draining(&self) {

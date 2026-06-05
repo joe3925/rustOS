@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use std::sync::{Condvar, Mutex};
 use std::task::Wake;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::global_async::{
     DomainClass, DomainConfig, DomainId, GlobalAsyncExecutor, KERNEL_NORMAL_DOMAIN,
@@ -308,9 +308,29 @@ struct RecursiveSubmitState {
     completed: AtomicUsize,
 }
 
+struct DomainConcurrencyState {
+    running: AtomicUsize,
+    max_running: AtomicUsize,
+    completed: AtomicUsize,
+    release: AtomicBool,
+}
+
 extern "win64" fn increment_counter(ctx: usize) {
     let counter = unsafe { &*(ctx as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::AcqRel);
+}
+
+extern "win64" fn blocking_domain_counter(ctx: usize) {
+    let state = unsafe { &*(ctx as *const DomainConcurrencyState) };
+    let running = state.running.fetch_add(1, Ordering::AcqRel) + 1;
+    state.max_running.fetch_max(running, Ordering::AcqRel);
+
+    while !state.release.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+
+    state.running.fetch_sub(1, Ordering::AcqRel);
+    state.completed.fetch_add(1, Ordering::AcqRel);
 }
 
 extern "win64" fn recursive_submit_counter(ctx: usize) {
@@ -1042,6 +1062,55 @@ fn submit_to_domain_executes_work_and_updates_domain_stats() {
     assert!(stats.submitted >= jobs);
     assert!(stats.completed >= jobs);
     assert_eq!(stats.queued_count, 0);
+}
+
+#[test]
+fn hot_domain_can_run_multiple_active_pumps() {
+    let _guard = super::global_runtime_lock();
+    super::init_threaded_runtime();
+
+    if super::test_shard_count() < 2 {
+        return;
+    }
+
+    let jobs = 4;
+    let expected_concurrency = 2;
+    let state = Arc::new(DomainConcurrencyState {
+        running: AtomicUsize::new(0),
+        max_running: AtomicUsize::new(0),
+        completed: AtomicUsize::new(0),
+        release: AtomicBool::new(false),
+    });
+    let ctx = Arc::as_ptr(&state) as usize;
+    let domain_id = GlobalAsyncExecutor::global().create_domain(DomainConfig {
+        class: DomainClass::KernelNormal,
+        max_active: expected_concurrency,
+        max_queued: jobs,
+        quantum: 1,
+        ..DomainConfig::default()
+    });
+
+    for _ in 0..jobs {
+        GlobalAsyncExecutor::global().submit_to_domain(domain_id, blocking_domain_counter, ctx);
+    }
+
+    let start = Instant::now();
+    while state.max_running.load(Ordering::Acquire) < expected_concurrency
+        && start.elapsed() < Duration::from_secs(2)
+    {
+        std::thread::yield_now();
+    }
+
+    state.release.store(true, Ordering::Release);
+
+    super::wait_until(Duration::from_secs(10), || {
+        state.completed.load(Ordering::Acquire) == jobs
+    });
+
+    assert!(
+        state.max_running.load(Ordering::Acquire) >= expected_concurrency,
+        "hot domain never exceeded single-pump execution"
+    );
 }
 
 #[test]

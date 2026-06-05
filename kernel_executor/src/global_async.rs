@@ -231,12 +231,10 @@ impl GlobalAsyncExecutor {
             return;
         }
 
-        if !domain.try_mark_scheduled() {
-            return;
+        while domain.try_reserve_schedule_token() {
+            runtime.run_queue.push(domain_id);
+            self.try_schedule();
         }
-
-        runtime.run_queue.push(domain_id);
-        self.try_schedule();
     }
 
     fn try_schedule(&self) {
@@ -259,7 +257,7 @@ impl GlobalAsyncExecutor {
             a: 0,
         }) {
             self.active_pumps.0.fetch_sub(1, Ordering::AcqRel);
-            panic!("executor reserved more runtime pumps than platform runtime capacity");
+            return;
         }
     }
 
@@ -283,17 +281,18 @@ impl GlobalAsyncExecutor {
             };
 
             if !domain.is_schedulable_for_policy() {
-                domain.clear_scheduled();
+                domain.release_schedule_token();
                 self.schedule_domain_if_needed(runtime, domain_id, &domain);
                 continue;
             }
 
             if !domain.try_reserve_active() {
-                domain.clear_scheduled();
+                domain.release_schedule_token();
                 self.schedule_domain_if_needed(runtime, domain_id, &domain);
                 continue;
             }
 
+            domain.release_schedule_token();
             domain.record_scheduler_selection();
 
             let tick = self.run_tick.0.fetch_add(1, Ordering::Relaxed) + 1;
@@ -356,7 +355,6 @@ impl GlobalAsyncExecutor {
             domain.spend_deficit(ran_count.max(1));
         }
 
-        domain.clear_scheduled();
         self.schedule_domain_if_needed(runtime, domain_id, domain);
     }
 }
